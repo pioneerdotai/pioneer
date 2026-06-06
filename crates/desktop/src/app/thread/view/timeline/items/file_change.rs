@@ -330,6 +330,7 @@ impl PioneerDesktop {
 fn file_change_status_label(kind: TimelineFinalStatusKind) -> String {
     match kind {
         TimelineFinalStatusKind::Cancelled => t!("timeline.file_change.cancelled").to_string(),
+        TimelineFinalStatusKind::Blocked => t!("timeline.file_change.blocked").to_string(),
         TimelineFinalStatusKind::Failed => t!("timeline.file_change.failed").to_string(),
         TimelineFinalStatusKind::Running => t!("timeline.file_change.running").to_string(),
         TimelineFinalStatusKind::Completed => t!("timeline.file_change.completed").to_string(),

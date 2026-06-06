@@ -6766,7 +6766,7 @@ async fn failed_child_task_run_marks_target_turn_failed_without_candidate() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn blocked_execution_window_recovery_does_not_fail_child_task_run() {
+async fn blocked_execution_window_recovery_blocks_child_task_run_without_failure() {
     let provider = Arc::new(HangingChildProvider::new());
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
@@ -6890,7 +6890,7 @@ async fn blocked_execution_window_recovery_does_not_fail_child_task_run() {
         .await
         .expect("run should reload after recovery")
         .expect("run should still exist");
-    assert_eq!(stored_run.status, TaskRunStatus::Running);
+    assert_eq!(stored_run.status, TaskRunStatus::Blocked);
     let task_run_turn = crud_store
         .get_task_run_turn_by_turn(
             lineage.child_thread_id.as_str(),
@@ -6899,7 +6899,16 @@ async fn blocked_execution_window_recovery_does_not_fail_child_task_run() {
         .await
         .expect("task run turn lookup should succeed")
         .expect("target task_run_turn should exist");
-    assert_eq!(task_run_turn.status, TaskRunTurnStatus::InProgress);
+    assert_eq!(task_run_turn.status, TaskRunTurnStatus::Blocked);
+    let stored_task = crud_store
+        .get_task(response.task.id.as_str())
+        .await
+        .expect("task should reload after blocked recovery")
+        .expect("task should still exist");
+    assert_eq!(
+        stored_task.task.status,
+        pioneer_protocol::TaskStatus::Blocked
+    );
     assert!(
         crud_store
             .list_task_result_candidates(run.id.as_str())
@@ -6919,6 +6928,9 @@ async fn blocked_execution_window_recovery_does_not_fail_child_task_run() {
         .collect::<Vec<_>>();
     assert!(!event_types.contains(&events::TASK_RUN_FAILED));
     assert!(!event_types.contains(&events::TASK_RUN_TURN_FAILED));
+    assert!(event_types.contains(&events::TASK_RUN_BLOCKED));
+    assert!(event_types.contains(&events::TASK_RUN_TURN_BLOCKED));
+    assert!(event_types.contains(&events::TASK_BLOCKED));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9843,6 +9855,28 @@ async fn direct_durable_execution_window_lifecycle_updates_rows() {
             },
         })
         .await;
+    let turn_blocked_live_payload = recv_text_timeout_context(
+        &mut rx,
+        Duration::from_secs(2),
+        "turn/blocked live notification",
+    )
+    .await;
+    let turn_blocked_live_rpc: JsonRpcNotification =
+        serde_json::from_str(&turn_blocked_live_payload)
+            .expect("turn blocked notification should decode");
+    assert_eq!(turn_blocked_live_rpc.method, events::TURN_BLOCKED);
+    let turn_blocked_live_params = turn_blocked_live_rpc
+        .params
+        .expect("turn blocked notification should include params");
+    assert_eq!(turn_blocked_live_params["workspace_id"], workspace_id);
+    assert_eq!(turn_blocked_live_params["thread_id"], thread_id);
+    assert_eq!(turn_blocked_live_params["turn"]["id"], turn_id);
+    assert_eq!(turn_blocked_live_params["turn"]["status"], "Blocked");
+    assert_eq!(
+        turn_blocked_live_params["turn"]["error"],
+        "total budget exhausted"
+    );
+
     let blocked_live_payload = recv_text_timeout_context(
         &mut rx,
         Duration::from_secs(2),
@@ -9968,6 +10002,12 @@ async fn direct_durable_execution_window_lifecycle_updates_rows() {
         &event.payload,
         ThreadHistoryEventPayload::TurnExecutionWindowBlocked(notification)
             if notification.reason == "total budget exhausted"
+    )));
+    assert!(history.events.iter().any(|event| matches!(
+        &event.payload,
+        ThreadHistoryEventPayload::TurnBlocked { turn, .. }
+            if turn.status == TurnStatus::Blocked
+                && turn.error.as_deref() == Some("total budget exhausted")
     )));
     let history_json =
         serde_json::to_string(&history.events).expect("thread history should serialize");
@@ -10190,6 +10230,65 @@ async fn terminal_turn_failure_closes_running_execution_window() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_turn_blocked_closes_running_execution_window_without_failure() {
+    let thread_id = "thr_window_terminal_blocked";
+    let turn_id = "turn_window_terminal_blocked";
+    let (processor, crud_store, workspace_id) =
+        setup_execution_window_terminal_turn(thread_id, turn_id).await;
+
+    start_terminal_test_execution_window(
+        &processor,
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+        "runtime_win_terminal_blocked",
+    )
+    .await;
+
+    processor
+        .handle_durable_agent_event(AgentDurableEvent::TurnBlocked {
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            reason: "needs user review".to_owned(),
+            recovery: None,
+        })
+        .await;
+
+    let window = crud_store
+        .latest_turn_execution_window(turn_id)
+        .await
+        .expect("latest window should load")
+        .expect("window should exist");
+    assert_eq!(window.status, ExecutionWindowStatus::Blocked);
+    assert!(window.completed_at.is_some());
+    assert_eq!(window.metadata_json["terminalStatus"], "blocked");
+    assert_eq!(window.metadata_json["terminalReason"], "needs user review");
+    let (_workspace_id, turn) = crud_store
+        .get_turn(thread_id, turn_id)
+        .await
+        .expect("turn should load")
+        .expect("turn should exist");
+    assert_eq!(turn.status, TurnStatus::Blocked);
+    assert_eq!(turn.error.as_deref(), Some("needs user review"));
+    let history = crud_store
+        .get_thread_history(thread_id, Some(16))
+        .await
+        .expect("history should load")
+        .expect("history should exist");
+    assert!(history.events.iter().any(|event| matches!(
+        &event.payload,
+        ThreadHistoryEventPayload::TurnBlocked { turn, .. }
+            if turn.status == TurnStatus::Blocked
+    )));
+    assert!(
+        !history
+            .events
+            .iter()
+            .any(|event| matches!(&event.payload, ThreadHistoryEventPayload::TurnFailed { .. }))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminal_turn_interruption_closes_running_execution_window() {
     let thread_id = "thr_window_terminal_interrupt";
     let turn_id = "turn_window_terminal_interrupt";
@@ -10219,9 +10318,9 @@ async fn terminal_turn_interruption_closes_running_execution_window() {
         .await
         .expect("latest window should load")
         .expect("window should exist");
-    assert_eq!(window.status, ExecutionWindowStatus::Failed);
+    assert_eq!(window.status, ExecutionWindowStatus::Interrupted);
     assert!(window.completed_at.is_some());
-    assert_eq!(window.metadata_json["terminalStatus"], "failed");
+    assert_eq!(window.metadata_json["terminalStatus"], "interrupted");
     assert_eq!(window.metadata_json["terminalReason"], "user cancelled");
     let (_workspace_id, turn) = crud_store
         .get_turn(thread_id, turn_id)

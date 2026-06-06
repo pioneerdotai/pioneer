@@ -99,6 +99,22 @@ impl TaskExecutionHandle {
         .await
     }
 
+    pub async fn record_task_run_turn_blocked(
+        &self,
+        task_run_turn: TaskRunTurn,
+        error: Option<TaskError>,
+        event_timestamp_secs: i64,
+    ) -> TaskRuntimeResult<()> {
+        self.append_and_publish(
+            vec![TaskEventPayload::TaskRunTurnBlocked {
+                task_run_turn,
+                error,
+            }],
+            event_timestamp_secs,
+        )
+        .await
+    }
+
     pub async fn record_task_run_turn_completed(
         &self,
         task_run_turn: TaskRunTurn,
@@ -303,6 +319,59 @@ impl TaskExecutionHandle {
         self.mark_execution_terminal(
             failure_execution_status(error.as_ref()),
             completed_at,
+            None,
+            error.as_ref(),
+        )
+        .await
+    }
+
+    pub async fn block_run(
+        &self,
+        error: Option<TaskError>,
+        blocked_at: i64,
+    ) -> TaskRuntimeResult<()> {
+        if self.run_is_terminal().await? {
+            return Ok(());
+        }
+        if self.task_is_terminal().await? {
+            return self
+                .release_locks_only(
+                    TaskWriteLockStatus::Released,
+                    Some("run blocked after task terminal".to_owned()),
+                    blocked_at,
+                )
+                .await;
+        }
+
+        let mut events = vec![TaskEventPayload::RunBlocked {
+            task_id: self.task_id.clone(),
+            run_id: self.run_id.clone(),
+            error: error.clone(),
+            blocked_at,
+        }];
+        self.push_write_lock_released(
+            &mut events,
+            TaskWriteLockStatus::Released,
+            Some("run blocked".to_owned()),
+            blocked_at,
+        )
+        .await?;
+        if self.should_emit_terminal_task_event().await? {
+            events.push(TaskEventPayload::TaskBlocked {
+                task_id: self.task_id.clone(),
+                error: error.clone(),
+                blocked_at,
+            });
+        } else {
+            self.push_active_schedule_after_terminal(&mut events, blocked_at)
+                .await?;
+        }
+        self.push_delivery_queued(&mut events, blocked_at, None, error.clone())
+            .await?;
+        self.append_and_publish(events, blocked_at).await?;
+        self.mark_execution_terminal(
+            TaskRunExecutionStatus::Blocked,
+            blocked_at,
             None,
             error.as_ref(),
         )

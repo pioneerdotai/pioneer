@@ -160,17 +160,11 @@ pub enum ToolLoopGuardDecision {
         instruction: String,
         budget_exceeded: ToolLoopBudgetExceeded,
     },
-    FailTurn {
-        message: String,
-        budget_exceeded: ToolLoopBudgetExceeded,
-    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolLoopBudgetAction {
     ContinueInNextWindow,
-    RequestFinalNoToolsRound,
-    FailTurn,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,18 +250,13 @@ impl ToolLoopGuard {
         if !tools_enabled {
             if tool_call_count > 0 {
                 let observed = u32::try_from(tool_call_count).unwrap_or(u32::MAX);
-                let budget_exceeded = ToolLoopBudgetExceeded {
-                    reason: ToolLoopBudgetReason::ProviderReturnedToolsAfterToolsDisabled,
-                    limit: 0,
-                    observed,
-                    action: ToolLoopBudgetAction::FailTurn,
-                };
-                return ToolLoopGuardDecision::FailTurn {
-                    message: Self::terminal_message(
-                        ToolLoopBudgetReason::ProviderReturnedToolsAfterToolsDisabled,
-                        format!("tool_calls={tool_call_count}"),
-                    ),
-                    budget_exceeded,
+                return ToolLoopGuardDecision::RequestContinuation {
+                    budget_exceeded: ToolLoopBudgetExceeded {
+                        reason: ToolLoopBudgetReason::ProviderReturnedToolsAfterToolsDisabled,
+                        limit: 0,
+                        observed,
+                        action: ToolLoopBudgetAction::ContinueInNextWindow,
+                    },
                 };
             }
 
@@ -482,7 +471,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_tools_after_tools_disabled_fails_deterministically() {
+    fn provider_tools_after_tools_disabled_requests_continuation() {
         let mut guard = guard(8, 8);
         guard
             .request_final_answer_with_instruction("wrap up without tools")
@@ -494,19 +483,14 @@ mod tests {
         let decision = guard.after_provider_round(final_round.tools_enabled, 1);
         assert!(matches!(
             decision,
-            ToolLoopGuardDecision::FailTurn {
+            ToolLoopGuardDecision::RequestContinuation {
                 budget_exceeded: ToolLoopBudgetExceeded {
                     reason: ToolLoopBudgetReason::ProviderReturnedToolsAfterToolsDisabled,
                     limit: 0,
                     observed: 1,
-                    action: ToolLoopBudgetAction::FailTurn,
+                    action: ToolLoopBudgetAction::ContinueInNextWindow,
                 },
-                ..
             }
         ));
-        if let ToolLoopGuardDecision::FailTurn { message, .. } = decision {
-            assert!(message.contains("tool_loop_budget_exceeded"));
-            assert!(message.contains("provider_returned_tools_after_tools_disabled"));
-        }
     }
 }

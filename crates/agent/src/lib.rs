@@ -512,6 +512,12 @@ pub enum AgentEvent {
         error: String,
         recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
     },
+    TurnBlocked {
+        thread_id: String,
+        turn_id: String,
+        reason: String,
+        recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -859,6 +865,9 @@ impl ProgressCoalescer {
                 thread_id, turn_id, ..
             }
             | AgentDurableEvent::TurnFailed {
+                thread_id, turn_id, ..
+            }
+            | AgentDurableEvent::TurnBlocked {
                 thread_id, turn_id, ..
             }
             | AgentDurableEvent::TurnInterrupted {
@@ -1422,6 +1431,7 @@ struct ActiveTurnRequest {
 #[derive(Debug, Clone)]
 enum TurnTaskFailure {
     Terminal(String),
+    Blocked(String),
     ProviderFailure {
         item_id: String,
         item_type: TurnItemType,

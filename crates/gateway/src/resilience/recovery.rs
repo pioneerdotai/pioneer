@@ -892,6 +892,89 @@ impl RecoveryCoordinator {
         error_message: &str,
         now_unix: i64,
     ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+        self.fail_active_recoveries_for_turn_with_cancel_reason(
+            turn_id,
+            recovery,
+            error_message,
+            now_unix,
+            "turn failed; pending recovery jobs cancelled",
+        )
+        .await
+    }
+
+    pub async fn block_active_recoveries_for_turn(
+        &self,
+        turn_id: &str,
+        recovery: Option<&RecoveryAttemptContext>,
+        error_message: &str,
+        now_unix: i64,
+    ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+        let jobs = if let Some(recovery) = recovery {
+            self.crud_store
+                .get_recovery_job(recovery.job_id.as_str())
+                .await?
+                .filter(|job| job.turn_id == turn_id)
+                .filter(|job| job.status == RecoveryJobStatus::Active)
+                .filter(|job| {
+                    job.active_attempt_id.as_deref() == Some(recovery.attempt_id.as_str())
+                })
+                .into_iter()
+                .collect::<Vec<_>>()
+        } else {
+            self.crud_store
+                .find_recovery_jobs_by_turn_and_status(turn_id, RecoveryJobStatus::Active)
+                .await?
+        };
+
+        let mut blocked_any = false;
+        for job in jobs {
+            if let Some(active_attempt_id) = job.active_attempt_id.clone() {
+                blocked_any |= self
+                    .crud_store
+                    .mark_recovery_job_terminal_after_attempt(
+                        job.id.as_str(),
+                        active_attempt_id.as_str(),
+                        RecoveryJobStatus::Blocked,
+                        Some(error_message.to_owned()),
+                        now_unix,
+                    )
+                    .await?;
+            } else {
+                blocked_any |= self
+                    .crud_store
+                    .mark_malformed_active_recovery_job_terminal(
+                        job.id.as_str(),
+                        RecoveryJobStatus::Blocked,
+                        Some(error_message.to_owned()),
+                        now_unix,
+                    )
+                    .await?;
+            }
+        }
+
+        if recovery.is_none() || blocked_any {
+            let _ = self
+                .crud_store
+                .cancel_open_recovery_jobs_for_turn(
+                    turn_id,
+                    None,
+                    Some("turn blocked; pending recovery jobs cancelled".to_owned()),
+                    now_unix,
+                )
+                .await?;
+        }
+
+        Ok(Vec::new())
+    }
+
+    async fn fail_active_recoveries_for_turn_with_cancel_reason(
+        &self,
+        turn_id: &str,
+        recovery: Option<&RecoveryAttemptContext>,
+        error_message: &str,
+        now_unix: i64,
+        pending_cancel_reason: &str,
+    ) -> Result<Vec<RecoveryCoordinatorEvent>> {
         let jobs = if let Some(recovery) = recovery {
             self.crud_store
                 .get_recovery_job(recovery.job_id.as_str())
@@ -946,7 +1029,7 @@ impl RecoveryCoordinator {
                 .cancel_open_recovery_jobs_for_turn(
                     turn_id,
                     failed_job_id.as_deref(),
-                    Some("turn failed; pending recovery jobs cancelled".to_owned()),
+                    Some(pending_cancel_reason.to_owned()),
                     now_unix,
                 )
                 .await?;
@@ -3646,6 +3729,86 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stale.status, RecoveryJobStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn turn_block_marks_active_recovery_blocked_without_exhausted_event() {
+        let (crud_store, coordinator) = setup_coordinator().await;
+        let turn_id = "turn_block_blocks_recovery";
+        let active_job = coordinator
+            .enqueue_provider_failure_job(
+                &ProviderFailureCandidate {
+                    turn_id: turn_id.to_owned(),
+                    item_id: "reasoning_1".to_owned(),
+                    item_type: TurnItemType::Reasoning,
+                    failure: provider_failure(ProviderFailureClass::NetworkTransient, "first"),
+                },
+                1_700_000_000,
+            )
+            .await
+            .expect("initial provider failure should enqueue")
+            .into_job();
+        let active_attempt_id =
+            claim_and_activate(crud_store.as_ref(), active_job.id.as_str()).await;
+
+        let stale_pending = crud_store
+            .enqueue_recovery_job(
+                turn_id.to_owned(),
+                "reasoning_stale".to_owned(),
+                TurnItemType::Reasoning,
+                None,
+                RecoveryTrigger::ProviderError,
+                RecoveryAction::RetryWithBackoff,
+                Some("stale duplicate".to_owned()),
+                None,
+                None,
+                None,
+                0,
+                3,
+                serde_json::json!({}),
+                serde_json::json!({}),
+                1_700_000_001,
+            )
+            .await
+            .expect("stale pending job should enqueue for regression setup");
+
+        let recovery = recovery_context(active_job.id.as_str(), active_attempt_id.as_str());
+        let events = coordinator
+            .block_active_recoveries_for_turn(
+                turn_id,
+                Some(&recovery),
+                "total window budget exhausted",
+                1_700_000_002,
+            )
+            .await
+            .expect("turn block should close active recovery");
+        assert!(
+            events.is_empty(),
+            "blocked recovery must not emit failed/exhausted recovery events"
+        );
+
+        let active = crud_store
+            .get_recovery_job(active_job.id.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.status, RecoveryJobStatus::Blocked);
+        assert_eq!(
+            active.last_error.as_deref(),
+            Some("total window budget exhausted")
+        );
+        assert!(active.active_attempt_id.is_none());
+
+        let stale = crud_store
+            .get_recovery_job(stale_pending.id.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stale.status, RecoveryJobStatus::Cancelled);
+        assert_eq!(
+            stale.last_error.as_deref(),
+            Some("turn blocked; pending recovery jobs cancelled")
+        );
     }
 
     #[tokio::test]

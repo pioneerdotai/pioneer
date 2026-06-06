@@ -389,6 +389,14 @@ pub async fn mark_turn_execution_window_failed<C: ConnectionTrait>(
     update_window_with_stats(db, window_id, ExecutionWindowStatus::Failed, None, stats).await
 }
 
+pub async fn mark_turn_execution_window_interrupted<C: ConnectionTrait>(
+    db: &C,
+    window_id: &str,
+    stats: TurnExecutionWindowStatsRecord,
+) -> Result<TurnExecutionWindowRecord> {
+    update_window_with_stats(db, window_id, ExecutionWindowStatus::Interrupted, None, stats).await
+}
+
 pub async fn mark_turn_execution_window_blocked<C: ConnectionTrait>(
     db: &C,
     window_id: &str,
@@ -649,9 +657,9 @@ mod tests {
 
     #[test]
     fn execution_window_status_and_reason_roundtrip_through_db_strings() {
-        let status = ExecutionWindowStatus::Exhausted;
+        let status = ExecutionWindowStatus::Interrupted;
         let status_db = execution_window_status_to_db(status);
-        assert_eq!(status_db, "exhausted");
+        assert_eq!(status_db, "interrupted");
         assert_eq!(execution_window_status_from_db(&status_db).unwrap(), status);
 
         let reason = ExecutionWindowExhaustionReason::MaxToolCallsPerWindow;

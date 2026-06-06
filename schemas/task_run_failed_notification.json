@@ -344,6 +344,7 @@
         "waiting_review",
         "succeeded",
         "failed",
+        "blocked",
         "cancelled",
         "timed_out"
       ]

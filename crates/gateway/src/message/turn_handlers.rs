@@ -1162,6 +1162,7 @@ fn task_definition_event_belongs_to_creation_turn(payload: &TaskEventPayload) ->
             | TaskEventPayload::TaskPaused { .. }
             | TaskEventPayload::TaskResumed { .. }
             | TaskEventPayload::TaskDetached { .. }
+            | TaskEventPayload::TaskBlocked { .. }
             | TaskEventPayload::TaskCancelled { .. }
     )
 }
@@ -1171,6 +1172,7 @@ fn task_terminal_event_without_run_id(payload: &TaskEventPayload) -> bool {
         payload,
         TaskEventPayload::TaskCompleted { .. }
             | TaskEventPayload::TaskFailed { .. }
+            | TaskEventPayload::TaskBlocked { .. }
             | TaskEventPayload::TaskCancelled { .. }
     )
 }

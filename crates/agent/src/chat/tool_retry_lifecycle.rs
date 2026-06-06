@@ -142,10 +142,6 @@ fn protocol_loop_action(action: pioneer_tools::ToolLoopBudgetAction) -> ToolLoop
         pioneer_tools::ToolLoopBudgetAction::ContinueInNextWindow => {
             ToolLoopBudgetAction::ContinueInNextWindow
         }
-        pioneer_tools::ToolLoopBudgetAction::RequestFinalNoToolsRound => {
-            ToolLoopBudgetAction::RequestFinalNoToolsRound
-        }
-        pioneer_tools::ToolLoopBudgetAction::FailTurn => ToolLoopBudgetAction::FailTurn,
     }
 }
 

@@ -102,6 +102,7 @@
         "checkpointed",
         "continued",
         "completed",
+        "interrupted",
         "blocked",
         "failed"
       ]

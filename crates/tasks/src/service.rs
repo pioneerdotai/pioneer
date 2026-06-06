@@ -2861,6 +2861,12 @@ impl TaskService {
             )
             .chain(
                 self.store
+                    .list_task_runs_by_status(TaskRunStatus::Blocked, 1024)
+                    .await?
+                    .into_iter(),
+            )
+            .chain(
+                self.store
                     .list_task_runs_by_status(TaskRunStatus::Cancelled, 1024)
                     .await?
                     .into_iter(),
@@ -2980,11 +2986,13 @@ impl TaskService {
 
         let mut completed = Vec::new();
         let mut failed = Vec::new();
+        let mut blocked = Vec::new();
         let mut cancelled = Vec::new();
         let mut review_required = Vec::new();
         let mut pending = Vec::new();
         let mut total_count = 0u32;
         let mut terminal_count = 0u32;
+        let mut blocked_count = 0u32;
         let mut review_required_count = 0u32;
         let mut pending_count = 0u32;
 
@@ -3021,6 +3029,11 @@ impl TaskService {
                     terminal_count = terminal_count.saturating_add(1);
                     failed.push(item);
                 }
+                WaitItemState::Blocked => {
+                    terminal_count = terminal_count.saturating_add(1);
+                    blocked_count = blocked_count.saturating_add(1);
+                    blocked.push(item);
+                }
                 WaitItemState::Cancelled => {
                     terminal_count = terminal_count.saturating_add(1);
                     cancelled.push(item);
@@ -3051,6 +3064,7 @@ impl TaskService {
         Ok(TaskWaitResponse {
             completed,
             failed,
+            blocked,
             cancelled,
             review_required,
             pending,
@@ -3060,6 +3074,7 @@ impl TaskService {
             terminal_count,
             pending_count,
             review_required_count,
+            blocked_count,
             non_waitable_count: 0,
             mode: params.mode,
         })
@@ -4460,6 +4475,7 @@ fn empty_wait_response(mode: TaskWaitMode) -> TaskWaitResponse {
     TaskWaitResponse {
         completed: Vec::new(),
         failed: Vec::new(),
+        blocked: Vec::new(),
         cancelled: Vec::new(),
         review_required: Vec::new(),
         pending: Vec::new(),
@@ -4469,6 +4485,7 @@ fn empty_wait_response(mode: TaskWaitMode) -> TaskWaitResponse {
         terminal_count: 0,
         pending_count: 0,
         review_required_count: 0,
+        blocked_count: 0,
         non_waitable_count: 0,
         mode,
     }
@@ -4482,6 +4499,7 @@ fn usize_to_u32(value: usize) -> u32 {
 enum WaitItemState {
     Completed,
     Failed,
+    Blocked,
     Cancelled,
     ReviewRequired,
     Pending,
@@ -4492,6 +4510,7 @@ fn wait_item_state(item: &TaskWaitItem) -> WaitItemState {
         match run.status {
             TaskRunStatus::Succeeded => return WaitItemState::Completed,
             TaskRunStatus::Failed | TaskRunStatus::TimedOut => return WaitItemState::Failed,
+            TaskRunStatus::Blocked => return WaitItemState::Blocked,
             TaskRunStatus::Cancelled => return WaitItemState::Cancelled,
             TaskRunStatus::WaitingReview => return WaitItemState::ReviewRequired,
             _ => {}
@@ -4501,6 +4520,7 @@ fn wait_item_state(item: &TaskWaitItem) -> WaitItemState {
     match item.task.status {
         TaskStatus::Completed => WaitItemState::Completed,
         TaskStatus::Failed => WaitItemState::Failed,
+        TaskStatus::Blocked => WaitItemState::Blocked,
         TaskStatus::Cancelled => WaitItemState::Cancelled,
         TaskStatus::WaitingReview => WaitItemState::ReviewRequired,
         _ => WaitItemState::Pending,

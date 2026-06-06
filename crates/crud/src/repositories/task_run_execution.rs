@@ -325,10 +325,11 @@ fn active_model_from_new_execution(
     })
 }
 
-fn terminal_status_values() -> [&'static str; 4] {
+fn terminal_status_values() -> [&'static str; 5] {
     [
         task_run_execution_status_to_db(TaskRunExecutionStatus::Succeeded),
         task_run_execution_status_to_db(TaskRunExecutionStatus::Failed),
+        task_run_execution_status_to_db(TaskRunExecutionStatus::Blocked),
         task_run_execution_status_to_db(TaskRunExecutionStatus::Cancelled),
         task_run_execution_status_to_db(TaskRunExecutionStatus::TimedOut),
     ]

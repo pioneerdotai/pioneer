@@ -106,6 +106,7 @@
         "candidate_created",
         "review_recorded",
         "failed",
+        "blocked",
         "interrupted",
         "cancelled"
       ]

@@ -115,6 +115,7 @@ fn execution_window_terminal_metadata(
         pioneer_protocol::ExecutionWindowStatus::Exhausted => "exhausted",
         pioneer_protocol::ExecutionWindowStatus::Checkpointed => "checkpointed",
         pioneer_protocol::ExecutionWindowStatus::Continued => "continued",
+        pioneer_protocol::ExecutionWindowStatus::Interrupted => "interrupted",
         pioneer_protocol::ExecutionWindowStatus::Blocked => "blocked",
     };
     metadata.insert(
@@ -178,6 +179,7 @@ fn durable_event_thread_id(event: &AgentDurableEvent) -> Option<&str> {
         | AgentDurableEvent::RecoveryAttemptSucceeded { thread_id, .. }
         | AgentDurableEvent::TurnCompleted { thread_id, .. }
         | AgentDurableEvent::TurnFailed { thread_id, .. }
+        | AgentDurableEvent::TurnBlocked { thread_id, .. }
         | AgentDurableEvent::TurnInterrupted { thread_id, .. } => Some(thread_id.as_str()),
         AgentDurableEvent::ItemStarted { notification } => Some(notification.thread_id.as_str()),
         AgentDurableEvent::ItemCompleted { notification } => Some(notification.thread_id.as_str()),
@@ -284,6 +286,16 @@ impl MessageProcessor {
             pioneer_protocol::ExecutionWindowStatus::Failed => {
                 self.crud_store
                     .mark_turn_execution_window_failed(window.id.as_str(), stats)
+                    .await?;
+            }
+            pioneer_protocol::ExecutionWindowStatus::Interrupted => {
+                self.crud_store
+                    .mark_turn_execution_window_interrupted(window.id.as_str(), stats)
+                    .await?;
+            }
+            pioneer_protocol::ExecutionWindowStatus::Blocked => {
+                self.crud_store
+                    .mark_turn_execution_window_blocked(window.id.as_str(), None, stats)
                     .await?;
             }
             _ => {}
@@ -1802,6 +1814,19 @@ impl MessageProcessor {
                     return false;
                 }
             }
+            AgentDurableEvent::TurnBlocked {
+                thread_id,
+                turn_id,
+                reason,
+                recovery,
+            } => {
+                if !self
+                    .mark_turn_blocked_with_recovery(thread_id, turn_id, reason, recovery)
+                    .await
+                {
+                    return false;
+                }
+            }
             AgentDurableEvent::TurnInterrupted {
                 thread_id,
                 turn_id,
@@ -2282,12 +2307,12 @@ impl MessageProcessor {
             }
         };
 
-        let mut should_fail_turn = item_snapshot.is_none();
+        let mut should_mark_turn_failed = item_snapshot.is_none();
         if let Some(item) = item_snapshot {
             if let Some(failed_item) =
                 Self::force_fail_tool_item(item.clone(), outcome.error_message.as_str())
             {
-                should_fail_turn = true;
+                should_mark_turn_failed = true;
                 let completed = pioneer_protocol::ItemCompletedNotification {
                     workspace_id: workspace_id.clone(),
                     thread_id: thread_id.clone(),
@@ -2318,14 +2343,15 @@ impl MessageProcessor {
                     }
                 }
             } else if !item.is_tool_item() {
-                should_fail_turn = true;
+                should_mark_turn_failed = true;
             }
         }
 
-        if should_fail_turn {
+        if should_mark_turn_failed {
             let status_label = match outcome.status {
                 pioneer_protocol::RecoveryJobStatus::Exhausted => "exhausted",
                 pioneer_protocol::RecoveryJobStatus::Failed => "failed",
+                pioneer_protocol::RecoveryJobStatus::Blocked => "blocked",
                 pioneer_protocol::RecoveryJobStatus::Pending
                 | pioneer_protocol::RecoveryJobStatus::Active
                 | pioneer_protocol::RecoveryJobStatus::Succeeded
@@ -3055,6 +3081,17 @@ impl MessageProcessor {
         turn_id: String,
         reason: String,
     ) -> bool {
+        self.mark_turn_blocked_with_recovery(thread_id, turn_id, reason, None)
+            .await
+    }
+
+    pub(super) async fn mark_turn_blocked_with_recovery(
+        &self,
+        thread_id: String,
+        turn_id: String,
+        reason: String,
+        recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
+    ) -> bool {
         if let Some((_workspace_id, current_turn)) = self
             .thread_manager
             .turn_get(thread_id.as_str(), turn_id.as_str())
@@ -3065,6 +3102,28 @@ impl MessageProcessor {
             }
             if current_turn.status != TurnStatus::InProgress {
                 return false;
+            }
+        }
+
+        if let Some(recovery) = recovery.as_ref() {
+            match self
+                .recovery_coordinator
+                .is_active_recovery_attempt(turn_id.as_str(), recovery)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => return false,
+                Err(error) => {
+                    warn!(
+                        thread_id,
+                        turn_id,
+                        recovery_job_id = %recovery.job_id,
+                        recovery_attempt_id = %recovery.attempt_id,
+                        error = %format!("{error:#}"),
+                        "failed to verify recovery block context"
+                    );
+                    return false;
+                }
             }
         }
 
@@ -3090,16 +3149,16 @@ impl MessageProcessor {
             }
         };
 
+        let turn_blocked = TurnBlockedNotification {
+            workspace_id: finish_outcome.workspace_id.clone(),
+            thread_id: finish_outcome.thread_id.clone(),
+            turn: finish_outcome.turn.clone(),
+        };
+
         let event_timestamp = now_timestamp_secs();
         if let Err(error) = self
             .crud_store
-            .update_turn_status(
-                thread_id.as_str(),
-                turn_id.as_str(),
-                TurnStatus::Blocked,
-                Some(reason.as_str()),
-                event_timestamp,
-            )
+            .materialize_turn_blocked(turn_blocked.clone(), event_timestamp)
             .await
         {
             self.thread_manager
@@ -3110,15 +3169,88 @@ impl MessageProcessor {
                 thread_id,
                 turn_id,
                 error = %format!("{error:#}"),
-                "failed to persist turn blocked status"
+                "failed to persist turn/blocked event"
             );
             return false;
         }
 
+        if let Err(error) = self
+            .close_latest_active_execution_window_for_terminal_turn(
+                turn_id.as_str(),
+                pioneer_protocol::ExecutionWindowStatus::Blocked,
+                turn_blocked.turn.error.as_deref(),
+            )
+            .await
+        {
+            warn!(
+                thread_id,
+                turn_id,
+                error = %format!("{error:#}"),
+                "failed to close execution window after turn block"
+            );
+        }
+
+        if let Err(error) = self
+            .task_agent_executor
+            .reconcile_child_turn_blocked(
+                thread_id.as_str(),
+                turn_id.as_str(),
+                turn_blocked.turn.error.as_deref().unwrap_or("turn blocked"),
+            )
+            .await
+        {
+            warn!(
+                thread_id,
+                turn_id,
+                error = %format!("{error:#}"),
+                "failed to reconcile blocked child task turn"
+            );
+        }
+
+        if let Err(error) = self
+            .crud_store
+            .delete_turn_llm_context_for_turn(turn_id.as_str())
+            .await
+        {
+            warn!(
+                thread_id,
+                turn_id,
+                error = %format!("{error:#}"),
+                "failed to delete turn_llm_context rows after turn block"
+            );
+        }
+        self.clear_turn_llm_context_state(turn_id.as_str()).await;
+        self.clear_artifact_finalization_state(turn_id.as_str())
+            .await;
+
+        if let Err(error) = self
+            .recovery_coordinator
+            .block_active_recoveries_for_turn(
+                turn_id.as_str(),
+                recovery.as_ref(),
+                turn_blocked.turn.error.as_deref().unwrap_or("turn blocked"),
+                event_timestamp,
+            )
+            .await
+        {
+            warn!(
+                thread_id,
+                turn_id,
+                error = %format!("{error:#}"),
+                "failed to mark active recovery jobs blocked"
+            );
+        }
+
+        self.send_notification_to_connections(
+            events::TURN_BLOCKED,
+            &turn_blocked,
+            finish_outcome.connection_ids,
+        )
+        .await;
         self.notify_parent_timeline_changed_for_child_turn(
-            finish_outcome.thread_id.as_str(),
-            finish_outcome.turn.id.as_str(),
-            Some(finish_outcome.workspace_id.as_str()),
+            turn_blocked.thread_id.as_str(),
+            turn_blocked.turn.id.as_str(),
+            Some(turn_blocked.workspace_id.as_str()),
             TurnTimelineChangedReason::ChildTurnChanged,
         )
         .await;
@@ -3246,7 +3378,7 @@ impl MessageProcessor {
         if let Err(error) = self
             .close_latest_active_execution_window_for_terminal_turn(
                 turn_id.as_str(),
-                pioneer_protocol::ExecutionWindowStatus::Failed,
+                pioneer_protocol::ExecutionWindowStatus::Interrupted,
                 Some(reason.as_str()),
             )
             .await

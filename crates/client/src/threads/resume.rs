@@ -60,6 +60,7 @@ pub enum TurnResumeStatusPlan {
     PollAfter(Duration),
     Complete,
     Fail,
+    Block,
     Reset,
 }
 
@@ -694,7 +695,7 @@ pub fn plan_turn_resume_after_status(status: TurnStatus) -> TurnResumeStatusPlan
         }
         TurnStatus::Completed => TurnResumeStatusPlan::Complete,
         TurnStatus::Failed | TurnStatus::Interrupted => TurnResumeStatusPlan::Fail,
-        TurnStatus::Blocked => TurnResumeStatusPlan::Reset,
+        TurnStatus::Blocked => TurnResumeStatusPlan::Block,
     }
 }
 
@@ -704,7 +705,8 @@ pub fn turn_resume_terminal_event(thread_id: String, turn: Turn) -> Option<Conve
         TurnStatus::Failed | TurnStatus::Interrupted => {
             Some(ConversationEvent::TurnFailed { thread_id, turn })
         }
-        TurnStatus::InProgress | TurnStatus::Blocked => None,
+        TurnStatus::Blocked => Some(ConversationEvent::TurnBlocked { thread_id, turn }),
+        TurnStatus::InProgress => None,
     }
 }
 
@@ -886,7 +888,7 @@ mod tests {
         );
         assert_eq!(
             plan_turn_resume_after_status(TurnStatus::Blocked),
-            TurnResumeStatusPlan::Reset
+            TurnResumeStatusPlan::Block
         );
     }
 
@@ -909,7 +911,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_event_maps_completed_and_failed_turns_only() {
+    fn terminal_event_maps_terminal_turns() {
         let completed = Turn {
             id: "turn_a".to_owned(),
             status: TurnStatus::Completed,
@@ -938,6 +940,23 @@ mod tests {
             Some(ConversationEvent::TurnFailed { thread_id, turn }) => {
                 assert_eq!(thread_id, "thread_b");
                 assert_eq!(turn.status, TurnStatus::Interrupted);
+            }
+            event => panic!("unexpected event: {event:?}"),
+        }
+
+        let blocked = Turn {
+            id: "turn_blocked".to_owned(),
+            status: TurnStatus::Blocked,
+            turn_kind: TurnKind::Conversation,
+            origin: TurnOrigin::User,
+            error: Some("needs review".to_owned()),
+            prompt_manifest: None,
+        };
+        match turn_resume_terminal_event("thread_blocked".to_owned(), blocked) {
+            Some(ConversationEvent::TurnBlocked { thread_id, turn }) => {
+                assert_eq!(thread_id, "thread_blocked");
+                assert_eq!(turn.status, TurnStatus::Blocked);
+                assert_eq!(turn.error.as_deref(), Some("needs review"));
             }
             event => panic!("unexpected event: {event:?}"),
         }

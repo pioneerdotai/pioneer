@@ -70,6 +70,7 @@ macro_rules! client_system_label {
 pub enum TimelineEntryStatus {
     Running,
     Completed,
+    Blocked,
     Failed,
     Cancelled,
 }
@@ -339,6 +340,17 @@ impl ConversationProjector {
                 ts_unix_ms,
             );
         }
+    }
+
+    pub fn apply_turn_blocked(&mut self, turn: &Turn, ts_unix_ms: i64) {
+        self.upsert_turn(
+            turn.id.as_str(),
+            TurnPhase::Blocked,
+            None,
+            Some(ts_unix_ms),
+            turn.error.clone(),
+        );
+        self.mark_turn_items_terminal(turn.id.as_str(), TimelineEntryStatus::Blocked, ts_unix_ms);
     }
 
     pub fn apply_item_timeout_detected(
@@ -701,8 +713,6 @@ impl ConversationProjector {
         let action_label = tool_loop_budget_action_label(action);
         let level = match action {
             ToolLoopBudgetAction::ContinueInNextWindow => SystemEventLevel::Info,
-            ToolLoopBudgetAction::RequestFinalNoToolsRound => SystemEventLevel::Warning,
-            ToolLoopBudgetAction::FailTurn => SystemEventLevel::Error,
         };
         let message = client_system_label!("timeline.system.tool_loop_budget_exceeded").to_string();
         self.push_system_event_item(
@@ -829,6 +839,7 @@ impl ConversationProjector {
             Some(ts_unix_ms),
             Some(notification.reason.clone()),
         );
+        self.mark_turn_items_terminal(turn_id, TimelineEntryStatus::Blocked, ts_unix_ms);
         self.push_system_event_item(
             turn_id,
             SystemEventLevel::Warning,
@@ -1273,6 +1284,7 @@ fn recovery_job_status_label(status: RecoveryJobStatus) -> &'static str {
         RecoveryJobStatus::Succeeded => "succeeded",
         RecoveryJobStatus::Failed => "failed",
         RecoveryJobStatus::Exhausted => "exhausted",
+        RecoveryJobStatus::Blocked => "blocked",
         RecoveryJobStatus::Cancelled => "cancelled",
     }
 }
@@ -1377,8 +1389,6 @@ fn tool_loop_budget_limit_kind_label(limit_kind: ToolLoopBudgetLimitKind) -> &'s
 fn tool_loop_budget_action_label(action: ToolLoopBudgetAction) -> &'static str {
     match action {
         ToolLoopBudgetAction::ContinueInNextWindow => "continue_in_next_window",
-        ToolLoopBudgetAction::RequestFinalNoToolsRound => "request_final_no_tools_round",
-        ToolLoopBudgetAction::FailTurn => "fail_turn",
     }
 }
 
@@ -1389,6 +1399,7 @@ fn execution_window_status_label(status: ExecutionWindowStatus) -> &'static str 
         ExecutionWindowStatus::Checkpointed => "checkpointed",
         ExecutionWindowStatus::Continued => "continued",
         ExecutionWindowStatus::Completed => "completed",
+        ExecutionWindowStatus::Interrupted => "interrupted",
         ExecutionWindowStatus::Blocked => "blocked",
         ExecutionWindowStatus::Failed => "failed",
     }

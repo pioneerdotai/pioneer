@@ -885,6 +885,7 @@
         "checkpointed",
         "continued",
         "completed",
+        "interrupted",
         "blocked",
         "failed"
       ]
@@ -1028,6 +1029,22 @@
             },
             "params": {
               "$ref": "#/$defs/TurnFailedNotification"
+            }
+          },
+          "required": [
+            "kind",
+            "params"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "turn_blocked"
+            },
+            "params": {
+              "$ref": "#/$defs/TurnBlockedNotification"
             }
           },
           "required": [
@@ -1728,6 +1745,22 @@
           "properties": {
             "kind": {
               "type": "string",
+              "const": "task_run_blocked"
+            },
+            "params": {
+              "$ref": "#/$defs/TaskRunFailedNotification"
+            }
+          },
+          "required": [
+            "kind",
+            "params"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
               "const": "task_run_cancelled"
             },
             "params": {
@@ -1761,6 +1794,22 @@
             "kind": {
               "type": "string",
               "const": "task_failed"
+            },
+            "params": {
+              "$ref": "#/$defs/TaskFailedNotification"
+            }
+          },
+          "required": [
+            "kind",
+            "params"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "task_blocked"
             },
             "params": {
               "$ref": "#/$defs/TaskFailedNotification"
@@ -3905,6 +3954,7 @@
         "succeeded",
         "failed",
         "exhausted",
+        "blocked",
         "cancelled"
       ]
     },
@@ -6075,6 +6125,7 @@
         "waiting_review",
         "succeeded",
         "failed",
+        "blocked",
         "cancelled",
         "timed_out"
       ]
@@ -6128,6 +6179,7 @@
         "waiting_review",
         "completed",
         "failed",
+        "blocked",
         "cancelled"
       ]
     },
@@ -7167,9 +7219,7 @@
     "ToolLoopBudgetAction": {
       "type": "string",
       "enum": [
-        "continue_in_next_window",
-        "request_final_no_tools_round",
-        "fail_turn"
+        "continue_in_next_window"
       ]
     },
     "ToolLoopBudgetLimitKind": {
@@ -7811,6 +7861,25 @@
       "required": [
         "id",
         "status"
+      ]
+    },
+    "TurnBlockedNotification": {
+      "type": "object",
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        },
+        "turn": {
+          "$ref": "#/$defs/Turn"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "thread_id",
+        "turn"
       ]
     },
     "TurnCompletedNotification": {

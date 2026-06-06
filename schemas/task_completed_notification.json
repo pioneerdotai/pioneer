@@ -593,6 +593,7 @@
         "waiting_review",
         "completed",
         "failed",
+        "blocked",
         "cancelled"
       ]
     },

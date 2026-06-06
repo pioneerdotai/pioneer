@@ -886,6 +886,7 @@ pub enum ExecutionWindowStatus {
     Checkpointed,
     Continued,
     Completed,
+    Interrupted,
     Blocked,
     Failed,
 }
@@ -1618,6 +1619,7 @@ pub enum RecoveryJobStatus {
     Succeeded,
     Failed,
     Exhausted,
+    Blocked,
     Cancelled,
 }
 
@@ -2178,8 +2180,6 @@ pub enum ToolLoopBudgetLimitKind {
 #[serde(rename_all = "snake_case")]
 pub enum ToolLoopBudgetAction {
     ContinueInNextWindow,
-    RequestFinalNoToolsRound,
-    FailTurn,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
@@ -2659,6 +2659,13 @@ pub struct TurnFailedNotification {
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnBlockedNotification {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub turn: Turn,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 pub struct ItemStartedNotification {
     pub workspace_id: String,
     pub thread_id: String,
@@ -2965,6 +2972,7 @@ mod tests {
             (ExecutionWindowStatus::Checkpointed, "checkpointed"),
             (ExecutionWindowStatus::Continued, "continued"),
             (ExecutionWindowStatus::Completed, "completed"),
+            (ExecutionWindowStatus::Interrupted, "interrupted"),
             (ExecutionWindowStatus::Blocked, "blocked"),
             (ExecutionWindowStatus::Failed, "failed"),
         ];
@@ -3018,17 +3026,7 @@ mod tests {
 
     #[test]
     fn tool_loop_budget_action_includes_continuation_wire_value() {
-        let cases = [
-            (
-                ToolLoopBudgetAction::ContinueInNextWindow,
-                "continue_in_next_window",
-            ),
-            (
-                ToolLoopBudgetAction::RequestFinalNoToolsRound,
-                "request_final_no_tools_round",
-            ),
-            (ToolLoopBudgetAction::FailTurn, "fail_turn"),
-        ];
+        let cases = [(ToolLoopBudgetAction::ContinueInNextWindow, "continue_in_next_window")];
 
         for (value, expected) in cases {
             let encoded = serde_json::to_value(value).expect("action should serialize");

@@ -3,6 +3,19 @@
   "title": "TaskWaitResponse",
   "type": "object",
   "properties": {
+    "blocked": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/TaskWaitItem"
+      }
+    },
+    "blockedCount": {
+      "type": "integer",
+      "format": "uint32",
+      "default": 0,
+      "minimum": 0
+    },
     "cancelled": {
       "type": "array",
       "default": [],
@@ -940,6 +953,7 @@
         "waiting_review",
         "succeeded",
         "failed",
+        "blocked",
         "cancelled",
         "timed_out"
       ]
@@ -955,6 +969,7 @@
         "waiting_review",
         "completed",
         "failed",
+        "blocked",
         "cancelled"
       ]
     },

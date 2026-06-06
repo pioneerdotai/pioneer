@@ -174,6 +174,24 @@ impl TaskProjector {
                 handle_projection_outcome("run_failed", run_id, &outcome)?;
                 Ok(())
             }),
+            TaskEventPayload::RunBlocked {
+                task_id: _,
+                run_id,
+                error,
+                blocked_at,
+            } => project_future(async move {
+                let blocked_at = unix_to_datetime(*blocked_at);
+                let outcome = task_run::update_run_error(
+                    db,
+                    run_id,
+                    TaskRunStatus::Blocked,
+                    error.as_ref(),
+                    blocked_at,
+                )
+                .await?;
+                handle_projection_outcome("run_blocked", run_id, &outcome)?;
+                Ok(())
+            }),
             TaskEventPayload::RunRetryScheduled { retry_run, .. } => project_future(async move {
                 task_run::upsert_run(db, retry_run).await?;
                 let outcome = task::update_task_status(
@@ -256,6 +274,24 @@ impl TaskProjector {
                 )
                 .await?;
                 handle_projection_outcome("task_failed", task_id, &outcome)?;
+                Ok(())
+            }),
+            TaskEventPayload::TaskBlocked {
+                task_id,
+                error,
+                blocked_at,
+            } => project_future(async move {
+                let blocked_at = unix_to_datetime(*blocked_at);
+                let outcome = task::update_task_error(
+                    db,
+                    task_id,
+                    TaskStatus::Blocked,
+                    error.as_ref(),
+                    blocked_at,
+                    Some(blocked_at),
+                )
+                .await?;
+                handle_projection_outcome("task_blocked", task_id, &outcome)?;
                 Ok(())
             }),
             TaskEventPayload::TaskCancelled {
@@ -415,7 +451,8 @@ impl TaskProjector {
             }
             TaskEventPayload::TaskRunTurnStarted { task_run_turn }
             | TaskEventPayload::TaskRunTurnCompleted { task_run_turn }
-            | TaskEventPayload::TaskRunTurnFailed { task_run_turn, .. } => {
+            | TaskEventPayload::TaskRunTurnFailed { task_run_turn, .. }
+            | TaskEventPayload::TaskRunTurnBlocked { task_run_turn, .. } => {
                 project_future(async move {
                     task_run_turn::upsert_turn(
                         db,

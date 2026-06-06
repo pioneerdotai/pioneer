@@ -161,6 +161,16 @@ impl MessageProcessor {
                     .await;
                 }
             }
+            TaskEventPayload::RunBlocked { run_id, .. } => {
+                if let Some(run) = task_response.runs.into_iter().find(|run| run.id == run_id) {
+                    self.send_notification_to_workspace_connections(
+                        workspace_id.as_str(),
+                        events::TASK_RUN_BLOCKED,
+                        &pioneer_protocol::TaskRunFailedNotification { context, run },
+                    )
+                    .await;
+                }
+            }
             TaskEventPayload::RunCancelled { run_id, .. } => {
                 if let Some(run) = task_response.runs.into_iter().find(|run| run.id == run_id) {
                     self.send_notification_to_workspace_connections(
@@ -186,6 +196,17 @@ impl MessageProcessor {
                 self.send_notification_to_workspace_connections(
                     workspace_id.as_str(),
                     events::TASK_FAILED,
+                    &pioneer_protocol::TaskFailedNotification {
+                        context,
+                        task: task_response.task,
+                    },
+                )
+                .await;
+            }
+            TaskEventPayload::TaskBlocked { .. } => {
+                self.send_notification_to_workspace_connections(
+                    workspace_id.as_str(),
+                    events::TASK_BLOCKED,
                     &pioneer_protocol::TaskFailedNotification {
                         context,
                         task: task_response.task,
@@ -429,6 +450,7 @@ impl MessageProcessor {
             | TaskEventPayload::TaskRunTurnStarted { .. }
             | TaskEventPayload::TaskRunTurnCompleted { .. }
             | TaskEventPayload::TaskRunTurnFailed { .. }
+            | TaskEventPayload::TaskRunTurnBlocked { .. }
             | TaskEventPayload::TaskResultCandidateCreated { .. }
             | TaskEventPayload::TaskResultReviewEventRecorded { .. }
             | TaskEventPayload::TaskResultCandidateAccepted { .. }
@@ -841,7 +863,9 @@ fn should_refresh_parent_task_anchor(
             reason,
             TaskRescheduleReason::UserRequested | TaskRescheduleReason::MissedFireSkipped
         ),
-        TaskEventPayload::TaskCompleted { .. } | TaskEventPayload::TaskFailed { .. } => response
+        TaskEventPayload::TaskCompleted { .. }
+        | TaskEventPayload::TaskFailed { .. }
+        | TaskEventPayload::TaskBlocked { .. } => response
             .runs
             .last()
             .map(|run| task_run_uses_creation_anchor(response, run.id.as_str()))

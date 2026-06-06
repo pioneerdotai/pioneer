@@ -1296,6 +1296,7 @@
         "waiting_review",
         "succeeded",
         "failed",
+        "blocked",
         "cancelled",
         "timed_out"
       ]
@@ -1334,6 +1335,7 @@
         "waiting_review",
         "completed",
         "failed",
+        "blocked",
         "cancelled"
       ]
     },

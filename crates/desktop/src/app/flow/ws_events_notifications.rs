@@ -15,8 +15,8 @@ use pioneer_client::notifications::router::{
     reduce_skills_changed_notification, reduce_thread_agents_doc_changed_notification,
     reduce_thread_artifacts_changed_notification, reduce_thread_closed_notification,
     reduce_thread_started_notification, reduce_thread_tree_changed_notification,
-    reduce_thread_updated_notification, reduce_turn_completed_notification,
-    reduce_turn_execution_window_blocked_notification,
+    reduce_thread_updated_notification, reduce_turn_blocked_notification,
+    reduce_turn_completed_notification, reduce_turn_execution_window_blocked_notification,
     reduce_turn_execution_window_checkpointed_notification,
     reduce_turn_execution_window_continued_notification,
     reduce_turn_execution_window_exhausted_notification,
@@ -49,6 +49,9 @@ impl PioneerDesktop {
             }
             GatewayNotification::TurnFailed(notification) => {
                 self.apply_turn_failed_notification(notification);
+            }
+            GatewayNotification::TurnBlocked(notification) => {
+                self.apply_turn_blocked_notification(notification);
             }
             GatewayNotification::ItemStarted(notification) => {
                 let reduction = reduce_item_started_notification(notification);
@@ -216,9 +219,11 @@ impl PioneerDesktop {
             | GatewayNotification::TaskProgress(_)
             | GatewayNotification::TaskRunCompleted(_)
             | GatewayNotification::TaskRunFailed(_)
+            | GatewayNotification::TaskRunBlocked(_)
             | GatewayNotification::TaskRunCancelled(_)
             | GatewayNotification::TaskCompleted(_)
             | GatewayNotification::TaskFailed(_)
+            | GatewayNotification::TaskBlocked(_)
             | GatewayNotification::TaskCancelled(_)
             | GatewayNotification::TaskDetached(_)
             | GatewayNotification::TaskUpdated(_)
@@ -327,6 +332,14 @@ impl PioneerDesktop {
         notification: pioneer_protocol::TurnFailedNotification,
     ) {
         let reduction = reduce_turn_failed_notification(notification);
+        self.apply_turn_lifecycle_reduction(reduction, None);
+    }
+
+    fn apply_turn_blocked_notification(
+        &mut self,
+        notification: pioneer_protocol::TurnBlockedNotification,
+    ) {
+        let reduction = reduce_turn_blocked_notification(notification);
         self.apply_turn_lifecycle_reduction(reduction, None);
     }
 

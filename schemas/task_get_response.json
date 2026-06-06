@@ -1596,6 +1596,7 @@
         "waiting_review",
         "succeeded",
         "failed",
+        "blocked",
         "cancelled",
         "timed_out"
       ]
@@ -1752,6 +1753,7 @@
         "candidate_created",
         "review_recorded",
         "failed",
+        "blocked",
         "interrupted",
         "cancelled"
       ]
@@ -1790,6 +1792,7 @@
         "waiting_review",
         "completed",
         "failed",
+        "blocked",
         "cancelled"
       ]
     },

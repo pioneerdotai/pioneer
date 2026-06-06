@@ -22,11 +22,13 @@ impl TaskNotificationMapper {
             TaskEventPayload::Progress { .. } => events::TASK_PROGRESS,
             TaskEventPayload::RunCompleted { .. } => events::TASK_RUN_COMPLETED,
             TaskEventPayload::RunFailed { .. } => events::TASK_RUN_FAILED,
+            TaskEventPayload::RunBlocked { .. } => events::TASK_RUN_BLOCKED,
             TaskEventPayload::RunRetryScheduled { .. } => events::TASK_RUN_RETRY_SCHEDULED,
             TaskEventPayload::RunRetryExhausted { .. } => events::TASK_RUN_RETRY_EXHAUSTED,
             TaskEventPayload::RunCancelled { .. } => events::TASK_RUN_CANCELLED,
             TaskEventPayload::TaskCompleted { .. } => events::TASK_COMPLETED,
             TaskEventPayload::TaskFailed { .. } => events::TASK_FAILED,
+            TaskEventPayload::TaskBlocked { .. } => events::TASK_BLOCKED,
             TaskEventPayload::TaskCancelled { .. } => events::TASK_CANCELLED,
             TaskEventPayload::TaskDetached { .. } => events::TASK_DETACHED,
             TaskEventPayload::TaskUpdated { .. } => events::TASK_UPDATED,
@@ -40,6 +42,7 @@ impl TaskNotificationMapper {
             TaskEventPayload::TaskRunTurnStarted { .. } => events::TASK_RUN_TURN_STARTED,
             TaskEventPayload::TaskRunTurnCompleted { .. } => events::TASK_RUN_TURN_COMPLETED,
             TaskEventPayload::TaskRunTurnFailed { .. } => events::TASK_RUN_TURN_FAILED,
+            TaskEventPayload::TaskRunTurnBlocked { .. } => events::TASK_RUN_TURN_BLOCKED,
             TaskEventPayload::TaskResultCandidateCreated { .. } => {
                 events::TASK_RESULT_CANDIDATE_CREATED
             }

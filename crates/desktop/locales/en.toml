@@ -965,6 +965,7 @@ results_count = "%{count} results"
 
 [timeline.file_change]
 cancelled = "Cancelled"
+blocked = "Blocked"
 failed = "Changes not applied"
 running = "Applying changes"
 completed = "Files changed"
@@ -977,6 +978,7 @@ output = "Output"
 
 [timeline.download]
 cancelled = "Cancelled"
+blocked = "Blocked"
 failed = "Download failed"
 running = "Downloading file"
 completed = "File downloaded"

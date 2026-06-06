@@ -2911,8 +2911,10 @@ fn task_wait_tool_output(
         "terminalCount": response.terminal_count,
         "pendingCount": response.pending_count,
         "reviewRequiredCount": response.review_required_count,
+        "blockedCount": response.blocked_count,
         "completed": response.completed.iter().map(wait_item_output).collect::<Vec<_>>(),
         "failed": response.failed.iter().map(wait_item_output).collect::<Vec<_>>(),
+        "blocked": response.blocked.iter().map(wait_item_output).collect::<Vec<_>>(),
         "cancelled": response.cancelled.iter().map(wait_item_output).collect::<Vec<_>>(),
         "reviewRequired": response.review_required.iter().map(review_required_item_output).collect::<Vec<_>>(),
         "pending": response.pending.iter().map(wait_item_output).collect::<Vec<_>>(),
@@ -3677,6 +3679,7 @@ mod tests {
         pioneer_protocol::TaskWaitResponse {
             completed: Vec::new(),
             failed: Vec::new(),
+            blocked: Vec::new(),
             cancelled: Vec::new(),
             review_required: vec![pioneer_protocol::TaskWaitReviewItem {
                 item: pioneer_protocol::TaskWaitItem {
@@ -3701,6 +3704,7 @@ mod tests {
             terminal_count: 0,
             pending_count: 0,
             review_required_count: 1,
+            blocked_count: 0,
             non_waitable_count: 0,
             mode: TaskWaitMode::AllTerminalOrReviewRequired,
         }

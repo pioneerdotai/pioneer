@@ -75,6 +75,7 @@
         "succeeded",
         "failed",
         "exhausted",
+        "blocked",
         "cancelled"
       ]
     },

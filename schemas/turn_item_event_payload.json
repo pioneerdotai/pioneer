@@ -1088,6 +1088,7 @@
         "checkpointed",
         "continued",
         "completed",
+        "interrupted",
         "blocked",
         "failed"
       ]
@@ -1483,6 +1484,7 @@
         "succeeded",
         "failed",
         "exhausted",
+        "blocked",
         "cancelled"
       ]
     },
@@ -1658,6 +1660,7 @@
         "waiting_review",
         "completed",
         "failed",
+        "blocked",
         "cancelled"
       ]
     },
@@ -1872,9 +1875,7 @@
     "ToolLoopBudgetAction": {
       "type": "string",
       "enum": [
-        "continue_in_next_window",
-        "request_final_no_tools_round",
-        "fail_turn"
+        "continue_in_next_window"
       ]
     },
     "ToolLoopBudgetLimitKind": {

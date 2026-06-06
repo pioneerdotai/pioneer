@@ -123,6 +123,13 @@ pub enum AgentDurableEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         recovery: Option<RecoveryAttemptContext>,
     },
+    TurnBlocked {
+        thread_id: String,
+        turn_id: String,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recovery: Option<RecoveryAttemptContext>,
+    },
     TurnInterrupted {
         thread_id: String,
         turn_id: String,
@@ -238,6 +245,7 @@ impl AgentDurableEvent {
             | Self::RecoveryAttemptSucceeded { turn_id, .. }
             | Self::TurnCompleted { turn_id, .. }
             | Self::TurnFailed { turn_id, .. }
+            | Self::TurnBlocked { turn_id, .. }
             | Self::TurnInterrupted { turn_id, .. } => DurableEventCausalityKey::Turn {
                 turn_id: turn_id.clone(),
             },
@@ -287,6 +295,7 @@ impl AgentDurableEvent {
         match self {
             Self::TurnCompleted { .. }
             | Self::TurnFailed { .. }
+            | Self::TurnBlocked { .. }
             | Self::TurnInterrupted { .. }
             | Self::ItemCompleted { .. }
             | Self::ItemToolRetryExhausted { .. } => true,
@@ -445,11 +454,13 @@ impl TaskEventPayload {
             | Self::RunStarted { .. }
             | Self::RunCompleted { .. }
             | Self::RunFailed { .. }
+            | Self::RunBlocked { .. }
             | Self::RunRetryScheduled { .. }
             | Self::RunRetryExhausted { .. }
             | Self::RunCancelled { .. }
             | Self::TaskCompleted { .. }
             | Self::TaskFailed { .. }
+            | Self::TaskBlocked { .. }
             | Self::TaskCancelled { .. }
             | Self::TaskDetached { .. }
             | Self::TaskUpdated { .. }
@@ -463,6 +474,7 @@ impl TaskEventPayload {
             | Self::TaskRunTurnStarted { .. }
             | Self::TaskRunTurnCompleted { .. }
             | Self::TaskRunTurnFailed { .. }
+            | Self::TaskRunTurnBlocked { .. }
             | Self::TaskResultCandidateCreated { .. }
             | Self::TaskResultReviewEventRecorded { .. }
             | Self::TaskResultCandidateAccepted { .. }
@@ -489,10 +501,12 @@ impl TaskEventPayload {
             self,
             Self::RunCompleted { .. }
                 | Self::RunFailed { .. }
+                | Self::RunBlocked { .. }
                 | Self::RunRetryExhausted { .. }
                 | Self::RunCancelled { .. }
                 | Self::TaskCompleted { .. }
                 | Self::TaskFailed { .. }
+                | Self::TaskBlocked { .. }
                 | Self::TaskCancelled { .. }
                 | Self::DepthLimitExceeded { .. }
                 | Self::DeliveryDelivered { .. }

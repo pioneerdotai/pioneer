@@ -419,6 +419,12 @@ pub enum ThreadHistoryEventPayload {
         thread_id: String,
         turn: Turn,
     },
+    #[serde(rename_all = "camelCase")]
+    TurnBlocked {
+        workspace_id: String,
+        thread_id: String,
+        turn: Turn,
+    },
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]

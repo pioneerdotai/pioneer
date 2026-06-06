@@ -98,6 +98,7 @@ pub struct AgentPostTurnHookDispatchPolicy {
     pub on_terminal_failure: bool,
     pub on_provider_failure: bool,
     pub on_interrupted: bool,
+    pub on_blocked: bool,
 }
 
 impl Default for AgentPostTurnHookDispatchPolicy {
@@ -107,6 +108,7 @@ impl Default for AgentPostTurnHookDispatchPolicy {
             on_terminal_failure: false,
             on_provider_failure: false,
             on_interrupted: false,
+            on_blocked: false,
         }
     }
 }
@@ -119,6 +121,7 @@ impl AgentPostTurnHookDispatchPolicy {
     pub fn include_failures(mut self) -> Self {
         self.on_terminal_failure = true;
         self.on_provider_failure = true;
+        self.on_blocked = true;
         self
     }
 
@@ -128,6 +131,7 @@ impl AgentPostTurnHookDispatchPolicy {
             TurnPostTurnStatus::Failed => self.on_terminal_failure,
             TurnPostTurnStatus::ProviderFailure => self.on_provider_failure,
             TurnPostTurnStatus::Interrupted => self.on_interrupted,
+            TurnPostTurnStatus::Blocked => self.on_blocked,
         }
     }
 }
@@ -189,6 +193,7 @@ impl AgentTurnPostTurnSummary {
             TurnPostTurnStatus::Failed
                 | TurnPostTurnStatus::ProviderFailure
                 | TurnPostTurnStatus::Interrupted
+                | TurnPostTurnStatus::Blocked
         ));
         Self {
             status,

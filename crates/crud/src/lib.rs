@@ -730,6 +730,19 @@ impl CrudStore {
             .await
     }
 
+    pub async fn mark_turn_execution_window_interrupted(
+        &self,
+        window_id: &str,
+        stats: TurnExecutionWindowStatsRecord,
+    ) -> Result<TurnExecutionWindowRecord> {
+        turn_execution_window::mark_turn_execution_window_interrupted(
+            &self.connection,
+            window_id,
+            stats,
+        )
+        .await
+    }
+
     pub async fn mark_turn_execution_window_blocked(
         &self,
         window_id: &str,
@@ -3129,6 +3142,18 @@ impl CrudStore {
         .await
     }
 
+    pub async fn materialize_turn_blocked(
+        &self,
+        notification: pioneer_protocol::TurnBlockedNotification,
+        event_timestamp_secs: i64,
+    ) -> Result<()> {
+        self.materialize_turn_event(
+            TurnEventPayload::TurnBlocked(notification),
+            event_timestamp_secs,
+        )
+        .await
+    }
+
     pub async fn append_task_event(
         &self,
         event: TaskEventPayload,
@@ -4511,14 +4536,7 @@ impl CrudStore {
             if !params.statuses.is_empty() && !params.statuses.contains(&task.status) {
                 continue;
             }
-            if !params.include_completed
-                && matches!(
-                    task.status,
-                    pioneer_protocol::TaskStatus::Completed
-                        | pioneer_protocol::TaskStatus::Failed
-                        | pioneer_protocol::TaskStatus::Cancelled
-                )
-            {
+            if !params.include_completed && task.status.is_terminal() {
                 continue;
             }
             let triggers = task_trigger::list_triggers_by_task(&self.connection, task.id.as_str())
@@ -5034,7 +5052,8 @@ impl CrudStore {
                 }
                 TurnEventPayload::TurnStarted(_)
                 | TurnEventPayload::TurnCompleted(_)
-                | TurnEventPayload::TurnFailed(_) => continue,
+                | TurnEventPayload::TurnFailed(_)
+                | TurnEventPayload::TurnBlocked(_) => continue,
             };
 
             events.push(TurnItemEvent {
@@ -6647,6 +6666,13 @@ impl CrudStore {
                 }
                 TurnEventPayload::TurnFailed(notification) => {
                     ThreadHistoryEventPayload::TurnFailed {
+                        workspace_id: notification.workspace_id,
+                        thread_id: notification.thread_id,
+                        turn: notification.turn,
+                    }
+                }
+                TurnEventPayload::TurnBlocked(notification) => {
+                    ThreadHistoryEventPayload::TurnBlocked {
                         workspace_id: notification.workspace_id,
                         thread_id: notification.thread_id,
                         turn: notification.turn,
@@ -12528,7 +12554,7 @@ mod tests {
                     limit_kind: ToolLoopBudgetLimitKind::AgentRounds,
                     limit: 32,
                     observed: 33,
-                    action: ToolLoopBudgetAction::RequestFinalNoToolsRound,
+                    action: ToolLoopBudgetAction::ContinueInNextWindow,
                     reason: "agent_rounds_exceeded".to_owned(),
                 },
                 timestamp + 4,
@@ -12571,7 +12597,7 @@ mod tests {
         assert!(matches!(
             payloads[3],
             TurnItemEventPayload::TurnToolLoopBudgetExceeded {
-                action: ToolLoopBudgetAction::RequestFinalNoToolsRound,
+                action: ToolLoopBudgetAction::ContinueInNextWindow,
                 ..
             }
         ));

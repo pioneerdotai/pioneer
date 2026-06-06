@@ -2954,6 +2954,17 @@ fn test_agent_event_from_durable(event: AgentDurableEvent) -> Option<AgentEvent>
             error,
             recovery,
         }),
+        AgentDurableEvent::TurnBlocked {
+            thread_id,
+            turn_id,
+            reason,
+            recovery,
+        } => Some(AgentEvent::TurnBlocked {
+            thread_id,
+            turn_id,
+            reason,
+            recovery,
+        }),
         AgentDurableEvent::TurnInterrupted {
             thread_id,
             turn_id,
@@ -3008,7 +3019,9 @@ async fn recv_events_until_terminal(
         };
         let terminal = matches!(
             event,
-            AgentEvent::TurnCompleted { .. } | AgentEvent::TurnFailed { .. }
+            AgentEvent::TurnCompleted { .. }
+                | AgentEvent::TurnFailed { .. }
+                | AgentEvent::TurnBlocked { .. }
         );
         observed.push(event);
         if terminal {
@@ -3055,7 +3068,7 @@ async fn recv_events_until_loop_budget_action(
     panic!("loop budget event not received")
 }
 
-async fn recv_durable_events_until_window_blocked(
+async fn recv_durable_events_until_turn_blocked(
     events: &mut tokio::sync::mpsc::Receiver<AgentDurableEvent>,
 ) -> Vec<AgentDurableEvent> {
     let mut observed = Vec::new();
@@ -3066,20 +3079,20 @@ async fn recv_durable_events_until_window_blocked(
             Ok(None) => {
                 panic!("agent durable event channel should stay open")
             }
-            Err(_) => panic!("timed out waiting for execution window blocked event"),
+            Err(_) => panic!("timed out waiting for turn blocked event"),
         };
         assert!(
             !matches!(&event, AgentDurableEvent::TurnFailed { .. }),
             "controlled budget stop must not emit crash-style turn failure: {event:?}"
         );
-        let blocked = matches!(&event, AgentDurableEvent::TurnExecutionWindowBlocked { .. });
+        let blocked = matches!(&event, AgentDurableEvent::TurnBlocked { .. });
         observed.push(event);
         if blocked {
             return observed;
         }
     }
 
-    panic!("execution window blocked event not received")
+    panic!("turn blocked event not received")
 }
 
 fn assert_turn_completed(observed: &[AgentEvent]) {
@@ -3094,6 +3107,13 @@ fn assert_turn_failed(observed: &[AgentEvent], expected_error: &str) {
         panic!("expected terminal turn failure, observed {observed:?}");
     };
     assert_eq!(error, expected_error);
+}
+
+fn assert_turn_blocked(observed: &[AgentEvent], expected_reason: &str) {
+    let Some(AgentEvent::TurnBlocked { reason, .. }) = observed.last() else {
+        panic!("expected terminal turn block, observed {observed:?}");
+    };
+    assert_eq!(reason, expected_reason);
 }
 
 fn completed_agent_message_text(observed: &[AgentEvent]) -> Option<String> {
@@ -4599,7 +4619,7 @@ async fn phase_08_multiple_policy_contributions_merge_deterministically() {
 }
 
 #[tokio::test]
-async fn phase_08_best_effort_policy_hook_failure_does_not_fail_turn() {
+async fn phase_08_best_effort_policy_hook_failure_does_not_mark_turn_failed() {
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
     let provider = Arc::new(CaptureAgentProvider::default());
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
@@ -5740,7 +5760,7 @@ async fn phase_11_repeated_review_observation_does_not_spam_or_complete() {
         "Review the attached child result.",
     )
     .await;
-    assert_turn_failed(
+    assert_turn_blocked(
         &observed,
         "Attached task result review is still required. Call task_accept, task_revise, or task_cancel for each pending review candidate before providing the final answer.",
     );
@@ -8717,7 +8737,8 @@ async fn execution_window_continuation_restarts_same_turn_and_completes_next_win
             | AgentEvent::ProviderFailureDetected { turn_id, .. }
             | AgentEvent::RecoveryAttemptSucceeded { turn_id, .. }
             | AgentEvent::TurnCompleted { turn_id, .. }
-            | AgentEvent::TurnFailed { turn_id, .. } => Some(turn_id.as_str()),
+            | AgentEvent::TurnFailed { turn_id, .. }
+            | AgentEvent::TurnBlocked { turn_id, .. } => Some(turn_id.as_str()),
             AgentEvent::ItemStarted(notification) => Some(notification.turn_id.as_str()),
             AgentEvent::ItemDelta(notification) => Some(notification.turn_id.as_str()),
             AgentEvent::ItemCompleted(notification) => Some(notification.turn_id.as_str()),
@@ -8794,6 +8815,124 @@ async fn execution_window_continuation_restarts_same_turn_and_completes_next_win
 }
 
 #[tokio::test]
+async fn provider_recovery_success_boundary_survives_execution_window_continuation() {
+    let provider = Arc::new(LoopBudgetProvider::new(
+        LoopBudgetProviderMode::TwoToolRoundsThenFinal,
+        1,
+    ));
+    let mut config = test_tool_loop_config();
+    set_execution_window_budget(&mut config, 2, 16);
+    config.retry.max_recoverable_retry_rounds_per_episode = 16;
+    config.retry.max_same_tool_error_retries_per_episode = 16;
+    let manager = loop_budget_manager(provider.clone(), config);
+    let thread_id = "thr_loop_budget_recovery_window";
+    let turn_id = "turn_loop_budget_recovery_window";
+    let recovery_job_id = "recovery_job_window_continuation";
+    let recovery_attempt_id = "recovery_attempt_window_continuation";
+
+    let mut events = start_loop_budget_turn(&manager, thread_id, turn_id).await;
+    let initial_events = recv_events_until_terminal(&mut events).await;
+    assert!(matches!(
+        initial_events.last(),
+        Some(AgentEvent::TurnCompleted { .. })
+    ));
+
+    provider.next_index.store(0, Ordering::SeqCst);
+    provider
+        .requests
+        .lock()
+        .expect("loop budget provider lock poisoned")
+        .clear();
+    while events.try_recv().is_ok() {}
+
+    manager
+        .start_recovery_attempt(
+            thread_id,
+            RecoveryAttemptRequest {
+                recovery_job_id: recovery_job_id.to_owned(),
+                recovery_attempt_id: recovery_attempt_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                item_id: "reasoning_item".to_owned(),
+                item_type: TurnItemType::Reasoning,
+                force_non_stream: false,
+                refresh_provider_auth: false,
+                compact_history: false,
+                continue_generation: true,
+                model_override: None,
+                retained_llm_context: Vec::new(),
+                execution_checkpoint_context: None,
+            },
+        )
+        .await
+        .expect("recovery request should restart completed turn");
+
+    let mut recovery_events = Vec::new();
+    let mut saw_recovery_success = false;
+    let mut saw_recovery_budget_continuation = false;
+    for _ in 0..160 {
+        let event = match timeout(Duration::from_secs(2), events.recv()).await {
+            Ok(Some(event)) => event,
+            Ok(None) => panic!("agent event channel should stay open"),
+            Err(_) => panic!("timed out waiting for recovery continuation terminal event"),
+        };
+        if matches!(
+            event,
+            AgentEvent::RecoveryAttemptSucceeded {
+                ref recovery,
+                ..
+            } if recovery.job_id == recovery_job_id
+                && recovery.attempt_id == recovery_attempt_id
+        ) {
+            saw_recovery_success = true;
+        }
+        if matches!(
+            event,
+            AgentEvent::TurnToolLoopBudgetExceeded(ref notification)
+                if notification.limit_kind == ToolLoopBudgetLimitKind::AgentRounds
+                    && notification.action == ToolLoopBudgetAction::ContinueInNextWindow
+        ) {
+            assert!(
+                saw_recovery_success,
+                "provider recovery should close at the provider boundary before later window continuation"
+            );
+            saw_recovery_budget_continuation = true;
+        }
+        let terminal_after_recovery_continuation = saw_recovery_budget_continuation
+            && matches!(
+                event,
+                AgentEvent::TurnCompleted { .. }
+                    | AgentEvent::TurnFailed { .. }
+                    | AgentEvent::TurnBlocked { .. }
+            );
+        recovery_events.push(event);
+        if terminal_after_recovery_continuation {
+            break;
+        }
+    }
+    assert!(
+        saw_recovery_budget_continuation,
+        "recovery attempt should cross an execution-window boundary"
+    );
+    assert!(
+        saw_recovery_success,
+        "recovery success should be emitted before recovery continuation terminal event"
+    );
+    assert!(
+        matches!(
+            recovery_events.last(),
+            Some(AgentEvent::TurnCompleted { recovery: None, .. })
+        ),
+        "completed turn should not carry recovery after the recovery job was already closed: {recovery_events:#?}"
+    );
+    assert!(
+        !recovery_events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnFailed { .. })),
+        "recovery continuation must not fail the turn"
+    );
+}
+
+#[tokio::test]
 async fn max_windows_cap_blocks_continuation_without_turn_failed() {
     let provider = Arc::new(LoopBudgetProvider::new(
         LoopBudgetProviderMode::ToolWhileAvailableThenFinal,
@@ -8834,7 +8973,7 @@ async fn max_windows_cap_blocks_continuation_without_turn_failed() {
         .await
         .expect("turn should start");
 
-    let observed_events = recv_durable_events_until_window_blocked(&mut durable_events).await;
+    let observed_events = recv_durable_events_until_turn_blocked(&mut durable_events).await;
     let blocked = observed_events
         .iter()
         .find_map(|event| {
@@ -8926,7 +9065,7 @@ async fn total_tool_call_cap_blocks_continuation_without_turn_failed() {
         .await
         .expect("turn should start");
 
-    let observed_events = recv_durable_events_until_window_blocked(&mut durable_events).await;
+    let observed_events = recv_durable_events_until_turn_blocked(&mut durable_events).await;
     let blocked = observed_events
         .iter()
         .find_map(|event| {
@@ -9011,7 +9150,7 @@ async fn consecutive_failed_window_cap_blocks_continuation_without_turn_failed()
         .await
         .expect("turn should start");
 
-    let observed_events = recv_durable_events_until_window_blocked(&mut durable_events).await;
+    let observed_events = recv_durable_events_until_turn_blocked(&mut durable_events).await;
     let blocked = observed_events
         .iter()
         .find_map(|event| {
@@ -9128,7 +9267,7 @@ async fn memory_recall_tools_remain_available_for_budget_continuation() {
 }
 
 #[tokio::test]
-async fn tool_loop_fails_when_provider_requests_tools_after_tools_disabled() {
+async fn provider_tools_after_tools_disabled_requests_continuation_without_turn_failed() {
     let provider = Arc::new(LoopBudgetProvider::new(
         LoopBudgetProviderMode::AlwaysTools,
         1,
@@ -9145,17 +9284,12 @@ async fn tool_loop_fails_when_provider_requests_tools_after_tools_disabled() {
     )
     .await;
 
-    let observed_events = recv_events_until_terminal(&mut events).await;
-    let terminal = observed_events
-        .last()
-        .expect("terminal event should be observed");
-    match terminal {
-        AgentEvent::TurnFailed { error, .. } => {
-            assert!(error.contains("tool_loop_budget_exceeded"));
-            assert!(error.contains("provider_returned_tools_after_tools_disabled"));
-        }
-        other => panic!("turn should fail deterministically: {other:?}"),
-    }
+    let observed_events = recv_events_until_loop_budget_action(
+        &mut events,
+        ToolLoopBudgetLimitKind::ProviderReturnedToolsAfterToolsDisabled,
+        ToolLoopBudgetAction::ContinueInNextWindow,
+    )
+    .await;
     let budget_index = observed_events
         .iter()
         .position(|event| {
@@ -9164,23 +9298,37 @@ async fn tool_loop_fails_when_provider_requests_tools_after_tools_disabled() {
                 AgentEvent::TurnToolLoopBudgetExceeded(notification)
                     if notification.limit_kind
                         == ToolLoopBudgetLimitKind::ProviderReturnedToolsAfterToolsDisabled
-                        && notification.action == ToolLoopBudgetAction::FailTurn
+                        && notification.action == ToolLoopBudgetAction::ContinueInNextWindow
             )
         })
-        .expect("hard loop-budget event should be emitted");
-    let failed_index = observed_events
-        .iter()
-        .position(|event| matches!(event, AgentEvent::TurnFailed { .. }))
-        .expect("turn failed event should be emitted");
-    assert!(budget_index < failed_index);
+        .expect("provider tool-call leak should request continuation");
+    assert!(
+        !observed_events[..=budget_index]
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnFailed { .. })),
+        "provider tools after tools-disabled must not fail the turn"
+    );
 
     let requests = provider.snapshot_requests();
-    assert_eq!(requests.len(), 3);
-    assert!(requests[2].tools.is_none());
+    assert!(
+        requests.len() >= 4,
+        "continuation should schedule another provider request after the no-tools violation"
+    );
+    let no_tools_index = requests
+        .iter()
+        .position(|request| request.tools.is_none())
+        .expect("fixture should enter one no-tools finalization round before continuation");
     assert_eq!(
-        tool_result_message_count(&requests[2]),
+        tool_result_message_count(&requests[no_tools_index]),
         2,
         "only tool-capable retry rounds should execute tools before no-tools violation"
+    );
+    assert!(
+        requests
+            .iter()
+            .skip(no_tools_index + 1)
+            .any(|request| request.tools.is_some()),
+        "next execution window should restore tools after provider tools-disabled violation"
     );
 }
 
@@ -9267,13 +9415,13 @@ async fn task_mutation_failure_preserves_root_cause_when_provider_returns_tools_
     .await;
 
     assert_turn_completed(&observed);
-    assert!(observed.iter().any(|event| matches!(
-        event,
-        AgentEvent::TurnToolLoopBudgetExceeded(notification)
-            if notification.limit_kind
-                == ToolLoopBudgetLimitKind::ProviderReturnedToolsAfterToolsDisabled
-                && notification.action == ToolLoopBudgetAction::FailTurn
-    )));
+    assert!(
+        !observed.iter().any(|event| match event {
+            AgentEvent::TurnFailed { .. } => true,
+            _ => false,
+        }),
+        "deterministic task mutation finalization must not surface a turn failure"
+    );
     let final_text =
         completed_agent_message_text(&observed).expect("final assistant text should be emitted");
     assert!(final_text.contains("Task mutation failed"), "{final_text}");

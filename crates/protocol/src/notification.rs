@@ -23,11 +23,12 @@ use crate::{
     TaskTreeChangedNotification as TaskTreeChangedTaskNotification, TaskUpdatedNotification,
     ThreadAgentsDocChangedNotification, ThreadArtifactsChangedNotification,
     ThreadClosedNotification, ThreadStartedNotification, ThreadTreeChangedNotification,
-    ThreadUpdatedNotification, TurnCompletedNotification, TurnExecutionWindowBlockedNotification,
-    TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
-    TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification,
-    TurnFailedNotification, TurnStartedNotification, TurnTimelineChangedNotification,
-    TurnToolLoopBudgetExceededNotification, WorkspaceChangedNotification,
+    ThreadUpdatedNotification, TurnBlockedNotification, TurnCompletedNotification,
+    TurnExecutionWindowBlockedNotification, TurnExecutionWindowCheckpointedNotification,
+    TurnExecutionWindowContinuedNotification, TurnExecutionWindowExhaustedNotification,
+    TurnExecutionWindowStartedNotification, TurnFailedNotification, TurnStartedNotification,
+    TurnTimelineChangedNotification, TurnToolLoopBudgetExceededNotification,
+    WorkspaceChangedNotification,
 };
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
@@ -60,6 +61,7 @@ pub enum GatewayNotification {
     TurnStarted(TurnStartedNotification),
     TurnCompleted(TurnCompletedNotification),
     TurnFailed(TurnFailedNotification),
+    TurnBlocked(TurnBlockedNotification),
     TurnTimelineChanged(TurnTimelineChangedNotification),
     TurnExecutionWindowStarted(TurnExecutionWindowStartedNotification),
     TurnExecutionWindowExhausted(TurnExecutionWindowExhaustedNotification),
@@ -103,9 +105,11 @@ pub enum GatewayNotification {
     TaskProgress(TaskProgressNotification),
     TaskRunCompleted(TaskRunCompletedNotification),
     TaskRunFailed(TaskRunFailedNotification),
+    TaskRunBlocked(TaskRunFailedNotification),
     TaskRunCancelled(TaskRunFailedNotification),
     TaskCompleted(TaskCompletedNotification),
     TaskFailed(TaskFailedNotification),
+    TaskBlocked(TaskFailedNotification),
     TaskCancelled(TaskCancelledNotification),
     TaskDetached(TaskDetachedNotification),
     TaskUpdated(TaskUpdatedNotification),
@@ -165,6 +169,9 @@ impl GatewayNotification {
             events::TURN_FAILED => serde_json::from_value::<TurnFailedNotification>(params)
                 .ok()
                 .map(Self::TurnFailed),
+            events::TURN_BLOCKED => serde_json::from_value::<TurnBlockedNotification>(params)
+                .ok()
+                .map(Self::TurnBlocked),
             events::TURN_TIMELINE_CHANGED => {
                 serde_json::from_value::<TurnTimelineChangedNotification>(params)
                     .ok()
@@ -400,6 +407,9 @@ impl GatewayNotification {
             events::TASK_RUN_FAILED => serde_json::from_value::<TaskRunFailedNotification>(params)
                 .ok()
                 .map(Self::TaskRunFailed),
+            events::TASK_RUN_BLOCKED => serde_json::from_value::<TaskRunFailedNotification>(params)
+                .ok()
+                .map(Self::TaskRunBlocked),
             events::TASK_RUN_CANCELLED => {
                 serde_json::from_value::<TaskRunFailedNotification>(params)
                     .ok()
@@ -411,6 +421,9 @@ impl GatewayNotification {
             events::TASK_FAILED => serde_json::from_value::<TaskFailedNotification>(params)
                 .ok()
                 .map(Self::TaskFailed),
+            events::TASK_BLOCKED => serde_json::from_value::<TaskFailedNotification>(params)
+                .ok()
+                .map(Self::TaskBlocked),
             events::TASK_CANCELLED => serde_json::from_value::<TaskCancelledNotification>(params)
                 .ok()
                 .map(Self::TaskCancelled),
@@ -957,7 +970,7 @@ mod tests {
                 "limit_kind": "agent_rounds",
                 "limit": 32,
                 "observed": 33,
-                "action": "request_final_no_tools_round",
+                "action": "continue_in_next_window",
                 "reason": "agent_rounds_exceeded"
             }
         }))
@@ -973,7 +986,7 @@ mod tests {
                 );
                 assert_eq!(
                     notification.action,
-                    ToolLoopBudgetAction::RequestFinalNoToolsRound
+                    ToolLoopBudgetAction::ContinueInNextWindow
                 );
                 assert_eq!(notification.observed, 33);
             }

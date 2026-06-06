@@ -69,6 +69,7 @@ impl TurnItemHandler for TaskHandler {
 fn status_for_task(status: TaskStatus) -> TimelineEntryStatus {
     match status {
         TaskStatus::Completed => TimelineEntryStatus::Completed,
+        TaskStatus::Blocked => TimelineEntryStatus::Blocked,
         TaskStatus::Failed => TimelineEntryStatus::Failed,
         TaskStatus::Cancelled => TimelineEntryStatus::Cancelled,
         TaskStatus::Draft

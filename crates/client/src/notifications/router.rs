@@ -12,7 +12,7 @@ use pioneer_protocol::{
     SkillsChangedNotification, Thread, ThreadAgentsDocChangedNotification,
     ThreadArtifactsChangedNotification, ThreadClosedNotification, ThreadStartedNotification,
     ThreadStatus, ThreadTreeChangedNotification, ThreadUpdatedNotification,
-    TurnCompletedNotification, TurnExecutionWindowBlockedNotification,
+    TurnBlockedNotification, TurnCompletedNotification, TurnExecutionWindowBlockedNotification,
     TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
     TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification,
     TurnFailedNotification, TurnStartedNotification, TurnTimelineChangedNotification,
@@ -228,6 +228,29 @@ pub fn reduce_turn_failed_notification(
         queue_thread_list_refresh: false,
         thread_status: Some(ThreadStatus::Idle),
         conversation_event: ConversationEvent::TurnFailed {
+            thread_id,
+            turn: notification.turn,
+        },
+        tick_conversation: false,
+        reset_thread_resume: true,
+        refresh_thread_artifacts: false,
+        sync_composer_model_selection: false,
+    }
+}
+
+pub fn reduce_turn_blocked_notification(
+    notification: TurnBlockedNotification,
+) -> TurnLifecycleReduction {
+    let thread_id = notification.thread_id.clone();
+    let workspace_id = notification.workspace_id.clone();
+
+    TurnLifecycleReduction {
+        thread_id: thread_id.clone(),
+        workspace_id,
+        promote_thread_from_draft: false,
+        queue_thread_list_refresh: false,
+        thread_status: Some(ThreadStatus::Idle),
+        conversation_event: ConversationEvent::TurnBlocked {
             thread_id,
             turn: notification.turn,
         },
@@ -1191,7 +1214,7 @@ mod tests {
                 limit_kind: ToolLoopBudgetLimitKind::ToolCalls,
                 limit: 20,
                 observed: 21,
-                action: ToolLoopBudgetAction::RequestFinalNoToolsRound,
+                action: ToolLoopBudgetAction::ContinueInNextWindow,
                 reason: "too many calls".to_owned(),
             },
         );

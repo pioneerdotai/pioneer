@@ -135,6 +135,10 @@ impl Conversation {
                     self.projector.apply_turn_failed(&turn, ts_unix_ms);
                 }
             }
+            ConversationEvent::TurnBlocked { turn, .. } => {
+                self.pending_completion_turn_id = None;
+                self.projector.apply_turn_blocked(&turn, ts_unix_ms);
+            }
             ConversationEvent::ItemStarted { turn_id, item, .. } => {
                 self.item_handlers.apply_started(
                     &mut self.projector,

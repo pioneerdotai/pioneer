@@ -5,10 +5,11 @@ use pioneer_protocol::{
     ItemRetryAttemptStartedNotification, ItemRetryScheduledNotification, ItemStartedNotification,
     ItemTimeoutDetectedNotification, ItemToolRetryExhaustedNotification,
     ItemToolRetryResolvedNotification, ItemToolRetryScheduledNotification, ItemUpdatedNotification,
-    SandboxMode, Thread, Turn, TurnCompletedNotification, TurnExecutionWindowBlockedNotification,
-    TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
-    TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification,
-    TurnFailedNotification, TurnToolLoopBudgetExceededNotification, UserInput,
+    SandboxMode, Thread, Turn, TurnBlockedNotification, TurnCompletedNotification,
+    TurnExecutionWindowBlockedNotification, TurnExecutionWindowCheckpointedNotification,
+    TurnExecutionWindowContinuedNotification, TurnExecutionWindowExhaustedNotification,
+    TurnExecutionWindowStartedNotification, TurnFailedNotification,
+    TurnToolLoopBudgetExceededNotification, UserInput,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use serde::{Deserialize, Serialize};
@@ -46,6 +47,7 @@ pub enum TurnEventPayload {
     TurnExecutionWindowBlocked(TurnExecutionWindowBlockedNotification),
     TurnCompleted(TurnCompletedNotification),
     TurnFailed(TurnFailedNotification),
+    TurnBlocked(TurnBlockedNotification),
 }
 
 impl TurnEventPayload {
@@ -73,6 +75,7 @@ impl TurnEventPayload {
             Self::TurnExecutionWindowBlocked(_) => events::TURN_EXECUTION_WINDOW_BLOCKED,
             Self::TurnCompleted(_) => events::TURN_COMPLETED,
             Self::TurnFailed(_) => events::TURN_FAILED,
+            Self::TurnBlocked(_) => events::TURN_BLOCKED,
         }
     }
 
@@ -100,6 +103,7 @@ impl TurnEventPayload {
             Self::TurnExecutionWindowBlocked(payload) => payload.thread_id.as_str(),
             Self::TurnCompleted(payload) => payload.thread_id.as_str(),
             Self::TurnFailed(payload) => payload.thread_id.as_str(),
+            Self::TurnBlocked(payload) => payload.thread_id.as_str(),
         }
     }
 
@@ -127,6 +131,7 @@ impl TurnEventPayload {
             Self::TurnExecutionWindowBlocked(payload) => payload.turn_id.as_str(),
             Self::TurnCompleted(payload) => payload.turn.id.as_str(),
             Self::TurnFailed(payload) => payload.turn.id.as_str(),
+            Self::TurnBlocked(payload) => payload.turn.id.as_str(),
         }
     }
 }

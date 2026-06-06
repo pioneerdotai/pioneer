@@ -320,6 +320,7 @@
         "checkpointed",
         "continued",
         "completed",
+        "interrupted",
         "blocked",
         "failed"
       ]
@@ -921,6 +922,7 @@
         "succeeded",
         "failed",
         "exhausted",
+        "blocked",
         "cancelled"
       ]
     },
@@ -1096,6 +1098,7 @@
         "waiting_review",
         "completed",
         "failed",
+        "blocked",
         "cancelled"
       ]
     },
@@ -2038,6 +2041,30 @@
             "threadId",
             "turn"
           ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "threadId": {
+              "type": "string"
+            },
+            "turn": {
+              "$ref": "#/$defs/Turn"
+            },
+            "type": {
+              "type": "string",
+              "const": "turnBlocked"
+            },
+            "workspaceId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "workspaceId",
+            "threadId",
+            "turn"
+          ]
         }
       ]
     },
@@ -2240,9 +2267,7 @@
     "ToolLoopBudgetAction": {
       "type": "string",
       "enum": [
-        "continue_in_next_window",
-        "request_final_no_tools_round",
-        "fail_turn"
+        "continue_in_next_window"
       ]
     },
     "ToolLoopBudgetLimitKind": {

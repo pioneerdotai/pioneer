@@ -965,6 +965,7 @@ results_count = "%{count} 件の結果"
 
 [timeline.file_change]
 cancelled = "キャンセル済み"
+blocked = "ブロック済み"
 failed = "変更は適用されませんでした"
 running = "変更を適用中"
 completed = "ファイルを変更しました"
@@ -977,6 +978,7 @@ output = "出力"
 
 [timeline.download]
 cancelled = "キャンセル済み"
+blocked = "ブロック済み"
 failed = "ダウンロードに失敗しました"
 running = "ファイルをダウンロード中"
 completed = "ファイルをダウンロードしました"

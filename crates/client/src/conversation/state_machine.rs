@@ -249,6 +249,13 @@ impl TurnStateMachine {
                     }
                 }
             }
+            ConversationEvent::TurnBlocked { turn, .. } => {
+                if self.matches_turn(turn.id.as_str()) || self.in_flight_turn_id().is_none() {
+                    self.state = TurnFlowState::Blocked {
+                        turn_id: turn.id.clone(),
+                    };
+                }
+            }
             ConversationEvent::ItemStarted { turn_id, .. }
             | ConversationEvent::ItemDelta { turn_id, .. }
             | ConversationEvent::ItemTimeoutDetected { turn_id, .. }

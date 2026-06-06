@@ -388,6 +388,7 @@ pub fn is_task_timeline_agent_message(item_view: &ItemView) -> bool {
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub enum TimelineFinalStatusKind {
     Cancelled,
+    Blocked,
     Failed,
     Running,
     Completed,
@@ -397,6 +398,7 @@ impl TimelineFinalStatusKind {
     pub fn label(self) -> &'static str {
         match self {
             Self::Cancelled => "Cancelled",
+            Self::Blocked => "Blocked",
             Self::Failed => "Failed",
             Self::Running => "Running",
             Self::Completed => "Completed",
@@ -450,6 +452,9 @@ pub fn final_file_change_status(
         TimelineEntryStatus::Cancelled => {
             TimelineFinalStatus::new(TimelineFinalStatusKind::Cancelled, false)
         }
+        TimelineEntryStatus::Blocked => {
+            TimelineFinalStatus::new(TimelineFinalStatusKind::Blocked, false)
+        }
         TimelineEntryStatus::Failed => {
             TimelineFinalStatus::new(TimelineFinalStatusKind::Failed, false)
         }
@@ -493,6 +498,9 @@ fn final_http_tool_status(
         TimelineEntryStatus::Cancelled => {
             TimelineFinalStatus::new(TimelineFinalStatusKind::Cancelled, false)
         }
+        TimelineEntryStatus::Blocked => {
+            TimelineFinalStatus::new(TimelineFinalStatusKind::Blocked, false)
+        }
         TimelineEntryStatus::Failed => {
             TimelineFinalStatus::new(TimelineFinalStatusKind::Failed, false)
         }
@@ -525,6 +533,7 @@ pub fn final_dynamic_tool_status(
 ) -> (String, bool) {
     match status {
         TimelineEntryStatus::Cancelled => ("Cancelled".to_owned(), false),
+        TimelineEntryStatus::Blocked => ("Blocked".to_owned(), false),
         TimelineEntryStatus::Failed => ("Failed".to_owned(), false),
         TimelineEntryStatus::Running => ("Running".to_owned(), true),
         TimelineEntryStatus::Completed => {

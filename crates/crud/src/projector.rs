@@ -165,6 +165,21 @@ impl TurnProjector {
                 )
                 .await
             }),
+            TurnEventPayload::TurnBlocked(payload) => project_future(async move {
+                self.close_running_attempts_for_terminal_turn(
+                    db,
+                    payload.turn.id.as_str(),
+                    created_at,
+                )
+                .await?;
+                self.project_turn_finished(
+                    db,
+                    payload.thread_id.as_str(),
+                    &payload.turn,
+                    created_at,
+                )
+                .await
+            }),
         };
         future.await
     }

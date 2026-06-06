@@ -965,6 +965,7 @@ results_count = "%{count} 个结果"
 
 [timeline.file_change]
 cancelled = "已取消"
+blocked = "已阻止"
 failed = "更改未应用"
 running = "正在应用更改"
 completed = "文件已更改"
@@ -977,6 +978,7 @@ output = "输出"
 
 [timeline.download]
 cancelled = "已取消"
+blocked = "已阻止"
 failed = "下载失败"
 running = "正在下载文件"
 completed = "文件已下载"

@@ -212,6 +212,7 @@ impl PioneerDesktop {
 fn download_status_label(kind: TimelineFinalStatusKind) -> String {
     match kind {
         TimelineFinalStatusKind::Cancelled => t!("timeline.download.cancelled").to_string(),
+        TimelineFinalStatusKind::Blocked => t!("timeline.download.blocked").to_string(),
         TimelineFinalStatusKind::Failed => t!("timeline.download.failed").to_string(),
         TimelineFinalStatusKind::Running => t!("timeline.download.running").to_string(),
         TimelineFinalStatusKind::Completed => t!("timeline.download.completed").to_string(),

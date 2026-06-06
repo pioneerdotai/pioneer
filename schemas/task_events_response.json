@@ -1569,6 +1569,49 @@
           "properties": {
             "kind": {
               "type": "string",
+              "const": "run_blocked"
+            },
+            "payload": {
+              "type": "object",
+              "properties": {
+                "blocked_at": {
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "error": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/TaskError"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "run_id": {
+                  "type": "string"
+                },
+                "task_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "task_id",
+                "run_id",
+                "blocked_at"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
               "const": "run_retry_scheduled"
             },
             "payload": {
@@ -1767,6 +1810,45 @@
               "required": [
                 "task_id",
                 "completed_at"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "task_blocked"
+            },
+            "payload": {
+              "type": "object",
+              "properties": {
+                "blocked_at": {
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "error": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/TaskError"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "task_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "task_id",
+                "blocked_at"
               ]
             }
           },
@@ -2189,6 +2271,40 @@
             "kind": {
               "type": "string",
               "const": "task_run_turn_failed"
+            },
+            "payload": {
+              "type": "object",
+              "properties": {
+                "error": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/TaskError"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "task_run_turn": {
+                  "$ref": "#/$defs/TaskRunTurn"
+                }
+              },
+              "required": [
+                "task_run_turn"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "task_run_turn_blocked"
             },
             "payload": {
               "type": "object",
@@ -3419,6 +3535,7 @@
         "waiting_review",
         "succeeded",
         "failed",
+        "blocked",
         "cancelled",
         "timed_out"
       ]
@@ -3575,6 +3692,7 @@
         "candidate_created",
         "review_recorded",
         "failed",
+        "blocked",
         "interrupted",
         "cancelled"
       ]
@@ -3613,6 +3731,7 @@
         "waiting_review",
         "completed",
         "failed",
+        "blocked",
         "cancelled"
       ]
     },

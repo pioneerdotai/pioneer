@@ -72,7 +72,8 @@ fn history_event_thread_id(payload: &ThreadHistoryEventPayload) -> &str {
             pioneer_protocol::TurnExecutionWindowBlockedNotification { thread_id, .. },
         )
         | ThreadHistoryEventPayload::TurnCompleted { thread_id, .. }
-        | ThreadHistoryEventPayload::TurnFailed { thread_id, .. } => thread_id.as_str(),
+        | ThreadHistoryEventPayload::TurnFailed { thread_id, .. }
+        | ThreadHistoryEventPayload::TurnBlocked { thread_id, .. } => thread_id.as_str(),
     }
 }
 

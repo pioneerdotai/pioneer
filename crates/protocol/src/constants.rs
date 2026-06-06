@@ -103,6 +103,7 @@ pub mod events {
     pub const TURN_STARTED: &str = "turn/started";
     pub const TURN_COMPLETED: &str = "turn/completed";
     pub const TURN_FAILED: &str = "turn/failed";
+    pub const TURN_BLOCKED: &str = "turn/blocked";
     pub const TURN_TIMELINE_CHANGED: &str = "turn/timeline/changed";
     pub const TURN_EXECUTION_WINDOW_STARTED: &str = "turn/execution_window/started";
     pub const TURN_EXECUTION_WINDOW_EXHAUSTED: &str = "turn/execution_window/exhausted";
@@ -142,11 +143,13 @@ pub mod events {
     pub const TASK_PROGRESS: &str = "task/progress";
     pub const TASK_RUN_COMPLETED: &str = "task/run/completed";
     pub const TASK_RUN_FAILED: &str = "task/run/failed";
+    pub const TASK_RUN_BLOCKED: &str = "task/run/blocked";
     pub const TASK_RUN_RETRY_SCHEDULED: &str = "task/run/retry_scheduled";
     pub const TASK_RUN_RETRY_EXHAUSTED: &str = "task/run/retry_exhausted";
     pub const TASK_RUN_CANCELLED: &str = "task/run/cancelled";
     pub const TASK_COMPLETED: &str = "task/completed";
     pub const TASK_FAILED: &str = "task/failed";
+    pub const TASK_BLOCKED: &str = "task/blocked";
     pub const TASK_CANCELLED: &str = "task/cancelled";
     pub const TASK_DETACHED: &str = "task/detached";
     pub const TASK_UPDATED: &str = "task/updated";
@@ -159,6 +162,7 @@ pub mod events {
     pub const TASK_RUN_TURN_STARTED: &str = "task/run/turn/started";
     pub const TASK_RUN_TURN_COMPLETED: &str = "task/run/turn/completed";
     pub const TASK_RUN_TURN_FAILED: &str = "task/run/turn/failed";
+    pub const TASK_RUN_TURN_BLOCKED: &str = "task/run/turn/blocked";
     pub const TASK_RESULT_CANDIDATE_CREATED: &str = "task/result_candidate/created";
     pub const TASK_RESULT_REVIEW_EVENT_RECORDED: &str = "task/result_review_event/recorded";
     pub const TASK_RESULT_CANDIDATE_ACCEPTED: &str = "task/result_candidate/accepted";

@@ -20,6 +20,7 @@ pub enum EventKind {
     TurnStarted,
     TurnCompleted,
     TurnFailed,
+    TurnBlocked,
     TurnCancelled,
     ItemStarted,
     ItemDelta,
@@ -82,6 +83,10 @@ pub enum ConversationEvent {
         turn: Turn,
     },
     TurnFailed {
+        thread_id: String,
+        turn: Turn,
+    },
+    TurnBlocked {
         thread_id: String,
         turn: Turn,
     },
@@ -251,6 +256,7 @@ impl ConversationEvent {
             | Self::TurnStarted { thread_id, .. }
             | Self::TurnCompleted { thread_id, .. }
             | Self::TurnFailed { thread_id, .. }
+            | Self::TurnBlocked { thread_id, .. }
             | Self::ItemStarted { thread_id, .. }
             | Self::ItemDelta { thread_id, .. }
             | Self::ItemTimeoutDetected { thread_id, .. }
@@ -323,7 +329,8 @@ impl ConversationEvent {
             }
             Self::TurnStarted { turn, .. }
             | Self::TurnCompleted { turn, .. }
-            | Self::TurnFailed { turn, .. } => Some(turn.id.as_str()),
+            | Self::TurnFailed { turn, .. }
+            | Self::TurnBlocked { turn, .. } => Some(turn.id.as_str()),
         }
     }
 
@@ -351,6 +358,7 @@ impl ConversationEvent {
             | Self::TurnStarted { .. }
             | Self::TurnCompleted { .. }
             | Self::TurnFailed { .. }
+            | Self::TurnBlocked { .. }
             | Self::TurnToolLoopBudgetExceeded { .. }
             | Self::TurnExecutionWindowStarted { .. }
             | Self::TurnExecutionWindowExhausted { .. }
@@ -376,6 +384,7 @@ impl ConversationEvent {
                     EventKind::TurnFailed
                 }
             }
+            Self::TurnBlocked { .. } => EventKind::TurnBlocked,
             Self::ItemStarted { .. } => EventKind::ItemStarted,
             Self::ItemDelta { .. } => EventKind::ItemDelta,
             Self::ItemTimeoutDetected { .. } => EventKind::ItemTimeoutDetected,

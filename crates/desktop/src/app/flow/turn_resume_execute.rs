@@ -130,6 +130,19 @@ impl PioneerDesktop {
                                     }
                                     view.reset_thread_resume_state(target_thread_id.as_str());
                                 }
+                                TurnResumeStatusPlan::Block => {
+                                    if let Some(event) = thread_resume::turn_resume_terminal_event(
+                                        target_thread_id.clone(),
+                                        turn_snapshot.turn,
+                                    ) {
+                                        view.upsert_thread_conversation_mut(
+                                            target_thread_id.as_str(),
+                                            target_workspace_id.as_str(),
+                                        )
+                                        .apply(event);
+                                    }
+                                    view.reset_thread_resume_state(target_thread_id.as_str());
+                                }
                                 TurnResumeStatusPlan::Reset => {
                                     view.reset_thread_resume_state(target_thread_id.as_str());
                                 }

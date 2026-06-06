@@ -11,6 +11,7 @@ pub fn task_status_label(status: TaskStatus) -> &'static str {
         TaskStatus::Waiting => "Waiting",
         TaskStatus::WaitingReview => "Needs review",
         TaskStatus::Completed => "Completed",
+        TaskStatus::Blocked => "Blocked",
         TaskStatus::Failed => "Failed",
         TaskStatus::Cancelled => "Cancelled",
     }

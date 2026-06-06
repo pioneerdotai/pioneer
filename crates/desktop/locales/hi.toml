@@ -965,6 +965,7 @@ results_count = "%{count} परिणाम"
 
 [timeline.file_change]
 cancelled = "रद्द"
+blocked = "ब्लॉक किया गया"
 failed = "बदलाव लागू नहीं हुए"
 running = "बदलाव लागू हो रहे हैं"
 completed = "फाइलें बदली गईं"
@@ -977,6 +978,7 @@ output = "आउटपुट"
 
 [timeline.download]
 cancelled = "रद्द"
+blocked = "ब्लॉक किया गया"
 failed = "डाउनलोड विफल"
 running = "फाइल डाउनलोड हो रही है"
 completed = "फाइल डाउनलोड हुई"

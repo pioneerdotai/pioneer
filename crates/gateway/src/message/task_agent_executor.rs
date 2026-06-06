@@ -13,8 +13,8 @@ use pioneer_protocol::{
     TaskRun, TaskRunExecution, TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding,
     TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskThreadLineage,
     TaskTrigger, TaskTriggerKind, TaskValue, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility,
-    ThreadStatus, Turn, TurnCompletedNotification, TurnFailedNotification, TurnKind, TurnOrigin,
-    TurnStartParams, TurnStartedNotification, TurnStatus, UserInput,
+    ThreadStatus, Turn, TurnBlockedNotification, TurnCompletedNotification, TurnFailedNotification,
+    TurnKind, TurnOrigin, TurnStartParams, TurnStartedNotification, TurnStatus, UserInput,
 };
 use pioneer_tasks::{
     CreateTaskResultReviewerContextParams, RecordTaskResultReviewEventParams,
@@ -473,7 +473,7 @@ impl TaskAgentExecutor {
                         .error
                         .unwrap_or_else(|| "revision child turn failed".to_owned());
                     let target_status =
-                        task_run_turn_failure_status_from_child_turn_status(turn.status)
+                        task_run_turn_terminal_status_from_child_turn_status(turn.status)
                             .unwrap_or(TaskRunTurnStatus::Failed);
                     self.fail_child_turn(
                         child_runtime,
@@ -484,8 +484,11 @@ impl TaskAgentExecutor {
                     .await?;
                 }
                 TurnStatus::Blocked => {
-                    // Execution-window blocking is a runtime pause for the same child turn.
-                    // It must not be reconciled as a semantic task revision failure.
+                    let error_message = turn
+                        .error
+                        .unwrap_or_else(|| "revision child turn blocked".to_owned());
+                    self.block_child_turn(child_runtime, error_message.as_str(), handle)
+                        .await?;
                 }
                 TurnStatus::InProgress => {
                     let started_at = now_timestamp_secs();
@@ -814,17 +817,19 @@ impl TaskAgentExecutor {
             TurnStatus::Failed | TurnStatus::Interrupted => {
                 let error_message = turn.error.unwrap_or_else(|| "child turn failed".to_owned());
                 let target_status =
-                    task_run_turn_failure_status_from_child_turn_status(turn.status)
+                    task_run_turn_terminal_status_from_child_turn_status(turn.status)
                         .unwrap_or(TaskRunTurnStatus::Failed);
                 self.fail_child_turn(child_runtime, error_message.as_str(), target_status, handle)
                     .await?;
                 Ok(TaskExecutorStartOutcome::Started)
             }
             TurnStatus::Blocked => {
-                // A blocked execution window is a controlled runtime stop, not a child task
-                // failure. Leave task-run reconciliation untouched until an actual terminal
-                // child status or an explicit task action resolves it.
-                Ok(TaskExecutorStartOutcome::Queued)
+                let error_message = turn
+                    .error
+                    .unwrap_or_else(|| "child turn blocked".to_owned());
+                self.block_child_turn(child_runtime, error_message.as_str(), handle)
+                    .await?;
+                Ok(TaskExecutorStartOutcome::Started)
             }
             TurnStatus::InProgress => {
                 self.restart_in_progress_child_turn(
@@ -1149,14 +1154,57 @@ impl TaskAgentExecutor {
             .await?;
             return Ok(true);
         }
-        let target_status = processor
-            .crud_store
-            .get_turn(thread_id, turn_id)
-            .await?
-            .and_then(|(_, turn)| task_run_turn_failure_status_from_child_turn_status(turn.status))
+        let Some((_, turn)) = processor.crud_store.get_turn(thread_id, turn_id).await? else {
+            self.fail_child_turn(
+                child_runtime,
+                error_message,
+                TaskRunTurnStatus::Failed,
+                handle,
+            )
+            .await?;
+            return Ok(true);
+        };
+        if turn.status == TurnStatus::Blocked {
+            self.block_child_turn(child_runtime, error_message, handle)
+                .await?;
+            return Ok(true);
+        }
+        let target_status = task_run_turn_terminal_status_from_child_turn_status(turn.status)
             .unwrap_or(TaskRunTurnStatus::Failed);
         self.fail_child_turn(child_runtime, error_message, target_status, handle)
             .await?;
+        Ok(true)
+    }
+
+    pub(super) async fn reconcile_child_turn_blocked(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        reason: &str,
+    ) -> Result<bool> {
+        let processor = self.processor()?;
+        let Some(child_runtime) =
+            load_child_runtime_for_turn(&processor, thread_id, turn_id).await?
+        else {
+            return Ok(false);
+        };
+        let Some(task_response) = processor
+            .crud_store
+            .get_task(child_runtime.task_run_turn.task_id.as_str())
+            .await?
+        else {
+            return Ok(true);
+        };
+        if task_response.task.status.is_terminal() {
+            return Ok(true);
+        }
+        let handle = TaskExecutionHandle::new(
+            processor.crud_store.clone(),
+            processor.task_runtime.event_bus(),
+            child_runtime.task_run_turn.task_id.clone(),
+            child_runtime.task_run_turn.run_id.clone(),
+        );
+        self.block_child_turn(child_runtime, reason, handle).await?;
         Ok(true)
     }
 
@@ -1442,7 +1490,60 @@ impl TaskAgentExecutor {
                     .await?;
                 }
                 TurnStatus::InProgress => {}
-                TurnStatus::Failed | TurnStatus::Interrupted | TurnStatus::Blocked => {}
+                TurnStatus::Failed | TurnStatus::Interrupted => {
+                    let handle = TaskExecutionHandle::new(
+                        processor.crud_store.clone(),
+                        processor.task_runtime.event_bus(),
+                        task_run_turn.task_id.clone(),
+                        task_run_turn.run_id.clone(),
+                    );
+                    let error_message = turn
+                        .error
+                        .unwrap_or_else(|| "reviewer child turn failed".to_owned());
+                    let target_status =
+                        task_run_turn_terminal_status_from_child_turn_status(turn.status)
+                            .unwrap_or(TaskRunTurnStatus::Failed);
+                    let failed_at = now_timestamp_secs();
+                    record_task_run_turn_failure(
+                        &handle,
+                        &task_run_turn,
+                        target_status,
+                        Some(task_error(
+                            "reviewer_turn_failed",
+                            error_message,
+                            TaskErrorClass::Unknown,
+                            Some(task_run_turn.run_id.clone()),
+                        )),
+                        failed_at,
+                    )
+                    .await?;
+                }
+                TurnStatus::Blocked => {
+                    let handle = TaskExecutionHandle::new(
+                        processor.crud_store.clone(),
+                        processor.task_runtime.event_bus(),
+                        task_run_turn.task_id.clone(),
+                        task_run_turn.run_id.clone(),
+                    );
+                    let error_message = turn
+                        .error
+                        .unwrap_or_else(|| "reviewer child turn blocked".to_owned());
+                    self.block_child_turn(
+                        TaskRunChildRuntime {
+                            lineage: processor
+                                .crud_store
+                                .get_task_thread_lineage(task_run_turn.thread_id.as_str())
+                                .await?
+                                .unwrap_or_else(|| {
+                                    fallback_lineage_for_task_run_turn(&task_run_turn)
+                                }),
+                            task_run_turn,
+                        },
+                        error_message.as_str(),
+                        handle,
+                    )
+                    .await?;
+                }
             }
             return Ok(());
         }
@@ -1706,6 +1807,32 @@ impl TaskAgentExecutor {
         handle.fail_run(Some(error), failed_at).await?;
         mark_task_run_occurrence_turn_failed(&processor, &child_runtime.lineage, error_message)
             .await?;
+        Ok(())
+    }
+
+    async fn block_child_turn(
+        &self,
+        child_runtime: TaskRunChildRuntime,
+        reason: &str,
+        handle: TaskExecutionHandle,
+    ) -> Result<()> {
+        let processor = self.processor()?;
+        let blocked_at = now_timestamp_secs();
+        let error = task_error(
+            "child_turn_blocked",
+            reason.to_owned(),
+            TaskErrorClass::Policy,
+            Some(child_runtime.task_run_turn.run_id.clone()),
+        );
+        handle
+            .record_task_run_turn_blocked(
+                blocked_task_run_turn(&child_runtime.task_run_turn, blocked_at),
+                Some(error.clone()),
+                blocked_at,
+            )
+            .await?;
+        handle.block_run(Some(error), blocked_at).await?;
+        mark_task_run_occurrence_turn_blocked(&processor, &child_runtime.lineage, reason).await?;
         Ok(())
     }
 
@@ -2094,6 +2221,21 @@ async fn mark_task_run_occurrence_turn_failed(
     .await
 }
 
+async fn mark_task_run_occurrence_turn_blocked(
+    processor: &Arc<MessageProcessor>,
+    lineage: &TaskThreadLineage,
+    reason: &str,
+) -> Result<()> {
+    mark_task_run_occurrence_turn_terminal(
+        processor,
+        lineage,
+        TurnStatus::Blocked,
+        Some(reason.to_owned()),
+        now_timestamp_secs(),
+    )
+    .await
+}
+
 async fn mark_task_run_occurrence_turn_terminal(
     processor: &Arc<MessageProcessor>,
     lineage: &TaskThreadLineage,
@@ -2157,7 +2299,24 @@ async fn mark_task_run_occurrence_turn_terminal(
                 )
                 .await;
         }
-        TurnStatus::Blocked => {}
+        TurnStatus::Blocked => {
+            let notification = TurnBlockedNotification {
+                workspace_id,
+                thread_id: parent_thread_id.to_owned(),
+                turn,
+            };
+            processor
+                .crud_store
+                .materialize_turn_blocked(notification.clone(), completed_at)
+                .await?;
+            processor
+                .send_notification_to_thread_subscribers(
+                    parent_thread_id,
+                    events::TURN_BLOCKED,
+                    &notification,
+                )
+                .await;
+        }
         TurnStatus::InProgress => {}
     }
     Ok(())
@@ -2412,6 +2571,13 @@ fn failed_task_run_turn(
     failed
 }
 
+fn blocked_task_run_turn(task_run_turn: &TaskRunTurn, completed_at: i64) -> TaskRunTurn {
+    let mut blocked = task_run_turn.clone();
+    blocked.status = TaskRunTurnStatus::Blocked;
+    blocked.completed_at = Some(completed_at);
+    blocked
+}
+
 fn revision_dispatch_error_details(task_run_turn: &TaskRunTurn) -> TaskValue {
     TaskValue::Object(BTreeMap::from([
         (
@@ -2662,13 +2828,14 @@ fn runtime_auto_accept_review_event_id(run_id: &str, turn_id: &str) -> String {
     format!("trre_auto_{run_id}_{turn_id}")
 }
 
-fn task_run_turn_failure_status_from_child_turn_status(
+fn task_run_turn_terminal_status_from_child_turn_status(
     status: TurnStatus,
 ) -> Option<TaskRunTurnStatus> {
     match status {
         TurnStatus::Failed => Some(TaskRunTurnStatus::Failed),
         TurnStatus::Interrupted => Some(TaskRunTurnStatus::Interrupted),
-        TurnStatus::Completed | TurnStatus::Blocked | TurnStatus::InProgress => None,
+        TurnStatus::Blocked => Some(TaskRunTurnStatus::Blocked),
+        TurnStatus::Completed | TurnStatus::InProgress => None,
     }
 }
 

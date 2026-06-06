@@ -543,6 +543,7 @@ pub enum TurnPostTurnStatus {
     Failed,
     ProviderFailure,
     Interrupted,
+    Blocked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

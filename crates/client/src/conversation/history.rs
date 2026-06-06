@@ -612,6 +612,16 @@ impl Conversation {
                 self.apply_history_conversation_event(conversation_event, event.created_at);
                 self.projector.apply_turn_failed(turn, event.created_at);
             }
+            ThreadHistoryEventPayload::TurnBlocked {
+                thread_id, turn, ..
+            } => {
+                let conversation_event = ConversationEvent::TurnBlocked {
+                    thread_id: thread_id.clone(),
+                    turn: turn.clone(),
+                };
+                self.apply_history_conversation_event(conversation_event, event.created_at);
+                self.projector.apply_turn_blocked(turn, event.created_at);
+            }
         }
     }
 
@@ -1030,6 +1040,14 @@ fn task_event_message(event: &TaskEvent) -> String {
         pioneer_protocol::TaskEventPayload::RunRetryExhausted { .. } => {
             "Task retries exhausted".to_owned()
         }
+        pioneer_protocol::TaskEventPayload::RunBlocked { error, .. } => error
+            .as_ref()
+            .map(|error| format!("Task run blocked: {}", error.message))
+            .unwrap_or_else(|| "Task run blocked".to_owned()),
+        pioneer_protocol::TaskEventPayload::TaskBlocked { error, .. } => error
+            .as_ref()
+            .map(|error| format!("Task blocked: {}", error.message))
+            .unwrap_or_else(|| "Task blocked".to_owned()),
         pioneer_protocol::TaskEventPayload::ChildThreadLinked { .. } => {
             "Subagent thread linked".to_owned()
         }
@@ -1079,6 +1097,24 @@ fn task_event_message(event: &TaskEvent) -> String {
                     task_run_turn_kind_label(task_run_turn.kind)
                 )
             }),
+        pioneer_protocol::TaskEventPayload::TaskRunTurnBlocked {
+            task_run_turn,
+            error,
+        } => error
+            .as_ref()
+            .map(|error| {
+                format!(
+                    "Task {} turn blocked: {}",
+                    task_run_turn_kind_label(task_run_turn.kind),
+                    error.message
+                )
+            })
+            .unwrap_or_else(|| {
+                format!(
+                    "Task {} turn blocked",
+                    task_run_turn_kind_label(task_run_turn.kind)
+                )
+            }),
         pioneer_protocol::TaskEventPayload::TaskResultCandidateCreated { candidate } => format!(
             "Task result candidate created: round {}, {}",
             candidate.round,
@@ -1116,11 +1152,13 @@ fn task_event_message(event: &TaskEvent) -> String {
                 "Task run completed".to_owned()
             }
             pioneer_protocol::constants::events::TASK_RUN_FAILED => "Task run failed".to_owned(),
+            pioneer_protocol::constants::events::TASK_RUN_BLOCKED => "Task run blocked".to_owned(),
             pioneer_protocol::constants::events::TASK_RUN_CANCELLED => {
                 "Task run cancelled".to_owned()
             }
             pioneer_protocol::constants::events::TASK_COMPLETED => "Task completed".to_owned(),
             pioneer_protocol::constants::events::TASK_FAILED => "Task failed".to_owned(),
+            pioneer_protocol::constants::events::TASK_BLOCKED => "Task blocked".to_owned(),
             pioneer_protocol::constants::events::TASK_CANCELLED => "Task cancelled".to_owned(),
             pioneer_protocol::constants::events::TASK_DETACHED => "Task detached".to_owned(),
             pioneer_protocol::constants::events::TASK_UPDATED => "Task updated".to_owned(),
@@ -1145,6 +1183,7 @@ fn task_event_message(event: &TaskEvent) -> String {
 fn task_event_level(event: &TaskEvent) -> SystemEventLevel {
     match &event.payload {
         pioneer_protocol::TaskEventPayload::TaskRunTurnFailed { .. }
+        | pioneer_protocol::TaskEventPayload::TaskRunTurnBlocked { .. }
         | pioneer_protocol::TaskEventPayload::TaskResultCandidateRejected { .. }
         | pioneer_protocol::TaskEventPayload::TaskResultCandidateCancelled { .. } => {
             return SystemEventLevel::Warning;
@@ -1165,6 +1204,9 @@ fn task_event_level(event: &TaskEvent) -> SystemEventLevel {
     match event.event_type.as_str() {
         pioneer_protocol::constants::events::TASK_FAILED
         | pioneer_protocol::constants::events::TASK_RUN_FAILED
+        | pioneer_protocol::constants::events::TASK_BLOCKED
+        | pioneer_protocol::constants::events::TASK_RUN_BLOCKED
+        | pioneer_protocol::constants::events::TASK_RUN_TURN_BLOCKED
         | pioneer_protocol::constants::events::TASK_RUN_RETRY_EXHAUSTED
         | pioneer_protocol::constants::events::TASK_WRITE_LOCK_BLOCKED
         | pioneer_protocol::constants::events::TASK_WRITE_LOCK_EXPIRED => SystemEventLevel::Warning,
@@ -1186,6 +1228,7 @@ fn task_run_turn_status_label(status: pioneer_protocol::TaskRunTurnStatus) -> &'
         pioneer_protocol::TaskRunTurnStatus::InProgress => "in progress",
         pioneer_protocol::TaskRunTurnStatus::CandidateCreated => "candidate created",
         pioneer_protocol::TaskRunTurnStatus::ReviewRecorded => "review recorded",
+        pioneer_protocol::TaskRunTurnStatus::Blocked => "blocked",
         pioneer_protocol::TaskRunTurnStatus::Failed => "failed",
         pioneer_protocol::TaskRunTurnStatus::Interrupted => "interrupted",
         pioneer_protocol::TaskRunTurnStatus::Cancelled => "cancelled",

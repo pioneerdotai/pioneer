@@ -69,5 +69,6 @@ pub(super) fn turn_post_turn_status_label(status: TurnPostTurnStatus) -> &'stati
         TurnPostTurnStatus::Failed => "failed",
         TurnPostTurnStatus::ProviderFailure => "provider_failure",
         TurnPostTurnStatus::Interrupted => "interrupted",
+        TurnPostTurnStatus::Blocked => "blocked",
     }
 }

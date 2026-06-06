@@ -1639,7 +1639,7 @@ fn tool_retry_events_are_logged_without_recovery_projection() {
         limit_kind: ToolLoopBudgetLimitKind::AgentRounds,
         limit: 32,
         observed: 33,
-        action: ToolLoopBudgetAction::RequestFinalNoToolsRound,
+        action: ToolLoopBudgetAction::ContinueInNextWindow,
         reason: "agent_rounds_exceeded".to_owned(),
     });
 
@@ -1870,7 +1870,7 @@ fn history_hydration_replays_tool_retry_events_like_live_events() {
         limit_kind: ToolLoopBudgetLimitKind::AgentRounds,
         limit: 32,
         observed: 33,
-        action: ToolLoopBudgetAction::RequestFinalNoToolsRound,
+        action: ToolLoopBudgetAction::ContinueInNextWindow,
         reason: "agent_rounds_exceeded".to_owned(),
     });
 
@@ -1925,7 +1925,7 @@ fn history_hydration_replays_tool_retry_events_like_live_events() {
                 limit_kind: ToolLoopBudgetLimitKind::AgentRounds,
                 limit: 32,
                 observed: 33,
-                action: ToolLoopBudgetAction::RequestFinalNoToolsRound,
+                action: ToolLoopBudgetAction::ContinueInNextWindow,
                 reason: "agent_rounds_exceeded".to_owned(),
             },
         },

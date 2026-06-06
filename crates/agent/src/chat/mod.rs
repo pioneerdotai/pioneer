@@ -465,6 +465,7 @@ fn post_turn_tool_error_class(error_class: ToolErrorClass) -> TurnPostTurnToolEr
 #[derive(Debug, Clone)]
 pub(super) enum ChatTurnError {
     Terminal(String),
+    Blocked(String),
     ProviderFailure {
         item_id: String,
         item_type: TurnItemType,
@@ -774,6 +775,7 @@ fn agent_event_error(error: AgentEventHubError) -> ChatTurnError {
 fn chat_error_post_turn_status(error: &ChatTurnError) -> pioneer_hooks::TurnPostTurnStatus {
     match error {
         ChatTurnError::ProviderFailure { .. } => pioneer_hooks::TurnPostTurnStatus::ProviderFailure,
+        ChatTurnError::Blocked(_) => pioneer_hooks::TurnPostTurnStatus::Blocked,
         ChatTurnError::Terminal(_) | ChatTurnError::WithPostTurnDispatch { .. } => {
             pioneer_hooks::TurnPostTurnStatus::Failed
         }
@@ -783,6 +785,7 @@ fn chat_error_post_turn_status(error: &ChatTurnError) -> pioneer_hooks::TurnPost
 fn chat_error_preview(error: &ChatTurnError) -> String {
     match error {
         ChatTurnError::Terminal(message) => message.clone(),
+        ChatTurnError::Blocked(message) => message.clone(),
         ChatTurnError::ProviderFailure { failure, .. } => {
             failure.message.clone().unwrap_or_else(|| {
                 format!(
@@ -3727,6 +3730,79 @@ async fn execute_agent_provider_response(
 
             window_stats.record_provider_round(round.tool_calls.len(), round.provider_token_count);
 
+            if !round_plan.tools_enabled
+                && !round.tool_calls.is_empty()
+                && let Some(final_text) =
+                    task_mutation_finalization_guard.deterministic_failure_message()
+            {
+                post_turn_assistant_text = final_text.clone();
+                send_reasoning_completed(
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    current_thinking_id.as_str(),
+                    round.reasoning.as_str(),
+                    event_tx.as_ref(),
+                )
+                .await
+                .map_err(|error| (error, current_thinking_id.clone()))?;
+                emit_durable_event(
+                    event_tx.as_ref(),
+                    AgentDurableEvent::ItemStarted {
+                        notification: ItemStartedNotification {
+                            workspace_id: workspace_id.to_owned(),
+                            thread_id: thread_id.to_owned(),
+                            turn_id: turn_id.to_owned(),
+                            item: TurnItem::AgentMessage {
+                                id: message_item_id.to_owned(),
+                                text: String::new(),
+                                markdown: None,
+                                markdown_version: None,
+                            },
+                        },
+                    },
+                )
+                .await
+                .map_err(|error| (error, current_thinking_id.clone()))?;
+                emit_progress_event(
+                    event_tx.as_ref(),
+                    AgentProgressEvent::ItemDelta {
+                        notification: ItemDeltaNotification {
+                            workspace_id: workspace_id.to_owned(),
+                            thread_id: thread_id.to_owned(),
+                            turn_id: turn_id.to_owned(),
+                            item_id: message_item_id.to_owned(),
+                            delta: final_text.clone(),
+                            stream: Some(pioneer_protocol::ItemDeltaStream::AgentMessage),
+                            payload: None,
+                            markdown: None,
+                            markdown_version: None,
+                        },
+                    },
+                )
+                .await
+                .map_err(|error| (error, current_thinking_id.clone()))?;
+                emit_durable_event(
+                    event_tx.as_ref(),
+                    AgentDurableEvent::ItemCompleted {
+                        notification: ItemCompletedNotification {
+                            workspace_id: workspace_id.to_owned(),
+                            thread_id: thread_id.to_owned(),
+                            turn_id: turn_id.to_owned(),
+                            item: TurnItem::AgentMessage {
+                                id: message_item_id.to_owned(),
+                                text: final_text,
+                                markdown: None,
+                                markdown_version: None,
+                            },
+                        },
+                    },
+                )
+                .await
+                .map_err(|error| (error, current_thinking_id.clone()))?;
+                return Ok(AgentProviderLoopOutcome::Completed);
+            }
+
             match tool_loop_guard
                 .after_provider_round(round_plan.tools_enabled, round.tool_calls.len())
             {
@@ -3845,96 +3921,6 @@ async fn execute_agent_provider_response(
 
                     continue;
                 }
-                ToolLoopGuardDecision::FailTurn {
-                    message,
-                    budget_exceeded,
-                } => {
-                    emit_tool_loop_budget_exceeded(
-                        &budget_exceeded,
-                        workspace_id,
-                        thread_id,
-                        turn_id,
-                        event_tx.as_ref(),
-                    )
-                    .await
-                    .map_err(|error| (agent_event_error(error), current_thinking_id.clone()))?;
-                    if budget_exceeded.reason
-                        == ToolLoopBudgetReason::ProviderReturnedToolsAfterToolsDisabled
-                        && let Some(final_text) =
-                            task_mutation_finalization_guard.deterministic_failure_message()
-                    {
-                        post_turn_assistant_text = final_text.clone();
-                        send_reasoning_completed(
-                            workspace_id,
-                            thread_id,
-                            turn_id,
-                            current_thinking_id.as_str(),
-                            round.reasoning.as_str(),
-                            event_tx.as_ref(),
-                        )
-                        .await
-                        .map_err(|error| (error, current_thinking_id.clone()))?;
-                        emit_durable_event(
-                            event_tx.as_ref(),
-                            AgentDurableEvent::ItemStarted {
-                                notification: ItemStartedNotification {
-                                    workspace_id: workspace_id.to_owned(),
-                                    thread_id: thread_id.to_owned(),
-                                    turn_id: turn_id.to_owned(),
-                                    item: TurnItem::AgentMessage {
-                                        id: message_item_id.to_owned(),
-                                        text: String::new(),
-                                        markdown: None,
-                                        markdown_version: None,
-                                    },
-                                },
-                            },
-                        )
-                        .await
-                        .map_err(|error| (error, current_thinking_id.clone()))?;
-                        emit_progress_event(
-                            event_tx.as_ref(),
-                            AgentProgressEvent::ItemDelta {
-                                notification: ItemDeltaNotification {
-                                    workspace_id: workspace_id.to_owned(),
-                                    thread_id: thread_id.to_owned(),
-                                    turn_id: turn_id.to_owned(),
-                                    item_id: message_item_id.to_owned(),
-                                    delta: final_text.clone(),
-                                    stream: Some(pioneer_protocol::ItemDeltaStream::AgentMessage),
-                                    payload: None,
-                                    markdown: None,
-                                    markdown_version: None,
-                                },
-                            },
-                        )
-                        .await
-                        .map_err(|error| (error, current_thinking_id.clone()))?;
-                        emit_durable_event(
-                            event_tx.as_ref(),
-                            AgentDurableEvent::ItemCompleted {
-                                notification: ItemCompletedNotification {
-                                    workspace_id: workspace_id.to_owned(),
-                                    thread_id: thread_id.to_owned(),
-                                    turn_id: turn_id.to_owned(),
-                                    item: TurnItem::AgentMessage {
-                                        id: message_item_id.to_owned(),
-                                        text: final_text,
-                                        markdown: None,
-                                        markdown_version: None,
-                                    },
-                                },
-                            },
-                        )
-                        .await
-                        .map_err(|error| (error, current_thinking_id.clone()))?;
-                        return Ok(AgentProviderLoopOutcome::Completed);
-                    }
-                    return Err((
-                        ChatTurnError::Terminal(message),
-                        current_thinking_id.clone(),
-                    ));
-                }
             }
 
             if round.tool_calls.is_empty() {
@@ -3957,7 +3943,7 @@ async fn execute_agent_provider_response(
                         .any(|signature| !observed_review_required_signatures.contains(signature));
                     if !has_new_signature {
                         return Err((
-                            ChatTurnError::Terminal(review_required_final_answer_block_message()),
+                            ChatTurnError::Blocked(review_required_final_answer_block_message()),
                             current_thinking_id.clone(),
                         ));
                     }

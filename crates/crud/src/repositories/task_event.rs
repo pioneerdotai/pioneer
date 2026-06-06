@@ -134,6 +134,7 @@ fn equivalent_cancelled_terminal_payload(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalOutcome {
     Succeeded,
+    Blocked,
     Failed,
     Cancelled,
 }
@@ -152,6 +153,9 @@ fn terminal_outcome(payload: &TaskEventPayload) -> Option<TerminalOutcome> {
             } else {
                 Some(TerminalOutcome::Failed)
             }
+        }
+        TaskEventPayload::RunBlocked { .. } | TaskEventPayload::TaskBlocked { .. } => {
+            Some(TerminalOutcome::Blocked)
         }
         TaskEventPayload::RunCancelled { .. } | TaskEventPayload::TaskCancelled { .. } => {
             Some(TerminalOutcome::Cancelled)

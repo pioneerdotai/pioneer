@@ -62,12 +62,16 @@ pub enum TaskStatus {
     WaitingReview,
     Completed,
     Failed,
+    Blocked,
     Cancelled,
 }
 
 impl TaskStatus {
     pub const fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Blocked | Self::Cancelled
+        )
     }
 }
 
@@ -256,6 +260,7 @@ pub enum TaskRunStatus {
     WaitingReview,
     Succeeded,
     Failed,
+    Blocked,
     Cancelled,
     TimedOut,
 }
@@ -264,7 +269,7 @@ impl TaskRunStatus {
     pub const fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Succeeded | Self::Failed | Self::Cancelled | Self::TimedOut
+            Self::Succeeded | Self::Failed | Self::Blocked | Self::Cancelled | Self::TimedOut
         )
     }
 }
@@ -278,6 +283,7 @@ pub enum TaskRunExecutionStatus {
     WaitingReview,
     Succeeded,
     Failed,
+    Blocked,
     Cancelled,
     TimedOut,
 }
@@ -286,7 +292,7 @@ impl TaskRunExecutionStatus {
     pub const fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Succeeded | Self::Failed | Self::Cancelled | Self::TimedOut
+            Self::Succeeded | Self::Failed | Self::Blocked | Self::Cancelled | Self::TimedOut
         )
     }
 }
@@ -315,6 +321,7 @@ pub enum TaskRunTurnStatus {
     CandidateCreated,
     ReviewRecorded,
     Failed,
+    Blocked,
     Interrupted,
     Cancelled,
 }
@@ -1286,6 +1293,13 @@ pub enum TaskEventPayload {
         error: Option<TaskError>,
         completed_at: i64,
     },
+    RunBlocked {
+        task_id: String,
+        run_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<TaskError>,
+        blocked_at: i64,
+    },
     RunRetryScheduled {
         task_id: String,
         failed_run_id: String,
@@ -1320,6 +1334,12 @@ pub enum TaskEventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<TaskError>,
         completed_at: i64,
+    },
+    TaskBlocked {
+        task_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<TaskError>,
+        blocked_at: i64,
     },
     TaskCancelled {
         task_id: String,
@@ -1389,6 +1409,11 @@ pub enum TaskEventPayload {
         task_run_turn: TaskRunTurn,
     },
     TaskRunTurnFailed {
+        task_run_turn: TaskRunTurn,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<TaskError>,
+    },
+    TaskRunTurnBlocked {
         task_run_turn: TaskRunTurn,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<TaskError>,
@@ -1494,11 +1519,13 @@ impl TaskEventPayload {
             | Self::Progress { task_id, .. }
             | Self::RunCompleted { task_id, .. }
             | Self::RunFailed { task_id, .. }
+            | Self::RunBlocked { task_id, .. }
             | Self::RunRetryScheduled { task_id, .. }
             | Self::RunRetryExhausted { task_id, .. }
             | Self::RunCancelled { task_id, .. }
             | Self::TaskCompleted { task_id, .. }
             | Self::TaskFailed { task_id, .. }
+            | Self::TaskBlocked { task_id, .. }
             | Self::TaskCancelled { task_id, .. }
             | Self::TaskRescheduled { task_id, .. }
             | Self::TaskRecovered { task_id, .. }
@@ -1521,7 +1548,8 @@ impl TaskEventPayload {
             Self::TaskRunThreadBindingCreated { binding } => binding.task_id.as_str(),
             Self::TaskRunTurnStarted { task_run_turn }
             | Self::TaskRunTurnCompleted { task_run_turn }
-            | Self::TaskRunTurnFailed { task_run_turn, .. } => task_run_turn.task_id.as_str(),
+            | Self::TaskRunTurnFailed { task_run_turn, .. }
+            | Self::TaskRunTurnBlocked { task_run_turn, .. } => task_run_turn.task_id.as_str(),
             Self::TaskResultCandidateCreated { candidate }
             | Self::TaskResultCandidateAccepted { candidate, .. }
             | Self::TaskResultCandidateRejected { candidate, .. }
@@ -1551,11 +1579,13 @@ impl TaskEventPayload {
             Self::RunStarted { run_id, .. }
             | Self::RunCompleted { run_id, .. }
             | Self::RunFailed { run_id, .. }
+            | Self::RunBlocked { run_id, .. }
             | Self::RunCancelled { run_id, .. } => Some(run_id.as_str()),
             Self::RunRetryScheduled { retry_run, .. } => Some(retry_run.id.as_str()),
             Self::RunRetryExhausted { final_run_id, .. } => Some(final_run_id.as_str()),
             Self::TaskCompleted { .. }
             | Self::TaskFailed { .. }
+            | Self::TaskBlocked { .. }
             | Self::TaskCancelled { .. }
             | Self::TaskDetached { .. } => None,
             Self::ChildThreadLinked { lineage } => Some(lineage.task_run_id.as_str()),
@@ -1563,7 +1593,8 @@ impl TaskEventPayload {
             Self::TaskRunThreadBindingCreated { binding } => Some(binding.run_id.as_str()),
             Self::TaskRunTurnStarted { task_run_turn }
             | Self::TaskRunTurnCompleted { task_run_turn }
-            | Self::TaskRunTurnFailed { task_run_turn, .. } => Some(task_run_turn.run_id.as_str()),
+            | Self::TaskRunTurnFailed { task_run_turn, .. }
+            | Self::TaskRunTurnBlocked { task_run_turn, .. } => Some(task_run_turn.run_id.as_str()),
             Self::TaskResultCandidateCreated { candidate }
             | Self::TaskResultCandidateAccepted { candidate, .. }
             | Self::TaskResultCandidateRejected { candidate, .. }
@@ -1597,7 +1628,8 @@ impl TaskEventPayload {
             Self::TaskRunThreadBindingCreated { binding } => Some(binding.thread_id.as_str()),
             Self::TaskRunTurnStarted { task_run_turn }
             | Self::TaskRunTurnCompleted { task_run_turn }
-            | Self::TaskRunTurnFailed { task_run_turn, .. } => {
+            | Self::TaskRunTurnFailed { task_run_turn, .. }
+            | Self::TaskRunTurnBlocked { task_run_turn, .. } => {
                 Some(task_run_turn.thread_id.as_str())
             }
             Self::TaskResultCandidateCreated { candidate }
@@ -1624,7 +1656,10 @@ impl TaskEventPayload {
             Self::ChildThreadLinked { lineage } => Some(lineage.child_turn_id.as_str()),
             Self::TaskRunTurnStarted { task_run_turn }
             | Self::TaskRunTurnCompleted { task_run_turn }
-            | Self::TaskRunTurnFailed { task_run_turn, .. } => Some(task_run_turn.turn_id.as_str()),
+            | Self::TaskRunTurnFailed { task_run_turn, .. }
+            | Self::TaskRunTurnBlocked { task_run_turn, .. } => {
+                Some(task_run_turn.turn_id.as_str())
+            }
             Self::TaskResultCandidateCreated { candidate }
             | Self::TaskResultCandidateAccepted { candidate, .. }
             | Self::TaskResultCandidateRejected { candidate, .. }
@@ -1655,11 +1690,13 @@ impl TaskEventPayload {
             Self::Progress { .. } => events::TASK_PROGRESS,
             Self::RunCompleted { .. } => events::TASK_RUN_COMPLETED,
             Self::RunFailed { .. } => events::TASK_RUN_FAILED,
+            Self::RunBlocked { .. } => events::TASK_RUN_BLOCKED,
             Self::RunRetryScheduled { .. } => events::TASK_RUN_RETRY_SCHEDULED,
             Self::RunRetryExhausted { .. } => events::TASK_RUN_RETRY_EXHAUSTED,
             Self::RunCancelled { .. } => events::TASK_RUN_CANCELLED,
             Self::TaskCompleted { .. } => events::TASK_COMPLETED,
             Self::TaskFailed { .. } => events::TASK_FAILED,
+            Self::TaskBlocked { .. } => events::TASK_BLOCKED,
             Self::TaskCancelled { .. } => events::TASK_CANCELLED,
             Self::TaskDetached { .. } => events::TASK_DETACHED,
             Self::TaskUpdated { .. } => events::TASK_UPDATED,
@@ -1673,6 +1710,7 @@ impl TaskEventPayload {
             Self::TaskRunTurnStarted { .. } => events::TASK_RUN_TURN_STARTED,
             Self::TaskRunTurnCompleted { .. } => events::TASK_RUN_TURN_COMPLETED,
             Self::TaskRunTurnFailed { .. } => events::TASK_RUN_TURN_FAILED,
+            Self::TaskRunTurnBlocked { .. } => events::TASK_RUN_TURN_BLOCKED,
             Self::TaskResultCandidateCreated { .. } => events::TASK_RESULT_CANDIDATE_CREATED,
             Self::TaskResultReviewEventRecorded { .. } => events::TASK_RESULT_REVIEW_EVENT_RECORDED,
             Self::TaskResultCandidateAccepted { .. } => events::TASK_RESULT_CANDIDATE_ACCEPTED,
@@ -1721,6 +1759,7 @@ impl TaskEventPayload {
             Self::RunStarted { run_id, .. } => Some(format!("run:{run_id}:started")),
             Self::RunCompleted { run_id, .. }
             | Self::RunFailed { run_id, .. }
+            | Self::RunBlocked { run_id, .. }
             | Self::RunCancelled { run_id, .. } => Some(format!("run:{run_id}:terminal")),
             Self::RunRetryScheduled { retry_run, .. } => {
                 Some(format!("run:{}:retry_created", retry_run.id))
@@ -1734,6 +1773,7 @@ impl TaskEventPayload {
             )),
             Self::TaskCompleted { task_id, .. }
             | Self::TaskFailed { task_id, .. }
+            | Self::TaskBlocked { task_id, .. }
             | Self::TaskCancelled { task_id, .. } => Some(format!("task:{task_id}:terminal")),
             Self::TaskDetached { task, detached_at } => Some(format!(
                 "task:{}:detached:{}:{detached_at}",
@@ -1787,6 +1827,10 @@ impl TaskEventPayload {
             )),
             Self::TaskRunTurnFailed { task_run_turn, .. } => Some(format!(
                 "run:{}:turn:{}:failed",
+                task_run_turn.run_id, task_run_turn.turn_id
+            )),
+            Self::TaskRunTurnBlocked { task_run_turn, .. } => Some(format!(
+                "run:{}:turn:{}:blocked",
                 task_run_turn.run_id, task_run_turn.turn_id
             )),
             Self::TaskResultCandidateCreated { candidate } => Some(format!(
@@ -2370,6 +2414,8 @@ pub struct TaskWaitResponse {
     #[serde(default)]
     pub failed: Vec<TaskWaitItem>,
     #[serde(default)]
+    pub blocked: Vec<TaskWaitItem>,
+    #[serde(default)]
     pub cancelled: Vec<TaskWaitItem>,
     #[serde(default)]
     pub review_required: Vec<TaskWaitReviewItem>,
@@ -2383,6 +2429,8 @@ pub struct TaskWaitResponse {
     pub pending_count: u32,
     #[serde(default)]
     pub review_required_count: u32,
+    #[serde(default)]
+    pub blocked_count: u32,
     #[serde(default)]
     pub non_waitable_count: u32,
     pub mode: TaskWaitMode,
@@ -2729,10 +2777,10 @@ pub struct TaskTurnItem {
 #[cfg(test)]
 mod tests {
     use super::{
-        TaskAgentSpec, TaskEventPayload, TaskExecutorKind, TaskOwnerKind, TaskRescheduleReason,
-        TaskRunExecutionStatus, TaskRunStatus, TaskStatus, TaskTriggerKind, TaskTriggerSpec,
-        TaskTriggerStatus, TaskTurnItem, TaskWaitMode, TaskWaitResponse, TaskWaitReviewAction,
-        TaskWaitRevisionBlockedReason,
+        TaskAgentSpec, TaskEventPayload, TaskExecutorKind, TaskGetResponse, TaskOwnerKind,
+        TaskRescheduleReason, TaskResultReviewerKind, TaskRunExecutionStatus, TaskRunStatus,
+        TaskStatus, TaskTriggerKind, TaskTriggerSpec, TaskTriggerStatus, TaskTurnItem,
+        TaskWaitMode, TaskWaitResponse, TaskWaitReviewAction, TaskWaitRevisionBlockedReason,
     };
     use serde_json::json;
 
@@ -2954,6 +3002,112 @@ mod tests {
         assert_eq!(
             encoded["reviewRequired"][0]["allowedActions"],
             json!(["task_accept", "task_revise", "task_cancel"])
+        );
+    }
+
+    #[test]
+    fn phase_12_task_get_response_decodes_candidate_and_review_history() {
+        let task = json!({
+            "id": "task_review00000001",
+            "workspaceId": "workspace_default",
+            "ownerKind": "thread",
+            "ownerId": "thread_parent000001",
+            "createdByThreadId": "thread_parent000001",
+            "createdByTurnId": "turn_parent0000001",
+            "executorKind": "agent",
+            "status": "waiting_review",
+            "title": "Review child work",
+            "goal": "Produce a result",
+            "priority": 0,
+            "revision": 1,
+            "createdAt": 10,
+            "updatedAt": 20
+        });
+        let candidate = json!({
+            "id": "candidate_review0001",
+            "taskId": "task_review00000001",
+            "runId": "run_review000000001",
+            "taskRunTurnId": "run_turn_initial001",
+            "threadId": "thread_child0000001",
+            "turnId": "turn_child000000001",
+            "round": 0,
+            "status": "pending_review",
+            "result": {
+                "summary": "child result",
+                "data": {
+                    "kind": "string",
+                    "value": "result body"
+                }
+            },
+            "summary": "child result",
+            "diagnostics": ["schema matched"],
+            "createdAt": 20,
+            "updatedAt": 20
+        });
+
+        let decoded: TaskGetResponse = serde_json::from_value(json!({
+            "task": task,
+            "triggers": [],
+            "runs": [],
+            "agentSpecs": [],
+            "dependencies": [],
+            "writeLocks": [],
+            "threadLineage": [],
+            "taskRunThreadBindings": [],
+            "taskRunTurns": [{
+                "id": "run_turn_initial001",
+                "taskId": "task_review00000001",
+                "runId": "run_review000000001",
+                "executionId": null,
+                "threadId": "thread_child0000001",
+                "turnId": "turn_child000000001",
+                "kind": "initial",
+                "round": 0,
+                "sequence": 0,
+                "status": "candidate_created",
+                "createdAt": 10,
+                "startedAt": 11,
+                "completedAt": 20
+            }, {
+                "id": "run_turn_revision01",
+                "taskId": "task_review00000001",
+                "runId": "run_review000000001",
+                "executionId": null,
+                "threadId": "thread_child0000001",
+                "turnId": "turn_child000000002",
+                "kind": "revision",
+                "round": 1,
+                "sequence": 1,
+                "status": "in_progress",
+                "requestedByCandidateId": "candidate_review0001",
+                "requestedByReviewEventId": "review_event0000001",
+                "createdAt": 21,
+                "startedAt": 22
+            }],
+            "resultCandidates": [candidate],
+            "resultReviewEvents": [{
+                "id": "review_event0000001",
+                "candidateId": "candidate_review0001",
+                "taskId": "task_review00000001",
+                "runId": "run_review000000001",
+                "taskRunTurnId": "run_turn_initial001",
+                "reviewerKind": "review_agent",
+                "reviewerThreadId": "thread_reviewer0001",
+                "reviewerTurnId": "turn_reviewer00001",
+                "eventKind": "advisory",
+                "decision": "request_changes",
+                "feedbackText": "tighten the result",
+                "nextTaskRunTurnId": "run_turn_revision01",
+                "createdAt": 21
+            }]
+        }))
+        .expect("task get response should decode candidate and review history");
+
+        assert_eq!(decoded.task_run_turns.len(), 2);
+        assert_eq!(decoded.result_candidates[0].id, "candidate_review0001");
+        assert_eq!(
+            decoded.result_review_events[0].reviewer_kind,
+            TaskResultReviewerKind::ReviewAgent
         );
     }
 

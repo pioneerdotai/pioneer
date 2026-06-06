@@ -39,6 +39,7 @@ pub const RECOVERY_STATUS_ACTIVE: &str = "active";
 pub const RECOVERY_STATUS_SUCCEEDED: &str = "succeeded";
 pub const RECOVERY_STATUS_FAILED: &str = "failed";
 pub const RECOVERY_STATUS_EXHAUSTED: &str = "exhausted";
+pub const RECOVERY_STATUS_BLOCKED: &str = "blocked";
 pub const RECOVERY_STATUS_CANCELLED: &str = "cancelled";
 
 pub const MEMORY_NAMESPACE_DEFAULT: &str = "default";
@@ -437,6 +438,7 @@ pub fn task_status_to_db(status: TaskStatus) -> &'static str {
         TaskStatus::WaitingReview => "waiting_review",
         TaskStatus::Completed => "completed",
         TaskStatus::Failed => "failed",
+        TaskStatus::Blocked => "blocked",
         TaskStatus::Cancelled => "cancelled",
     }
 }
@@ -451,6 +453,7 @@ pub fn task_status_from_db(value: &str) -> Option<TaskStatus> {
         "waiting_review" => Some(TaskStatus::WaitingReview),
         "completed" => Some(TaskStatus::Completed),
         "failed" => Some(TaskStatus::Failed),
+        "blocked" => Some(TaskStatus::Blocked),
         "cancelled" => Some(TaskStatus::Cancelled),
         _ => None,
     }
@@ -538,6 +541,7 @@ pub fn task_run_status_to_db(status: TaskRunStatus) -> &'static str {
         TaskRunStatus::WaitingReview => "waiting_review",
         TaskRunStatus::Succeeded => "succeeded",
         TaskRunStatus::Failed => "failed",
+        TaskRunStatus::Blocked => "blocked",
         TaskRunStatus::Cancelled => "cancelled",
         TaskRunStatus::TimedOut => "timed_out",
     }
@@ -552,6 +556,7 @@ pub fn task_run_status_from_db(value: &str) -> Option<TaskRunStatus> {
         "waiting_review" => Some(TaskRunStatus::WaitingReview),
         "succeeded" => Some(TaskRunStatus::Succeeded),
         "failed" => Some(TaskRunStatus::Failed),
+        "blocked" => Some(TaskRunStatus::Blocked),
         "cancelled" => Some(TaskRunStatus::Cancelled),
         "timed_out" => Some(TaskRunStatus::TimedOut),
         _ => None,
@@ -574,6 +579,7 @@ pub fn task_run_execution_status_to_db(status: TaskRunExecutionStatus) -> &'stat
         TaskRunExecutionStatus::WaitingReview => "waiting_review",
         TaskRunExecutionStatus::Succeeded => "succeeded",
         TaskRunExecutionStatus::Failed => "failed",
+        TaskRunExecutionStatus::Blocked => "blocked",
         TaskRunExecutionStatus::Cancelled => "cancelled",
         TaskRunExecutionStatus::TimedOut => "timed_out",
     }
@@ -587,6 +593,7 @@ pub fn task_run_execution_status_from_db(value: &str) -> Option<TaskRunExecution
         "waiting_review" => Some(TaskRunExecutionStatus::WaitingReview),
         "succeeded" => Some(TaskRunExecutionStatus::Succeeded),
         "failed" => Some(TaskRunExecutionStatus::Failed),
+        "blocked" => Some(TaskRunExecutionStatus::Blocked),
         "cancelled" => Some(TaskRunExecutionStatus::Cancelled),
         "timed_out" => Some(TaskRunExecutionStatus::TimedOut),
         _ => None,
@@ -957,6 +964,7 @@ pub fn recovery_job_status_to_db(status: RecoveryJobStatus) -> &'static str {
         RecoveryJobStatus::Succeeded => RECOVERY_STATUS_SUCCEEDED,
         RecoveryJobStatus::Failed => RECOVERY_STATUS_FAILED,
         RecoveryJobStatus::Exhausted => RECOVERY_STATUS_EXHAUSTED,
+        RecoveryJobStatus::Blocked => RECOVERY_STATUS_BLOCKED,
         RecoveryJobStatus::Cancelled => RECOVERY_STATUS_CANCELLED,
     }
 }
@@ -968,6 +976,7 @@ pub fn recovery_job_status_from_db(value: &str) -> Option<RecoveryJobStatus> {
         RECOVERY_STATUS_SUCCEEDED => Some(RecoveryJobStatus::Succeeded),
         RECOVERY_STATUS_FAILED => Some(RecoveryJobStatus::Failed),
         RECOVERY_STATUS_EXHAUSTED => Some(RecoveryJobStatus::Exhausted),
+        RECOVERY_STATUS_BLOCKED => Some(RecoveryJobStatus::Blocked),
         RECOVERY_STATUS_CANCELLED => Some(RecoveryJobStatus::Cancelled),
         _ => None,
     }
@@ -1078,10 +1087,11 @@ pub fn prompt_manifest_profile_to_db(profile: PromptManifestProfile) -> &'static
 #[cfg(test)]
 mod tests {
     use super::{
+        recovery_job_status_from_db, recovery_job_status_to_db,
         sandbox_mode_to_db, thread_mode_from_db, thread_mode_to_db, thread_status_from_db,
         thread_status_to_db, turn_status_from_db, turn_status_to_db,
     };
-    use pioneer_protocol::{SandboxMode, ThreadMode, ThreadStatus, TurnStatus};
+    use pioneer_protocol::{RecoveryJobStatus, SandboxMode, ThreadMode, ThreadStatus, TurnStatus};
 
     #[test]
     fn db_values_are_snake_case() {
@@ -1096,6 +1106,10 @@ mod tests {
         assert_eq!(turn_status_to_db(TurnStatus::Failed), "failed");
         assert_eq!(turn_status_to_db(TurnStatus::Interrupted), "interrupted");
         assert_eq!(turn_status_to_db(TurnStatus::Blocked), "blocked");
+        assert_eq!(
+            recovery_job_status_to_db(RecoveryJobStatus::Blocked),
+            "blocked"
+        );
     }
 
     #[test]
@@ -1115,6 +1129,14 @@ mod tests {
         );
         assert_eq!(turn_status_from_db("blocked"), Some(TurnStatus::Blocked));
         assert_eq!(turn_status_from_db("InProgress"), None);
+    }
+
+    #[test]
+    fn recovery_job_status_parser_accepts_blocked() {
+        assert_eq!(
+            recovery_job_status_from_db("blocked"),
+            Some(RecoveryJobStatus::Blocked)
+        );
     }
 
     #[test]

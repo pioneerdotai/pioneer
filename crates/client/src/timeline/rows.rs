@@ -92,7 +92,10 @@ pub fn build_timeline_rows(
     for (group_key, (anchor_index, status)) in task_anchor_by_group_key_any_status {
         if matches!(
             status,
-            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+            TaskStatus::Completed
+                | TaskStatus::Blocked
+                | TaskStatus::Failed
+                | TaskStatus::Cancelled
         ) {
             continue;
         }
@@ -516,6 +519,7 @@ fn is_terminal_parent_agent_message(item_view: &ItemView) -> bool {
         && matches!(
             item_view.status,
             TimelineEntryStatus::Completed
+                | TimelineEntryStatus::Blocked
                 | TimelineEntryStatus::Failed
                 | TimelineEntryStatus::Cancelled
         )
