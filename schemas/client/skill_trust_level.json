@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SkillTrustLevel",
+  "oneOf": [
+    {
+      "type": "string",
+      "enum": [
+        "Internal",
+        "Verified",
+        "Community",
+        "Untrusted",
+        "None"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "Other": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Other"
+      ]
+    }
+  ]
+}

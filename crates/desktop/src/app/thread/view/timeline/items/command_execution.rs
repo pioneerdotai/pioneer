@@ -9,67 +9,15 @@ use crate::{
 use gpui::{prelude::*, *};
 use gpui_component::{collapsible::Collapsible, h_flex, spinner::Spinner, *};
 use gpui_terminal::{ColorPalette, TerminalConfig, TerminalView};
-use pioneer_protocol::{ToolDisplayPayload, ToolStoragePayload, TurnItem};
-use serde_json::Value as JsonValue;
+use pioneer_client::timeline::labels::{
+    command_from_arguments, normalize_for_terminal, shell_output_from_display,
+    shell_output_from_storage,
+};
+use pioneer_protocol::TurnItem;
 use std::{
     hash::{Hash, Hasher},
     io::Cursor,
 };
-
-fn command_from_arguments(arguments: &JsonValue) -> Option<String> {
-    if let Some(cmd) = arguments.get("cmd").and_then(JsonValue::as_str)
-        && !cmd.trim().is_empty()
-    {
-        return Some(cmd.to_owned());
-    }
-
-    arguments
-        .get("command")
-        .and_then(JsonValue::as_array)
-        .map(|parts| {
-            parts
-                .iter()
-                .filter_map(JsonValue::as_str)
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .filter(|cmd| !cmd.trim().is_empty())
-}
-
-fn shell_output_from_display(display: &ToolDisplayPayload) -> Option<&str> {
-    match display {
-        ToolDisplayPayload::Shell {
-            aggregated_output,
-            stdout,
-            stderr,
-            ..
-        } => aggregated_output
-            .as_deref()
-            .or_else(|| stdout.as_deref())
-            .or_else(|| stderr.as_deref()),
-        _ => None,
-    }
-}
-
-fn shell_output_from_storage(storage: &ToolStoragePayload) -> Option<&str> {
-    match storage {
-        ToolStoragePayload::Shell {
-            aggregated_output,
-            stdout,
-            stderr,
-            ..
-        } => aggregated_output
-            .as_deref()
-            .or_else(|| stdout.as_deref())
-            .or_else(|| stderr.as_deref()),
-        _ => None,
-    }
-}
-
-fn normalize_for_terminal(text: &str) -> String {
-    let unified = text.replace("\r\n", "\n").replace('\r', "\n");
-    unified.replace('\n', "\r\n")
-}
 
 impl PioneerDesktop {
     fn estimate_terminal_cols(content_width: Pixels) -> usize {

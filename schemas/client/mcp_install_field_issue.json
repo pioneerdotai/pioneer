@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "McpInstallFieldIssue",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "ServerValidationError": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "ServerValidationError"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "Diagnostic": {
+          "type": "object",
+          "properties": {
+            "field_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "level": {
+              "$ref": "#/$defs/McpDiagnosticLevel"
+            },
+            "message": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "level",
+            "message"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Diagnostic"
+      ]
+    }
+  ],
+  "$defs": {
+    "McpDiagnosticLevel": {
+      "type": "string",
+      "enum": [
+        "error",
+        "warning"
+      ]
+    }
+  }
+}

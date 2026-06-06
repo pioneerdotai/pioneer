@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "McpAuditAction",
+  "oneOf": [
+    {
+      "type": "string",
+      "enum": [
+        "Install",
+        "Update",
+        "Uninstall",
+        "Policy",
+        "Start",
+        "Started",
+        "StartFailed",
+        "Stop",
+        "Stopped",
+        "Restart",
+        "CatalogRefreshed",
+        "Call",
+        "CallCompleted",
+        "CallFailed",
+        "None"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "Other": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Other"
+      ]
+    }
+  ]
+}

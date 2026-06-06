@@ -12,6 +12,7 @@ use gpui_component::{
     theme::ActiveTheme,
     v_flex,
 };
+use pioneer_client::artifacts::presentation as client_artifact_presentation;
 use pioneer_protocol::{
     ArtifactBindingDirection, ArtifactBindingKind, ArtifactCreatedByKind, ArtifactKind,
     ArtifactRef, ArtifactStatus, ArtifactSummary,
@@ -25,10 +26,11 @@ impl PioneerDesktop {
         let total_count = self.thread_artifacts.items_for_active_thread().len();
         let visible_items = self.thread_artifacts.visible_items();
         let visible_count = visible_items.len();
-        let selected_artifact_id = self.thread_artifacts.selected_artifact_id.clone();
-        let is_loading_active_thread = self.thread_artifacts.loading
-            && self.thread_artifacts.loading_thread_id.as_deref()
-                == self.thread_artifacts.active_thread_id.as_deref();
+        let selected_artifact_id = self
+            .thread_artifacts
+            .selected_artifact_id()
+            .map(str::to_owned);
+        let is_loading_active_thread = self.thread_artifacts.is_loading_active_thread();
 
         let mut list = v_flex().w_full().gap_2();
         for summary in visible_items {
@@ -89,24 +91,27 @@ impl PioneerDesktop {
                                 .child(t!("artifacts.loading").to_string()),
                         )
                     })
-                    .when_some(self.thread_artifacts.error.as_ref(), |this, error| {
-                        this.child(
-                            v_flex()
-                                .gap_1()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(cx.theme().danger.opacity(0.45))
-                                .bg(cx.theme().danger.opacity(0.08))
-                                .p_3()
-                                .text_sm()
-                                .child(
-                                    div()
-                                        .font_medium()
-                                        .child(t!("artifacts.failed").to_string()),
-                                )
-                                .child(div().text_xs().child(error.clone())),
-                        )
-                    })
+                    .when_some(
+                        self.thread_artifacts.error().map(str::to_owned),
+                        |this, error| {
+                            this.child(
+                                v_flex()
+                                    .gap_1()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(cx.theme().danger.opacity(0.45))
+                                    .bg(cx.theme().danger.opacity(0.08))
+                                    .p_3()
+                                    .text_sm()
+                                    .child(
+                                        div()
+                                            .font_medium()
+                                            .child(t!("artifacts.failed").to_string()),
+                                    )
+                                    .child(div().text_xs().child(error)),
+                            )
+                        },
+                    )
                     .child(if total_count == 0 && !is_loading_active_thread {
                         self.render_thread_artifact_empty(cx)
                     } else if visible_count == 0 {
@@ -144,21 +149,24 @@ impl PioneerDesktop {
             .overflow_y_hidden()
             .scrollbar_width(px(0.))
             .children(ThreadArtifactFilter::all().into_iter().map(|filter| {
-                Button::new(("thread-artifact-filter", filter_id(filter)))
-                    .flex_none()
-                    .ghost()
-                    .small()
-                    .compact()
-                    .selected(self.thread_artifacts.filter == filter)
-                    .child(
-                        div()
-                            .text_xs()
-                            .whitespace_nowrap()
-                            .child(filter_label(filter)),
-                    )
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        view.set_thread_artifact_filter(filter, cx);
-                    }))
+                Button::new((
+                    "thread-artifact-filter",
+                    client_artifact_presentation::thread_artifact_filter_id(filter),
+                ))
+                .flex_none()
+                .ghost()
+                .small()
+                .compact()
+                .selected(self.thread_artifacts.filter() == filter)
+                .child(
+                    div()
+                        .text_xs()
+                        .whitespace_nowrap()
+                        .child(filter_label(filter)),
+                )
+                .on_click(cx.listener(move |view, _, _, cx| {
+                    view.set_thread_artifact_filter(filter, cx);
+                }))
             }))
             .into_any_element()
     }
@@ -183,8 +191,8 @@ impl PioneerDesktop {
     ) -> AnyElement {
         let artifact = &summary.artifact;
         let artifact_id = artifact.artifact_id.clone();
-        let selected = self.thread_artifacts.selected_artifact_id.as_deref()
-            == Some(artifact.artifact_id.as_str());
+        let selected =
+            self.thread_artifacts.selected_artifact_id() == Some(artifact.artifact_id.as_str());
         self.request_thread_artifact_preview_load(summary.workspace_id.as_str(), artifact, cx);
         let preview_image_path = self
             .thread_artifacts
@@ -194,7 +202,7 @@ impl PioneerDesktop {
         h_flex()
             .id((
                 "thread-artifact-row",
-                stable_artifact_row_id(artifact.artifact_id.as_str()),
+                client_artifact_presentation::stable_artifact_row_id(artifact.artifact_id.as_str()),
             ))
             .w_full()
             .items_center()
@@ -623,31 +631,12 @@ fn filter_label(filter: ThreadArtifactFilter) -> String {
     }
 }
 
-fn filter_id(filter: ThreadArtifactFilter) -> usize {
-    match filter {
-        ThreadArtifactFilter::All => 0,
-        ThreadArtifactFilter::Uploaded => 1,
-        ThreadArtifactFilter::Generated => 2,
-        ThreadArtifactFilter::TaskOutput => 3,
-        ThreadArtifactFilter::Images => 4,
-        ThreadArtifactFilter::Documents => 5,
-    }
-}
-
-fn stable_artifact_row_id(artifact_id: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    artifact_id.hash(&mut hasher);
-    hasher.finish()
-}
-
 fn kind_icon(_kind: ArtifactKind) -> IconName {
     IconName::File
 }
 
 fn artifact_kind_label(kind: ArtifactKind) -> String {
-    format!("{kind:?}").to_ascii_lowercase()
+    client_artifact_presentation::artifact_kind_code(kind)
 }
 
 fn created_by_label(kind: ArtifactCreatedByKind) -> String {
@@ -676,11 +665,11 @@ fn status_label(status: ArtifactStatus) -> String {
 }
 
 fn binding_kind_label(kind: ArtifactBindingKind) -> String {
-    format!("{kind:?}").to_ascii_lowercase()
+    client_artifact_presentation::artifact_binding_kind_code(kind)
 }
 
 fn binding_direction_label(direction: ArtifactBindingDirection) -> String {
-    format!("{direction:?}").to_ascii_lowercase()
+    client_artifact_presentation::artifact_binding_direction_code(direction)
 }
 
 fn binding_target_label(
@@ -690,26 +679,17 @@ fn binding_target_label(
     task_id: Option<&str>,
     tool_call_id: Option<&str>,
 ) -> String {
-    let mut parts = Vec::new();
-    if let Some(thread_id) = thread_id {
-        parts.push(format!("thread {thread_id}"));
-    }
-    if let Some(turn_id) = turn_id {
-        parts.push(format!("turn {turn_id}"));
-    }
-    if let Some(message_id) = message_id {
-        parts.push(format!("message {message_id}"));
-    }
-    if let Some(task_id) = task_id {
-        parts.push(format!("task {task_id}"));
-    }
-    if let Some(tool_call_id) = tool_call_id {
-        parts.push(format!("tool {tool_call_id}"));
-    }
-    if parts.is_empty() {
+    let summary = client_artifact_presentation::artifact_binding_target_summary(
+        thread_id,
+        turn_id,
+        message_id,
+        task_id,
+        tool_call_id,
+    );
+    if summary.is_empty() {
         t!("artifacts.provenance_unknown").to_string()
     } else {
-        parts.join(" / ")
+        summary
     }
 }
 

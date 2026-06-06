@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SkillDiagnosticsTableCell",
+  "type": "object",
+  "properties": {
+    "text": {
+      "type": "string"
+    },
+    "tone": {
+      "$ref": "#/$defs/SkillDiagnosticsTone"
+    },
+    "tooltip": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "text",
+    "tone"
+  ],
+  "$defs": {
+    "SkillDiagnosticsTone": {
+      "type": "string",
+      "enum": [
+        "Default",
+        "Muted",
+        "Success",
+        "Warning",
+        "Danger"
+      ]
+    }
+  }
+}

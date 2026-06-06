@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SkillSourceKind",
+  "oneOf": [
+    {
+      "type": "string",
+      "enum": [
+        "System",
+        "User",
+        "Registry"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "Other": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Other"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "McpConfigValidationError",
+  "oneOf": [
+    {
+      "type": "string",
+      "enum": [
+        "ServersRequired",
+        "ServersEmpty",
+        "ServerNameEmpty"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "InvalidJson": {
+          "type": "object",
+          "properties": {
+            "error": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "error"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "InvalidJson"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "ServerConfigObject": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "ServerConfigObject"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "CommandOrUrlRequired": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "CommandOrUrlRequired"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "CommandUrlExclusive": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "CommandUrlExclusive"
+      ]
+    }
+  ]
+}

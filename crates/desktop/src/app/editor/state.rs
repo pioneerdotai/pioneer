@@ -1,21 +1,19 @@
-use super::{
-    autosave::{
-        AGENTS_DOC_AUTOSAVE_DELAY, AgentsDocAutosaveDecision, AgentsDocAutosaveState,
-        AgentsDocEditorLoadState, AgentsDocEditorSaveState,
-    },
-    content::{
-        agents_doc_content_hash, agents_doc_initial_buffer, agents_doc_is_version_conflict_error,
-        agents_doc_normalize_content, agents_doc_save_error_message, agents_doc_saved_at_now,
-    },
+use super::content::{
+    agents_doc_conflict_refresh_projection, agents_doc_content_hash, agents_doc_get_params,
+    agents_doc_is_version_conflict_error, agents_doc_load_projection,
+    agents_doc_save_error_message, agents_doc_save_params, agents_doc_saved_at_now,
 };
 use crate::gateway::GatewayWsCommandSender;
 use anyhow::Error;
 use gpui::{prelude::*, *};
 use gpui_component::input::{InputEvent, InputState};
+use pioneer_client::agents_doc::autosave::{
+    AGENTS_DOC_AUTOSAVE_DELAY, AgentsDocAutosaveDecision, AgentsDocAutosaveState,
+    AgentsDocEditorLoadState, AgentsDocEditorSaveState,
+};
 use pioneer_protocol::{
-    ThreadAgentsDocGetParams, ThreadAgentsDocGetResponse, ThreadAgentsDocPayload,
-    ThreadAgentsDocResolvedPayload, ThreadAgentsDocSaveParams, ThreadAgentsDocSaveReason,
-    ThreadAgentsDocSaveResponse,
+    ThreadAgentsDocGetResponse, ThreadAgentsDocPayload, ThreadAgentsDocResolvedPayload,
+    ThreadAgentsDocSaveReason, ThreadAgentsDocSaveResponse,
 };
 
 pub(in crate::app) struct AgentsDocEditor {
@@ -75,10 +73,7 @@ impl AgentsDocEditor {
         self.autosave.reset_from_explicit(None);
 
         let ws_sender = self.ws_sender.clone();
-        let params = ThreadAgentsDocGetParams {
-            workspace_id: self.workspace_id.clone(),
-            folder_id: self.folder_id.clone(),
-        };
+        let params = agents_doc_get_params(self.workspace_id.as_str(), self.folder_id.as_deref());
         let input = self.input.clone();
         let window_handle = self.window_handle;
         cx.spawn(move |editor: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -116,13 +111,13 @@ impl AgentsDocEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let content = agents_doc_initial_buffer(response.explicit.as_ref());
-        self.explicit_doc = response.explicit;
-        self.effective_doc = response.effective;
+        let projection = agents_doc_load_projection(response);
+        self.explicit_doc = projection.explicit_doc;
+        self.effective_doc = projection.effective_doc;
         self.load_state = AgentsDocEditorLoadState::Loaded;
         self.autosave
             .reset_from_explicit(self.explicit_doc.as_ref());
-        self.set_input_value_suppressed(input, content, window, cx);
+        self.set_input_value_suppressed(input, projection.buffer, window, cx);
     }
 
     fn set_input_value_suppressed(
@@ -203,16 +198,15 @@ impl AgentsDocEditor {
         }
 
         let content = self.input.read(cx).value().to_string();
-        let normalized_content = agents_doc_normalize_content(content.as_str());
         let expected_version = self.autosave.last_saved_version;
         let ws_sender = self.ws_sender.clone();
-        let params = ThreadAgentsDocSaveParams {
-            workspace_id: self.workspace_id.clone(),
-            folder_id: self.folder_id.clone(),
-            content: normalized_content,
+        let params = agents_doc_save_params(
+            self.workspace_id.as_str(),
+            self.folder_id.as_deref(),
+            content.as_str(),
             expected_version,
-            save_reason: ThreadAgentsDocSaveReason::Autosave,
-        };
+            ThreadAgentsDocSaveReason::Autosave,
+        );
         let window_handle = self.window_handle;
 
         self.autosave.mark_saving();
@@ -272,10 +266,7 @@ impl AgentsDocEditor {
             .finish_error(t!("editor.agents_doc.save_conflict").to_string());
 
         let ws_sender = self.ws_sender.clone();
-        let params = ThreadAgentsDocGetParams {
-            workspace_id: self.workspace_id.clone(),
-            folder_id: self.folder_id.clone(),
-        };
+        let params = agents_doc_get_params(self.workspace_id.as_str(), self.folder_id.as_deref());
         let window_handle = self.window_handle;
 
         cx.spawn(move |editor: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -303,14 +294,15 @@ impl AgentsDocEditor {
     ) {
         match result {
             Ok(response) => {
-                let Some(remote_doc) = response.explicit.clone() else {
+                let projection = agents_doc_conflict_refresh_projection(response);
+                let Some(remote_doc) = projection.remote_doc else {
                     self.autosave.finish_error(
                         t!("editor.agents_doc.save_conflict_missing_remote").to_string(),
                     );
                     return;
                 };
-                self.explicit_doc = response.explicit;
-                self.effective_doc = response.effective;
+                self.explicit_doc = projection.explicit_doc;
+                self.effective_doc = projection.effective_doc;
                 self.autosave.enter_conflict(local_content, remote_doc);
             }
             Err(error) => {

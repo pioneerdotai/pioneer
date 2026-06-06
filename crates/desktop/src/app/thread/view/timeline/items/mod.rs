@@ -15,7 +15,9 @@ use crate::app::{
 };
 use gpui::{prelude::*, *};
 use gpui_component::{Icon, IconName, h_flex, theme::ActiveTheme, v_flex};
-use pioneer_protocol::{TaskStatus, TurnItem};
+use pioneer_client::tasks::display::task_status_label;
+use pioneer_client::timeline::labels as timeline_labels;
+use pioneer_protocol::TurnItem;
 use pioneer_tools::default_favicon_url;
 
 pub(super) fn now_unix_ms() -> i64 {
@@ -26,28 +28,7 @@ pub(super) fn now_unix_ms() -> i64 {
 }
 
 pub(super) fn format_elapsed_ms(elapsed_ms: u64) -> String {
-    let total_seconds = elapsed_ms / 1_000;
-    let hours = total_seconds / 3_600;
-    let minutes = (total_seconds % 3_600) / 60;
-    let seconds = total_seconds % 60;
-
-    if hours > 0 {
-        t!(
-            "timeline.elapsed.hours_minutes",
-            hours = hours,
-            minutes = minutes : {:02}
-        )
-        .to_string()
-    } else if minutes > 0 {
-        t!(
-            "timeline.elapsed.minutes_seconds",
-            minutes = minutes,
-            seconds = seconds : {:02}
-        )
-        .to_string()
-    } else {
-        t!("timeline.elapsed.seconds", seconds = seconds).to_string()
-    }
+    timeline_labels::format_elapsed_ms(elapsed_ms)
 }
 
 pub(super) fn format_elapsed(item_view: &ItemView) -> Option<String> {
@@ -60,10 +41,7 @@ pub(super) fn format_elapsed(item_view: &ItemView) -> Option<String> {
 }
 
 pub(super) fn host_from_url(url: &str) -> Option<String> {
-    gpui::http_client::Url::parse(url)
-        .ok()
-        .or_else(|| gpui::http_client::Url::parse(format!("https://{url}").as_str()).ok())
-        .and_then(|parsed| parsed.host_str().map(str::to_owned))
+    timeline_labels::host_from_url(url)
 }
 
 impl PioneerDesktop {
@@ -330,32 +308,5 @@ impl PioneerDesktop {
         result.push('\n');
         result.push_str(&t!("timeline.common.truncated").to_string());
         result
-    }
-}
-
-fn task_status_label(status: TaskStatus) -> &'static str {
-    match status {
-        TaskStatus::Draft => "Draft",
-        TaskStatus::Scheduled => "Scheduled",
-        TaskStatus::Queued => "Queued",
-        TaskStatus::Running => "Running",
-        TaskStatus::Waiting => "Waiting",
-        TaskStatus::WaitingReview => "Needs review",
-        TaskStatus::Completed => "Completed",
-        TaskStatus::Failed => "Failed",
-        TaskStatus::Cancelled => "Cancelled",
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::task_status_label;
-    use pioneer_protocol::TaskStatus;
-
-    #[test]
-    fn phase_12_waiting_review_task_status_label_requires_review() {
-        assert_eq!(task_status_label(TaskStatus::WaitingReview), "Needs review");
-        assert_eq!(task_status_label(TaskStatus::Running), "Running");
-        assert_eq!(task_status_label(TaskStatus::Completed), "Completed");
     }
 }

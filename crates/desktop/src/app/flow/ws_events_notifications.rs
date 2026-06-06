@@ -1,5 +1,39 @@
 use super::*;
-use crate::app::conversation::ConversationEvent;
+use pioneer_client::notifications::router::{
+    ArtifactDeletedRefreshReduction, ArtifactThreadRefreshReduction, ConversationEventReduction,
+    SkillsRefreshReduction, ThreadArtifactsRefreshReduction, ThreadClosedReduction,
+    ThreadStartedContext, ThreadStartedReduction, ThreadUpdatedReduction, TurnLifecycleReduction,
+    TurnTimelineRefreshReduction, WorkspaceRefreshReduction, reduce_artifact_created_notification,
+    reduce_artifact_deleted_notification, reduce_artifact_updated_notification,
+    reduce_item_completed_notification, reduce_item_delta_notification,
+    reduce_item_recovery_attached_notification, reduce_item_recovery_exhausted_notification,
+    reduce_item_recovery_opened_notification, reduce_item_recovery_succeeded_notification,
+    reduce_item_retry_attempt_started_notification, reduce_item_retry_scheduled_notification,
+    reduce_item_started_notification, reduce_item_timeout_detected_notification,
+    reduce_item_tool_retry_exhausted_notification, reduce_item_tool_retry_resolved_notification,
+    reduce_item_tool_retry_scheduled_notification, reduce_item_updated_notification,
+    reduce_skills_changed_notification, reduce_thread_agents_doc_changed_notification,
+    reduce_thread_artifacts_changed_notification, reduce_thread_closed_notification,
+    reduce_thread_started_notification, reduce_thread_tree_changed_notification,
+    reduce_thread_updated_notification, reduce_turn_completed_notification,
+    reduce_turn_execution_window_blocked_notification,
+    reduce_turn_execution_window_checkpointed_notification,
+    reduce_turn_execution_window_continued_notification,
+    reduce_turn_execution_window_exhausted_notification,
+    reduce_turn_execution_window_started_notification, reduce_turn_failed_notification,
+    reduce_turn_started_notification, reduce_turn_timeline_changed_notification,
+    reduce_turn_tool_loop_budget_exceeded_notification,
+};
+use pioneer_client::workspaces::actions::{
+    WorkspacePreferenceReduction, reduce_workspace_preference_after_catalog_change,
+};
+use pioneer_client::workspaces::selectors as workspace_selectors;
+
+#[cfg(test)]
+pub(super) use pioneer_client::notifications::router::should_accept_thread_started_as_local_pending;
+#[cfg(test)]
+pub(super) use pioneer_client::notifications::router::should_refresh_workspace_bound_data;
+pub(super) use pioneer_client::workspaces::actions::apply_workspace_changed_to_catalog;
 
 impl PioneerDesktop {
     pub(in crate::app::flow) fn apply_gateway_notification(
@@ -21,57 +55,20 @@ impl PioneerDesktop {
                 self.apply_turn_failed_notification(notification);
             }
             GatewayNotification::ItemStarted(notification) => {
-                let thread_id = notification.thread_id.clone();
-                self.upsert_thread_conversation_mut(
-                    thread_id.as_str(),
-                    notification.workspace_id.as_str(),
-                )
-                .apply(ConversationEvent::ItemStarted {
-                    thread_id: notification.thread_id,
-                    turn_id: notification.turn_id,
-                    item: notification.item,
-                });
+                let reduction = reduce_item_started_notification(notification);
+                self.apply_conversation_event_reduction(reduction);
             }
             GatewayNotification::ItemDelta(notification) => {
-                let thread_id = notification.thread_id.clone();
-                self.upsert_thread_conversation_mut(
-                    thread_id.as_str(),
-                    notification.workspace_id.as_str(),
-                )
-                .apply(ConversationEvent::ItemDelta {
-                    thread_id: notification.thread_id,
-                    turn_id: notification.turn_id,
-                    item_id: notification.item_id,
-                    delta: notification.delta,
-                    stream: notification.stream,
-                    payload: notification.payload,
-                    markdown: notification.markdown,
-                    markdown_version: notification.markdown_version,
-                });
+                let reduction = reduce_item_delta_notification(notification);
+                self.apply_conversation_event_reduction(reduction);
             }
             GatewayNotification::ItemCompleted(notification) => {
-                let thread_id = notification.thread_id.clone();
-                self.upsert_thread_conversation_mut(
-                    thread_id.as_str(),
-                    notification.workspace_id.as_str(),
-                )
-                .apply(ConversationEvent::ItemCompleted {
-                    thread_id: notification.thread_id,
-                    turn_id: notification.turn_id,
-                    item: notification.item,
-                });
+                let reduction = reduce_item_completed_notification(notification);
+                self.apply_conversation_event_reduction(reduction);
             }
             GatewayNotification::ItemUpdated(notification) => {
-                let thread_id = notification.thread_id.clone();
-                self.upsert_thread_conversation_mut(
-                    thread_id.as_str(),
-                    notification.workspace_id.as_str(),
-                )
-                .apply(ConversationEvent::ItemUpdated {
-                    thread_id: notification.thread_id,
-                    turn_id: notification.turn_id,
-                    item: notification.item,
-                });
+                let reduction = reduce_item_updated_notification(notification);
+                self.apply_conversation_event_reduction(reduction);
             }
             GatewayNotification::ContextCompressing(_notification) => {
                 // TODO: show "Compressing conversation..." indicator in UI
@@ -80,224 +77,69 @@ impl PioneerDesktop {
                 // TODO: dismiss compression indicator in UI
             }
             GatewayNotification::ItemTimeoutDetected(notification) => {
-                let thread_id = notification.thread_id.clone();
-                self.upsert_thread_conversation_mut(
-                    thread_id.as_str(),
-                    notification.workspace_id.as_str(),
-                )
-                .apply(ConversationEvent::ItemTimeoutDetected {
-                    thread_id: notification.thread_id,
-                    turn_id: notification.turn_id,
-                    item_id: notification.item_id,
-                    item_type: notification.item_type,
-                    attempt_number: notification.attempt_number,
-                    reason: notification.reason,
-                    recovery_job_id: notification.recovery_job_id,
-                });
+                let reduction = reduce_item_timeout_detected_notification(notification);
+                self.apply_conversation_event_reduction(reduction);
             }
             GatewayNotification::ItemRecoveryOpened(notification) => {
-                let thread_id = notification.thread_id.clone();
-                self.upsert_thread_conversation_mut(
-                    thread_id.as_str(),
-                    notification.workspace_id.as_str(),
-                )
-                .apply(ConversationEvent::ItemRecoveryOpened {
-                    thread_id: notification.thread_id,
-                    turn_id: notification.turn_id,
-                    item_id: notification.item_id,
-                    item_type: notification.item_type,
-                    recovery_job_id: notification.recovery_job_id,
-                    attempt_number: notification.attempt_number,
-                });
+                let reduction = reduce_item_recovery_opened_notification(notification);
+                self.apply_conversation_event_reduction(reduction);
             }
             GatewayNotification::ItemRecoveryAttached(notification) => {
-                let thread_id = notification.thread_id.clone();
-                self.upsert_thread_conversation_mut(
-                    thread_id.as_str(),
-                    notification.workspace_id.as_str(),
-                )
-                .apply(ConversationEvent::ItemRecoveryAttached {
-                    thread_id: notification.thread_id,
-                    turn_id: notification.turn_id,
-                    item_id: notification.item_id,
-                    item_type: notification.item_type,
-                    recovery_job_id: notification.recovery_job_id,
-                    recovery_item_id: notification.recovery_item_id,
-                    recovery_item_type: notification.recovery_item_type,
-                    existing_status: notification.existing_status,
-                    next_attempt_number: notification.next_attempt_number,
-                });
+                let reduction = reduce_item_recovery_attached_notification(notification);
+                self.apply_conversation_event_reduction(reduction);
             }
             GatewayNotification::ItemRetryScheduled(notification) => {
-                let thread_id = notification.thread_id.clone();
-                self.upsert_thread_conversation_mut(
-                    thread_id.as_str(),
-                    notification.workspace_id.as_str(),
-                )
-                .apply(ConversationEvent::ItemRetryScheduled {
-                    thread_id: notification.thread_id,
-                    turn_id: notification.turn_id,
-                    item_id: notification.item_id,
-                    item_type: notification.item_type,
-                    recovery_job_id: notification.recovery_job_id,
-                    attempt_number: notification.attempt_number,
-                    next_run_at_unix: notification.next_run_at_unix,
-                    reason: notification.reason,
-                });
+                let reduction = reduce_item_retry_scheduled_notification(notification);
+                self.apply_conversation_event_reduction(reduction);
             }
             GatewayNotification::ItemRetryAttemptStarted(notification) => {
-                let thread_id = notification.thread_id.clone();
-                self.upsert_thread_conversation_mut(
-                    thread_id.as_str(),
-                    notification.workspace_id.as_str(),
-                )
-                .apply(ConversationEvent::ItemRetryAttemptStarted {
-                    thread_id: notification.thread_id,
-                    turn_id: notification.turn_id,
-                    item_id: notification.item_id,
-                    item_type: notification.item_type,
-                    recovery_job_id: notification.recovery_job_id,
-                    attempt_number: notification.attempt_number,
-                });
+                let reduction = reduce_item_retry_attempt_started_notification(notification);
+                self.apply_conversation_event_reduction(reduction);
             }
             GatewayNotification::ItemRecoverySucceeded(notification) => {
-                let thread_id = notification.thread_id.clone();
-                self.upsert_thread_conversation_mut(
-                    thread_id.as_str(),
-                    notification.workspace_id.as_str(),
-                )
-                .apply(ConversationEvent::ItemRecoverySucceeded {
-                    thread_id: notification.thread_id,
-                    turn_id: notification.turn_id,
-                    item_id: notification.item_id,
-                    item_type: notification.item_type,
-                    recovery_job_id: notification.recovery_job_id,
-                    attempt_number: notification.attempt_number,
-                });
+                let reduction = reduce_item_recovery_succeeded_notification(notification);
+                self.apply_conversation_event_reduction(reduction);
             }
             GatewayNotification::ItemRecoveryExhausted(notification) => {
-                let thread_id = notification.thread_id.clone();
-                self.upsert_thread_conversation_mut(
-                    thread_id.as_str(),
-                    notification.workspace_id.as_str(),
-                )
-                .apply(ConversationEvent::ItemRecoveryExhausted {
-                    thread_id: notification.thread_id,
-                    turn_id: notification.turn_id,
-                    item_id: notification.item_id,
-                    item_type: notification.item_type,
-                    recovery_job_id: notification.recovery_job_id,
-                    attempt_number: notification.attempt_number,
-                    status: notification.status,
-                    error_message: notification.error_message,
-                });
+                let reduction = reduce_item_recovery_exhausted_notification(notification);
+                self.apply_conversation_event_reduction(reduction);
             }
             GatewayNotification::ItemToolRetryScheduled(notification) => {
-                let thread_id = notification.thread_id.clone();
-                self.upsert_thread_conversation_mut(
-                    thread_id.as_str(),
-                    notification.workspace_id.as_str(),
-                )
-                .apply(ConversationEvent::ItemToolRetryScheduled {
-                    thread_id: notification.thread_id,
-                    turn_id: notification.turn_id,
-                    item_id: notification.item_id,
-                    item_type: notification.item_type,
-                    tool_retry_episode_id: notification.tool_retry_episode_id,
-                    tool_name: notification.tool_name,
-                    attempt_number: notification.attempt_number,
-                    error_class: notification.error_class,
-                    retry_hint: notification.retry_hint,
-                    budgets: notification.budgets,
-                    failure_signature_fingerprint: notification.failure_signature_fingerprint,
-                    reason: notification.reason,
-                });
+                let reduction = reduce_item_tool_retry_scheduled_notification(notification);
+                self.apply_conversation_event_reduction(reduction);
             }
             GatewayNotification::ItemToolRetryResolved(notification) => {
-                let thread_id = notification.thread_id.clone();
-                self.upsert_thread_conversation_mut(
-                    thread_id.as_str(),
-                    notification.workspace_id.as_str(),
-                )
-                .apply(ConversationEvent::ItemToolRetryResolved {
-                    thread_id: notification.thread_id,
-                    turn_id: notification.turn_id,
-                    item_id: notification.item_id,
-                    item_type: notification.item_type,
-                    tool_retry_episode_id: notification.tool_retry_episode_id,
-                    tool_name: notification.tool_name,
-                    attempt_number: notification.attempt_number,
-                    resolution: notification.resolution,
-                    budgets: notification.budgets,
-                    reason: notification.reason,
-                });
+                let reduction = reduce_item_tool_retry_resolved_notification(notification);
+                self.apply_conversation_event_reduction(reduction);
             }
             GatewayNotification::ItemToolRetryExhausted(notification) => {
-                let thread_id = notification.thread_id.clone();
-                self.upsert_thread_conversation_mut(
-                    thread_id.as_str(),
-                    notification.workspace_id.as_str(),
-                )
-                .apply(ConversationEvent::ItemToolRetryExhausted {
-                    thread_id: notification.thread_id,
-                    turn_id: notification.turn_id,
-                    item_id: notification.item_id,
-                    item_type: notification.item_type,
-                    tool_retry_episode_id: notification.tool_retry_episode_id,
-                    tool_name: notification.tool_name,
-                    attempt_number: notification.attempt_number,
-                    error_class: notification.error_class,
-                    exhaustion_kind: notification.exhaustion_kind,
-                    budgets: notification.budgets,
-                    failure_signature_fingerprint: notification.failure_signature_fingerprint,
-                    reason: notification.reason,
-                });
+                let reduction = reduce_item_tool_retry_exhausted_notification(notification);
+                self.apply_conversation_event_reduction(reduction);
             }
             GatewayNotification::TurnToolLoopBudgetExceeded(notification) => {
-                let thread_id = notification.thread_id.clone();
-                self.upsert_thread_conversation_mut(
-                    thread_id.as_str(),
-                    notification.workspace_id.as_str(),
-                )
-                .apply(ConversationEvent::TurnToolLoopBudgetExceeded {
-                    thread_id: notification.thread_id,
-                    turn_id: notification.turn_id,
-                    limit_kind: notification.limit_kind,
-                    limit: notification.limit,
-                    observed: notification.observed,
-                    action: notification.action,
-                    reason: notification.reason,
-                });
+                let reduction = reduce_turn_tool_loop_budget_exceeded_notification(notification);
+                self.apply_conversation_event_reduction(reduction);
             }
             GatewayNotification::TurnExecutionWindowStarted(notification) => {
-                let thread_id = notification.thread_id.clone();
-                let workspace_id = notification.workspace_id.clone();
-                self.upsert_thread_conversation_mut(thread_id.as_str(), workspace_id.as_str())
-                    .apply(ConversationEvent::TurnExecutionWindowStarted { notification });
+                let reduction = reduce_turn_execution_window_started_notification(notification);
+                self.apply_conversation_event_reduction(reduction);
             }
             GatewayNotification::TurnExecutionWindowExhausted(notification) => {
-                let thread_id = notification.thread_id.clone();
-                let workspace_id = notification.workspace_id.clone();
-                self.upsert_thread_conversation_mut(thread_id.as_str(), workspace_id.as_str())
-                    .apply(ConversationEvent::TurnExecutionWindowExhausted { notification });
+                let reduction = reduce_turn_execution_window_exhausted_notification(notification);
+                self.apply_conversation_event_reduction(reduction);
             }
             GatewayNotification::TurnExecutionWindowCheckpointed(notification) => {
-                let thread_id = notification.thread_id.clone();
-                let workspace_id = notification.workspace_id.clone();
-                self.upsert_thread_conversation_mut(thread_id.as_str(), workspace_id.as_str())
-                    .apply(ConversationEvent::TurnExecutionWindowCheckpointed { notification });
+                let reduction =
+                    reduce_turn_execution_window_checkpointed_notification(notification);
+                self.apply_conversation_event_reduction(reduction);
             }
             GatewayNotification::TurnExecutionWindowContinued(notification) => {
-                let thread_id = notification.thread_id.clone();
-                let workspace_id = notification.workspace_id.clone();
-                self.upsert_thread_conversation_mut(thread_id.as_str(), workspace_id.as_str())
-                    .apply(ConversationEvent::TurnExecutionWindowContinued { notification });
+                let reduction = reduce_turn_execution_window_continued_notification(notification);
+                self.apply_conversation_event_reduction(reduction);
             }
             GatewayNotification::TurnExecutionWindowBlocked(notification) => {
-                let thread_id = notification.thread_id.clone();
-                let workspace_id = notification.workspace_id.clone();
-                self.upsert_thread_conversation_mut(thread_id.as_str(), workspace_id.as_str())
-                    .apply(ConversationEvent::TurnExecutionWindowBlocked { notification });
+                let reduction = reduce_turn_execution_window_blocked_notification(notification);
+                self.apply_conversation_event_reduction(reduction);
             }
             GatewayNotification::Unknown(_notification) => {}
             GatewayNotification::ThreadClosed(notification) => {
@@ -305,11 +147,9 @@ impl PioneerDesktop {
                     notification.thread_id.as_str(),
                     notification.workspace_id.as_str(),
                 );
-                if matches_thread_workspace {
-                    self.remove_thread_conversation(notification.thread_id.as_str());
-                    let _ = self.clear_active_thread_if_matches(notification.thread_id.as_str());
-                    self.queue_thread_list_refresh();
-                }
+                let reduction =
+                    reduce_thread_closed_notification(notification, matches_thread_workspace);
+                self.apply_thread_closed_reduction(reduction);
             }
             GatewayNotification::ThreadTreeChanged(notification) => {
                 self.apply_thread_tree_changed_notification(notification);
@@ -334,29 +174,40 @@ impl PioneerDesktop {
                 self.apply_mcp_server_catalog_changed_notification(notification);
             }
             GatewayNotification::ThreadArtifactsChanged(notification) => {
-                self.apply_thread_artifacts_changed_notification(notification, cx);
+                let matches_thread_workspace = self.thread_workspace_matches(
+                    notification.thread_id.as_str(),
+                    notification.workspace_id.as_str(),
+                );
+                let reduction = reduce_thread_artifacts_changed_notification(
+                    notification,
+                    matches_thread_workspace,
+                );
+                self.apply_thread_artifacts_refresh_reduction(reduction, cx);
             }
             GatewayNotification::ArtifactCreated(notification) => {
-                if let Some(thread_id) = notification.artifact.primary_thread_id {
-                    self.refresh_thread_artifacts(thread_id, true, cx);
-                }
+                let reduction = reduce_artifact_created_notification(notification);
+                self.apply_artifact_thread_refresh_reduction(reduction, cx);
             }
             GatewayNotification::ArtifactUpdated(notification) => {
-                if let Some(thread_id) = notification.artifact.primary_thread_id {
-                    self.refresh_thread_artifacts(thread_id, true, cx);
-                }
+                let reduction = reduce_artifact_updated_notification(notification);
+                self.apply_artifact_thread_refresh_reduction(reduction, cx);
             }
             GatewayNotification::ArtifactDeleted(notification) => {
-                self.refresh_current_thread_artifacts_if_contains(
-                    notification.artifact_id.as_str(),
-                    cx,
+                let active_thread_id = self.current_active_thread_id().map(str::to_owned);
+                let active_thread_artifacts = self.thread_artifacts.items_for_active_thread();
+                let reduction = reduce_artifact_deleted_notification(
+                    notification,
+                    active_thread_id.as_deref(),
+                    active_thread_artifacts,
                 );
+                self.apply_artifact_deleted_refresh_reduction(reduction, cx);
             }
             GatewayNotification::ArtifactProjectionUpdated(_)
             | GatewayNotification::ArtifactUploadProgress(_)
             | GatewayNotification::ArtifactDownloadProgress(_) => {}
             GatewayNotification::TurnTimelineChanged(notification) => {
-                self.refresh_turn_timeline(notification.thread_id, notification.turn_id, cx);
+                let reduction = reduce_turn_timeline_changed_notification(notification);
+                self.apply_turn_timeline_refresh_reduction(reduction, cx);
             }
             GatewayNotification::WorkspaceChanged(notification) => {
                 self.apply_workspace_changed_notification(notification);
@@ -395,97 +246,75 @@ impl PioneerDesktop {
         &mut self,
         notification: pioneer_protocol::ThreadStartedNotification,
     ) {
-        let thread = notification.thread;
-        let thread_id = thread.id.clone();
-        let workspace_id = thread.workspace_id.clone();
-        self.upsert_thread_snapshot(thread);
-        self.upsert_thread_for_workspace(thread_id.as_str(), workspace_id.as_str());
-
         let pending_thread_id = self.thread_start_coordinator().pending_thread_id.clone();
-        let started_local_pending = should_accept_thread_started_as_local_pending(
-            pending_thread_id.as_deref(),
-            thread_id.as_str(),
+        let active_workspace = self.active_workspace_scope_for_notifications();
+        let reduction = reduce_thread_started_notification(
+            notification,
+            ThreadStartedContext {
+                pending_thread_id: pending_thread_id.as_deref(),
+                active_thread_id: self.current_active_thread_id(),
+                active_workspace_id: active_workspace.as_deref(),
+            },
         );
-        if started_local_pending {
-            self.set_draft_thread_id(Some(thread_id.clone()));
-            if self.current_active_thread_id().is_none() {
-                self.set_active_thread_id(Some(thread_id.clone()));
-            }
-            self.set_preferred_workspace_id(Some(workspace_id.clone()));
-            self.persist_active_gateway_workspace_id(workspace_id.clone());
+        self.apply_thread_started_reduction(reduction);
+    }
+
+    fn apply_thread_started_reduction(&mut self, reduction: ThreadStartedReduction) {
+        self.upsert_thread_snapshot(reduction.thread);
+        self.upsert_thread_for_workspace(
+            reduction.thread_id.as_str(),
+            reduction.workspace_id.as_str(),
+        );
+
+        if let Some(thread_id) = reduction.set_draft_thread_id {
+            self.set_draft_thread_id(Some(thread_id));
+        }
+        if let Some(thread_id) = reduction.set_active_thread_id {
+            self.set_active_thread_id(Some(thread_id));
+        }
+        if let Some(workspace_id) = reduction.set_preferred_workspace_id {
+            self.set_preferred_workspace_id(Some(workspace_id));
+        }
+        if let Some(workspace_id) = reduction.persist_active_gateway_workspace_id {
+            self.persist_active_gateway_workspace_id(workspace_id);
+        }
+        if reduction.reset_thread_start {
             self.reset_thread_start_state();
+        }
+        if reduction.clear_thread_start_queue {
             self.clear_thread_start_queue();
         }
-
-        let active_workspace = self.active_workspace_scope_for_notifications();
-        if started_local_pending
-            || should_refresh_workspace_bound_data(
-                active_workspace.as_deref(),
-                workspace_id.as_str(),
-            )
-        {
+        if reduction.queue_thread_list_refresh {
             self.queue_thread_list_refresh();
         }
-        self.sync_composer_model_selection_for_active_thread();
+        if reduction.sync_composer_model_selection {
+            self.sync_composer_model_selection_for_active_thread();
+        }
     }
 
     fn apply_workspace_changed_notification(&mut self, notification: WorkspaceChangedNotification) {
         apply_workspace_changed_to_catalog(&mut self.workspaces, &notification);
-        self.ensure_active_workspace_preference_is_valid();
-    }
-
-    fn ensure_active_workspace_preference_is_valid(&mut self) {
-        let Some(preferred_workspace_id) = self.preferred_workspace_id().map(str::to_owned) else {
-            return;
-        };
-
-        let preferred_still_active = self
-            .workspace_by_id(preferred_workspace_id.as_str())
-            .is_some_and(|workspace| workspace.is_active);
-        if preferred_still_active {
-            return;
-        }
-
-        let fallback_workspace_id =
-            resolve_active_workspace_id(None, self.workspaces()).map(str::to_owned);
-        self.set_preferred_workspace_id(fallback_workspace_id.clone());
-        if let Some(workspace_id) = fallback_workspace_id {
-            self.persist_active_gateway_workspace_id(workspace_id);
-            self.queue_thread_list_refresh();
-        }
+        let reduction = reduce_workspace_preference_after_catalog_change(
+            self.preferred_workspace_id(),
+            self.workspaces(),
+        );
+        self.apply_workspace_preference_reduction(reduction);
     }
 
     fn apply_turn_started_notification(
         &mut self,
         notification: pioneer_protocol::TurnStartedNotification,
     ) {
-        let thread_id = notification.thread_id.clone();
-        self.promote_thread_from_draft(thread_id.as_str());
-        self.queue_thread_list_refresh();
-        if let Some(coordinator) = self.thread_coordinator_mut(thread_id.as_str()) {
-            if let Some(thread) = coordinator.thread_mut() {
-                thread.status = pioneer_protocol::ThreadStatus::Active;
-            }
-        }
-        self.upsert_thread_conversation_mut(thread_id.as_str(), notification.workspace_id.as_str())
-            .apply(ConversationEvent::TurnStarted {
-                thread_id: notification.thread_id,
-                turn: notification.turn,
-            });
-        self.reset_thread_resume_state(thread_id.as_str());
-        self.sync_composer_model_selection_for_active_thread();
+        let reduction = reduce_turn_started_notification(notification);
+        self.apply_turn_lifecycle_reduction(reduction, None);
     }
 
     fn apply_thread_updated_notification(
         &mut self,
         notification: pioneer_protocol::ThreadUpdatedNotification,
     ) {
-        let thread = notification.thread;
-        let thread_id = thread.id.clone();
-        let workspace_id = thread.workspace_id.clone();
-        self.upsert_thread_snapshot(thread);
-        self.upsert_thread_for_workspace(thread_id.as_str(), workspace_id.as_str());
-        self.sync_composer_model_selection_for_active_thread();
+        let reduction = reduce_thread_updated_notification(notification);
+        self.apply_thread_updated_reduction(reduction);
     }
 
     fn apply_turn_completed_notification(
@@ -493,40 +322,103 @@ impl PioneerDesktop {
         notification: pioneer_protocol::TurnCompletedNotification,
         cx: &mut Context<Self>,
     ) {
-        let thread_id = notification.thread_id.clone();
-        if let Some(coordinator) = self.thread_coordinator_mut(thread_id.as_str()) {
-            if let Some(thread) = coordinator.thread_mut() {
-                thread.status = pioneer_protocol::ThreadStatus::Idle;
-            }
-        }
-        self.upsert_thread_conversation_mut(thread_id.as_str(), notification.workspace_id.as_str())
-            .apply(ConversationEvent::TurnCompleted {
-                thread_id: notification.thread_id,
-                turn: notification.turn,
-            });
-        if let Some(conversation) = self.thread_conversation_mut(thread_id.as_str()) {
-            let _ = conversation.tick();
-        }
-        self.reset_thread_resume_state(thread_id.as_str());
-        self.refresh_thread_artifacts(thread_id, true, cx);
+        let reduction = reduce_turn_completed_notification(notification);
+        self.apply_turn_lifecycle_reduction(reduction, Some(cx));
     }
 
     fn apply_turn_failed_notification(
         &mut self,
         notification: pioneer_protocol::TurnFailedNotification,
     ) {
-        let thread_id = notification.thread_id.clone();
-        if let Some(coordinator) = self.thread_coordinator_mut(thread_id.as_str()) {
-            if let Some(thread) = coordinator.thread_mut() {
-                thread.status = pioneer_protocol::ThreadStatus::Idle;
-            }
+        let reduction = reduce_turn_failed_notification(notification);
+        self.apply_turn_lifecycle_reduction(reduction, None);
+    }
+
+    fn apply_turn_lifecycle_reduction(
+        &mut self,
+        reduction: TurnLifecycleReduction,
+        mut cx: Option<&mut Context<Self>>,
+    ) {
+        let thread_id = reduction.thread_id.clone();
+        if reduction.promote_thread_from_draft {
+            self.promote_thread_from_draft(thread_id.as_str());
         }
-        self.upsert_thread_conversation_mut(thread_id.as_str(), notification.workspace_id.as_str())
-            .apply(ConversationEvent::TurnFailed {
-                thread_id: notification.thread_id,
-                turn: notification.turn,
-            });
-        self.reset_thread_resume_state(thread_id.as_str());
+        if reduction.queue_thread_list_refresh {
+            self.queue_thread_list_refresh();
+        }
+        if let Some(status) = reduction.thread_status
+            && let Some(coordinator) = self.thread_coordinator_mut(thread_id.as_str())
+            && let Some(thread) = coordinator.thread_mut()
+        {
+            thread.status = status;
+        }
+        self.upsert_thread_conversation_mut(thread_id.as_str(), reduction.workspace_id.as_str())
+            .apply(reduction.conversation_event);
+        if reduction.tick_conversation
+            && let Some(conversation) = self.thread_conversation_mut(thread_id.as_str())
+        {
+            let _ = conversation.tick();
+        }
+        if reduction.reset_thread_resume {
+            self.reset_thread_resume_state(thread_id.as_str());
+        }
+        if reduction.refresh_thread_artifacts
+            && let Some(cx) = cx.as_deref_mut()
+        {
+            self.refresh_thread_artifacts(thread_id.clone(), true, cx);
+        }
+        if reduction.sync_composer_model_selection {
+            self.sync_composer_model_selection_for_active_thread();
+        }
+    }
+
+    fn apply_conversation_event_reduction(&mut self, reduction: ConversationEventReduction) {
+        self.upsert_thread_conversation_mut(
+            reduction.thread_id.as_str(),
+            reduction.workspace_id.as_str(),
+        )
+        .apply(reduction.conversation_event);
+    }
+
+    fn apply_thread_closed_reduction(&mut self, reduction: ThreadClosedReduction) {
+        if reduction.remove_thread_conversation {
+            self.remove_thread_conversation(reduction.thread_id.as_str());
+        }
+        if reduction.clear_active_thread_if_matches {
+            let _ = self.clear_active_thread_if_matches(reduction.thread_id.as_str());
+        }
+        if reduction.queue_thread_list_refresh {
+            self.queue_thread_list_refresh();
+        }
+    }
+
+    fn apply_thread_updated_reduction(&mut self, reduction: ThreadUpdatedReduction) {
+        self.upsert_thread_snapshot(reduction.thread);
+        self.upsert_thread_for_workspace(
+            reduction.thread_id.as_str(),
+            reduction.workspace_id.as_str(),
+        );
+        if reduction.sync_composer_model_selection {
+            self.sync_composer_model_selection_for_active_thread();
+        }
+    }
+
+    fn apply_workspace_refresh_reduction(&mut self, reduction: WorkspaceRefreshReduction) {
+        if reduction.queue_thread_list_refresh {
+            self.queue_thread_list_refresh();
+        }
+    }
+
+    fn apply_workspace_preference_reduction(&mut self, reduction: WorkspacePreferenceReduction) {
+        if let Some(workspace_id) = reduction.set_preferred_workspace_id {
+            self.set_preferred_workspace_id(workspace_id);
+        }
+        if let Some(workspace_id) = reduction.persist_active_gateway_workspace_id {
+            self.persist_active_gateway_workspace_id(workspace_id);
+        }
+        if reduction.queue_thread_list_refresh {
+            self.queue_thread_list_refresh();
+        }
     }
 
     fn apply_thread_tree_changed_notification(
@@ -534,12 +426,9 @@ impl PioneerDesktop {
         notification: pioneer_protocol::ThreadTreeChangedNotification,
     ) {
         let active_workspace = self.active_workspace_scope_for_notifications();
-        if should_refresh_workspace_bound_data(
-            active_workspace.as_deref(),
-            notification.workspace_id.as_str(),
-        ) {
-            self.queue_thread_list_refresh();
-        }
+        let reduction =
+            reduce_thread_tree_changed_notification(notification, active_workspace.as_deref());
+        self.apply_workspace_refresh_reduction(reduction);
     }
 
     fn apply_thread_agents_doc_changed_notification(
@@ -547,12 +436,11 @@ impl PioneerDesktop {
         notification: pioneer_protocol::ThreadAgentsDocChangedNotification,
     ) {
         let active_workspace = self.active_workspace_scope_for_notifications();
-        if should_refresh_workspace_bound_data(
+        let reduction = reduce_thread_agents_doc_changed_notification(
+            notification,
             active_workspace.as_deref(),
-            notification.workspace_id.as_str(),
-        ) {
-            self.queue_thread_list_refresh();
-        }
+        );
+        self.apply_workspace_refresh_reduction(reduction);
     }
 
     fn apply_skills_changed_notification(
@@ -560,54 +448,71 @@ impl PioneerDesktop {
         notification: pioneer_protocol::SkillsChangedNotification,
     ) {
         let active_workspace = self.active_workspace_scope_for_notifications();
-        if should_refresh_workspace_bound_data(
-            active_workspace.as_deref(),
-            notification.workspace_id.as_str(),
-        ) {
+        let reduction =
+            reduce_skills_changed_notification(notification, active_workspace.as_deref());
+        self.apply_skills_refresh_reduction(reduction);
+    }
+
+    fn apply_skills_refresh_reduction(&mut self, reduction: SkillsRefreshReduction) {
+        if reduction.queue_skills_refresh {
             self.queue_skills_refresh();
         }
     }
 
-    fn active_workspace_scope_for_notifications(&self) -> Option<String> {
-        self.active_workspace_id()
-            .map(str::to_owned)
-            .or_else(|| self.preferred_workspace_id().map(str::to_owned))
-            .or_else(|| {
-                self.gateway
-                    .runtime
-                    .as_ref()
-                    .and_then(GatewayRuntime::active_workspace_id)
-                    .map(str::to_owned)
-            })
-    }
-}
-
-pub(super) fn apply_workspace_changed_to_catalog(
-    workspaces: &mut Vec<Workspace>,
-    notification: &WorkspaceChangedNotification,
-) {
-    let workspace = notification.workspace.clone();
-    if matches!(notification.kind, WorkspaceChangeKind::CurrentChanged) && workspace.is_current {
-        for existing in workspaces.iter_mut() {
-            if existing.id != workspace.id {
-                existing.is_current = false;
-            }
+    fn apply_thread_artifacts_refresh_reduction(
+        &mut self,
+        reduction: ThreadArtifactsRefreshReduction,
+        cx: &mut Context<Self>,
+    ) {
+        if reduction.refresh_thread_artifacts {
+            self.refresh_thread_artifacts(reduction.thread_id, reduction.force_refresh, cx);
         }
     }
 
-    upsert_workspace_catalog_item(workspaces, workspace);
-}
+    fn apply_artifact_thread_refresh_reduction(
+        &mut self,
+        reduction: ArtifactThreadRefreshReduction,
+        cx: &mut Context<Self>,
+    ) {
+        if reduction.refresh_thread_artifacts
+            && let Some(thread_id) = reduction.thread_id
+        {
+            self.refresh_thread_artifacts(thread_id, reduction.force_refresh, cx);
+        }
+    }
 
-pub(super) fn should_refresh_workspace_bound_data(
-    active_workspace: Option<&str>,
-    notification_workspace: &str,
-) -> bool {
-    active_workspace == Some(notification_workspace)
-}
+    fn apply_artifact_deleted_refresh_reduction(
+        &mut self,
+        reduction: ArtifactDeletedRefreshReduction,
+        cx: &mut Context<Self>,
+    ) {
+        if reduction.refresh_thread_artifacts
+            && let Some(thread_id) = reduction.active_thread_id
+        {
+            self.refresh_thread_artifacts(thread_id, reduction.force_refresh, cx);
+        }
+    }
 
-pub(super) fn should_accept_thread_started_as_local_pending(
-    pending_thread_id: Option<&str>,
-    started_thread_id: &str,
-) -> bool {
-    pending_thread_id == Some(started_thread_id)
+    fn apply_turn_timeline_refresh_reduction(
+        &mut self,
+        reduction: TurnTimelineRefreshReduction,
+        cx: &mut Context<Self>,
+    ) {
+        if reduction.queue_turn_timeline_refresh {
+            self.refresh_turn_timeline(reduction.thread_id, reduction.turn_id, cx);
+        }
+    }
+
+    fn active_workspace_scope_for_notifications(&self) -> Option<String> {
+        let runtime_workspace_id = self
+            .gateway
+            .runtime
+            .as_ref()
+            .and_then(GatewayRuntime::active_workspace_id);
+        workspace_selectors::resolve_workspace_scope(
+            self.active_workspace_id(),
+            self.preferred_workspace_id(),
+            runtime_workspace_id,
+        )
+    }
 }

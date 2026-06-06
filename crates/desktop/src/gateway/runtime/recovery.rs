@@ -1,8 +1,9 @@
 use crate::gateway::connectivity::is_gateway_reachable;
 use crate::gateway::control::{is_configured_service_active, start_gateway_service};
 use crate::gateway::registry::save_registry;
-use crate::gateway::types::GatewayEndpointKind;
 use anyhow::{Result, bail};
+use pioneer_client::gateway::runtime::classify_local_gateway_state;
+use pioneer_client::gateway::types::GatewayEndpointKind;
 use tracing::info;
 
 use super::discovery::ensure_managed_gateway_up_to_date;
@@ -141,15 +142,4 @@ fn normalize_local_service_active(reachable: bool, service_active: bool) -> bool
     }
 
     service_active
-}
-
-pub(crate) fn classify_local_gateway_state(
-    reachable: bool,
-    service_active: bool,
-) -> ActiveGatewayState {
-    match (reachable, service_active) {
-        (true, true) => ActiveGatewayState::Connected,
-        (true, false) => ActiveGatewayState::LocalAddressConflict,
-        (false, _) => ActiveGatewayState::Unreachable,
-    }
 }

@@ -8,26 +8,26 @@ use crate::gateway::registry::{
     gateway_auth_token_ref, load_registry, save_registry, setup_required,
 };
 use crate::gateway::secrets::DesktopSecrets;
-use crate::gateway::timings::{GatewayTimings, GatewayWsTimings};
-use crate::gateway::types::{GatewayEndpoint, GatewayEndpointKind, GatewayRegistry};
+use crate::gateway::timings::{
+    GatewayTimings, GatewayWsTimings, gateway_timings_from_config, gateway_ws_timings_from_config,
+};
 use anyhow::{Context, Result, bail};
+use pioneer_client::gateway::runtime as client_gateway_runtime;
+use pioneer_client::gateway::secrets::{gateway_auth_token_label, normalize_gateway_auth_token};
+#[cfg(test)]
+use pioneer_client::gateway::types::GatewayEndpointKind;
+use pioneer_client::gateway::types::{GatewayEndpoint, GatewayRegistry};
 use pioneer_config::AppConfig;
 use pioneer_protocol::generate_id;
 use std::path::PathBuf;
 use tracing::{info, warn};
 
+use pioneer_client::gateway::runtime::ActiveGatewayState;
+
 #[cfg(test)]
 pub(crate) use compat::is_same_gateway_version;
 #[cfg(test)]
-pub(crate) use recovery::classify_local_gateway_state;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ActiveGatewayState {
-    NotConfigured,
-    Connected,
-    Unreachable,
-    LocalAddressConflict,
-}
+pub(crate) use pioneer_client::gateway::runtime::classify_local_gateway_state;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LocalGatewayRecovery {
@@ -63,8 +63,8 @@ impl GatewayRuntime {
             .context(t!("errors.runtime.ensure_home").to_string())?;
         let registry_file_name = config.desktop.gateway.registry_file_name.trim();
         let registry_path = runtime_home.join(registry_file_name);
-        let timings = GatewayTimings::from_config(&config.desktop.gateway)?;
-        let ws_timings = GatewayWsTimings::from_config(&config.desktop.gateway)?;
+        let timings = gateway_timings_from_config(&config.desktop.gateway)?;
+        let ws_timings = gateway_ws_timings_from_config(&config.desktop.gateway)?;
         let secrets = DesktopSecrets::open(&runtime_home)?;
         let registry = load_registry(&registry_path, &config)?;
 
@@ -117,7 +117,7 @@ impl GatewayRuntime {
     }
 
     pub fn active_gateway_id(&self) -> Option<&str> {
-        self.registry.active_gateway_id.as_deref()
+        client_gateway_runtime::active_gateway_id(&self.registry)
     }
 
     pub fn endpoints(&self) -> Vec<GatewayEndpoint> {
@@ -130,13 +130,11 @@ impl GatewayRuntime {
     }
 
     pub fn active_gateway(&self) -> Option<&GatewayEndpoint> {
-        let active_id = self.registry.active_gateway_id.as_deref()?;
-        self.endpoint_by_id(active_id)
+        client_gateway_runtime::active_gateway(&self.registry)
     }
 
     pub fn active_workspace_id(&self) -> Option<&str> {
-        self.active_gateway()
-            .and_then(|endpoint| endpoint.workspace_id.as_deref())
+        client_gateway_runtime::active_workspace_id(&self.registry)
     }
 
     pub fn endpoint(&self, id: &str) -> Option<GatewayEndpoint> {
@@ -164,17 +162,14 @@ impl GatewayRuntime {
                     endpoint.id
                 )
             })?
-            .and_then(normalize_token);
+            .and_then(|token| normalize_gateway_auth_token(token.as_str()));
 
         Ok(token)
     }
 
     pub fn activate_gateway(&mut self, id: &str) -> Result<()> {
-        if self.endpoint_by_id(id).is_none() {
-            bail!("{}", t!("errors.gateway.id_not_found", id = id));
-        }
-
-        self.registry.active_gateway_id = Some(id.to_owned());
+        client_gateway_runtime::activate_gateway(&mut self.registry, id)
+            .map_err(map_gateway_profile_error)?;
         save_registry(&self.registry_path, &self.registry)
     }
 
@@ -183,11 +178,12 @@ impl GatewayRuntime {
         gateway_id: &str,
         workspace_id: Option<String>,
     ) -> Result<()> {
-        let Some(endpoint) = self.endpoint_by_id_mut(gateway_id) else {
-            bail!("{}", t!("errors.gateway.id_not_found", id = gateway_id));
-        };
-
-        endpoint.workspace_id = workspace_id;
+        client_gateway_runtime::set_gateway_workspace_id(
+            &mut self.registry,
+            gateway_id,
+            workspace_id,
+        )
+        .map_err(map_gateway_profile_error)?;
         save_registry(&self.registry_path, &self.registry)
     }
 
@@ -198,10 +194,7 @@ impl GatewayRuntime {
         auth_token: Option<&str>,
     ) -> Result<GatewayEndpoint> {
         let address = normalize_address(address)?;
-        let auth_token = auth_token.and_then(|token| {
-            let token = token.trim();
-            (!token.is_empty()).then_some(token.to_owned())
-        });
+        let auth_token = auth_token.and_then(normalize_gateway_auth_token);
 
         if !crate::gateway::connectivity::is_gateway_reachable(
             &address,
@@ -216,104 +209,86 @@ impl GatewayRuntime {
             );
         }
 
-        if let Some(existing_index) = self
-            .registry
-            .remotes
-            .iter()
-            .position(|remote| remote.address == address)
-        {
-            let existing_id = self.registry.remotes[existing_index].id.clone();
-            let existing_name = if name.trim().is_empty() {
-                self.registry.remotes[existing_index].name.clone()
-            } else {
-                name.trim().to_owned()
-            };
-            let had_token_ref = self.registry.remotes[existing_index]
-                .auth_token_ref
-                .as_deref()
-                .is_some_and(|token_ref| !token_ref.trim().is_empty());
-            let auth_token_update = if let Some(token) = auth_token {
-                let token_ref = gateway_auth_token_ref(existing_id.as_str())?;
-                self.secrets.put_gateway_auth_token(
-                    token_ref.as_str(),
-                    token.as_str(),
-                    Some(gateway_token_label(
-                        existing_name.as_str(),
-                        address.as_str(),
-                    )),
-                )?;
-                Some(token_ref)
-            } else {
-                None
-            };
-
-            let existing = self
-                .registry
-                .remotes
-                .get_mut(existing_index)
-                .expect("remote index should exist");
-            existing.name = existing_name;
-            if let Some(token_ref) = auth_token_update {
-                existing.auth_token_ref = Some(token_ref);
-            }
-
-            let endpoint = existing.clone();
-            if let Err(error) = save_registry(&self.registry_path, &self.registry) {
-                if !had_token_ref && let Some(token_ref) = endpoint.auth_token_ref.as_deref() {
-                    let _ = self.secrets.delete_gateway_auth_token(token_ref);
-                }
-                return Err(error);
-            }
-            return Ok(endpoint);
-        }
-
-        let endpoint_id = format!("remote-{}", generate_id(8));
-        let endpoint_name = if name.trim().is_empty() {
+        let plan = client_gateway_runtime::plan_add_remote_gateway_profile(
+            &self.registry,
+            format!("remote-{}", generate_id(8)),
+            name,
+            address.as_str(),
+            auth_token.is_some(),
+            |endpoint_id| {
+                gateway_auth_token_ref(endpoint_id).map_err(|error| {
+                    client_gateway_runtime::GatewayProfileError::InvalidAuthTokenRef {
+                        endpoint_id: endpoint_id.to_owned(),
+                        reason: format!("{error:#}"),
+                    }
+                })
+            },
             t!(
                 "gateway.endpoint.remote_name",
                 index = self.registry.remotes.len() + 1
             )
-            .to_string()
-        } else {
-            name.trim().to_owned()
-        };
+            .to_string(),
+        )
+        .map_err(map_gateway_profile_error)?;
 
-        let mut endpoint = GatewayEndpoint {
-            id: endpoint_id.clone(),
-            name: endpoint_name,
-            address,
-            kind: GatewayEndpointKind::Remote,
-            auth_token_ref: None,
-            workspace_id: None,
-            service_name: None,
+        let previous_token = match &plan {
+            client_gateway_runtime::AddRemoteGatewayProfilePlan::UpdateExisting {
+                previous_endpoint,
+                ..
+            } => self.gateway_auth_token_for_endpoint(previous_endpoint)?,
+            client_gateway_runtime::AddRemoteGatewayProfilePlan::Add { .. } => None,
         };
-
-        let mut wrote_token_ref = None;
-        if let Some(token) = auth_token {
-            let token_ref = gateway_auth_token_ref(endpoint_id.as_str())?;
+        let mut wrote_token_ref: Option<String> = None;
+        if let Some(token) = auth_token.as_deref() {
+            let token_ref = plan
+                .auth_token_ref()
+                .expect("token ref should exist when auth token is present");
             self.secrets.put_gateway_auth_token(
-                token_ref.as_str(),
-                token.as_str(),
-                Some(gateway_token_label(
-                    endpoint.name.as_str(),
-                    endpoint.address.as_str(),
+                token_ref,
+                token,
+                Some(gateway_auth_token_label(
+                    plan.endpoint().name.as_str(),
+                    plan.endpoint().address.as_str(),
                 )),
             )?;
-            endpoint.auth_token_ref = Some(token_ref.clone());
-            wrote_token_ref = Some(token_ref);
+            wrote_token_ref = Some(token_ref.to_owned());
         }
 
-        self.registry.remotes.push(endpoint.clone());
+        client_gateway_runtime::apply_add_remote_gateway_profile_plan(&mut self.registry, &plan);
         if let Err(error) = save_registry(&self.registry_path, &self.registry) {
+            client_gateway_runtime::rollback_add_remote_gateway_profile_plan(
+                &mut self.registry,
+                &plan,
+            );
             if let Some(token_ref) = wrote_token_ref.as_deref() {
-                let _ = self.secrets.delete_gateway_auth_token(token_ref);
+                if let Some(previous_token) = previous_token.as_deref() {
+                    let previous_endpoint = match &plan {
+                        client_gateway_runtime::AddRemoteGatewayProfilePlan::UpdateExisting {
+                            previous_endpoint,
+                            ..
+                        } => Some(previous_endpoint),
+                        client_gateway_runtime::AddRemoteGatewayProfilePlan::Add { .. } => None,
+                    };
+                    if let Some(previous_endpoint) = previous_endpoint
+                        && let Some(previous_token_ref) =
+                            previous_endpoint.auth_token_ref.as_deref()
+                    {
+                        let _ = self.secrets.put_gateway_auth_token(
+                            previous_token_ref,
+                            previous_token,
+                            Some(gateway_auth_token_label(
+                                previous_endpoint.name.as_str(),
+                                previous_endpoint.address.as_str(),
+                            )),
+                        );
+                    }
+                } else {
+                    let _ = self.secrets.delete_gateway_auth_token(token_ref);
+                }
             }
-            self.registry
-                .remotes
-                .retain(|remote| remote.id != endpoint_id);
             return Err(error);
         }
-        Ok(endpoint)
+        Ok(plan.endpoint().clone())
     }
 
     pub fn update_remote_gateway(
@@ -324,91 +299,72 @@ impl GatewayRuntime {
         auth_token: Option<&str>,
     ) -> Result<GatewayEndpoint> {
         let address = normalize_address(address)?;
-        let Some(existing_index) = self
+        let auth_token = auth_token.and_then(normalize_gateway_auth_token);
+        let default_index = self
             .registry
             .remotes
             .iter()
             .position(|remote| remote.id == id)
-        else {
-            bail!("{}", t!("errors.gateway.id_not_found", id = id));
-        };
-
-        if self
-            .registry
-            .remotes
-            .iter()
-            .enumerate()
-            .any(|(index, remote)| index != existing_index && remote.address == address)
-        {
-            bail!(
-                "{}",
-                t!(
-                    "errors.gateway.address_already_exists",
-                    address = address.as_str()
-                )
-            );
-        }
-
-        let old_endpoint = self.registry.remotes[existing_index].clone();
-        let old_token = self.gateway_auth_token_for_endpoint(&old_endpoint)?;
-        let endpoint_name = if name.trim().is_empty() {
-            t!("gateway.endpoint.remote_name", index = existing_index + 1).to_string()
-        } else {
-            name.trim().to_owned()
-        };
-        let auth_token = auth_token.and_then(|token| {
-            let token = token.trim();
-            (!token.is_empty()).then_some(token.to_owned())
-        });
-        let next_token_ref = if auth_token.is_some() {
-            Some(gateway_auth_token_ref(id)?)
-        } else {
-            None
-        };
+            .map(|index| index + 1)
+            .unwrap_or_else(|| self.registry.remotes.len() + 1);
+        let plan = client_gateway_runtime::plan_update_remote_gateway_profile(
+            &self.registry,
+            id,
+            name,
+            address.as_str(),
+            auth_token.is_some(),
+            |endpoint_id| {
+                gateway_auth_token_ref(endpoint_id).map_err(|error| {
+                    client_gateway_runtime::GatewayProfileError::InvalidAuthTokenRef {
+                        endpoint_id: endpoint_id.to_owned(),
+                        reason: format!("{error:#}"),
+                    }
+                })
+            },
+            t!("gateway.endpoint.remote_name", index = default_index).to_string(),
+        )
+        .map_err(map_gateway_profile_error)?;
+        let old_token = self.gateway_auth_token_for_endpoint(&plan.previous_endpoint)?;
 
         if let Some(token) = auth_token.as_deref() {
-            let token_ref = next_token_ref.as_deref().expect("token ref exists");
+            let token_ref = plan
+                .auth_token_ref()
+                .expect("token ref should exist when auth token is present");
             self.secrets.put_gateway_auth_token(
                 token_ref,
                 token,
-                Some(gateway_token_label(
-                    endpoint_name.as_str(),
-                    address.as_str(),
+                Some(gateway_auth_token_label(
+                    plan.endpoint.name.as_str(),
+                    plan.endpoint.address.as_str(),
                 )),
             )?;
         }
 
-        let existing = self
-            .registry
-            .remotes
-            .get_mut(existing_index)
-            .expect("remote index should exist");
-        existing.name = endpoint_name;
-        existing.address = address;
-        existing.auth_token_ref = next_token_ref.clone();
-
-        let endpoint = existing.clone();
+        client_gateway_runtime::apply_update_remote_gateway_profile_plan(&mut self.registry, &plan);
         if let Err(error) = save_registry(&self.registry_path, &self.registry) {
-            self.registry.remotes[existing_index] = old_endpoint.clone();
+            client_gateway_runtime::rollback_update_remote_gateway_profile_plan(
+                &mut self.registry,
+                &plan,
+            );
             if let Some(old_token) = old_token.as_deref() {
-                if let Some(token_ref) = old_endpoint.auth_token_ref.as_deref() {
+                if let Some(token_ref) = plan.previous_endpoint.auth_token_ref.as_deref() {
                     let _ = self.secrets.put_gateway_auth_token(
                         token_ref,
                         old_token,
-                        Some(gateway_token_label(
-                            old_endpoint.name.as_str(),
-                            old_endpoint.address.as_str(),
+                        Some(gateway_auth_token_label(
+                            plan.previous_endpoint.name.as_str(),
+                            plan.previous_endpoint.address.as_str(),
                         )),
                     );
                 }
-            } else if let Some(token_ref) = next_token_ref.as_deref() {
+            } else if let Some(token_ref) = plan.auth_token_ref() {
                 let _ = self.secrets.delete_gateway_auth_token(token_ref);
             }
             return Err(error);
         }
 
         if auth_token.is_none()
-            && let Some(token_ref) = old_endpoint.auth_token_ref.as_deref()
+            && let Some(token_ref) = plan.previous_endpoint.auth_token_ref.as_deref()
             && let Err(error) = self.secrets.delete_gateway_auth_token(token_ref)
         {
             warn!(
@@ -418,43 +374,32 @@ impl GatewayRuntime {
             );
         }
 
-        Ok(endpoint)
+        Ok(plan.endpoint)
     }
 
     pub fn delete_gateway(&mut self, id: &str) -> Result<GatewayDeleteOutcome> {
-        if self.registry.local.id == id {
-            bail!("{}", t!("errors.gateway.local_delete_unsupported"));
-        }
-
-        let Some(existing_index) = self
-            .registry
-            .remotes
-            .iter()
-            .position(|remote| remote.id == id)
-        else {
-            bail!("{}", t!("errors.gateway.id_not_found", id = id));
-        };
-
-        let deleted_endpoint = self.registry.remotes.remove(existing_index);
-        let deleted_active = self.registry.active_gateway_id.as_deref() == Some(id);
-        let previous_active_gateway_id = self.registry.active_gateway_id.clone();
-        let fallback_endpoint = if deleted_active {
-            let fallback = self.endpoints().into_iter().next();
-            self.registry.active_gateway_id = fallback.as_ref().map(|endpoint| endpoint.id.clone());
-            fallback
+        let fallback_endpoint = if self.registry.active_gateway_id.as_deref() == Some(id) {
+            self.remote_delete_fallback_endpoint(id)
         } else {
             None
         };
+        let plan = client_gateway_runtime::plan_delete_remote_gateway_profile(
+            &self.registry,
+            id,
+            fallback_endpoint,
+        )
+        .map_err(map_gateway_profile_error)?;
 
+        client_gateway_runtime::apply_delete_remote_gateway_profile_plan(&mut self.registry, &plan);
         if let Err(error) = save_registry(&self.registry_path, &self.registry) {
-            self.registry
-                .remotes
-                .insert(existing_index, deleted_endpoint.clone());
-            self.registry.active_gateway_id = previous_active_gateway_id;
+            client_gateway_runtime::rollback_delete_remote_gateway_profile_plan(
+                &mut self.registry,
+                &plan,
+            );
             return Err(error);
         }
 
-        if let Some(token_ref) = deleted_endpoint.auth_token_ref.as_deref()
+        if let Some(token_ref) = plan.endpoint.auth_token_ref.as_deref()
             && let Err(error) = self.secrets.delete_gateway_auth_token(token_ref)
         {
             warn!(
@@ -465,8 +410,8 @@ impl GatewayRuntime {
         }
 
         Ok(GatewayDeleteOutcome {
-            deleted_active,
-            fallback_endpoint,
+            deleted_active: plan.deleted_active,
+            fallback_endpoint: plan.fallback_endpoint,
         })
     }
 
@@ -498,7 +443,7 @@ impl GatewayRuntime {
         self.secrets.put_gateway_auth_token(
             token_ref.as_str(),
             token.as_str(),
-            Some(gateway_token_label(
+            Some(gateway_auth_token_label(
                 self.registry.local.name.as_str(),
                 self.registry.local.address.as_str(),
             )),
@@ -508,25 +453,7 @@ impl GatewayRuntime {
     }
 
     fn endpoint_by_id(&self, id: &str) -> Option<&GatewayEndpoint> {
-        if self.registry.local.id == id {
-            return Some(&self.registry.local);
-        }
-
-        self.registry
-            .remotes
-            .iter()
-            .find(|endpoint| endpoint.id == id)
-    }
-
-    fn endpoint_by_id_mut(&mut self, id: &str) -> Option<&mut GatewayEndpoint> {
-        if self.registry.local.id == id {
-            return Some(&mut self.registry.local);
-        }
-
-        self.registry
-            .remotes
-            .iter_mut()
-            .find(|endpoint| endpoint.id == id)
+        client_gateway_runtime::endpoint_by_id(&self.registry, id)
     }
 
     fn local_gateway_id(&self) -> &str {
@@ -551,6 +478,18 @@ impl GatewayRuntime {
             }
         }
     }
+
+    fn remote_delete_fallback_endpoint(&self, deleted_id: &str) -> Option<GatewayEndpoint> {
+        if self.local_gateway_is_selectable() {
+            return Some(self.registry.local.clone());
+        }
+
+        self.registry
+            .remotes
+            .iter()
+            .find(|endpoint| endpoint.id != deleted_id)
+            .cloned()
+    }
 }
 
 pub fn ensure_runtime_home_dir() -> Result<PathBuf> {
@@ -567,13 +506,36 @@ pub fn ensure_runtime_home_dir() -> Result<PathBuf> {
     Ok(runtime_home)
 }
 
-fn gateway_token_label(name: &str, address: &str) -> String {
-    format!("{} ({})", name.trim(), address.trim())
-}
-
-fn normalize_token(token: String) -> Option<String> {
-    let trimmed = token.trim();
-    (!trimmed.is_empty()).then_some(trimmed.to_owned())
+fn map_gateway_profile_error(error: client_gateway_runtime::GatewayProfileError) -> anyhow::Error {
+    match error {
+        client_gateway_runtime::GatewayProfileError::EndpointNotFound { id } => {
+            anyhow::anyhow!("{}", t!("errors.gateway.id_not_found", id = id))
+        }
+        client_gateway_runtime::GatewayProfileError::LocalGatewayDeleteUnsupported => {
+            anyhow::anyhow!("{}", t!("errors.gateway.local_delete_unsupported"))
+        }
+        client_gateway_runtime::GatewayProfileError::DuplicateRemoteAddress { address } => {
+            anyhow::anyhow!(
+                "{}",
+                t!(
+                    "errors.gateway.address_already_exists",
+                    address = address.as_str()
+                )
+            )
+        }
+        client_gateway_runtime::GatewayProfileError::InvalidAddress { address, .. } => {
+            anyhow::anyhow!(
+                "{}",
+                t!(
+                    "errors.gateway.invalid_address",
+                    normalized = address.as_str()
+                )
+            )
+        }
+        client_gateway_runtime::GatewayProfileError::InvalidAuthTokenRef { reason, .. } => {
+            anyhow::anyhow!("{reason}")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -590,9 +552,9 @@ impl GatewayRuntime {
 
         let config = test_config();
         let timings =
-            GatewayTimings::from_config(&config.desktop.gateway).expect("gateway timings");
+            gateway_timings_from_config(&config.desktop.gateway).expect("gateway timings");
         let ws_timings =
-            GatewayWsTimings::from_config(&config.desktop.gateway).expect("gateway ws timings");
+            gateway_ws_timings_from_config(&config.desktop.gateway).expect("gateway ws timings");
         let registry = default_registry(&config).expect("default registry");
         let registry_path =
             unique_temp_dir().join(config.desktop.gateway.registry_file_name.as_str());
@@ -638,9 +600,9 @@ mod tests {
     fn test_runtime(registry_path: PathBuf, secrets: DesktopSecrets) -> GatewayRuntime {
         let config = test_config();
         let timings =
-            GatewayTimings::from_config(&config.desktop.gateway).expect("gateway timings");
+            gateway_timings_from_config(&config.desktop.gateway).expect("gateway timings");
         let ws_timings =
-            GatewayWsTimings::from_config(&config.desktop.gateway).expect("gateway ws timings");
+            gateway_ws_timings_from_config(&config.desktop.gateway).expect("gateway ws timings");
         let registry = default_registry(&config).expect("default registry");
 
         GatewayRuntime {

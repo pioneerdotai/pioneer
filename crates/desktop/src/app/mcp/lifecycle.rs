@@ -3,9 +3,19 @@ use crate::{
     gateway::GatewayRuntime,
 };
 use gpui::{prelude::*, *};
+use pioneer_client::mcp::{
+    details as mcp_details, list as mcp_list,
+    notifications::{
+        McpRefreshReduction, McpServerCatalogChangedReduction, McpServerStatusChangedReduction,
+        apply_mcp_server_catalog_changed_to_catalog, apply_mcp_server_status_changed_to_catalog,
+        apply_mcp_server_status_changed_to_details, reduce_mcp_changed_notification,
+        reduce_mcp_server_catalog_changed_notification,
+        reduce_mcp_server_status_changed_notification,
+    },
+};
+use pioneer_client::workspaces::selectors as workspace_selectors;
 use pioneer_protocol::{
-    McpChangedNotification, McpListItem, McpListParams, McpServerCatalogChangedNotification,
-    McpServerDetailsParams, McpServerDetailsResponse, McpServerStatusChangedNotification,
+    McpChangedNotification, McpServerCatalogChangedNotification, McpServerStatusChangedNotification,
 };
 use std::time::Duration;
 use tracing::warn;
@@ -26,8 +36,7 @@ impl PioneerDesktop {
         server_id: String,
         cx: &mut Context<Self>,
     ) {
-        let exists = self.mcp_servers.iter().any(|server| server.id == server_id);
-        if !exists {
+        if !mcp_list::mcp_server_exists_by_id(self.mcp_servers.as_slice(), server_id.as_str()) {
             self.mcp_error = Some(t!("mcp.error.server_not_available").to_string());
             return;
         }
@@ -44,12 +53,8 @@ impl PioneerDesktop {
         server_id: String,
         cx: &mut Context<Self>,
     ) {
-        let server_id = self
-            .mcp_servers
-            .iter()
-            .find(|server| server.id == server_id || server.name == server_id)
-            .map(|server| server.id.clone())
-            .unwrap_or(server_id);
+        let server_id =
+            mcp_list::resolve_mcp_server_id_from_timeline(self.mcp_servers.as_slice(), server_id);
 
         self.mcp_selected_server_id = Some(server_id);
         self.mcp_server_details = None;
@@ -114,9 +119,9 @@ impl PioneerDesktop {
             let mut cx = cx.clone();
             async move {
                 let result = cx
-                    .background_spawn(
-                        async move { ws_sender.mcp_list(McpListParams { workspace_id }) },
-                    )
+                    .background_spawn(async move {
+                        ws_sender.mcp_list(mcp_list::mcp_list_params(workspace_id))
+                    })
                     .await;
 
                 let _ = this.update(&mut cx, |view, cx| {
@@ -180,10 +185,10 @@ impl PioneerDesktop {
             async move {
                 let result = cx
                     .background_spawn(async move {
-                        ws_sender.mcp_server_details(McpServerDetailsParams {
+                        ws_sender.mcp_server_details(mcp_details::mcp_server_details_params(
                             workspace_id,
-                            server_id: server_id.clone(),
-                        })
+                            server_id.clone(),
+                        ))
                     })
                     .await;
 
@@ -219,12 +224,20 @@ impl PioneerDesktop {
         &mut self,
         notification: McpChangedNotification,
     ) {
-        if !self.mcp_notification_workspace_matches(notification.workspace_id.as_str()) {
-            return;
-        }
+        let current_workspace = self.mcp_workspace_scope();
+        let reduction = reduce_mcp_changed_notification(
+            notification,
+            current_workspace.as_deref(),
+            self.mcp_selected_server_id.as_deref(),
+        );
+        self.apply_mcp_refresh_reduction(reduction);
+    }
 
-        self.queue_mcp_refresh();
-        if self.mcp_selected_server_id.is_some() {
+    fn apply_mcp_refresh_reduction(&mut self, reduction: McpRefreshReduction) {
+        if reduction.queue_mcp_refresh {
+            self.queue_mcp_refresh();
+        }
+        if reduction.queue_mcp_details_refresh {
             self.queue_mcp_details_refresh();
         }
     }
@@ -233,29 +246,34 @@ impl PioneerDesktop {
         &mut self,
         notification: McpServerStatusChangedNotification,
     ) {
-        if !self.mcp_notification_workspace_matches(notification.workspace_id.as_str()) {
+        let current_workspace = self.mcp_workspace_scope();
+        let reduction = reduce_mcp_server_status_changed_notification(
+            notification,
+            current_workspace.as_deref(),
+            self.mcp_selected_server_id.as_deref(),
+            self.mcp_server_details.is_some(),
+        );
+        self.apply_mcp_server_status_changed_reduction(reduction);
+    }
+
+    fn apply_mcp_server_status_changed_reduction(
+        &mut self,
+        reduction: McpServerStatusChangedReduction,
+    ) {
+        if !reduction.workspace_matches {
             return;
         }
 
-        for server in &mut self.mcp_servers {
-            if server.id == notification.server.id {
-                server.runtime = notification.server.runtime.clone();
-                server.status = notification.server.status;
-                server.status_reason = notification.server.status_reason.clone();
+        apply_mcp_server_status_changed_to_catalog(&mut self.mcp_servers, &reduction.notification);
+
+        if reduction.update_selected_details {
+            if let Some(details) = self.mcp_server_details.as_mut() {
+                apply_mcp_server_status_changed_to_details(details, &reduction.notification);
             }
         }
 
-        if self.mcp_selected_server_id.as_deref() == Some(notification.server.id.as_str()) {
-            if let Some(details) = self.mcp_server_details.as_mut() {
-                details.server.runtime = notification.server.runtime.clone();
-                details.server.status = notification.server.status;
-                details.server.status_reason = notification.server.status_reason.clone();
-                details.health.runtime = notification.server.runtime;
-                details.health.status = notification.server.status;
-                details.health.status_reason = notification.server.status_reason;
-            } else {
-                self.queue_mcp_details_refresh();
-            }
+        if reduction.queue_mcp_details_refresh {
+            self.queue_mcp_details_refresh();
         }
     }
 
@@ -263,93 +281,82 @@ impl PioneerDesktop {
         &mut self,
         notification: McpServerCatalogChangedNotification,
     ) {
-        if !self.mcp_notification_workspace_matches(notification.workspace_id.as_str()) {
+        let current_workspace = self.mcp_workspace_scope();
+        let reduction = reduce_mcp_server_catalog_changed_notification(
+            notification,
+            current_workspace.as_deref(),
+            self.mcp_selected_server_id.as_deref(),
+        );
+        self.apply_mcp_server_catalog_changed_reduction(reduction);
+    }
+
+    fn apply_mcp_server_catalog_changed_reduction(
+        &mut self,
+        reduction: McpServerCatalogChangedReduction,
+    ) {
+        if !reduction.workspace_matches {
             return;
         }
 
-        for server in &mut self.mcp_servers {
-            if server.id == notification.server_id {
-                server.tools_count = notification.tools_count;
-                server.resources_count = notification.resources_count;
-                server.resource_templates_count = notification.resource_templates_count;
-                server.prompts_count = notification.prompts_count;
-            }
-        }
+        apply_mcp_server_catalog_changed_to_catalog(&mut self.mcp_servers, &reduction.notification);
 
-        if self.mcp_selected_server_id.as_deref() == Some(notification.server_id.as_str()) {
+        if reduction.queue_mcp_details_refresh {
             self.queue_mcp_details_refresh();
         }
     }
 
     pub(in crate::app) fn mcp_workspace_scope(&self) -> Option<String> {
-        self.preferred_workspace_id()
-            .map(str::to_owned)
-            .or_else(|| {
-                self.gateway
-                    .runtime
-                    .as_ref()
-                    .and_then(GatewayRuntime::active_workspace_id)
-                    .map(str::to_owned)
-            })
-            .and_then(|workspace_id| {
-                let trimmed = workspace_id.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_owned())
-                }
-            })
+        let runtime_workspace_id = self
+            .gateway
+            .runtime
+            .as_ref()
+            .and_then(GatewayRuntime::active_workspace_id);
+        workspace_selectors::resolve_workspace_scope(
+            None,
+            self.preferred_workspace_id(),
+            runtime_workspace_id,
+        )
     }
 
     pub(super) fn is_mcp_pending(&self, name: &str) -> bool {
-        self.mcp_pending_actions.contains(name)
+        mcp_list::is_mcp_pending(&self.mcp_pending_actions, name)
     }
 
     pub(super) fn mark_mcp_pending(&mut self, name: &str, pending: bool) {
-        if pending {
-            self.mcp_pending_actions.insert(name.to_owned());
-        } else {
-            self.mcp_pending_actions.remove(name);
+        mcp_list::set_mcp_pending(&mut self.mcp_pending_actions, name, pending);
+    }
+
+    fn apply_mcp_snapshot(
+        &mut self,
+        servers: Vec<pioneer_protocol::McpListItem>,
+        cx: &mut Context<Self>,
+    ) {
+        let application = mcp_list::apply_mcp_snapshot(
+            &mut self.mcp_servers,
+            &mut self.mcp_pending_actions,
+            &mut self.mcp_selected_server_id,
+            &mut self.mcp_server_details,
+            servers,
+        );
+
+        if application.selected_still_present
+            && self.main_content_view == MainContentView::McpDetails
+        {
+            self.refresh_mcp_server_details(cx);
+        } else if application.selected_removed
+            && self.main_content_view == MainContentView::McpDetails
+        {
+            self.set_main_content_view(MainContentView::Mcp, cx);
         }
     }
 
-    fn apply_mcp_snapshot(&mut self, servers: Vec<McpListItem>, cx: &mut Context<Self>) {
-        self.mcp_pending_actions.retain(|name| {
-            name == "__install__" || servers.iter().any(|server| server.name == *name)
-        });
-
-        self.mcp_servers = servers;
-
-        if let Some(server_id) = self.mcp_selected_server_id.clone() {
-            let still_present = self.mcp_servers.iter().any(|server| server.id == server_id);
-            if still_present {
-                if self.main_content_view == MainContentView::McpDetails {
-                    self.refresh_mcp_server_details(cx);
-                }
-            } else {
-                self.mcp_selected_server_id = None;
-                self.mcp_server_details = None;
-                if self.main_content_view == MainContentView::McpDetails {
-                    self.set_main_content_view(MainContentView::Mcp, cx);
-                }
-            }
-        }
-    }
-
-    fn apply_mcp_details_response(&mut self, details: McpServerDetailsResponse) {
-        self.mcp_selected_server_id = Some(details.server.id.clone());
-        for server in &mut self.mcp_servers {
-            if server.id == details.server.id {
-                *server = details.server.clone();
-            }
-        }
-        self.mcp_server_details = Some(details);
-    }
-
-    fn mcp_notification_workspace_matches(&self, workspace_id: &str) -> bool {
-        self.mcp_workspace_scope()
-            .as_deref()
-            .is_some_and(|current| current == workspace_id)
+    fn apply_mcp_details_response(&mut self, details: pioneer_protocol::McpServerDetailsResponse) {
+        mcp_details::apply_mcp_details_response(
+            &mut self.mcp_servers,
+            &mut self.mcp_selected_server_id,
+            &mut self.mcp_server_details,
+            details,
+        );
     }
 
     fn ensure_mcp_poller(&mut self, cx: &mut Context<Self>) {

@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskReviewPlanError",
+  "oneOf": [
+    {
+      "type": "string",
+      "enum": [
+        "UserControlsNotAllowed",
+        "MissingTaskId",
+        "MissingRunId",
+        "MissingCandidateId",
+        "BlankFeedback"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "ActionNotAllowed": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "$ref": "#/$defs/TaskReviewAction"
+            }
+          },
+          "required": [
+            "action"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "ActionNotAllowed"
+      ]
+    }
+  ],
+  "$defs": {
+    "TaskReviewAction": {
+      "type": "string",
+      "enum": [
+        "Accept",
+        "Revise",
+        "Cancel"
+      ]
+    }
+  }
+}

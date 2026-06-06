@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TimelineCoalescedToolsRow",
+  "type": "object",
+  "properties": {
+    "count": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0
+    },
+    "is_open": {
+      "type": "boolean"
+    },
+    "kind": {
+      "$ref": "#/$defs/TimelineCoalescedToolsKind"
+    },
+    "toggle_key": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "toggle_key",
+    "count",
+    "is_open",
+    "kind"
+  ],
+  "$defs": {
+    "TimelineCoalescedToolsKind": {
+      "type": "string",
+      "enum": [
+        "CompletedTaskTools",
+        "RepeatedTaskWait"
+      ]
+    }
+  }
+}

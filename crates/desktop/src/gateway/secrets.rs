@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use pioneer_client::gateway::secrets::{GatewayAuthTokenRef, normalize_gateway_auth_token};
 use pioneer_keystore::{
     DbKeyStore, DbKeyStoreConfig, SecretEntryMeta, SecretFilter, SecretId, SecretKind, SecretMeta,
     SecretStore,
@@ -27,8 +28,7 @@ impl DesktopSecrets {
     }
 
     pub(crate) fn get_gateway_auth_token(&self, token_ref: &str) -> Result<Option<String>> {
-        let id = SecretId::desktop_gateway_auth_token(token_ref)
-            .context("invalid desktop gateway auth token ref")?;
+        let id = desktop_gateway_auth_secret_id(token_ref)?;
         self.store
             .get_string(&id)
             .context("failed to read desktop gateway auth token from keystore")
@@ -40,13 +40,11 @@ impl DesktopSecrets {
         token: &str,
         label: Option<String>,
     ) -> Result<()> {
-        let token = token.trim();
-        if token.is_empty() {
+        let Some(token) = normalize_gateway_auth_token(token) else {
             bail!("desktop gateway auth token must not be empty");
-        }
+        };
 
-        let id = SecretId::desktop_gateway_auth_token(token_ref)
-            .context("invalid desktop gateway auth token ref")?;
+        let id = desktop_gateway_auth_secret_id(token_ref)?;
         let now = current_unix_i64()?;
         let created_at = self
             .existing_gateway_auth_token_meta(&id)?
@@ -62,7 +60,7 @@ impl DesktopSecrets {
         self.store
             .put_string(
                 &id,
-                token,
+                token.as_str(),
                 SecretMeta {
                     kind: SecretKind::DesktopGatewayAuthToken,
                     label: Some(label),
@@ -74,8 +72,7 @@ impl DesktopSecrets {
     }
 
     pub(crate) fn delete_gateway_auth_token(&self, token_ref: &str) -> Result<bool> {
-        let id = SecretId::desktop_gateway_auth_token(token_ref)
-            .context("invalid desktop gateway auth token ref")?;
+        let id = desktop_gateway_auth_secret_id(token_ref)?;
         self.store
             .delete(&id)
             .context("failed to delete desktop gateway auth token from keystore")
@@ -88,6 +85,13 @@ impl DesktopSecrets {
             .context("failed to list desktop gateway auth tokens from keystore")?;
         Ok(entries.into_iter().find(|entry| entry.id == *id))
     }
+}
+
+fn desktop_gateway_auth_secret_id(token_ref: &str) -> Result<SecretId> {
+    let token_ref =
+        GatewayAuthTokenRef::new(token_ref).context("invalid gateway auth token ref")?;
+    SecretId::desktop_gateway_auth_token(token_ref.as_str())
+        .context("invalid desktop gateway auth token ref")
 }
 
 fn current_unix_i64() -> Result<i64> {

@@ -1,0 +1,264 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GatewayStatusProjection",
+  "type": "object",
+  "properties": {
+    "clear_gateway_error": {
+      "type": "boolean"
+    },
+    "connection_state": {
+      "$ref": "#/$defs/GatewayConnectionState"
+    },
+    "status": {
+      "$ref": "#/$defs/GatewayStatusTextUpdate"
+    },
+    "status_level": {
+      "$ref": "#/$defs/GatewayStatusLevel"
+    }
+  },
+  "required": [
+    "status",
+    "status_level",
+    "connection_state",
+    "clear_gateway_error"
+  ],
+  "$defs": {
+    "GatewayConnectionState": {
+      "type": "string",
+      "enum": [
+        "Idle",
+        "Connecting",
+        "Connected",
+        "Reconnecting",
+        "Disconnected"
+      ]
+    },
+    "GatewayStatusLevel": {
+      "type": "string",
+      "enum": [
+        "Neutral",
+        "Connected",
+        "Degraded",
+        "Failed"
+      ]
+    },
+    "GatewayStatusMessage": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "Connecting",
+            "StartingLocal",
+            "Connected",
+            "NotConfigured",
+            "Unavailable",
+            "LocalConflict",
+            "SubsystemNotReady"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ConnectingNamed": {
+              "type": "object",
+              "properties": {
+                "endpoint_name": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "endpoint_name"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "ConnectingNamed"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Reconnecting": {
+              "type": "object",
+              "properties": {
+                "attempt": {
+                  "type": "integer",
+                  "format": "uint32",
+                  "minimum": 0
+                },
+                "delay_ms": {
+                  "type": "integer",
+                  "format": "uint64",
+                  "minimum": 0
+                },
+                "endpoint_name": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "endpoint_name",
+                "attempt",
+                "delay_ms"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Reconnecting"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ConnectedEndpoint": {
+              "type": "object",
+              "properties": {
+                "address": {
+                  "type": "string"
+                },
+                "endpoint_name": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "endpoint_name",
+                "address"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "ConnectedEndpoint"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "LocalStopped": {
+              "type": "object",
+              "properties": {
+                "address": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "address"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "LocalStopped"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "RemoteUnavailable": {
+              "type": "object",
+              "properties": {
+                "address": {
+                  "type": "string"
+                },
+                "endpoint_name": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "endpoint_name",
+                "address"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "RemoteUnavailable"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "LocalConflictAt": {
+              "type": "object",
+              "properties": {
+                "address": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "address"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "LocalConflictAt"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "FailedCheck": {
+              "type": "object",
+              "properties": {
+                "error": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "error"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "FailedCheck"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "SubsystemFailed": {
+              "type": "object",
+              "properties": {
+                "error": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "error"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "SubsystemFailed"
+          ]
+        }
+      ]
+    },
+    "GatewayStatusTextUpdate": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "KeepExisting"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Set": {
+              "$ref": "#/$defs/GatewayStatusMessage"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Set"
+          ]
+        }
+      ]
+    }
+  }
+}

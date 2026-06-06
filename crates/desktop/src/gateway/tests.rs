@@ -1,10 +1,11 @@
-use super::ActiveGatewayState;
 use super::connectivity::normalize_address;
 use super::registry::{
     default_registry, load_registry, normalize_registry, save_registry, setup_required,
 };
 use super::runtime::{classify_local_gateway_state, is_same_gateway_version};
-use super::types::{GatewayEndpoint, GatewayEndpointKind, GatewayRegistry};
+use pioneer_client::gateway::runtime::ActiveGatewayState;
+use pioneer_client::gateway::types::GatewayRegistry;
+use pioneer_client::gateway::types::{GatewayEndpoint, GatewayEndpointKind};
 use pioneer_config::{
     AppConfig, DesktopConfig, GatewayArtifactsConfig, GatewayAuthConfig,
     GatewayComputerUseToolsConfig, GatewayConfig, GatewayDatabaseConfig, GatewayMemoryConfig,

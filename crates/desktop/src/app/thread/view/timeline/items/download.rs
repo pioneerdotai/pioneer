@@ -5,65 +5,11 @@ use crate::app::{
 };
 use gpui::{prelude::*, *};
 use gpui_component::{collapsible::Collapsible, h_flex, spinner::Spinner, v_flex, *};
+use pioneer_client::timeline::labels::{
+    TimelineFinalStatusKind, download_url_from_arguments, final_download_status, format_bytes_human,
+};
 use pioneer_protocol::TurnItem;
-use serde_json::Value as JsonValue;
 use std::hash::{Hash, Hasher};
-
-fn download_url_from_arguments(arguments: &JsonValue) -> Option<String> {
-    arguments
-        .get("url")
-        .and_then(JsonValue::as_str)
-        .map(str::trim)
-        .filter(|url| !url.is_empty())
-        .map(str::to_owned)
-}
-
-fn final_download_status(
-    status: TimelineEntryStatus,
-    success: Option<bool>,
-    status_code: Option<u16>,
-) -> (String, bool) {
-    match status {
-        TimelineEntryStatus::Cancelled => (t!("timeline.download.cancelled").to_string(), false),
-        TimelineEntryStatus::Failed => (t!("timeline.download.failed").to_string(), false),
-        TimelineEntryStatus::Running => (t!("timeline.download.running").to_string(), true),
-        TimelineEntryStatus::Completed => {
-            if matches!(success, Some(false)) || status_code.is_some_and(|code| code >= 400) {
-                (t!("timeline.download.failed").to_string(), false)
-            } else {
-                (t!("timeline.download.completed").to_string(), true)
-            }
-        }
-    }
-}
-
-fn byte_unit_label(unit_idx: usize) -> String {
-    match unit_idx {
-        0 => t!("timeline.download.unit_b").to_string(),
-        1 => t!("timeline.download.unit_kb").to_string(),
-        2 => t!("timeline.download.unit_mb").to_string(),
-        3 => t!("timeline.download.unit_gb").to_string(),
-        _ => t!("timeline.download.unit_tb").to_string(),
-    }
-}
-
-fn format_bytes_human(bytes: u64) -> String {
-    let mut value = bytes as f64;
-    let mut unit_idx = 0usize;
-    while value >= 1024.0 && unit_idx < 4 {
-        value /= 1024.0;
-        unit_idx += 1;
-    }
-    let unit = byte_unit_label(unit_idx);
-
-    if unit_idx == 0 {
-        format!("{bytes} {unit}")
-    } else if value.fract() < 0.05 {
-        format!("{value:.0} {unit}")
-    } else {
-        format!("{value:.1} {unit}")
-    }
-}
 
 impl PioneerDesktop {
     pub(super) fn render_item_download(
@@ -125,8 +71,9 @@ impl PioneerDesktop {
         entry.id.hash(&mut toggle_id_hasher);
         let toggle_id = toggle_id_hasher.finish();
 
-        let (final_status, is_successful) =
-            final_download_status(item_view.status, success, status_code);
+        let status = final_download_status(item_view.status, success, status_code);
+        let final_status = download_status_label(status.kind);
+        let is_successful = status.successful;
 
         let content = if item_view.status == TimelineEntryStatus::Running {
             v_flex()
@@ -263,5 +210,14 @@ impl PioneerDesktop {
         };
 
         self.render_item_row(is_first_row, is_last_row, content_width, content)
+    }
+}
+
+fn download_status_label(kind: TimelineFinalStatusKind) -> String {
+    match kind {
+        TimelineFinalStatusKind::Cancelled => t!("timeline.download.cancelled").to_string(),
+        TimelineFinalStatusKind::Failed => t!("timeline.download.failed").to_string(),
+        TimelineFinalStatusKind::Running => t!("timeline.download.running").to_string(),
+        TimelineFinalStatusKind::Completed => t!("timeline.download.completed").to_string(),
     }
 }

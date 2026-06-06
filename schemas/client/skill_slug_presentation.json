@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SkillSlugPresentation",
+  "type": "object",
+  "properties": {
+    "owner": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "slug": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "slug"
+  ]
+}

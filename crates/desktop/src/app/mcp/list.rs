@@ -1,7 +1,8 @@
 use crate::{app::root::PioneerDesktop, assets::PioneerIconName};
 use gpui::{prelude::*, *};
 use gpui_component::{button::*, scroll::Scrollbar, theme::ActiveTheme, *};
-use pioneer_protocol::{McpListItem, McpRuntimeState, McpServerStatus, McpTransportSummary};
+use pioneer_client::mcp::presentation as mcp_presentation;
+use pioneer_protocol::{McpListItem, McpServerStatus};
 use std::rc::Rc;
 
 const MCP_SERVER_CARD_HEIGHT: f32 = 78.0;
@@ -137,16 +138,9 @@ impl PioneerDesktop {
     ) -> AnyElement {
         let status_color = Self::mcp_status_color(server.status, cx);
         let status_label = Self::mcp_status_label(server.status);
-        let capability_labels = Self::mcp_capability_labels(
-            server.tools_count,
-            server.resources_count,
-            server.resource_templates_count,
-            server.prompts_count,
-        );
-        let display_name = server
-            .display_name
-            .clone()
-            .unwrap_or_else(|| server.name.clone());
+        let capability_labels =
+            Self::mcp_capability_labels(mcp_presentation::mcp_capability_counts(server).as_slice());
+        let display_name = mcp_presentation::mcp_display_name(server);
 
         v_flex()
             .id(("mcp-server-row", index))
@@ -230,78 +224,74 @@ impl PioneerDesktop {
     }
 
     pub(super) fn mcp_status_label(status: McpServerStatus) -> String {
-        match status {
-            McpServerStatus::NotStarted => t!("mcp.status.not_started").to_string(),
-            McpServerStatus::Disabled => t!("mcp.status.disabled").to_string(),
-            McpServerStatus::Starting => t!("mcp.status.starting").to_string(),
-            McpServerStatus::Ready => t!("mcp.status.ready").to_string(),
-            McpServerStatus::Degraded => t!("mcp.status.degraded").to_string(),
-            McpServerStatus::AuthRequired => t!("mcp.status.auth_required").to_string(),
-            McpServerStatus::Failed => t!("mcp.status.failed").to_string(),
-            McpServerStatus::Stopping => t!("mcp.status.stopping").to_string(),
-            McpServerStatus::Stopped => t!("mcp.status.stopped").to_string(),
-            McpServerStatus::Restarting => t!("mcp.status.restarting").to_string(),
-        }
+        Self::mcp_status_label_from_kind(mcp_presentation::mcp_status_label(status))
     }
 
-    pub(super) fn mcp_runtime_label(status: McpRuntimeState) -> String {
+    pub(super) fn mcp_status_label_from_kind(status: mcp_presentation::McpStatusLabel) -> String {
         match status {
-            McpRuntimeState::NotStarted => t!("mcp.status.not_started").to_string(),
-            McpRuntimeState::Disabled => t!("mcp.status.disabled").to_string(),
-            McpRuntimeState::Starting => t!("mcp.status.starting").to_string(),
-            McpRuntimeState::Ready => t!("mcp.status.ready").to_string(),
-            McpRuntimeState::Degraded => t!("mcp.status.degraded").to_string(),
-            McpRuntimeState::AuthRequired => t!("mcp.status.auth_required").to_string(),
-            McpRuntimeState::Failed => t!("mcp.status.failed").to_string(),
-            McpRuntimeState::Stopping => t!("mcp.status.stopping").to_string(),
-            McpRuntimeState::Stopped => t!("mcp.status.stopped").to_string(),
-            McpRuntimeState::Restarting => t!("mcp.status.restarting").to_string(),
+            mcp_presentation::McpStatusLabel::NotStarted => {
+                t!("mcp.status.not_started").to_string()
+            }
+            mcp_presentation::McpStatusLabel::Disabled => t!("mcp.status.disabled").to_string(),
+            mcp_presentation::McpStatusLabel::Starting => t!("mcp.status.starting").to_string(),
+            mcp_presentation::McpStatusLabel::Ready => t!("mcp.status.ready").to_string(),
+            mcp_presentation::McpStatusLabel::Degraded => t!("mcp.status.degraded").to_string(),
+            mcp_presentation::McpStatusLabel::AuthRequired => {
+                t!("mcp.status.auth_required").to_string()
+            }
+            mcp_presentation::McpStatusLabel::Failed => t!("mcp.status.failed").to_string(),
+            mcp_presentation::McpStatusLabel::Stopping => t!("mcp.status.stopping").to_string(),
+            mcp_presentation::McpStatusLabel::Stopped => t!("mcp.status.stopped").to_string(),
+            mcp_presentation::McpStatusLabel::Restarting => t!("mcp.status.restarting").to_string(),
         }
     }
 
     pub(super) fn mcp_status_color(status: McpServerStatus, cx: &mut Context<Self>) -> Hsla {
-        match status {
-            McpServerStatus::Ready => cx.theme().success,
-            McpServerStatus::Degraded | McpServerStatus::Starting | McpServerStatus::Restarting => {
-                cx.theme().warning
-            }
-            McpServerStatus::Failed | McpServerStatus::AuthRequired => cx.theme().danger,
-            McpServerStatus::Disabled | McpServerStatus::Stopped | McpServerStatus::Stopping => {
-                cx.theme().muted_foreground
-            }
-            McpServerStatus::NotStarted => cx.theme().foreground.opacity(0.45),
+        match mcp_presentation::mcp_status_tone(status) {
+            mcp_presentation::McpPresentationTone::Success => cx.theme().success,
+            mcp_presentation::McpPresentationTone::Warning => cx.theme().warning,
+            mcp_presentation::McpPresentationTone::Danger => cx.theme().danger,
+            mcp_presentation::McpPresentationTone::Muted => cx.theme().muted_foreground,
+            mcp_presentation::McpPresentationTone::Default => cx.theme().foreground.opacity(0.84),
         }
     }
 
-    pub(super) fn mcp_transport_label(transport: &McpTransportSummary) -> String {
+    pub(super) fn mcp_transport_label_from_presentation(
+        transport: &mcp_presentation::McpTransportPresentation,
+    ) -> String {
         match transport {
-            McpTransportSummary::Stdio { command } => format!("stdio: {command}"),
-            McpTransportSummary::StreamableHttp { url } => format!("http: {url}"),
+            mcp_presentation::McpTransportPresentation::Stdio { command } => {
+                format!("stdio: {command}")
+            }
+            mcp_presentation::McpTransportPresentation::StreamableHttp { url } => {
+                format!("http: {url}")
+            }
         }
     }
 
     pub(super) fn mcp_capability_labels(
-        tools_count: usize,
-        resources_count: usize,
-        resource_templates_count: usize,
-        prompts_count: usize,
+        counts: &[mcp_presentation::McpCapabilityCount],
     ) -> Vec<String> {
-        [
-            (tools_count, t!("mcp.capabilities.tools").to_string()),
-            (
-                resources_count,
-                t!("mcp.capabilities.resources").to_string(),
-            ),
-            (
-                resource_templates_count,
-                t!("mcp.capabilities.templates").to_string(),
-            ),
-            (prompts_count, t!("mcp.capabilities.prompts").to_string()),
-        ]
-        .into_iter()
-        .filter(|(count, _)| *count > 0)
-        .map(|(count, label)| format!("{count} {label}"))
-        .collect()
+        counts
+            .iter()
+            .map(|count| {
+                let label = match count.kind {
+                    mcp_presentation::McpCapabilityKind::Tools => {
+                        t!("mcp.capabilities.tools").to_string()
+                    }
+                    mcp_presentation::McpCapabilityKind::Resources => {
+                        t!("mcp.capabilities.resources").to_string()
+                    }
+                    mcp_presentation::McpCapabilityKind::ResourceTemplates => {
+                        t!("mcp.capabilities.templates").to_string()
+                    }
+                    mcp_presentation::McpCapabilityKind::Prompts => {
+                        t!("mcp.capabilities.prompts").to_string()
+                    }
+                };
+                format!("{} {label}", count.count)
+            })
+            .collect()
     }
 }
 

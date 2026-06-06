@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SkillSecurityCard",
+  "type": "object",
+  "properties": {
+    "location": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "message": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "rule_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "severity": {
+      "$ref": "#/$defs/SkillSecuritySeverity"
+    },
+    "severity_tone": {
+      "$ref": "#/$defs/SkillDiagnosticsTone"
+    }
+  },
+  "required": [
+    "severity",
+    "severity_tone"
+  ],
+  "$defs": {
+    "SkillDiagnosticsTone": {
+      "type": "string",
+      "enum": [
+        "Default",
+        "Muted",
+        "Success",
+        "Warning",
+        "Danger"
+      ]
+    },
+    "SkillSecuritySeverity": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "Critical",
+            "High",
+            "Medium",
+            "Low",
+            "Info",
+            "None"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Other": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Other"
+          ]
+        }
+      ]
+    }
+  }
+}

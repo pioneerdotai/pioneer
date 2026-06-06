@@ -6,6 +6,7 @@ use gpui_component::{
     theme::ActiveTheme,
     *,
 };
+use pioneer_client::skills::presentation as skill_presentation;
 use pioneer_protocol::SkillListItem;
 use std::rc::Rc;
 
@@ -308,12 +309,8 @@ impl PioneerDesktop {
         let (owner, _slug_label) = Self::split_skill_slug_for_view(skill.slug.as_str());
         let status_color = Self::status_color(skill.status.as_str(), cx);
         let status_label = Self::status_label(skill.status.as_str());
-        let version_label = skill
-            .version
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or("-")
-            .to_owned();
+        let version_label = skill_presentation::optional_non_empty_text(skill.version.as_deref())
+            .unwrap_or_else(|| "-".to_owned());
 
         v_flex()
             .id(("installed-skill-row", index))
@@ -462,52 +459,54 @@ impl PioneerDesktop {
     }
 
     pub(crate) fn source_label(source_kind: &str) -> String {
-        match source_kind {
-            "system" => t!("skills.source.system").to_string(),
-            "user" => t!("skills.source.user").to_string(),
-            "registry" => t!("skills.source.registry").to_string(),
-            _ => source_kind.to_owned(),
+        match skill_presentation::skill_source_kind(source_kind) {
+            skill_presentation::SkillSourceKind::System => t!("skills.source.system").to_string(),
+            skill_presentation::SkillSourceKind::User => t!("skills.source.user").to_string(),
+            skill_presentation::SkillSourceKind::Registry => {
+                t!("skills.source.registry").to_string()
+            }
+            skill_presentation::SkillSourceKind::Other(value) => value,
         }
     }
 
     pub(crate) fn trust_label(trust_level: &str) -> String {
-        match trust_level {
-            "internal" => t!("skills.trust.internal").to_string(),
-            "verified" => t!("skills.trust.verified").to_string(),
-            "community" => t!("skills.trust.community").to_string(),
-            "untrusted" => t!("skills.trust.untrusted").to_string(),
-            _ => trust_level.to_owned(),
+        match skill_presentation::skill_trust_level(trust_level) {
+            skill_presentation::SkillTrustLevel::Internal => {
+                t!("skills.trust.internal").to_string()
+            }
+            skill_presentation::SkillTrustLevel::Verified => {
+                t!("skills.trust.verified").to_string()
+            }
+            skill_presentation::SkillTrustLevel::Community => {
+                t!("skills.trust.community").to_string()
+            }
+            skill_presentation::SkillTrustLevel::Untrusted => {
+                t!("skills.trust.untrusted").to_string()
+            }
+            skill_presentation::SkillTrustLevel::Other(value) => value,
+            skill_presentation::SkillTrustLevel::None => String::new(),
         }
     }
 
     pub(crate) fn status_label(status: &str) -> String {
-        match status {
-            "active" => t!("skills.status.active").to_string(),
-            "blocked" => t!("skills.status.blocked").to_string(),
-            "disabled" => t!("skills.status.disabled").to_string(),
-            _ => status.to_owned(),
+        match skill_presentation::skill_status(status) {
+            skill_presentation::SkillStatus::Active => t!("skills.status.active").to_string(),
+            skill_presentation::SkillStatus::Blocked => t!("skills.status.blocked").to_string(),
+            skill_presentation::SkillStatus::Disabled => t!("skills.status.disabled").to_string(),
+            skill_presentation::SkillStatus::Other(value) => value,
         }
     }
 
     pub(crate) fn status_color(status: &str, cx: &mut Context<Self>) -> Hsla {
-        match status {
-            "active" => cx.theme().success,
-            "blocked" => cx.theme().warning,
-            "disabled" => cx.theme().foreground.opacity(1.),
+        match skill_presentation::skill_status_tone(status) {
+            skill_presentation::SkillDiagnosticsTone::Success => cx.theme().success,
+            skill_presentation::SkillDiagnosticsTone::Warning => cx.theme().warning,
             _ => cx.theme().foreground.opacity(1.),
         }
     }
 
-    pub(crate) fn split_skill_slug_for_view(skill_slug: &str) -> (Option<&str>, &str) {
-        let trimmed = skill_slug.trim();
-        if let Some((owner, slug)) = trimmed.split_once('/') {
-            let owner = owner.trim();
-            let slug = slug.trim();
-            if !owner.is_empty() && !slug.is_empty() {
-                return (Some(owner), slug);
-            }
-        }
-
-        (None, trimmed)
+    pub(crate) fn split_skill_slug_for_view(skill_slug: &str) -> (Option<String>, String) {
+        let split = skill_presentation::split_skill_slug_for_view(skill_slug);
+        (split.owner, split.slug)
     }
 }

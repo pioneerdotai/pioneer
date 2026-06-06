@@ -1,9 +1,7 @@
 use crate::app::root::{GatewayConnectionState, PioneerDesktop};
 use gpui::{prelude::*, *};
-use pioneer_protocol::{WorkspaceCreateParams, WorkspaceUpdateParams, generate_id};
+use pioneer_client::workspaces::actions as workspace_actions;
 use tracing::warn;
-
-const WORKSPACE_ID_LEN: usize = 21;
 
 impl PioneerDesktop {
     pub(in crate::app) fn create_workspace_from_dialog(
@@ -11,10 +9,12 @@ impl PioneerDesktop {
         name: String,
         cx: &mut Context<Self>,
     ) -> bool {
-        let name = name.trim().to_owned();
-        if name.is_empty() || self.workspace_action_in_progress() {
-            return false;
-        }
+        let create_plan =
+            workspace_actions::plan_workspace_create(name, self.workspace_action_in_progress());
+        let create_params = match create_plan {
+            workspace_actions::WorkspaceCreatePlan::Request(params) => params,
+            workspace_actions::WorkspaceCreatePlan::Skip(_) => return false,
+        };
 
         if self.gateway.connection_state != GatewayConnectionState::Connected {
             self.set_workspaces_error(Some(
@@ -33,26 +33,21 @@ impl PioneerDesktop {
         self.set_workspaces_error(None);
 
         let ws_sender = self.gateway.ws_command_sender.clone();
-        let workspace_id = generate_id(WORKSPACE_ID_LEN);
 
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
-            let name = name.clone();
-            let workspace_id = workspace_id.clone();
+            let create_params = create_params.clone();
 
             async move {
                 let result = cx
-                    .background_spawn(async move {
-                        ws_sender.workspace_create(WorkspaceCreateParams {
-                            workspace_id,
-                            name: Some(name),
-                            make_current: false,
-                        })
-                    })
+                    .background_spawn(async move { ws_sender.workspace_create(create_params) })
                     .await;
 
                 let _ = this.update(&mut cx, |view, cx| {
-                    if view.gateway.ws_connection_id != Some(connection_id) {
+                    if !workspace_actions::workspace_action_result_matches_connection(
+                        connection_id,
+                        view.gateway.ws_connection_id,
+                    ) {
                         return;
                     }
 
@@ -60,13 +55,13 @@ impl PioneerDesktop {
 
                     match result {
                         Ok(response) => {
-                            let workspace_id = response.workspace.id.clone();
-                            crate::app::flow::upsert_workspace_catalog_item(
-                                &mut view.workspaces,
-                                response.workspace,
-                            );
+                            let applied =
+                                workspace_actions::apply_workspace_create_response_to_catalog(
+                                    &mut view.workspaces,
+                                    response.workspace,
+                                );
                             view.set_workspaces_error(None);
-                            view.switch_workspace_from_ui(workspace_id, cx);
+                            view.switch_workspace_from_ui(applied.workspace_id, cx);
                         }
                         Err(error) => {
                             let message = format!("{error:#}");
@@ -90,17 +85,21 @@ impl PioneerDesktop {
         name: String,
         cx: &mut Context<Self>,
     ) -> bool {
-        let name = name.trim().to_owned();
-        if name.is_empty() || self.workspace_action_in_progress() {
-            return false;
-        }
-
-        if self
-            .workspace_by_id(workspace_id.as_str())
-            .is_some_and(|workspace| workspace.name == name)
-        {
-            return true;
-        }
+        let action_in_progress = self.workspace_action_in_progress();
+        let current_workspace = self.workspace_by_id(workspace_id.as_str());
+        let rename_plan = workspace_actions::plan_workspace_rename(
+            workspace_id,
+            name,
+            action_in_progress,
+            current_workspace,
+        );
+        let update_params = match rename_plan {
+            workspace_actions::WorkspaceRenamePlan::Request(params) => params,
+            workspace_actions::WorkspaceRenamePlan::Skip(
+                workspace_actions::WorkspaceActionRejection::Unchanged,
+            ) => return true,
+            workspace_actions::WorkspaceRenamePlan::Skip(_) => return false,
+        };
 
         if self.gateway.connection_state != GatewayConnectionState::Connected {
             self.set_workspaces_error(Some(
@@ -122,21 +121,18 @@ impl PioneerDesktop {
 
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
-            let workspace_id = workspace_id.clone();
-            let name = name.clone();
+            let update_params = update_params.clone();
 
             async move {
                 let result = cx
-                    .background_spawn(async move {
-                        ws_sender.workspace_update(WorkspaceUpdateParams {
-                            workspace_id,
-                            name: Some(name),
-                        })
-                    })
+                    .background_spawn(async move { ws_sender.workspace_update(update_params) })
                     .await;
 
                 let _ = this.update(&mut cx, |view, cx| {
-                    if view.gateway.ws_connection_id != Some(connection_id) {
+                    if !workspace_actions::workspace_action_result_matches_connection(
+                        connection_id,
+                        view.gateway.ws_connection_id,
+                    ) {
                         return;
                     }
 
@@ -144,7 +140,7 @@ impl PioneerDesktop {
 
                     match result {
                         Ok(response) => {
-                            crate::app::flow::upsert_workspace_catalog_item(
+                            workspace_actions::apply_workspace_update_response_to_catalog(
                                 &mut view.workspaces,
                                 response.workspace,
                             );

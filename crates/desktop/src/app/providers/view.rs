@@ -1,29 +1,35 @@
-use super::catalog::{PROVIDER_CATALOG, ProviderCatalogEntry};
+use super::catalog::{ProviderCatalogEntry, provider_catalog_entries};
 use crate::{
-    app::root::{GatewayConnectionState, PioneerDesktop, ProviderFilter},
+    app::root::{GatewayConnectionState, PioneerDesktop},
     assets::PioneerIconName,
 };
 use gpui::{prelude::*, *};
 use gpui_component::{button::*, theme::ActiveTheme, *};
+use pioneer_client::providers::selectors;
 
 impl PioneerDesktop {
     pub(crate) fn render_providers(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let desktop_entity = cx.entity().clone();
-        let providers_error = self.providers_error.clone();
-        let is_loading = self.providers_loading;
+        let providers_error = self.providers.error().map(str::to_owned);
+        let is_loading = self.providers.loading();
         let is_connected = self.gateway.connection_state == GatewayConnectionState::Connected;
-        let configured_provider_names = self.provider_configured_names.clone();
+        let configured_provider_names = self.providers.configured_names().clone();
+        let provider_filter = self.providers.filter();
         let grid_columns = self.provider_grid_columns(window);
-        let visible_providers = PROVIDER_CATALOG
-            .iter()
+        let visible_providers = provider_catalog_entries()
             .enumerate()
-            .filter(|(_, provider)| match self.provider_filter {
-                ProviderFilter::All => true,
-                ProviderFilter::Connected => configured_provider_names.contains(provider.id),
+            .filter(|(_, provider)| {
+                selectors::provider_filter_includes_provider(
+                    provider_filter,
+                    provider.id,
+                    &configured_provider_names,
+                )
             })
             .collect::<Vec<_>>();
-        let show_empty_connected_state =
-            self.provider_filter == ProviderFilter::Connected && visible_providers.is_empty();
+        let show_empty_connected_state = selectors::provider_filter_empty_connected_state(
+            provider_filter,
+            visible_providers.len(),
+        );
 
         v_flex()
             .size_full()
@@ -126,7 +132,7 @@ impl PioneerDesktop {
                                             |(index, provider)| {
                                                 Self::render_provider_card(
                                                     *index,
-                                                    provider,
+                                                    *provider,
                                                     configured_provider_names.contains(provider.id),
                                                     is_connected,
                                                     desktop_entity.clone(),
@@ -165,7 +171,7 @@ impl PioneerDesktop {
 
     fn render_provider_card(
         index: usize,
-        provider: &ProviderCatalogEntry,
+        provider: ProviderCatalogEntry,
         is_configured: bool,
         is_connected: bool,
         desktop_entity: Entity<Self>,

@@ -1,0 +1,39 @@
+[
+  {
+    "jsonrpc": "2.0",
+    "method": "workspace/changed",
+    "params": {
+      "kind": "updated",
+      "workspace": {
+        "id": "ws_phase29",
+        "name": "Phase 29",
+        "is_active": true,
+        "is_current": true,
+        "created_at": 1,
+        "updated_at": 2
+      }
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "method": "turn/started",
+    "params": {
+      "workspace_id": "ws_phase29",
+      "thread_id": "thr_phase29",
+      "turn": {
+        "id": "turn_phase29",
+        "status": "InProgress"
+      }
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "method": "turn/future_event",
+    "params": {
+      "workspace_id": "ws_phase29",
+      "thread_id": "thr_phase29",
+      "turn_id": "turn_phase29",
+      "new_field": true
+    }
+  }
+]

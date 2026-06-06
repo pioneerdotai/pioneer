@@ -5,19 +5,9 @@ use crate::app::{
 };
 use gpui::{prelude::*, *};
 use gpui_component::{collapsible::Collapsible, h_flex, spinner::Spinner, v_flex, *};
+use pioneer_client::timeline::labels::web_search_query_from_arguments;
 use pioneer_protocol::{TurnItem, WebSearchResultItem};
-use serde_json::Value as JsonValue;
 use std::hash::{Hash, Hasher};
-
-fn web_search_query_from_arguments(arguments: &JsonValue) -> Option<String> {
-    arguments
-        .get("query")
-        .or_else(|| arguments.get("q"))
-        .and_then(JsonValue::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-}
 
 fn results_count_label(count: usize) -> String {
     t!("timeline.web_search.results_count", count = count).to_string()

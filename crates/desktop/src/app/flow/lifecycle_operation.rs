@@ -1,4 +1,8 @@
 use super::*;
+use pioneer_client::state::reducers::{
+    GatewayStatusEndpoint, GatewayStatusInput, GatewayStatusProjection, GatewayStatusTextUpdate,
+    project_gateway_status,
+};
 
 impl PioneerDesktop {
     pub(in crate::app::flow) fn begin_gateway_operation(
@@ -111,96 +115,55 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app::flow) fn refresh_gateway_status(&mut self) {
-        if self.gateway.connecting {
-            if self.gateway.status.is_empty() {
-                self.gateway.status = t!("gateway.status.connecting").to_string();
-            }
-            self.gateway.status_level = GatewayStatusLevel::Neutral;
-            self.gateway.connection_state = GatewayConnectionState::Connecting;
-            return;
-        }
-
-        if let Some(runtime) = self.gateway.runtime.as_ref() {
-            match runtime.active_gateway_state() {
-                Ok(ActiveGatewayState::NotConfigured) => {
-                    self.gateway.status = t!("gateway.status.not_configured").to_string();
-                    self.gateway.status_level = GatewayStatusLevel::Degraded;
-                    self.gateway.connection_state = GatewayConnectionState::Idle;
-                }
-                Ok(ActiveGatewayState::Connected) => {
-                    if gateway_has_ready_ws_connection(
-                        self.gateway.connection_state,
-                        self.gateway.ws_connection_id,
-                    ) {
-                        if let Some(active) = runtime.active_gateway() {
-                            self.gateway.status = format!(
-                                "{}: {} ({})",
-                                t!("gateway.status.connected"),
-                                active.name.as_str(),
-                                active.address.as_str()
-                            );
-                        } else {
-                            self.gateway.status = t!("gateway.status.connected").to_string();
-                        }
-                        self.gateway.status_level = GatewayStatusLevel::Connected;
-                        self.gateway.connection_state = GatewayConnectionState::Connected;
-                        self.gateway.error = None;
-                    } else {
-                        self.gateway.status = t!("gateway.status.unavailable").to_string();
-                        self.gateway.status_level = GatewayStatusLevel::Failed;
-                        self.gateway.connection_state = GatewayConnectionState::Disconnected;
-                    }
-                }
-                Ok(ActiveGatewayState::Unreachable) => {
-                    if let Some(active) = runtime.active_gateway() {
-                        self.gateway.status = match active.kind {
-                            GatewayEndpointKind::Local => t!(
-                                "gateway.status.local_stopped",
-                                gateway_address = active.address.as_str()
-                            )
-                            .to_string(),
-                            GatewayEndpointKind::Remote => t!(
-                                "gateway.status.remote_unavailable",
-                                gateway_name = active.name.as_str(),
-                                gateway_address = active.address.as_str()
-                            )
-                            .to_string(),
-                        };
-                    } else {
-                        self.gateway.status = t!("gateway.status.unavailable").to_string();
-                    }
-                    self.gateway.status_level = GatewayStatusLevel::Failed;
-                    self.gateway.connection_state = GatewayConnectionState::Disconnected;
-                }
-                Ok(ActiveGatewayState::LocalAddressConflict) => {
-                    if let Some(active) = runtime.active_gateway() {
-                        self.gateway.status = t!(
-                            "gateway.status.local_conflict_at",
-                            gateway_address = active.address.as_str()
-                        )
-                        .to_string();
-                    } else {
-                        self.gateway.status = t!("gateway.status.local_conflict").to_string();
-                    }
-                    self.gateway.status_level = GatewayStatusLevel::Failed;
-                    self.gateway.connection_state = GatewayConnectionState::Disconnected;
-                }
-                Err(error) => {
-                    self.gateway.status =
-                        t!("gateway.status.failed_check", error = format!("{error:#}")).to_string();
-                    self.gateway.status_level = GatewayStatusLevel::Failed;
-                    self.gateway.connection_state = GatewayConnectionState::Disconnected;
-                }
-            }
-        } else if let Some(error) = self.gateway.error.as_ref() {
-            self.gateway.status =
-                t!("gateway.status.subsystem_failed", error = error.as_str()).to_string();
-            self.gateway.status_level = GatewayStatusLevel::Failed;
-            self.gateway.connection_state = GatewayConnectionState::Disconnected;
+        let runtime_state = if self.gateway.connecting {
+            None
         } else {
-            self.gateway.status = t!("gateway.status.subsystem_not_ready").to_string();
-            self.gateway.status_level = GatewayStatusLevel::Neutral;
-            self.gateway.connection_state = GatewayConnectionState::Idle;
+            self.gateway.runtime.as_ref().map(|runtime| {
+                runtime
+                    .active_gateway_state()
+                    .map_err(|error| format!("{error:#}"))
+            })
+        };
+        let active_endpoint = if self.gateway.connecting {
+            None
+        } else {
+            self.gateway
+                .runtime
+                .as_ref()
+                .and_then(GatewayRuntime::active_gateway)
+                .map(|active| {
+                    GatewayStatusEndpoint::new(
+                        active.name.clone(),
+                        active.address.clone(),
+                        active.kind,
+                    )
+                })
+        };
+        let has_ready_ws_connection = gateway_has_ready_ws_connection(
+            self.gateway.connection_state,
+            self.gateway.ws_connection_id,
+        );
+
+        let projection = project_gateway_status(GatewayStatusInput {
+            connecting: self.gateway.connecting,
+            current_status_is_empty: self.gateway.status.is_empty(),
+            runtime_state,
+            active_endpoint,
+            has_ready_ws_connection,
+            gateway_error: self.gateway.error.clone(),
+        });
+
+        self.apply_gateway_status_projection(projection);
+    }
+
+    fn apply_gateway_status_projection(&mut self, projection: GatewayStatusProjection) {
+        if let GatewayStatusTextUpdate::Set(status) = projection.status {
+            self.gateway.status = super::ws_events_connection::gateway_status_message_text(&status);
+        }
+        self.gateway.status_level = projection.status_level;
+        self.gateway.connection_state = projection.connection_state;
+        if projection.clear_gateway_error {
+            self.gateway.error = None;
         }
     }
 }

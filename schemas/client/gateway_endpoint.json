@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GatewayEndpoint",
+  "type": "object",
+  "properties": {
+    "address": {
+      "type": "string"
+    },
+    "auth_token_ref": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "id": {
+      "type": "string"
+    },
+    "kind": {
+      "$ref": "#/$defs/GatewayEndpointKind"
+    },
+    "name": {
+      "type": "string"
+    },
+    "service_name": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "workspace_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "name",
+    "address",
+    "kind"
+  ],
+  "$defs": {
+    "GatewayEndpointKind": {
+      "type": "string",
+      "enum": [
+        "local",
+        "remote"
+      ]
+    }
+  }
+}

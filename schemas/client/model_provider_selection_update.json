@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ModelProviderSelectionUpdate",
+  "type": "object",
+  "properties": {
+    "clear_models": {
+      "type": "boolean"
+    },
+    "loading_models": {
+      "type": "boolean"
+    },
+    "selected_model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "selected_provider": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "clear_models",
+    "loading_models"
+  ]
+}

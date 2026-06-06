@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SkillTrustGateToolKind",
+  "oneOf": [
+    {
+      "type": "string",
+      "enum": [
+        "Shell",
+        "Http",
+        "FunctionProxy",
+        "Mcp",
+        "None"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "Other": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Other"
+      ]
+    }
+  ]
+}

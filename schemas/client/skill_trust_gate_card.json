@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SkillTrustGateCard",
+  "type": "object",
+  "properties": {
+    "decision": {
+      "$ref": "#/$defs/SkillTrustGateDecision"
+    },
+    "decision_tone": {
+      "$ref": "#/$defs/SkillDiagnosticsTone"
+    },
+    "minimum_trust": {
+      "$ref": "#/$defs/SkillTrustLevel"
+    },
+    "tool_kind": {
+      "$ref": "#/$defs/SkillTrustGateToolKind"
+    }
+  },
+  "required": [
+    "tool_kind",
+    "minimum_trust",
+    "decision",
+    "decision_tone"
+  ],
+  "$defs": {
+    "SkillDiagnosticsTone": {
+      "type": "string",
+      "enum": [
+        "Default",
+        "Muted",
+        "Success",
+        "Warning",
+        "Danger"
+      ]
+    },
+    "SkillTrustGateDecision": {
+      "type": "string",
+      "enum": [
+        "Allowed",
+        "Blocked"
+      ]
+    },
+    "SkillTrustGateToolKind": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "Shell",
+            "Http",
+            "FunctionProxy",
+            "Mcp",
+            "None"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Other": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Other"
+          ]
+        }
+      ]
+    },
+    "SkillTrustLevel": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "Internal",
+            "Verified",
+            "Community",
+            "Untrusted",
+            "None"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Other": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Other"
+          ]
+        }
+      ]
+    }
+  }
+}

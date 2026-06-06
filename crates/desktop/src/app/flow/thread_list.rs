@@ -1,4 +1,8 @@
 use super::*;
+use pioneer_client::threads::start as thread_start;
+pub(super) use pioneer_client::turns::timeline_refresh::{
+    TurnTimelineRefreshTransitionEvent, transition_turn_timeline_refresh_state,
+};
 
 impl PioneerDesktop {
     pub(crate) fn upsert_thread_for_workspace(&mut self, thread_id: &str, workspace_id: &str) {
@@ -189,19 +193,10 @@ impl PioneerDesktop {
             async move {
                 let result = cx
                     .background_spawn(async move {
-                        ws_sender.thread_start(ThreadStartParams {
-                            thread_id: thread_id_for_request,
-                            workspace_id: workspace_id_for_request,
-                            name: None,
-                            model: None,
-                            model_provider: None,
-                            sandbox: None,
-                            mode: None,
-                            origin_kind: None,
-                            sidebar_visibility: None,
-                            agent_nickname: None,
-                            agent_role: None,
-                        })
+                        ws_sender.thread_start(thread_start::thread_start_params(
+                            thread_id_for_request,
+                            workspace_id_for_request,
+                        ))
                     })
                     .await;
 
@@ -440,16 +435,15 @@ impl PioneerDesktop {
 
     fn request_turn_timeline_refresh(&mut self, thread_id: &str, turn_id: &str) -> Option<u64> {
         let key = (thread_id.to_owned(), turn_id.to_owned());
-        let state = self.turn_timeline_refresh.entry(key).or_default();
-        state.next_generation = state.next_generation.saturating_add(1);
-        if state.in_flight {
-            state.dirty = true;
-            return None;
+        let current = self.turn_timeline_refresh.remove(&key);
+        let (next_state, generation) = transition_turn_timeline_refresh_state(
+            current,
+            TurnTimelineRefreshTransitionEvent::Request,
+        );
+        if let Some(state) = next_state {
+            self.turn_timeline_refresh.insert(key, state);
         }
-        state.in_flight = true;
-        state.dirty = false;
-        state.in_flight_generation = state.next_generation;
-        Some(state.in_flight_generation)
+        generation
     }
 
     fn complete_turn_timeline_refresh(
@@ -459,19 +453,19 @@ impl PioneerDesktop {
         completed_generation: u64,
     ) -> Option<u64> {
         let key = (thread_id.to_owned(), turn_id.to_owned());
-        let Some(state) = self.turn_timeline_refresh.get_mut(&key) else {
+        let Some(current) = self.turn_timeline_refresh.remove(&key) else {
             return None;
         };
-        let should_rerun = state.dirty || state.next_generation > completed_generation;
-        state.in_flight = false;
-        state.dirty = false;
-        if should_rerun {
-            state.in_flight = true;
-            state.in_flight_generation = state.next_generation;
-            return Some(state.in_flight_generation);
+        let (next_state, next_generation) = transition_turn_timeline_refresh_state(
+            Some(current),
+            TurnTimelineRefreshTransitionEvent::Complete {
+                generation: completed_generation,
+            },
+        );
+        if let Some(state) = next_state {
+            self.turn_timeline_refresh.insert(key, state);
         }
-        self.turn_timeline_refresh.remove(&key);
-        None
+        next_generation
     }
 
     fn abort_turn_timeline_refresh(&mut self, thread_id: &str, turn_id: &str) {
@@ -485,11 +479,10 @@ pub(crate) fn resolve_thread_tree_workspace_id(
     preferred_workspace_id: Option<&str>,
     runtime_workspace_id: Option<&str>,
 ) -> Option<String> {
-    normalize_workspace_id(
-        active_workspace_id
-            .or(preferred_workspace_id)
-            .or(runtime_workspace_id)
-            .map(str::to_owned),
+    pioneer_client::workspaces::selectors::resolve_workspace_scope(
+        active_workspace_id,
+        preferred_workspace_id,
+        runtime_workspace_id,
     )
 }
 
@@ -497,17 +490,11 @@ fn load_task_turn_timelines(
     ws_sender: &crate::gateway::GatewayWsCommandSender,
     response: &ThreadHistoryResponse,
 ) -> Vec<TurnTimelineResponse> {
-    turn_ids_with_task_anchors(response)
+    pioneer_client::threads::history::composed_task_turn_timeline_params(response)
         .into_iter()
-        .filter_map(|turn_id| {
+        .filter_map(|params| {
             ws_sender
-                .turn_timeline(TurnTimelineParams {
-                    thread_id: response.thread_id.clone(),
-                    turn_id,
-                    compose_tasks: true,
-                    include_collapsed_task_events: false,
-                    max_child_items_per_task: Some(500),
-                })
+                .turn_timeline(params)
                 .map_err(|error| {
                     warn!(
                         thread_id = response.thread_id.as_str(),
@@ -519,69 +506,4 @@ fn load_task_turn_timelines(
                 .ok()
         })
         .collect()
-}
-
-fn turn_ids_with_task_anchors(response: &ThreadHistoryResponse) -> Vec<String> {
-    let mut turn_ids = Vec::new();
-    for event in &response.events {
-        let has_task_anchor = match &event.payload {
-            pioneer_protocol::ThreadHistoryEventPayload::ItemStarted { item, .. }
-            | pioneer_protocol::ThreadHistoryEventPayload::ItemCompleted { item, .. }
-            | pioneer_protocol::ThreadHistoryEventPayload::ItemUpdated { item, .. } => {
-                matches!(item, pioneer_protocol::TurnItem::Task { .. })
-            }
-            _ => false,
-        };
-        if has_task_anchor && !turn_ids.iter().any(|turn_id| turn_id == &event.turn_id) {
-            turn_ids.push(event.turn_id.clone());
-        }
-    }
-    turn_ids
-}
-
-#[cfg(test)]
-pub(super) fn transition_turn_timeline_refresh_state(
-    state: Option<super::super::root::TurnTimelineRefreshState>,
-    event: TurnTimelineRefreshTransitionEvent,
-) -> (
-    Option<super::super::root::TurnTimelineRefreshState>,
-    Option<u64>,
-) {
-    let mut state = state.unwrap_or_default();
-    match event {
-        TurnTimelineRefreshTransitionEvent::Request => {
-            state.next_generation = state.next_generation.saturating_add(1);
-            if state.in_flight {
-                state.dirty = true;
-                return (Some(state), None);
-            }
-            state.in_flight = true;
-            state.dirty = false;
-            state.in_flight_generation = state.next_generation;
-            let in_flight_generation = state.in_flight_generation;
-            (Some(state), Some(in_flight_generation))
-        }
-        TurnTimelineRefreshTransitionEvent::Complete { generation } => {
-            if !state.in_flight {
-                return (Some(state), None);
-            }
-            let should_rerun = state.dirty || state.next_generation > generation;
-            state.in_flight = false;
-            state.dirty = false;
-            if should_rerun {
-                state.in_flight = true;
-                state.in_flight_generation = state.next_generation;
-                let in_flight_generation = state.in_flight_generation;
-                return (Some(state), Some(in_flight_generation));
-            }
-            (None, None)
-        }
-    }
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum TurnTimelineRefreshTransitionEvent {
-    Request,
-    Complete { generation: u64 },
 }

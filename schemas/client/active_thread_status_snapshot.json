@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ActiveThreadStatusSnapshot",
+  "oneOf": [
+    {
+      "type": "string",
+      "enum": [
+        "GatewayDisconnected",
+        "StartingThread",
+        "FinishingTurn",
+        "PreviousTurnFailed",
+        "TurnCancelled",
+        "TurnCompleted",
+        "Ready",
+        "StartingTurn",
+        "AgentProcessing"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "TurnRunning": {
+          "type": "object",
+          "properties": {
+            "turn_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "turn_id"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "TurnRunning"
+      ]
+    }
+  ]
+}

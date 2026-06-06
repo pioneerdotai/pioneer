@@ -1,0 +1,185 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "McpDetailValue",
+  "oneOf": [
+    {
+      "type": "string",
+      "enum": [
+        "Empty"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "Text": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Text"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "Timestamp": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Timestamp"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "Count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Count"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "Bool": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Bool"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "Status": {
+          "$ref": "#/$defs/McpStatusLabel"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Status"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "Source": {
+          "$ref": "#/$defs/McpSourceLabel"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Source"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "Scope": {
+          "$ref": "#/$defs/McpScopeLabel"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Scope"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "Transport": {
+          "$ref": "#/$defs/McpTransportPresentation"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Transport"
+      ]
+    }
+  ],
+  "$defs": {
+    "McpScopeLabel": {
+      "type": "string",
+      "enum": [
+        "Workspace",
+        "User"
+      ]
+    },
+    "McpSourceLabel": {
+      "type": "string",
+      "enum": [
+        "Config"
+      ]
+    },
+    "McpStatusLabel": {
+      "type": "string",
+      "enum": [
+        "NotStarted",
+        "Disabled",
+        "Starting",
+        "Ready",
+        "Degraded",
+        "AuthRequired",
+        "Failed",
+        "Stopping",
+        "Stopped",
+        "Restarting"
+      ]
+    },
+    "McpTransportPresentation": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "Stdio": {
+              "type": "object",
+              "properties": {
+                "command": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "command"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Stdio"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "StreamableHttp": {
+              "type": "object",
+              "properties": {
+                "url": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "url"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "StreamableHttp"
+          ]
+        }
+      ]
+    }
+  }
+}

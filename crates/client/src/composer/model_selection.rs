@@ -1,0 +1,420 @@
+//! Model, provider, and composer mode selection helpers.
+
+use pioneer_protocol::{Thread, ThreadMode};
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ComposerModelSelection {
+    pub provider: String,
+    pub model: String,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ComposerModelSelectionCandidate {
+    pub thread_id: String,
+    pub workspace_id: String,
+    pub updated_at: i64,
+    pub has_turns: bool,
+    pub selection: Option<ComposerModelSelection>,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ComposerModelSelectionState {
+    pub selected_provider: Option<String>,
+    pub selected_model: Option<String>,
+    pub manually_selected: bool,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ModelSelectorSelection {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ModelProviderSelectionUpdate {
+    pub selected_provider: Option<String>,
+    pub selected_model: Option<String>,
+    pub clear_models: bool,
+    pub loading_models: bool,
+}
+
+impl ComposerModelSelection {
+    pub fn from_thread(thread: &Thread) -> Option<Self> {
+        composer_model_selection_from_parts(
+            Some(thread.model_provider.as_str()),
+            Some(thread.model.as_str()),
+        )
+    }
+
+    pub fn into_parts(self) -> (Option<String>, Option<String>) {
+        (Some(self.provider), Some(self.model))
+    }
+}
+
+impl ComposerModelSelectionState {
+    pub fn new(
+        selected_provider: Option<String>,
+        selected_model: Option<String>,
+        manually_selected: bool,
+    ) -> Self {
+        Self {
+            selected_provider,
+            selected_model,
+            manually_selected,
+        }
+    }
+
+    pub fn set_from_user(
+        &mut self,
+        selected_provider: Option<String>,
+        selected_model: Option<String>,
+    ) -> bool {
+        let changed = self.selected_provider != selected_provider
+            || self.selected_model != selected_model
+            || !self.manually_selected;
+        self.selected_provider = selected_provider;
+        self.selected_model = selected_model;
+        self.manually_selected = true;
+        changed
+    }
+
+    pub fn sync_resolved_selection(&mut self, selection: Option<ComposerModelSelection>) -> bool {
+        if self.manually_selected {
+            return false;
+        }
+
+        self.apply_resolved_selection(selection)
+    }
+
+    pub fn reset_to_resolved_selection(
+        &mut self,
+        selection: Option<ComposerModelSelection>,
+    ) -> bool {
+        let changed = self.manually_selected;
+        self.manually_selected = false;
+        self.apply_resolved_selection(selection) || changed
+    }
+
+    pub fn apply_resolved_selection(&mut self, selection: Option<ComposerModelSelection>) -> bool {
+        let (selected_provider, selected_model) = selection
+            .map(ComposerModelSelection::into_parts)
+            .unwrap_or((None, None));
+        let changed =
+            self.selected_provider != selected_provider || self.selected_model != selected_model;
+        self.selected_provider = selected_provider;
+        self.selected_model = selected_model;
+        changed
+    }
+
+    pub fn has_complete_selection(&self) -> bool {
+        has_complete_composer_model_selection(
+            self.selected_provider.as_deref(),
+            self.selected_model.as_deref(),
+        )
+    }
+
+    pub fn into_parts(self) -> (Option<String>, Option<String>, bool) {
+        (
+            self.selected_provider,
+            self.selected_model,
+            self.manually_selected,
+        )
+    }
+}
+
+pub fn composer_model_selection_from_parts(
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> Option<ComposerModelSelection> {
+    let provider = provider?.trim();
+    let model = model?.trim();
+
+    if provider.is_empty() || model.is_empty() {
+        return None;
+    }
+
+    Some(ComposerModelSelection {
+        provider: provider.to_owned(),
+        model: model.to_owned(),
+    })
+}
+
+pub fn has_complete_composer_model_selection(provider: Option<&str>, model: Option<&str>) -> bool {
+    composer_model_selection_from_parts(provider, model).is_some()
+}
+
+pub fn resolve_composer_model_selection(
+    active_thread_id: Option<&str>,
+    active_workspace_id: Option<&str>,
+    candidates: Vec<ComposerModelSelectionCandidate>,
+) -> Option<ComposerModelSelection> {
+    let active_thread_id = active_thread_id?;
+
+    let active_candidate = candidates
+        .iter()
+        .find(|candidate| candidate.thread_id == active_thread_id);
+    let workspace_id = active_workspace_id.map(str::to_owned).or_else(|| {
+        candidates
+            .iter()
+            .find(|candidate| candidate.thread_id == active_thread_id)
+            .map(|candidate| candidate.workspace_id.clone())
+    })?;
+
+    if let Some(active) = active_candidate {
+        if active.workspace_id == workspace_id && active.has_turns {
+            return active.selection.clone();
+        }
+    }
+
+    candidates
+        .into_iter()
+        .filter(|candidate| candidate.workspace_id == workspace_id)
+        .filter(|candidate| candidate.thread_id != active_thread_id)
+        .filter(|candidate| candidate.has_turns)
+        .filter_map(|candidate| {
+            let selection = candidate.selection.clone()?;
+            Some((candidate, selection))
+        })
+        .max_by(|(lhs, _), (rhs, _)| {
+            lhs.updated_at
+                .cmp(&rhs.updated_at)
+                .then_with(|| lhs.thread_id.cmp(&rhs.thread_id))
+        })
+        .map(|(_, selection)| selection)
+}
+
+pub fn default_composer_turn_mode() -> ThreadMode {
+    ThreadMode::Agent
+}
+
+pub fn composer_turn_mode_options() -> [ThreadMode; 2] {
+    [ThreadMode::Agent, ThreadMode::Chat]
+}
+
+pub fn set_composer_turn_mode(current: &mut ThreadMode, mode: ThreadMode) -> bool {
+    if *current == mode {
+        return false;
+    }
+
+    *current = mode;
+    true
+}
+
+pub fn select_model_provider(provider_name: String) -> ModelProviderSelectionUpdate {
+    ModelProviderSelectionUpdate {
+        selected_provider: Some(provider_name),
+        selected_model: None,
+        clear_models: true,
+        loading_models: true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pioneer_protocol::{ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus};
+
+    fn selection(provider: &str, model: &str) -> Option<ComposerModelSelection> {
+        Some(ComposerModelSelection {
+            provider: provider.to_owned(),
+            model: model.to_owned(),
+        })
+    }
+
+    fn candidate(
+        thread_id: &str,
+        workspace_id: &str,
+        updated_at: i64,
+        has_turns: bool,
+        provider: &str,
+        model: &str,
+    ) -> ComposerModelSelectionCandidate {
+        ComposerModelSelectionCandidate {
+            thread_id: thread_id.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            updated_at,
+            has_turns,
+            selection: selection(provider, model),
+        }
+    }
+
+    fn thread(provider: &str, model: &str) -> Thread {
+        Thread {
+            workspace_id: "ws".to_owned(),
+            id: "thread".to_owned(),
+            name: None,
+            preview: String::new(),
+            mode: ThreadMode::Agent,
+            model: model.to_owned(),
+            model_provider: provider.to_owned(),
+            created_at: 1,
+            updated_at: 1,
+            status: ThreadStatus::Active,
+            origin_kind: ThreadOriginKind::User,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            turns: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn active_thread_with_turns_wins_over_newer_workspace_turn() {
+        let resolved = resolve_composer_model_selection(
+            Some("thread_a"),
+            Some("ws"),
+            vec![
+                candidate("thread_a", "ws", 10, true, "openai", "gpt-5.4"),
+                candidate("thread_b", "ws", 20, true, "anthropic", "claude-sonnet-4.5"),
+            ],
+        );
+
+        assert_eq!(resolved, selection("openai", "gpt-5.4"));
+    }
+
+    #[test]
+    fn empty_active_thread_uses_latest_workspace_turn() {
+        let resolved = resolve_composer_model_selection(
+            Some("thread_empty"),
+            Some("ws"),
+            vec![
+                candidate("thread_empty", "ws", 30, false, "openai", "default"),
+                candidate("thread_old", "ws", 10, true, "openai", "gpt-5.4"),
+                candidate(
+                    "thread_new",
+                    "ws",
+                    20,
+                    true,
+                    "openrouter",
+                    "anthropic/claude",
+                ),
+            ],
+        );
+
+        assert_eq!(resolved, selection("openrouter", "anthropic/claude"));
+    }
+
+    #[test]
+    fn empty_workspace_keeps_model_selection_blank() {
+        let resolved = resolve_composer_model_selection(
+            Some("thread_empty"),
+            Some("ws"),
+            vec![candidate(
+                "thread_empty",
+                "ws",
+                30,
+                false,
+                "openai",
+                "default",
+            )],
+        );
+
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn fallback_ignores_other_workspaces() {
+        let resolved = resolve_composer_model_selection(
+            Some("thread_empty"),
+            Some("ws_a"),
+            vec![
+                candidate("thread_empty", "ws_a", 30, false, "openai", "default"),
+                candidate("thread_b", "ws_b", 40, true, "anthropic", "claude"),
+                candidate("thread_a", "ws_a", 20, true, "openai", "gpt-5.4"),
+            ],
+        );
+
+        assert_eq!(resolved, selection("openai", "gpt-5.4"));
+    }
+
+    #[test]
+    fn active_thread_from_other_workspace_does_not_win_when_workspace_is_explicit() {
+        let resolved = resolve_composer_model_selection(
+            Some("thread_old_active"),
+            Some("ws_b"),
+            vec![
+                candidate("thread_old_active", "ws_a", 30, true, "openai", "gpt-5.4"),
+                candidate(
+                    "thread_b",
+                    "ws_b",
+                    20,
+                    true,
+                    "openrouter",
+                    "anthropic/claude",
+                ),
+            ],
+        );
+
+        assert_eq!(resolved, selection("openrouter", "anthropic/claude"));
+    }
+
+    #[test]
+    fn model_selection_from_parts_trims_and_rejects_missing_values() {
+        assert_eq!(
+            composer_model_selection_from_parts(Some(" openai "), Some(" gpt-5.4 ")),
+            selection("openai", "gpt-5.4")
+        );
+        assert!(composer_model_selection_from_parts(Some("openai"), Some(" ")).is_none());
+        assert!(!has_complete_composer_model_selection(
+            Some(" "),
+            Some("gpt-5.4")
+        ));
+    }
+
+    #[test]
+    fn model_selection_from_thread_uses_thread_provider_and_model() {
+        assert_eq!(
+            ComposerModelSelection::from_thread(&thread(" openai ", " gpt-5.4 ")),
+            selection("openai", "gpt-5.4")
+        );
+    }
+
+    #[test]
+    fn composer_model_selection_state_tracks_manual_override_and_reset() {
+        let mut state = ComposerModelSelectionState::default();
+
+        assert!(state.set_from_user(Some("openai".to_owned()), Some("gpt-5.4".to_owned()),));
+        assert!(state.manually_selected);
+        assert!(state.has_complete_selection());
+
+        assert!(!state.sync_resolved_selection(selection("anthropic", "claude")));
+        assert_eq!(state.selected_provider.as_deref(), Some("openai"));
+        assert_eq!(state.selected_model.as_deref(), Some("gpt-5.4"));
+
+        assert!(state.reset_to_resolved_selection(selection("anthropic", "claude")));
+        assert!(!state.manually_selected);
+        assert_eq!(state.selected_provider.as_deref(), Some("anthropic"));
+        assert_eq!(state.selected_model.as_deref(), Some("claude"));
+
+        assert!(state.sync_resolved_selection(None));
+        assert!(!state.has_complete_selection());
+    }
+
+    #[test]
+    fn set_composer_turn_mode_reports_changes() {
+        let mut mode = default_composer_turn_mode();
+
+        assert!(!set_composer_turn_mode(&mut mode, ThreadMode::Agent));
+        assert!(set_composer_turn_mode(&mut mode, ThreadMode::Chat));
+        assert_eq!(mode, ThreadMode::Chat);
+        assert_eq!(
+            composer_turn_mode_options(),
+            [ThreadMode::Agent, ThreadMode::Chat]
+        );
+    }
+
+    #[test]
+    fn selecting_provider_resets_model_and_requests_model_loading() {
+        let update = select_model_provider("openai".to_owned());
+
+        assert_eq!(update.selected_provider.as_deref(), Some("openai"));
+        assert_eq!(update.selected_model, None);
+        assert!(update.clear_models);
+        assert!(update.loading_models);
+    }
+}

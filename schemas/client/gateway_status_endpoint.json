@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GatewayStatusEndpoint",
+  "type": "object",
+  "properties": {
+    "address": {
+      "type": "string"
+    },
+    "kind": {
+      "$ref": "#/$defs/GatewayEndpointKind"
+    },
+    "name": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "name",
+    "address",
+    "kind"
+  ],
+  "$defs": {
+    "GatewayEndpointKind": {
+      "type": "string",
+      "enum": [
+        "local",
+        "remote"
+      ]
+    }
+  }
+}

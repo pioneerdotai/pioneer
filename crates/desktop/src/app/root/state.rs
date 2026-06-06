@@ -2,7 +2,7 @@ use super::*;
 use crate::app::skills::details::table::SkillDiagnosticsTableDelegate;
 use crate::{state, window};
 use gpui_component::table::TableState;
-use pioneer_protocol::ThreadMode;
+use pioneer_client::composer::model_selection::default_composer_turn_mode;
 
 impl PioneerDesktop {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -87,15 +87,12 @@ impl PioneerDesktop {
             composer_capabilities: Vec::new(),
             composer_upload_in_progress: false,
             composer_upload_error: None,
-            composer_turn_mode: ThreadMode::Agent,
+            composer_turn_mode: default_composer_turn_mode(),
             composer_selected_provider: None,
             composer_selected_model: None,
             composer_model_selection_manually_selected: false,
             main_content_view: MainContentView::Threads,
-            provider_configured_names: HashSet::new(),
-            provider_filter: ProviderFilter::All,
-            providers_loading: false,
-            providers_error: None,
+            providers: Default::default(),
             mcp_servers: Vec::new(),
             mcp_selected_server_id: None,
             mcp_server_details: None,
@@ -132,8 +129,7 @@ impl PioneerDesktop {
             thread_timeline_view_state: RefCell::new(ThreadTimelineViewState::default()),
             thread_timeline_item_expanded: RefCell::new(HashSet::new()),
             thread_timeline_terminal_item: RefCell::new(HashMap::new()),
-            task_review_actions_in_flight: HashSet::new(),
-            task_review_action_errors: HashMap::new(),
+            task_review_actions: TaskReviewActionState::default(),
             thread_artifacts: ThreadArtifactsState::default(),
             show_thread_artifacts_sidebar: false,
             thread_artifacts_sidebar_width: px(340.),

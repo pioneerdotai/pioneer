@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TimelineCoalescedToolsKind",
+  "type": "string",
+  "enum": [
+    "CompletedTaskTools",
+    "RepeatedTaskWait"
+  ]
+}

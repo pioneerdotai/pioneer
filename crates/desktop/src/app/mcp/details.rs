@@ -17,21 +17,17 @@ use gpui_component::{
     theme::ActiveTheme,
     *,
 };
-use pioneer_protocol::{
-    McpAuditEventSummary, McpListItem, McpPromptCatalogItem, McpResourceCatalogItem,
-    McpResourceTemplateCatalogItem, McpServerDetailsResponse, McpToolCatalogItem,
-};
+use pioneer_client::mcp::{details as mcp_details, presentation as mcp_presentation};
+use pioneer_protocol::{McpAuditEventSummary, McpListItem, McpServerDetailsResponse};
 
 impl PioneerDesktop {
     pub(crate) fn render_mcp_details(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
-        let selected = self.mcp_selected_server_id.as_ref().and_then(|server_id| {
-            self.mcp_servers
-                .iter()
-                .find(|server| server.id == *server_id)
-                .cloned()
-        });
         let details = self.mcp_server_details.as_ref();
-        let server = details.map(|details| details.server.clone()).or(selected);
+        let server = mcp_details::mcp_details_server(
+            self.mcp_servers.as_slice(),
+            self.mcp_selected_server_id.as_deref(),
+            details,
+        );
 
         let Some(server) = server else {
             return v_flex()
@@ -75,12 +71,10 @@ impl PioneerDesktop {
                             .items_start()
                             .gap_10()
                             .child(
-                                div().text_base().font_semibold().child(
-                                    server
-                                        .display_name
-                                        .clone()
-                                        .unwrap_or_else(|| server.name.clone()),
-                                ),
+                                div()
+                                    .text_base()
+                                    .font_semibold()
+                                    .child(mcp_presentation::mcp_display_name(&server)),
                             )
                             .child(
                                 div()
@@ -306,38 +300,17 @@ impl PioneerDesktop {
         details: Option<&McpServerDetailsResponse>,
         grid_columns: u16,
     ) -> AnyElement {
-        let generated_at = details
-            .map(|details| Self::format_mcp_time(details.generated_at))
-            .unwrap_or_else(|| "-".to_owned());
-        let source_label = match server.source_kind {
-            pioneer_protocol::McpSourceKind::Config => t!("mcp.details.source_config").to_string(),
-        };
-        let scope_label = match server.scope {
-            pioneer_protocol::McpScopeKind::Workspace => {
-                t!("mcp.details.scope_workspace").to_string()
-            }
-            pioneer_protocol::McpScopeKind::User => t!("mcp.details.scope_user").to_string(),
-        };
+        let rows = mcp_presentation::mcp_overview_rows(server, details);
 
-        div()
-            .w_full()
-            .grid()
-            .grid_cols(grid_columns)
-            .gap_4()
-            .child(meta_item(
-                source_label,
-                t!("mcp.details.source").to_string(),
-            ))
-            .child(meta_item(scope_label, t!("mcp.details.scope").to_string()))
-            .child(meta_item(
-                Self::mcp_transport_label(&server.transport),
-                t!("mcp.details.transport").to_string(),
-            ))
-            .child(meta_item(
-                generated_at,
-                t!("mcp.details.loaded").to_string(),
-            ))
-            .into_any_element()
+        let mut content = div().w_full().grid().grid_cols(grid_columns).gap_4();
+        for row in rows {
+            content = content.child(meta_item(
+                Self::mcp_detail_value_label(&row.value),
+                Self::mcp_detail_meta_label(row.kind),
+            ));
+        }
+
+        content.into_any_element()
     }
 
     fn render_mcp_health_section(
@@ -348,59 +321,19 @@ impl PioneerDesktop {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let health = details.map(|details| &details.health);
-        let retry_attempt = health
-            .and_then(|health| health.retry_attempt)
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "-".to_owned());
-        let next_retry_at = health
-            .and_then(|health| health.next_retry_at)
-            .map(Self::format_mcp_time)
-            .unwrap_or_else(|| "-".to_owned());
-        let last_seen_at = server
-            .runtime
-            .last_seen_at
-            .map(Self::format_mcp_time)
-            .unwrap_or_else(|| "-".to_owned());
-        let last_error = server
-            .runtime
-            .last_error
-            .clone()
-            .or_else(|| health.and_then(|health| health.last_error.clone()))
-            .unwrap_or_else(|| "-".to_owned());
+        let health_rows = mcp_presentation::mcp_health_rows(server, details);
+
+        let mut grid = div().w_full().grid().grid_cols(grid_columns).gap_4();
+        for row in health_rows {
+            grid = grid.child(meta_item(
+                Self::mcp_detail_value_label(&row.value),
+                Self::mcp_detail_meta_label(row.kind),
+            ));
+        }
 
         let content = v_flex()
             .gap_4()
-            .child(
-                div()
-                    .w_full()
-                    .grid()
-                    .grid_cols(grid_columns)
-                    .gap_4()
-                    .child(meta_item(
-                        Self::mcp_runtime_label(server.runtime.state),
-                        t!("mcp.details.runtime").to_string(),
-                    ))
-                    .child(meta_item(
-                        Self::mcp_policy_summary(server.runtime.live),
-                        t!("mcp.details.live").to_string(),
-                    ))
-                    .child(meta_item(
-                        last_seen_at,
-                        t!("mcp.details.last_seen").to_string(),
-                    ))
-                    .child(meta_item(
-                        retry_attempt,
-                        t!("mcp.details.retry_attempt").to_string(),
-                    ))
-                    .child(meta_item(
-                        next_retry_at,
-                        t!("mcp.details.next_retry").to_string(),
-                    ))
-                    .child(meta_item(
-                        last_error,
-                        t!("mcp.details.last_error").to_string(),
-                    )),
-            )
+            .child(grid)
             .when_some(
                 health.and_then(|health| health.stderr_tail.clone()),
                 |this, tail| {
@@ -663,28 +596,22 @@ impl PioneerDesktop {
             },
         ];
 
-        let rows = audit
+        let rows = mcp_presentation::mcp_audit_rows(audit, 8)
             .iter()
-            .take(8)
             .map(|item| {
                 let event_time = Self::format_mcp_time(item.created_at);
-                let action = Self::mcp_audit_action_label(item.action.as_str());
+                let action = Self::mcp_audit_action_label(&item.action);
                 let event_label = item
                     .raw_tool_name
                     .as_deref()
-                    .filter(|value| !value.trim().is_empty())
                     .map(|tool| format!("{action} / {tool}"))
                     .unwrap_or_else(|| action.clone());
-                let decision = Self::mcp_audit_decision_label(item.decision.as_str());
-                let reason = item
-                    .reason_code
-                    .as_deref()
-                    .filter(|value| !value.trim().is_empty())
-                    .map(str::to_owned);
+                let decision = Self::mcp_audit_decision_label(&item.decision);
+                let reason = item.reason_code.clone();
                 let reason_label = reason
                     .clone()
                     .unwrap_or_else(|| t!("mcp.common.none").to_string());
-                let details_summary = Self::summarize_mcp_audit_details(&item.details);
+                let details_summary = Self::mcp_audit_details_summary_label(&item.details_summary);
                 let details = if reason.is_none() {
                     details_summary.clone()
                 } else {
@@ -712,7 +639,7 @@ impl PioneerDesktop {
                         SkillDiagnosticsTableCell {
                             text: decision.clone(),
                             tooltip: Some(decision),
-                            tone: Self::mcp_audit_decision_tone(item.decision.as_str()),
+                            tone: Self::mcp_presentation_tone(item.decision_tone),
                         },
                         SkillDiagnosticsTableCell {
                             text: details.clone(),
@@ -727,51 +654,118 @@ impl PioneerDesktop {
         SkillDiagnosticsTableModel { columns, rows }
     }
 
-    fn mcp_policy_summary(enabled: bool) -> String {
-        if enabled {
-            t!("mcp.common.yes").to_string()
-        } else {
-            t!("mcp.common.no").to_string()
+    fn mcp_detail_meta_label(kind: mcp_presentation::McpDetailMetaKind) -> String {
+        match kind {
+            mcp_presentation::McpDetailMetaKind::Source => t!("mcp.details.source").to_string(),
+            mcp_presentation::McpDetailMetaKind::Scope => t!("mcp.details.scope").to_string(),
+            mcp_presentation::McpDetailMetaKind::Transport => {
+                t!("mcp.details.transport").to_string()
+            }
+            mcp_presentation::McpDetailMetaKind::Loaded => t!("mcp.details.loaded").to_string(),
+            mcp_presentation::McpDetailMetaKind::Runtime => t!("mcp.details.runtime").to_string(),
+            mcp_presentation::McpDetailMetaKind::Live => t!("mcp.details.live").to_string(),
+            mcp_presentation::McpDetailMetaKind::LastSeen => {
+                t!("mcp.details.last_seen").to_string()
+            }
+            mcp_presentation::McpDetailMetaKind::RetryAttempt => {
+                t!("mcp.details.retry_attempt").to_string()
+            }
+            mcp_presentation::McpDetailMetaKind::NextRetry => {
+                t!("mcp.details.next_retry").to_string()
+            }
+            mcp_presentation::McpDetailMetaKind::LastError => {
+                t!("mcp.details.last_error").to_string()
+            }
         }
     }
 
-    fn mcp_audit_action_label(action: &str) -> String {
-        match action.trim() {
-            "install" => t!("mcp.audit.action_install").to_string(),
-            "update" => t!("mcp.audit.action_update").to_string(),
-            "uninstall" => t!("mcp.audit.action_uninstall").to_string(),
-            "policy" => t!("mcp.audit.action_policy").to_string(),
-            "start" => t!("mcp.audit.action_start").to_string(),
-            "started" => t!("mcp.audit.action_started").to_string(),
-            "start_failed" => t!("mcp.audit.action_start_failed").to_string(),
-            "stop" => t!("mcp.audit.action_stop").to_string(),
-            "stopped" => t!("mcp.audit.action_stopped").to_string(),
-            "restart" => t!("mcp.audit.action_restart").to_string(),
-            "catalog_refreshed" => t!("mcp.audit.action_catalog_refreshed").to_string(),
-            "call" => t!("mcp.audit.action_call").to_string(),
-            "call_completed" => t!("mcp.audit.action_call_completed").to_string(),
-            "call_failed" => t!("mcp.audit.action_call_failed").to_string(),
-            other if !other.is_empty() => other.to_owned(),
-            _ => t!("mcp.common.none").to_string(),
+    fn mcp_detail_value_label(value: &mcp_presentation::McpDetailValue) -> String {
+        match value {
+            mcp_presentation::McpDetailValue::Empty => "-".to_owned(),
+            mcp_presentation::McpDetailValue::Text(value) => value.clone(),
+            mcp_presentation::McpDetailValue::Timestamp(value) => Self::format_mcp_time(*value),
+            mcp_presentation::McpDetailValue::Count(value) => value.to_string(),
+            mcp_presentation::McpDetailValue::Bool(value) => {
+                if *value {
+                    t!("mcp.common.yes").to_string()
+                } else {
+                    t!("mcp.common.no").to_string()
+                }
+            }
+            mcp_presentation::McpDetailValue::Status(status) => {
+                Self::mcp_status_label_from_kind(*status)
+            }
+            mcp_presentation::McpDetailValue::Source(source) => match source {
+                mcp_presentation::McpSourceLabel::Config => {
+                    t!("mcp.details.source_config").to_string()
+                }
+            },
+            mcp_presentation::McpDetailValue::Scope(scope) => match scope {
+                mcp_presentation::McpScopeLabel::Workspace => {
+                    t!("mcp.details.scope_workspace").to_string()
+                }
+                mcp_presentation::McpScopeLabel::User => t!("mcp.details.scope_user").to_string(),
+            },
+            mcp_presentation::McpDetailValue::Transport(transport) => {
+                Self::mcp_transport_label_from_presentation(transport)
+            }
         }
     }
 
-    fn mcp_audit_decision_label(decision: &str) -> String {
-        match decision.trim() {
-            "allowed" => t!("mcp.audit.decision_allowed").to_string(),
-            "blocked" => t!("mcp.audit.decision_blocked").to_string(),
-            "warning" => t!("mcp.audit.decision_warning").to_string(),
-            other if !other.is_empty() => other.to_owned(),
-            _ => t!("mcp.common.none").to_string(),
+    fn mcp_audit_action_label(action: &mcp_presentation::McpAuditAction) -> String {
+        match action {
+            mcp_presentation::McpAuditAction::Install => t!("mcp.audit.action_install").to_string(),
+            mcp_presentation::McpAuditAction::Update => t!("mcp.audit.action_update").to_string(),
+            mcp_presentation::McpAuditAction::Uninstall => {
+                t!("mcp.audit.action_uninstall").to_string()
+            }
+            mcp_presentation::McpAuditAction::Policy => t!("mcp.audit.action_policy").to_string(),
+            mcp_presentation::McpAuditAction::Start => t!("mcp.audit.action_start").to_string(),
+            mcp_presentation::McpAuditAction::Started => t!("mcp.audit.action_started").to_string(),
+            mcp_presentation::McpAuditAction::StartFailed => {
+                t!("mcp.audit.action_start_failed").to_string()
+            }
+            mcp_presentation::McpAuditAction::Stop => t!("mcp.audit.action_stop").to_string(),
+            mcp_presentation::McpAuditAction::Stopped => t!("mcp.audit.action_stopped").to_string(),
+            mcp_presentation::McpAuditAction::Restart => t!("mcp.audit.action_restart").to_string(),
+            mcp_presentation::McpAuditAction::CatalogRefreshed => {
+                t!("mcp.audit.action_catalog_refreshed").to_string()
+            }
+            mcp_presentation::McpAuditAction::Call => t!("mcp.audit.action_call").to_string(),
+            mcp_presentation::McpAuditAction::CallCompleted => {
+                t!("mcp.audit.action_call_completed").to_string()
+            }
+            mcp_presentation::McpAuditAction::CallFailed => {
+                t!("mcp.audit.action_call_failed").to_string()
+            }
+            mcp_presentation::McpAuditAction::Other(value) => value.clone(),
+            mcp_presentation::McpAuditAction::None => t!("mcp.common.none").to_string(),
         }
     }
 
-    fn mcp_audit_decision_tone(decision: &str) -> SkillDiagnosticsTone {
-        match decision.trim() {
-            "allowed" => SkillDiagnosticsTone::Success,
-            "blocked" => SkillDiagnosticsTone::Danger,
-            "warning" => SkillDiagnosticsTone::Warning,
-            _ => SkillDiagnosticsTone::Muted,
+    fn mcp_audit_decision_label(decision: &mcp_presentation::McpAuditDecision) -> String {
+        match decision {
+            mcp_presentation::McpAuditDecision::Allowed => {
+                t!("mcp.audit.decision_allowed").to_string()
+            }
+            mcp_presentation::McpAuditDecision::Blocked => {
+                t!("mcp.audit.decision_blocked").to_string()
+            }
+            mcp_presentation::McpAuditDecision::Warning => {
+                t!("mcp.audit.decision_warning").to_string()
+            }
+            mcp_presentation::McpAuditDecision::Other(value) => value.clone(),
+            mcp_presentation::McpAuditDecision::None => t!("mcp.common.none").to_string(),
+        }
+    }
+
+    fn mcp_presentation_tone(tone: mcp_presentation::McpPresentationTone) -> SkillDiagnosticsTone {
+        match tone {
+            mcp_presentation::McpPresentationTone::Default => SkillDiagnosticsTone::Default,
+            mcp_presentation::McpPresentationTone::Muted => SkillDiagnosticsTone::Muted,
+            mcp_presentation::McpPresentationTone::Success => SkillDiagnosticsTone::Success,
+            mcp_presentation::McpPresentationTone::Warning => SkillDiagnosticsTone::Warning,
+            mcp_presentation::McpPresentationTone::Danger => SkillDiagnosticsTone::Danger,
         }
     }
 
@@ -787,57 +781,38 @@ impl PioneerDesktop {
             .unwrap_or_else(|| "-".to_owned())
     }
 
-    fn summarize_mcp_audit_details(details: &serde_json::Value) -> String {
-        match details {
-            serde_json::Value::Null => t!("mcp.common.empty").to_string(),
-            serde_json::Value::Object(map) => {
-                if map.is_empty() {
-                    return t!("mcp.common.empty").to_string();
-                }
-
-                map.iter()
-                    .take(2)
-                    .map(|(key, value)| format!("{key}: {}", Self::mcp_json_value_preview(value)))
-                    .collect::<Vec<_>>()
-                    .join(" | ")
+    fn mcp_audit_details_summary_label(
+        summary: &mcp_presentation::McpAuditDetailsSummary,
+    ) -> String {
+        match summary {
+            mcp_presentation::McpAuditDetailsSummary::Empty => t!("mcp.common.empty").to_string(),
+            mcp_presentation::McpAuditDetailsSummary::ObjectPairs(pairs) => pairs
+                .iter()
+                .map(|(key, value)| format!("{key}: {}", Self::mcp_json_value_preview_label(value)))
+                .collect::<Vec<_>>()
+                .join(" | "),
+            mcp_presentation::McpAuditDetailsSummary::ArrayLen(count) => {
+                t!("mcp.common.items_count", count = *count).to_string()
             }
-            serde_json::Value::Array(values) => {
-                t!("mcp.common.items_count", count = values.len()).to_string()
+            mcp_presentation::McpAuditDetailsSummary::Value(value) => {
+                Self::mcp_json_value_preview_label(value)
             }
-            other => Self::mcp_json_value_preview(other),
         }
     }
 
-    fn mcp_json_value_preview(value: &serde_json::Value) -> String {
+    fn mcp_json_value_preview_label(value: &mcp_presentation::McpJsonValuePreview) -> String {
         match value {
-            serde_json::Value::String(value) => Self::truncate_for_mcp_table(value, 48),
-            serde_json::Value::Bool(value) => value.to_string(),
-            serde_json::Value::Number(value) => value.to_string(),
-            serde_json::Value::Null => t!("mcp.common.none").to_string(),
-            serde_json::Value::Array(values) => {
-                if values.is_empty() {
-                    "[]".to_owned()
-                } else {
-                    format!("[{}]", values.len())
-                }
-            }
-            serde_json::Value::Object(map) => {
-                if map.is_empty() {
-                    "{}".to_owned()
-                } else {
-                    t!("mcp.common.keys_count", count = map.len()).to_string()
-                }
+            mcp_presentation::McpJsonValuePreview::Text(value) => value.clone(),
+            mcp_presentation::McpJsonValuePreview::Bool(value) => value.to_string(),
+            mcp_presentation::McpJsonValuePreview::Number(value) => value.clone(),
+            mcp_presentation::McpJsonValuePreview::None => t!("mcp.common.none").to_string(),
+            mcp_presentation::McpJsonValuePreview::EmptyArray => "[]".to_owned(),
+            mcp_presentation::McpJsonValuePreview::ArrayLen(count) => format!("[{count}]"),
+            mcp_presentation::McpJsonValuePreview::EmptyObject => "{}".to_owned(),
+            mcp_presentation::McpJsonValuePreview::ObjectKeys(count) => {
+                t!("mcp.common.keys_count", count = *count).to_string()
             }
         }
-    }
-
-    fn truncate_for_mcp_table(value: &str, max_chars: usize) -> String {
-        if value.chars().count() <= max_chars {
-            return value.to_owned();
-        }
-
-        let shortened = value.chars().take(max_chars).collect::<String>();
-        format!("{shortened}...")
     }
 
     fn mcp_details_element_hash(parts: &[&str]) -> u64 {
@@ -923,61 +898,51 @@ fn catalog_json_text_block(
 }
 
 fn render_tool_card(
-    tool: &McpToolCatalogItem,
+    tool: &pioneer_protocol::McpToolCatalogItem,
     card_ix: usize,
     cx: &mut Context<PioneerDesktop>,
 ) -> AnyElement {
-    let title = tool
-        .title
-        .clone()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| tool.name.clone());
-
-    catalog_item_card(("mcp-tool-card", card_ix), title, cx)
+    catalog_item_card(
+        ("mcp-tool-card", card_ix),
+        mcp_presentation::mcp_tool_title(tool),
+        cx,
+    )
 }
 
 fn render_resource_card(
-    resource: &McpResourceCatalogItem,
+    resource: &pioneer_protocol::McpResourceCatalogItem,
     card_ix: usize,
     cx: &mut Context<PioneerDesktop>,
 ) -> AnyElement {
-    let title = resource
-        .title
-        .clone()
-        .or_else(|| resource.name.clone())
-        .or_else(|| resource.uri.clone())
-        .unwrap_or_else(|| "-".to_owned());
-
-    catalog_item_card(("mcp-resource-card", card_ix), title, cx)
+    catalog_item_card(
+        ("mcp-resource-card", card_ix),
+        mcp_presentation::mcp_resource_title(resource).unwrap_or_else(|| "-".to_owned()),
+        cx,
+    )
 }
 
 fn render_resource_template_card(
-    template: &McpResourceTemplateCatalogItem,
+    template: &pioneer_protocol::McpResourceTemplateCatalogItem,
     card_ix: usize,
     cx: &mut Context<PioneerDesktop>,
 ) -> AnyElement {
-    let title = template
-        .title
-        .clone()
-        .or_else(|| template.name.clone())
-        .or_else(|| template.uri_template.clone())
-        .unwrap_or_else(|| "-".to_owned());
-
-    catalog_item_card(("mcp-resource-template-card", card_ix), title, cx)
+    catalog_item_card(
+        ("mcp-resource-template-card", card_ix),
+        mcp_presentation::mcp_resource_template_title(template).unwrap_or_else(|| "-".to_owned()),
+        cx,
+    )
 }
 
 fn render_prompt_card(
-    prompt: &McpPromptCatalogItem,
+    prompt: &pioneer_protocol::McpPromptCatalogItem,
     card_ix: usize,
     cx: &mut Context<PioneerDesktop>,
 ) -> AnyElement {
-    let title = prompt
-        .title
-        .clone()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| prompt.name.clone());
-
-    catalog_item_card(("mcp-prompt-card", card_ix), title, cx)
+    catalog_item_card(
+        ("mcp-prompt-card", card_ix),
+        mcp_presentation::mcp_prompt_title(prompt),
+        cx,
+    )
 }
 
 fn catalog_item_card(

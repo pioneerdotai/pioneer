@@ -1,4 +1,9 @@
 use super::*;
+use pioneer_client::agents_doc::scope as agents_doc_scope;
+use pioneer_client::state::selectors as client_selectors;
+use pioneer_client::state::snapshot::{ClientSnapshot, ClientSnapshotInput};
+use pioneer_client::threads::tree as thread_tree;
+use pioneer_client::workspaces::selectors as workspace_selectors;
 
 impl PioneerDesktop {
     pub(in crate::app) fn thread_tree_state(&self) -> &Entity<TreeState> {
@@ -34,13 +39,14 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn workspace_by_id(&self, workspace_id: &str) -> Option<&Workspace> {
-        self.workspaces
-            .iter()
-            .find(|workspace| workspace.id == workspace_id)
+        workspace_selectors::workspace_by_id(self.workspaces(), workspace_id)
     }
 
     pub(in crate::app) fn active_workspace_id(&self) -> Option<&str> {
-        resolve_active_workspace_id(self.preferred_workspace_id(), self.workspaces())
+        workspace_selectors::resolve_active_workspace_id(
+            self.preferred_workspace_id(),
+            self.workspaces(),
+        )
     }
 
     pub(in crate::app) fn active_workspace(&self) -> Option<&Workspace> {
@@ -52,47 +58,38 @@ impl PioneerDesktop {
         &self,
         workspace_id: &str,
     ) -> Option<&str> {
-        self.last_active_thread_by_workspace
-            .get(workspace_id)
-            .map(String::as_str)
+        thread_tree::remembered_thread_for_workspace(
+            &self.last_active_thread_by_workspace,
+            workspace_id,
+        )
     }
 
     pub(in crate::app) fn draft_thread_for_workspace(&self, workspace_id: &str) -> Option<&str> {
-        self.draft_thread_by_workspace
-            .get(workspace_id)
-            .map(String::as_str)
+        thread_tree::remembered_thread_for_workspace(&self.draft_thread_by_workspace, workspace_id)
     }
 
     pub(in crate::app) fn thread_start_coordinator(&self) -> &ThreadStartCoordinator {
         &self.thread_start
     }
 
-    pub(in crate::app) fn has_in_flight_thread_start(&self) -> bool {
-        self.thread_start.in_progress || self.thread_start.pending_thread_id.is_some()
-    }
-
     pub(in crate::app) fn thread_coordinator(&self, thread_id: &str) -> Option<&ThreadCoordinator> {
-        self.thread_coordinators.get(thread_id)
+        client_selectors::thread_coordinator_from(&self.thread_coordinators, thread_id)
     }
 
     pub(in crate::app) fn thread_conversation(&self, thread_id: &str) -> Option<&Conversation> {
-        self.thread_coordinator(thread_id)
-            .map(|coordinator| &coordinator.conversation)
+        client_selectors::thread_conversation_from(&self.thread_coordinators, thread_id)
     }
 
     pub(in crate::app) fn thread_workspace_id(&self, thread_id: &str) -> Option<&str> {
-        self.thread_coordinator(thread_id)
-            .map(|coordinator| coordinator.workspace_id.as_str())
+        client_selectors::thread_workspace_id_from(&self.thread_coordinators, thread_id)
     }
 
     pub(in crate::app) fn model_selector_workspace_id(&self) -> String {
-        self.active_workspace_id()
-            .or_else(|| {
-                self.current_active_thread_id()
-                    .and_then(|thread_id| self.thread_workspace_id(thread_id))
-            })
-            .map(str::to_owned)
-            .unwrap_or_default()
+        client_selectors::model_selector_workspace_id_from(
+            self.active_workspace_id(),
+            self.current_active_thread_id(),
+            &self.thread_coordinators,
+        )
     }
 
     pub(in crate::app) fn thread_folder(&self, folder_id: &str) -> Option<&ThreadFolder> {
@@ -103,15 +100,7 @@ impl PioneerDesktop {
         &self,
         workspace_id: &str,
     ) -> Vec<&ThreadFolder> {
-        thread_folders_for_workspace_from(&self.thread_folders, workspace_id)
-    }
-
-    pub(in crate::app) fn thread_agents_doc_summary(
-        &self,
-        folder_id: Option<&str>,
-    ) -> Option<&ThreadAgentsDocSummary> {
-        self.thread_agents_doc_summaries
-            .get(&ThreadAgentsDocSummaryKey::from_folder_id(folder_id))
+        thread_tree::thread_folders_for_workspace(&self.thread_folders, workspace_id)
     }
 
     pub(in crate::app) fn thread_agents_doc_summary_for_workspace(
@@ -119,15 +108,18 @@ impl PioneerDesktop {
         folder_id: Option<&str>,
         workspace_id: &str,
     ) -> Option<&ThreadAgentsDocSummary> {
-        self.thread_agents_doc_summary(folder_id)
-            .filter(|summary| summary.workspace_id == workspace_id)
+        agents_doc_scope::thread_agents_doc_summary_for_workspace(
+            &self.thread_agents_doc_summaries,
+            folder_id,
+            workspace_id,
+        )
     }
 
     pub(in crate::app) fn thread_placements_for_workspace(
         &self,
         workspace_id: &str,
     ) -> Vec<&ThreadPlacement> {
-        thread_placements_for_workspace_from(&self.thread_placements, workspace_id)
+        thread_tree::thread_placements_for_workspace(&self.thread_placements, workspace_id)
     }
 
     pub(in crate::app) fn selected_thread_tree_node_id(&self) -> Option<&str> {
@@ -146,63 +138,72 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn has_known_threads_for_workspace(&self, workspace_id: &str) -> bool {
-        has_known_threads_for_workspace_in(&self.thread_coordinators, workspace_id)
+        client_selectors::has_known_threads_for_workspace(&self.thread_coordinators, workspace_id)
     }
 
     pub(in crate::app) fn is_thread_history_loading(&self, thread_id: &str) -> bool {
-        self.thread_coordinator(thread_id)
-            .is_some_and(|coordinator| coordinator.history_loading)
+        client_selectors::is_thread_history_loading(&self.thread_coordinators, thread_id)
     }
 
     pub(in crate::app) fn is_thread_history_loaded(&self, thread_id: &str) -> bool {
-        self.thread_coordinator(thread_id)
-            .is_some_and(|coordinator| coordinator.history_loaded)
+        client_selectors::is_thread_history_loaded(&self.thread_coordinators, thread_id)
     }
 
     pub(in crate::app) fn active_thread_conversation(&self) -> Option<&Conversation> {
-        self.current_active_thread_id()
-            .and_then(|thread_id| self.thread_conversation(thread_id))
+        client_selectors::active_thread_conversation(
+            self.current_active_thread_id(),
+            &self.thread_coordinators,
+        )
     }
 
     pub(in crate::app) fn has_any_in_flight_turn(&self) -> bool {
-        self.thread_coordinators
-            .values()
-            .any(|coordinator| coordinator.conversation.in_flight_turn_id().is_some())
+        client_selectors::has_any_in_flight_turn_in(&self.thread_coordinators)
     }
 
     pub(in crate::app) fn in_flight_turn_id_for_thread(&self, thread_id: &str) -> Option<String> {
-        self.thread_conversation(thread_id)
-            .and_then(|conversation| conversation.in_flight_turn_id().map(str::to_owned))
+        client_selectors::in_flight_turn_id_for_thread_in(&self.thread_coordinators, thread_id)
+    }
+
+    pub(in crate::app) fn client_snapshot(&self) -> ClientSnapshot {
+        ClientSnapshot::from_parts(ClientSnapshotInput {
+            active_thread_id: self.current_active_thread_id(),
+            draft_thread_id: self.draft_thread_id(),
+            preferred_workspace_id: self.preferred_workspace_id(),
+            workspaces: self.workspaces(),
+            workspaces_loading: self.workspaces_loading(),
+            workspaces_error: self.workspaces_error(),
+            workspace_action_in_progress: self.workspace_action_in_progress(),
+            thread_list_loading: self.thread_list_loading,
+            thread_start_in_progress: self.thread_start.in_progress,
+            pending_thread_id: self.thread_start.pending_thread_id.as_deref(),
+            coordinators: &self.thread_coordinators,
+            gateway_connected: self.gateway.connection_state == GatewayConnectionState::Connected,
+        })
     }
 }
 
+#[cfg(test)]
 fn thread_folders_for_workspace_from<'a>(
     folders: &'a HashMap<String, ThreadFolder>,
     workspace_id: &str,
 ) -> Vec<&'a ThreadFolder> {
-    folders
-        .values()
-        .filter(|folder| folder.workspace_id == workspace_id)
-        .collect()
+    thread_tree::thread_folders_for_workspace(folders, workspace_id)
 }
 
+#[cfg(test)]
 fn thread_placements_for_workspace_from<'a>(
     placements: &'a HashMap<String, ThreadPlacement>,
     workspace_id: &str,
 ) -> Vec<&'a ThreadPlacement> {
-    placements
-        .values()
-        .filter(|placement| placement.workspace_id == workspace_id)
-        .collect()
+    thread_tree::thread_placements_for_workspace(placements, workspace_id)
 }
 
+#[cfg(test)]
 fn has_known_threads_for_workspace_in(
     coordinators: &HashMap<String, ThreadCoordinator>,
     workspace_id: &str,
 ) -> bool {
-    coordinators
-        .values()
-        .any(|coordinator| coordinator.workspace_id == workspace_id)
+    client_selectors::has_known_threads_for_workspace(coordinators, workspace_id)
 }
 
 fn sorted_thread_ids_from_coordinators(
@@ -210,49 +211,15 @@ fn sorted_thread_ids_from_coordinators(
     draft_thread_id: Option<&str>,
     workspace_id: Option<&str>,
 ) -> Vec<String> {
-    let mut thread_ids: Vec<String> = coordinators
-        .iter()
-        .filter(|(thread_id, coordinator)| {
-            Some(thread_id.as_str()) != draft_thread_id
-                && workspace_id.is_none_or(|workspace_id| coordinator.workspace_id == workspace_id)
-        })
-        .map(|(thread_id, _)| thread_id.clone())
-        .collect();
-    thread_ids.sort_by(|lhs, rhs| {
-        let lhs_updated = coordinators
-            .get(lhs.as_str())
-            .map(ThreadCoordinator::updated_at)
-            .unwrap_or_default();
-        let rhs_updated = coordinators
-            .get(rhs.as_str())
-            .map(ThreadCoordinator::updated_at)
-            .unwrap_or_default();
-        rhs_updated.cmp(&lhs_updated).then_with(|| lhs.cmp(rhs))
-    });
-    thread_ids
+    thread_tree::sorted_thread_ids_from_coordinators(coordinators, draft_thread_id, workspace_id)
 }
 
+#[cfg(test)]
 pub(in crate::app) fn resolve_active_workspace_id<'a>(
     persisted_workspace_id: Option<&str>,
     workspaces: &'a [Workspace],
 ) -> Option<&'a str> {
-    if let Some(workspace_id) = persisted_workspace_id.and_then(|workspace_id| {
-        let trimmed = workspace_id.trim();
-        (!trimmed.is_empty()).then_some(trimmed)
-    }) {
-        if let Some(workspace) = workspaces
-            .iter()
-            .find(|workspace| workspace.is_active && workspace.id == workspace_id)
-        {
-            return Some(workspace.id.as_str());
-        }
-    }
-
-    workspaces
-        .iter()
-        .find(|workspace| workspace.is_active && workspace.is_current)
-        .or_else(|| workspaces.iter().find(|workspace| workspace.is_active))
-        .map(|workspace| workspace.id.as_str())
+    workspace_selectors::resolve_active_workspace_id(persisted_workspace_id, workspaces)
 }
 
 #[cfg(test)]

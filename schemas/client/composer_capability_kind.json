@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ComposerCapabilityKind",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "Skill": {
+          "type": "object",
+          "properties": {
+            "slug": {
+              "type": "string"
+            },
+            "source_kind": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "slug",
+            "source_kind"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Skill"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "McpServer": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "scope_kind": {
+              "$ref": "#/$defs/McpScopeKind"
+            }
+          },
+          "required": [
+            "name",
+            "scope_kind"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "McpServer"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "McpTool": {
+          "type": "object",
+          "properties": {
+            "raw_tool_name": {
+              "type": "string"
+            },
+            "scope_kind": {
+              "$ref": "#/$defs/McpScopeKind"
+            },
+            "server_name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "server_name",
+            "raw_tool_name",
+            "scope_kind"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "McpTool"
+      ]
+    }
+  ],
+  "$defs": {
+    "McpScopeKind": {
+      "type": "string",
+      "enum": [
+        "workspace",
+        "user"
+      ]
+    }
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ArtifactUploadFileRequest",
+  "type": "object",
+  "properties": {
+    "client_attachment_id": {
+      "type": "string"
+    },
+    "mime_type": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "path": {
+      "$ref": "#/$defs/ClientPath"
+    },
+    "planned_turn_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "thread_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_id",
+    "client_attachment_id",
+    "path"
+  ],
+  "$defs": {
+    "ClientPath": {
+      "type": "string"
+    }
+  }
+}

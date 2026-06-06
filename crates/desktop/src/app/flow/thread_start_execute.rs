@@ -1,4 +1,5 @@
 use super::*;
+use pioneer_client::threads::start as thread_start;
 
 impl PioneerDesktop {
     pub(in crate::app::flow) fn schedule_thread_start_retry(
@@ -15,14 +16,13 @@ impl PioneerDesktop {
             return;
         }
 
-        let start = self.thread_start_coordinator_mut();
-
-        let delay = thread_start_retry_delay(start.retry_attempt);
-        let attempt = start.retry_attempt.saturating_add(1);
-
-        start.pending_thread_id = Some(thread_id.to_owned());
-        start.retry_attempt = attempt;
-        start.next_attempt_at = Some(std::time::Instant::now() + delay);
+        let retry_plan = thread_start::apply_thread_start_retry(
+            self.thread_start_coordinator_mut(),
+            thread_id,
+            std::time::Instant::now(),
+        );
+        let delay = retry_plan.delay;
+        let attempt = retry_plan.attempt;
 
         let expected_attempt = attempt;
         let thread_id_for_timer = thread_id.to_owned();
@@ -42,10 +42,11 @@ impl PioneerDesktop {
 
                     let start = app.thread_start_coordinator();
 
-                    if start.retry_attempt != expected_attempt
-                        || start.pending_thread_id.as_deref() != Some(thread_id_for_timer.as_str())
-                        || start.in_progress
-                    {
+                    if !thread_start::should_fire_scheduled_thread_start_retry(
+                        start,
+                        expected_attempt,
+                        thread_id_for_timer.as_str(),
+                    ) {
                         return;
                     }
 
@@ -81,23 +82,16 @@ impl PioneerDesktop {
             return false;
         }
 
-        let start = self.thread_start_coordinator_mut();
-        if start.in_progress {
-            return false;
-        }
-
-        start.in_progress = true;
-        start.next_attempt_at = None;
-
-        let requested_thread_id = start
-            .pending_thread_id
-            .clone()
-            .unwrap_or_else(|| generate_id(ID_LEN));
-        start.pending_thread_id = Some(requested_thread_id.clone());
-
         let scope = self.default_thread_start_scope();
-        let requested_workspace_id =
-            (scope.as_str() != WORKSPACE_START_SCOPE_BOOTSTRAP).then_some(scope);
+        let Some(start_plan) = thread_start::begin_thread_start_attempt(
+            self.thread_start_coordinator_mut(),
+            thread_start::generate_thread_start_id(),
+            scope,
+        ) else {
+            return false;
+        };
+        let requested_thread_id = start_plan.requested_thread_id;
+        let requested_workspace_id = start_plan.requested_workspace_id;
 
         let ws_sender = self.gateway.ws_command_sender.clone();
 
@@ -119,24 +113,16 @@ impl PioneerDesktop {
                             }
                         };
 
-                        let response = match ws_sender.thread_start(ThreadStartParams {
-                            thread_id: requested_thread_id_for_request,
-                            workspace_id: workspace_id.clone(),
-                            name: None,
-                            model: None,
-                            model_provider: None,
-                            sandbox: None,
-                            mode: None,
-                            origin_kind: None,
-                            sidebar_visibility: None,
-                            agent_nickname: None,
-                            agent_role: None,
-                        }) {
-                            Ok(response) => response,
-                            Err(error) => {
-                                return Err(ThreadStartBootstrapFailure { error });
-                            }
-                        };
+                        let response =
+                            match ws_sender.thread_start(thread_start::thread_start_params(
+                                requested_thread_id_for_request,
+                                workspace_id.clone(),
+                            )) {
+                                Ok(response) => response,
+                                Err(error) => {
+                                    return Err(ThreadStartBootstrapFailure { error });
+                                }
+                            };
 
                         Ok::<_, ThreadStartBootstrapFailure>(ThreadStartBootstrapOutcome {
                             workspace_id,
@@ -150,7 +136,7 @@ impl PioneerDesktop {
                         return;
                     }
 
-                    app.thread_start_coordinator_mut().in_progress = false;
+                    thread_start::finish_thread_start_attempt(app.thread_start_coordinator_mut());
 
                     match result {
                         Ok(outcome) => {

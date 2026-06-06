@@ -4,15 +4,9 @@ use gpui_component::{
     table::{Column, TableDelegate, TableState},
     theme::ActiveTheme,
 };
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SkillDiagnosticsTone {
-    Default,
-    Muted,
-    Success,
-    Warning,
-    Danger,
-}
+pub(crate) use pioneer_client::skills::presentation::{
+    SkillDiagnosticsTableCell, SkillDiagnosticsTableRow, SkillDiagnosticsTone,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct SkillDiagnosticsTableColumn {
@@ -20,18 +14,6 @@ pub(crate) struct SkillDiagnosticsTableColumn {
     pub title: String,
     pub hint: String,
     pub width: Pixels,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SkillDiagnosticsTableCell {
-    pub text: String,
-    pub tooltip: Option<String>,
-    pub tone: SkillDiagnosticsTone,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct SkillDiagnosticsTableRow {
-    pub cells: Vec<SkillDiagnosticsTableCell>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

@@ -5,37 +5,9 @@ use crate::app::{
 };
 use gpui::{prelude::*, *};
 use gpui_component::{collapsible::Collapsible, h_flex, spinner::Spinner, v_flex, *};
+use pioneer_client::timeline::labels::{final_web_fetch_status, web_fetch_url_from_arguments};
 use pioneer_protocol::TurnItem;
-use serde_json::Value as JsonValue;
 use std::hash::{Hash, Hasher};
-
-fn web_fetch_url_from_arguments(arguments: &JsonValue) -> Option<String> {
-    arguments
-        .get("url")
-        .and_then(JsonValue::as_str)
-        .map(str::trim)
-        .filter(|url| !url.is_empty())
-        .map(str::to_owned)
-}
-
-fn final_web_fetch_status(
-    status: TimelineEntryStatus,
-    success: Option<bool>,
-    status_code: Option<u16>,
-) -> (String, bool) {
-    match status {
-        TimelineEntryStatus::Cancelled => (t!("timeline.web_fetch.cancelled").to_string(), false),
-        TimelineEntryStatus::Failed => (t!("timeline.web_fetch.failed").to_string(), false),
-        TimelineEntryStatus::Running => (t!("timeline.web_fetch.running").to_string(), true),
-        TimelineEntryStatus::Completed => {
-            if matches!(success, Some(false)) || status_code.is_some_and(|code| code >= 400) {
-                (t!("timeline.web_fetch.failed").to_string(), false)
-            } else {
-                (t!("timeline.web_fetch.completed").to_string(), true)
-            }
-        }
-    }
-}
 
 impl PioneerDesktop {
     pub(super) fn render_item_web_fetch(

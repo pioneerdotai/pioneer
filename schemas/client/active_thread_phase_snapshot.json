@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ActiveThreadPhaseSnapshot",
+  "type": "string",
+  "enum": [
+    "Idle",
+    "Starting",
+    "Running",
+    "Cancelling",
+    "Completing",
+    "Completed",
+    "Failed",
+    "Blocked",
+    "Cancelled"
+  ]
+}

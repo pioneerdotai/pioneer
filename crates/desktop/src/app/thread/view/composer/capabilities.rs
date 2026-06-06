@@ -1,7 +1,5 @@
 use crate::{
-    app::root::{
-        ComposerCapability, ComposerCapabilityKind, GatewayConnectionState, PioneerDesktop,
-    },
+    app::root::{ComposerCapability, GatewayConnectionState, PioneerDesktop},
     components::buttonts::{default_outline_button, default_primary_button},
 };
 use gpui::{prelude::*, *};
@@ -14,35 +12,14 @@ use gpui_component::{
     theme::ActiveTheme,
     *,
 };
-use pioneer_protocol::{
-    McpListItem, McpListParams, McpRuntimeState, McpScopeKind, McpServerDetailsParams,
-    McpServerDetailsResponse, SkillListItem, SkillListParams,
+use pioneer_client::composer::capabilities as composer_capabilities;
+use pioneer_client::composer::capabilities::{
+    McpCapabilityUnavailableReason, SelectableMcpCapability, SelectableSkillCapability,
+    SkillCapabilityUnavailableReason,
 };
+use pioneer_client::mcp::{details as mcp_details, list as mcp_list};
+use pioneer_protocol::SkillListParams;
 use std::collections::HashSet;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct SelectableSkillCapability {
-    pub(super) key: String,
-    pub(super) label: String,
-    pub(super) description: String,
-    pub(super) slug: String,
-    pub(super) source_kind: String,
-    pub(super) selectable: bool,
-    pub(super) unavailable_reason: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct SelectableMcpCapability {
-    pub(super) key: String,
-    pub(super) label: String,
-    pub(super) description: String,
-    pub(super) server_id: String,
-    pub(super) server_name: String,
-    pub(super) raw_tool_name: Option<String>,
-    pub(super) scope_kind: McpScopeKind,
-    pub(super) selectable: bool,
-    pub(super) unavailable_reason: Option<String>,
-}
 
 struct CapabilityPickerState {
     search: Entity<InputState>,
@@ -92,41 +69,19 @@ impl CapabilityPickerState {
     }
 
     fn toggle_selected(&mut self, key: &str, cx: &mut Context<Self>) {
-        if !self.selected.remove(key) {
-            self.selected.insert(key.to_owned());
-        }
+        composer_capabilities::toggle_selected_capability_key(&mut self.selected, key);
         cx.notify();
     }
 
     fn toggle_mcp_selected(&mut self, row: &SelectableMcpCapability, cx: &mut Context<Self>) {
-        if row.raw_tool_name.is_none() {
-            if self.selected.remove(row.key.as_str()) {
-                cx.notify();
-                return;
-            }
-
-            self.selected.insert(row.key.clone());
+        let update = composer_capabilities::toggle_mcp_capability_selection(
+            &mut self.selected,
+            self.mcp_server_rows.as_slice(),
+            self.mcp_tool_rows.as_slice(),
+            row,
+        );
+        if update.collapse_active_server {
             self.active_mcp_server_id = None;
-            for tool_row in self
-                .mcp_tool_rows
-                .iter()
-                .filter(|tool_row| tool_row.server_id == row.server_id)
-            {
-                self.selected.remove(tool_row.key.as_str());
-            }
-            cx.notify();
-            return;
-        }
-
-        if !self.selected.remove(row.key.as_str()) {
-            self.selected.insert(row.key.clone());
-            if let Some(server_row) = self
-                .mcp_server_rows
-                .iter()
-                .find(|server_row| server_row.server_id == row.server_id)
-            {
-                self.selected.remove(server_row.key.as_str());
-            }
         }
         cx.notify();
     }
@@ -142,7 +97,11 @@ impl CapabilityPickerState {
         rows: Vec<SelectableSkillCapability>,
         cx: &mut Context<Self>,
     ) {
-        self.skill_rows = rows;
+        composer_capabilities::replace_skill_capability_rows(
+            &mut self.skill_rows,
+            &mut self.selected,
+            rows,
+        );
         self.skill_loading = false;
         self.skill_error = None;
         cx.notify();
@@ -165,7 +124,12 @@ impl CapabilityPickerState {
         rows: Vec<SelectableMcpCapability>,
         cx: &mut Context<Self>,
     ) {
-        self.mcp_server_rows = rows;
+        composer_capabilities::replace_mcp_server_capability_rows(
+            &mut self.mcp_server_rows,
+            self.mcp_tool_rows.as_slice(),
+            &mut self.selected,
+            rows,
+        );
         self.mcp_server_loading = false;
         self.mcp_server_error = None;
         cx.notify();
@@ -177,39 +141,21 @@ impl CapabilityPickerState {
         cx.notify();
     }
 
-    fn mcp_tools_loaded(&self, server_id: &str) -> bool {
-        self.mcp_tool_rows
-            .iter()
-            .any(|row| row.server_id.as_str() == server_id)
-    }
-
     fn toggle_mcp_tools(&mut self, server_id: &str, cx: &mut Context<Self>) -> bool {
-        if self
-            .mcp_server_rows
-            .iter()
-            .any(|row| row.server_id.as_str() == server_id && self.selected.contains(&row.key))
-        {
-            self.active_mcp_server_id = None;
+        let should_load = composer_capabilities::toggle_mcp_tool_capability_panel(
+            &self.selected,
+            self.mcp_server_rows.as_slice(),
+            self.mcp_tool_rows.as_slice(),
+            &mut self.active_mcp_server_id,
+            &mut self.mcp_tool_error,
+            self.mcp_tool_loading_server_id.as_deref(),
+            server_id,
+        );
+        if !should_load {
             cx.notify();
-            return false;
         }
 
-        if self.active_mcp_server_id.as_deref() == Some(server_id) {
-            self.active_mcp_server_id = None;
-            cx.notify();
-            return false;
-        }
-
-        if self.mcp_tools_loaded(server_id)
-            || self.mcp_tool_loading_server_id.as_deref() == Some(server_id)
-        {
-            self.active_mcp_server_id = Some(server_id.to_owned());
-            self.mcp_tool_error = None;
-            cx.notify();
-            return false;
-        }
-
-        true
+        should_load
     }
 
     fn start_loading_mcp_tools(&mut self, server_id: String, cx: &mut Context<Self>) {
@@ -225,9 +171,13 @@ impl CapabilityPickerState {
         rows: Vec<SelectableMcpCapability>,
         cx: &mut Context<Self>,
     ) {
-        self.mcp_tool_rows
-            .retain(|row| row.server_id.as_str() != server_id);
-        self.mcp_tool_rows.extend(rows);
+        composer_capabilities::replace_mcp_tool_capability_rows_for_server(
+            &mut self.mcp_tool_rows,
+            self.mcp_server_rows.as_slice(),
+            &mut self.selected,
+            server_id,
+            rows,
+        );
         if self.mcp_tool_loading_server_id.as_deref() == Some(server_id) {
             self.mcp_tool_loading_server_id = None;
         }
@@ -236,18 +186,14 @@ impl CapabilityPickerState {
     }
 
     fn merge_mcp_tool_rows(&mut self, rows: Vec<SelectableMcpCapability>, cx: &mut Context<Self>) {
-        let server_ids = rows
-            .iter()
-            .map(|row| row.server_id.clone())
-            .collect::<HashSet<_>>();
-        if server_ids.is_empty() {
-            return;
+        if composer_capabilities::merge_mcp_tool_capability_rows(
+            &mut self.mcp_tool_rows,
+            self.mcp_server_rows.as_slice(),
+            &mut self.selected,
+            rows,
+        ) {
+            cx.notify();
         }
-
-        self.mcp_tool_rows
-            .retain(|row| !server_ids.contains(row.server_id.as_str()));
-        self.mcp_tool_rows.extend(rows);
-        cx.notify();
     }
 
     fn fail_loading_mcp_tools(&mut self, server_id: &str, error: String, cx: &mut Context<Self>) {
@@ -284,7 +230,7 @@ impl PioneerDesktop {
                 let state = picker_state.read(cx);
                 let query = state.query(cx);
                 (
-                    filter_selectable_skill_capability_rows(
+                    composer_capabilities::filter_selectable_skill_capability_rows(
                         state.skill_rows.as_slice(),
                         query.as_str(),
                     ),
@@ -370,7 +316,8 @@ impl PioneerDesktop {
             );
             state.mcp_server_rows = server_rows;
             if let Some(details) = initial_details {
-                state.mcp_tool_rows = filter_mcp_tool_capability_rows(&details, "");
+                state.mcp_tool_rows =
+                    composer_capabilities::filter_mcp_tool_capability_rows(&details, "");
             }
             state
         });
@@ -394,12 +341,10 @@ impl PioneerDesktop {
                 let query = state.query(cx);
                 let has_query = !query.is_empty();
                 let active_server_id = state.active_mcp_server_id.clone();
-                let selected_server_ids = state
-                    .mcp_server_rows
-                    .iter()
-                    .filter(|row| state.selected.contains(row.key.as_str()) && row.selectable)
-                    .map(|row| row.server_id.clone())
-                    .collect::<HashSet<_>>();
+                let selected_server_ids = composer_capabilities::selected_mcp_server_ids(
+                    state.mcp_server_rows.as_slice(),
+                    &state.selected,
+                );
                 let active_server_selected = active_server_id
                     .as_deref()
                     .is_some_and(|server_id| selected_server_ids.contains(server_id));
@@ -409,12 +354,12 @@ impl PioneerDesktop {
                     .map(|row| row.server_id.clone())
                     .collect::<HashSet<_>>();
                 (
-                    filter_selectable_mcp_capability_rows(
+                    composer_capabilities::filter_selectable_mcp_capability_rows(
                         state.mcp_server_rows.as_slice(),
                         query.as_str(),
                     ),
                     if has_query {
-                        filter_search_mcp_tool_capability_rows(
+                        composer_capabilities::filter_search_mcp_tool_capability_rows(
                             state.mcp_tool_rows.as_slice(),
                             &selected_server_ids,
                             query.as_str(),
@@ -422,7 +367,7 @@ impl PioneerDesktop {
                     } else if active_server_selected {
                         Vec::new()
                     } else {
-                        filter_active_mcp_tool_capability_rows(
+                        composer_capabilities::filter_active_mcp_tool_capability_rows(
                             state.mcp_tool_rows.as_slice(),
                             active_server_id.as_deref(),
                             query.as_str(),
@@ -514,38 +459,14 @@ impl PioneerDesktop {
         &self,
         query: &str,
     ) -> Vec<SelectableSkillCapability> {
-        filter_skill_capability_rows(self.installed_skills.as_slice(), query)
+        composer_capabilities::filter_skill_capability_rows(self.installed_skills.as_slice(), query)
     }
 
     pub(super) fn selectable_mcp_server_capabilities(
         &self,
         query: &str,
     ) -> Vec<SelectableMcpCapability> {
-        let query = query.trim().to_ascii_lowercase();
-        let mut rows = self
-            .mcp_servers
-            .iter()
-            .map(selectable_mcp_server_from_item)
-            .filter(|row| {
-                query.is_empty()
-                    || row.label.to_ascii_lowercase().contains(query.as_str())
-                    || row
-                        .server_name
-                        .to_ascii_lowercase()
-                        .contains(query.as_str())
-                    || row
-                        .description
-                        .to_ascii_lowercase()
-                        .contains(query.as_str())
-            })
-            .collect::<Vec<_>>();
-        rows.sort_by(|left, right| {
-            left.label
-                .to_ascii_lowercase()
-                .cmp(&right.label.to_ascii_lowercase())
-                .then_with(|| left.key.cmp(&right.key))
-        });
-        rows
+        composer_capabilities::filter_mcp_server_capability_rows(self.mcp_servers.as_slice(), query)
     }
 
     fn load_composer_skill_picker_rows(
@@ -593,7 +514,10 @@ impl PioneerDesktop {
                                 .filter(|skill| skill.install.installed)
                                 .collect::<Vec<_>>();
                             state.finish_loading_skills(
-                                filter_skill_capability_rows(installed.as_slice(), ""),
+                                composer_capabilities::filter_skill_capability_rows(
+                                    installed.as_slice(),
+                                    "",
+                                ),
                                 cx,
                             );
                         }
@@ -644,9 +568,9 @@ impl PioneerDesktop {
                 let workspace_id_for_prefetch = workspace_id.clone();
                 let prefetch_ws_sender = ws_sender.clone();
                 let result = cx
-                    .background_spawn(
-                        async move { ws_sender.mcp_list(McpListParams { workspace_id }) },
-                    )
+                    .background_spawn(async move {
+                        ws_sender.mcp_list(mcp_list::mcp_list_params(workspace_id))
+                    })
                     .await;
 
                 let prefetch_server_ids = match result {
@@ -654,7 +578,7 @@ impl PioneerDesktop {
                         let rows = response
                             .servers
                             .iter()
-                            .map(selectable_mcp_server_from_item)
+                            .map(composer_capabilities::selectable_mcp_server_from_item)
                             .collect::<Vec<_>>();
                         let prefetch_server_ids = rows
                             .iter()
@@ -664,7 +588,10 @@ impl PioneerDesktop {
                         let _ = cx.update(|cx| {
                             picker_state.update(cx, |state, cx| {
                                 state.finish_loading_mcp_servers(
-                                    filter_selectable_mcp_capability_rows(rows.as_slice(), ""),
+                                    composer_capabilities::filter_selectable_mcp_capability_rows(
+                                        rows.as_slice(),
+                                        "",
+                                    ),
                                     cx,
                                 );
                             });
@@ -694,13 +621,18 @@ impl PioneerDesktop {
                     .background_spawn(async move {
                         let mut rows = Vec::new();
                         for server_id in prefetch_server_ids {
-                            let details =
-                                prefetch_ws_sender.mcp_server_details(McpServerDetailsParams {
-                                    workspace_id: workspace_id_for_prefetch.clone(),
+                            let details = prefetch_ws_sender.mcp_server_details(
+                                mcp_details::mcp_server_details_params(
+                                    workspace_id_for_prefetch.clone(),
                                     server_id,
-                                });
+                                ),
+                            );
                             if let Ok(details) = details {
-                                rows.extend(filter_mcp_tool_capability_rows(&details, ""));
+                                rows.extend(
+                                    composer_capabilities::filter_mcp_tool_capability_rows(
+                                        &details, "",
+                                    ),
+                                );
                             }
                         }
                         rows
@@ -756,17 +688,19 @@ impl PioneerDesktop {
                 let server_id_for_request = server_id.clone();
                 let result = cx
                     .background_spawn(async move {
-                        ws_sender.mcp_server_details(McpServerDetailsParams {
+                        ws_sender.mcp_server_details(mcp_details::mcp_server_details_params(
                             workspace_id,
-                            server_id: server_id_for_request,
-                        })
+                            server_id_for_request,
+                        ))
                     })
                     .await;
 
                 let _ = cx.update(|cx| {
                     picker_state.update(cx, |state, cx| match result {
                         Ok(response) => {
-                            let rows = filter_mcp_tool_capability_rows(&response, "");
+                            let rows = composer_capabilities::filter_mcp_tool_capability_rows(
+                                &response, "",
+                            );
                             state.finish_loading_mcp_tools(server_id.as_str(), rows, cx);
                         }
                         Err(error) => {
@@ -842,7 +776,8 @@ fn render_skill_rows(
         let key_for_toggle = key.clone();
         let picker_state_for_row = picker_state.clone();
         let picker_state_for_toggle = picker_state.clone();
-        let disabled_reason = row.unavailable_reason.clone();
+        let disabled_reason =
+            skill_capability_unavailable_reason_label(row.unavailable_reason.as_ref());
         let row_element = h_flex()
             .id(("composer-skill-picker-row", key_id))
             .w_full()
@@ -1207,7 +1142,8 @@ fn render_mcp_row(
     let is_tool = row.raw_tool_name.is_some();
     let is_loading_tools = can_load_tools && loading_server_id == Some(row.server_id.as_str());
     let is_selectable = row.selectable;
-    let disabled_reason = row.unavailable_reason.clone();
+    let disabled_reason = mcp_capability_unavailable_reason_label(row.unavailable_reason.as_ref());
+    let description = mcp_capability_row_description(&row);
     let row_for_row_click = row.clone();
     let row_for_toggle = row.clone();
     let picker_state_for_row = picker_state.clone();
@@ -1247,7 +1183,7 @@ fn render_mcp_row(
                             .text_xs()
                             .opacity(0.6)
                             .line_height(relative(1.25))
-                            .child(row.description.clone()),
+                            .child(description),
                     )
                 })
                 .when_some(disabled_reason, |this, reason| {
@@ -1354,538 +1290,59 @@ fn picker_error_state(message: String, cx: &mut App) -> AnyElement {
         .into_any_element()
 }
 
-fn selected_skill_composer_capabilities(state: &CapabilityPickerState) -> Vec<ComposerCapability> {
-    state
-        .skill_rows
-        .iter()
-        .filter(|row| state.selected.contains(row.key.as_str()) && row.selectable)
-        .map(|row| ComposerCapability {
-            id: row.key.clone(),
-            label: row.label.clone(),
-            kind: ComposerCapabilityKind::Skill {
-                slug: row.slug.clone(),
-                source_kind: row.source_kind.clone(),
-            },
-        })
-        .collect()
+fn skill_capability_unavailable_reason_label(
+    reason: Option<&SkillCapabilityUnavailableReason>,
+) -> Option<String> {
+    match reason? {
+        SkillCapabilityUnavailableReason::DisabledByPolicy => {
+            Some(t!("chat.composer.capability_picker.disabled_by_policy").to_string())
+        }
+        SkillCapabilityUnavailableReason::Inactive { status_reason } => {
+            status_reason.clone().or_else(|| {
+                Some(t!("chat.composer.capability_picker.blocked_by_runtime_checks").to_string())
+            })
+        }
+    }
 }
 
-fn selected_mcp_composer_capabilities(state: &CapabilityPickerState) -> Vec<ComposerCapability> {
-    selected_mcp_composer_capabilities_from_rows(
-        state.mcp_server_rows.as_slice(),
-        state.mcp_tool_rows.as_slice(),
+fn mcp_capability_unavailable_reason_label(
+    reason: Option<&McpCapabilityUnavailableReason>,
+) -> Option<String> {
+    match reason? {
+        McpCapabilityUnavailableReason::DisabledByPolicy => {
+            Some(t!("chat.composer.capability_picker.disabled_by_policy").to_string())
+        }
+        McpCapabilityUnavailableReason::RuntimeUnavailable => {
+            Some(t!("chat.composer.capability_picker.runtime_unavailable").to_string())
+        }
+        McpCapabilityUnavailableReason::RuntimeNotReady => {
+            Some(t!("chat.composer.capability_picker.runtime_not_ready").to_string())
+        }
+        McpCapabilityUnavailableReason::NoToolCatalog => {
+            Some(t!("chat.composer.capability_picker.no_tool_catalog").to_string())
+        }
+    }
+}
+
+fn mcp_capability_row_description(row: &SelectableMcpCapability) -> String {
+    if let Some(count) = row.tools_count {
+        return t!("chat.composer.capability_picker.tools_count", count = count).to_string();
+    }
+
+    row.description.clone()
+}
+
+fn selected_skill_composer_capabilities(state: &CapabilityPickerState) -> Vec<ComposerCapability> {
+    composer_capabilities::selected_skill_composer_capabilities_from_rows(
+        state.skill_rows.as_slice(),
         &state.selected,
     )
 }
 
-fn selected_mcp_composer_capabilities_from_rows(
-    server_rows: &[SelectableMcpCapability],
-    tool_rows: &[SelectableMcpCapability],
-    selected: &HashSet<String>,
-) -> Vec<ComposerCapability> {
-    let selected_server_ids = server_rows
-        .iter()
-        .filter(|row| selected.contains(row.key.as_str()) && row.selectable)
-        .map(|row| row.server_id.as_str())
-        .collect::<HashSet<_>>();
-
-    server_rows
-        .iter()
-        .chain(tool_rows.iter())
-        .filter(|row| selected.contains(row.key.as_str()) && row.selectable)
-        .filter(|row| {
-            row.raw_tool_name.is_none() || !selected_server_ids.contains(row.server_id.as_str())
-        })
-        .cloned()
-        .map(mcp_row_to_composer_capability)
-        .collect()
-}
-
-fn filter_selectable_skill_capability_rows(
-    rows: &[SelectableSkillCapability],
-    query: &str,
-) -> Vec<SelectableSkillCapability> {
-    let query = query.trim().to_ascii_lowercase();
-    rows.iter()
-        .filter(|row| {
-            query.is_empty()
-                || row.label.to_ascii_lowercase().contains(query.as_str())
-                || row.slug.to_ascii_lowercase().contains(query.as_str())
-                || row
-                    .description
-                    .to_ascii_lowercase()
-                    .contains(query.as_str())
-        })
-        .cloned()
-        .collect()
-}
-
-fn filter_selectable_mcp_capability_rows(
-    rows: &[SelectableMcpCapability],
-    query: &str,
-) -> Vec<SelectableMcpCapability> {
-    let query = query.trim().to_ascii_lowercase();
-    rows.iter()
-        .filter(|row| {
-            query.is_empty()
-                || row.label.to_ascii_lowercase().contains(query.as_str())
-                || row
-                    .server_name
-                    .to_ascii_lowercase()
-                    .contains(query.as_str())
-                || row
-                    .raw_tool_name
-                    .as_deref()
-                    .unwrap_or_default()
-                    .to_ascii_lowercase()
-                    .contains(query.as_str())
-                || row
-                    .description
-                    .to_ascii_lowercase()
-                    .contains(query.as_str())
-        })
-        .cloned()
-        .collect()
-}
-
-fn filter_active_mcp_tool_capability_rows(
-    rows: &[SelectableMcpCapability],
-    active_server_id: Option<&str>,
-    query: &str,
-) -> Vec<SelectableMcpCapability> {
-    let Some(active_server_id) = active_server_id else {
-        return Vec::new();
-    };
-    let active_rows = rows
-        .iter()
-        .filter(|row| row.server_id.as_str() == active_server_id)
-        .cloned()
-        .collect::<Vec<_>>();
-    filter_selectable_mcp_capability_rows(active_rows.as_slice(), query)
-}
-
-fn filter_search_mcp_tool_capability_rows(
-    rows: &[SelectableMcpCapability],
-    selected_server_ids: &HashSet<String>,
-    query: &str,
-) -> Vec<SelectableMcpCapability> {
-    filter_selectable_mcp_capability_rows(rows, query)
-        .into_iter()
-        .filter(|row| {
-            row.raw_tool_name.is_some() && !selected_server_ids.contains(row.server_id.as_str())
-        })
-        .collect()
-}
-
-fn selectable_skill_from_item(skill: &SkillListItem) -> SelectableSkillCapability {
-    let unavailable_reason = if !skill.policy.enabled {
-        Some(t!("chat.composer.capability_picker.disabled_by_policy").to_string())
-    } else if skill.status != "active" {
-        skill.status_reason.clone().or_else(|| {
-            Some(t!("chat.composer.capability_picker.blocked_by_runtime_checks").to_string())
-        })
-    } else {
-        None
-    };
-    let key = ComposerCapabilityKind::Skill {
-        slug: skill.slug.clone(),
-        source_kind: skill.source_kind.clone(),
-    }
-    .key();
-
-    SelectableSkillCapability {
-        key,
-        label: skill.display_name.clone(),
-        description: skill.description.clone(),
-        slug: skill.slug.clone(),
-        source_kind: skill.source_kind.clone(),
-        selectable: unavailable_reason.is_none(),
-        unavailable_reason,
-    }
-}
-
-fn filter_skill_capability_rows(
-    skills: &[SkillListItem],
-    query: &str,
-) -> Vec<SelectableSkillCapability> {
-    let query = query.trim().to_ascii_lowercase();
-    let mut rows = skills
-        .iter()
-        .map(selectable_skill_from_item)
-        .filter(|row| {
-            query.is_empty()
-                || row.label.to_ascii_lowercase().contains(query.as_str())
-                || row.slug.to_ascii_lowercase().contains(query.as_str())
-                || row
-                    .description
-                    .to_ascii_lowercase()
-                    .contains(query.as_str())
-        })
-        .collect::<Vec<_>>();
-    rows.sort_by(|left, right| {
-        left.label
-            .to_ascii_lowercase()
-            .cmp(&right.label.to_ascii_lowercase())
-            .then_with(|| left.key.cmp(&right.key))
-    });
-    rows
-}
-
-fn selectable_mcp_server_from_item(server: &McpListItem) -> SelectableMcpCapability {
-    let unavailable_reason = mcp_server_unavailable_reason(server);
-    let label = server
-        .display_name
-        .clone()
-        .unwrap_or_else(|| server.name.clone());
-    let key = ComposerCapabilityKind::McpServer {
-        name: server.name.clone(),
-        scope_kind: server.scope,
-    }
-    .key();
-
-    SelectableMcpCapability {
-        key,
-        label,
-        description: t!(
-            "chat.composer.capability_picker.tools_count",
-            count = server.tools_count
-        )
-        .to_string(),
-        server_id: server.id.clone(),
-        server_name: server.name.clone(),
-        raw_tool_name: None,
-        scope_kind: server.scope,
-        selectable: unavailable_reason.is_none(),
-        unavailable_reason,
-    }
-}
-
-fn mcp_server_unavailable_reason(server: &McpListItem) -> Option<String> {
-    if !server.policy.enabled {
-        return Some(t!("chat.composer.capability_picker.disabled_by_policy").to_string());
-    }
-    if !server.runtime.live {
-        return Some(t!("chat.composer.capability_picker.runtime_unavailable").to_string());
-    }
-    if !matches!(
-        server.runtime.state,
-        McpRuntimeState::Ready | McpRuntimeState::Degraded
-    ) {
-        return Some(t!("chat.composer.capability_picker.runtime_not_ready").to_string());
-    }
-    if server.tools_count == 0 {
-        return Some(t!("chat.composer.capability_picker.no_tool_catalog").to_string());
-    }
-    None
-}
-
-fn filter_mcp_tool_capability_rows(
-    details: &McpServerDetailsResponse,
-    query: &str,
-) -> Vec<SelectableMcpCapability> {
-    let query = query.trim().to_ascii_lowercase();
-    let server = &details.server;
-    let server_label = server
-        .display_name
-        .clone()
-        .unwrap_or_else(|| server.name.clone());
-    let server_selectable = mcp_server_unavailable_reason(server).is_none();
-    let mut rows = details
-        .catalog
-        .tools
-        .iter()
-        .map(|tool| {
-            let label = tool
-                .title
-                .clone()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| tool.name.clone());
-            let description = tool.description.clone().unwrap_or_default();
-            let unavailable_reason = if server_selectable {
-                None
-            } else {
-                mcp_server_unavailable_reason(server)
-            };
-            let key = ComposerCapabilityKind::McpTool {
-                server_name: server.name.clone(),
-                raw_tool_name: tool.name.clone(),
-                scope_kind: server.scope,
-            }
-            .key();
-            SelectableMcpCapability {
-                key,
-                label: format!("{server_label}/{label}"),
-                description,
-                server_id: server.id.clone(),
-                server_name: server.name.clone(),
-                raw_tool_name: Some(tool.name.clone()),
-                scope_kind: server.scope,
-                selectable: unavailable_reason.is_none(),
-                unavailable_reason,
-            }
-        })
-        .filter(|row| {
-            query.is_empty()
-                || row.label.to_ascii_lowercase().contains(query.as_str())
-                || row
-                    .raw_tool_name
-                    .as_deref()
-                    .unwrap_or_default()
-                    .to_ascii_lowercase()
-                    .contains(query.as_str())
-                || row
-                    .description
-                    .to_ascii_lowercase()
-                    .contains(query.as_str())
-        })
-        .collect::<Vec<_>>();
-    rows.sort_by(|left, right| {
-        left.label
-            .to_ascii_lowercase()
-            .cmp(&right.label.to_ascii_lowercase())
-            .then_with(|| left.key.cmp(&right.key))
-    });
-    rows
-}
-
-fn mcp_row_to_composer_capability(row: SelectableMcpCapability) -> ComposerCapability {
-    let kind = match row.raw_tool_name {
-        Some(raw_tool_name) => ComposerCapabilityKind::McpTool {
-            server_name: row.server_name,
-            raw_tool_name,
-            scope_kind: row.scope_kind,
-        },
-        None => ComposerCapabilityKind::McpServer {
-            name: row.server_name,
-            scope_kind: row.scope_kind,
-        },
-    };
-    ComposerCapability {
-        id: row.key,
-        label: row.label,
-        kind,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        filter_mcp_tool_capability_rows, filter_search_mcp_tool_capability_rows,
-        filter_skill_capability_rows, mcp_row_to_composer_capability,
-        mcp_server_unavailable_reason, selectable_mcp_server_from_item, selectable_skill_from_item,
-        selected_mcp_composer_capabilities_from_rows,
-    };
-    use pioneer_protocol::{
-        McpListItem, McpPolicyState, McpRuntimeState, McpRuntimeStatus, McpScopeKind,
-        McpServerCatalogDetails, McpServerDetailsResponse, McpServerHealthDetails, McpServerStatus,
-        McpSourceKind, McpToolCatalogItem, McpTransportSummary, SkillHealthSummary,
-        SkillInstallState, SkillListItem, SkillPolicyState,
-    };
-    use std::collections::HashSet;
-
-    #[test]
-    fn selectable_skill_preserves_disabled_reason() {
-        let mut item = skill_item("tests/example");
-        item.policy.enabled = false;
-
-        let row = selectable_skill_from_item(&item);
-
-        assert!(!row.selectable);
-        assert_eq!(
-            row.unavailable_reason.as_deref(),
-            Some("Disabled by policy")
-        );
-    }
-
-    #[test]
-    fn selectable_skill_rows_filter_by_label_slug_and_description() {
-        let mut docs = skill_item("tests/docs-writer");
-        docs.display_name = "Docs Writer".to_owned();
-        docs.description = "Creates release notes".to_owned();
-        let mut image = skill_item("tests/imagegen");
-        image.display_name = "Imagegen".to_owned();
-        image.description = "Generate bitmap assets".to_owned();
-
-        let rows = filter_skill_capability_rows(&[image.clone(), docs.clone()], "release");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].slug, "tests/docs-writer");
-
-        let rows = filter_skill_capability_rows(&[image, docs], "imagegen");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].key, "skill:user:tests/imagegen");
-        assert!(rows[0].selectable);
-    }
-
-    #[test]
-    fn mcp_server_requires_live_runtime_and_catalog() {
-        let mut server = mcp_server("server-a");
-        server.runtime.live = false;
-        assert_eq!(
-            mcp_server_unavailable_reason(&server).as_deref(),
-            Some("Runtime unavailable")
-        );
-
-        server.runtime.live = true;
-        server.tools_count = 0;
-        assert_eq!(
-            mcp_server_unavailable_reason(&server).as_deref(),
-            Some("No tool catalog available")
-        );
-    }
-
-    #[test]
-    fn mcp_tool_rows_filter_and_convert_to_tool_capability() {
-        let details = mcp_details("browser", vec![mcp_tool("open", "Open page")]);
-
-        let rows = filter_mcp_tool_capability_rows(&details, "page");
-
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].key, "mcp-tool:workspace:browser:open");
-        assert_eq!(rows[0].raw_tool_name.as_deref(), Some("open"));
-        assert!(rows[0].selectable);
-
-        let capability = mcp_row_to_composer_capability(rows[0].clone());
-        assert_eq!(capability.id, "mcp-tool:workspace:browser:open");
-    }
-
-    #[test]
-    fn mcp_search_can_match_tools_from_unopened_servers() {
-        let browser = mcp_details("browser", vec![mcp_tool("open", "Open page")]);
-        let resend = mcp_details("resend", vec![mcp_tool("add_contact", "Add contact")]);
-        let mut rows = filter_mcp_tool_capability_rows(&browser, "");
-        rows.extend(filter_mcp_tool_capability_rows(&resend, ""));
-
-        let filtered = filter_search_mcp_tool_capability_rows(&rows, &HashSet::new(), "contact");
-
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].server_name, "resend");
-        assert_eq!(filtered[0].raw_tool_name.as_deref(), Some("add_contact"));
-    }
-
-    #[test]
-    fn selected_mcp_capabilities_skip_tools_when_server_is_selected() {
-        let server = selectable_mcp_server_from_item(&mcp_server("resend"));
-        let details = mcp_details(
-            "resend",
-            vec![mcp_tool("add_contact", "Add contact to audience")],
-        );
-        let tool = filter_mcp_tool_capability_rows(&details, "contact")
-            .into_iter()
-            .next()
-            .expect("test tool should match query");
-        let mut selected = HashSet::new();
-        selected.insert(server.key.clone());
-        selected.insert(tool.key.clone());
-
-        let capabilities =
-            selected_mcp_composer_capabilities_from_rows(&[server], &[tool], &selected);
-
-        assert_eq!(capabilities.len(), 1);
-        assert_eq!(capabilities[0].id, "mcp-server:workspace:resend");
-    }
-
-    fn skill_item(slug: &str) -> SkillListItem {
-        SkillListItem {
-            slug: slug.to_owned(),
-            source_kind: "user".to_owned(),
-            display_name: "Example".to_owned(),
-            description: "Example skill".to_owned(),
-            version: None,
-            fingerprint: "fingerprint".to_owned(),
-            trust_level: "community".to_owned(),
-            install: SkillInstallState {
-                managed: false,
-                installed: true,
-                lifecycle_editable: true,
-                install_path: None,
-                updated_at: None,
-            },
-            policy: SkillPolicyState {
-                enabled: true,
-                allow_implicit_invocation: false,
-                allow_implicit_invocation_editable: true,
-            },
-            health: SkillHealthSummary {
-                status: "ok".to_owned(),
-                dependency_failures: Vec::new(),
-                security_blocks: Vec::new(),
-                validation_issues: Vec::new(),
-            },
-            status: "active".to_owned(),
-            status_reason: None,
-        }
-    }
-
-    fn mcp_server(name: &str) -> McpListItem {
-        McpListItem {
-            id: format!("mcp:{name}"),
-            name: name.to_owned(),
-            display_name: None,
-            scope: McpScopeKind::Workspace,
-            source_kind: McpSourceKind::Config,
-            transport: McpTransportSummary::Stdio {
-                command: "server".to_owned(),
-            },
-            policy: McpPolicyState {
-                enabled: true,
-                allow_implicit_invocation: false,
-            },
-            required: false,
-            fingerprint: "fingerprint".to_owned(),
-            runtime: McpRuntimeStatus {
-                state: McpRuntimeState::Ready,
-                live: true,
-                last_seen_at: None,
-                last_error: None,
-            },
-            tools_count: 1,
-            resources_count: 0,
-            resource_templates_count: 0,
-            prompts_count: 0,
-            status: McpServerStatus::Ready,
-            status_reason: None,
-        }
-    }
-
-    fn mcp_tool(name: &str, description: &str) -> McpToolCatalogItem {
-        McpToolCatalogItem {
-            name: name.to_owned(),
-            title: None,
-            description: Some(description.to_owned()),
-            input_schema_summary: None,
-            annotations: None,
-        }
-    }
-
-    fn mcp_details(server_name: &str, tools: Vec<McpToolCatalogItem>) -> McpServerDetailsResponse {
-        let mut server = mcp_server(server_name);
-        server.tools_count = tools.len();
-        McpServerDetailsResponse {
-            snapshot_version: 1,
-            generated_at: 1_700_000_000,
-            server: server.clone(),
-            catalog: McpServerCatalogDetails {
-                catalog_version: Some("catalog-v1".to_owned()),
-                generated_at: Some(1_700_000_000),
-                server_info: serde_json::json!({ "name": server.name }),
-                server_instructions_hash: None,
-                tools,
-                resources: Vec::new(),
-                resource_templates: Vec::new(),
-                prompts: Vec::new(),
-            },
-            health: McpServerHealthDetails {
-                runtime: server.runtime.clone(),
-                status: server.status,
-                status_reason: server.status_reason.clone(),
-                last_error: None,
-                retry_attempt: None,
-                next_retry_at: None,
-                catalog_version: Some("catalog-v1".to_owned()),
-                stderr_tail: None,
-            },
-            audit: Vec::new(),
-            recent_bindings: Vec::new(),
-        }
-    }
+fn selected_mcp_composer_capabilities(state: &CapabilityPickerState) -> Vec<ComposerCapability> {
+    composer_capabilities::selected_mcp_composer_capabilities_from_rows(
+        state.mcp_server_rows.as_slice(),
+        state.mcp_tool_rows.as_slice(),
+        &state.selected,
+    )
 }

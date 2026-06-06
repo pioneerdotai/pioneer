@@ -1,37 +1,20 @@
+#[cfg(test)]
+use super::super::root::ComposerAttachment;
 use super::super::{
     conversation::ConversationEvent,
-    root::{
-        ComposerAttachment, ComposerAttachmentKind, ComposerAttachmentUploadState,
-        ComposerCapability, PioneerDesktop,
-    },
+    root::{ComposerCapability, PioneerDesktop},
 };
-use crate::gateway::{DesktopArtifactUploadRequest, GatewayEndpointKind, GatewayWsCommandSender};
-use anyhow::{Context as AnyhowContext, Result, anyhow};
 use gpui::{prelude::*, *};
-use pioneer_protocol::{
-    ArtifactCapabilitiesParams, ArtifactCapabilitiesResponse, ArtifactKind, ArtifactRef,
-    REQUEST_ID_LEN, TurnCancelParams, TurnMcpServerCapabilitySummary, TurnMcpToolCapabilitySummary,
-    TurnSkillCapabilitySummary, TurnStartParams, UserInput, UserMessageAttachment, generate_id,
+use pioneer_client::composer::attachments as composer_attachments;
+use pioneer_client::composer::capabilities as composer_capabilities;
+use pioneer_client::composer::turn_prepare::{
+    self as composer_turn_prepare, PrepareComposerTurnRequest,
 };
-use std::path::{Path, PathBuf};
-
-const TURN_ID_LEN: usize = 21;
-
-#[derive(Debug, Clone)]
-struct PreparedComposerAttachment {
-    attachment: ComposerAttachment,
-    artifact: Option<ArtifactRef>,
-}
-
-#[derive(Debug, Clone)]
-struct PreparedComposerTurn {
-    input: Vec<UserInput>,
-    capabilities: Vec<pioneer_protocol::TurnCapability>,
-    user_text: String,
-    user_message_text: String,
-    user_attachments: Vec<UserMessageAttachment>,
-    attachments: Vec<PreparedComposerAttachment>,
-}
+use pioneer_client::turns::{cancel as turn_cancel, start as turn_start};
+use pioneer_protocol::ArtifactRef;
+#[cfg(test)]
+use pioneer_protocol::UserInput;
+use std::path::PathBuf;
 
 impl PioneerDesktop {
     pub(super) fn open_composer_file_picker(
@@ -73,16 +56,19 @@ impl PioneerDesktop {
     }
 
     pub(super) fn remove_composer_attachment_at(&mut self, index: usize) {
-        if index < self.composer_attachments.len() {
-            self.composer_attachments.remove(index);
+        if composer_attachments::remove_composer_attachment_at(
+            &mut self.composer_attachments,
+            index,
+        ) {
             self.composer_upload_error = None;
         }
     }
 
     pub(super) fn remove_composer_capability_at(&mut self, index: usize) {
-        if index < self.composer_capabilities.len() {
-            self.composer_capabilities.remove(index);
-        }
+        composer_capabilities::remove_composer_capability_at(
+            &mut self.composer_capabilities,
+            index,
+        );
     }
 
     pub(super) fn add_composer_capabilities(
@@ -90,7 +76,10 @@ impl PioneerDesktop {
         capabilities: impl IntoIterator<Item = ComposerCapability>,
     ) {
         for capability in capabilities {
-            add_composer_capability(&mut self.composer_capabilities, capability);
+            composer_capabilities::add_composer_capability(
+                &mut self.composer_capabilities,
+                capability,
+            );
         }
     }
 
@@ -110,14 +99,16 @@ impl PioneerDesktop {
         let composer_text = composer_state.read(cx).value().trim().to_owned();
         let composer_attachments = self.composer_attachments.clone();
         let composer_capabilities = self.composer_capabilities.clone();
-        if composer_text.is_empty()
-            && composer_attachments.is_empty()
-            && composer_capabilities.is_empty()
-        {
+        if !composer_turn_prepare::composer_has_sendable_content(
+            composer_text.as_str(),
+            !composer_attachments.is_empty(),
+            !composer_capabilities.is_empty(),
+        ) {
             return;
         }
-        let turn_id = generate_id(TURN_ID_LEN);
-        let pending_request_id = generate_id(REQUEST_ID_LEN);
+        let turn_start_ids = turn_start::plan_turn_start_ids();
+        let turn_id = turn_start_ids.turn_id;
+        let pending_request_id = turn_start_ids.pending_request_id;
         let workspace_id = self
             .thread_workspace_id(thread_id.as_str())
             .map(str::to_owned)
@@ -132,14 +123,9 @@ impl PioneerDesktop {
 
         self.composer_upload_in_progress = true;
         self.composer_upload_error = None;
-        for attachment in &mut self.composer_attachments {
-            if !matches!(
-                attachment.upload_state,
-                ComposerAttachmentUploadState::Uploaded { .. }
-            ) {
-                attachment.upload_state = ComposerAttachmentUploadState::Uploading;
-            }
-        }
+        composer_turn_prepare::mark_pending_composer_attachments_uploading(
+            &mut self.composer_attachments,
+        );
         cx.notify();
 
         cx.spawn_in(
@@ -156,16 +142,15 @@ impl PioneerDesktop {
                 async move {
                     let prepare_result = cx
                         .background_spawn(async move {
-                            prepare_composer_turn(
-                                upload_sender,
-                                workspace_id_for_prepare,
-                                thread_id_for_prepare,
-                                turn_id_for_prepare,
+                            upload_sender.prepare_composer_turn(PrepareComposerTurnRequest {
+                                workspace_id: workspace_id_for_prepare,
+                                thread_id: thread_id_for_prepare,
+                                turn_id: turn_id_for_prepare,
                                 endpoint_kind,
-                                composer_text_for_prepare,
-                                composer_attachments_for_prepare,
-                                composer_capabilities_for_prepare,
-                            )
+                                text: composer_text_for_prepare,
+                                attachments: composer_attachments_for_prepare,
+                                capabilities: composer_capabilities_for_prepare,
+                            })
                         })
                         .await;
 
@@ -176,17 +161,10 @@ impl PioneerDesktop {
                                 let error = format!("{error:#}");
                                 view.composer_upload_in_progress = false;
                                 view.composer_upload_error = Some(error.clone());
-                                for attachment in &mut view.composer_attachments {
-                                    if matches!(
-                                        attachment.upload_state,
-                                        ComposerAttachmentUploadState::Uploading
-                                    ) {
-                                        attachment.upload_state =
-                                            ComposerAttachmentUploadState::Failed {
-                                                error: error.clone(),
-                                            };
-                                    }
-                                }
+                                composer_turn_prepare::mark_uploading_composer_attachments_failed(
+                                    &mut view.composer_attachments,
+                                    error.as_str(),
+                                );
                                 cx.notify();
                                 return;
                             }
@@ -194,17 +172,13 @@ impl PioneerDesktop {
 
                         view.composer_upload_in_progress = false;
                         view.composer_upload_error = None;
-                        for (attachment, prepared_attachment) in view
-                            .composer_attachments
-                            .iter_mut()
-                            .zip(prepared.attachments.iter())
-                        {
-                            if let Some(artifact) = prepared_attachment.artifact.as_ref() {
-                                attachment.upload_state = ComposerAttachmentUploadState::Uploaded {
-                                    artifact: artifact.clone(),
-                                };
-                            }
-                        }
+                        composer_turn_prepare::apply_uploaded_composer_attachment_artifacts(
+                            &mut view.composer_attachments,
+                            prepared
+                                .attachments
+                                .iter()
+                                .map(|prepared_attachment| prepared_attachment.artifact.clone()),
+                        );
                         view.clear_composer(window, cx);
                         view.clear_thread_draft(thread_id.as_str());
 
@@ -238,13 +212,13 @@ impl PioneerDesktop {
                             cx.notify();
                             return;
                         };
-                        conversation.apply(ConversationEvent::LocalTurnStartRequested {
-                            thread_id: thread_id.clone(),
-                            turn_id: turn_id.clone(),
-                            pending_request_id: pending_request_id.clone(),
-                            user_text: prepared.user_message_text.clone(),
-                            attachments: prepared.user_attachments.clone(),
-                        });
+                        conversation.apply(turn_start::local_turn_start_requested_event(
+                            thread_id.clone(),
+                            turn_id.clone(),
+                            pending_request_id.clone(),
+                            prepared.user_message_text.clone(),
+                            prepared.user_attachments.clone(),
+                        ));
 
                         let ws_sender = turn_start_sender.clone();
                         let thread_id_for_send = thread_id.clone();
@@ -260,16 +234,19 @@ impl PioneerDesktop {
                             async move {
                                 let result = cx
                                     .background_spawn(async move {
-                                        ws_sender.turn_start(TurnStartParams {
-                                            thread_id: thread_id_for_send.clone(),
-                                            turn_id: turn_id_for_send.clone(),
-                                            input: turn_input_for_send,
-                                            capabilities: turn_capabilities_for_send,
-                                            model: selected_model_for_send,
-                                            model_provider: selected_provider_for_send,
-                                            sandbox_policy: None,
-                                            mode: Some(selected_mode),
-                                        })
+                                        ws_sender.turn_start(
+                                            turn_start::turn_start_params_from_plan(
+                                                turn_start::TurnStartParamsPlan {
+                                                    thread_id: thread_id_for_send.clone(),
+                                                    turn_id: turn_id_for_send.clone(),
+                                                    input: turn_input_for_send,
+                                                    capabilities: turn_capabilities_for_send,
+                                                    model: selected_model_for_send,
+                                                    model_provider: selected_provider_for_send,
+                                                    mode: Some(selected_mode),
+                                                },
+                                            ),
+                                        )
                                     })
                                     .await;
 
@@ -282,12 +259,11 @@ impl PioneerDesktop {
                                                 return;
                                             };
                                             conversation.apply(
-                                                ConversationEvent::LocalTurnStartAccepted {
-                                                    thread_id: thread_id.clone(),
-                                                    turn_id: turn_id.clone(),
-                                                    pending_request_id: pending_request_id_for_send
-                                                        .clone(),
-                                                },
+                                                turn_start::local_turn_start_accepted_event(
+                                                    thread_id.clone(),
+                                                    turn_id.clone(),
+                                                    pending_request_id_for_send.clone(),
+                                                ),
                                             );
                                             conversation.apply(ConversationEvent::TurnStarted {
                                                 thread_id: thread_id.clone(),
@@ -301,13 +277,12 @@ impl PioneerDesktop {
                                                 return;
                                             };
                                             conversation.apply(
-                                                ConversationEvent::LocalTurnStartRejected {
-                                                    thread_id: thread_id.clone(),
-                                                    turn_id: turn_id.clone(),
-                                                    pending_request_id: pending_request_id_for_send
-                                                        .clone(),
-                                                    error: format!("{error:#}"),
-                                                },
+                                                turn_start::local_turn_start_rejected_event(
+                                                    thread_id.clone(),
+                                                    turn_id.clone(),
+                                                    pending_request_id_for_send.clone(),
+                                                    format!("{error:#}"),
+                                                ),
                                             );
                                         }
                                     }
@@ -339,41 +314,39 @@ impl PioneerDesktop {
         let Some(conversation) = self.thread_conversation_mut(thread_id.as_str()) else {
             return;
         };
-        if conversation.is_cancelling_turn() {
+        let Some(cancel_request) = turn_cancel::plan_turn_cancel_request(
+            thread_id.clone(),
+            turn_id.clone(),
+            conversation.is_cancelling_turn(),
+            Some(t!("chat.composer.stop_reason").to_string()),
+        ) else {
             return;
-        }
+        };
 
-        conversation.apply(ConversationEvent::LocalTurnCancelRequested {
-            thread_id: thread_id.clone(),
-            turn_id: turn_id.clone(),
-        });
+        let turn_cancel::TurnCancelRequest {
+            requested_event,
+            params,
+        } = cancel_request;
+        conversation.apply(requested_event);
 
         let ws_sender = self.gateway.ws_command_sender.clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
-            let thread_id_for_request = thread_id.clone();
-            let turn_id_for_request = turn_id.clone();
 
             async move {
                 let result = cx
-                    .background_spawn(async move {
-                        ws_sender.turn_cancel(TurnCancelParams {
-                            thread_id: thread_id_for_request,
-                            turn_id: turn_id_for_request,
-                            reason: Some(t!("chat.composer.stop_reason").to_string()),
-                        })
-                    })
+                    .background_spawn(async move { ws_sender.turn_cancel(params) })
                     .await;
 
                 let _ = this.update(&mut cx, |view, cx| {
                     if let Err(error) = result
                         && let Some(conversation) = view.thread_conversation_mut(thread_id.as_str())
                     {
-                        conversation.apply(ConversationEvent::LocalTurnCancelRejected {
-                            thread_id: thread_id.clone(),
-                            turn_id: turn_id.clone(),
-                            error: format!("{error:#}"),
-                        });
+                        conversation.apply(turn_cancel::local_turn_cancel_rejected_event(
+                            thread_id.clone(),
+                            turn_id.clone(),
+                            format!("{error:#}"),
+                        ));
                     }
 
                     cx.notify();
@@ -386,33 +359,10 @@ impl PioneerDesktop {
     }
 
     fn append_composer_attachment_paths(&mut self, paths: Vec<PathBuf>) {
-        for path in paths {
-            let path_value = path.to_string_lossy().trim().to_owned();
-            if path_value.is_empty() {
-                continue;
-            }
-
-            if self
-                .composer_attachments
-                .iter()
-                .any(|attachment| attachment.path == path_value)
-            {
-                continue;
-            }
-
-            let file_name = path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .map(str::to_owned)
-                .unwrap_or_else(|| path_value.clone());
-
-            self.composer_attachments.push(ComposerAttachment {
-                path: path_value.clone(),
-                file_name,
-                kind: infer_attachment_kind(path_value.as_str()),
-                upload_state: ComposerAttachmentUploadState::Local,
-            });
-        }
+        composer_attachments::append_composer_attachment_paths(
+            &mut self.composer_attachments,
+            paths,
+        );
     }
 
     pub(in crate::app) fn attach_artifact_to_composer(
@@ -420,219 +370,14 @@ impl PioneerDesktop {
         artifact: ArtifactRef,
         cx: &mut Context<Self>,
     ) {
-        if artifact.status != pioneer_protocol::ArtifactStatus::Ready {
-            return;
-        }
-        if self.composer_attachments.iter().any(|attachment| {
-            matches!(
-                &attachment.upload_state,
-                ComposerAttachmentUploadState::Uploaded { artifact: existing }
-                    if existing.artifact_id == artifact.artifact_id
-                        && existing.version_id == artifact.version_id
-            )
-        }) {
-            return;
-        }
-
-        let file_name = if artifact.display_name.trim().is_empty() {
-            artifact.artifact_id.clone()
-        } else {
-            artifact.display_name.clone()
-        };
-        let version_suffix = artifact
-            .version_id
-            .as_ref()
-            .map(|version_id| format!("#{version_id}"))
-            .unwrap_or_default();
-        self.composer_attachments.push(ComposerAttachment {
-            path: format!("artifact://{}{}", artifact.artifact_id, version_suffix),
-            file_name,
-            kind: composer_attachment_kind_from_artifact_kind(artifact.kind),
-            upload_state: ComposerAttachmentUploadState::Uploaded { artifact },
-        });
-        self.composer_upload_error = None;
-        cx.notify();
-    }
-}
-
-fn prepare_composer_turn(
-    ws_sender: GatewayWsCommandSender,
-    workspace_id: String,
-    thread_id: String,
-    turn_id: String,
-    endpoint_kind: Option<GatewayEndpointKind>,
-    text: String,
-    attachments: Vec<ComposerAttachment>,
-    capabilities: Vec<ComposerCapability>,
-) -> Result<PreparedComposerTurn> {
-    if workspace_id.trim().is_empty() {
-        return Err(anyhow!(
-            "workspace_id is required before uploading attachments"
-        ));
-    }
-
-    let artifact_capabilities = if attachments.is_empty() {
-        None
-    } else {
-        ws_sender
-            .artifact_capabilities(ArtifactCapabilitiesParams {
-                workspace_id: workspace_id.clone(),
-            })
-            .ok()
-    };
-    let upload_required =
-        local_attachments_require_artifact_upload(endpoint_kind, artifact_capabilities.as_ref());
-    let mut prepared_attachments = Vec::with_capacity(attachments.len());
-
-    for (index, attachment) in attachments.into_iter().enumerate() {
-        let artifact = if let Some(artifact) = uploaded_artifact_from_attachment(&attachment) {
-            Some(artifact)
-        } else if upload_required {
-            let client_attachment_id = format!("{turn_id}_attachment_{index}");
-            Some(
-                ws_sender
-                    .upload_artifact_file(DesktopArtifactUploadRequest {
-                        workspace_id: workspace_id.clone(),
-                        thread_id: Some(thread_id.clone()),
-                        planned_turn_id: Some(turn_id.clone()),
-                        client_attachment_id,
-                        path: PathBuf::from(attachment.path.clone()),
-                        mime_type: None,
-                    })
-                    .with_context(|| {
-                        format!(
-                            "failed to upload `{}` before starting turn",
-                            attachment.file_name
-                        )
-                    })?,
-            )
-        } else {
-            None
-        };
-
-        prepared_attachments.push(PreparedComposerAttachment {
-            attachment,
+        if composer_attachments::add_composer_attachment_from_artifact(
+            &mut self.composer_attachments,
             artifact,
-        });
-    }
-
-    let prepared_turn = build_prepared_composer_turn(text, prepared_attachments, capabilities);
-
-    Ok(prepared_turn)
-}
-
-fn add_composer_capability(
-    composer_capabilities: &mut Vec<ComposerCapability>,
-    capability: ComposerCapability,
-) {
-    composer_capabilities.retain(|existing| !composer_capabilities_conflict(existing, &capability));
-
-    let key = capability.key();
-    if composer_capabilities
-        .iter()
-        .any(|existing| existing.key() == key)
-    {
-        return;
-    }
-
-    composer_capabilities.push(capability);
-}
-
-fn composer_capabilities_conflict(
-    existing: &ComposerCapability,
-    incoming: &ComposerCapability,
-) -> bool {
-    match (&existing.kind, &incoming.kind) {
-        (
-            super::super::root::ComposerCapabilityKind::McpServer { name, scope_kind },
-            super::super::root::ComposerCapabilityKind::McpTool {
-                server_name,
-                scope_kind: tool_scope_kind,
-                ..
-            },
-        ) => name == server_name && scope_kind == tool_scope_kind,
-        (
-            super::super::root::ComposerCapabilityKind::McpTool {
-                server_name,
-                scope_kind,
-                ..
-            },
-            super::super::root::ComposerCapabilityKind::McpServer {
-                name,
-                scope_kind: server_scope_kind,
-            },
-        ) => server_name == name && scope_kind == server_scope_kind,
-        _ => false,
-    }
-}
-
-fn build_prepared_composer_turn(
-    text: String,
-    prepared_attachments: Vec<PreparedComposerAttachment>,
-    capabilities: Vec<ComposerCapability>,
-) -> PreparedComposerTurn {
-    let input =
-        build_turn_input_from_prepared_composer(text.as_str(), prepared_attachments.as_slice());
-    let turn_capabilities = capabilities
-        .iter()
-        .map(ComposerCapability::to_turn_capability)
-        .collect::<Vec<_>>();
-    let user_text =
-        user_message_preview_from_prepared_composer(text.as_str(), prepared_attachments.as_slice());
-    let user_message_text = text.trim().to_owned();
-    let mut user_attachments =
-        user_message_attachments_from_prepared_composer(prepared_attachments.as_slice());
-    user_attachments.extend(user_message_attachments_from_composer_capabilities(
-        capabilities.as_slice(),
-    ));
-
-    PreparedComposerTurn {
-        input,
-        capabilities: turn_capabilities,
-        user_text,
-        user_message_text,
-        user_attachments,
-        attachments: prepared_attachments,
-    }
-}
-
-fn local_attachments_require_artifact_upload(
-    endpoint_kind: Option<GatewayEndpointKind>,
-    capabilities: Option<&ArtifactCapabilitiesResponse>,
-) -> bool {
-    if capabilities.is_some_and(|capabilities| capabilities.upload.required_for_local_paths) {
-        return true;
-    }
-
-    !matches!(endpoint_kind, Some(GatewayEndpointKind::Local)) || capabilities.is_none()
-}
-
-fn build_turn_input_from_prepared_composer(
-    text: &str,
-    attachments: &[PreparedComposerAttachment],
-) -> Vec<UserInput> {
-    let mut input = Vec::new();
-
-    let text = text.trim();
-    if !text.is_empty() {
-        input.push(UserInput::Text {
-            text: text.to_owned(),
-            text_elements: Vec::new(),
-        });
-    }
-
-    for prepared in attachments {
-        if let Some(artifact) = prepared.artifact.as_ref() {
-            input.push(UserInput::Artifact {
-                artifact_id: artifact.artifact_id.clone(),
-                version_id: artifact.version_id.clone(),
-            });
-        } else {
-            input.push(local_user_input_from_attachment(&prepared.attachment));
+        ) {
+            self.composer_upload_error = None;
+            cx.notify();
         }
     }
-
-    input
 }
 
 #[cfg(test)]
@@ -640,159 +385,7 @@ fn build_turn_input_from_composer(
     text: &str,
     attachments: &[ComposerAttachment],
 ) -> Vec<UserInput> {
-    let mut input = Vec::new();
-
-    let text = text.trim();
-    if !text.is_empty() {
-        input.push(UserInput::Text {
-            text: text.to_owned(),
-            text_elements: Vec::new(),
-        });
-    }
-
-    for attachment in attachments {
-        input.push(local_user_input_from_attachment(attachment));
-    }
-
-    input
-}
-
-fn local_user_input_from_attachment(attachment: &ComposerAttachment) -> UserInput {
-    match attachment.kind {
-        ComposerAttachmentKind::Image => UserInput::LocalImage {
-            path: attachment.path.clone(),
-        },
-        ComposerAttachmentKind::Audio => UserInput::LocalAudio {
-            path: attachment.path.clone(),
-        },
-        ComposerAttachmentKind::Video => UserInput::LocalVideo {
-            path: attachment.path.clone(),
-        },
-        ComposerAttachmentKind::File => UserInput::LocalFile {
-            path: attachment.path.clone(),
-        },
-    }
-}
-
-fn user_message_attachments_from_prepared_composer(
-    attachments: &[PreparedComposerAttachment],
-) -> Vec<UserMessageAttachment> {
-    attachments
-        .iter()
-        .map(|prepared| {
-            if let Some(artifact) = prepared.artifact.as_ref() {
-                UserMessageAttachment::Artifact {
-                    artifact: artifact.clone(),
-                }
-            } else {
-                local_user_message_attachment_from_attachment(&prepared.attachment)
-            }
-        })
-        .collect()
-}
-
-fn local_user_message_attachment_from_attachment(
-    attachment: &ComposerAttachment,
-) -> UserMessageAttachment {
-    match attachment.kind {
-        ComposerAttachmentKind::Image => UserMessageAttachment::LocalImage {
-            path: attachment.path.clone(),
-        },
-        ComposerAttachmentKind::Audio => UserMessageAttachment::LocalAudio {
-            path: attachment.path.clone(),
-        },
-        ComposerAttachmentKind::Video => UserMessageAttachment::LocalVideo {
-            path: attachment.path.clone(),
-        },
-        ComposerAttachmentKind::File => UserMessageAttachment::LocalFile {
-            path: attachment.path.clone(),
-        },
-    }
-}
-
-fn user_message_attachments_from_composer_capabilities(
-    capabilities: &[ComposerCapability],
-) -> Vec<UserMessageAttachment> {
-    capabilities
-        .iter()
-        .map(|capability| match &capability.kind {
-            super::super::root::ComposerCapabilityKind::Skill { slug, source_kind } => {
-                UserMessageAttachment::Skill {
-                    capability: TurnSkillCapabilitySummary {
-                        id: capability.id.clone(),
-                        label: capability.label.clone(),
-                        slug: slug.clone(),
-                        source_kind: source_kind.clone(),
-                    },
-                }
-            }
-            super::super::root::ComposerCapabilityKind::McpServer { name, scope_kind } => {
-                UserMessageAttachment::McpServer {
-                    capability: TurnMcpServerCapabilitySummary {
-                        id: capability.id.clone(),
-                        label: capability.label.clone(),
-                        name: name.clone(),
-                        scope_kind: *scope_kind,
-                    },
-                }
-            }
-            super::super::root::ComposerCapabilityKind::McpTool {
-                server_name,
-                raw_tool_name,
-                scope_kind,
-            } => UserMessageAttachment::McpTool {
-                capability: TurnMcpToolCapabilitySummary {
-                    id: capability.id.clone(),
-                    label: capability.label.clone(),
-                    server_name: server_name.clone(),
-                    raw_tool_name: raw_tool_name.clone(),
-                    scope_kind: *scope_kind,
-                },
-            },
-        })
-        .collect()
-}
-
-fn uploaded_artifact_from_attachment(attachment: &ComposerAttachment) -> Option<ArtifactRef> {
-    match &attachment.upload_state {
-        ComposerAttachmentUploadState::Uploaded { artifact } => Some(artifact.clone()),
-        _ => None,
-    }
-}
-
-fn user_message_preview_from_prepared_composer(
-    text: &str,
-    attachments: &[PreparedComposerAttachment],
-) -> String {
-    let mut body_lines = Vec::new();
-    let trimmed = text.trim();
-    if !trimmed.is_empty() {
-        body_lines.push(trimmed.to_owned());
-    }
-
-    let attachment_names = attachments
-        .iter()
-        .map(|prepared| {
-            let display_name = prepared
-                .artifact
-                .as_ref()
-                .map(|artifact| artifact.display_name.as_str())
-                .filter(|display_name| !display_name.trim().is_empty())
-                .unwrap_or(prepared.attachment.file_name.as_str());
-            if display_name.trim().is_empty() {
-                attachment_name_from_reference(prepared.attachment.path.as_str())
-            } else {
-                display_name.to_owned()
-            }
-        })
-        .filter(|name| !name.trim().is_empty())
-        .collect::<Vec<_>>();
-
-    if !attachment_names.is_empty() {
-        body_lines.push(attachment_names.join(", "));
-    }
-
-    body_lines.join("\n")
+    composer_turn_prepare::turn_input_from_composer_attachments(text, attachments)
 }
 
 #[cfg(test)]
@@ -812,13 +405,17 @@ fn user_message_preview_from_input(input: &[UserInput]) -> String {
             | UserInput::File { url }
             | UserInput::Audio { url }
             | UserInput::Video { url } => {
-                attachment_names.push(attachment_name_from_reference(url.as_str()));
+                attachment_names.push(composer_turn_prepare::attachment_name_from_reference(
+                    url.as_str(),
+                ));
             }
             UserInput::LocalImage { path }
             | UserInput::LocalFile { path }
             | UserInput::LocalAudio { path }
             | UserInput::LocalVideo { path } => {
-                attachment_names.push(attachment_name_from_reference(path.as_str()));
+                attachment_names.push(composer_turn_prepare::attachment_name_from_reference(
+                    path.as_str(),
+                ));
             }
             UserInput::Artifact {
                 artifact_id,
@@ -850,81 +447,23 @@ fn user_message_preview_from_input(input: &[UserInput]) -> String {
     }
 }
 
-fn attachment_name_from_reference(reference: &str) -> String {
-    if reference.contains("://") || reference.starts_with("data:") {
-        let without_query = reference
-            .split_once('?')
-            .map_or(reference, |(value, _)| value);
-        let without_fragment = without_query
-            .split_once('#')
-            .map_or(without_query, |(value, _)| value);
-        let candidate = without_fragment
-            .rsplit('/')
-            .next()
-            .unwrap_or(without_fragment);
-        if candidate.is_empty() {
-            reference.to_owned()
-        } else {
-            candidate.to_owned()
-        }
-    } else {
-        Path::new(reference)
-            .file_name()
-            .and_then(|value| value.to_str())
-            .map(str::to_owned)
-            .unwrap_or_else(|| reference.to_owned())
-    }
-}
-
-fn infer_attachment_kind(path: &str) -> ComposerAttachmentKind {
-    let extension = Path::new(path)
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(|value| value.to_ascii_lowercase());
-
-    match extension.as_deref() {
-        Some("png") | Some("jpg") | Some("jpeg") | Some("gif") | Some("webp") | Some("bmp")
-        | Some("tif") | Some("tiff") | Some("avif") | Some("heic") | Some("heif") | Some("svg") => {
-            ComposerAttachmentKind::Image
-        }
-        Some("mp3") | Some("wav") | Some("m4a") | Some("aac") | Some("ogg") | Some("oga")
-        | Some("flac") => ComposerAttachmentKind::Audio,
-        Some("mp4") | Some("mov") | Some("webm") | Some("mkv") | Some("avi") | Some("mpeg")
-        | Some("mpg") => ComposerAttachmentKind::Video,
-        _ => ComposerAttachmentKind::File,
-    }
-}
-
-fn composer_attachment_kind_from_artifact_kind(kind: ArtifactKind) -> ComposerAttachmentKind {
-    match kind {
-        ArtifactKind::Image | ArtifactKind::GeneratedImage | ArtifactKind::Screenshot => {
-            ComposerAttachmentKind::Image
-        }
-        ArtifactKind::Audio => ComposerAttachmentKind::Audio,
-        ArtifactKind::Video => ComposerAttachmentKind::Video,
-        _ => ComposerAttachmentKind::File,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        PreparedComposerAttachment, add_composer_capability, build_prepared_composer_turn,
-        build_turn_input_from_composer, build_turn_input_from_prepared_composer,
-        composer_attachment_kind_from_artifact_kind, infer_attachment_kind,
-        local_attachments_require_artifact_upload, uploaded_artifact_from_attachment,
-        user_message_preview_from_input, user_message_preview_from_prepared_composer,
+    use super::{build_turn_input_from_composer, user_message_preview_from_input};
+    use crate::app::root::{
+        ComposerAttachment, ComposerAttachmentUploadState, ComposerCapability,
+        ComposerCapabilityKind,
     };
-    use crate::{
-        app::root::{
-            ComposerAttachment, ComposerAttachmentKind, ComposerAttachmentUploadState,
-            ComposerCapability, ComposerCapabilityKind,
-        },
-        gateway::GatewayEndpointKind,
+    use pioneer_client::composer::attachments::{
+        ComposerAttachmentKind, composer_attachment_kind_from_artifact_kind, infer_attachment_kind,
+        uploaded_artifact_from_attachment,
+    };
+    use pioneer_client::composer::capabilities::add_composer_capability;
+    use pioneer_client::composer::turn_prepare::{
+        self as composer_turn_prepare, PreparedComposerAttachment, build_prepared_composer_turn,
     };
     use pioneer_protocol::{
-        ArtifactCapabilitiesResponse, ArtifactDownloadCapabilities, ArtifactKind, ArtifactRef,
-        ArtifactStatus, ArtifactUploadCapabilities, McpScopeKind, TurnCapabilityKind, UserInput,
+        ArtifactKind, ArtifactRef, ArtifactStatus, McpScopeKind, TurnCapabilityKind, UserInput,
         UserMessageAttachment,
     };
 
@@ -948,23 +487,6 @@ mod tests {
             sha256: Some("a".repeat(64)),
             status: ArtifactStatus::Ready,
             preview: None,
-        }
-    }
-
-    fn capabilities(required_for_local_paths: bool) -> ArtifactCapabilitiesResponse {
-        ArtifactCapabilitiesResponse {
-            upload: ArtifactUploadCapabilities {
-                required_for_local_paths,
-                recommended_chunk_size_bytes: 1024,
-                max_chunk_size_bytes: 1024,
-                max_file_size_bytes: 1024 * 1024,
-                max_files_per_turn: 16,
-            },
-            download: ArtifactDownloadCapabilities {
-                recommended_chunk_size_bytes: 1024,
-                max_chunk_size_bytes: 1024,
-                max_concurrent_downloads: 2,
-            },
         }
     }
 
@@ -1147,39 +669,6 @@ mod tests {
     }
 
     #[test]
-    fn remote_gateway_requires_artifact_upload_even_when_capability_is_permissive() {
-        let caps = capabilities(false);
-
-        assert!(local_attachments_require_artifact_upload(
-            Some(GatewayEndpointKind::Remote),
-            Some(&caps)
-        ));
-        assert!(local_attachments_require_artifact_upload(None, Some(&caps)));
-        assert!(!local_attachments_require_artifact_upload(
-            Some(GatewayEndpointKind::Local),
-            Some(&caps)
-        ));
-    }
-
-    #[test]
-    fn capability_required_for_local_paths_forces_upload() {
-        let caps = capabilities(true);
-
-        assert!(local_attachments_require_artifact_upload(
-            Some(GatewayEndpointKind::Local),
-            Some(&caps)
-        ));
-    }
-
-    #[test]
-    fn missing_capability_response_falls_back_to_upload() {
-        assert!(local_attachments_require_artifact_upload(
-            Some(GatewayEndpointKind::Local),
-            None
-        ));
-    }
-
-    #[test]
     fn prepared_composer_maps_uploaded_attachments_to_artifact_input() {
         let prepared = vec![
             PreparedComposerAttachment {
@@ -1192,7 +681,8 @@ mod tests {
             },
         ];
 
-        let input = build_turn_input_from_prepared_composer("hello", prepared.as_slice());
+        let input =
+            composer_turn_prepare::turn_input_from_prepared_composer("hello", prepared.as_slice());
 
         assert_eq!(input.len(), 3);
         assert!(matches!(
@@ -1218,7 +708,8 @@ mod tests {
             artifact: None,
         }];
 
-        let input = build_turn_input_from_prepared_composer("hello", prepared.as_slice());
+        let input =
+            composer_turn_prepare::turn_input_from_prepared_composer("hello", prepared.as_slice());
 
         assert!(matches!(input[1], UserInput::LocalFile { .. }));
     }
@@ -1230,7 +721,10 @@ mod tests {
             artifact: Some(artifact_ref("art_a", "av_a", "remote-a.txt")),
         }];
 
-        let preview = user_message_preview_from_prepared_composer("hello", prepared.as_slice());
+        let preview = composer_turn_prepare::user_message_preview_from_prepared_composer(
+            "hello",
+            prepared.as_slice(),
+        );
 
         assert_eq!(preview, "hello\nremote-a.txt");
     }

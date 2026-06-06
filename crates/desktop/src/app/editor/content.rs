@@ -1,44 +1,74 @@
 use anyhow::Error;
+use pioneer_client::agents_doc::content as agents_doc_content;
+#[cfg(test)]
 use pioneer_protocol::ThreadAgentsDocPayload;
-use sha2::{Digest, Sha256};
-use std::time::{SystemTime, UNIX_EPOCH};
+use pioneer_protocol::{
+    ThreadAgentsDocGetParams, ThreadAgentsDocGetResponse, ThreadAgentsDocSaveParams,
+    ThreadAgentsDocSaveReason,
+};
 
+pub(super) use pioneer_client::agents_doc::content::{
+    AgentsDocConflictRefreshProjection, AgentsDocLoadProjection,
+};
+
+#[cfg(test)]
 pub(super) fn agents_doc_initial_buffer(explicit_doc: Option<&ThreadAgentsDocPayload>) -> String {
-    explicit_doc
-        .map(|doc| doc.content.clone())
-        .unwrap_or_default()
+    agents_doc_content::agents_doc_initial_buffer(explicit_doc)
 }
 
-pub(super) fn agents_doc_normalize_content(content: &str) -> String {
-    content.replace("\r\n", "\n").replace('\r', "\n")
+pub(super) fn agents_doc_load_projection(
+    response: ThreadAgentsDocGetResponse,
+) -> AgentsDocLoadProjection {
+    agents_doc_content::agents_doc_load_projection(response)
 }
 
 pub(super) fn agents_doc_content_hash(content: &str) -> String {
-    let normalized = agents_doc_normalize_content(content);
-    let mut hasher = Sha256::new();
-    hasher.update(normalized.as_bytes());
-    hex::encode(hasher.finalize())
+    agents_doc_content::agents_doc_content_hash(content)
+}
+
+pub(super) fn agents_doc_get_params(
+    workspace_id: &str,
+    folder_id: Option<&str>,
+) -> ThreadAgentsDocGetParams {
+    agents_doc_content::agents_doc_get_params(workspace_id, folder_id)
+}
+
+pub(super) fn agents_doc_save_params(
+    workspace_id: &str,
+    folder_id: Option<&str>,
+    content: &str,
+    expected_version: Option<i64>,
+    save_reason: ThreadAgentsDocSaveReason,
+) -> ThreadAgentsDocSaveParams {
+    agents_doc_content::agents_doc_save_params(
+        workspace_id,
+        folder_id,
+        content,
+        expected_version,
+        save_reason,
+    )
 }
 
 pub(super) fn agents_doc_save_error_message(error: &Error) -> String {
     let message = format!("{error:#}");
-    let lower = message.to_ascii_lowercase();
-    if lower.contains("version") || lower.contains("conflict") {
-        t!("editor.agents_doc.save_conflict").to_string()
-    } else {
-        message
+    match agents_doc_content::agents_doc_save_error_kind(message.as_str()) {
+        agents_doc_content::AgentsDocSaveErrorKind::VersionConflict => {
+            t!("editor.agents_doc.save_conflict").to_string()
+        }
+        agents_doc_content::AgentsDocSaveErrorKind::Other => message,
     }
 }
 
 pub(super) fn agents_doc_is_version_conflict_error(error: &Error) -> bool {
-    let message = format!("{error:#}").to_ascii_lowercase();
-    message.contains("version conflict")
-        || (message.contains("version") && message.contains("conflict"))
+    agents_doc_content::agents_doc_is_version_conflict_error_message(format!("{error:#}").as_str())
+}
+
+pub(super) fn agents_doc_conflict_refresh_projection(
+    response: ThreadAgentsDocGetResponse,
+) -> AgentsDocConflictRefreshProjection {
+    agents_doc_content::agents_doc_conflict_refresh_projection(response)
 }
 
 pub(super) fn agents_doc_saved_at_now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or_default()
+    agents_doc_content::agents_doc_saved_at_now()
 }

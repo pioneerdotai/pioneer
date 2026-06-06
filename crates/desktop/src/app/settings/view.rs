@@ -450,10 +450,7 @@ impl PioneerDesktop {
                                                             move |view: &mut PioneerDesktop,
                                                                   selection: ModelSelectorSelection,
                                                                   cx| {
-                                                                let model_selection =
-                                                                    Self::model_selection_from_selector_selection(
-                                                                        selection,
-                                                                    );
+                                                                let model_selection = pioneer_client::settings::memory::gateway_memory_model_selection_from_model_selector(selection);
                                                                 view.apply_preflight_model_setting(
                                                                     model_selection,
                                                                     cx,
@@ -664,10 +661,7 @@ impl PioneerDesktop {
                                                     move |view: &mut PioneerDesktop,
                                                           selection: ModelSelectorSelection,
                                                           cx| {
-                                                        let model_selection =
-                                                            Self::model_selection_from_selector_selection(
-                                                                selection,
-                                                            );
+                                                        let model_selection = pioneer_client::settings::memory::gateway_memory_model_selection_from_model_selector(selection);
                                                         view.apply_memory_model_setting(
                                                             setting,
                                                             model_selection,
@@ -706,19 +700,6 @@ impl PioneerDesktop {
                     })),
             )
             .into_any_element()
-    }
-
-    fn model_selection_from_selector_selection(
-        selection: ModelSelectorSelection,
-    ) -> GatewayMemoryModelSelection {
-        match (selection.provider, selection.model) {
-            (Some(provider), Some(model))
-                if !provider.trim().is_empty() && !model.trim().is_empty() =>
-            {
-                GatewayMemoryModelSelection::custom(provider, model)
-            }
-            _ => GatewayMemoryModelSelection::thread(),
-        }
     }
 
     fn render_theme_setting(

@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ProviderSetApiKeyPlan",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "Send": {
+          "$ref": "#/$defs/ProviderApiKeyActionRequest"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Send"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "Unavailable": {
+          "$ref": "#/$defs/ProviderApiKeyActionUnavailable"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Unavailable"
+      ]
+    }
+  ],
+  "$defs": {
+    "ProviderApiKeyActionRequest": {
+      "type": "object",
+      "properties": {
+        "canonical_provider_id": {
+          "type": "string"
+        },
+        "connection_id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "params": {
+          "$ref": "#/$defs/ProviderSetApiKeyParams"
+        }
+      },
+      "required": [
+        "connection_id",
+        "canonical_provider_id",
+        "params"
+      ]
+    },
+    "ProviderApiKeyActionUnavailable": {
+      "type": "string",
+      "enum": [
+        "GatewayNotConnected",
+        "WorkspaceNotSelected"
+      ]
+    },
+    "ProviderSetApiKeyParams": {
+      "type": "object",
+      "properties": {
+        "api_key": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "provider",
+        "api_key"
+      ]
+    }
+  }
+}

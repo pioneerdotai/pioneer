@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WorkspaceSnapshot",
+  "type": "object",
+  "properties": {
+    "action_in_progress": {
+      "type": "boolean"
+    },
+    "active_workspace_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "loading": {
+      "type": "boolean"
+    },
+    "preferred_workspace_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "workspace_count": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "loading",
+    "action_in_progress",
+    "workspace_count"
+  ]
+}

@@ -1,4 +1,8 @@
 use super::*;
+use pioneer_client::threads::start as thread_start;
+use pioneer_client::workspaces::actions as workspace_actions;
+#[cfg(test)]
+use pioneer_client::workspaces::selectors as workspace_selectors;
 
 struct WorkspaceBootstrapOutcome {
     workspace_id: String,
@@ -21,31 +25,24 @@ pub(crate) fn resolve_workspace_id_for_thread_start(
     ws_sender: &crate::gateway::GatewayWsCommandSender,
     requested_workspace_id: Option<String>,
 ) -> anyhow::Result<String> {
-    if let Some(workspace_id) = normalize_workspace_id(requested_workspace_id) {
-        return Ok(workspace_id);
+    match thread_start::plan_workspace_id_for_thread_start(requested_workspace_id) {
+        thread_start::ThreadStartWorkspaceResolution::Requested(workspace_id) => Ok(workspace_id),
+        thread_start::ThreadStartWorkspaceResolution::LoadDefaultWorkspace => {
+            let response = ws_sender.workspace_default()?;
+            thread_start::normalize_default_workspace_id_for_thread_start(response.workspace.id)
+                .ok_or_else(|| anyhow!("workspace/default returned an empty workspace id"))
+        }
     }
-
-    let response = ws_sender.workspace_default()?;
-    normalize_workspace_id(Some(response.workspace.id))
-        .ok_or_else(|| anyhow!("workspace/default returned an empty workspace id"))
 }
 
+#[cfg(test)]
 pub(crate) fn normalize_workspace_id(value: Option<String>) -> Option<String> {
-    value.and_then(|workspace_id| {
-        let trimmed = workspace_id.trim();
-        (!trimmed.is_empty()).then_some(trimmed.to_owned())
-    })
+    workspace_selectors::normalize_workspace_id(value)
 }
 
+#[cfg(test)]
 pub(crate) fn upsert_workspace_catalog_item(workspaces: &mut Vec<Workspace>, workspace: Workspace) {
-    if let Some(existing) = workspaces
-        .iter_mut()
-        .find(|candidate| candidate.id == workspace.id)
-    {
-        *existing = workspace;
-    } else {
-        workspaces.push(workspace);
-    }
+    workspace_actions::upsert_workspace_catalog_item(workspaces, workspace);
 }
 
 impl PioneerDesktop {
@@ -79,26 +76,33 @@ impl PioneerDesktop {
                 let result = cx
                     .background_spawn(async move {
                         let mut workspaces = ws_sender.workspace_list()?.workspaces;
-                        let mut workspace_id = resolve_active_workspace_id(
+                        let mut workspace_id = match workspace_actions::plan_workspace_bootstrap_after_list(
                             persisted_workspace_id.as_deref(),
                             workspaces.as_slice(),
-                        )
-                        .map(str::to_owned);
+                        ) {
+                            workspace_actions::WorkspaceBootstrapAfterList::SelectWorkspace {
+                                workspace_id,
+                            } => workspace_id,
+                            workspace_actions::WorkspaceBootstrapAfterList::LoadDefaultWorkspace => {
+                                let workspace = ws_sender.workspace_default()?.workspace;
+                                workspace_actions::apply_workspace_default_for_bootstrap(
+                                    &mut workspaces,
+                                    workspace,
+                                )
+                                .ok_or_else(|| {
+                                    anyhow!("workspace/default returned an empty workspace id")
+                                })?
+                            }
+                        };
 
-                        if workspace_id.is_none() {
-                            let workspace = ws_sender.workspace_default()?.workspace;
-                            workspace_id = normalize_workspace_id(Some(workspace.id.clone()));
-                            upsert_workspace_catalog_item(&mut workspaces, workspace);
-                        }
-
-                        let workspace_id = workspace_id.ok_or_else(|| {
-                            anyhow!("workspace bootstrap could not resolve an active workspace")
-                        })?;
                         let response = ws_sender.workspace_select(WorkspaceSelectParams {
                             workspace_id: workspace_id.clone(),
                             make_current: false,
                         })?;
-                        upsert_workspace_catalog_item(&mut workspaces, response.workspace);
+                        workspace_id = workspace_actions::apply_workspace_select_response_to_catalog(
+                            &mut workspaces,
+                            response.workspace,
+                        );
 
                         Ok::<_, anyhow::Error>(WorkspaceBootstrapOutcome {
                             workspace_id,
@@ -108,7 +112,10 @@ impl PioneerDesktop {
                     .await;
 
                 let _ = this.update(&mut cx, |view, cx| {
-                    if view.gateway.ws_connection_id != Some(connection_id) {
+                    if !workspace_actions::workspace_action_result_matches_connection(
+                        connection_id,
+                        view.gateway.ws_connection_id,
+                    ) {
                         return;
                     }
 

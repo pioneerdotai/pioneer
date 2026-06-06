@@ -4,19 +4,14 @@ mod registry;
 mod runtime;
 mod secrets;
 mod timings;
-mod types;
 mod ws;
 
 pub(crate) use connectivity::normalize_address;
 pub(crate) use control::GatewayInstallWarning;
 pub(crate) use timings::GatewayWsTimings;
 
-pub use runtime::{ActiveGatewayState, GatewayRuntime, ensure_runtime_home_dir};
-pub use types::{GatewayEndpoint, GatewayEndpointKind};
-pub use ws::{
-    DesktopArtifactDownloadRequest, DesktopArtifactDownloadResult, DesktopArtifactUploadRequest,
-    GatewayWsClient, GatewayWsCommandSender, GatewayWsConnectSpec, GatewayWsEvent,
-};
+pub use runtime::{GatewayRuntime, ensure_runtime_home_dir};
+pub use ws::{GatewayWsClient, GatewayWsCommandSender};
 
 #[cfg(test)]
 mod tests;

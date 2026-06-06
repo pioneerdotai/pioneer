@@ -1,10 +1,14 @@
-use crate::gateway::connectivity::normalize_address;
-use crate::gateway::types::{GatewayEndpoint, GatewayEndpointKind, GatewayRegistry};
 use anyhow::{Context, Result, bail};
+use pioneer_client::gateway::registry::{
+    GatewayRegistryConfig, GatewayRegistryError, default_registry as default_client_registry,
+    normalize_registry as normalize_client_registry, setup_required as client_setup_required,
+};
+use pioneer_client::gateway::secrets::{
+    EndpointIdGatewayAuthTokenRefNamer, GatewayAuthTokenRefNamer,
+};
+use pioneer_client::gateway::types::GatewayRegistry;
 use pioneer_config::AppConfig;
 use pioneer_keystore::{SecretId, ensure_private_file, ensure_private_runtime_dir};
-use pioneer_protocol::generate_id;
-use std::collections::HashSet;
 use std::path::Path;
 
 pub(crate) fn load_registry(path: &Path, config: &AppConfig) -> Result<GatewayRegistry> {
@@ -49,109 +53,47 @@ pub(crate) fn save_registry(path: &Path, registry: &GatewayRegistry) -> Result<(
 }
 
 pub(crate) fn default_registry(config: &AppConfig) -> Result<GatewayRegistry> {
-    Ok(GatewayRegistry {
-        version: current_registry_version(config),
-        active_gateway_id: None,
-        local: local_endpoint_from_config(config, None)?,
-        remotes: Vec::new(),
-    })
+    Ok(default_client_registry(&registry_config(config)?))
 }
 
 pub(crate) fn setup_required(registry: &GatewayRegistry) -> bool {
-    registry.active_gateway_id.is_none()
+    client_setup_required(registry)
 }
 
 pub(crate) fn normalize_registry(registry: &mut GatewayRegistry, config: &AppConfig) -> Result<()> {
-    let local_gateway_id = local_gateway_id(config);
-    let local_workspace_id = registry
-        .local
-        .workspace_id
-        .take()
-        .and_then(normalize_workspace_id);
-    registry.version = current_registry_version(config);
-    registry.local = local_endpoint_from_config(config, local_workspace_id)?;
-
-    let mut seen_ids = HashSet::from([local_gateway_id.to_owned()]);
-    let mut seen_addresses = HashSet::new();
-    let mut remotes = Vec::new();
-
-    for mut endpoint in std::mem::take(&mut registry.remotes) {
-        let address = match normalize_address(endpoint.address.as_str()) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-
-        endpoint.kind = GatewayEndpointKind::Remote;
-        endpoint.service_name = None;
-        endpoint.address = address.clone();
-        endpoint.workspace_id = endpoint.workspace_id.and_then(normalize_workspace_id);
-        let has_auth_token_ref =
-            normalize_auth_token_ref(endpoint.auth_token_ref.take())?.is_some();
-
-        if endpoint.name.trim().is_empty() {
-            endpoint.name =
-                t!("gateway.endpoint.remote_name", index = remotes.len() + 1).to_string();
-        } else {
-            endpoint.name = endpoint.name.trim().to_owned();
-        }
-
-        endpoint.id = endpoint.id.trim().to_owned();
-        if endpoint.id.is_empty() || endpoint.id == local_gateway_id {
-            endpoint.id = format!("remote-{}", generate_id(8));
-        }
-
-        while !seen_ids.insert(endpoint.id.clone()) {
-            endpoint.id = format!("remote-{}", generate_id(8));
-        }
-
-        endpoint.auth_token_ref = if has_auth_token_ref {
-            Some(gateway_auth_token_ref(endpoint.id.as_str())?)
-        } else {
-            None
-        };
-
-        if !seen_addresses.insert(address) {
-            continue;
-        }
-
-        remotes.push(endpoint);
-    }
-
-    registry.remotes = remotes;
-
-    if let Some(active) = registry.active_gateway_id.as_deref()
-        && !registry.local.id.eq(active)
-        && !registry
-            .remotes
-            .iter()
-            .any(|endpoint| endpoint.id == active)
-    {
-        registry.active_gateway_id = None;
-    }
-
-    Ok(())
+    let registry_config = registry_config(config)?;
+    normalize_client_registry(
+        registry,
+        &registry_config,
+        |endpoint_id| {
+            gateway_auth_token_ref(endpoint_id).map_err(|error| {
+                GatewayRegistryError::invalid_auth_token_ref(endpoint_id, format!("{error:#}"))
+            })
+        },
+        |index| t!("gateway.endpoint.remote_name", index = index).to_string(),
+    )
+    .map_err(anyhow::Error::new)
 }
 
 pub(crate) fn gateway_auth_token_ref(endpoint_id: &str) -> Result<String> {
-    let id = SecretId::desktop_gateway_auth_token(endpoint_id)
+    let token_ref = EndpointIdGatewayAuthTokenRefNamer
+        .auth_token_ref_for_endpoint(endpoint_id)
+        .context("invalid gateway auth token ref")?;
+    let id = SecretId::desktop_gateway_auth_token(token_ref.as_str())
         .context("invalid desktop gateway endpoint id")?;
     Ok(id.user().to_owned())
 }
 
-fn local_endpoint_from_config(
-    config: &AppConfig,
-    workspace_id: Option<String>,
-) -> Result<GatewayEndpoint> {
+fn registry_config(config: &AppConfig) -> Result<GatewayRegistryConfig> {
     let local_gateway_id = local_gateway_id(config);
 
-    Ok(GatewayEndpoint {
-        id: local_gateway_id.to_owned(),
-        name: t!("gateway.endpoint.local_name").to_string(),
-        address: config.gateway.listen_addr.trim().to_owned(),
-        kind: GatewayEndpointKind::Local,
-        auth_token_ref: Some(gateway_auth_token_ref(local_gateway_id)?),
-        workspace_id,
-        service_name: Some(config.gateway.service_name.trim().to_owned()),
+    Ok(GatewayRegistryConfig {
+        version: current_registry_version(config),
+        local_gateway_id: local_gateway_id.to_owned(),
+        local_name: t!("gateway.endpoint.local_name").to_string(),
+        local_address: config.gateway.listen_addr.trim().to_owned(),
+        local_auth_token_ref: Some(gateway_auth_token_ref(local_gateway_id)?),
+        local_service_name: Some(config.gateway.service_name.trim().to_owned()),
     })
 }
 
@@ -161,23 +103,6 @@ fn local_gateway_id(config: &AppConfig) -> &str {
 
 fn current_registry_version(config: &AppConfig) -> u32 {
     config.desktop.gateway.registry_version
-}
-
-fn normalize_auth_token_ref(value: Option<String>) -> Result<Option<String>> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-
-    Ok(Some(gateway_auth_token_ref(trimmed)?))
-}
-
-fn normalize_workspace_id(value: String) -> Option<String> {
-    let trimmed = value.trim();
-    (!trimmed.is_empty()).then_some(trimmed.to_owned())
 }
 
 fn write_private_registry_file(path: &Path, content: &str) -> Result<()> {

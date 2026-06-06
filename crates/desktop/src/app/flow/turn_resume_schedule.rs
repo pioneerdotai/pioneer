@@ -1,4 +1,5 @@
 use super::*;
+use pioneer_client::threads::resume::{self as thread_resume, ScheduledTurnResumePlan};
 
 impl PioneerDesktop {
     pub(in crate::app::flow) fn schedule_turn_resume_after(
@@ -19,9 +20,12 @@ impl PioneerDesktop {
             return;
         };
 
-        resume.next_attempt_at = Some(std::time::Instant::now() + delay);
-
-        let retry_attempt = resume.retry_attempt;
+        let schedule_plan = thread_resume::schedule_turn_resume_after_state(
+            resume,
+            delay,
+            std::time::Instant::now(),
+        );
+        let retry_attempt = schedule_plan.retry_attempt;
         let thread_id = thread_id.to_owned();
 
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -36,26 +40,29 @@ impl PioneerDesktop {
                         return;
                     }
 
+                    let has_in_flight_turn = view
+                        .in_flight_turn_id_for_thread(thread_id.as_str())
+                        .is_some();
                     let Some(resume) = view.thread_resume_state_mut(thread_id.as_str()) else {
                         return;
                     };
 
-                    if resume.retry_attempt != retry_attempt || resume.in_progress {
-                        return;
-                    }
-
-                    if view
-                        .in_flight_turn_id_for_thread(thread_id.as_str())
-                        .is_none()
-                    {
-                        view.reset_thread_resume_state(thread_id.as_str());
-                        return;
-                    }
-
-                    view.enqueue_turn_resume_thread(thread_id.clone());
-                    let resumed = view.drive_turn_resume_queue(cx);
-                    if resumed {
-                        cx.notify();
+                    match thread_resume::plan_scheduled_turn_resume(
+                        resume,
+                        retry_attempt,
+                        has_in_flight_turn,
+                    ) {
+                        ScheduledTurnResumePlan::Skip => {}
+                        ScheduledTurnResumePlan::ResetMissingTurn => {
+                            view.reset_thread_resume_state(thread_id.as_str());
+                        }
+                        ScheduledTurnResumePlan::Resume => {
+                            view.enqueue_turn_resume_thread(thread_id.clone());
+                            let resumed = view.drive_turn_resume_queue(cx);
+                            if resumed {
+                                cx.notify();
+                            }
+                        }
                     }
                 });
             }
@@ -77,14 +84,12 @@ impl PioneerDesktop {
             return;
         }
 
-        let mut attempt = 1;
-        let mut delay = turn_resume_retry_delay(0);
-        if let Some(resume) = self.thread_resume_state_mut(thread_id) {
-            delay = turn_resume_retry_delay(resume.retry_attempt);
-            attempt = resume.retry_attempt.saturating_add(1);
-            resume.retry_attempt = attempt;
-            resume.next_attempt_at = Some(std::time::Instant::now() + delay);
-        }
+        let retry_plan = thread_resume::apply_turn_resume_retry(
+            self.thread_resume_state_mut(thread_id),
+            std::time::Instant::now(),
+        );
+        let attempt = retry_plan.attempt;
+        let delay = retry_plan.delay;
         self.schedule_turn_resume_after(connection_id, thread_id, delay, cx);
 
         warn!(

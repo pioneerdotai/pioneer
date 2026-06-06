@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "McpCapabilityCount",
+  "type": "object",
+  "properties": {
+    "count": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0
+    },
+    "kind": {
+      "$ref": "#/$defs/McpCapabilityKind"
+    }
+  },
+  "required": [
+    "kind",
+    "count"
+  ],
+  "$defs": {
+    "McpCapabilityKind": {
+      "type": "string",
+      "enum": [
+        "Tools",
+        "Resources",
+        "ResourceTemplates",
+        "Prompts"
+      ]
+    }
+  }
+}

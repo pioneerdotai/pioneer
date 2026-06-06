@@ -84,7 +84,10 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app::flow) fn next_gateway_connection_epoch(&mut self) -> u64 {
-        self.gateway.connection_epoch = self.gateway.connection_epoch.saturating_add(1);
+        self.gateway.connection_epoch =
+            pioneer_client::gateway::runtime::next_gateway_operation_epoch(
+                self.gateway.connection_epoch,
+            );
         self.gateway.connection_epoch
     }
 

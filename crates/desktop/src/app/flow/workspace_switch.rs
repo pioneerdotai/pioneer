@@ -1,5 +1,15 @@
-use super::thread_list::resolve_thread_tree_workspace_id;
 use super::*;
+#[cfg(test)]
+use pioneer_client::threads::tree::WorkspaceThreadState;
+use pioneer_client::threads::tree::{
+    remember_workspace_thread_state, restore_workspace_thread_state,
+};
+use pioneer_client::workspaces::actions as workspace_actions;
+use pioneer_client::workspaces::selectors as workspace_selectors;
+#[cfg(test)]
+pub(crate) use pioneer_client::workspaces::selectors::{
+    workspace_switch_is_noop, workspace_switch_target_is_known_active,
+};
 
 impl PioneerDesktop {
     pub(in crate::app) fn switch_workspace_from_ui(
@@ -7,27 +17,29 @@ impl PioneerDesktop {
         workspace_id: String,
         cx: &mut Context<Self>,
     ) {
-        let Some(workspace_id) = normalize_workspace_id(Some(workspace_id)) else {
-            self.set_workspaces_error(Some("workspace id is required".to_owned()));
-            return;
-        };
-
-        if self.workspace_action_in_progress() {
-            return;
-        }
-
         let current_workspace_id = self.current_workspace_scope();
-        if workspace_switch_is_noop(current_workspace_id.as_deref(), workspace_id.as_str()) {
-            return;
-        }
-
-        if !workspace_switch_target_is_known_active(self.workspaces(), workspace_id.as_str()) {
-            self.set_workspaces_error(Some(format!(
-                "workspace `{}` is not available",
-                workspace_id
-            )));
-            return;
-        }
+        let switch_plan = workspace_actions::plan_workspace_switch_from_ui(
+            workspace_id,
+            self.workspace_action_in_progress(),
+            current_workspace_id.as_deref(),
+            self.workspaces(),
+        );
+        let workspace_id = match switch_plan {
+            workspace_actions::WorkspaceSwitchPlan::Switch { workspace_id } => workspace_id,
+            workspace_actions::WorkspaceSwitchPlan::MissingWorkspaceId => {
+                self.set_workspaces_error(Some("workspace id is required".to_owned()));
+                return;
+            }
+            workspace_actions::WorkspaceSwitchPlan::UnknownTarget { workspace_id } => {
+                self.set_workspaces_error(Some(format!(
+                    "workspace `{}` is not available",
+                    workspace_id
+                )));
+                return;
+            }
+            workspace_actions::WorkspaceSwitchPlan::Busy
+            | workspace_actions::WorkspaceSwitchPlan::Noop => return,
+        };
 
         if self.gateway.connection_state != GatewayConnectionState::Connected {
             self.set_workspaces_error(Some(t!("mcp.error.gateway_not_connected").to_string()));
@@ -65,7 +77,10 @@ impl PioneerDesktop {
                     .await;
 
                 let _ = this.update(&mut cx, |view, cx| {
-                    if view.gateway.ws_connection_id != Some(connection_id) {
+                    if !workspace_actions::workspace_action_result_matches_connection(
+                        connection_id,
+                        view.gateway.ws_connection_id,
+                    ) {
                         return;
                     }
 
@@ -73,8 +88,11 @@ impl PioneerDesktop {
 
                     match result {
                         Ok(response) => {
-                            let selected_workspace_id = response.workspace.id.clone();
-                            upsert_workspace_catalog_item(&mut view.workspaces, response.workspace);
+                            let selected_workspace_id =
+                                workspace_actions::apply_workspace_select_response_to_catalog(
+                                    &mut view.workspaces,
+                                    response.workspace,
+                                );
                             view.persist_active_gateway_workspace_id(selected_workspace_id.clone());
                             view.set_preferred_workspace_id(Some(selected_workspace_id.clone()));
                             view.load_thread_folder_expansion_for_workspace(
@@ -106,7 +124,7 @@ impl PioneerDesktop {
             .runtime
             .as_ref()
             .and_then(GatewayRuntime::active_workspace_id);
-        resolve_thread_tree_workspace_id(
+        workspace_selectors::resolve_workspace_scope(
             self.active_workspace_id(),
             self.preferred_workspace_id(),
             runtime_workspace_id,
@@ -152,79 +170,11 @@ impl PioneerDesktop {
                 }
             }
             MainContentView::Providers => {
-                self.provider_configured_names.clear();
+                self.providers.clear_for_workspace_switch();
                 self.refresh_configured_providers(cx);
             }
             _ => {}
         }
-    }
-}
-
-pub(crate) fn workspace_switch_is_noop(
-    current_workspace_id: Option<&str>,
-    target_workspace_id: &str,
-) -> bool {
-    normalize_workspace_id(current_workspace_id.map(str::to_owned)).as_deref()
-        == normalize_workspace_id(Some(target_workspace_id.to_owned())).as_deref()
-}
-
-pub(crate) fn workspace_switch_target_is_known_active(
-    workspaces: &[Workspace],
-    target_workspace_id: &str,
-) -> bool {
-    if workspaces.is_empty() {
-        return true;
-    }
-
-    workspaces
-        .iter()
-        .any(|workspace| workspace.is_active && workspace.id == target_workspace_id)
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct WorkspaceThreadState {
-    active_thread_id: Option<String>,
-    draft_thread_id: Option<String>,
-}
-
-fn remember_workspace_thread_state(
-    workspace_id: &str,
-    active_thread_id: Option<&str>,
-    draft_thread_id: Option<&str>,
-    pending_thread_id: Option<&str>,
-    thread_workspace_matches: impl Fn(&str, &str) -> bool,
-) -> WorkspaceThreadState {
-    let active_thread_id = active_thread_id
-        .filter(|thread_id| thread_workspace_matches(thread_id, workspace_id))
-        .map(str::to_owned);
-    let draft_thread_id = draft_thread_id
-        .filter(|thread_id| thread_workspace_matches(thread_id, workspace_id))
-        .or(pending_thread_id)
-        .map(str::to_owned);
-
-    WorkspaceThreadState {
-        active_thread_id,
-        draft_thread_id,
-    }
-}
-
-fn restore_workspace_thread_state(
-    workspace_id: &str,
-    last_active_thread_id: Option<&str>,
-    draft_thread_id: Option<&str>,
-    thread_workspace_matches: impl Fn(&str, &str) -> bool,
-) -> WorkspaceThreadState {
-    let draft_thread_id = draft_thread_id
-        .filter(|thread_id| thread_workspace_matches(thread_id, workspace_id))
-        .map(str::to_owned);
-    let active_thread_id = last_active_thread_id
-        .filter(|thread_id| thread_workspace_matches(thread_id, workspace_id))
-        .map(str::to_owned)
-        .or_else(|| draft_thread_id.clone());
-
-    WorkspaceThreadState {
-        active_thread_id,
-        draft_thread_id,
     }
 }
 

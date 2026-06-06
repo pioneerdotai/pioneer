@@ -1,0 +1,1145 @@
+//! Schema and contract export helpers.
+
+use std::any::type_name;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ClientContractDomain {
+    Root,
+    Connection,
+    Timeline,
+    Composer,
+    Artifacts,
+    Providers,
+    Skills,
+    Mcp,
+    Settings,
+    Tasks,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ClientContractKind {
+    Snapshot,
+    Event,
+    Command,
+    Effect,
+    SelectorDto,
+    PresentationDto,
+    ActionState,
+    ActionPlan,
+    RegistryDto,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ClientContractStability {
+    Stable,
+    Provisional,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClientContractType {
+    pub file_name: &'static str,
+    pub rust_type: &'static str,
+    pub domain: ClientContractDomain,
+    pub kind: ClientContractKind,
+    pub stability: ClientContractStability,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClientSchemaInternalExclusion {
+    pub rust_type: &'static str,
+    pub reason: &'static str,
+}
+
+macro_rules! contract_type {
+    ($file_name:literal, $ty:ty, $domain:expr, $kind:expr, $stability:expr) => {
+        ClientContractType {
+            file_name: $file_name,
+            rust_type: type_name::<$ty>(),
+            domain: $domain,
+            kind: $kind,
+            stability: $stability,
+        }
+    };
+}
+
+macro_rules! internal_exclusion {
+    ($ty:ty, $reason:literal) => {
+        ClientSchemaInternalExclusion {
+            rust_type: type_name::<$ty>(),
+            reason: $reason,
+        }
+    };
+}
+
+pub fn client_contract_types() -> Vec<ClientContractType> {
+    use ClientContractDomain as Domain;
+    use ClientContractKind as Kind;
+    use ClientContractStability as Stability;
+
+    let mut contracts = vec![
+        contract_type!(
+            "active_thread_phase_snapshot.json",
+            crate::state::snapshot::ActiveThreadPhaseSnapshot,
+            Domain::Root,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "active_thread_snapshot.json",
+            crate::state::snapshot::ActiveThreadSnapshot,
+            Domain::Root,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "active_thread_status_snapshot.json",
+            crate::state::snapshot::ActiveThreadStatusSnapshot,
+            Domain::Root,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "artifact_action_status.json",
+            crate::artifacts::actions::ArtifactActionStatus,
+            Domain::Artifacts,
+            Kind::ActionState,
+            Stability::Stable
+        ),
+        contract_type!(
+            "artifact_download_request_plan_error.json",
+            crate::artifacts::actions::ArtifactDownloadRequestPlanError,
+            Domain::Artifacts,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "artifact_download_request.json",
+            crate::artifacts::download::ArtifactDownloadRequest,
+            Domain::Artifacts,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "artifact_download_result.json",
+            crate::artifacts::download::ArtifactDownloadResult,
+            Domain::Artifacts,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "artifact_file_action_block_reason.json",
+            crate::artifacts::actions::ArtifactFileActionBlockReason,
+            Domain::Artifacts,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "artifact_upload_file_request.json",
+            crate::artifacts::upload::ArtifactUploadFileRequest,
+            Domain::Artifacts,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "artifact_version_key.json",
+            crate::artifacts::actions::ArtifactVersionKey,
+            Domain::Artifacts,
+            Kind::ActionState,
+            Stability::Stable
+        ),
+        contract_type!(
+            "capability_rejection_row.json",
+            crate::timeline::labels::CapabilityRejectionRow,
+            Domain::Timeline,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "client_command.json",
+            crate::contracts::ClientCommand,
+            Domain::Root,
+            Kind::Command,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "client_effect.json",
+            crate::notifications::effects::ClientEffect,
+            Domain::Root,
+            Kind::Effect,
+            Stability::Stable
+        ),
+        contract_type!(
+            "client_error_event.json",
+            crate::contracts::ClientErrorEvent,
+            Domain::Root,
+            Kind::Event,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "client_event.json",
+            crate::contracts::ClientEvent,
+            Domain::Root,
+            Kind::Event,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "client_snapshot.json",
+            crate::state::snapshot::ClientSnapshot,
+            Domain::Root,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "composer_attachment.json",
+            crate::composer::attachments::ComposerAttachment,
+            Domain::Composer,
+            Kind::SelectorDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "composer_attachment_kind.json",
+            crate::composer::attachments::ComposerAttachmentKind,
+            Domain::Composer,
+            Kind::SelectorDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "composer_attachment_upload_state.json",
+            crate::composer::attachments::ComposerAttachmentUploadState,
+            Domain::Composer,
+            Kind::SelectorDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "composer_capability.json",
+            crate::composer::capabilities::ComposerCapability,
+            Domain::Composer,
+            Kind::SelectorDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "composer_capability_kind.json",
+            crate::composer::capabilities::ComposerCapabilityKind,
+            Domain::Composer,
+            Kind::SelectorDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "composer_draft.json",
+            crate::composer::draft::ComposerDraft<
+                crate::composer::attachments::ComposerAttachment,
+                crate::composer::capabilities::ComposerCapability,
+            >,
+            Domain::Composer,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "composer_model_selection.json",
+            crate::composer::model_selection::ComposerModelSelection,
+            Domain::Composer,
+            Kind::SelectorDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "composer_model_selection_candidate.json",
+            crate::composer::model_selection::ComposerModelSelectionCandidate,
+            Domain::Composer,
+            Kind::SelectorDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "gateway_connection_state.json",
+            crate::state::client_state::GatewayConnectionState,
+            Domain::Connection,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "gateway_endpoint.json",
+            crate::gateway::types::GatewayEndpoint,
+            Domain::Connection,
+            Kind::RegistryDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "gateway_endpoint_kind.json",
+            crate::gateway::types::GatewayEndpointKind,
+            Domain::Connection,
+            Kind::RegistryDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "gateway_registry.json",
+            crate::gateway::types::GatewayRegistry,
+            Domain::Connection,
+            Kind::RegistryDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "gateway_settings_state.json",
+            crate::settings::gateway::GatewaySettingsState,
+            Domain::Settings,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "gateway_settings_update_plan.json",
+            crate::settings::gateway::GatewaySettingsUpdatePlan,
+            Domain::Settings,
+            Kind::ActionPlan,
+            Stability::Stable
+        ),
+        contract_type!(
+            "gateway_status_endpoint.json",
+            crate::state::reducers::GatewayStatusEndpoint,
+            Domain::Connection,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "gateway_status_level.json",
+            crate::state::client_state::GatewayStatusLevel,
+            Domain::Connection,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "gateway_status_message.json",
+            crate::state::reducers::GatewayStatusMessage,
+            Domain::Connection,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "gateway_status_projection.json",
+            crate::state::reducers::GatewayStatusProjection,
+            Domain::Connection,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "gateway_status_text_update.json",
+            crate::state::reducers::GatewayStatusTextUpdate,
+            Domain::Connection,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "mcp_audit_action.json",
+            crate::mcp::presentation::McpAuditAction,
+            Domain::Mcp,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "mcp_audit_decision.json",
+            crate::mcp::presentation::McpAuditDecision,
+            Domain::Mcp,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "mcp_audit_details_summary.json",
+            crate::mcp::presentation::McpAuditDetailsSummary,
+            Domain::Mcp,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "mcp_audit_row.json",
+            crate::mcp::presentation::McpAuditRow,
+            Domain::Mcp,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "mcp_capability_count.json",
+            crate::mcp::presentation::McpCapabilityCount,
+            Domain::Mcp,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "mcp_capability_kind.json",
+            crate::mcp::presentation::McpCapabilityKind,
+            Domain::Mcp,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "mcp_config_validation_error.json",
+            crate::mcp::actions::McpConfigValidationError,
+            Domain::Mcp,
+            Kind::ActionPlan,
+            Stability::Stable
+        ),
+        contract_type!(
+            "mcp_detail_meta_kind.json",
+            crate::mcp::presentation::McpDetailMetaKind,
+            Domain::Mcp,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "mcp_detail_meta_row.json",
+            crate::mcp::presentation::McpDetailMetaRow,
+            Domain::Mcp,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "mcp_detail_value.json",
+            crate::mcp::presentation::McpDetailValue,
+            Domain::Mcp,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "mcp_install_field_issue.json",
+            crate::mcp::actions::McpInstallFieldIssue,
+            Domain::Mcp,
+            Kind::ActionPlan,
+            Stability::Stable
+        ),
+        contract_type!(
+            "mcp_json_value_preview.json",
+            crate::mcp::presentation::McpJsonValuePreview,
+            Domain::Mcp,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "mcp_list_state.json",
+            crate::mcp::list::McpListState,
+            Domain::Mcp,
+            Kind::Snapshot,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "mcp_presentation_tone.json",
+            crate::mcp::presentation::McpPresentationTone,
+            Domain::Mcp,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "mcp_scope_label.json",
+            crate::mcp::presentation::McpScopeLabel,
+            Domain::Mcp,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "mcp_source_label.json",
+            crate::mcp::presentation::McpSourceLabel,
+            Domain::Mcp,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "mcp_status_label.json",
+            crate::mcp::presentation::McpStatusLabel,
+            Domain::Mcp,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "mcp_timeline_metadata.json",
+            crate::timeline::labels::McpTimelineMetadata,
+            Domain::Timeline,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "mcp_transport_presentation.json",
+            crate::mcp::presentation::McpTransportPresentation,
+            Domain::Mcp,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "memory_model_setting.json",
+            crate::settings::memory::MemoryModelSetting,
+            Domain::Settings,
+            Kind::ActionPlan,
+            Stability::Stable
+        ),
+        contract_type!(
+            "memory_setting_toggle.json",
+            crate::settings::memory::MemorySettingToggle,
+            Domain::Settings,
+            Kind::ActionPlan,
+            Stability::Stable
+        ),
+        contract_type!(
+            "mcp_capability_selection_toggle.json",
+            crate::composer::capabilities::McpCapabilitySelectionToggle,
+            Domain::Composer,
+            Kind::SelectorDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "mcp_capability_unavailable_reason.json",
+            crate::composer::capabilities::McpCapabilityUnavailableReason,
+            Domain::Composer,
+            Kind::SelectorDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "model_provider_selection_update.json",
+            crate::composer::model_selection::ModelProviderSelectionUpdate,
+            Domain::Composer,
+            Kind::SelectorDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "model_selector_selection.json",
+            crate::composer::model_selection::ModelSelectorSelection,
+            Domain::Composer,
+            Kind::SelectorDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "parsed_user_attachment.json",
+            crate::timeline::labels::ParsedUserAttachment,
+            Domain::Timeline,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "parsed_user_attachment_kind.json",
+            crate::timeline::labels::ParsedUserAttachmentKind,
+            Domain::Timeline,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "prepared_composer_attachment.json",
+            crate::composer::turn_prepare::PreparedComposerAttachment,
+            Domain::Composer,
+            Kind::ActionPlan,
+            Stability::Stable
+        ),
+        contract_type!(
+            "prepare_composer_turn_request.json",
+            crate::composer::turn_prepare::PrepareComposerTurnRequest,
+            Domain::Composer,
+            Kind::ActionPlan,
+            Stability::Stable
+        ),
+        contract_type!(
+            "prepared_composer_turn.json",
+            crate::composer::turn_prepare::PreparedComposerTurn,
+            Domain::Composer,
+            Kind::ActionPlan,
+            Stability::Stable
+        ),
+        contract_type!(
+            "provider_api_key_action_unavailable.json",
+            crate::providers::actions::ProviderApiKeyActionUnavailable,
+            Domain::Providers,
+            Kind::ActionPlan,
+            Stability::Stable
+        ),
+        contract_type!(
+            "provider_delete_api_key_action_request.json",
+            crate::providers::actions::ProviderDeleteApiKeyActionRequest,
+            Domain::Providers,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "provider_delete_api_key_plan.json",
+            crate::providers::actions::ProviderDeleteApiKeyPlan,
+            Domain::Providers,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "provider_filter.json",
+            crate::providers::selectors::ProviderFilter,
+            Domain::Providers,
+            Kind::SelectorDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "provider_set_api_key_action_request.json",
+            crate::providers::actions::ProviderSetApiKeyActionRequest,
+            Domain::Providers,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "provider_set_api_key_plan.json",
+            crate::providers::actions::ProviderSetApiKeyPlan,
+            Domain::Providers,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "reconciled_skills_snapshot.json",
+            crate::skills::catalog::ReconciledSkillsSnapshot,
+            Domain::Skills,
+            Kind::Snapshot,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "selectable_mcp_capability.json",
+            crate::composer::capabilities::SelectableMcpCapability,
+            Domain::Composer,
+            Kind::SelectorDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "selectable_skill_capability.json",
+            crate::composer::capabilities::SelectableSkillCapability,
+            Domain::Composer,
+            Kind::SelectorDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "skill_audit_action.json",
+            crate::skills::presentation::SkillAuditAction,
+            Domain::Skills,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "skill_audit_decision.json",
+            crate::skills::presentation::SkillAuditDecision,
+            Domain::Skills,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "skill_audit_details_summary.json",
+            crate::skills::presentation::SkillAuditDetailsSummary,
+            Domain::Skills,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "skill_audit_row.json",
+            crate::skills::presentation::SkillAuditRow,
+            Domain::Skills,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "skill_capability_unavailable_reason.json",
+            crate::composer::capabilities::SkillCapabilityUnavailableReason,
+            Domain::Composer,
+            Kind::SelectorDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "skill_catalog_state.json",
+            crate::skills::catalog::SkillCatalogState,
+            Domain::Skills,
+            Kind::Snapshot,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "skill_dependency_card.json",
+            crate::skills::presentation::SkillDependencyCard,
+            Domain::Skills,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "skill_dependency_kind.json",
+            crate::skills::presentation::SkillDependencyKind,
+            Domain::Skills,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "skill_dependency_status.json",
+            crate::skills::presentation::SkillDependencyStatus,
+            Domain::Skills,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "skill_detail_diagnostics.json",
+            crate::skills::presentation::SkillDetailDiagnostics,
+            Domain::Skills,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "skill_diagnostics_table_cell.json",
+            crate::skills::presentation::SkillDiagnosticsTableCell,
+            Domain::Skills,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "skill_diagnostics_table_row.json",
+            crate::skills::presentation::SkillDiagnosticsTableRow,
+            Domain::Skills,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "skill_diagnostics_tone.json",
+            crate::skills::presentation::SkillDiagnosticsTone,
+            Domain::Skills,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "skill_json_value_preview.json",
+            crate::skills::presentation::SkillJsonValuePreview,
+            Domain::Skills,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "skill_security_card.json",
+            crate::skills::presentation::SkillSecurityCard,
+            Domain::Skills,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "skill_security_severity.json",
+            crate::skills::presentation::SkillSecuritySeverity,
+            Domain::Skills,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "skill_slug_presentation.json",
+            crate::skills::presentation::SkillSlugPresentation,
+            Domain::Skills,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "skill_source_kind.json",
+            crate::skills::presentation::SkillSourceKind,
+            Domain::Skills,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "skill_status.json",
+            crate::skills::presentation::SkillStatus,
+            Domain::Skills,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "skill_summary_presentation.json",
+            crate::skills::presentation::SkillSummaryPresentation,
+            Domain::Skills,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "skill_trust_gate_card.json",
+            crate::skills::presentation::SkillTrustGateCard,
+            Domain::Skills,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "skill_trust_gate_decision.json",
+            crate::skills::presentation::SkillTrustGateDecision,
+            Domain::Skills,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "skill_trust_gate_tool_kind.json",
+            crate::skills::presentation::SkillTrustGateToolKind,
+            Domain::Skills,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "skill_trust_level.json",
+            crate::skills::presentation::SkillTrustLevel,
+            Domain::Skills,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "skills_catalog_snapshot.json",
+            crate::skills::catalog::SkillsCatalogSnapshot,
+            Domain::Skills,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "skills_catalog_split.json",
+            crate::skills::catalog::SkillsCatalogSplit,
+            Domain::Skills,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "system_event_detail_row.json",
+            crate::timeline::labels::SystemEventDetailRow,
+            Domain::Timeline,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "system_event_presentation.json",
+            crate::timeline::labels::SystemEventPresentation,
+            Domain::Timeline,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "task_review_action.json",
+            crate::tasks::review::TaskReviewAction,
+            Domain::Tasks,
+            Kind::ActionState,
+            Stability::Stable
+        ),
+        contract_type!(
+            "task_review_action_state.json",
+            crate::tasks::review::TaskReviewActionState,
+            Domain::Tasks,
+            Kind::ActionState,
+            Stability::Stable
+        ),
+        contract_type!(
+            "task_review_plan_error.json",
+            crate::tasks::review::TaskReviewPlanError,
+            Domain::Tasks,
+            Kind::ActionPlan,
+            Stability::Stable
+        ),
+        contract_type!(
+            "task_wait_review_display.json",
+            crate::timeline::labels::TaskWaitReviewDisplay,
+            Domain::Timeline,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "task_wait_review_display_item.json",
+            crate::timeline::labels::TaskWaitReviewDisplayItem,
+            Domain::Timeline,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "thread_artifact_cache_entry.json",
+            crate::artifacts::state::ThreadArtifactCacheEntry,
+            Domain::Artifacts,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "thread_artifact_filter.json",
+            crate::artifacts::state::ThreadArtifactFilter,
+            Domain::Artifacts,
+            Kind::SelectorDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "artifact_binding_target_kind.json",
+            crate::artifacts::presentation::ArtifactBindingTargetKind,
+            Domain::Artifacts,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "artifact_binding_target_part.json",
+            crate::artifacts::presentation::ArtifactBindingTargetPart,
+            Domain::Artifacts,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "thread_list_snapshot.json",
+            crate::state::snapshot::ThreadListSnapshot,
+            Domain::Root,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "timeline_coalesced_tools_kind.json",
+            crate::timeline::rows::TimelineCoalescedToolsKind,
+            Domain::Timeline,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "timeline_coalesced_tools_row.json",
+            crate::timeline::rows::TimelineCoalescedToolsRow,
+            Domain::Timeline,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "timeline_final_status.json",
+            crate::timeline::labels::TimelineFinalStatus,
+            Domain::Timeline,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "timeline_final_status_kind.json",
+            crate::timeline::labels::TimelineFinalStatusKind,
+            Domain::Timeline,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "timeline_row.json",
+            crate::timeline::rows::TimelineRow,
+            Domain::Timeline,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "timeline_row_kind.json",
+            crate::timeline::rows::TimelineRowKind,
+            Domain::Timeline,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "turn_work_group_row.json",
+            crate::timeline::rows::TurnWorkGroupRow,
+            Domain::Timeline,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "workspace_snapshot.json",
+            crate::state::snapshot::WorkspaceSnapshot,
+            Domain::Root,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+    ];
+
+    contracts.sort_by(|left, right| left.file_name.cmp(right.file_name));
+    contracts
+}
+
+pub fn client_schema_internal_exclusions() -> Vec<ClientSchemaInternalExclusion> {
+    vec![
+        internal_exclusion!(
+            crate::state::client_state::ClientState,
+            "aggregate mutable Rust state, not a shell snapshot DTO"
+        ),
+        internal_exclusion!(
+            crate::state::client_state::ThreadsState,
+            "aggregate mutable Rust state, not a shell snapshot DTO"
+        ),
+        internal_exclusion!(
+            crate::state::client_state::WorkspacesState,
+            "aggregate mutable Rust state, not a shell snapshot DTO"
+        ),
+        internal_exclusion!(
+            crate::state::client_state::GatewayClientState,
+            "aggregate mutable Rust state, not a shell snapshot DTO"
+        ),
+        internal_exclusion!(
+            crate::state::client_state::SettingsState,
+            "aggregate mutable Rust state, not a shell snapshot DTO"
+        ),
+        internal_exclusion!(
+            crate::state::reducers::GatewaySwitchCleanupPlan,
+            "reducer implementation detail"
+        ),
+        internal_exclusion!(
+            crate::state::reducers::GatewayStatusInput,
+            "selector input, not a shell contract"
+        ),
+        internal_exclusion!(
+            crate::state::reducers::GatewayConnectionEvent,
+            "connection reducer input, not a shell event contract"
+        ),
+        internal_exclusion!(
+            crate::state::reducers::GatewaySettingsConnectionUpdate,
+            "reducer implementation detail"
+        ),
+        internal_exclusion!(
+            crate::state::reducers::GatewayConnectionReduction,
+            "reducer implementation detail"
+        ),
+        internal_exclusion!(
+            crate::notifications::router::ThreadStartedReduction,
+            "notification reducer output consumed inside Rust state mutation"
+        ),
+        internal_exclusion!(
+            crate::notifications::router::TurnLifecycleReduction,
+            "notification reducer output consumed inside Rust state mutation"
+        ),
+        internal_exclusion!(
+            crate::notifications::router::ConversationEventReduction,
+            "notification reducer output consumed inside Rust state mutation"
+        ),
+        internal_exclusion!(
+            crate::notifications::router::ThreadClosedReduction,
+            "notification reducer output consumed inside Rust state mutation"
+        ),
+        internal_exclusion!(
+            crate::notifications::router::ThreadUpdatedReduction,
+            "notification reducer output consumed inside Rust state mutation"
+        ),
+        internal_exclusion!(
+            crate::notifications::router::WorkspaceRefreshReduction,
+            "notification reducer output consumed inside Rust state mutation"
+        ),
+        internal_exclusion!(
+            crate::notifications::router::SkillsRefreshReduction,
+            "notification reducer output consumed inside Rust state mutation"
+        ),
+        internal_exclusion!(
+            crate::notifications::router::ThreadArtifactsRefreshReduction,
+            "notification reducer output consumed inside Rust state mutation"
+        ),
+        internal_exclusion!(
+            crate::notifications::router::ArtifactThreadRefreshReduction,
+            "notification reducer output consumed inside Rust state mutation"
+        ),
+        internal_exclusion!(
+            crate::notifications::router::ArtifactDeletedRefreshReduction,
+            "notification reducer output consumed inside Rust state mutation"
+        ),
+        internal_exclusion!(
+            crate::notifications::router::TurnTimelineRefreshReduction,
+            "notification reducer output consumed inside Rust state mutation"
+        ),
+        internal_exclusion!(
+            crate::conversation::reducer::ConversationProjector,
+            "projector implementation detail"
+        ),
+        internal_exclusion!(
+            crate::conversation::reducer::ConversationViewState,
+            "conversation read model is projected to shell-facing timeline rows"
+        ),
+        internal_exclusion!(
+            crate::conversation::reducer::TurnView,
+            "conversation read model is projected to shell-facing timeline rows"
+        ),
+        internal_exclusion!(
+            crate::conversation::reducer::ItemView,
+            "conversation read model is projected to shell-facing timeline rows"
+        ),
+        internal_exclusion!(
+            crate::conversation::reducer::TimelineEntry,
+            "conversation read model is projected to shell-facing timeline rows"
+        ),
+        internal_exclusion!(
+            crate::threads::coordinator::ThreadCoordinator,
+            "mutable per-thread coordinator state"
+        ),
+        internal_exclusion!(
+            crate::threads::start::ThreadStartCoordinator,
+            "workflow coordinator state"
+        ),
+        internal_exclusion!(
+            crate::threads::resume::ThreadResumeCoordinator,
+            "workflow coordinator state"
+        ),
+        internal_exclusion!(
+            crate::conversation::state_machine::TurnStateMachine,
+            "state machine implementation detail"
+        ),
+        internal_exclusion!(
+            crate::artifacts::actions::ArtifactLocalFile,
+            "native filesystem handle used by Rust artifact file actions"
+        ),
+        internal_exclusion!(
+            crate::artifacts::actions::ThreadArtifactActionState,
+            "mutable per-thread artifact action state"
+        ),
+        internal_exclusion!(
+            crate::artifacts::actions::ArtifactCachedDownload,
+            "native cache file descriptor used behind platform file traits"
+        ),
+        internal_exclusion!(
+            crate::artifacts::preview::ArtifactPreviewImagePaths,
+            "native preview cache paths, not a shell DTO"
+        ),
+        internal_exclusion!(
+            crate::artifacts::preview::ArtifactPreviewReadData,
+            "binary preview read buffer used inside Rust cache orchestration"
+        ),
+        internal_exclusion!(
+            crate::artifacts::preview::ArtifactPreviewVariantTarget,
+            "native image rendering target used behind platform preview traits"
+        ),
+        internal_exclusion!(
+            crate::artifacts::preview::ThreadArtifactPreviewState,
+            "mutable per-thread preview cache state"
+        ),
+        internal_exclusion!(
+            crate::mcp::list::McpSnapshotApplication,
+            "snapshot reconciliation output consumed inside Rust state mutation"
+        ),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn client_contract_files_are_unique_and_sorted() {
+        let contracts = client_contract_types();
+        assert!(!contracts.is_empty());
+
+        let file_names = contracts
+            .iter()
+            .map(|contract| contract.file_name)
+            .collect::<Vec<_>>();
+        let mut sorted = file_names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+
+        assert_eq!(file_names, sorted);
+    }
+
+    #[test]
+    fn client_contract_boundary_covers_phase_28_domains() {
+        let domains = client_contract_types()
+            .into_iter()
+            .map(|contract| contract.domain)
+            .collect::<BTreeSet<_>>();
+
+        for expected in [
+            ClientContractDomain::Root,
+            ClientContractDomain::Connection,
+            ClientContractDomain::Timeline,
+            ClientContractDomain::Composer,
+            ClientContractDomain::Artifacts,
+            ClientContractDomain::Providers,
+            ClientContractDomain::Skills,
+            ClientContractDomain::Mcp,
+            ClientContractDomain::Settings,
+            ClientContractDomain::Tasks,
+        ] {
+            assert!(domains.contains(&expected), "missing domain {expected:?}");
+        }
+    }
+
+    #[test]
+    fn client_contract_boundary_excludes_internal_reducer_types() {
+        let public_types = client_contract_types()
+            .into_iter()
+            .map(|contract| contract.rust_type)
+            .collect::<BTreeSet<_>>();
+
+        for exclusion in client_schema_internal_exclusions() {
+            assert!(
+                !public_types.contains(exclusion.rust_type),
+                "internal type is public: {}",
+                exclusion.rust_type
+            );
+        }
+    }
+}

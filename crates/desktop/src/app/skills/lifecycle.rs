@@ -3,10 +3,9 @@ use crate::{
     gateway::GatewayRuntime,
 };
 use gpui::{prelude::*, *};
-use pioneer_protocol::{
-    SkillHealthItem, SkillHealthTarget, SkillListItem, SkillListParams, SkillsHealthParams,
+use pioneer_client::{
+    skills::catalog as skill_catalog, workspaces::selectors as workspace_selectors,
 };
-use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tracing::warn;
 
@@ -26,10 +25,11 @@ impl PioneerDesktop {
         source_kind: String,
         cx: &mut Context<Self>,
     ) {
-        let exists = self
-            .installed_skills
-            .iter()
-            .any(|skill| skill.slug == slug && skill.source_kind == source_kind);
+        let exists = skill_catalog::skill_exists(
+            self.installed_skills.as_slice(),
+            slug.as_str(),
+            source_kind.as_str(),
+        );
 
         if !exists {
             self.skills_error = Some(t!("skills.error.invalid_skill_target").to_string());
@@ -86,34 +86,7 @@ impl PioneerDesktop {
                 let workspace_id_for_request = workspace_id.clone();
                 let result = cx
                     .background_spawn(async move {
-                        let list = ws_sender.skills_list(SkillListParams {
-                            workspace_id: workspace_id_for_request.clone(),
-                            include_health: true,
-                            include_policy: true,
-                        })?;
-
-                        let targets = list
-                            .skills
-                            .iter()
-                            .map(|skill| SkillHealthTarget {
-                                slug: skill.slug.clone(),
-                                source_kind: skill.source_kind.clone(),
-                            })
-                            .collect::<Vec<_>>();
-
-                        let health_items = if targets.is_empty() {
-                            Vec::new()
-                        } else {
-                            ws_sender
-                                .skills_health(SkillsHealthParams {
-                                    workspace_id: workspace_id_for_request,
-                                    skills: targets,
-                                    audit_limit: 16,
-                                })?
-                                .skills
-                        };
-
-                        Ok::<_, anyhow::Error>((list.skills, health_items))
+                        skill_catalog::load_skills_snapshot(&ws_sender, workspace_id_for_request)
                     })
                     .await;
 
@@ -125,8 +98,8 @@ impl PioneerDesktop {
                     view.skills_loading = false;
 
                     match result {
-                        Ok((catalog, health_items)) => {
-                            view.apply_skills_snapshot(catalog, health_items, cx);
+                        Ok(snapshot) => {
+                            view.apply_skills_snapshot(snapshot, cx);
                             view.skills_error = None;
                         }
                         Err(error) => {
@@ -144,83 +117,51 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn skills_workspace_scope(&self) -> Option<String> {
-        self.preferred_workspace_id()
-            .map(str::to_owned)
-            .or_else(|| {
-                self.gateway
-                    .runtime
-                    .as_ref()
-                    .and_then(GatewayRuntime::active_workspace_id)
-                    .map(str::to_owned)
-            })
-            .and_then(|workspace_id| {
-                let trimmed = workspace_id.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_owned())
-                }
-            })
-    }
-
-    pub(super) fn skill_key(slug: &str, source_kind: &str) -> String {
-        format!("{slug}::{source_kind}")
+        let runtime_workspace_id = self
+            .gateway
+            .runtime
+            .as_ref()
+            .and_then(GatewayRuntime::active_workspace_id);
+        workspace_selectors::resolve_workspace_scope(
+            None,
+            self.preferred_workspace_id(),
+            runtime_workspace_id,
+        )
     }
 
     pub(super) fn is_skill_pending(&self, slug: &str, source_kind: &str) -> bool {
-        self.skills_pending_actions
-            .contains(Self::skill_key(slug, source_kind).as_str())
+        skill_catalog::is_skill_pending(&self.skills_pending_actions, slug, source_kind)
     }
 
     pub(super) fn mark_skill_pending(&mut self, slug: &str, source_kind: &str, pending: bool) {
-        let key = Self::skill_key(slug, source_kind);
-        if pending {
-            self.skills_pending_actions.insert(key);
-        } else {
-            self.skills_pending_actions.remove(key.as_str());
-        }
+        skill_catalog::mark_skill_pending(
+            &mut self.skills_pending_actions,
+            slug,
+            source_kind,
+            pending,
+        );
     }
 
     pub(super) fn apply_skills_snapshot(
         &mut self,
-        catalog: Vec<SkillListItem>,
-        health_items: Vec<SkillHealthItem>,
+        snapshot: skill_catalog::SkillsCatalogSnapshot,
         cx: &mut Context<Self>,
     ) {
-        let (catalog, installed_skills) = derive_skills_catalog_and_installed(catalog);
+        let reconciled = skill_catalog::reconcile_skills_snapshot(
+            snapshot,
+            &mut self.skills_pending_actions,
+            self.selected_skill_target.clone(),
+        );
+        let snapshot = reconciled.snapshot;
 
-        let health_details = health_items
-            .into_iter()
-            .map(|item| {
-                (
-                    Self::skill_key(item.slug.as_str(), item.source_kind.as_str()),
-                    item,
-                )
-            })
-            .collect::<HashMap<_, _>>();
+        self.skills_catalog = snapshot.catalog;
+        self.installed_skills = snapshot.installed;
+        self.skills_health_details = snapshot.health_details;
+        self.selected_skill_target = reconciled.selected_target;
 
-        let catalog_keys = catalog
-            .iter()
-            .map(|skill| Self::skill_key(skill.slug.as_str(), skill.source_kind.as_str()))
-            .collect::<HashSet<_>>();
-
-        self.skills_pending_actions
-            .retain(|key| catalog_keys.contains(key));
-
-        self.skills_catalog = catalog;
-        self.installed_skills = installed_skills;
-        self.skills_health_details = health_details;
-
-        if let Some((slug, source_kind)) = self.selected_skill_target.as_ref() {
-            let still_present = self
-                .installed_skills
-                .iter()
-                .any(|skill| skill.slug == *slug && skill.source_kind == *source_kind);
-            if !still_present {
-                self.selected_skill_target = None;
-                if self.main_content_view == MainContentView::SkillDetails {
-                    self.set_main_content_view(MainContentView::Skills, cx);
-                }
+        if reconciled.selected_target_cleared {
+            if self.main_content_view == MainContentView::SkillDetails {
+                self.set_main_content_view(MainContentView::Skills, cx);
             }
         }
     }
@@ -255,21 +196,4 @@ impl PioneerDesktop {
         })
         .detach();
     }
-}
-
-fn derive_skills_catalog_and_installed(
-    mut catalog: Vec<SkillListItem>,
-) -> (Vec<SkillListItem>, Vec<SkillListItem>) {
-    catalog.sort_by(|left, right| {
-        left.source_kind
-            .cmp(&right.source_kind)
-            .then_with(|| left.slug.cmp(&right.slug))
-    });
-
-    let installed = catalog
-        .iter()
-        .filter(|skill| skill.install.installed)
-        .cloned()
-        .collect::<Vec<_>>();
-    (catalog, installed)
 }

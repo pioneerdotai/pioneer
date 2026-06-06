@@ -1,5 +1,11 @@
 use super::*;
 use crate::state;
+use pioneer_client::agents_doc::scope as agents_doc_scope;
+use pioneer_client::composer::draft as composer_draft;
+use pioneer_client::state::reducers as client_state_reducers;
+use pioneer_client::threads::{
+    resume as thread_resume, start as thread_start, tree as thread_tree,
+};
 use tracing::warn;
 
 impl PioneerDesktop {
@@ -92,15 +98,11 @@ impl PioneerDesktop {
         workspace_id: &str,
         thread_id: Option<String>,
     ) {
-        match thread_id {
-            Some(thread_id) => {
-                self.last_active_thread_by_workspace
-                    .insert(workspace_id.to_owned(), thread_id);
-            }
-            None => {
-                self.last_active_thread_by_workspace.remove(workspace_id);
-            }
-        }
+        thread_tree::remember_thread_for_workspace(
+            &mut self.last_active_thread_by_workspace,
+            workspace_id,
+            thread_id,
+        );
     }
 
     pub(in crate::app) fn remember_draft_thread_for_workspace(
@@ -108,15 +110,11 @@ impl PioneerDesktop {
         workspace_id: &str,
         thread_id: Option<String>,
     ) {
-        match thread_id {
-            Some(thread_id) => {
-                self.draft_thread_by_workspace
-                    .insert(workspace_id.to_owned(), thread_id);
-            }
-            None => {
-                self.draft_thread_by_workspace.remove(workspace_id);
-            }
-        }
+        thread_tree::remember_thread_for_workspace(
+            &mut self.draft_thread_by_workspace,
+            workspace_id,
+            thread_id,
+        );
     }
 
     pub(in crate::app) fn remember_active_thread_draft(&mut self, cx: &Context<Self>) {
@@ -124,26 +122,28 @@ impl PioneerDesktop {
             return;
         };
 
-        let value = self.composer_state.read(cx).value().trim_end().to_owned();
+        let value =
+            composer_draft::normalize_composer_draft_text(&self.composer_state.read(cx).value());
         let attachments = self.composer_attachments.clone();
         let capabilities = self.composer_capabilities.clone();
-        if value.is_empty() && attachments.is_empty() && capabilities.is_empty() {
-            self.thread_drafts.remove(thread_id.as_str());
-            self.thread_draft_attachments.remove(thread_id.as_str());
-            self.thread_draft_capabilities.remove(thread_id.as_str());
-        } else {
-            self.thread_drafts.insert(thread_id.clone(), value);
-            self.thread_draft_attachments
-                .insert(thread_id.clone(), attachments);
-            self.thread_draft_capabilities
-                .insert(thread_id, capabilities);
-        }
+        composer_draft::remember_thread_composer_draft(
+            thread_id.as_str(),
+            value,
+            attachments,
+            capabilities,
+            &mut self.thread_drafts,
+            &mut self.thread_draft_attachments,
+            &mut self.thread_draft_capabilities,
+        );
     }
 
     pub(in crate::app) fn clear_thread_draft(&mut self, thread_id: &str) {
-        self.thread_drafts.remove(thread_id);
-        self.thread_draft_attachments.remove(thread_id);
-        self.thread_draft_capabilities.remove(thread_id);
+        composer_draft::clear_thread_composer_draft(
+            thread_id,
+            &mut self.thread_drafts,
+            &mut self.thread_draft_attachments,
+            &mut self.thread_draft_capabilities,
+        );
     }
 
     pub(in crate::app) fn restore_thread_draft(
@@ -152,26 +152,17 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let value = self
-            .thread_drafts
-            .get(thread_id)
-            .cloned()
-            .unwrap_or_default();
-        let attachments = self
-            .thread_draft_attachments
-            .get(thread_id)
-            .cloned()
-            .unwrap_or_default();
-        let capabilities = self
-            .thread_draft_capabilities
-            .get(thread_id)
-            .cloned()
-            .unwrap_or_default();
+        let draft = composer_draft::restore_thread_composer_draft(
+            thread_id,
+            &self.thread_drafts,
+            &self.thread_draft_attachments,
+            &self.thread_draft_capabilities,
+        );
         self.composer_state.update(cx, move |state, cx| {
-            state.set_value(value.clone(), window, cx)
+            state.set_value(draft.text.clone(), window, cx)
         });
-        self.composer_attachments = attachments;
-        self.composer_capabilities = capabilities;
+        self.composer_attachments = draft.attachments;
+        self.composer_capabilities = draft.capabilities;
     }
 
     pub(in crate::app) fn activate_thread_with_draft_restore(
@@ -195,7 +186,7 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn reset_thread_start_state(&mut self) {
-        self.thread_start = ThreadStartCoordinator::default();
+        client_state_reducers::reset_thread_start_coordinator(&mut self.thread_start);
     }
 
     pub(in crate::app) fn thread_start_coordinator_mut(&mut self) -> &mut ThreadStartCoordinator {
@@ -203,36 +194,37 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn enqueue_thread_start_request(&mut self) {
-        self.thread_start_requested = true;
+        thread_start::enqueue_thread_start_request(&mut self.thread_start_requested);
     }
 
     pub(in crate::app) fn dequeue_thread_start_request(&mut self) -> bool {
-        if !self.thread_start_requested {
-            return false;
-        }
-        self.thread_start_requested = false;
-        true
+        thread_start::dequeue_thread_start_request(&mut self.thread_start_requested)
     }
 
     pub(in crate::app) fn clear_thread_start_queue(&mut self) {
-        self.thread_start_requested = false;
+        thread_start::clear_thread_start_request(&mut self.thread_start_requested);
     }
 
     pub(in crate::app) fn enqueue_turn_resume_thread(&mut self, thread_id: String) {
-        if self.ready_turn_resume_thread_set.insert(thread_id.clone()) {
-            self.ready_turn_resume_threads.push_back(thread_id);
-        }
+        thread_resume::enqueue_turn_resume_thread(
+            &mut self.ready_turn_resume_threads,
+            &mut self.ready_turn_resume_thread_set,
+            thread_id,
+        );
     }
 
     pub(in crate::app) fn dequeue_turn_resume_thread(&mut self) -> Option<String> {
-        let thread_id = self.ready_turn_resume_threads.pop_front()?;
-        self.ready_turn_resume_thread_set.remove(thread_id.as_str());
-        Some(thread_id)
+        thread_resume::dequeue_turn_resume_thread(
+            &mut self.ready_turn_resume_threads,
+            &mut self.ready_turn_resume_thread_set,
+        )
     }
 
     pub(in crate::app) fn clear_turn_resume_queue(&mut self) {
-        self.ready_turn_resume_threads.clear();
-        self.ready_turn_resume_thread_set.clear();
+        thread_resume::clear_turn_resume_queue(
+            &mut self.ready_turn_resume_threads,
+            &mut self.ready_turn_resume_thread_set,
+        );
     }
 
     pub(in crate::app) fn upsert_thread_coordinator(
@@ -240,26 +232,18 @@ impl PioneerDesktop {
         thread_id: &str,
         workspace_id: &str,
     ) -> &mut ThreadCoordinator {
-        let coordinator = self
-            .thread_coordinators
-            .entry(thread_id.to_owned())
-            .or_insert_with(|| ThreadCoordinator::pending(thread_id, workspace_id));
-        coordinator.set_workspace_id(workspace_id);
-        coordinator
+        client_state_reducers::upsert_thread_coordinator_in(
+            &mut self.thread_coordinators,
+            thread_id,
+            workspace_id,
+        )
     }
 
     pub(in crate::app) fn upsert_thread_snapshot(
         &mut self,
         thread: Thread,
     ) -> &mut ThreadCoordinator {
-        let thread_id = thread.id.clone();
-        match self.thread_coordinators.entry(thread_id) {
-            Entry::Occupied(mut occupied) => {
-                occupied.get_mut().set_snapshot(thread);
-                occupied.into_mut()
-            }
-            Entry::Vacant(vacant) => vacant.insert(ThreadCoordinator::new(thread)),
-        }
+        client_state_reducers::upsert_thread_snapshot_in(&mut self.thread_coordinators, thread)
     }
 
     pub(in crate::app) fn thread_conversation_mut(
@@ -289,15 +273,11 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn queue_thread_list_refresh(&mut self) {
-        self.thread_list_refresh_requested = true;
+        thread_tree::queue_thread_tree_refresh(&mut self.thread_list_refresh_requested);
     }
 
     pub(in crate::app) fn take_thread_list_refresh_request(&mut self) -> bool {
-        if !self.thread_list_refresh_requested {
-            return false;
-        }
-        self.thread_list_refresh_requested = false;
-        true
+        thread_tree::take_thread_tree_refresh_request(&mut self.thread_list_refresh_requested)
     }
 
     pub(in crate::app) fn set_thread_history_loading(&mut self, thread_id: &str, loading: bool) {
@@ -315,22 +295,26 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn remove_thread_conversation(&mut self, thread_id: &str) {
-        self.clear_draft_thread_if_matches(thread_id);
-        self.thread_coordinators.remove(thread_id);
-        self.thread_drafts.remove(thread_id);
-        self.thread_draft_attachments.remove(thread_id);
-        self.thread_draft_capabilities.remove(thread_id);
-        self.thread_placements.remove(thread_id);
-        self.turn_timeline_refresh
-            .retain(|(refresh_thread_id, _), _| refresh_thread_id != thread_id);
+        client_state_reducers::remove_thread_scoped_entries(
+            thread_id,
+            &mut self.draft_thread_id,
+            &mut self.thread_coordinators,
+            &mut self.thread_drafts,
+            &mut self.thread_draft_attachments,
+            &mut self.thread_draft_capabilities,
+            &mut self.thread_placements,
+            &mut self.turn_timeline_refresh,
+        );
     }
 
     pub(in crate::app) fn clear_thread_conversations(&mut self) {
         self.draft_thread_id = None;
         self.thread_coordinators.clear();
-        self.thread_drafts.clear();
-        self.thread_draft_attachments.clear();
-        self.thread_draft_capabilities.clear();
+        composer_draft::clear_all_composer_drafts(
+            &mut self.thread_drafts,
+            &mut self.thread_draft_attachments,
+            &mut self.thread_draft_capabilities,
+        );
         self.composer_attachments.clear();
         self.composer_capabilities.clear();
         self.composer_upload_in_progress = false;
@@ -352,26 +336,14 @@ impl PioneerDesktop {
         placements: Vec<ThreadPlacement>,
         agents_docs: Vec<ThreadAgentsDocSummary>,
     ) {
-        self.thread_folders = folders
-            .into_iter()
-            .map(|folder| (folder.id.clone(), folder))
-            .collect();
-
-        let mut next_expanded = HashMap::new();
-        for folder_id in self.thread_folders.keys() {
-            let expanded = self
-                .thread_folder_expanded
-                .get(folder_id)
-                .copied()
-                .unwrap_or(false);
-            next_expanded.insert(folder_id.clone(), expanded);
-        }
-        self.thread_folder_expanded = next_expanded;
-
-        self.thread_placements = placements
-            .into_iter()
-            .map(|placement| (placement.thread_id.clone(), placement))
-            .collect();
+        let normalized = thread_tree::normalize_thread_tree_snapshot(
+            folders,
+            placements,
+            &self.thread_folder_expanded,
+        );
+        self.thread_folders = normalized.folders_by_id;
+        self.thread_folder_expanded = normalized.folder_expanded;
+        self.thread_placements = normalized.placements_by_thread_id;
         self.thread_agents_doc_summaries = thread_agents_doc_summaries_by_scope(agents_docs);
     }
 
@@ -380,12 +352,7 @@ impl PioneerDesktop {
         folder_id: &str,
         cx: &mut Context<Self>,
     ) {
-        if let Some(expanded) = self.thread_folder_expanded.get_mut(folder_id) {
-            *expanded = !*expanded;
-        } else {
-            self.thread_folder_expanded
-                .insert(folder_id.to_owned(), true);
-        }
+        thread_tree::toggle_thread_folder_expanded(&mut self.thread_folder_expanded, folder_id);
 
         self.save_thread_folder_expansion_for_active_workspace(cx);
     }
@@ -396,8 +363,11 @@ impl PioneerDesktop {
         expanded: bool,
         cx: &mut Context<Self>,
     ) {
-        self.thread_folder_expanded
-            .insert(folder_id.to_owned(), expanded);
+        thread_tree::set_thread_folder_expanded(
+            &mut self.thread_folder_expanded,
+            folder_id,
+            expanded,
+        );
 
         self.save_thread_folder_expansion_for_active_workspace(cx);
     }
@@ -435,15 +405,7 @@ impl PioneerDesktop {
 pub(super) fn thread_agents_doc_summaries_by_scope(
     summaries: Vec<ThreadAgentsDocSummary>,
 ) -> HashMap<ThreadAgentsDocSummaryKey, ThreadAgentsDocSummary> {
-    summaries
-        .into_iter()
-        .map(|summary| {
-            (
-                ThreadAgentsDocSummaryKey::from_folder_id(summary.folder_id.as_deref()),
-                summary,
-            )
-        })
-        .collect()
+    agents_doc_scope::thread_agents_doc_summaries_by_scope(summaries)
 }
 
 #[cfg(test)]

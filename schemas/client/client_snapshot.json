@@ -1,0 +1,201 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ClientSnapshot",
+  "type": "object",
+  "properties": {
+    "active_thread": {
+      "$ref": "#/$defs/ActiveThreadSnapshot"
+    },
+    "has_any_in_flight_turn": {
+      "type": "boolean"
+    },
+    "has_in_flight_thread_start": {
+      "type": "boolean"
+    },
+    "threads": {
+      "$ref": "#/$defs/ThreadListSnapshot"
+    },
+    "workspace": {
+      "$ref": "#/$defs/WorkspaceSnapshot"
+    }
+  },
+  "required": [
+    "workspace",
+    "threads",
+    "active_thread",
+    "has_in_flight_thread_start",
+    "has_any_in_flight_turn"
+  ],
+  "$defs": {
+    "ActiveThreadPhaseSnapshot": {
+      "type": "string",
+      "enum": [
+        "Idle",
+        "Starting",
+        "Running",
+        "Cancelling",
+        "Completing",
+        "Completed",
+        "Failed",
+        "Blocked",
+        "Cancelled"
+      ]
+    },
+    "ActiveThreadSnapshot": {
+      "type": "object",
+      "properties": {
+        "history_loaded": {
+          "type": "boolean"
+        },
+        "history_loading": {
+          "type": "boolean"
+        },
+        "in_flight_turn_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "is_draft": {
+          "type": "boolean"
+        },
+        "phase": {
+          "$ref": "#/$defs/ActiveThreadPhaseSnapshot"
+        },
+        "status": {
+          "$ref": "#/$defs/ActiveThreadStatusSnapshot"
+        },
+        "thread_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "is_draft",
+        "history_loading",
+        "history_loaded",
+        "phase",
+        "status"
+      ]
+    },
+    "ActiveThreadStatusSnapshot": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "GatewayDisconnected",
+            "StartingThread",
+            "FinishingTurn",
+            "PreviousTurnFailed",
+            "TurnCancelled",
+            "TurnCompleted",
+            "Ready",
+            "StartingTurn",
+            "AgentProcessing"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "TurnRunning": {
+              "type": "object",
+              "properties": {
+                "turn_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "turn_id"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "TurnRunning"
+          ]
+        }
+      ]
+    },
+    "ThreadListSnapshot": {
+      "type": "object",
+      "properties": {
+        "active_thread_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "active_workspace_thread_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "draft_thread_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "has_known_threads_for_active_workspace": {
+          "type": "boolean"
+        },
+        "loading": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "active_workspace_thread_ids",
+        "has_known_threads_for_active_workspace",
+        "loading"
+      ]
+    },
+    "WorkspaceSnapshot": {
+      "type": "object",
+      "properties": {
+        "action_in_progress": {
+          "type": "boolean"
+        },
+        "active_workspace_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "loading": {
+          "type": "boolean"
+        },
+        "preferred_workspace_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "loading",
+        "action_in_progress",
+        "workspace_count"
+      ]
+    }
+  }
+}

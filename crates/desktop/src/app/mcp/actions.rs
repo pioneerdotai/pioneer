@@ -1,11 +1,7 @@
 use crate::app::root::{GatewayConnectionState, MainContentView, PioneerDesktop};
 use gpui::{prelude::*, *};
-use pioneer_protocol::{
-    McpPolicySetParams, McpScopeKind, McpServerRestartParams, McpServerStatus, McpUninstallParams,
-};
+use pioneer_client::mcp::{actions as mcp_actions, list as mcp_list};
 use tracing::warn;
-
-pub(super) const MCP_INSTALL_PENDING_KEY: &str = "__install__";
 
 impl PioneerDesktop {
     pub(super) fn set_mcp_policy(
@@ -15,26 +11,29 @@ impl PioneerDesktop {
         allow_implicit_invocation: bool,
         cx: &mut Context<Self>,
     ) {
-        let name = name.trim().to_owned();
-        if name.is_empty() {
+        let Some(name) = mcp_list::normalize_mcp_server_name(name.as_str()) else {
             self.mcp_error = Some(t!("mcp.error.server_name_required").to_string());
             return;
-        }
-        if self.gateway.connection_state != GatewayConnectionState::Connected {
-            self.mcp_error = Some(t!("mcp.error.gateway_not_connected").to_string());
-            return;
-        }
-
-        let Some(connection_id) = self.gateway.ws_connection_id else {
-            self.mcp_error = Some(t!("mcp.error.gateway_not_connected").to_string());
-            return;
         };
-        let Some(workspace_id) = self.mcp_workspace_scope() else {
-            self.mcp_error = Some(t!("mcp.error.workspace_not_selected").to_string());
-            return;
+        let scope = match mcp_actions::plan_mcp_action_scope(
+            matches!(
+                self.gateway.connection_state,
+                GatewayConnectionState::Connected
+            ),
+            self.gateway.ws_connection_id,
+            self.mcp_workspace_scope(),
+        ) {
+            mcp_actions::McpActionScopePlan::Send(scope) => scope,
+            mcp_actions::McpActionScopePlan::Unavailable(reason) => {
+                self.apply_mcp_action_unavailable(reason);
+                return;
+            }
         };
+        let connection_id = scope.connection_id;
+        let workspace_id = scope.workspace_id;
 
-        let previous_policy = self.mcp_policy_values(name.as_str());
+        let previous_policy =
+            mcp_actions::mcp_policy_values(self.mcp_servers.as_slice(), name.as_str());
         self.mcp_error = None;
         self.mark_mcp_pending(name.as_str(), true);
         self.apply_local_mcp_policy(name.as_str(), enabled, allow_implicit_invocation);
@@ -46,18 +45,20 @@ impl PioneerDesktop {
             async move {
                 let result = cx
                     .background_spawn(async move {
-                        ws_sender.mcp_policy_set(McpPolicySetParams {
+                        ws_sender.mcp_policy_set(mcp_actions::mcp_policy_set_params(
                             workspace_id,
-                            name: name_for_request,
-                            scope_kind: McpScopeKind::Workspace,
-                            enabled: Some(enabled),
-                            allow_implicit_invocation: Some(allow_implicit_invocation),
-                        })
+                            name_for_request,
+                            enabled,
+                            allow_implicit_invocation,
+                        ))
                     })
                     .await;
 
                 let _ = this.update(&mut cx, |view, cx| {
-                    if view.gateway.ws_connection_id != Some(connection_id) {
+                    if !mcp_actions::mcp_action_matches_connection(
+                        connection_id,
+                        view.gateway.ws_connection_id,
+                    ) {
                         return;
                     }
 
@@ -66,7 +67,9 @@ impl PioneerDesktop {
                         Ok(_) => {
                             view.mcp_error = None;
                             view.queue_mcp_refresh();
-                            if view.mcp_selected_server_id.is_some() {
+                            if mcp_actions::mcp_action_should_refresh_details(
+                                view.mcp_selected_server_id.as_deref(),
+                            ) {
                                 view.queue_mcp_details_refresh();
                             }
                         }
@@ -99,24 +102,26 @@ impl PioneerDesktop {
     }
 
     pub(super) fn restart_mcp_server(&mut self, name: String, cx: &mut Context<Self>) {
-        let name = name.trim().to_owned();
-        if name.is_empty() {
+        let Some(name) = mcp_list::normalize_mcp_server_name(name.as_str()) else {
             self.mcp_error = Some(t!("mcp.error.server_name_required").to_string());
             return;
-        }
-        if self.gateway.connection_state != GatewayConnectionState::Connected {
-            self.mcp_error = Some(t!("mcp.error.gateway_not_connected").to_string());
-            return;
-        }
-
-        let Some(connection_id) = self.gateway.ws_connection_id else {
-            self.mcp_error = Some(t!("mcp.error.gateway_not_connected").to_string());
-            return;
         };
-        let Some(workspace_id) = self.mcp_workspace_scope() else {
-            self.mcp_error = Some(t!("mcp.error.workspace_not_selected").to_string());
-            return;
+        let scope = match mcp_actions::plan_mcp_action_scope(
+            matches!(
+                self.gateway.connection_state,
+                GatewayConnectionState::Connected
+            ),
+            self.gateway.ws_connection_id,
+            self.mcp_workspace_scope(),
+        ) {
+            mcp_actions::McpActionScopePlan::Send(scope) => scope,
+            mcp_actions::McpActionScopePlan::Unavailable(reason) => {
+                self.apply_mcp_action_unavailable(reason);
+                return;
+            }
         };
+        let connection_id = scope.connection_id;
+        let workspace_id = scope.workspace_id;
 
         self.mcp_error = None;
         self.mark_mcp_pending(name.as_str(), true);
@@ -128,16 +133,18 @@ impl PioneerDesktop {
             async move {
                 let result = cx
                     .background_spawn(async move {
-                        ws_sender.mcp_server_restart(McpServerRestartParams {
+                        ws_sender.mcp_server_restart(mcp_actions::mcp_server_restart_params(
                             workspace_id,
-                            name: name_for_request,
-                            scope_kind: McpScopeKind::Workspace,
-                        })
+                            name_for_request,
+                        ))
                     })
                     .await;
 
                 let _ = this.update(&mut cx, |view, cx| {
-                    if view.gateway.ws_connection_id != Some(connection_id) {
+                    if !mcp_actions::mcp_action_matches_connection(
+                        connection_id,
+                        view.gateway.ws_connection_id,
+                    ) {
                         return;
                     }
 
@@ -146,7 +153,9 @@ impl PioneerDesktop {
                         Ok(_) => {
                             view.mcp_error = None;
                             view.queue_mcp_refresh();
-                            if view.mcp_selected_server_id.is_some() {
+                            if mcp_actions::mcp_action_should_refresh_details(
+                                view.mcp_selected_server_id.as_deref(),
+                            ) {
                                 view.queue_mcp_details_refresh();
                             }
                         }
@@ -172,24 +181,26 @@ impl PioneerDesktop {
     }
 
     pub(super) fn uninstall_mcp_server(&mut self, name: String, cx: &mut Context<Self>) {
-        let name = name.trim().to_owned();
-        if name.is_empty() {
+        let Some(name) = mcp_list::normalize_mcp_server_name(name.as_str()) else {
             self.mcp_error = Some(t!("mcp.error.server_name_required").to_string());
             return;
-        }
-        if self.gateway.connection_state != GatewayConnectionState::Connected {
-            self.mcp_error = Some(t!("mcp.error.gateway_not_connected").to_string());
-            return;
-        }
-
-        let Some(connection_id) = self.gateway.ws_connection_id else {
-            self.mcp_error = Some(t!("mcp.error.gateway_not_connected").to_string());
-            return;
         };
-        let Some(workspace_id) = self.mcp_workspace_scope() else {
-            self.mcp_error = Some(t!("mcp.error.workspace_not_selected").to_string());
-            return;
+        let scope = match mcp_actions::plan_mcp_action_scope(
+            matches!(
+                self.gateway.connection_state,
+                GatewayConnectionState::Connected
+            ),
+            self.gateway.ws_connection_id,
+            self.mcp_workspace_scope(),
+        ) {
+            mcp_actions::McpActionScopePlan::Send(scope) => scope,
+            mcp_actions::McpActionScopePlan::Unavailable(reason) => {
+                self.apply_mcp_action_unavailable(reason);
+                return;
+            }
         };
+        let connection_id = scope.connection_id;
+        let workspace_id = scope.workspace_id;
 
         self.mcp_error = None;
         self.mark_mcp_pending(name.as_str(), true);
@@ -201,16 +212,18 @@ impl PioneerDesktop {
             async move {
                 let result = cx
                     .background_spawn(async move {
-                        ws_sender.mcp_uninstall(McpUninstallParams {
+                        ws_sender.mcp_uninstall(mcp_actions::mcp_uninstall_params(
                             workspace_id,
-                            name: name_for_request,
-                            scope_kind: McpScopeKind::Workspace,
-                        })
+                            name_for_request,
+                        ))
                     })
                     .await;
 
                 let _ = this.update(&mut cx, |view, cx| {
-                    if view.gateway.ws_connection_id != Some(connection_id) {
+                    if !mcp_actions::mcp_action_matches_connection(
+                        connection_id,
+                        view.gateway.ws_connection_id,
+                    ) {
                         return;
                     }
 
@@ -218,8 +231,10 @@ impl PioneerDesktop {
                     match result {
                         Ok(_) => {
                             view.mcp_error = None;
-                            view.mcp_selected_server_id = None;
-                            view.mcp_server_details = None;
+                            mcp_actions::apply_mcp_uninstall_success(
+                                &mut view.mcp_selected_server_id,
+                                &mut view.mcp_server_details,
+                            );
                             if view.main_content_view == MainContentView::McpDetails {
                                 view.set_main_content_view(MainContentView::Mcp, cx);
                             }
@@ -246,43 +261,29 @@ impl PioneerDesktop {
         .detach();
     }
 
-    fn mcp_policy_values(&self, name: &str) -> Option<(bool, bool)> {
-        self.mcp_servers
-            .iter()
-            .find(|server| server.name == name)
-            .map(|server| {
-                (
-                    server.policy.enabled,
-                    server.policy.allow_implicit_invocation,
-                )
-            })
-    }
-
     fn apply_local_mcp_policy(
         &mut self,
         name: &str,
         enabled: bool,
         allow_implicit_invocation: bool,
     ) {
-        for server in &mut self.mcp_servers {
-            if server.name == name {
-                server.policy.enabled = enabled;
-                server.policy.allow_implicit_invocation = allow_implicit_invocation;
-                if !enabled {
-                    server.status = McpServerStatus::Disabled;
-                }
-            }
-        }
+        mcp_actions::apply_local_mcp_policy(
+            &mut self.mcp_servers,
+            &mut self.mcp_server_details,
+            name,
+            enabled,
+            allow_implicit_invocation,
+        );
+    }
 
-        if let Some(details) = self.mcp_server_details.as_mut() {
-            if details.server.name == name {
-                details.server.policy.enabled = enabled;
-                details.server.policy.allow_implicit_invocation = allow_implicit_invocation;
-                if !enabled {
-                    details.server.status = McpServerStatus::Disabled;
-                    details.health.status = McpServerStatus::Disabled;
-                }
+    fn apply_mcp_action_unavailable(&mut self, reason: mcp_actions::McpActionUnavailable) {
+        self.mcp_error = Some(match reason {
+            mcp_actions::McpActionUnavailable::GatewayNotConnected => {
+                t!("mcp.error.gateway_not_connected").to_string()
             }
-        }
+            mcp_actions::McpActionUnavailable::WorkspaceNotSelected => {
+                t!("mcp.error.workspace_not_selected").to_string()
+            }
+        });
     }
 }

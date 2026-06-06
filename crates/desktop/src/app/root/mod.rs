@@ -4,6 +4,7 @@ mod queries;
 mod state;
 mod view;
 
+#[cfg(test)]
 pub(in crate::app) use queries::resolve_active_workspace_id;
 
 use crate::{
@@ -21,28 +22,36 @@ use gpui_component::{
     VirtualListScrollHandle, input::InputState, table::TableState, tree::TreeState,
 };
 use gpui_terminal::TerminalView;
+#[cfg(test)]
+pub(super) use pioneer_client::artifacts::actions::ArtifactLocalFile as ThreadArtifactLocalFile;
+pub(super) use pioneer_client::{
+    agents_doc::scope::{
+        AgentsDocEditorScope as ThreadAgentsDocEditorScope, ThreadAgentsDocSummaryKey,
+    },
+    artifacts::actions::ArtifactActionStatus as ThreadArtifactActionStatus,
+    artifacts::preview::ArtifactPreviewImagePaths as ThreadArtifactPreviewImagePaths,
+    artifacts::state::{ThreadArtifactFilter, ThreadArtifactsState},
+    composer::attachments::{ComposerAttachment, ComposerAttachmentUploadState},
+    composer::capabilities::{ComposerCapability, ComposerCapabilityKind},
+    gateway::runtime::GatewaySetupAction,
+    providers::list::ProviderListState,
+    providers::selectors::ProviderFilter,
+    skills::upload::SkillUploadProgress,
+    state::client_state::{GatewayConnectionState, GatewayStatusLevel},
+    tasks::review::TaskReviewActionState,
+    threads::{resume::ThreadResumeCoordinator, start::ThreadStartCoordinator},
+    turns::timeline_refresh::TurnTimelineRefreshState,
+};
 use pioneer_protocol::{
-    ArtifactRef, ArtifactSummary, GatewaySettingsSnapshot, McpListItem, McpScopeKind,
-    McpServerDetailsResponse, SkillHealthItem, SkillListItem, Thread, ThreadAgentsDocSummary,
-    ThreadFolder, ThreadMode, ThreadPlacement, TurnCapability, TurnCapabilityKind, Workspace,
+    GatewaySettingsSnapshot, McpListItem, McpServerDetailsResponse, SkillHealthItem, SkillListItem,
+    Thread, ThreadAgentsDocSummary, ThreadFolder, ThreadMode, ThreadPlacement, Workspace,
 };
 use std::{
     cell::RefCell,
-    collections::hash_map::Entry,
     collections::{HashMap, HashSet, VecDeque},
-    path::PathBuf,
     rc::Rc,
     sync::{Arc, atomic::AtomicBool},
-    time::Instant,
 };
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum GatewaySetupAction {
-    ConnectRemote,
-    StartLocal,
-    SaveGateway,
-    DeleteGateway,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum GatewayOperationSource {
@@ -97,30 +106,6 @@ impl GatewaySetupFormMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum GatewayStatusLevel {
-    Neutral,
-    Connected,
-    Degraded,
-    Failed,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum GatewayConnectionState {
-    Idle,
-    Connecting,
-    Connected,
-    Reconnecting,
-    Disconnected,
-}
-
-#[derive(Clone, Debug)]
-pub(super) struct SkillUploadProgress {
-    pub label: String,
-    pub sent_bytes: u64,
-    pub total_bytes: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MainContentView {
     Threads,
     AgentsDoc,
@@ -136,33 +121,6 @@ pub(super) enum MainContentView {
 pub(super) enum SettingsContentView {
     General,
     Memory,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ProviderFilter {
-    All,
-    Connected,
-}
-
-impl GatewayConnectionState {
-    pub(super) fn is_transitioning(self) -> bool {
-        matches!(self, Self::Connecting | Self::Reconnecting)
-    }
-}
-
-#[derive(Default)]
-pub(super) struct ThreadResumeCoordinator {
-    pub(super) in_progress: bool,
-    pub(super) retry_attempt: u32,
-    pub(super) next_attempt_at: Option<Instant>,
-}
-
-#[derive(Default)]
-pub(super) struct ThreadStartCoordinator {
-    pub(super) pending_thread_id: Option<String>,
-    pub(super) in_progress: bool,
-    pub(super) retry_attempt: u32,
-    pub(super) next_attempt_at: Option<Instant>,
 }
 
 pub(super) struct GatewayCoordinator {
@@ -217,227 +175,6 @@ pub(super) struct CachedTimelineTerminal {
     pub(super) view: Entity<TerminalView>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum ComposerAttachmentKind {
-    Image,
-    File,
-    Audio,
-    Video,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ComposerAttachment {
-    pub(super) path: String,
-    pub(super) file_name: String,
-    pub(super) kind: ComposerAttachmentKind,
-    pub(super) upload_state: ComposerAttachmentUploadState,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum ComposerAttachmentUploadState {
-    Local,
-    Uploading,
-    Uploaded { artifact: ArtifactRef },
-    Failed { error: String },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ComposerCapability {
-    pub(super) id: String,
-    pub(super) label: String,
-    pub(super) kind: ComposerCapabilityKind,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum ComposerCapabilityKind {
-    Skill {
-        slug: String,
-        source_kind: String,
-    },
-    McpServer {
-        name: String,
-        scope_kind: McpScopeKind,
-    },
-    McpTool {
-        server_name: String,
-        raw_tool_name: String,
-        scope_kind: McpScopeKind,
-    },
-}
-
-impl ComposerCapability {
-    pub(super) fn key(&self) -> String {
-        self.kind.key()
-    }
-
-    pub(super) fn to_turn_capability(&self) -> TurnCapability {
-        TurnCapability {
-            id: self.id.clone(),
-            kind: match &self.kind {
-                ComposerCapabilityKind::Skill { slug, source_kind } => TurnCapabilityKind::Skill {
-                    slug: slug.clone(),
-                    source_kind: source_kind.clone(),
-                },
-                ComposerCapabilityKind::McpServer { name, scope_kind } => {
-                    TurnCapabilityKind::McpServer {
-                        name: name.clone(),
-                        scope_kind: *scope_kind,
-                    }
-                }
-                ComposerCapabilityKind::McpTool {
-                    server_name,
-                    raw_tool_name,
-                    scope_kind,
-                } => TurnCapabilityKind::McpTool {
-                    server_name: server_name.clone(),
-                    raw_tool_name: raw_tool_name.clone(),
-                    scope_kind: *scope_kind,
-                },
-            },
-            label: (!self.label.trim().is_empty()).then(|| self.label.clone()),
-        }
-    }
-}
-
-impl ComposerCapabilityKind {
-    pub(super) fn key(&self) -> String {
-        match self {
-            Self::Skill { slug, source_kind } => format!("skill:{source_kind}:{slug}"),
-            Self::McpServer { name, scope_kind } => {
-                format!("mcp-server:{}:{name}", scope_kind.as_str())
-            }
-            Self::McpTool {
-                server_name,
-                raw_tool_name,
-                scope_kind,
-            } => format!(
-                "mcp-tool:{}:{server_name}:{raw_tool_name}",
-                scope_kind.as_str()
-            ),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub(super) struct TurnTimelineRefreshState {
-    pub(super) in_flight: bool,
-    pub(super) dirty: bool,
-    pub(super) next_generation: u64,
-    pub(super) in_flight_generation: u64,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) enum ThreadArtifactFilter {
-    #[default]
-    All,
-    Uploaded,
-    Generated,
-    TaskOutput,
-    Images,
-    Documents,
-}
-
-#[derive(Clone, Debug, Default)]
-pub(super) struct ThreadArtifactCacheEntry {
-    pub(super) items: Vec<ArtifactSummary>,
-    pub(super) loaded: bool,
-    pub(super) error: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(super) struct ThreadArtifactVersionKey {
-    pub(super) artifact_id: String,
-    pub(super) version_id: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct ThreadArtifactLocalFile {
-    pub(super) path: PathBuf,
-    pub(super) sha256: String,
-    pub(super) size_bytes: Option<u64>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum ThreadArtifactActionStatus {
-    Queued,
-    Downloading,
-    Verifying,
-    Opening,
-    Revealing,
-    Failed(String),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct ThreadArtifactPreviewImagePaths {
-    pub(super) square_path: PathBuf,
-    pub(super) detail_path: PathBuf,
-}
-
-#[derive(Clone, Debug, Default)]
-pub(super) struct ThreadArtifactsState {
-    pub(super) active_thread_id: Option<String>,
-    pub(super) loading: bool,
-    pub(super) loading_thread_id: Option<String>,
-    pub(super) loading_thread_ids: HashSet<String>,
-    pub(super) refresh_requested_thread_ids: HashSet<String>,
-    pub(super) retry_after_by_thread: HashMap<String, Instant>,
-    pub(super) transient_retry_count_by_thread: HashMap<String, u8>,
-    pub(super) error: Option<String>,
-    pub(super) selected_artifact_id: Option<String>,
-    pub(super) filter: ThreadArtifactFilter,
-    pub(super) cache_by_thread: HashMap<String, ThreadArtifactCacheEntry>,
-    pub(super) local_files_by_artifact: HashMap<ThreadArtifactVersionKey, ThreadArtifactLocalFile>,
-    pub(super) action_status_by_artifact:
-        HashMap<ThreadArtifactVersionKey, ThreadArtifactActionStatus>,
-    pub(super) preview_image_path_by_artifact:
-        HashMap<ThreadArtifactVersionKey, ThreadArtifactPreviewImagePaths>,
-    pub(super) preview_loading_by_artifact: HashSet<ThreadArtifactVersionKey>,
-    pub(super) preview_failed_by_artifact: HashSet<ThreadArtifactVersionKey>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(super) enum ThreadAgentsDocSummaryKey {
-    Root,
-    Folder(String),
-}
-
-impl ThreadAgentsDocSummaryKey {
-    pub(super) fn from_folder_id(folder_id: Option<&str>) -> Self {
-        match folder_id {
-            Some(folder_id) => Self::Folder(folder_id.to_owned()),
-            None => Self::Root,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum ThreadAgentsDocEditorScope {
-    Root {
-        workspace_id: String,
-    },
-    Folder {
-        workspace_id: String,
-        folder_id: String,
-    },
-}
-
-impl ThreadAgentsDocEditorScope {
-    pub(super) fn folder_id(&self) -> Option<&str> {
-        match self {
-            Self::Root { .. } => None,
-            Self::Folder { folder_id, .. } => Some(folder_id.as_str()),
-        }
-    }
-
-    pub(super) fn workspace_id(&self) -> &str {
-        match self {
-            Self::Root { workspace_id } | Self::Folder { workspace_id, .. } => {
-                workspace_id.as_str()
-            }
-        }
-    }
-}
-
 pub struct PioneerDesktop {
     pub(super) thread_coordinators: HashMap<String, ThreadCoordinator>,
     pub(super) thread_folders: HashMap<String, ThreadFolder>,
@@ -473,10 +210,7 @@ pub struct PioneerDesktop {
     pub(super) composer_selected_model: Option<String>,
     pub(super) composer_model_selection_manually_selected: bool,
     pub(super) main_content_view: MainContentView,
-    pub(super) provider_configured_names: HashSet<String>,
-    pub(super) provider_filter: ProviderFilter,
-    pub(super) providers_loading: bool,
-    pub(super) providers_error: Option<String>,
+    pub(super) providers: ProviderListState,
     pub(super) mcp_servers: Vec<McpListItem>,
     pub(super) mcp_selected_server_id: Option<String>,
     pub(super) mcp_server_details: Option<McpServerDetailsResponse>,
@@ -513,8 +247,7 @@ pub struct PioneerDesktop {
     pub(super) thread_timeline_view_state: RefCell<ThreadTimelineViewState>,
     pub(super) thread_timeline_item_expanded: RefCell<HashSet<String>>,
     pub(super) thread_timeline_terminal_item: RefCell<HashMap<String, CachedTimelineTerminal>>,
-    pub(super) task_review_actions_in_flight: HashSet<String>,
-    pub(super) task_review_action_errors: HashMap<String, String>,
+    pub(super) task_review_actions: TaskReviewActionState,
     pub(super) thread_artifacts: ThreadArtifactsState,
     pub(super) show_thread_artifacts_sidebar: bool,
     pub(super) thread_artifacts_sidebar_width: Pixels,
@@ -525,62 +258,4 @@ pub struct PioneerDesktop {
     pub(super) gateway: GatewayCoordinator,
     pub(super) show_sidebar: bool,
     pub(super) sidebar_panel_width: Pixels,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{ComposerCapability, ComposerCapabilityKind};
-    use pioneer_protocol::{McpScopeKind, TurnCapabilityKind};
-
-    #[test]
-    fn composer_capability_key_is_canonical_by_kind() {
-        assert_eq!(
-            ComposerCapabilityKind::Skill {
-                slug: "imagegen".to_owned(),
-                source_kind: "user".to_owned(),
-            }
-            .key(),
-            "skill:user:imagegen"
-        );
-        assert_eq!(
-            ComposerCapabilityKind::McpServer {
-                name: "browser".to_owned(),
-                scope_kind: McpScopeKind::Workspace,
-            }
-            .key(),
-            "mcp-server:workspace:browser"
-        );
-        assert_eq!(
-            ComposerCapabilityKind::McpTool {
-                server_name: "browser".to_owned(),
-                raw_tool_name: "open".to_owned(),
-                scope_kind: McpScopeKind::Workspace,
-            }
-            .key(),
-            "mcp-tool:workspace:browser:open"
-        );
-    }
-
-    #[test]
-    fn composer_capability_converts_to_turn_capability_without_text_tokens() {
-        let capability = ComposerCapability {
-            id: "skill:user:imagegen".to_owned(),
-            label: "imagegen".to_owned(),
-            kind: ComposerCapabilityKind::Skill {
-                slug: "imagegen".to_owned(),
-                source_kind: "user".to_owned(),
-            },
-        };
-
-        let turn_capability = capability.to_turn_capability();
-        assert_eq!(turn_capability.id, "skill:user:imagegen");
-        assert_eq!(turn_capability.label.as_deref(), Some("imagegen"));
-        assert_eq!(
-            turn_capability.kind,
-            TurnCapabilityKind::Skill {
-                slug: "imagegen".to_owned(),
-                source_kind: "user".to_owned(),
-            }
-        );
-    }
 }

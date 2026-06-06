@@ -1,11 +1,16 @@
 use super::{
-    DesktopArtifactDownloadRequest, DesktopArtifactUploadRequest, GatewayWsClient,
-    GatewayWsConnectSpec, GatewayWsEvent, duration_to_millis_u64,
+    GatewayWsClient, GatewayWsConnectSpec, GatewayWsEvent, duration_to_millis_u64,
     encode_artifact_upload_chunk_frame, next_backoff, normalize_ws_url, process_text_payload,
 };
 use crate::gateway::timings::GatewayWsTimings;
-use crate::gateway::types::GatewayEndpointKind;
 use futures_util::{SinkExt, StreamExt};
+use pioneer_client::artifacts::download::ArtifactDownloadRequest;
+use pioneer_client::composer::{
+    attachments::{ComposerAttachment, ComposerAttachmentKind, ComposerAttachmentUploadState},
+    turn_prepare::PrepareComposerTurnRequest,
+};
+use pioneer_client::gateway::types::GatewayEndpointKind;
+use pioneer_client::rpc::PendingJsonRpcRequests;
 use pioneer_protocol::{
     GatewayNotification, TaskAcceptParams, TaskCancelParams, TaskCancelScope, TaskGetResponse,
     TaskReviseParams, TaskStatus, TaskWaitResponse, ThreadStartParams, ThreadUnsubscribeStatus,
@@ -108,7 +113,7 @@ fn next_backoff_doubles_until_max() {
 #[test]
 fn process_text_payload_maps_unknown_agent_notifications() {
     let (event_tx, event_rx) = mpsc::channel();
-    let mut pending_requests = HashMap::new();
+    let mut pending_requests = PendingJsonRpcRequests::default();
     let mut pending_upload_chunks = HashMap::new();
     let mut pending_artifact_upload_chunks = HashMap::new();
     let payload = json!({
@@ -157,7 +162,7 @@ fn process_text_payload_maps_unknown_agent_notifications() {
 #[test]
 fn phase_12_process_text_payload_decodes_waiting_review_task_item() {
     let (event_tx, event_rx) = mpsc::channel();
-    let mut pending_requests = HashMap::new();
+    let mut pending_requests = PendingJsonRpcRequests::default();
     let mut pending_upload_chunks = HashMap::new();
     let mut pending_artifact_upload_chunks = HashMap::new();
     let payload = json!({
@@ -343,7 +348,7 @@ fn phase_12_desktop_decodes_candidate_and_review_history_payload() {
 #[test]
 fn process_text_payload_maps_thread_updated_notifications() {
     let (event_tx, event_rx) = mpsc::channel();
-    let mut pending_requests = HashMap::new();
+    let mut pending_requests = PendingJsonRpcRequests::default();
     let mut pending_upload_chunks = HashMap::new();
     let mut pending_artifact_upload_chunks = HashMap::new();
     let payload = json!({
@@ -396,7 +401,7 @@ fn process_text_payload_maps_thread_updated_notifications() {
 #[test]
 fn process_text_payload_maps_workspace_changed_notifications() {
     let (event_tx, event_rx) = mpsc::channel();
-    let mut pending_requests = HashMap::new();
+    let mut pending_requests = PendingJsonRpcRequests::default();
     let mut pending_upload_chunks = HashMap::new();
     let mut pending_artifact_upload_chunks = HashMap::new();
     let payload = json!({
@@ -563,7 +568,7 @@ fn artifact_upload_chunk_sends_binary_frame_and_receives_ack() {
 #[test]
 fn artifact_upload_ack_routes_to_pending_sender() {
     let (event_tx, _event_rx) = mpsc::channel();
-    let mut pending_requests = HashMap::new();
+    let mut pending_requests = PendingJsonRpcRequests::default();
     let mut pending_upload_chunks = HashMap::new();
     let mut pending_artifact_upload_chunks = HashMap::new();
     let (ack_tx, ack_rx) = mpsc::channel();
@@ -600,7 +605,7 @@ fn artifact_upload_ack_routes_to_pending_sender() {
 }
 
 #[test]
-fn upload_artifact_file_uploads_small_fixture_and_returns_ref() {
+fn prepare_composer_turn_uploads_small_fixture_and_returns_artifact_input() {
     let mut server = TestWsServer::spawn("127.0.0.1:0");
     let client = GatewayWsClient::new();
     let sender = client.command_sender();
@@ -616,20 +621,31 @@ fn upload_artifact_file_uploads_small_fixture_and_returns_ref() {
     let _connection_id = sender
         .connect_and_wait(spec)
         .expect("expected connect_and_wait to succeed");
-    let artifact = sender
-        .upload_artifact_file(DesktopArtifactUploadRequest {
+    let prepared = sender
+        .prepare_composer_turn(PrepareComposerTurnRequest {
             workspace_id: TEST_WORKSPACE_ID.to_owned(),
-            thread_id: Some("thr_a".to_owned()),
-            planned_turn_id: Some("turn_a".to_owned()),
-            client_attachment_id: "client_attachment_1".to_owned(),
-            path: file_path,
-            mime_type: None,
+            thread_id: "thr_a".to_owned(),
+            turn_id: "turn_a".to_owned(),
+            endpoint_kind: Some(GatewayEndpointKind::Local),
+            text: "hello".to_owned(),
+            attachments: vec![ComposerAttachment {
+                path: file_path.to_string_lossy().to_string(),
+                file_name: "fixture.txt".to_owned(),
+                kind: ComposerAttachmentKind::File,
+                upload_state: ComposerAttachmentUploadState::Uploading,
+            }],
+            capabilities: Vec::new(),
         })
-        .expect("artifact file upload");
+        .expect("prepare composer turn");
 
+    let artifact = prepared.attachments[0]
+        .artifact
+        .as_ref()
+        .expect("uploaded artifact");
     assert_eq!(artifact.artifact_id, "artifact_upload_result");
     assert_eq!(artifact.display_name, "fixture.txt");
     assert_eq!(artifact.size_bytes, Some(5));
+    assert!(matches!(prepared.input[1], UserInput::Artifact { .. }));
 
     let _ = sender.shutdown();
     server.stop();
@@ -652,7 +668,7 @@ fn artifact_download_writes_verified_cache_file() {
         .expect("expected connect_and_wait to succeed");
     let result = sender
         .download_artifact_to_cache_with_runtime_home(
-            DesktopArtifactDownloadRequest {
+            ArtifactDownloadRequest {
                 gateway_profile_id: "remote/test".to_owned(),
                 workspace_id: TEST_WORKSPACE_ID.to_owned(),
                 artifact_id: "artifact_download_result".to_owned(),
@@ -672,6 +688,7 @@ fn artifact_download_writes_verified_cache_file() {
     assert!(
         !result
             .local_path
+            .as_path()
             .with_file_name("download.txt.part")
             .exists()
     );
@@ -697,7 +714,7 @@ fn artifact_download_interrupted_download_removes_part_file() {
         .expect("expected connect_and_wait to succeed");
     let error = sender
         .download_artifact_to_cache_with_runtime_home(
-            DesktopArtifactDownloadRequest {
+            ArtifactDownloadRequest {
                 gateway_profile_id: "remote/test".to_owned(),
                 workspace_id: TEST_WORKSPACE_ID.to_owned(),
                 artifact_id: "artifact_download_corrupt".to_owned(),

@@ -12,10 +12,8 @@ use gpui_component::{
     theme::{Theme, ThemeMode},
     tree::TreeItem,
 };
-use pioneer_protocol::{
-    GatewayGeneralSettings, GatewayGeneralSettingsUpdate, GatewayMemoryModelSelection,
-    GatewayMemorySettings, GatewaySettingsUpdate,
-};
+use pioneer_client::settings::{gateway as gateway_settings, memory as settings_memory};
+use pioneer_protocol::{GatewayMemoryModelSelection, GatewayMemorySettings, GatewaySettingsUpdate};
 use tracing::warn;
 
 impl PioneerDesktop {
@@ -85,21 +83,14 @@ impl PioneerDesktop {
         enabled: bool,
         cx: &mut Context<Self>,
     ) {
-        let Some(mut memory) = self.current_gateway_memory_settings() else {
+        let Some(memory) = self.current_gateway_memory_settings() else {
             self.refresh_gateway_settings(cx);
             return;
         };
-        match toggle {
-            MemorySettingToggle::Enabled => memory.enabled = enabled,
-            MemorySettingToggle::ActiveRecall => memory.active_recall_enabled = enabled,
-            MemorySettingToggle::ProactiveWrites => memory.proactive_writes_enabled = enabled,
-            MemorySettingToggle::BackgroundExtraction => {
-                memory.background_extraction_enabled = enabled
-            }
-            MemorySettingToggle::DebugTrace => memory.debug_trace_enabled = enabled,
-        }
-
-        self.apply_gateway_memory_settings(memory, cx);
+        self.apply_gateway_memory_settings(
+            settings_memory::memory_settings_with_toggle(memory, toggle, enabled),
+            cx,
+        );
     }
 
     pub(in crate::app) fn apply_keepawake_setting(
@@ -107,23 +98,14 @@ impl PioneerDesktop {
         enabled: bool,
         cx: &mut Context<Self>,
     ) {
-        let Some(mut snapshot) = self.gateway.settings.clone() else {
+        let Some(plan) =
+            gateway_settings::keepawake_update_plan(self.gateway.settings.as_ref(), enabled)
+        else {
             self.refresh_gateway_settings(cx);
             return;
         };
 
-        snapshot.general.keepawake = enabled;
-        self.apply_gateway_settings_update(
-            snapshot,
-            GatewaySettingsUpdate {
-                general: Some(GatewayGeneralSettingsUpdate {
-                    keepawake: Some(enabled),
-                    preflight_model: None,
-                }),
-                memory: None,
-            },
-            cx,
-        );
+        self.apply_gateway_settings_update(plan.snapshot, plan.update, cx);
     }
 
     pub(super) fn apply_memory_model_setting(
@@ -132,17 +114,14 @@ impl PioneerDesktop {
         model_selection: GatewayMemoryModelSelection,
         cx: &mut Context<Self>,
     ) {
-        let Some(mut memory) = self.current_gateway_memory_settings() else {
+        let Some(memory) = self.current_gateway_memory_settings() else {
             self.refresh_gateway_settings(cx);
             return;
         };
-        match setting {
-            MemoryModelSetting::PostTurnExtractor => {
-                memory.proactive_writes_model = model_selection
-            }
-        }
-
-        self.apply_gateway_memory_settings(memory, cx);
+        self.apply_gateway_memory_settings(
+            settings_memory::memory_settings_with_model_selection(memory, setting, model_selection),
+            cx,
+        );
     }
 
     pub(super) fn apply_preflight_model_setting(
@@ -150,45 +129,45 @@ impl PioneerDesktop {
         model_selection: GatewayMemoryModelSelection,
         cx: &mut Context<Self>,
     ) {
-        let Some(mut snapshot) = self.gateway.settings.clone() else {
+        let Some(plan) = gateway_settings::preflight_model_update_plan(
+            self.gateway.settings.as_ref(),
+            model_selection,
+        ) else {
             self.refresh_gateway_settings(cx);
             return;
         };
 
-        snapshot.general.preflight_model = model_selection.clone();
-        self.apply_gateway_settings_update(
-            snapshot,
-            GatewaySettingsUpdate {
-                general: Some(GatewayGeneralSettingsUpdate {
-                    keepawake: None,
-                    preflight_model: Some(model_selection),
-                }),
-                memory: None,
-            },
-            cx,
-        );
+        self.apply_gateway_settings_update(plan.snapshot, plan.update, cx);
     }
 
     pub(in crate::app) fn refresh_gateway_settings(&mut self, cx: &mut Context<Self>) {
-        if self.gateway.settings_loading {
+        if !gateway_settings::should_start_gateway_settings_refresh(self.gateway.settings_loading) {
             return;
         }
         if self.gateway.connection_state != GatewayConnectionState::Connected {
-            self.gateway.settings = None;
-            self.gateway.settings_loading = false;
-            self.gateway.settings_error = Some("Gateway is not connected".to_owned());
+            gateway_settings::apply_gateway_settings_unavailable(
+                &mut self.gateway.settings,
+                &mut self.gateway.settings_loading,
+                &mut self.gateway.settings_error,
+                "Gateway is not connected",
+            );
             return;
         }
         let Some(connection_id) = self.gateway.ws_connection_id else {
-            self.gateway.settings = None;
-            self.gateway.settings_loading = false;
-            self.gateway.settings_error = Some("Gateway is not connected".to_owned());
+            gateway_settings::apply_gateway_settings_unavailable(
+                &mut self.gateway.settings,
+                &mut self.gateway.settings_loading,
+                &mut self.gateway.settings_error,
+                "Gateway is not connected",
+            );
             return;
         };
         let connection_epoch = self.gateway.connection_epoch;
 
-        self.gateway.settings_loading = true;
-        self.gateway.settings_error = None;
+        gateway_settings::begin_gateway_settings_refresh(
+            &mut self.gateway.settings_loading,
+            &mut self.gateway.settings_error,
+        );
 
         let ws_sender = self.gateway.ws_command_sender.clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -199,20 +178,30 @@ impl PioneerDesktop {
                     .await;
 
                 let _ = this.update(&mut cx, |view, cx| {
-                    if view.gateway.ws_connection_id != Some(connection_id)
-                        || view.gateway.connection_epoch != connection_epoch
-                    {
+                    if !gateway_settings::settings_action_matches_connection(
+                        connection_id,
+                        connection_epoch,
+                        view.gateway.ws_connection_id,
+                        view.gateway.connection_epoch,
+                    ) {
                         return;
                     }
 
-                    view.gateway.settings_loading = false;
                     match result {
                         Ok(response) => {
-                            view.gateway.settings = Some(response.settings);
-                            view.gateway.settings_error = None;
+                            gateway_settings::apply_gateway_settings_get_response(
+                                &mut view.gateway.settings,
+                                &mut view.gateway.settings_loading,
+                                &mut view.gateway.settings_error,
+                                response,
+                            );
                         }
                         Err(error) => {
-                            view.gateway.settings_error = Some(format!("{error:#}"));
+                            gateway_settings::apply_gateway_settings_get_error(
+                                &mut view.gateway.settings_loading,
+                                &mut view.gateway.settings_error,
+                                format!("{error:#}"),
+                            );
                             warn!(
                                 error = %format!("{error:#}"),
                                 "failed to fetch gateway settings"
@@ -227,10 +216,7 @@ impl PioneerDesktop {
     }
 
     fn current_gateway_memory_settings(&self) -> Option<GatewayMemorySettings> {
-        self.gateway
-            .settings
-            .as_ref()
-            .map(|settings| settings.memory.clone())
+        settings_memory::current_gateway_memory_settings(self.gateway.settings.as_ref())
     }
 
     fn apply_gateway_memory_settings(
@@ -238,19 +224,13 @@ impl PioneerDesktop {
         memory: GatewayMemorySettings,
         cx: &mut Context<Self>,
     ) {
-        let mut snapshot = self.gateway.settings.clone().unwrap_or_else(|| {
-            pioneer_protocol::GatewaySettingsSnapshot {
-                general: GatewayGeneralSettings::default(),
-                memory: GatewayMemorySettings::default(),
-            }
-        });
-        snapshot.memory = memory.clone();
+        let snapshot = settings_memory::gateway_settings_snapshot_with_memory(
+            self.gateway.settings.as_ref(),
+            memory.clone(),
+        );
         self.apply_gateway_settings_update(
             snapshot,
-            GatewaySettingsUpdate {
-                general: None,
-                memory: Some(memory),
-            },
+            settings_memory::gateway_settings_update_for_memory(memory),
             cx,
         );
     }
@@ -267,8 +247,11 @@ impl PioneerDesktop {
         };
         let connection_epoch = self.gateway.connection_epoch;
 
-        self.gateway.settings = Some(snapshot);
-        self.gateway.settings_error = None;
+        gateway_settings::apply_optimistic_gateway_settings_update(
+            &mut self.gateway.settings,
+            &mut self.gateway.settings_error,
+            snapshot,
+        );
 
         let ws_sender = self.gateway.ws_command_sender.clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -279,19 +262,28 @@ impl PioneerDesktop {
                     .await;
 
                 let _ = this.update(&mut cx, |view, cx| {
-                    if view.gateway.ws_connection_id != Some(connection_id)
-                        || view.gateway.connection_epoch != connection_epoch
-                    {
+                    if !gateway_settings::settings_action_matches_connection(
+                        connection_id,
+                        connection_epoch,
+                        view.gateway.ws_connection_id,
+                        view.gateway.connection_epoch,
+                    ) {
                         return;
                     }
 
                     match result {
                         Ok(response) => {
-                            view.gateway.settings = Some(response.settings);
-                            view.gateway.settings_error = None;
+                            gateway_settings::apply_gateway_settings_update_response(
+                                &mut view.gateway.settings,
+                                &mut view.gateway.settings_error,
+                                response,
+                            );
                         }
                         Err(error) => {
-                            view.gateway.settings_error = Some(format!("{error:#}"));
+                            gateway_settings::apply_gateway_settings_update_error(
+                                &mut view.gateway.settings_error,
+                                format!("{error:#}"),
+                            );
                             warn!(
                                 error = %format!("{error:#}"),
                                 "failed to update gateway settings"
@@ -326,10 +318,9 @@ mod tests {
             .next()
             .expect("preflight setting function body exists");
 
-        assert!(preflight_fn.contains("snapshot.general.preflight_model"));
-        assert!(preflight_fn.contains("general: Some(GatewayGeneralSettingsUpdate"));
-        assert!(preflight_fn.contains("preflight_model: Some(model_selection)"));
-        assert!(preflight_fn.contains("memory: None"));
+        assert!(preflight_fn.contains("gateway_settings::preflight_model_update_plan"));
+        assert!(preflight_fn.contains("self.apply_gateway_settings_update"));
+        assert!(!preflight_fn.contains("settings_memory::gateway_settings_update_for_memory"));
     }
 
     #[test]
@@ -343,8 +334,8 @@ mod tests {
             .next()
             .expect("memory model setting function body exists");
 
-        assert!(memory_model_fn.contains("MemoryModelSetting::PostTurnExtractor"));
-        assert!(memory_model_fn.contains("memory.proactive_writes_model"));
+        assert!(memory_model_fn.contains("settings_memory::memory_settings_with_model_selection"));
+        assert!(memory_model_fn.contains("self.apply_gateway_memory_settings"));
         assert!(!memory_model_fn.contains("preflight_model"));
         assert!(!memory_model_fn.contains("ActiveRecall"));
     }

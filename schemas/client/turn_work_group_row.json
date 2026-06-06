@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnWorkGroupRow",
+  "type": "object",
+  "properties": {
+    "anchor_entry_id": {
+      "type": "string"
+    },
+    "elapsed_ms": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    },
+    "is_open": {
+      "type": "boolean"
+    },
+    "toggle_key": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "toggle_key",
+    "anchor_entry_id",
+    "is_open"
+  ]
+}

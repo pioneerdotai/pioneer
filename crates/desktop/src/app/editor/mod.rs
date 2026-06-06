@@ -1,4 +1,3 @@
-mod autosave;
 mod content;
 mod root_actions;
 mod state;

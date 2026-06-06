@@ -1,8 +1,7 @@
 use crate::app::{
     root::PioneerDesktop,
     skills::details::table::{
-        SkillDiagnosticsTableCell, SkillDiagnosticsTableColumn, SkillDiagnosticsTableDelegate,
-        SkillDiagnosticsTableModel, SkillDiagnosticsTableRow, SkillDiagnosticsTone,
+        SkillDiagnosticsTableColumn, SkillDiagnosticsTableDelegate, SkillDiagnosticsTableModel,
     },
 };
 use chrono::{Local, TimeZone};
@@ -15,6 +14,10 @@ use gpui_component::{
     table::{Table, TableState},
     theme::ActiveTheme,
     *,
+};
+use pioneer_client::skills::{
+    catalog as skill_catalog, health as skill_health, presentation as skill_presentation,
+    presentation::{SkillDiagnosticsTableCell, SkillDiagnosticsTableRow, SkillDiagnosticsTone},
 };
 use pioneer_protocol::{
     SkillAuditTimelineItem, SkillDependencyDiagnostic, SkillSecurityFinding, SkillTrustGateStatus,
@@ -42,12 +45,12 @@ impl PioneerDesktop {
                 .into_any_element();
         };
 
-        let Some(skill) = self
-            .installed_skills
-            .iter()
-            .find(|skill| skill.slug == slug && skill.source_kind == source_kind)
-            .cloned()
-        else {
+        let Some(skill) = skill_catalog::find_skill(
+            self.installed_skills.as_slice(),
+            slug.as_str(),
+            source_kind.as_str(),
+        )
+        .cloned() else {
             return v_flex()
                 .size_full()
                 .bg(cx.theme().background)
@@ -62,48 +65,30 @@ impl PioneerDesktop {
                 .into_any_element();
         };
 
-        let key = Self::skill_key(skill.slug.as_str(), skill.source_kind.as_str());
-        let health_detail = self.skills_health_details.get(key.as_str()).cloned();
+        let health_detail = skill_health::skill_health_detail(
+            &self.skills_health_details,
+            skill.slug.as_str(),
+            skill.source_kind.as_str(),
+        )
+        .cloned();
         let is_pending = self.is_skill_pending(skill.slug.as_str(), skill.source_kind.as_str());
         let desktop_entity = cx.entity().clone();
-        let version_label = skill
+        let skill_summary = skill_presentation::skill_summary_presentation(&skill);
+        let version_label = skill_summary
             .version
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or("-")
-            .to_owned();
+            .clone()
+            .unwrap_or_else(|| "-".to_owned());
         let source_label = Self::source_label(skill.source_kind.as_str());
         let trust_label = Self::trust_label(skill.trust_level.as_str());
         let status_label = Self::status_label(skill.status.as_str());
-        let fingerprint_short = Self::short_fingerprint(skill.fingerprint.as_str());
+        let fingerprint_short = skill_summary.fingerprint_short.clone();
         let status_color = Self::status_color(skill.status.as_str(), cx);
-        let (owner, _slug_label) = Self::split_skill_slug_for_view(skill.slug.as_str());
+        let owner = skill_summary.slug.owner.as_deref();
         let meta_grid_columns = self.skill_details_meta_grid_columns(window);
         let diagnostics_grid_columns = self.skill_details_diagnostics_grid_columns(window);
-        let dependency_diagnostics = if let Some(health) = health_detail.as_ref() {
-            health.dependency_diagnostics.clone()
-        } else {
-            skill.health.dependency_failures.clone()
-        };
-        let security_findings = if let Some(health) = health_detail.as_ref() {
-            health.security_findings.clone()
-        } else {
-            skill.health.security_blocks.clone()
-        };
-        let validation_issues = if let Some(health) = health_detail.as_ref() {
-            health.validation_issues.clone()
-        } else {
-            skill.health.validation_issues.clone()
-        };
-        let trust_gate = health_detail
-            .as_ref()
-            .map(|health| health.trust_gate.clone())
-            .unwrap_or_default();
-        let recent_audit = health_detail
-            .as_ref()
-            .map(|health| health.recent_audit.clone())
-            .unwrap_or_default();
-        self.sync_skill_diagnostics_tables(recent_audit.as_slice(), cx);
+        let detail_diagnostics =
+            skill_presentation::skill_detail_diagnostics(&skill, health_detail.as_ref());
+        self.sync_skill_diagnostics_tables(detail_diagnostics.recent_audit.as_slice(), cx);
 
         v_flex()
             .size_full()
@@ -301,23 +286,34 @@ impl PioneerDesktop {
                             )),
                     )
                     .child(Divider::horizontal())
-                    .child(self.render_validation_section(validation_issues.as_slice(), cx))
+                    .child(self.render_validation_section(
+                        detail_diagnostics.validation_issues.as_slice(),
+                        cx,
+                    ))
                     .child(Divider::horizontal())
                     .child(self.render_dependency_section(
-                        dependency_diagnostics.as_slice(),
+                        detail_diagnostics.dependency_diagnostics.as_slice(),
                         diagnostics_grid_columns,
                         cx,
                     ))
                     .child(Divider::horizontal())
                     .child(self.render_security_section(
-                        security_findings.as_slice(),
+                        detail_diagnostics.security_findings.as_slice(),
                         diagnostics_grid_columns,
                         cx,
                     ))
                     .child(Divider::horizontal())
-                    .child(self.render_trust_gate_section(trust_gate.as_slice(), cx))
+                    .child(
+                        self.render_trust_gate_section(
+                            detail_diagnostics.trust_gate.as_slice(),
+                            cx,
+                        ),
+                    )
                     .child(Divider::horizontal())
-                    .child(self.render_recent_audit_section(recent_audit.as_slice(), cx)),
+                    .child(self.render_recent_audit_section(
+                        detail_diagnostics.recent_audit.as_slice(),
+                        cx,
+                    )),
             )
             .into_any_element()
     }
@@ -491,33 +487,30 @@ impl PioneerDesktop {
         issues: &[SkillValidationDiagnostic],
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let subtitle = if issues.is_empty() {
+        let rows = skill_presentation::skill_validation_rows(issues);
+        let subtitle = if rows.is_empty() {
             t!("skills.diagnostics.empty_validation").to_string()
         } else {
-            format!("{} {}", t!("skills.screen.installed_count"), issues.len())
+            format!("{} {}", t!("skills.screen.installed_count"), rows.len())
         };
 
-        let content = if issues.is_empty() {
+        let content = if rows.is_empty() {
             None
         } else {
             Some(
                 v_flex()
                     .gap_4()
-                    .children(issues.iter().map(|issue| {
-                        let path = issue
-                            .field_path
-                            .as_deref()
-                            .filter(|value| !value.trim().is_empty())
-                            .unwrap_or("-");
+                    .children(rows.iter().map(|row| {
+                        let path = row.field_path.as_deref().unwrap_or("-");
                         v_flex()
                             .gap_0p5()
                             .child(
                                 div()
                                     .text_xs()
                                     .opacity(0.8)
-                                    .child(format!("{} ({}) | {}", issue.code, issue.level, path)),
+                                    .child(format!("{} ({}) | {}", row.code, row.level, path)),
                             )
-                            .child(div().text_xs().opacity(0.6).child(issue.message.clone()))
+                            .child(div().text_xs().opacity(0.6).child(row.message.clone()))
                     }))
                     .into_any_element(),
             )
@@ -547,7 +540,7 @@ impl PioneerDesktop {
         let content = if diagnostics.is_empty() {
             None
         } else {
-            let cards = diagnostics
+            let cards = skill_presentation::skill_dependency_cards(diagnostics)
                 .iter()
                 .enumerate()
                 .map(|(card_ix, item)| Self::render_dependency_card(item, card_ix, cx))
@@ -588,7 +581,7 @@ impl PioneerDesktop {
         let content = if findings.is_empty() {
             None
         } else {
-            let cards = findings
+            let cards = skill_presentation::skill_security_cards(findings)
                 .iter()
                 .enumerate()
                 .map(|(card_ix, item)| Self::render_security_card(item, card_ix, cx))
@@ -628,7 +621,7 @@ impl PioneerDesktop {
         let content = if trust_gate.is_empty() {
             None
         } else {
-            let cards = trust_gate
+            let cards = skill_presentation::skill_trust_gate_cards(trust_gate)
                 .iter()
                 .enumerate()
                 .map(|(card_ix, item)| Self::render_trust_gate_card(item, card_ix, cx))
@@ -655,23 +648,23 @@ impl PioneerDesktop {
     }
 
     fn render_dependency_card(
-        item: &SkillDependencyDiagnostic,
+        item: &skill_presentation::SkillDependencyCard,
         card_ix: usize,
         cx: &mut App,
     ) -> AnyElement {
         let scope = format!("dep-{card_ix}");
-        let requirement_title = Self::dependency_kind_label(item.kind.as_str());
-        let requirement_value = if item.name.trim().is_empty() {
-            t!("skills.diagnostics.none").to_string()
+        let requirement_title = Self::dependency_kind_label(&item.kind);
+        let requirement_value = if let Some(name) = item.requirement_name.as_ref() {
+            name.clone()
         } else {
-            item.name.trim().to_owned()
+            t!("skills.diagnostics.none").to_string()
         };
-        let status_label = Self::dependency_status_label(item.status.as_str());
-        let status_tone = Self::dependency_status_tone(item.status.as_str());
-        let action = if item.hint.trim().is_empty() {
-            t!("skills.diagnostics.none").to_string()
+        let status_label = Self::dependency_status_label(item.status);
+        let status_tone = skill_presentation::skill_dependency_status_tone(item.status);
+        let action = if let Some(hint) = item.action_hint.as_ref() {
+            hint.clone()
         } else {
-            item.hint.trim().to_owned()
+            t!("skills.diagnostics.none").to_string()
         };
 
         v_flex()
@@ -716,27 +709,26 @@ impl PioneerDesktop {
     }
 
     fn render_security_card(
-        item: &SkillSecurityFinding,
+        item: &skill_presentation::SkillSecurityCard,
         card_ix: usize,
         cx: &mut App,
     ) -> AnyElement {
         let scope = format!("sec-{card_ix}");
-        let severity_label = Self::security_severity_label(item.severity.as_str());
-        let severity_tone = Self::security_severity_tone(item.severity.as_str());
-        let rule_label = if item.rule_id.trim().is_empty() {
-            t!("skills.diagnostics.none").to_string()
+        let severity_label = Self::security_severity_label(&item.severity);
+        let severity_tone = item.severity_tone;
+        let rule_label = if let Some(rule_id) = item.rule_id.as_ref() {
+            rule_id.clone()
         } else {
-            item.rule_id.trim().to_owned()
+            t!("skills.diagnostics.none").to_string()
         };
-        let message = if item.message.trim().is_empty() {
-            t!("skills.diagnostics.none").to_string()
+        let message = if let Some(message) = item.message.as_ref() {
+            message.clone()
         } else {
-            item.message.trim().to_owned()
+            t!("skills.diagnostics.none").to_string()
         };
         let location = item
-            .path
+            .location
             .as_deref()
-            .filter(|value| !value.trim().is_empty())
             .map(str::to_owned)
             .unwrap_or_else(|| t!("skills.diagnostics.security_location_unknown").to_string());
 
@@ -792,16 +784,16 @@ impl PioneerDesktop {
     }
 
     fn render_trust_gate_card(
-        item: &SkillTrustGateStatus,
+        item: &skill_presentation::SkillTrustGateCard,
         card_ix: usize,
         cx: &mut App,
     ) -> AnyElement {
         let scope = format!("trust-{card_ix}");
-        let tool_label = Self::trust_gate_tool_label(item.tool_kind.as_str());
-        let min_trust_label = Self::trust_level_label(item.minimum_trust.as_str());
-        let decision_label = Self::trust_gate_decision_label(item.allowed);
-        let decision_tone = Self::trust_gate_decision_tone(item.allowed);
-        let explanation = if item.allowed {
+        let tool_label = Self::trust_gate_tool_label(&item.tool_kind);
+        let min_trust_label = Self::diagnostics_trust_level_label(&item.minimum_trust);
+        let decision_label = Self::trust_gate_decision_label(item.decision);
+        let decision_tone = item.decision_tone;
+        let explanation = if item.decision == skill_presentation::SkillTrustGateDecision::Allowed {
             t!("skills.diagnostics.trust_explanation_allowed").to_string()
         } else {
             format!(
@@ -1134,31 +1126,27 @@ impl PioneerDesktop {
             },
         ];
 
-        let rows = audit
+        let rows = skill_presentation::skill_audit_rows(audit, 8)
             .iter()
-            .take(8)
             .map(|item| {
                 let event_time = Self::format_skill_audit_time(item.created_at);
-                let action = Self::audit_action_label(item.action.as_str());
-                let decision = Self::audit_decision_label(item.decision.as_str());
-                let reason = item
+                let action = Self::audit_action_label(&item.action);
+                let decision = Self::audit_decision_label(item.decision);
+                let reason_label = item
                     .reason_code
-                    .as_deref()
-                    .filter(|value| !value.trim().is_empty())
-                    .map(str::to_owned)
+                    .clone()
                     .unwrap_or_else(|| t!("skills.diagnostics.audit_reason_none").to_string());
-                let details_summary = Self::summarize_audit_details(item.details_json.as_str());
-                let no_reason = t!("skills.diagnostics.audit_reason_none").to_string();
-                let details = if reason == no_reason {
+                let details_summary = Self::audit_details_summary_label(&item.details_summary);
+                let details = if item.reason_code.is_none() {
                     details_summary.clone()
                 } else {
-                    format!("{reason} | {details_summary}")
+                    format!("{reason_label} | {details_summary}")
                 };
                 let details_tooltip = format!(
                     "{}\n{} {}",
                     details_summary,
                     t!("skills.diagnostics.reason"),
-                    reason
+                    reason_label
                 );
 
                 SkillDiagnosticsTableRow {
@@ -1176,7 +1164,7 @@ impl PioneerDesktop {
                         SkillDiagnosticsTableCell {
                             text: decision.clone(),
                             tooltip: Some(decision),
-                            tone: Self::audit_decision_tone(item.decision.as_str()),
+                            tone: item.decision_tone,
                         },
                         SkillDiagnosticsTableCell {
                             text: details.clone(),
@@ -1211,128 +1199,169 @@ impl PioneerDesktop {
         hasher.finish()
     }
 
-    fn dependency_kind_label(kind: &str) -> String {
-        match kind.trim() {
-            "bin" => t!("skills.diagnostics.dependencies_kind_bin").to_string(),
-            "env" => t!("skills.diagnostics.dependencies_kind_env").to_string(),
-            "api_key" => t!("skills.diagnostics.dependencies_kind_api_key").to_string(),
-            "command" => t!("skills.diagnostics.dependencies_kind_command").to_string(),
-            "mcp" => t!("skills.diagnostics.dependencies_kind_mcp").to_string(),
-            "tool" => t!("skills.diagnostics.dependencies_kind_tool").to_string(),
-            other if !other.is_empty() => other.to_owned(),
-            _ => t!("skills.diagnostics.dependencies_kind_tool").to_string(),
+    fn dependency_kind_label(kind: &skill_presentation::SkillDependencyKind) -> String {
+        match kind {
+            skill_presentation::SkillDependencyKind::Bin => {
+                t!("skills.diagnostics.dependencies_kind_bin").to_string()
+            }
+            skill_presentation::SkillDependencyKind::Env => {
+                t!("skills.diagnostics.dependencies_kind_env").to_string()
+            }
+            skill_presentation::SkillDependencyKind::ApiKey => {
+                t!("skills.diagnostics.dependencies_kind_api_key").to_string()
+            }
+            skill_presentation::SkillDependencyKind::Command => {
+                t!("skills.diagnostics.dependencies_kind_command").to_string()
+            }
+            skill_presentation::SkillDependencyKind::Mcp => {
+                t!("skills.diagnostics.dependencies_kind_mcp").to_string()
+            }
+            skill_presentation::SkillDependencyKind::Tool => {
+                t!("skills.diagnostics.dependencies_kind_tool").to_string()
+            }
+            skill_presentation::SkillDependencyKind::Other(value) => value.clone(),
         }
     }
 
-    fn dependency_status_label(status: &str) -> String {
-        match status.trim() {
-            "satisfied" | "ok" | "available" => {
+    fn dependency_status_label(status: skill_presentation::SkillDependencyStatus) -> String {
+        match status {
+            skill_presentation::SkillDependencyStatus::Ready => {
                 t!("skills.diagnostics.dependencies_status_ready").to_string()
             }
-            "missing" => t!("skills.diagnostics.dependencies_status_missing").to_string(),
-            "blocked" => t!("skills.diagnostics.dependencies_status_blocked").to_string(),
-            "warning" => t!("skills.diagnostics.dependencies_status_warning").to_string(),
-            _ => t!("skills.diagnostics.dependencies_status_unknown").to_string(),
+            skill_presentation::SkillDependencyStatus::Missing => {
+                t!("skills.diagnostics.dependencies_status_missing").to_string()
+            }
+            skill_presentation::SkillDependencyStatus::Blocked => {
+                t!("skills.diagnostics.dependencies_status_blocked").to_string()
+            }
+            skill_presentation::SkillDependencyStatus::Warning => {
+                t!("skills.diagnostics.dependencies_status_warning").to_string()
+            }
+            skill_presentation::SkillDependencyStatus::Unknown => {
+                t!("skills.diagnostics.dependencies_status_unknown").to_string()
+            }
         }
     }
 
-    fn dependency_status_tone(status: &str) -> SkillDiagnosticsTone {
-        match status.trim() {
-            "satisfied" | "ok" | "available" => SkillDiagnosticsTone::Success,
-            "missing" | "blocked" => SkillDiagnosticsTone::Danger,
-            "warning" => SkillDiagnosticsTone::Warning,
-            _ => SkillDiagnosticsTone::Muted,
+    fn security_severity_label(severity: &skill_presentation::SkillSecuritySeverity) -> String {
+        match severity {
+            skill_presentation::SkillSecuritySeverity::Critical => {
+                t!("skills.diagnostics.security_severity_critical").to_string()
+            }
+            skill_presentation::SkillSecuritySeverity::High => {
+                t!("skills.diagnostics.security_severity_high").to_string()
+            }
+            skill_presentation::SkillSecuritySeverity::Medium => {
+                t!("skills.diagnostics.security_severity_medium").to_string()
+            }
+            skill_presentation::SkillSecuritySeverity::Low => {
+                t!("skills.diagnostics.security_severity_low").to_string()
+            }
+            skill_presentation::SkillSecuritySeverity::Info => {
+                t!("skills.diagnostics.security_severity_info").to_string()
+            }
+            skill_presentation::SkillSecuritySeverity::Other(value) => value.clone(),
+            skill_presentation::SkillSecuritySeverity::None => {
+                t!("skills.diagnostics.none").to_string()
+            }
         }
     }
 
-    fn security_severity_label(severity: &str) -> String {
-        match severity.trim().to_lowercase().as_str() {
-            "critical" => t!("skills.diagnostics.security_severity_critical").to_string(),
-            "high" => t!("skills.diagnostics.security_severity_high").to_string(),
-            "medium" => t!("skills.diagnostics.security_severity_medium").to_string(),
-            "low" => t!("skills.diagnostics.security_severity_low").to_string(),
-            "info" | "informational" => t!("skills.diagnostics.security_severity_info").to_string(),
-            other if !other.is_empty() => other.to_owned(),
-            _ => t!("skills.diagnostics.none").to_string(),
+    fn trust_gate_tool_label(tool_kind: &skill_presentation::SkillTrustGateToolKind) -> String {
+        match tool_kind {
+            skill_presentation::SkillTrustGateToolKind::Shell => {
+                t!("skills.diagnostics.trust_tool_shell").to_string()
+            }
+            skill_presentation::SkillTrustGateToolKind::Http => {
+                t!("skills.diagnostics.trust_tool_http").to_string()
+            }
+            skill_presentation::SkillTrustGateToolKind::FunctionProxy => {
+                t!("skills.diagnostics.trust_tool_function_proxy").to_string()
+            }
+            skill_presentation::SkillTrustGateToolKind::Mcp => {
+                t!("skills.diagnostics.trust_tool_mcp").to_string()
+            }
+            skill_presentation::SkillTrustGateToolKind::Other(value) => value.clone(),
+            skill_presentation::SkillTrustGateToolKind::None => {
+                t!("skills.diagnostics.none").to_string()
+            }
         }
     }
 
-    fn security_severity_tone(severity: &str) -> SkillDiagnosticsTone {
-        match severity.trim().to_lowercase().as_str() {
-            "critical" | "high" => SkillDiagnosticsTone::Danger,
-            "medium" => SkillDiagnosticsTone::Warning,
-            "low" | "info" | "informational" => SkillDiagnosticsTone::Muted,
-            _ => SkillDiagnosticsTone::Muted,
+    fn diagnostics_trust_level_label(trust_level: &skill_presentation::SkillTrustLevel) -> String {
+        match trust_level {
+            skill_presentation::SkillTrustLevel::Internal => {
+                t!("skills.trust.internal").to_string()
+            }
+            skill_presentation::SkillTrustLevel::Verified => {
+                t!("skills.trust.verified").to_string()
+            }
+            skill_presentation::SkillTrustLevel::Community => {
+                t!("skills.trust.community").to_string()
+            }
+            skill_presentation::SkillTrustLevel::Untrusted => {
+                t!("skills.trust.untrusted").to_string()
+            }
+            skill_presentation::SkillTrustLevel::Other(value) => value.clone(),
+            skill_presentation::SkillTrustLevel::None => t!("skills.diagnostics.none").to_string(),
         }
     }
 
-    fn trust_gate_tool_label(tool_kind: &str) -> String {
-        match tool_kind.trim() {
-            "shell" => t!("skills.diagnostics.trust_tool_shell").to_string(),
-            "http" => t!("skills.diagnostics.trust_tool_http").to_string(),
-            "function_proxy" => t!("skills.diagnostics.trust_tool_function_proxy").to_string(),
-            "mcp" => t!("skills.diagnostics.trust_tool_mcp").to_string(),
-            other if !other.is_empty() => other.to_owned(),
-            _ => t!("skills.diagnostics.none").to_string(),
+    fn trust_gate_decision_label(decision: skill_presentation::SkillTrustGateDecision) -> String {
+        match decision {
+            skill_presentation::SkillTrustGateDecision::Allowed => {
+                t!("skills.diagnostics.trust_decision_allowed").to_string()
+            }
+            skill_presentation::SkillTrustGateDecision::Blocked => {
+                t!("skills.diagnostics.trust_decision_blocked").to_string()
+            }
         }
     }
 
-    fn trust_level_label(trust_level: &str) -> String {
-        match trust_level.trim() {
-            "internal" => t!("skills.trust.internal").to_string(),
-            "verified" => t!("skills.trust.verified").to_string(),
-            "community" => t!("skills.trust.community").to_string(),
-            "untrusted" => t!("skills.trust.untrusted").to_string(),
-            other if !other.is_empty() => other.to_owned(),
-            _ => t!("skills.diagnostics.none").to_string(),
+    fn audit_action_label(action: &skill_presentation::SkillAuditAction) -> String {
+        match action {
+            skill_presentation::SkillAuditAction::Install => {
+                t!("skills.diagnostics.audit_action_install").to_string()
+            }
+            skill_presentation::SkillAuditAction::Update => {
+                t!("skills.diagnostics.audit_action_update").to_string()
+            }
+            skill_presentation::SkillAuditAction::Uninstall => {
+                t!("skills.diagnostics.audit_action_uninstall").to_string()
+            }
+            skill_presentation::SkillAuditAction::ResolveAllowed => {
+                t!("skills.diagnostics.audit_action_resolve_allowed").to_string()
+            }
+            skill_presentation::SkillAuditAction::ResolveBlocked => {
+                t!("skills.diagnostics.audit_action_resolve_blocked").to_string()
+            }
+            skill_presentation::SkillAuditAction::RuntimeAllowed => {
+                t!("skills.diagnostics.audit_action_runtime_allowed").to_string()
+            }
+            skill_presentation::SkillAuditAction::RuntimeBlocked => {
+                t!("skills.diagnostics.audit_action_runtime_blocked").to_string()
+            }
+            skill_presentation::SkillAuditAction::SecurityWarn => {
+                t!("skills.diagnostics.audit_action_security_warn").to_string()
+            }
+            skill_presentation::SkillAuditAction::None => t!("skills.diagnostics.none").to_string(),
         }
     }
 
-    fn trust_gate_decision_label(allowed: bool) -> String {
-        if allowed {
-            t!("skills.diagnostics.trust_decision_allowed").to_string()
-        } else {
-            t!("skills.diagnostics.trust_decision_blocked").to_string()
-        }
-    }
-
-    fn trust_gate_decision_tone(allowed: bool) -> SkillDiagnosticsTone {
-        if allowed {
-            SkillDiagnosticsTone::Success
-        } else {
-            SkillDiagnosticsTone::Danger
-        }
-    }
-
-    fn audit_action_label(action: &str) -> String {
-        match action.trim() {
-            "install" => t!("skills.diagnostics.audit_action_install").to_string(),
-            "update" => t!("skills.diagnostics.audit_action_update").to_string(),
-            "uninstall" => t!("skills.diagnostics.audit_action_uninstall").to_string(),
-            "resolve_allowed" => t!("skills.diagnostics.audit_action_resolve_allowed").to_string(),
-            "resolve_blocked" => t!("skills.diagnostics.audit_action_resolve_blocked").to_string(),
-            "runtime_allowed" => t!("skills.diagnostics.audit_action_runtime_allowed").to_string(),
-            "runtime_blocked" => t!("skills.diagnostics.audit_action_runtime_blocked").to_string(),
-            "security_warn" => t!("skills.diagnostics.audit_action_security_warn").to_string(),
-            _ => t!("skills.diagnostics.none").to_string(),
-        }
-    }
-
-    fn audit_decision_label(decision: &str) -> String {
-        match decision.trim() {
-            "allowed" => t!("skills.diagnostics.audit_decision_allowed").to_string(),
-            "blocked" => t!("skills.diagnostics.audit_decision_blocked").to_string(),
-            "warning" => t!("skills.diagnostics.audit_decision_warning").to_string(),
-            _ => t!("skills.diagnostics.none").to_string(),
-        }
-    }
-
-    fn audit_decision_tone(decision: &str) -> SkillDiagnosticsTone {
-        match decision.trim() {
-            "allowed" => SkillDiagnosticsTone::Success,
-            "blocked" => SkillDiagnosticsTone::Danger,
-            "warning" => SkillDiagnosticsTone::Warning,
-            _ => SkillDiagnosticsTone::Muted,
+    fn audit_decision_label(decision: skill_presentation::SkillAuditDecision) -> String {
+        match decision {
+            skill_presentation::SkillAuditDecision::Allowed => {
+                t!("skills.diagnostics.audit_decision_allowed").to_string()
+            }
+            skill_presentation::SkillAuditDecision::Blocked => {
+                t!("skills.diagnostics.audit_decision_blocked").to_string()
+            }
+            skill_presentation::SkillAuditDecision::Warning => {
+                t!("skills.diagnostics.audit_decision_warning").to_string()
+            }
+            skill_presentation::SkillAuditDecision::None => {
+                t!("skills.diagnostics.none").to_string()
+            }
         }
     }
 
@@ -1348,77 +1377,42 @@ impl PioneerDesktop {
             .unwrap_or_else(|| "-".to_owned())
     }
 
-    fn summarize_audit_details(details_json: &str) -> String {
-        let raw = details_json.trim();
-        if raw.is_empty() || raw == "{}" || raw == "null" {
-            return t!("skills.diagnostics.audit_details_empty").to_string();
+    fn audit_details_summary_label(
+        summary: &skill_presentation::SkillAuditDetailsSummary,
+    ) -> String {
+        match summary {
+            skill_presentation::SkillAuditDetailsSummary::Empty => {
+                t!("skills.diagnostics.audit_details_empty").to_string()
+            }
+            skill_presentation::SkillAuditDetailsSummary::Text(value) => value.clone(),
+            skill_presentation::SkillAuditDetailsSummary::ObjectPairs(pairs) => pairs
+                .iter()
+                .map(|(key, value)| format!("{key}: {}", Self::json_value_preview_label(value)))
+                .collect::<Vec<_>>()
+                .join(" | "),
+            skill_presentation::SkillAuditDetailsSummary::ArrayLen(len) => {
+                format!("{}: {}", t!("skills.diagnostics.audit_column_details"), len)
+            }
+            skill_presentation::SkillAuditDetailsSummary::Value(value) => {
+                Self::json_value_preview_label(value)
+            }
         }
+    }
 
-        let value: serde_json::Value = match serde_json::from_str(raw) {
-            Ok(value) => value,
-            Err(_) => return Self::truncate_for_table(raw, 96),
-        };
-
+    fn json_value_preview_label(value: &skill_presentation::SkillJsonValuePreview) -> String {
         match value {
-            serde_json::Value::Object(map) => {
-                if map.is_empty() {
-                    return t!("skills.diagnostics.audit_details_empty").to_string();
-                }
-
-                map.iter()
-                    .take(2)
-                    .map(|(key, value)| format!("{key}: {}", Self::json_value_preview(value)))
-                    .collect::<Vec<_>>()
-                    .join(" | ")
+            skill_presentation::SkillJsonValuePreview::Text(value) => value.clone(),
+            skill_presentation::SkillJsonValuePreview::Bool(value) => value.to_string(),
+            skill_presentation::SkillJsonValuePreview::Number(value) => value.clone(),
+            skill_presentation::SkillJsonValuePreview::None => {
+                t!("skills.diagnostics.none").to_string()
             }
-            serde_json::Value::Array(values) => {
-                format!(
-                    "{}: {}",
-                    t!("skills.diagnostics.audit_column_details"),
-                    values.len()
-                )
-            }
-            other => Self::json_value_preview(&other),
-        }
-    }
-
-    fn json_value_preview(value: &serde_json::Value) -> String {
-        match value {
-            serde_json::Value::String(value) => Self::truncate_for_table(value, 48),
-            serde_json::Value::Bool(value) => value.to_string(),
-            serde_json::Value::Number(value) => value.to_string(),
-            serde_json::Value::Null => t!("skills.diagnostics.none").to_string(),
-            serde_json::Value::Array(values) => {
-                if values.is_empty() {
-                    "[]".to_owned()
-                } else {
-                    format!("[{}]", values.len())
-                }
-            }
-            serde_json::Value::Object(map) => {
-                if map.is_empty() {
-                    "{}".to_owned()
-                } else {
-                    format!("{{{} keys}}", map.len())
-                }
+            skill_presentation::SkillJsonValuePreview::EmptyArray => "[]".to_owned(),
+            skill_presentation::SkillJsonValuePreview::ArrayLen(len) => format!("[{}]", len),
+            skill_presentation::SkillJsonValuePreview::EmptyObject => "{}".to_owned(),
+            skill_presentation::SkillJsonValuePreview::ObjectKeys(len) => {
+                format!("{{{} keys}}", len)
             }
         }
-    }
-
-    fn truncate_for_table(value: &str, max_chars: usize) -> String {
-        if value.chars().count() <= max_chars {
-            return value.to_owned();
-        }
-
-        let shortened = value.chars().take(max_chars).collect::<String>();
-        format!("{shortened}...")
-    }
-
-    fn short_fingerprint(fingerprint: &str) -> String {
-        let trimmed = fingerprint.trim();
-        if trimmed.len() <= 16 {
-            return trimmed.to_owned();
-        }
-        format!("{}...", &trimmed[..16])
     }
 }

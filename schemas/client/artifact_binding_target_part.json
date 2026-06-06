@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ArtifactBindingTargetPart",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "kind": {
+      "$ref": "#/$defs/ArtifactBindingTargetKind"
+    }
+  },
+  "required": [
+    "kind",
+    "id"
+  ],
+  "$defs": {
+    "ArtifactBindingTargetKind": {
+      "type": "string",
+      "enum": [
+        "Thread",
+        "Turn",
+        "Message",
+        "Task",
+        "Tool"
+      ]
+    }
+  }
+}

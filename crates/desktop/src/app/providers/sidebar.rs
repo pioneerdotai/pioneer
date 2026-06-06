@@ -2,6 +2,7 @@ use super::{PROVIDERS_FILTER_ALL_NODE_ID, PROVIDERS_FILTER_CONNECTED_NODE_ID};
 use crate::app::root::{PioneerDesktop, ProviderFilter};
 use gpui::{ClickEvent, prelude::*, *};
 use gpui_component::{list::ListItem, theme::ActiveTheme, tree::tree, *};
+use pioneer_client::providers::selectors;
 
 const TREE_ROW_HEIGHT_PX: f32 = 32.0;
 const TREE_ROW_CONTENT_HEIGHT_PX: f32 = 28.0;
@@ -105,12 +106,12 @@ impl PioneerDesktop {
 }
 
 fn parse_providers_sidebar_node_key(value: &str) -> ProvidersSidebarNodeKey {
-    if value == PROVIDERS_FILTER_ALL_NODE_ID {
-        return ProvidersSidebarNodeKey::Filter(ProviderFilter::All);
-    }
-
-    if value == PROVIDERS_FILTER_CONNECTED_NODE_ID {
-        return ProvidersSidebarNodeKey::Filter(ProviderFilter::Connected);
+    if let Some(filter) = selectors::provider_filter_from_node_id(
+        value,
+        PROVIDERS_FILTER_ALL_NODE_ID,
+        PROVIDERS_FILTER_CONNECTED_NODE_ID,
+    ) {
+        return ProvidersSidebarNodeKey::Filter(filter);
     }
 
     ProvidersSidebarNodeKey::Unknown

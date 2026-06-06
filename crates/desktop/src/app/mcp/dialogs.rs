@@ -1,4 +1,3 @@
-use super::actions::MCP_INSTALL_PENDING_KEY;
 use crate::app::root::{GatewayConnectionState, PioneerDesktop};
 use crate::components::buttonts::{default_outline_button, default_primary_button};
 use gpui::{prelude::*, *};
@@ -8,11 +7,11 @@ use gpui_component::{
     input::{Input, InputState},
     *,
 };
-use pioneer_protocol::{
-    McpDiagnosticLevel, McpInstallParams, McpInstallResponse, McpInstallResultStatus,
-    McpInstallStatus, McpScopeKind,
+use pioneer_client::mcp::{
+    actions as mcp_actions,
+    list::{self as mcp_list, MCP_INSTALL_PENDING_KEY},
 };
-use serde_json::Value as JsonValue;
+use pioneer_protocol::{McpDiagnosticLevel, McpInstallResponse};
 use std::{cell::RefCell, rc::Rc};
 use tracing::warn;
 
@@ -25,11 +24,10 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let name = name.trim().to_owned();
-        if name.is_empty() {
+        let Some(name) = mcp_list::normalize_mcp_server_name(name.as_str()) else {
             self.mcp_error = Some(t!("mcp.error.server_name_required").to_string());
             return;
-        }
+        };
 
         let title = t!("mcp.dialog.uninstall_title", name = name.as_str()).to_string();
         let description = t!("mcp.dialog.uninstall_description").to_string();
@@ -92,8 +90,9 @@ impl PioneerDesktop {
                     return false;
                 }
 
-                let config_json = config_input_state.read(cx).value().trim().to_owned();
-                if config_json.is_empty() {
+                let raw_config = config_input_state.read(cx).value().to_string();
+                let Some(config_json) = mcp_actions::normalize_mcp_config_json(raw_config.as_str())
+                else {
                     set_mcp_config_field_error(
                         &field_error,
                         t!("mcp.dialog.error.config_required").to_string(),
@@ -101,21 +100,32 @@ impl PioneerDesktop {
                         cx,
                     );
                     return false;
-                }
-                if let Err(error) = validate_mcp_config_for_submit(config_json.as_str()) {
-                    set_mcp_config_field_error(&field_error, error, &desktop_entity, cx);
+                };
+                if let Err(error) =
+                    mcp_actions::validate_mcp_config_for_submit(config_json.as_str())
+                {
+                    set_mcp_config_field_error(
+                        &field_error,
+                        mcp_config_validation_error_message(error),
+                        &desktop_entity,
+                        cx,
+                    );
                     return false;
                 }
 
                 let request = desktop_entity.update(cx, |view, cx| {
-                    if view.gateway.connection_state != GatewayConnectionState::Connected {
-                        return Err(t!("mcp.dialog.error.gateway_not_connected").to_string());
-                    }
-                    let Some(connection_id) = view.gateway.ws_connection_id else {
-                        return Err(t!("mcp.dialog.error.gateway_not_connected").to_string());
-                    };
-                    let Some(workspace_id) = view.mcp_workspace_scope() else {
-                        return Err(t!("mcp.dialog.error.workspace_not_selected").to_string());
+                    let scope = match mcp_actions::plan_mcp_action_scope(
+                        matches!(
+                            view.gateway.connection_state,
+                            GatewayConnectionState::Connected
+                        ),
+                        view.gateway.ws_connection_id,
+                        view.mcp_workspace_scope(),
+                    ) {
+                        mcp_actions::McpActionScopePlan::Send(scope) => scope,
+                        mcp_actions::McpActionScopePlan::Unavailable(reason) => {
+                            return Err(mcp_dialog_action_unavailable_message(reason));
+                        }
                     };
 
                     view.mcp_error = None;
@@ -123,8 +133,8 @@ impl PioneerDesktop {
                     cx.notify();
 
                     Ok((
-                        connection_id,
-                        workspace_id,
+                        scope.connection_id,
+                        scope.workspace_id,
                         view.gateway.ws_command_sender.clone(),
                     ))
                 });
@@ -148,13 +158,10 @@ impl PioneerDesktop {
                         async move |cx| {
                             let result = cx
                                 .background_spawn(async move {
-                                    ws_sender.mcp_install(McpInstallParams {
+                                    ws_sender.mcp_install(mcp_actions::mcp_install_params(
                                         workspace_id,
                                         config_json,
-                                        scope_kind: McpScopeKind::Workspace,
-                                        enabled: true,
-                                        allow_implicit_invocation: false,
-                                    })
+                                    ))
                                 })
                                 .await;
 
@@ -164,16 +171,13 @@ impl PioneerDesktop {
 
                             match result {
                                 Ok(response) => {
-                                    should_refresh = mcp_install_has_success(&response);
-                                    match response.status {
-                                        McpInstallStatus::Ok => {
-                                            close_dialog = true;
-                                        }
-                                        McpInstallStatus::Partial
-                                        | McpInstallStatus::ValidationError => {
-                                            error_message =
-                                                Some(mcp_install_response_field_error(&response));
-                                        }
+                                    should_refresh =
+                                        mcp_actions::mcp_install_has_success(&response);
+                                    if mcp_actions::mcp_install_should_close_dialog(&response) {
+                                        close_dialog = true;
+                                    } else {
+                                        error_message =
+                                            Some(mcp_install_response_field_error(&response));
                                     }
                                 }
                                 Err(error) => {
@@ -195,7 +199,10 @@ impl PioneerDesktop {
                             *field_error.borrow_mut() = error_message;
 
                             let _ = desktop_entity.update(cx, |view, cx| {
-                                if view.gateway.ws_connection_id == Some(connection_id) {
+                                if mcp_actions::mcp_action_matches_connection(
+                                    connection_id,
+                                    view.gateway.ws_connection_id,
+                                ) {
                                     view.mark_mcp_pending(MCP_INSTALL_PENDING_KEY, false);
                                     if close_dialog {
                                         view.mcp_error = None;
@@ -322,56 +329,40 @@ fn mcp_config_field_error(error: String, cx: &mut App) -> AnyElement {
         .into_any_element()
 }
 
-fn mcp_install_has_success(response: &McpInstallResponse) -> bool {
-    response.servers.iter().any(|item| {
-        matches!(
-            item.status,
-            McpInstallResultStatus::Installed | McpInstallResultStatus::Updated
-        )
-    })
-}
-
 fn mcp_install_response_field_error(response: &McpInstallResponse) -> String {
-    let mut lines = Vec::new();
-
-    for item in response
-        .servers
-        .iter()
-        .filter(|item| item.status == McpInstallResultStatus::ValidationError)
-    {
-        if item.diagnostics.is_empty() {
-            lines.push(
-                t!(
-                    "mcp.dialog.error.server_validation_error",
-                    name = item.name.as_str()
-                )
-                .to_string(),
-            );
-            continue;
-        }
-
-        for diagnostic in &item.diagnostics {
-            let level = match diagnostic.level {
-                McpDiagnosticLevel::Error => t!("mcp.dialog.error.level_error").to_string(),
-                McpDiagnosticLevel::Warning => t!("mcp.dialog.error.level_warning").to_string(),
-            };
-            let field = diagnostic
-                .field_path
-                .as_ref()
-                .map(|field| format!(" ({field})"))
-                .unwrap_or_default();
-            lines.push(
+    let mut lines = mcp_actions::mcp_install_response_field_issues(response)
+        .into_iter()
+        .map(|issue| match issue {
+            mcp_actions::McpInstallFieldIssue::ServerValidationError { name } => t!(
+                "mcp.dialog.error.server_validation_error",
+                name = name.as_str()
+            )
+            .to_string(),
+            mcp_actions::McpInstallFieldIssue::Diagnostic {
+                name,
+                level,
+                message,
+                field_path,
+            } => {
+                let level = match level {
+                    McpDiagnosticLevel::Error => t!("mcp.dialog.error.level_error").to_string(),
+                    McpDiagnosticLevel::Warning => t!("mcp.dialog.error.level_warning").to_string(),
+                };
+                let field = field_path
+                    .as_deref()
+                    .map(|field| format!(" ({field})"))
+                    .unwrap_or_default();
                 t!(
                     "mcp.dialog.error.diagnostic",
-                    name = item.name.as_str(),
+                    name = name.as_str(),
                     level = level.as_str(),
-                    message = diagnostic.message.as_str(),
+                    message = message.as_str(),
                     field = field.as_str()
                 )
-                .to_string(),
-            );
-        }
-    }
+                .to_string()
+            }
+        })
+        .collect::<Vec<_>>();
 
     if lines.is_empty() {
         lines.push(t!("mcp.dialog.error.validation_failed").to_string());
@@ -380,50 +371,45 @@ fn mcp_install_response_field_error(response: &McpInstallResponse) -> String {
     lines.join("\n")
 }
 
-fn validate_mcp_config_for_submit(raw: &str) -> Result<(), String> {
-    let value = serde_json::from_str::<JsonValue>(raw).map_err(|error| {
-        let error = error.to_string();
-        t!("mcp.dialog.error.config_invalid", error = error.as_str()).to_string()
-    })?;
-    let servers = value
-        .get("mcpServers")
-        .and_then(JsonValue::as_object)
-        .ok_or_else(|| t!("mcp.dialog.error.servers_required").to_string())?;
-    if servers.is_empty() {
-        return Err(t!("mcp.dialog.error.servers_empty").to_string());
-    }
-
-    for (name, server) in servers {
-        if name.trim().is_empty() {
-            return Err(t!("mcp.dialog.error.server_name_empty").to_string());
+fn mcp_dialog_action_unavailable_message(reason: mcp_actions::McpActionUnavailable) -> String {
+    match reason {
+        mcp_actions::McpActionUnavailable::GatewayNotConnected => {
+            t!("mcp.dialog.error.gateway_not_connected").to_string()
         }
-        let Some(server) = server.as_object() else {
-            return Err(t!(
-                "mcp.dialog.error.server_config_object",
-                name = name.as_str()
-            )
-            .to_string());
-        };
-        let has_command = server.contains_key("command");
-        let has_url = server.contains_key("url");
-        match (has_command, has_url) {
-            (true, false) | (false, true) => {}
-            (false, false) => {
-                return Err(t!(
-                    "mcp.dialog.error.command_or_url_required",
-                    name = name.as_str()
-                )
-                .to_string());
-            }
-            (true, true) => {
-                return Err(t!(
-                    "mcp.dialog.error.command_url_exclusive",
-                    name = name.as_str()
-                )
-                .to_string());
-            }
+        mcp_actions::McpActionUnavailable::WorkspaceNotSelected => {
+            t!("mcp.dialog.error.workspace_not_selected").to_string()
         }
     }
+}
 
-    Ok(())
+fn mcp_config_validation_error_message(error: mcp_actions::McpConfigValidationError) -> String {
+    match error {
+        mcp_actions::McpConfigValidationError::InvalidJson { error } => {
+            t!("mcp.dialog.error.config_invalid", error = error.as_str()).to_string()
+        }
+        mcp_actions::McpConfigValidationError::ServersRequired => {
+            t!("mcp.dialog.error.servers_required").to_string()
+        }
+        mcp_actions::McpConfigValidationError::ServersEmpty => {
+            t!("mcp.dialog.error.servers_empty").to_string()
+        }
+        mcp_actions::McpConfigValidationError::ServerNameEmpty => {
+            t!("mcp.dialog.error.server_name_empty").to_string()
+        }
+        mcp_actions::McpConfigValidationError::ServerConfigObject { name } => t!(
+            "mcp.dialog.error.server_config_object",
+            name = name.as_str()
+        )
+        .to_string(),
+        mcp_actions::McpConfigValidationError::CommandOrUrlRequired { name } => t!(
+            "mcp.dialog.error.command_or_url_required",
+            name = name.as_str()
+        )
+        .to_string(),
+        mcp_actions::McpConfigValidationError::CommandUrlExclusive { name } => t!(
+            "mcp.dialog.error.command_url_exclusive",
+            name = name.as_str()
+        )
+        .to_string(),
+    }
 }

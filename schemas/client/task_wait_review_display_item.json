@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskWaitReviewDisplayItem",
+  "type": "object",
+  "properties": {
+    "allowed_actions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "candidate_id": {
+      "type": "string"
+    },
+    "candidate_status": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "extraction_error_preview": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "max_revision_rounds": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0
+    },
+    "remaining_revision_rounds": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0
+    },
+    "result_preview": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "review_mode": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "revision_blocked_reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "round": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0
+    },
+    "run_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "status": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "summary": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "task_id": {
+      "type": "string"
+    },
+    "title": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "user_approval_required": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "task_id",
+    "candidate_id",
+    "user_approval_required",
+    "diagnostics",
+    "allowed_actions"
+  ]
+}

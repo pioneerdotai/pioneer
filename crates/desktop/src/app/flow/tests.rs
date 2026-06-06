@@ -38,9 +38,9 @@ use super::{
     turn_resume_retry_delay, upsert_workspace_catalog_item, warning_notification_messages,
 };
 use crate::app::root::{GatewayConnectionState, resolve_active_workspace_id};
-use crate::gateway::{
-    GatewayEndpoint, GatewayEndpointKind, GatewayInstallWarning, GatewayRuntime, GatewayWsEvent,
-};
+use crate::gateway::{GatewayInstallWarning, GatewayRuntime};
+use pioneer_client::gateway::types::{GatewayEndpoint, GatewayEndpointKind};
+use pioneer_client::transport::ws::GatewayWsEvent;
 use pioneer_protocol::{
     GatewayNotification, RecoveryAction, ToolCallStatus, ToolDisplayPayload, ToolLoopBudgetAction,
     ToolLoopBudgetLimitKind, ToolMetadata, ToolOutputPolicySnapshot, ToolRecoveryIdempotencyMode,

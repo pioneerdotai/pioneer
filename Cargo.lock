@@ -7180,6 +7180,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "pioneer-client"
+version = "0.10.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "flate2",
+ "futures-util",
+ "hex",
+ "mime_guess",
+ "pioneer-protocol",
+ "pioneer-skills",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tar",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite",
+ "url",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "pioneer-config"
 version = "0.10.0"
 dependencies = [
@@ -7217,7 +7241,6 @@ dependencies = [
  "anyhow",
  "base64",
  "chrono",
- "flate2",
  "futures-util",
  "gpui",
  "gpui-component",
@@ -7225,12 +7248,10 @@ dependencies = [
  "gpui-terminal",
  "hex",
  "image",
- "mime_guess",
+ "pioneer-client",
  "pioneer-config",
- "pioneer-gateway",
  "pioneer-keystore",
  "pioneer-protocol",
- "pioneer-skills",
  "pioneer-tools",
  "reqwest",
  "rust-embed",
@@ -7239,15 +7260,12 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "sys-locale",
- "tar",
  "tempfile",
  "tokio",
  "tokio-tungstenite",
  "toml 1.1.2+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
- "url",
- "windows-sys 0.61.2",
  "winresource",
 ]
 

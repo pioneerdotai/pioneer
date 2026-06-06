@@ -14,9 +14,10 @@ use gpui_component::{
     theme::ActiveTheme,
     *,
 };
-use pioneer_protocol::{
-    ProviderListModelsParams, ProviderListParams, ProviderModelInfo, ProviderSummary,
-};
+pub(crate) use pioneer_client::composer::model_selection::ModelSelectorSelection;
+use pioneer_client::providers::list::{self as provider_list, ProviderModelSelectorState};
+use pioneer_client::providers::presentation as provider_presentation;
+use pioneer_protocol::ProviderModelInfo;
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -30,12 +31,6 @@ const MODEL_ROW_MIN_HEIGHT: f32 = 32.0;
 const MODEL_LIST_MAX_HEIGHT: f32 = 260.0;
 /// Fallback width of selector popovers before trigger width is measured.
 const SELECTOR_POPOVER_FALLBACK_WIDTH: f32 = 380.0;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ModelSelectorSelection {
-    pub(crate) provider: Option<String>,
-    pub(crate) model: Option<String>,
-}
 
 type ModelSelectorSaveCallback =
     Rc<dyn Fn(&mut PioneerDesktop, ModelSelectorSelection, &mut Context<PioneerDesktop>) -> bool>;
@@ -56,13 +51,7 @@ struct ModelSelectorDialogState {
     ws_sender: GatewayWsCommandSender,
     workspace_id: String,
     on_save: ModelSelectorSaveCallback,
-    providers: Rc<RefCell<Vec<ProviderSummary>>>,
-    models: Rc<RefCell<Vec<ProviderModelInfo>>>,
-    selected_provider: Rc<RefCell<Option<String>>>,
-    selected_model: Rc<RefCell<Option<String>>>,
-    loading_providers: Rc<RefCell<bool>>,
-    loading_models: Rc<RefCell<bool>>,
-    error_message: Rc<RefCell<Option<String>>>,
+    selector: Rc<RefCell<ProviderModelSelectorState>>,
     provider_search_input: Entity<InputState>,
     model_search_input: Entity<InputState>,
     provider_scroll_handle: ScrollHandle,
@@ -163,15 +152,11 @@ impl PioneerDesktop {
     ) {
         let desktop_entity = cx.entity().clone();
 
-        let providers: Rc<RefCell<Vec<ProviderSummary>>> = Rc::new(RefCell::new(Vec::new()));
-        let models: Rc<RefCell<Vec<ProviderModelInfo>>> = Rc::new(RefCell::new(Vec::new()));
-        let selected_provider: Rc<RefCell<Option<String>>> =
-            Rc::new(RefCell::new(options.selected_provider.clone()));
-        let selected_model: Rc<RefCell<Option<String>>> =
-            Rc::new(RefCell::new(options.selected_model.clone()));
-        let loading_providers: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
-        let loading_models: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
-        let error_message: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let selector = Rc::new(RefCell::new(ProviderModelSelectorState::new(
+            options.selected_provider.clone(),
+            options.selected_model.clone(),
+        )));
+        selector.borrow_mut().mark_providers_loading();
 
         let provider_search_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -193,13 +178,7 @@ impl PioneerDesktop {
             ws_sender: options.ws_sender,
             workspace_id: options.workspace_id,
             on_save: options.on_save,
-            providers,
-            models,
-            selected_provider,
-            selected_model,
-            loading_providers,
-            loading_models,
-            error_message,
+            selector,
             provider_search_input,
             model_search_input,
             provider_scroll_handle,
@@ -215,9 +194,7 @@ impl PioneerDesktop {
     }
 
     fn load_providers_async(cx: &mut Context<Self>, state: &ModelSelectorDialogState) {
-        let providers = state.providers.clone();
-        let loading_providers = state.loading_providers.clone();
-        let error_message = state.error_message.clone();
+        let selector = state.selector.clone();
         let ws_sender = state.ws_sender.clone();
         let workspace_id = state.workspace_id.clone();
 
@@ -226,19 +203,20 @@ impl PioneerDesktop {
             async move {
                 let result = cx
                     .background_spawn(async move {
-                        ws_sender.provider_list(ProviderListParams { workspace_id })
+                        ws_sender.provider_list(provider_list::provider_list_params(workspace_id))
                     })
                     .await;
                 let _ = this.update(&mut cx, |_view, cx| {
                     match result {
                         Ok(response) => {
-                            *providers.borrow_mut() = response.providers;
+                            selector.borrow_mut().apply_provider_list_success(response);
                         }
                         Err(error) => {
-                            *error_message.borrow_mut() = Some(format!("{error:#}"));
+                            selector
+                                .borrow_mut()
+                                .apply_provider_list_error(format!("{error:#}"));
                         }
                     }
-                    *loading_providers.borrow_mut() = false;
                     cx.notify();
                 });
             }
@@ -251,8 +229,13 @@ impl PioneerDesktop {
         state: &ModelSelectorDialogState,
         selected_provider_name: Option<String>,
     ) {
-        if let Some(provider_name) = selected_provider_name {
-            *state.loading_models.borrow_mut() = true;
+        let provider_name = selected_provider_name.and_then(|_| {
+            state
+                .selector
+                .borrow_mut()
+                .preload_selected_provider_models()
+        });
+        if let Some(provider_name) = provider_name {
             Self::spawn_fetch_models_for_provider(cx, state.clone(), provider_name);
         }
     }
@@ -262,36 +245,41 @@ impl PioneerDesktop {
         state: ModelSelectorDialogState,
         provider_name: String,
     ) {
-        let models = state.models.clone();
-        let loading_models = state.loading_models.clone();
-        let error_message = state.error_message.clone();
+        let selector = state.selector.clone();
         let model_row_layout_cache = state.model_row_layout_cache.clone();
         let ws_sender = state.ws_sender.clone();
         let desktop_entity = state.desktop_entity.clone();
         let workspace_id = state.workspace_id.clone();
+        let provider_name_for_error = provider_name.clone();
 
         cx.spawn(move |cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             async move {
                 let result = cx
                     .background_spawn(async move {
-                        ws_sender.provider_list_models(ProviderListModelsParams {
+                        ws_sender.provider_list_models(provider_list::provider_list_models_params(
                             workspace_id,
-                            provider: provider_name,
-                        })
+                            provider_name,
+                        ))
                     })
                     .await;
                 let _ = desktop_entity.update(&mut cx, |_view, cx| {
                     match result {
                         Ok(response) => {
-                            *models.borrow_mut() = response.models;
-                            model_row_layout_cache.borrow_mut().clear();
+                            if selector
+                                .borrow_mut()
+                                .apply_provider_models_success(response)
+                            {
+                                model_row_layout_cache.borrow_mut().clear();
+                            }
                         }
                         Err(error) => {
-                            *error_message.borrow_mut() = Some(format!("{error:#}"));
+                            selector.borrow_mut().apply_provider_models_error(
+                                provider_name_for_error.as_str(),
+                                format!("{error:#}"),
+                            );
                         }
                     }
-                    *loading_models.borrow_mut() = false;
                     cx.notify();
                 });
             }
@@ -362,8 +350,7 @@ impl PioneerDesktop {
         state: ModelSelectorDialogState,
     ) -> Rc<dyn Fn(&mut App) -> bool> {
         Rc::new(move |cx| {
-            let provider = state.selected_provider.borrow().clone();
-            let model = state.selected_model.borrow().clone();
+            let (provider, model) = state.selector.borrow().selection_parts();
             state.desktop_entity.update(cx, |view, cx| {
                 let saved = (state.on_save)(view, ModelSelectorSelection { provider, model }, cx);
                 cx.notify();
@@ -374,17 +361,19 @@ impl PioneerDesktop {
 
     fn provider_trigger_label(state: &ModelSelectorDialogState) -> String {
         state
-            .selected_provider
+            .selector
             .borrow()
-            .clone()
+            .selected_provider()
+            .map(str::to_owned)
             .unwrap_or_else(|| t!("chat.composer.model.provider_placeholder").to_string())
     }
 
     fn model_trigger_label(state: &ModelSelectorDialogState) -> String {
         state
-            .selected_model
+            .selector
             .borrow()
-            .clone()
+            .selected_model()
+            .map(str::to_owned)
             .unwrap_or_else(|| t!("chat.composer.model.model_placeholder").to_string())
     }
 
@@ -455,20 +444,22 @@ impl PioneerDesktop {
         let popover_width =
             px((*state.provider_trigger_width_px.borrow()).max(SELECTOR_POPOVER_FALLBACK_WIDTH));
 
-        let provider_list = state.providers.borrow().clone();
-        let is_loading = *state.loading_providers.borrow();
-        let current_selected = state.selected_provider.borrow().clone();
+        let (provider_list, is_loading, current_selected) = {
+            let selector = state.selector.borrow();
+            (
+                selector.providers().to_vec(),
+                selector.loading_providers(),
+                selector.selected_provider().map(str::to_owned),
+            )
+        };
         let search_text = state
             .provider_search_input
             .read(popover_cx)
             .value()
             .to_lowercase();
 
-        let filtered: Vec<_> = provider_list
-            .iter()
-            .filter(|p| search_text.is_empty() || p.name.to_lowercase().contains(&search_text))
-            .cloned()
-            .collect();
+        let filtered =
+            provider_presentation::filter_model_selector_providers(&provider_list, &search_text);
 
         let mut content = v_flex()
             .w(popover_width)
@@ -555,11 +546,8 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut App,
     ) {
-        *state.selected_provider.borrow_mut() = Some(provider_name.clone());
-        *state.selected_model.borrow_mut() = None;
-        *state.models.borrow_mut() = Vec::new();
+        let provider_name = state.selector.borrow_mut().select_provider(provider_name);
         state.model_row_layout_cache.borrow_mut().clear();
-        *state.loading_models.borrow_mut() = true;
 
         let _ = popover_entity.update(cx, |state, cx| {
             state.dismiss(window, cx);
@@ -642,30 +630,23 @@ impl PioneerDesktop {
         let popover_width =
             px((*state.model_trigger_width_px.borrow()).max(SELECTOR_POPOVER_FALLBACK_WIDTH));
 
-        let model_list = state.models.borrow().clone();
-        let is_loading = *state.loading_models.borrow();
+        let (model_list, is_loading, error_text) = {
+            let selector = state.selector.borrow();
+            (
+                selector.models().to_vec(),
+                selector.loading_models(),
+                selector.error().map(str::to_owned),
+            )
+        };
         let search_text = state
             .model_search_input
             .read(popover_cx)
             .value()
             .to_lowercase();
-        let has_error = state.error_message.borrow().is_some();
+        let has_error = error_text.is_some();
 
-        let filtered: Vec<ProviderModelInfo> = model_list
-            .into_iter()
-            .filter(|m| {
-                if search_text.is_empty() {
-                    return true;
-                }
-                let name_match = m
-                    .name
-                    .as_deref()
-                    .map(|n| n.to_lowercase().contains(&search_text))
-                    .unwrap_or(false);
-                let id_match = m.id.to_lowercase().contains(&search_text);
-                name_match || id_match
-            })
-            .collect();
+        let filtered: Vec<ProviderModelInfo> =
+            provider_presentation::filter_model_selector_models(&model_list, &search_text);
         let filtered = Rc::new(filtered);
 
         let mut content = v_flex()
@@ -682,7 +663,7 @@ impl PioneerDesktop {
                     .child(t!("chat.composer.model.loading_models").to_string()),
             );
         } else if has_error {
-            let err_text = state.error_message.borrow().clone().unwrap_or_default();
+            let err_text = error_text.unwrap_or_default();
             content = content.child(
                 div()
                     .p_4()
@@ -875,7 +856,7 @@ impl PioneerDesktop {
     ) -> AnyElement {
         let model_id = model.id.clone();
         let display_name = model.name.clone().unwrap_or_else(|| model.id.clone());
-        let is_active = state.selected_model.borrow().as_deref() == Some(model_id.as_str());
+        let is_active = state.selector.borrow().selected_model() == Some(model_id.as_str());
         let has_name = model.name.is_some();
         let raw_id = model.id.clone();
         let id: SharedString = format!("model-vl-{ix}").into();
@@ -895,7 +876,10 @@ impl PioneerDesktop {
                 window.prevent_default();
             })
             .on_click(move |_, window, cx| {
-                *state.selected_model.borrow_mut() = Some(model_id.clone());
+                state
+                    .selector
+                    .borrow_mut()
+                    .set_selected_model(model_id.clone());
                 let _ = popover_entity.update(cx, |popover, cx| {
                     popover.dismiss(window, cx);
                 });

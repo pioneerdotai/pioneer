@@ -1,6 +1,6 @@
-use super::events::EventKind;
-use super::reducer::ConversationProjector;
 use super::{Conversation, ConversationEvent, MAX_EVENT_LOG_LEN, TimelineEntryStatus, TurnPhase};
+use pioneer_client::conversation::events::EventKind;
+use pioneer_client::conversation::reducer::ConversationProjector;
 use pioneer_protocol::{
     ArtifactKind, ArtifactRef, ArtifactStatus, ExecutionWindowExhaustionReason,
     ExecutionWindowStatus, ItemDeltaStream, RecoveryAction, RecoveryJobStatus, RecoveryTrigger,
@@ -23,7 +23,7 @@ const PENDING_REQUEST_ID: &str = "req_000000000000000001";
 const WORKSPACE_ID: &str = "ws_000000000000000001";
 
 fn pending_request_id(conversation: &Conversation) -> Option<&str> {
-    conversation.state_machine.pending_request_id()
+    conversation.pending_request_id()
 }
 
 fn apply_in_progress_turn(conversation: &mut Conversation) {
@@ -1575,9 +1575,9 @@ fn event_log_is_bounded() {
         });
     }
 
-    assert_eq!(conversation.event_log.len(), MAX_EVENT_LOG_LEN);
+    assert_eq!(conversation.event_log().len(), MAX_EVENT_LOG_LEN);
     assert_eq!(
-        conversation.event_log.front().map(|event| event.sequence),
+        conversation.event_log().front().map(|event| event.sequence),
         Some(101)
     );
 }
@@ -1646,7 +1646,7 @@ fn tool_retry_events_are_logged_without_recovery_projection() {
     });
 
     let kinds = conversation
-        .event_log
+        .event_log()
         .iter()
         .map(|event| event.kind)
         .collect::<Vec<_>>();
@@ -1697,7 +1697,7 @@ fn execution_window_events_project_runtime_rows_without_ending_turn() {
     });
 
     let kinds = conversation
-        .event_log
+        .event_log()
         .iter()
         .map(|event| event.kind)
         .collect::<Vec<_>>();
@@ -1826,7 +1826,7 @@ fn execution_window_blocked_projects_controlled_pause_not_failure() {
     );
 
     let kinds = conversation
-        .event_log
+        .event_log()
         .iter()
         .map(|event| event.kind)
         .collect::<Vec<_>>();
@@ -1939,12 +1939,12 @@ fn history_hydration_replays_tool_retry_events_like_live_events() {
     ]);
 
     let live_kinds = live
-        .event_log
+        .event_log()
         .iter()
         .map(|event| event.kind)
         .collect::<Vec<_>>();
     let replay_kinds = replay
-        .event_log
+        .event_log()
         .iter()
         .map(|event| event.kind)
         .collect::<Vec<_>>();
@@ -2037,12 +2037,12 @@ fn history_hydration_replays_execution_window_events_like_live_events() {
     ]);
 
     let live_kinds = live
-        .event_log
+        .event_log()
         .iter()
         .map(|event| event.kind)
         .collect::<Vec<_>>();
     let replay_kinds = replay
-        .event_log
+        .event_log()
         .iter()
         .map(|event| event.kind)
         .collect::<Vec<_>>();

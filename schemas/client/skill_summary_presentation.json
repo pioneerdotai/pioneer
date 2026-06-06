@@ -1,0 +1,142 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SkillSummaryPresentation",
+  "type": "object",
+  "properties": {
+    "fingerprint_short": {
+      "type": "string"
+    },
+    "slug": {
+      "$ref": "#/$defs/SkillSlugPresentation"
+    },
+    "source": {
+      "$ref": "#/$defs/SkillSourceKind"
+    },
+    "status": {
+      "$ref": "#/$defs/SkillStatus"
+    },
+    "status_tone": {
+      "$ref": "#/$defs/SkillDiagnosticsTone"
+    },
+    "trust": {
+      "$ref": "#/$defs/SkillTrustLevel"
+    },
+    "version": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "slug",
+    "source",
+    "trust",
+    "fingerprint_short",
+    "status",
+    "status_tone"
+  ],
+  "$defs": {
+    "SkillDiagnosticsTone": {
+      "type": "string",
+      "enum": [
+        "Default",
+        "Muted",
+        "Success",
+        "Warning",
+        "Danger"
+      ]
+    },
+    "SkillSlugPresentation": {
+      "type": "object",
+      "properties": {
+        "owner": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "slug": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "slug"
+      ]
+    },
+    "SkillSourceKind": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "System",
+            "User",
+            "Registry"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Other": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Other"
+          ]
+        }
+      ]
+    },
+    "SkillStatus": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "Active",
+            "Blocked",
+            "Disabled"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Other": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Other"
+          ]
+        }
+      ]
+    },
+    "SkillTrustLevel": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "Internal",
+            "Verified",
+            "Community",
+            "Untrusted",
+            "None"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Other": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Other"
+          ]
+        }
+      ]
+    }
+  }
+}

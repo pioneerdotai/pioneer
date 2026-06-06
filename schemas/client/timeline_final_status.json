@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TimelineFinalStatus",
+  "type": "object",
+  "properties": {
+    "kind": {
+      "$ref": "#/$defs/TimelineFinalStatusKind"
+    },
+    "successful": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "kind",
+    "successful"
+  ],
+  "$defs": {
+    "TimelineFinalStatusKind": {
+      "type": "string",
+      "enum": [
+        "Cancelled",
+        "Failed",
+        "Running",
+        "Completed"
+      ]
+    }
+  }
+}

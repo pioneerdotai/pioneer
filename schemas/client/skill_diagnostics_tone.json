@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SkillDiagnosticsTone",
+  "type": "string",
+  "enum": [
+    "Default",
+    "Muted",
+    "Success",
+    "Warning",
+    "Danger"
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "McpStatusLabel",
+  "type": "string",
+  "enum": [
+    "NotStarted",
+    "Disabled",
+    "Starting",
+    "Ready",
+    "Degraded",
+    "AuthRequired",
+    "Failed",
+    "Stopping",
+    "Stopped",
+    "Restarting"
+  ]
+}

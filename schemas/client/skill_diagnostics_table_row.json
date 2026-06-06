@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SkillDiagnosticsTableRow",
+  "type": "object",
+  "properties": {
+    "cells": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/SkillDiagnosticsTableCell"
+      }
+    }
+  },
+  "required": [
+    "cells"
+  ],
+  "$defs": {
+    "SkillDiagnosticsTableCell": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string"
+        },
+        "tone": {
+          "$ref": "#/$defs/SkillDiagnosticsTone"
+        },
+        "tooltip": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "text",
+        "tone"
+      ]
+    },
+    "SkillDiagnosticsTone": {
+      "type": "string",
+      "enum": [
+        "Default",
+        "Muted",
+        "Success",
+        "Warning",
+        "Danger"
+      ]
+    }
+  }
+}

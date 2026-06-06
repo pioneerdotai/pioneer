@@ -1,0 +1,252 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "McpAuditRow",
+  "type": "object",
+  "properties": {
+    "action": {
+      "$ref": "#/$defs/McpAuditAction"
+    },
+    "created_at": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "decision": {
+      "$ref": "#/$defs/McpAuditDecision"
+    },
+    "decision_tone": {
+      "$ref": "#/$defs/McpPresentationTone"
+    },
+    "details_summary": {
+      "$ref": "#/$defs/McpAuditDetailsSummary"
+    },
+    "raw_tool_name": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "reason_code": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "created_at",
+    "action",
+    "decision",
+    "decision_tone",
+    "details_summary"
+  ],
+  "$defs": {
+    "McpAuditAction": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "Install",
+            "Update",
+            "Uninstall",
+            "Policy",
+            "Start",
+            "Started",
+            "StartFailed",
+            "Stop",
+            "Stopped",
+            "Restart",
+            "CatalogRefreshed",
+            "Call",
+            "CallCompleted",
+            "CallFailed",
+            "None"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Other": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Other"
+          ]
+        }
+      ]
+    },
+    "McpAuditDecision": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "Allowed",
+            "Blocked",
+            "Warning",
+            "None"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Other": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Other"
+          ]
+        }
+      ]
+    },
+    "McpAuditDetailsSummary": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "Empty"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ObjectPairs": {
+              "type": "array",
+              "items": {
+                "type": "array",
+                "maxItems": 2,
+                "minItems": 2,
+                "prefixItems": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "$ref": "#/$defs/McpJsonValuePreview"
+                  }
+                ]
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "ObjectPairs"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ArrayLen": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "ArrayLen"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Value": {
+              "$ref": "#/$defs/McpJsonValuePreview"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Value"
+          ]
+        }
+      ]
+    },
+    "McpJsonValuePreview": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "None",
+            "EmptyArray",
+            "EmptyObject"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Text": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Text"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Bool": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Bool"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Number": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Number"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ArrayLen": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "ArrayLen"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ObjectKeys": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "ObjectKeys"
+          ]
+        }
+      ]
+    },
+    "McpPresentationTone": {
+      "type": "string",
+      "enum": [
+        "Default",
+        "Muted",
+        "Success",
+        "Warning",
+        "Danger"
+      ]
+    }
+  }
+}

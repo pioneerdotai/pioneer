@@ -19,13 +19,13 @@ impl PioneerDesktop {
         cx: &mut Context<Self>,
     ) {
         let provider_id = Self::canonical_provider_id(provider_id.as_str());
-        let Some(provider) = Self::provider_catalog_entry(provider_id.as_str()).copied() else {
+        let Some(provider) = Self::provider_catalog_entry(provider_id.as_str()) else {
             return;
         };
 
         let provider_title = provider.title();
         let provider_description = provider.description();
-        let is_configured = self.provider_configured_names.contains(provider.id);
+        let is_configured = self.providers.is_configured(provider.id);
         let api_key_input_state = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)

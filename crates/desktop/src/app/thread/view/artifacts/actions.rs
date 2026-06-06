@@ -1,54 +1,42 @@
 use crate::{
-    app::root::{
-        GatewayConnectionState, PioneerDesktop, ThreadArtifactActionStatus, ThreadArtifactLocalFile,
-    },
-    gateway::{
-        DesktopArtifactDownloadRequest, DesktopArtifactDownloadResult, GatewayWsCommandSender,
-    },
+    app::root::{GatewayConnectionState, PioneerDesktop, ThreadArtifactActionStatus},
+    gateway::GatewayWsCommandSender,
 };
-use anyhow::{Context as AnyhowContext, Result, anyhow, bail};
+use anyhow::{Context as AnyhowContext, Result};
 use gpui::{prelude::*, *};
-use pioneer_protocol::{ArtifactRef, ArtifactStatus, ArtifactSummary};
-use sha2::{Digest, Sha256};
+use pioneer_client::artifacts::{
+    actions as client_artifact_actions,
+    download::{ArtifactDownloadRequest, ArtifactDownloadResult},
+};
+use pioneer_client::platform::{ArtifactFileOpener, ClientPath};
+use pioneer_client::{ClientError, ClientResult};
+use pioneer_protocol::{ArtifactRef, ArtifactSummary};
 use std::{
-    fs,
-    io::Read,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     process::Command,
 };
 use tracing::warn;
 
-pub(crate) trait ArtifactDownloadClient {
+impl client_artifact_actions::ArtifactCachedDownloadClient for GatewayWsCommandSender {
     fn download_artifact_to_cache(
         &self,
-        request: DesktopArtifactDownloadRequest,
-    ) -> Result<DesktopArtifactDownloadResult>;
-}
-
-impl ArtifactDownloadClient for GatewayWsCommandSender {
-    fn download_artifact_to_cache(
-        &self,
-        request: DesktopArtifactDownloadRequest,
-    ) -> Result<DesktopArtifactDownloadResult> {
+        request: ArtifactDownloadRequest,
+    ) -> Result<ArtifactDownloadResult> {
         GatewayWsCommandSender::download_artifact_to_cache(self, request)
     }
-}
-
-pub(crate) trait ArtifactFileOpener {
-    fn open_file(&self, path: &Path) -> Result<()>;
-    fn reveal_file(&self, path: &Path) -> Result<()>;
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SystemArtifactFileOpener;
 
 impl ArtifactFileOpener for SystemArtifactFileOpener {
-    fn open_file(&self, path: &Path) -> Result<()> {
-        spawn_open_file(path)
+    fn open_file(&self, path: &ClientPath) -> ClientResult<()> {
+        spawn_open_file(path.as_path()).map_err(|error| ClientError::platform(format!("{error:#}")))
     }
 
-    fn reveal_file(&self, path: &Path) -> Result<()> {
-        spawn_reveal_file(path)
+    fn reveal_file(&self, path: &ClientPath) -> ClientResult<()> {
+        spawn_reveal_file(path.as_path())
+            .map_err(|error| ClientError::platform(format!("{error:#}")))
     }
 }
 
@@ -149,7 +137,7 @@ impl PioneerDesktop {
                 let artifact_for_download = artifact.clone();
                 let local_result = cx
                     .background_spawn(async move {
-                        ensure_artifact_local_copy_for_open(
+                        client_artifact_actions::ensure_artifact_local_copy_for_open(
                             &ws_sender,
                             request,
                             &artifact_for_download,
@@ -183,7 +171,7 @@ impl PioneerDesktop {
 
                 let open_result = cx
                     .background_spawn(async move {
-                        open_artifact_local_file(
+                        client_artifact_actions::open_artifact_local_file(
                             &SystemArtifactFileOpener,
                             local_file.path.as_path(),
                         )
@@ -229,7 +217,7 @@ impl PioneerDesktop {
             async move {
                 let reveal_result = cx
                     .background_spawn(async move {
-                        reveal_artifact_local_file(
+                        client_artifact_actions::reveal_artifact_local_file(
                             &SystemArtifactFileOpener,
                             local_file.path.as_path(),
                         )
@@ -302,7 +290,7 @@ impl PioneerDesktop {
 
                 let local_result = cx
                     .background_spawn(async move {
-                        copy_cached_download_to_destination(
+                        client_artifact_actions::copy_download_result_to_destination(
                             &cache_result,
                             display_name.as_str(),
                             destination_dir.as_path(),
@@ -332,57 +320,62 @@ impl PioneerDesktop {
     }
 
     fn artifact_action_can_download(&mut self, summary: &ArtifactSummary) -> bool {
-        if summary.artifact.status != ArtifactStatus::Ready {
-            return false;
+        let action_in_progress = self.thread_artifacts.action_in_progress(&summary.artifact);
+        let connected = self.gateway.connection_state == GatewayConnectionState::Connected;
+        match client_artifact_actions::artifact_download_block_reason(
+            summary,
+            action_in_progress,
+            connected,
+        ) {
+            None => true,
+            Some(client_artifact_actions::ArtifactFileActionBlockReason::NotConnected) => {
+                self.thread_artifacts.set_action_status(
+                    &summary.artifact,
+                    ThreadArtifactActionStatus::Failed(
+                        t!("artifacts.action.error.not_connected").to_string(),
+                    ),
+                );
+                false
+            }
+            Some(
+                client_artifact_actions::ArtifactFileActionBlockReason::NotReady
+                | client_artifact_actions::ArtifactFileActionBlockReason::ActionInProgress,
+            ) => false,
         }
-        if self.thread_artifacts.action_in_progress(&summary.artifact) {
-            return false;
-        }
-        if self.gateway.connection_state != GatewayConnectionState::Connected {
-            self.thread_artifacts.set_action_status(
-                &summary.artifact,
-                ThreadArtifactActionStatus::Failed(
-                    t!("artifacts.action.error.not_connected").to_string(),
-                ),
-            );
-            return false;
-        }
-        true
     }
 
     fn artifact_download_request(
         &mut self,
         summary: &ArtifactSummary,
-    ) -> Option<DesktopArtifactDownloadRequest> {
+    ) -> Option<ArtifactDownloadRequest> {
         let gateway_profile_id = self
             .gateway
             .runtime
             .as_ref()
             .and_then(|runtime| runtime.active_gateway().map(|gateway| gateway.id.clone()));
-        let Some(gateway_profile_id) = gateway_profile_id else {
-            self.thread_artifacts.set_action_status(
-                &summary.artifact,
-                ThreadArtifactActionStatus::Failed(
-                    t!("artifacts.action.error.no_gateway").to_string(),
-                ),
-            );
-            return None;
-        };
-        if summary.workspace_id.trim().is_empty() {
-            self.thread_artifacts.set_action_status(
-                &summary.artifact,
-                ThreadArtifactActionStatus::Failed(
-                    t!("artifacts.action.error.no_workspace").to_string(),
-                ),
-            );
-            return None;
+        match client_artifact_actions::plan_artifact_download_request(gateway_profile_id, summary) {
+            Ok(request) => Some(request),
+            Err(
+                client_artifact_actions::ArtifactDownloadRequestPlanError::MissingGatewayProfile,
+            ) => {
+                self.thread_artifacts.set_action_status(
+                    &summary.artifact,
+                    ThreadArtifactActionStatus::Failed(
+                        t!("artifacts.action.error.no_gateway").to_string(),
+                    ),
+                );
+                None
+            }
+            Err(client_artifact_actions::ArtifactDownloadRequestPlanError::MissingWorkspaceId) => {
+                self.thread_artifacts.set_action_status(
+                    &summary.artifact,
+                    ThreadArtifactActionStatus::Failed(
+                        t!("artifacts.action.error.no_workspace").to_string(),
+                    ),
+                );
+                None
+            }
         }
-        Some(DesktopArtifactDownloadRequest {
-            gateway_profile_id,
-            workspace_id: summary.workspace_id.clone(),
-            artifact_id: summary.artifact.artifact_id.clone(),
-            version_id: summary.artifact.version_id.clone(),
-        })
     }
 
     fn mark_thread_artifact_action_failed(
@@ -401,257 +394,6 @@ impl PioneerDesktop {
             .set_action_status(artifact, ThreadArtifactActionStatus::Failed(error));
         cx.notify();
     }
-}
-
-pub(crate) fn ensure_artifact_local_copy_for_open<C: ArtifactDownloadClient>(
-    client: &C,
-    request: DesktopArtifactDownloadRequest,
-    artifact: &ArtifactRef,
-    existing: Option<&ThreadArtifactLocalFile>,
-) -> Result<ThreadArtifactLocalFile> {
-    if let Some(existing) = existing
-        && existing_local_file_is_verified(existing, artifact)?
-    {
-        return Ok(existing.clone());
-    }
-
-    let result = client.download_artifact_to_cache(request)?;
-    verify_download_result(&result)?;
-    Ok(ThreadArtifactLocalFile {
-        path: result.local_path,
-        sha256: result.sha256,
-        size_bytes: Some(result.size_bytes),
-    })
-}
-
-pub(crate) fn copy_cached_download_to_destination(
-    result: &DesktopArtifactDownloadResult,
-    display_name: &str,
-    destination_dir: &Path,
-) -> Result<ThreadArtifactLocalFile> {
-    if !destination_dir.is_dir() {
-        bail!(
-            "artifact destination `{}` is not a directory",
-            destination_dir.display()
-        );
-    }
-    verify_download_result(result)?;
-
-    let final_path = unique_destination_path(destination_dir, display_name)?;
-    let part_path = unique_part_path(&final_path)?;
-    let copy_result = (|| -> Result<()> {
-        if part_path.exists() {
-            fs::remove_file(part_path.as_path()).with_context(|| {
-                format!(
-                    "failed to remove stale artifact download part `{}`",
-                    part_path.display()
-                )
-            })?;
-        }
-        fs::copy(result.local_path.as_path(), part_path.as_path()).with_context(|| {
-            format!(
-                "failed to copy artifact download `{}` to `{}`",
-                result.local_path.display(),
-                part_path.display()
-            )
-        })?;
-        verify_file(
-            part_path.as_path(),
-            result.sha256.as_str(),
-            Some(result.size_bytes),
-        )?;
-        fs::rename(part_path.as_path(), final_path.as_path()).with_context(|| {
-            format!(
-                "failed to finalize artifact download `{}`",
-                final_path.display()
-            )
-        })?;
-        Ok(())
-    })();
-
-    if copy_result.is_err() {
-        let _ = fs::remove_file(part_path.as_path());
-    }
-    copy_result?;
-
-    Ok(ThreadArtifactLocalFile {
-        path: final_path,
-        sha256: result.sha256.clone(),
-        size_bytes: Some(result.size_bytes),
-    })
-}
-
-pub(crate) fn open_artifact_local_file<O: ArtifactFileOpener>(
-    opener: &O,
-    path: &Path,
-) -> Result<()> {
-    if !path.is_file() {
-        bail!("artifact local file `{}` does not exist", path.display());
-    }
-    opener.open_file(path)
-}
-
-pub(crate) fn reveal_artifact_local_file<O: ArtifactFileOpener>(
-    opener: &O,
-    path: &Path,
-) -> Result<()> {
-    if !path.is_file() {
-        bail!("artifact local file `{}` does not exist", path.display());
-    }
-    opener.reveal_file(path)
-}
-
-pub(crate) fn existing_local_file_is_verified(
-    local_file: &ThreadArtifactLocalFile,
-    artifact: &ArtifactRef,
-) -> Result<bool> {
-    if !local_file.path.is_file() {
-        return Ok(false);
-    }
-    let expected_sha = artifact
-        .sha256
-        .as_deref()
-        .unwrap_or(local_file.sha256.as_str());
-    if expected_sha.trim().is_empty() {
-        return Ok(false);
-    }
-    if let Some(expected_size) = artifact.size_bytes.or(local_file.size_bytes) {
-        let actual_size = fs::metadata(local_file.path.as_path())
-            .with_context(|| {
-                format!(
-                    "failed to stat artifact local file `{}`",
-                    local_file.path.display()
-                )
-            })?
-            .len();
-        if actual_size != expected_size {
-            return Ok(false);
-        }
-    }
-    Ok(sha256_file(local_file.path.as_path())? == expected_sha)
-}
-
-pub(crate) fn sanitized_artifact_file_name(display_name: &str) -> String {
-    let fallback = "artifact";
-    let candidate = Path::new(display_name)
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or(display_name);
-    let mut sanitized = String::with_capacity(candidate.len().max(fallback.len()));
-    for ch in candidate.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
-            sanitized.push(ch);
-        } else {
-            sanitized.push('_');
-        }
-    }
-    let trimmed = sanitized
-        .trim_matches([' ', '\t', '\r', '\n'])
-        .trim_matches('.');
-    if trimmed.is_empty() {
-        fallback.to_owned()
-    } else {
-        trimmed.to_owned()
-    }
-}
-
-pub(crate) fn unique_destination_path(
-    destination_dir: &Path,
-    display_name: &str,
-) -> Result<PathBuf> {
-    reject_path_traversal(destination_dir)?;
-    let safe_name = sanitized_artifact_file_name(display_name);
-    let initial = destination_dir.join(safe_name.as_str());
-    if !initial.exists() {
-        return Ok(initial);
-    }
-
-    let safe_path = Path::new(safe_name.as_str());
-    let stem = safe_path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .filter(|value| !value.is_empty())
-        .unwrap_or("artifact");
-    let extension = safe_path.extension().and_then(|value| value.to_str());
-    for index in 1..10_000 {
-        let candidate_name = if let Some(extension) = extension {
-            format!("{stem} ({index}).{extension}")
-        } else {
-            format!("{stem} ({index})")
-        };
-        let candidate = destination_dir.join(candidate_name);
-        if !candidate.exists() {
-            return Ok(candidate);
-        }
-    }
-
-    bail!("failed to choose a unique artifact destination file name")
-}
-
-fn unique_part_path(final_path: &Path) -> Result<PathBuf> {
-    let file_name = final_path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .ok_or_else(|| anyhow!("artifact destination has no file name"))?;
-    Ok(final_path.with_file_name(format!("{file_name}.part")))
-}
-
-fn verify_download_result(result: &DesktopArtifactDownloadResult) -> Result<()> {
-    verify_file(
-        result.local_path.as_path(),
-        result.sha256.as_str(),
-        Some(result.size_bytes),
-    )
-}
-
-fn verify_file(path: &Path, expected_sha256: &str, expected_size: Option<u64>) -> Result<()> {
-    if !path.is_file() {
-        bail!("artifact file `{}` does not exist", path.display());
-    }
-    if let Some(expected_size) = expected_size {
-        let actual_size = fs::metadata(path)
-            .with_context(|| format!("failed to stat artifact file `{}`", path.display()))?
-            .len();
-        if actual_size != expected_size {
-            bail!(
-                "artifact file size mismatch for `{}`: expected {}, got {}",
-                path.display(),
-                expected_size,
-                actual_size
-            );
-        }
-    }
-    let actual_sha256 = sha256_file(path)?;
-    if actual_sha256 != expected_sha256 {
-        bail!("artifact file sha256 mismatch for `{}`", path.display());
-    }
-    Ok(())
-}
-
-fn sha256_file(path: &Path) -> Result<String> {
-    let mut file =
-        fs::File::open(path).with_context(|| format!("failed to open `{}`", path.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .with_context(|| format!("failed to read `{}`", path.display()))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(hex::encode(hasher.finalize()))
-}
-
-fn reject_path_traversal(path: &Path) -> Result<()> {
-    for component in path.components() {
-        if matches!(component, Component::ParentDir) {
-            bail!("artifact destination must not contain parent traversal");
-        }
-    }
-    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -703,35 +445,34 @@ fn spawn_command(command: &mut Command, action: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ArtifactDownloadClient, ArtifactFileOpener, copy_cached_download_to_destination,
-        ensure_artifact_local_copy_for_open, open_artifact_local_file, reveal_artifact_local_file,
-        unique_destination_path,
-    };
-    use crate::{
-        app::root::{ThreadArtifactLocalFile, ThreadArtifactsState},
-        gateway::{DesktopArtifactDownloadRequest, DesktopArtifactDownloadResult},
-    };
+    use crate::app::root::{ThreadArtifactLocalFile, ThreadArtifactsState};
     use anyhow::Result;
+    use pioneer_client::ClientResult;
+    use pioneer_client::artifacts::{
+        actions as client_artifact_actions,
+        download::{ArtifactDownloadRequest, ArtifactDownloadResult},
+    };
+    use pioneer_client::platform::{ArtifactFileOpener, ClientPath};
     use pioneer_protocol::{ArtifactKind, ArtifactRef, ArtifactStatus};
     use sha2::{Digest, Sha256};
     use std::cell::RefCell;
     use std::{
         fs,
         path::{Path, PathBuf},
+        sync::Mutex,
     };
 
     #[derive(Clone)]
     struct FakeDownloadClient {
-        result: DesktopArtifactDownloadResult,
+        result: ArtifactDownloadResult,
         calls: std::rc::Rc<RefCell<usize>>,
     }
 
-    impl ArtifactDownloadClient for FakeDownloadClient {
+    impl client_artifact_actions::ArtifactCachedDownloadClient for FakeDownloadClient {
         fn download_artifact_to_cache(
             &self,
-            request: DesktopArtifactDownloadRequest,
-        ) -> Result<DesktopArtifactDownloadResult> {
+            request: ArtifactDownloadRequest,
+        ) -> Result<ArtifactDownloadResult> {
             assert_eq!(request.artifact_id, self.result.artifact.artifact_id);
             *self.calls.borrow_mut() += 1;
             Ok(self.result.clone())
@@ -740,18 +481,24 @@ mod tests {
 
     #[derive(Default)]
     struct FakeOpener {
-        opened: RefCell<Vec<PathBuf>>,
-        revealed: RefCell<Vec<PathBuf>>,
+        opened: Mutex<Vec<PathBuf>>,
+        revealed: Mutex<Vec<PathBuf>>,
     }
 
     impl ArtifactFileOpener for FakeOpener {
-        fn open_file(&self, path: &Path) -> Result<()> {
-            self.opened.borrow_mut().push(path.to_owned());
+        fn open_file(&self, path: &ClientPath) -> ClientResult<()> {
+            self.opened
+                .lock()
+                .expect("opened lock")
+                .push(path.as_path().to_owned());
             Ok(())
         }
 
-        fn reveal_file(&self, path: &Path) -> Result<()> {
-            self.revealed.borrow_mut().push(path.to_owned());
+        fn reveal_file(&self, path: &ClientPath) -> ClientResult<()> {
+            self.revealed
+                .lock()
+                .expect("revealed lock")
+                .push(path.as_path().to_owned());
             Ok(())
         }
     }
@@ -793,8 +540,12 @@ mod tests {
         let mut result = download_result(cache_path, bytes, "report.txt");
         result.size_bytes = bytes.len() as u64;
 
-        let error = copy_cached_download_to_destination(&result, "report.txt", temp.path())
-            .expect_err("should fail verification");
+        let error = client_artifact_actions::copy_download_result_to_destination(
+            &result,
+            "report.txt",
+            temp.path(),
+        )
+        .expect_err("should fail verification");
 
         assert!(
             error.to_string().contains("size mismatch") || error.to_string().contains("sha256")
@@ -814,7 +565,7 @@ mod tests {
         };
         let artifact = artifact_ref("art_1", "report.txt", Some(sha256_bytes(bytes)));
 
-        let local_file = ensure_artifact_local_copy_for_open(
+        let local_file = client_artifact_actions::ensure_artifact_local_copy_for_open(
             &client,
             download_request("art_1"),
             &artifact,
@@ -822,10 +573,14 @@ mod tests {
         )
         .expect("local copy");
         let opener = FakeOpener::default();
-        open_artifact_local_file(&opener, local_file.path.as_path()).expect("open");
+        client_artifact_actions::open_artifact_local_file(&opener, local_file.path.as_path())
+            .expect("open");
 
         assert_eq!(*client.calls.borrow(), 1);
-        assert_eq!(opener.opened.borrow().as_slice(), &[cache_path]);
+        assert_eq!(
+            opener.opened.lock().expect("opened lock").as_slice(),
+            &[cache_path]
+        );
     }
 
     #[test]
@@ -845,7 +600,7 @@ mod tests {
             size_bytes: Some(bytes.len() as u64),
         };
 
-        let local_file = ensure_artifact_local_copy_for_open(
+        let local_file = client_artifact_actions::ensure_artifact_local_copy_for_open(
             &client,
             download_request("art_1"),
             &artifact,
@@ -863,25 +618,11 @@ mod tests {
         let missing = temp.path().join("missing.txt");
         let opener = FakeOpener::default();
 
-        let error = reveal_artifact_local_file(&opener, missing.as_path())
+        let error = client_artifact_actions::reveal_artifact_local_file(&opener, missing.as_path())
             .expect_err("missing file should not reveal");
 
         assert!(error.to_string().contains("does not exist"));
-        assert!(opener.revealed.borrow().is_empty());
-    }
-
-    #[test]
-    fn artifact_file_names_are_sanitized_and_uniqued() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        fs::write(temp.path().join("report_.txt"), b"existing").expect("write existing");
-
-        let path = unique_destination_path(temp.path(), "../report?.txt").expect("path");
-
-        assert_eq!(
-            path.file_name().and_then(|value| value.to_str()),
-            Some("report_ (1).txt")
-        );
-        assert!(path.starts_with(temp.path()));
+        assert!(opener.revealed.lock().expect("revealed lock").is_empty());
     }
 
     #[test]
@@ -906,23 +647,29 @@ mod tests {
         );
     }
 
-    fn download_artifact_to_destination<C: ArtifactDownloadClient>(
+    fn download_artifact_to_destination<
+        C: client_artifact_actions::ArtifactCachedDownloadClient,
+    >(
         client: &C,
-        request: DesktopArtifactDownloadRequest,
+        request: ArtifactDownloadRequest,
         display_name: &str,
         destination_dir: &Path,
     ) -> Result<ThreadArtifactLocalFile> {
         let result = client.download_artifact_to_cache(request)?;
-        copy_cached_download_to_destination(&result, display_name, destination_dir)
+        client_artifact_actions::copy_download_result_to_destination(
+            &result,
+            display_name,
+            destination_dir,
+        )
     }
 
     fn download_result(
         local_path: PathBuf,
         bytes: &[u8],
         display_name: &str,
-    ) -> DesktopArtifactDownloadResult {
-        DesktopArtifactDownloadResult {
-            local_path,
+    ) -> ArtifactDownloadResult {
+        ArtifactDownloadResult {
+            local_path: ClientPath::new(local_path),
             artifact: artifact_ref("art_1", display_name, Some(sha256_bytes(bytes))),
             size_bytes: bytes.len() as u64,
             sha256: sha256_bytes(bytes),
@@ -943,8 +690,8 @@ mod tests {
         }
     }
 
-    fn download_request(artifact_id: &str) -> DesktopArtifactDownloadRequest {
-        DesktopArtifactDownloadRequest {
+    fn download_request(artifact_id: &str) -> ArtifactDownloadRequest {
+        ArtifactDownloadRequest {
             gateway_profile_id: "remote".to_owned(),
             workspace_id: "ws_1".to_owned(),
             artifact_id: artifact_id.to_owned(),

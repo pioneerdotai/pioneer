@@ -54,16 +54,10 @@ impl PioneerDesktop {
         }
 
         let selected_node_id = agents_doc_tree_node_key(&scope);
-        let (workspace_id, folder_id) = match scope.clone() {
-            ThreadAgentsDocEditorScope::Root { workspace_id } => (workspace_id, None),
-            ThreadAgentsDocEditorScope::Folder {
-                workspace_id,
-                folder_id,
-            } => {
-                self.set_thread_folder_expanded(folder_id.as_str(), true, cx);
-                (workspace_id, Some(folder_id))
-            }
-        };
+        let (workspace_id, folder_id) = scope.clone().into_parts();
+        if let Some(folder_id) = folder_id.as_deref() {
+            self.set_thread_folder_expanded(folder_id, true, cx);
+        }
 
         let input = cx.new(|cx| {
             InputState::new(window, cx)

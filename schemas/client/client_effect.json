@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ClientEffect",
+  "oneOf": [
+    {
+      "type": "string",
+      "enum": [
+        "RefreshWorkspaceList",
+        "RefreshGatewaySettings",
+        "QueueSkillsRefresh",
+        "EnqueueInFlightTurnsForResume"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "UnsubscribeThreads": {
+          "type": "object",
+          "properties": {
+            "thread_ids": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "thread_ids"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "UnsubscribeThreads"
+      ]
+    }
+  ]
+}

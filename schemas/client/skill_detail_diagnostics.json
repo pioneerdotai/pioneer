@@ -1,0 +1,168 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SkillDetailDiagnostics",
+  "type": "object",
+  "properties": {
+    "dependency_diagnostics": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/SkillDependencyDiagnostic"
+      }
+    },
+    "recent_audit": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/SkillAuditTimelineItem"
+      }
+    },
+    "security_findings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/SkillSecurityFinding"
+      }
+    },
+    "trust_gate": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/SkillTrustGateStatus"
+      }
+    },
+    "validation_issues": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/SkillValidationDiagnostic"
+      }
+    }
+  },
+  "required": [
+    "dependency_diagnostics",
+    "security_findings",
+    "validation_issues",
+    "trust_gate",
+    "recent_audit"
+  ],
+  "$defs": {
+    "SkillAuditTimelineItem": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "decision": {
+          "type": "string"
+        },
+        "details_json": {
+          "type": "string"
+        },
+        "reason_code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "action",
+        "decision",
+        "created_at",
+        "details_json"
+      ]
+    },
+    "SkillDependencyDiagnostic": {
+      "type": "object",
+      "properties": {
+        "hint": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "name",
+        "status",
+        "hint"
+      ]
+    },
+    "SkillSecurityFinding": {
+      "type": "object",
+      "properties": {
+        "message": {
+          "type": "string"
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rule_id": {
+          "type": "string"
+        },
+        "severity": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "rule_id",
+        "severity",
+        "message"
+      ]
+    },
+    "SkillTrustGateStatus": {
+      "type": "object",
+      "properties": {
+        "allowed": {
+          "type": "boolean"
+        },
+        "minimum_trust": {
+          "type": "string"
+        },
+        "tool_kind": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool_kind",
+        "minimum_trust",
+        "allowed"
+      ]
+    },
+    "SkillValidationDiagnostic": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "field_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "level": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "level",
+        "message"
+      ]
+    }
+  }
+}

@@ -1,57 +1,68 @@
 use super::*;
+use pioneer_client::threads::start::{self as thread_start, ThreadStartDrivePlan};
 
 impl PioneerDesktop {
     pub(crate) fn request_thread_start_if_needed(&mut self) {
-        if let Some(existing_draft_thread_id) = self.draft_thread_id().map(str::to_owned) {
-            if self
-                .thread_coordinator(existing_draft_thread_id.as_str())
-                .is_some()
-            {
-                return;
-            }
-            self.clear_draft_thread_if_matches(existing_draft_thread_id.as_str());
+        let draft_thread_id = self.draft_thread_id().map(str::to_owned);
+        let draft_thread_exists = draft_thread_id
+            .as_deref()
+            .is_some_and(|thread_id| self.thread_coordinator(thread_id).is_some());
+        let plan = thread_start::plan_thread_start_request(
+            draft_thread_id.as_deref(),
+            draft_thread_exists,
+            self.thread_start_coordinator(),
+        );
+
+        if let Some(thread_id) = plan.clear_draft_thread_id {
+            self.clear_draft_thread_if_matches(thread_id.as_str());
         }
 
-        if self.thread_start_coordinator().in_progress {
+        if plan.ensure_pending_thread_id {
+            thread_start::ensure_pending_thread_start_id(
+                self.thread_start_coordinator_mut(),
+                thread_start::generate_thread_start_id(),
+            );
+        }
+
+        if !plan.enqueue_start_request {
             return;
-        }
-
-        let start = self.thread_start_coordinator_mut();
-        if start.pending_thread_id.is_none() {
-            start.pending_thread_id = Some(generate_id(ID_LEN));
         }
 
         self.enqueue_thread_start_request();
     }
 
     pub(crate) fn drive_thread_start_queue(&mut self, cx: &mut Context<Self>) -> bool {
-        if let Some(existing_draft_thread_id) = self.draft_thread_id().map(str::to_owned) {
-            if self
-                .thread_coordinator(existing_draft_thread_id.as_str())
-                .is_some()
-            {
-                self.clear_thread_start_queue();
-                return false;
+        let draft_thread_id = self.draft_thread_id().map(str::to_owned);
+        let draft_thread_exists = draft_thread_id
+            .as_deref()
+            .is_some_and(|thread_id| self.thread_coordinator(thread_id).is_some());
+        if let Some(thread_id) = draft_thread_id.as_deref() {
+            if !draft_thread_exists {
+                self.clear_draft_thread_if_matches(thread_id);
             }
-            self.clear_draft_thread_if_matches(existing_draft_thread_id.as_str());
         }
 
-        let Some(connection_id) = self.gateway.ws_connection_id else {
-            return false;
-        };
+        let plan = thread_start::plan_thread_start_drive(
+            draft_thread_id.as_deref(),
+            draft_thread_exists,
+            self.gateway.ws_connection_id,
+            self.gateway.connection_state == GatewayConnectionState::Connected,
+            self.thread_start_coordinator(),
+            self.thread_start_requested,
+        );
 
-        if self.gateway.connection_state != GatewayConnectionState::Connected {
-            return false;
+        match plan {
+            ThreadStartDrivePlan::ClearQueue => {
+                self.clear_thread_start_queue();
+                false
+            }
+            ThreadStartDrivePlan::Start { connection_id } => {
+                if !self.dequeue_thread_start_request() {
+                    return false;
+                }
+                self.ensure_thread_started(connection_id, cx)
+            }
+            ThreadStartDrivePlan::NotReady => false,
         }
-
-        if self.thread_start_coordinator().in_progress {
-            return false;
-        }
-
-        if !self.dequeue_thread_start_request() {
-            return false;
-        }
-
-        self.ensure_thread_started(connection_id, cx)
     }
 }

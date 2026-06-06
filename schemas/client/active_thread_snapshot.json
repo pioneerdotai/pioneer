@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ActiveThreadSnapshot",
+  "type": "object",
+  "properties": {
+    "history_loaded": {
+      "type": "boolean"
+    },
+    "history_loading": {
+      "type": "boolean"
+    },
+    "in_flight_turn_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "is_draft": {
+      "type": "boolean"
+    },
+    "phase": {
+      "$ref": "#/$defs/ActiveThreadPhaseSnapshot"
+    },
+    "status": {
+      "$ref": "#/$defs/ActiveThreadStatusSnapshot"
+    },
+    "thread_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "workspace_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "is_draft",
+    "history_loading",
+    "history_loaded",
+    "phase",
+    "status"
+  ],
+  "$defs": {
+    "ActiveThreadPhaseSnapshot": {
+      "type": "string",
+      "enum": [
+        "Idle",
+        "Starting",
+        "Running",
+        "Cancelling",
+        "Completing",
+        "Completed",
+        "Failed",
+        "Blocked",
+        "Cancelled"
+      ]
+    },
+    "ActiveThreadStatusSnapshot": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "GatewayDisconnected",
+            "StartingThread",
+            "FinishingTurn",
+            "PreviousTurnFailed",
+            "TurnCancelled",
+            "TurnCompleted",
+            "Ready",
+            "StartingTurn",
+            "AgentProcessing"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "TurnRunning": {
+              "type": "object",
+              "properties": {
+                "turn_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "turn_id"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "TurnRunning"
+          ]
+        }
+      ]
+    }
+  }
+}

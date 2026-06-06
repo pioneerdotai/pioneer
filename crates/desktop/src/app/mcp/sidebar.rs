@@ -4,6 +4,7 @@ use crate::{
 };
 use gpui::{prelude::*, *};
 use gpui_component::{button::*, theme::ActiveTheme, *};
+use pioneer_client::mcp::{details as mcp_details, list::MCP_INSTALL_PENDING_KEY};
 
 const SIDEBAR_MENU_ITEM_OPACITY: f32 = 0.8;
 
@@ -11,7 +12,7 @@ impl PioneerDesktop {
     pub(crate) fn render_mcp_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let desktop_entity = cx.entity().clone();
         let is_connected = self.gateway.connection_state == GatewayConnectionState::Connected;
-        let install_pending = self.is_mcp_pending("__install__");
+        let install_pending = self.is_mcp_pending(MCP_INSTALL_PENDING_KEY);
 
         v_flex()
             .size_full()
@@ -63,12 +64,11 @@ impl PioneerDesktop {
     pub(crate) fn render_mcp_details_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let desktop_entity = cx.entity().clone();
         let is_connected = self.gateway.connection_state == GatewayConnectionState::Connected;
-        let selected = self.mcp_selected_server_id.as_ref().and_then(|server_id| {
-            self.mcp_servers
-                .iter()
-                .find(|server| server.id == *server_id)
-                .cloned()
-        });
+        let selected = mcp_details::selected_mcp_server(
+            self.mcp_servers.as_slice(),
+            self.mcp_selected_server_id.as_deref(),
+        )
+        .cloned();
         let is_pending = selected
             .as_ref()
             .is_some_and(|server| self.is_mcp_pending(server.name.as_str()));

@@ -11,14 +11,12 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-base64.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 pioneer-config.workspace = true
-pioneer-gateway = { workspace = true, features = ["computer-use"] }
+pioneer-client.workspace = true
 pioneer-keystore.workspace = true
 pioneer-protocol.workspace = true
-pioneer-skills.workspace = true
 pioneer-tools.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -29,31 +27,22 @@ gpui-component.workspace = true
 gpui-component-assets.workspace = true
 rust-i18n.workspace = true
 tokio.workspace = true
-tokio-tungstenite.workspace = true
 futures-util.workspace = true
 chrono.workspace = true
 sys-locale.workspace = true
 rust-embed.workspace = true
-url.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
-flate2.workspace = true
-tar.workspace = true
-sha2.workspace = true
-hex.workspace = true
-mime_guess.workspace = true
 image.workspace = true
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = [
-  "Win32_Foundation",
-  "Win32_Storage_FileSystem",
-] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
 
 [dev-dependencies]
+base64.workspace = true
+hex.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
+tokio-tungstenite.workspace = true
 
 [package.metadata.i18n]
 available-locales = ["en", "ru", "zh", "hi", "es", "de", "fr", "jp"]

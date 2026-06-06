@@ -39,9 +39,10 @@ impl PioneerDesktop {
                 async move {
                     let result = cx
                         .background_spawn(async move {
-                            for thread_id in threads_to_unsubscribe {
-                                let _ = ws_sender.thread_unsubscribe(thread_id);
-                            }
+                            execute_gateway_command_client_effects(
+                                &ws_sender,
+                                threads_to_unsubscribe,
+                            );
                             let mut runtime = GatewayRuntime::load()?;
                             let endpoint = runtime.add_remote_gateway(
                                 name.as_str(),
@@ -167,9 +168,10 @@ impl PioneerDesktop {
 
                     let result = cx
                         .background_spawn(async move {
-                            for thread_id in threads_to_unsubscribe {
-                                let _ = ws_sender.thread_unsubscribe(thread_id);
-                            }
+                            execute_gateway_command_client_effects(
+                                &ws_sender,
+                                threads_to_unsubscribe,
+                            );
                             let connection_id = ws_sender.connect_and_wait(spec)?;
                             runtime.activate_gateway(endpoint_id.as_str())?;
 
@@ -260,9 +262,10 @@ impl PioneerDesktop {
 
                     let result = cx
                         .background_spawn(async move {
-                            for thread_id in threads_to_unsubscribe {
-                                let _ = ws_sender.thread_unsubscribe(thread_id);
-                            }
+                            execute_gateway_command_client_effects(
+                                &ws_sender,
+                                threads_to_unsubscribe,
+                            );
                             let mut runtime = GatewayRuntime::load()?;
                             let local_start = runtime.ensure_local_gateway_started()?;
                             let spec = build_ws_connect_spec(&runtime, &local_start.endpoint)?;
@@ -425,9 +428,10 @@ impl PioneerDesktop {
 
                     let result = cx
                         .background_spawn(async move {
-                            for thread_id in threads_to_unsubscribe {
-                                let _ = ws_sender.thread_unsubscribe(thread_id);
-                            }
+                            execute_gateway_command_client_effects(
+                                &ws_sender,
+                                threads_to_unsubscribe,
+                            );
 
                             let ws_connection_id = match ws_sender.connect_and_wait(spec) {
                                 Ok(connection_id) => Some(connection_id),
@@ -551,9 +555,7 @@ impl PioneerDesktop {
 
                     let result = cx
                         .background_spawn(async move {
-                            for thread_id in threads_to_unsubscribe {
-                                let _ = ws_sender.thread_unsubscribe(thread_id);
-                            }
+                            execute_gateway_command_client_effects(&ws_sender, threads_to_unsubscribe);
 
                             let mut runtime = runtime;
                             let mut install_warnings = Vec::new();
@@ -703,9 +705,10 @@ impl PioneerDesktop {
 
                     let result = cx
                         .background_spawn(async move {
-                            for thread_id in threads_to_unsubscribe {
-                                let _ = ws_sender.thread_unsubscribe(thread_id);
-                            }
+                            execute_gateway_command_client_effects(
+                                &ws_sender,
+                                threads_to_unsubscribe,
+                            );
                             let mut runtime = GatewayRuntime::load()?;
                             let mut endpoint =
                                 runtime.endpoint(gateway_id.as_str()).ok_or_else(|| {

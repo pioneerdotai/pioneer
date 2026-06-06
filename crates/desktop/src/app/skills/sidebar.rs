@@ -8,6 +8,7 @@ use gpui_component::{
     theme::ActiveTheme,
     *,
 };
+use pioneer_client::skills::catalog as skill_catalog;
 
 const SIDEBAR_MENU_ITEM_OPACITY: f32 = 0.8;
 
@@ -112,10 +113,12 @@ impl PioneerDesktop {
             .selected_skill_target
             .as_ref()
             .and_then(|(slug, source_kind)| {
-                self.installed_skills
-                    .iter()
-                    .find(|skill| skill.slug == *slug && skill.source_kind == *source_kind)
-                    .cloned()
+                skill_catalog::find_skill(
+                    self.installed_skills.as_slice(),
+                    slug.as_str(),
+                    source_kind.as_str(),
+                )
+                .cloned()
             });
         let is_pending = selected_skill.as_ref().is_some_and(|skill| {
             self.is_skill_pending(skill.slug.as_str(), skill.source_kind.as_str())

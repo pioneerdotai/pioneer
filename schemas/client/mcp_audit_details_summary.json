@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "McpAuditDetailsSummary",
+  "oneOf": [
+    {
+      "type": "string",
+      "enum": [
+        "Empty"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "ObjectPairs": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "type": "string"
+              },
+              {
+                "$ref": "#/$defs/McpJsonValuePreview"
+              }
+            ]
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "ObjectPairs"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "ArrayLen": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "ArrayLen"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "Value": {
+          "$ref": "#/$defs/McpJsonValuePreview"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Value"
+      ]
+    }
+  ],
+  "$defs": {
+    "McpJsonValuePreview": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "None",
+            "EmptyArray",
+            "EmptyObject"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Text": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Text"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Bool": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Bool"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Number": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Number"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ArrayLen": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "ArrayLen"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ObjectKeys": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "ObjectKeys"
+          ]
+        }
+      ]
+    }
+  }
+}

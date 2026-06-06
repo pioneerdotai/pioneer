@@ -6,22 +6,14 @@ use crate::assets::PioneerIconName;
 use chrono::{Local, TimeZone};
 use gpui::{prelude::*, *};
 use gpui_component::{Icon, clipboard::Clipboard, h_flex, theme::ActiveTheme, v_flex};
-use pioneer_protocol::{ArtifactRef, TurnItem, UserMessageAttachment};
-use std::path::{Path, PathBuf};
-
-#[derive(Clone)]
-struct ParsedUserAttachment {
-    display_name: String,
-    kind: ParsedUserAttachmentKind,
-    artifact: Option<ArtifactRef>,
-}
-
-#[derive(Clone, Copy)]
-enum ParsedUserAttachmentKind {
-    File,
-    Skill,
-    Mcp,
-}
+use pioneer_client::timeline::labels::{
+    ParsedUserAttachment, ParsedUserAttachmentKind, parse_user_attachments,
+    stable_user_message_attachment_chip_id,
+};
+#[cfg(test)]
+use pioneer_client::timeline::labels::{artifact_from_attachment, display_name_from_attachment};
+use pioneer_protocol::TurnItem;
+use std::path::PathBuf;
 
 impl PioneerDesktop {
     pub(super) fn render_item_user_message(
@@ -242,73 +234,6 @@ impl PioneerDesktop {
     }
 }
 
-fn parse_user_attachments(attachments: &[UserMessageAttachment]) -> Vec<ParsedUserAttachment> {
-    attachments
-        .iter()
-        .map(|attachment| ParsedUserAttachment {
-            display_name: display_name_from_attachment(attachment),
-            kind: attachment_kind(attachment),
-            artifact: artifact_from_attachment(attachment),
-        })
-        .collect()
-}
-
-fn attachment_kind(attachment: &UserMessageAttachment) -> ParsedUserAttachmentKind {
-    match attachment {
-        UserMessageAttachment::Skill { .. } => ParsedUserAttachmentKind::Skill,
-        UserMessageAttachment::McpServer { .. } | UserMessageAttachment::McpTool { .. } => {
-            ParsedUserAttachmentKind::Mcp
-        }
-        _ => ParsedUserAttachmentKind::File,
-    }
-}
-
-fn display_name_from_attachment(attachment: &UserMessageAttachment) -> String {
-    let source = match attachment {
-        UserMessageAttachment::Image { url }
-        | UserMessageAttachment::File { url }
-        | UserMessageAttachment::Audio { url }
-        | UserMessageAttachment::Video { url } => url.as_str(),
-        UserMessageAttachment::LocalImage { path }
-        | UserMessageAttachment::LocalFile { path }
-        | UserMessageAttachment::LocalAudio { path }
-        | UserMessageAttachment::LocalVideo { path } => path.as_str(),
-        UserMessageAttachment::Artifact { artifact } => return artifact.display_name.clone(),
-        UserMessageAttachment::Skill { capability } => return capability.label.clone(),
-        UserMessageAttachment::McpServer { capability } => return capability.label.clone(),
-        UserMessageAttachment::McpTool { capability } => return capability.label.clone(),
-    };
-
-    if source.contains("://") || source.starts_with("data:") {
-        let without_query = source.split_once('?').map_or(source, |(value, _)| value);
-        let without_fragment = without_query
-            .split_once('#')
-            .map_or(without_query, |(value, _)| value);
-        let candidate = without_fragment
-            .rsplit('/')
-            .next()
-            .unwrap_or(without_fragment);
-        if candidate.is_empty() {
-            source.to_owned()
-        } else {
-            candidate.to_owned()
-        }
-    } else {
-        Path::new(source)
-            .file_name()
-            .and_then(|value| value.to_str())
-            .map(str::to_owned)
-            .unwrap_or_else(|| source.to_owned())
-    }
-}
-
-fn artifact_from_attachment(attachment: &UserMessageAttachment) -> Option<ArtifactRef> {
-    match attachment {
-        UserMessageAttachment::Artifact { artifact } => Some(artifact.clone()),
-        _ => None,
-    }
-}
-
 fn attachment_file_icon(flex_none: bool) -> gpui::Div {
     let mut container = div().size(px(22.)).flex().items_center().justify_center();
     if flex_none {
@@ -345,15 +270,6 @@ fn attachment_capability_icon(
                 .opacity(0.8)
                 .text_color(cx.theme().foreground),
         )
-}
-
-fn stable_user_message_attachment_chip_id(item_id: &str, chip_index: usize) -> u64 {
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    item_id.hash(&mut hasher);
-    chip_index.hash(&mut hasher);
-    hasher.finish()
 }
 
 #[cfg(test)]

@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SkillDependencyCard",
+  "type": "object",
+  "properties": {
+    "action_hint": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "kind": {
+      "$ref": "#/$defs/SkillDependencyKind"
+    },
+    "requirement_name": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "status": {
+      "$ref": "#/$defs/SkillDependencyStatus"
+    }
+  },
+  "required": [
+    "kind",
+    "status"
+  ],
+  "$defs": {
+    "SkillDependencyKind": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "Bin",
+            "Env",
+            "ApiKey",
+            "Command",
+            "Mcp",
+            "Tool"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Other": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Other"
+          ]
+        }
+      ]
+    },
+    "SkillDependencyStatus": {
+      "type": "string",
+      "enum": [
+        "Ready",
+        "Missing",
+        "Blocked",
+        "Warning",
+        "Unknown"
+      ]
+    }
+  }
+}

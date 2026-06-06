@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadListSnapshot",
+  "type": "object",
+  "properties": {
+    "active_thread_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "active_workspace_thread_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "draft_thread_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "has_known_threads_for_active_workspace": {
+      "type": "boolean"
+    },
+    "loading": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "active_workspace_thread_ids",
+    "has_known_threads_for_active_workspace",
+    "loading"
+  ]
+}

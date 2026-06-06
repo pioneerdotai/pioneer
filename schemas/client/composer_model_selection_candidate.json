@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ComposerModelSelectionCandidate",
+  "type": "object",
+  "properties": {
+    "has_turns": {
+      "type": "boolean"
+    },
+    "selection": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ComposerModelSelection"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "thread_id": {
+      "type": "string"
+    },
+    "updated_at": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "thread_id",
+    "workspace_id",
+    "updated_at",
+    "has_turns"
+  ],
+  "$defs": {
+    "ComposerModelSelection": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider",
+        "model"
+      ]
+    }
+  }
+}

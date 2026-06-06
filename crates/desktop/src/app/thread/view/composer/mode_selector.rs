@@ -8,6 +8,7 @@ use gpui_component::{
     theme::ActiveTheme,
     *,
 };
+use pioneer_client::composer::model_selection as composer_model_selection;
 use pioneer_protocol::ThreadMode;
 
 impl PioneerDesktop {
@@ -89,8 +90,12 @@ impl PioneerDesktop {
                         })
                         .on_click(move |_, window, cx| {
                             let _ = desktop_entity.update(cx, |view, cx| {
-                                view.composer_turn_mode = mode;
-                                cx.notify();
+                                if composer_model_selection::set_composer_turn_mode(
+                                    &mut view.composer_turn_mode,
+                                    mode,
+                                ) {
+                                    cx.notify();
+                                }
                             });
                             let _ = popover_entity.update(cx, |state, cx| {
                                 state.dismiss(window, cx);
@@ -128,23 +133,36 @@ impl PioneerDesktop {
                         .into_any_element()
                 };
 
-                v_flex()
-                    .w(px(320.))
-                    .gap_1()
-                    .child(render_option(
-                        "composer-mode-agent",
-                        ThreadMode::Agent,
-                        PioneerIconName::Infinity,
-                        t!("chat.composer.mode.agent_label").to_string(),
-                        t!("chat.composer.mode.agent_description").to_string(),
-                    ))
-                    .child(render_option(
-                        "composer-mode-chat",
-                        ThreadMode::Chat,
-                        PioneerIconName::MessageCircle,
-                        t!("chat.composer.mode.chat_label").to_string(),
-                        t!("chat.composer.mode.chat_description").to_string(),
-                    ))
+                v_flex().w(px(320.)).gap_1().children(
+                    composer_model_selection::composer_turn_mode_options()
+                        .into_iter()
+                        .map(|mode| {
+                            let (id, description) = match mode {
+                                ThreadMode::Agent => (
+                                    "composer-mode-agent",
+                                    t!("chat.composer.mode.agent_description").to_string(),
+                                ),
+                                ThreadMode::Chat => (
+                                    "composer-mode-chat",
+                                    t!("chat.composer.mode.chat_description").to_string(),
+                                ),
+                            };
+                            render_option(
+                                id,
+                                mode,
+                                Self::composer_mode_icon(mode),
+                                match mode {
+                                    ThreadMode::Agent => {
+                                        t!("chat.composer.mode.agent_label").to_string()
+                                    }
+                                    ThreadMode::Chat => {
+                                        t!("chat.composer.mode.chat_label").to_string()
+                                    }
+                                },
+                                description,
+                            )
+                        }),
+                )
             })
             .into_any_element()
     }

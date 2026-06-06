@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "McpTimelineMetadata",
+  "type": "object",
+  "properties": {
+    "catalog_version": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "duration_ms": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    },
+    "raw_tool_name": {
+      "type": "string"
+    },
+    "result_truncated": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "runtime_state": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "server_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "server_name": {
+      "type": "string"
+    },
+    "snapshot_version": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "server_name",
+    "raw_tool_name"
+  ]
+}

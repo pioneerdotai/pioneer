@@ -1,8 +1,8 @@
-use super::{
-    autosave::{AgentsDocAutosaveDecision, AgentsDocAutosaveState, AgentsDocEditorSaveState},
-    content::{
-        agents_doc_content_hash, agents_doc_initial_buffer, agents_doc_is_version_conflict_error,
-    },
+use super::content::{
+    agents_doc_content_hash, agents_doc_initial_buffer, agents_doc_is_version_conflict_error,
+};
+use pioneer_client::agents_doc::autosave::{
+    AgentsDocAutosaveDecision, AgentsDocAutosaveState, AgentsDocEditorSaveState,
 };
 use pioneer_protocol::{ThreadAgentsDocPayload, ThreadAgentsDocStatus};
 

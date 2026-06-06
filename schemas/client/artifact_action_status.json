@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ArtifactActionStatus",
+  "oneOf": [
+    {
+      "type": "string",
+      "enum": [
+        "Queued",
+        "Downloading",
+        "Verifying",
+        "Opening",
+        "Revealing"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "Failed": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Failed"
+      ]
+    }
+  ]
+}

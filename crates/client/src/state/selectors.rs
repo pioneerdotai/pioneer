@@ -1,0 +1,580 @@
+//! Shared client state selectors.
+
+use crate::{
+    agents_doc::scope as agents_doc_scope,
+    conversation::{Conversation, state_machine::TurnFlowState},
+    state::{
+        client_state::{ClientState, ThreadAgentsDocSummaryKey, WorkspaceThreadState},
+        snapshot::{ActiveThreadPhaseSnapshot, ActiveThreadStatusSnapshot},
+    },
+    threads::{coordinator::ThreadCoordinator, tree as thread_tree},
+    workspaces::selectors as workspace_selectors,
+};
+use pioneer_protocol::{ThreadAgentsDocSummary, ThreadFolder, ThreadPlacement, Workspace};
+use std::collections::HashMap;
+
+pub fn current_active_thread_id(state: &ClientState) -> Option<&str> {
+    state.threads.active_thread_id.as_deref()
+}
+
+pub fn draft_thread_id(state: &ClientState) -> Option<&str> {
+    state.threads.draft_thread_id.as_deref()
+}
+
+pub fn preferred_workspace_id(state: &ClientState) -> Option<&str> {
+    state.workspaces.preferred_workspace_id.as_deref()
+}
+
+pub fn workspaces(state: &ClientState) -> &[Workspace] {
+    state.workspaces.workspaces.as_slice()
+}
+
+pub fn workspace_by_id<'a>(
+    workspaces: &'a [Workspace],
+    workspace_id: &str,
+) -> Option<&'a Workspace> {
+    workspace_selectors::workspace_by_id(workspaces, workspace_id)
+}
+
+pub fn active_workspace_id<'a>(state: &'a ClientState) -> Option<&'a str> {
+    resolve_active_workspace_id(preferred_workspace_id(state), workspaces(state))
+}
+
+pub fn active_workspace(state: &ClientState) -> Option<&Workspace> {
+    let workspace_id = active_workspace_id(state)?;
+    workspace_by_id(workspaces(state), workspace_id)
+}
+
+pub fn last_active_thread_for_workspace<'a>(
+    state: &'a ClientState,
+    workspace_id: &str,
+) -> Option<&'a str> {
+    remembered_thread_for_workspace(&state.threads.last_active_thread_by_workspace, workspace_id)
+}
+
+pub fn draft_thread_for_workspace<'a>(
+    state: &'a ClientState,
+    workspace_id: &str,
+) -> Option<&'a str> {
+    remembered_thread_for_workspace(&state.threads.draft_thread_by_workspace, workspace_id)
+}
+
+pub fn has_in_flight_thread_start(state: &ClientState) -> bool {
+    has_in_flight_thread_start_from(
+        state.threads.start.in_progress,
+        state.threads.start.pending_thread_id.as_deref(),
+    )
+}
+
+pub fn remembered_thread_for_workspace<'a>(
+    remembered_threads: &'a HashMap<String, String>,
+    workspace_id: &str,
+) -> Option<&'a str> {
+    thread_tree::remembered_thread_for_workspace(remembered_threads, workspace_id)
+}
+
+pub fn has_in_flight_thread_start_from(
+    thread_start_in_progress: bool,
+    pending_thread_id: Option<&str>,
+) -> bool {
+    thread_start_in_progress || pending_thread_id.is_some()
+}
+
+pub fn thread_coordinator<'a>(
+    state: &'a ClientState,
+    thread_id: &str,
+) -> Option<&'a ThreadCoordinator> {
+    thread_coordinator_from(&state.threads.coordinators, thread_id)
+}
+
+pub fn thread_coordinator_from<'a>(
+    coordinators: &'a HashMap<String, ThreadCoordinator>,
+    thread_id: &str,
+) -> Option<&'a ThreadCoordinator> {
+    coordinators.get(thread_id)
+}
+
+pub fn thread_conversation<'a>(
+    state: &'a ClientState,
+    thread_id: &str,
+) -> Option<&'a Conversation> {
+    thread_conversation_from(&state.threads.coordinators, thread_id)
+}
+
+pub fn thread_workspace_id<'a>(state: &'a ClientState, thread_id: &str) -> Option<&'a str> {
+    thread_workspace_id_from(&state.threads.coordinators, thread_id)
+}
+
+pub fn thread_workspace_matches(state: &ClientState, thread_id: &str, workspace_id: &str) -> bool {
+    thread_workspace_id(state, thread_id) == Some(workspace_id)
+}
+
+pub fn model_selector_workspace_id(state: &ClientState) -> String {
+    model_selector_workspace_id_from(
+        active_workspace_id(state),
+        current_active_thread_id(state),
+        &state.threads.coordinators,
+    )
+}
+
+pub fn thread_conversation_from<'a>(
+    coordinators: &'a HashMap<String, ThreadCoordinator>,
+    thread_id: &str,
+) -> Option<&'a Conversation> {
+    thread_coordinator_from(coordinators, thread_id).map(|coordinator| &coordinator.conversation)
+}
+
+pub fn thread_workspace_id_from<'a>(
+    coordinators: &'a HashMap<String, ThreadCoordinator>,
+    thread_id: &str,
+) -> Option<&'a str> {
+    thread_coordinator_from(coordinators, thread_id)
+        .map(|coordinator| coordinator.workspace_id.as_str())
+}
+
+pub fn model_selector_workspace_id_from(
+    active_workspace_id: Option<&str>,
+    active_thread_id: Option<&str>,
+    coordinators: &HashMap<String, ThreadCoordinator>,
+) -> String {
+    active_workspace_id
+        .or_else(|| {
+            active_thread_id.and_then(|thread_id| thread_workspace_id_from(coordinators, thread_id))
+        })
+        .map(str::to_owned)
+        .unwrap_or_default()
+}
+
+pub fn thread_folders_for_workspace<'a>(
+    folders: &'a HashMap<String, ThreadFolder>,
+    workspace_id: &str,
+) -> Vec<&'a ThreadFolder> {
+    thread_tree::thread_folders_for_workspace(folders, workspace_id)
+}
+
+pub fn thread_agents_doc_summary<'a>(
+    summaries: &'a HashMap<ThreadAgentsDocSummaryKey, ThreadAgentsDocSummary>,
+    folder_id: Option<&str>,
+) -> Option<&'a ThreadAgentsDocSummary> {
+    agents_doc_scope::thread_agents_doc_summary(summaries, folder_id)
+}
+
+pub fn thread_agents_doc_summary_for_workspace<'a>(
+    summaries: &'a HashMap<ThreadAgentsDocSummaryKey, ThreadAgentsDocSummary>,
+    folder_id: Option<&str>,
+    workspace_id: &str,
+) -> Option<&'a ThreadAgentsDocSummary> {
+    agents_doc_scope::thread_agents_doc_summary_for_workspace(summaries, folder_id, workspace_id)
+}
+
+pub fn thread_placements_for_workspace<'a>(
+    placements: &'a HashMap<String, ThreadPlacement>,
+    workspace_id: &str,
+) -> Vec<&'a ThreadPlacement> {
+    thread_tree::thread_placements_for_workspace(placements, workspace_id)
+}
+
+pub fn has_known_threads_for_workspace(
+    coordinators: &HashMap<String, ThreadCoordinator>,
+    workspace_id: &str,
+) -> bool {
+    coordinators
+        .values()
+        .any(|coordinator| coordinator.workspace_id == workspace_id)
+}
+
+pub fn sorted_thread_ids_from_coordinators(
+    coordinators: &HashMap<String, ThreadCoordinator>,
+    draft_thread_id: Option<&str>,
+    workspace_id: Option<&str>,
+) -> Vec<String> {
+    thread_tree::sorted_thread_ids_from_coordinators(coordinators, draft_thread_id, workspace_id)
+}
+
+pub fn sorted_thread_ids_for_workspace(state: &ClientState, workspace_id: &str) -> Vec<String> {
+    sorted_thread_ids_from_coordinators(
+        &state.threads.coordinators,
+        draft_thread_id(state),
+        Some(workspace_id),
+    )
+}
+
+pub fn has_any_in_flight_turn(state: &ClientState) -> bool {
+    has_any_in_flight_turn_in(&state.threads.coordinators)
+}
+
+pub fn in_flight_turn_id_for_thread(state: &ClientState, thread_id: &str) -> Option<String> {
+    in_flight_turn_id_for_thread_in(&state.threads.coordinators, thread_id)
+}
+
+pub fn is_thread_history_loading(
+    coordinators: &HashMap<String, ThreadCoordinator>,
+    thread_id: &str,
+) -> bool {
+    coordinators
+        .get(thread_id)
+        .is_some_and(|coordinator| coordinator.history_loading)
+}
+
+pub fn is_thread_history_loaded(
+    coordinators: &HashMap<String, ThreadCoordinator>,
+    thread_id: &str,
+) -> bool {
+    coordinators
+        .get(thread_id)
+        .is_some_and(|coordinator| coordinator.history_loaded)
+}
+
+pub fn active_thread_conversation<'a>(
+    active_thread_id: Option<&str>,
+    coordinators: &'a HashMap<String, ThreadCoordinator>,
+) -> Option<&'a Conversation> {
+    active_thread_id.and_then(|thread_id| thread_conversation_from(coordinators, thread_id))
+}
+
+pub fn has_any_in_flight_turn_in(coordinators: &HashMap<String, ThreadCoordinator>) -> bool {
+    coordinators
+        .values()
+        .any(|coordinator| coordinator.conversation.in_flight_turn_id().is_some())
+}
+
+pub fn in_flight_turn_id_for_thread_in(
+    coordinators: &HashMap<String, ThreadCoordinator>,
+    thread_id: &str,
+) -> Option<String> {
+    thread_conversation_from(coordinators, thread_id)
+        .and_then(|conversation| conversation.in_flight_turn_id().map(str::to_owned))
+}
+
+pub fn active_thread_phase_snapshot(
+    conversation: Option<&Conversation>,
+) -> ActiveThreadPhaseSnapshot {
+    match conversation.map(Conversation::turn_flow_state) {
+        Some(TurnFlowState::Starting { .. }) => ActiveThreadPhaseSnapshot::Starting,
+        Some(TurnFlowState::Running { .. }) => ActiveThreadPhaseSnapshot::Running,
+        Some(TurnFlowState::Cancelling { .. }) => ActiveThreadPhaseSnapshot::Cancelling,
+        Some(TurnFlowState::Completing { .. }) => ActiveThreadPhaseSnapshot::Completing,
+        Some(TurnFlowState::Completed { .. }) => ActiveThreadPhaseSnapshot::Completed,
+        Some(TurnFlowState::Failed { .. }) => ActiveThreadPhaseSnapshot::Failed,
+        Some(TurnFlowState::Blocked { .. }) => ActiveThreadPhaseSnapshot::Blocked,
+        Some(TurnFlowState::Cancelled { .. }) => ActiveThreadPhaseSnapshot::Cancelled,
+        Some(TurnFlowState::Idle) | None => ActiveThreadPhaseSnapshot::Idle,
+    }
+}
+
+pub fn active_thread_status_snapshot(
+    gateway_connected: bool,
+    active_thread_id: Option<&str>,
+    has_in_flight_thread_start: bool,
+    conversation: Option<&Conversation>,
+) -> ActiveThreadStatusSnapshot {
+    if !gateway_connected {
+        return ActiveThreadStatusSnapshot::GatewayDisconnected;
+    }
+
+    if active_thread_id.is_none() && has_in_flight_thread_start {
+        return ActiveThreadStatusSnapshot::StartingThread;
+    }
+
+    let phase = active_thread_phase_snapshot(conversation);
+
+    if phase == ActiveThreadPhaseSnapshot::Completing {
+        return ActiveThreadStatusSnapshot::FinishingTurn;
+    }
+
+    if let Some(turn_id) = conversation.and_then(Conversation::in_flight_turn_id) {
+        return ActiveThreadStatusSnapshot::TurnRunning {
+            turn_id: turn_id.to_owned(),
+        };
+    }
+
+    match phase {
+        ActiveThreadPhaseSnapshot::Failed => ActiveThreadStatusSnapshot::PreviousTurnFailed,
+        ActiveThreadPhaseSnapshot::Cancelled => ActiveThreadStatusSnapshot::TurnCancelled,
+        ActiveThreadPhaseSnapshot::Completed => ActiveThreadStatusSnapshot::TurnCompleted,
+        ActiveThreadPhaseSnapshot::Starting => ActiveThreadStatusSnapshot::StartingTurn,
+        ActiveThreadPhaseSnapshot::Running => ActiveThreadStatusSnapshot::AgentProcessing,
+        ActiveThreadPhaseSnapshot::Idle
+        | ActiveThreadPhaseSnapshot::Cancelling
+        | ActiveThreadPhaseSnapshot::Completing
+        | ActiveThreadPhaseSnapshot::Blocked => ActiveThreadStatusSnapshot::Ready,
+    }
+}
+
+pub fn normalize_workspace_id(value: Option<String>) -> Option<String> {
+    workspace_selectors::normalize_workspace_id(value)
+}
+
+pub fn resolve_active_workspace_id<'a>(
+    persisted_workspace_id: Option<&str>,
+    workspaces: &'a [Workspace],
+) -> Option<&'a str> {
+    workspace_selectors::resolve_active_workspace_id(persisted_workspace_id, workspaces)
+}
+
+pub fn resolve_thread_tree_workspace_id(
+    active_workspace_id: Option<&str>,
+    preferred_workspace_id: Option<&str>,
+    runtime_workspace_id: Option<&str>,
+) -> Option<String> {
+    workspace_selectors::resolve_workspace_scope(
+        active_workspace_id,
+        preferred_workspace_id,
+        runtime_workspace_id,
+    )
+}
+
+pub fn workspace_switch_is_noop(
+    current_workspace_id: Option<&str>,
+    target_workspace_id: &str,
+) -> bool {
+    workspace_selectors::workspace_switch_is_noop(current_workspace_id, target_workspace_id)
+}
+
+pub fn workspace_switch_target_is_known_active(
+    workspaces: &[Workspace],
+    target_workspace_id: &str,
+) -> bool {
+    workspace_selectors::workspace_switch_target_is_known_active(workspaces, target_workspace_id)
+}
+
+pub fn remember_workspace_thread_state(
+    workspace_id: &str,
+    active_thread_id: Option<&str>,
+    draft_thread_id: Option<&str>,
+    pending_thread_id: Option<&str>,
+    thread_workspace_matches: impl Fn(&str, &str) -> bool,
+) -> WorkspaceThreadState {
+    thread_tree::remember_workspace_thread_state(
+        workspace_id,
+        active_thread_id,
+        draft_thread_id,
+        pending_thread_id,
+        thread_workspace_matches,
+    )
+}
+
+pub fn restore_workspace_thread_state(
+    workspace_id: &str,
+    last_active_thread_id: Option<&str>,
+    draft_thread_id: Option<&str>,
+    thread_workspace_matches: impl Fn(&str, &str) -> bool,
+) -> WorkspaceThreadState {
+    thread_tree::restore_workspace_thread_state(
+        workspace_id,
+        last_active_thread_id,
+        draft_thread_id,
+        thread_workspace_matches,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conversation::ConversationEvent;
+    use pioneer_protocol::{
+        Thread, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus,
+    };
+
+    fn workspace(id: &str, is_active: bool, is_current: bool) -> Workspace {
+        Workspace {
+            id: id.to_owned(),
+            name: format!("{id} workspace"),
+            is_active,
+            is_current,
+            created_at: 1,
+            updated_at: 2,
+        }
+    }
+
+    fn thread(thread_id: &str, workspace_id: &str, updated_at: i64) -> Thread {
+        Thread {
+            workspace_id: workspace_id.to_owned(),
+            id: thread_id.to_owned(),
+            name: None,
+            preview: String::new(),
+            mode: ThreadMode::Chat,
+            model: "gpt-5.4".to_owned(),
+            model_provider: "openai".to_owned(),
+            created_at: updated_at,
+            updated_at,
+            status: ThreadStatus::Idle,
+            origin_kind: ThreadOriginKind::User,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            turns: Vec::new(),
+        }
+    }
+
+    fn coordinator(thread_id: &str, workspace_id: &str, updated_at: i64) -> ThreadCoordinator {
+        ThreadCoordinator::new(thread(thread_id, workspace_id, updated_at))
+    }
+
+    #[test]
+    fn resolve_active_workspace_prefers_valid_persisted_id() {
+        let workspaces = vec![
+            workspace("ws_1", true, true),
+            workspace("ws_2", true, false),
+        ];
+
+        assert_eq!(
+            resolve_active_workspace_id(Some("ws_2"), workspaces.as_slice()),
+            Some("ws_2")
+        );
+    }
+
+    #[test]
+    fn resolve_active_workspace_ignores_invalid_persisted_id_and_uses_current() {
+        let workspaces = vec![
+            workspace("ws_1", true, false),
+            workspace("ws_2", true, true),
+        ];
+
+        assert_eq!(
+            resolve_active_workspace_id(Some("missing"), workspaces.as_slice()),
+            Some("ws_2")
+        );
+    }
+
+    #[test]
+    fn workspace_filter_sorted_thread_ids_ignores_other_workspace_and_draft() {
+        let coordinators = HashMap::from([
+            (
+                "thread_a_old".to_owned(),
+                coordinator("thread_a_old", "ws_a", 10),
+            ),
+            (
+                "thread_a_new".to_owned(),
+                coordinator("thread_a_new", "ws_a", 30),
+            ),
+            (
+                "thread_a_draft".to_owned(),
+                coordinator("thread_a_draft", "ws_a", 40),
+            ),
+            (
+                "thread_b_newer".to_owned(),
+                coordinator("thread_b_newer", "ws_b", 100),
+            ),
+        ]);
+
+        assert_eq!(
+            sorted_thread_ids_from_coordinators(
+                &coordinators,
+                Some("thread_a_draft"),
+                Some("ws_a")
+            ),
+            vec!["thread_a_new".to_owned(), "thread_a_old".to_owned()]
+        );
+    }
+
+    #[test]
+    fn workspace_thread_state_restores_valid_draft_when_last_active_missing() {
+        let threads = HashMap::from([("draft_a", "ws_a"), ("thr_b", "ws_b")]);
+        let matches_workspace = |thread_id: &str, workspace_id: &str| {
+            threads.get(thread_id).copied() == Some(workspace_id)
+        };
+
+        let restored = restore_workspace_thread_state(
+            "ws_a",
+            Some("thr_missing"),
+            Some("draft_a"),
+            matches_workspace,
+        );
+
+        assert_eq!(
+            restored,
+            WorkspaceThreadState {
+                active_thread_id: Some("draft_a".to_owned()),
+                draft_thread_id: Some("draft_a".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn root_thread_selectors_read_coordinator_map_without_shell_state() {
+        let mut coordinators =
+            HashMap::from([("thread_a".to_owned(), coordinator("thread_a", "ws_a", 30))]);
+        coordinators
+            .get_mut("thread_a")
+            .expect("thread fixture")
+            .history_loaded = true;
+
+        assert_eq!(
+            thread_workspace_id_from(&coordinators, "thread_a"),
+            Some("ws_a")
+        );
+        assert!(is_thread_history_loaded(&coordinators, "thread_a"));
+        assert!(!is_thread_history_loading(&coordinators, "thread_a"));
+        assert_eq!(
+            model_selector_workspace_id_from(None, Some("thread_a"), &coordinators),
+            "ws_a"
+        );
+        assert_eq!(
+            model_selector_workspace_id_from(Some("ws_selected"), Some("thread_a"), &coordinators),
+            "ws_selected"
+        );
+    }
+
+    #[test]
+    fn active_thread_status_snapshot_is_ui_neutral() {
+        assert_eq!(
+            active_thread_status_snapshot(false, Some("thread_a"), false, None),
+            ActiveThreadStatusSnapshot::GatewayDisconnected
+        );
+        assert_eq!(
+            active_thread_status_snapshot(true, None, true, None),
+            ActiveThreadStatusSnapshot::StartingThread
+        );
+        assert_eq!(
+            active_thread_status_snapshot(true, None, false, None),
+            ActiveThreadStatusSnapshot::Ready
+        );
+    }
+
+    #[test]
+    fn active_thread_phase_snapshot_tracks_turn_lifecycle_without_string_matching() {
+        let mut conversation = Conversation::new("thread_a");
+        assert_eq!(
+            active_thread_phase_snapshot(Some(&conversation)),
+            ActiveThreadPhaseSnapshot::Idle
+        );
+
+        conversation.apply(ConversationEvent::LocalTurnStartRequested {
+            thread_id: "thread_a".to_owned(),
+            turn_id: "turn_a".to_owned(),
+            pending_request_id: "request_a".to_owned(),
+            user_text: "hello".to_owned(),
+            attachments: Vec::new(),
+        });
+        assert_eq!(
+            active_thread_phase_snapshot(Some(&conversation)),
+            ActiveThreadPhaseSnapshot::Starting
+        );
+
+        conversation.apply(ConversationEvent::LocalTurnStartAccepted {
+            thread_id: "thread_a".to_owned(),
+            turn_id: "turn_a".to_owned(),
+            pending_request_id: "request_a".to_owned(),
+        });
+        assert_eq!(
+            active_thread_phase_snapshot(Some(&conversation)),
+            ActiveThreadPhaseSnapshot::Running
+        );
+        assert_eq!(
+            active_thread_status_snapshot(true, Some("thread_a"), false, Some(&conversation)),
+            ActiveThreadStatusSnapshot::TurnRunning {
+                turn_id: "turn_a".to_owned(),
+            }
+        );
+
+        conversation.apply(ConversationEvent::LocalTurnCancelRequested {
+            thread_id: "thread_a".to_owned(),
+            turn_id: "turn_a".to_owned(),
+        });
+        assert_eq!(
+            active_thread_phase_snapshot(Some(&conversation)),
+            ActiveThreadPhaseSnapshot::Cancelling
+        );
+    }
+}

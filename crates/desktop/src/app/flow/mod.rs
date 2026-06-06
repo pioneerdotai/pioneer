@@ -1,4 +1,5 @@
 mod bootstrap;
+mod client_effects;
 mod helpers;
 mod lifecycle_gateway_ops;
 mod lifecycle_operation;
@@ -20,13 +21,10 @@ mod ws_events_pump;
 
 use super::root::{
     GatewayConnectionState, GatewayOperationSource, GatewaySetupAction, GatewayStatusLevel,
-    MainContentView, PioneerDesktop, resolve_active_workspace_id,
+    MainContentView, PioneerDesktop,
 };
 use crate::app::gateway_setup::GatewaySetupFormState;
-use crate::gateway::{
-    ActiveGatewayState, GatewayEndpoint, GatewayEndpointKind, GatewayInstallWarning,
-    GatewayRuntime, GatewayWsClient, GatewayWsConnectSpec, GatewayWsEvent,
-};
+use crate::gateway::{GatewayInstallWarning, GatewayRuntime, GatewayWsClient};
 use anyhow::anyhow;
 use gpui::{prelude::*, *};
 use gpui_component::{
@@ -40,16 +38,18 @@ use gpui_component::{
     theme::ActiveTheme,
     *,
 };
+use pioneer_client::gateway::types::{GatewayEndpoint, GatewayEndpointKind};
+use pioneer_client::transport::ws::{GatewayWsConnectSpec, GatewayWsEvent};
 use pioneer_protocol::generate_id;
 use pioneer_protocol::{
-    GatewayNotification, ThreadHistoryParams, ThreadHistoryResponse, ThreadStartParams,
-    ThreadTreeParams, TurnGetParams, TurnItemEventPayload, TurnItemsParams, TurnTimelineParams,
-    TurnTimelineResponse, Workspace, WorkspaceChangeKind, WorkspaceChangedNotification,
+    GatewayNotification, ThreadHistoryParams, ThreadHistoryResponse, ThreadTreeParams,
+    TurnTimelineParams, TurnTimelineResponse, Workspace, WorkspaceChangedNotification,
     WorkspaceSelectParams,
 };
 use std::time::Duration;
 use tracing::warn;
 
+use client_effects::*;
 use helpers::*;
 pub(crate) use workspace_bootstrap::*;
 
@@ -59,13 +59,8 @@ use ws_events_notifications::{
     should_refresh_workspace_bound_data,
 };
 
-const THREAD_START_RETRY_INITIAL_DELAY_MS: u64 = 500;
-const THREAD_START_RETRY_MAX_DELAY_MS: u64 = 5_000;
-const TURN_RESUME_RETRY_INITIAL_DELAY_MS: u64 = 800;
-const TURN_RESUME_RETRY_MAX_DELAY_MS: u64 = 5_000;
 const REMOTE_WS_CONNECT_TIMEOUT_MIN_MS: u64 = 5_000;
-const ID_LEN: usize = 21;
-const WORKSPACE_START_SCOPE_BOOTSTRAP: &str = "__bootstrap__";
+const ID_LEN: usize = pioneer_client::threads::start::THREAD_START_ID_LEN;
 
 struct GatewayOperationSuccess {
     runtime: GatewayRuntime,

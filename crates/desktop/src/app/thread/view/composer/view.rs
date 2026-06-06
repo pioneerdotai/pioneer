@@ -25,16 +25,12 @@ impl PioneerDesktop {
         let capabilities = self.composer_capabilities.clone();
         let upload_error = self.composer_upload_error.clone();
         let can_send = self.can_submit_message(cx);
-        let in_flight_turn_id = self
-            .active_thread_conversation()
-            .and_then(|conversation| conversation.in_flight_turn_id().map(str::to_owned));
-        let is_cancelling = self
-            .active_thread_conversation()
-            .is_some_and(|conversation| conversation.is_cancelling_turn());
-        let can_stop = in_flight_turn_id.is_some()
-            && self.gateway.connection_state == crate::app::root::GatewayConnectionState::Connected
-            && !is_cancelling;
-        let has_in_flight_turn = in_flight_turn_id.is_some();
+        let active_thread_snapshot = self.client_snapshot().active_thread;
+        let gateway_connected =
+            self.gateway.connection_state == crate::app::root::GatewayConnectionState::Connected;
+        let is_cancelling = active_thread_snapshot.is_cancelling_turn();
+        let can_stop = active_thread_snapshot.can_request_turn_cancel(gateway_connected);
+        let has_in_flight_turn = active_thread_snapshot.has_in_flight_turn();
 
         let composer_action_id = if has_in_flight_turn {
             "stop-turn"

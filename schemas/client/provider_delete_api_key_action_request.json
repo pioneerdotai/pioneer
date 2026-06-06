@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ProviderApiKeyActionRequest",
+  "type": "object",
+  "properties": {
+    "canonical_provider_id": {
+      "type": "string"
+    },
+    "connection_id": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "params": {
+      "$ref": "#/$defs/ProviderDeleteApiKeyParams"
+    }
+  },
+  "required": [
+    "connection_id",
+    "canonical_provider_id",
+    "params"
+  ],
+  "$defs": {
+    "ProviderDeleteApiKeyParams": {
+      "type": "object",
+      "properties": {
+        "provider": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "provider"
+      ]
+    }
+  }
+}

@@ -5,27 +5,9 @@ use crate::app::{
 };
 use gpui::{prelude::*, *};
 use gpui_component::{collapsible::Collapsible, h_flex, spinner::Spinner, v_flex, *};
+use pioneer_client::timeline::labels::{TimelineFinalStatusKind, final_file_change_status};
 use pioneer_protocol::TurnItem;
 use std::hash::{Hash, Hasher};
-
-fn final_file_change_status(
-    status: TimelineEntryStatus,
-    success: Option<bool>,
-    exit_code: Option<i32>,
-) -> (String, bool) {
-    match status {
-        TimelineEntryStatus::Cancelled => (t!("timeline.file_change.cancelled").to_string(), false),
-        TimelineEntryStatus::Failed => (t!("timeline.file_change.failed").to_string(), false),
-        TimelineEntryStatus::Running => (t!("timeline.file_change.running").to_string(), true),
-        TimelineEntryStatus::Completed => {
-            if matches!(success, Some(false)) || exit_code.is_some_and(|code| code != 0) {
-                (t!("timeline.file_change.failed").to_string(), false)
-            } else {
-                (t!("timeline.file_change.completed").to_string(), true)
-            }
-        }
-    }
-}
 
 fn changed_files_label(count: usize) -> String {
     match count {
@@ -117,8 +99,9 @@ impl PioneerDesktop {
         entry.id.hash(&mut toggle_id_hasher);
         let toggle_id = toggle_id_hasher.finish();
 
-        let (final_status, is_successful) =
-            final_file_change_status(item_view.status, success, exit_code);
+        let status = final_file_change_status(item_view.status, success, exit_code);
+        let final_status = file_change_status_label(status.kind);
+        let is_successful = status.successful;
 
         let content = if item_view.status == TimelineEntryStatus::Running {
             v_flex()
@@ -343,5 +326,14 @@ impl PioneerDesktop {
                     ),
             )
             .into_any_element()
+    }
+}
+
+fn file_change_status_label(kind: TimelineFinalStatusKind) -> String {
+    match kind {
+        TimelineFinalStatusKind::Cancelled => t!("timeline.file_change.cancelled").to_string(),
+        TimelineFinalStatusKind::Failed => t!("timeline.file_change.failed").to_string(),
+        TimelineFinalStatusKind::Running => t!("timeline.file_change.running").to_string(),
+        TimelineFinalStatusKind::Completed => t!("timeline.file_change.completed").to_string(),
     }
 }
