@@ -36,6 +36,23 @@ pub fn skill_upload_progress(
     }
 }
 
+pub fn skill_upload_progress_fraction(progress: &SkillUploadProgress) -> f32 {
+    if progress.total_bytes == 0 {
+        return 0.0;
+    }
+
+    (progress.sent_bytes as f32 / progress.total_bytes as f32).clamp(0.0, 1.0)
+}
+
+pub fn skill_upload_progress_text(progress: &SkillUploadProgress) -> String {
+    if progress.total_bytes == 0 {
+        return progress.label.clone();
+    }
+
+    let percent = (skill_upload_progress_fraction(progress) * 100.0).round() as u32;
+    format!("{} {}%", progress.label, percent)
+}
+
 pub fn archive_compressed_size(archive: &SkillUploadArchive) -> Result<u64> {
     u64::try_from(archive.bytes.len()).map_err(|_| anyhow!("skill archive size overflow"))
 }
@@ -176,6 +193,21 @@ mod tests {
         assert_eq!(params.compressed_size_bytes, 3);
         assert_eq!(params.uncompressed_size_hint_bytes, Some(100));
         assert_eq!(params.sha256, "abc123");
+    }
+
+    #[test]
+    fn progress_fraction_and_text_handle_pending_active_and_overflow_states() {
+        let pending = skill_upload_progress("Preparing", 0, 0);
+        assert_eq!(skill_upload_progress_fraction(&pending), 0.0);
+        assert_eq!(skill_upload_progress_text(&pending), "Preparing");
+
+        let active = skill_upload_progress("Uploading", 25, 100);
+        assert_eq!(skill_upload_progress_fraction(&active), 0.25);
+        assert_eq!(skill_upload_progress_text(&active), "Uploading 25%");
+
+        let overflow = skill_upload_progress("Uploading", 120, 100);
+        assert_eq!(skill_upload_progress_fraction(&overflow), 1.0);
+        assert_eq!(skill_upload_progress_text(&overflow), "Uploading 100%");
     }
 
     #[test]

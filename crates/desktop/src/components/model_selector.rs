@@ -456,7 +456,7 @@ impl PioneerDesktop {
             .provider_search_input
             .read(popover_cx)
             .value()
-            .to_lowercase();
+            .to_owned();
 
         let filtered =
             provider_presentation::filter_model_selector_providers(&provider_list, &search_text);
@@ -638,11 +638,7 @@ impl PioneerDesktop {
                 selector.error().map(str::to_owned),
             )
         };
-        let search_text = state
-            .model_search_input
-            .read(popover_cx)
-            .value()
-            .to_lowercase();
+        let search_text = state.model_search_input.read(popover_cx).value().to_owned();
         let has_error = error_text.is_some();
 
         let filtered: Vec<ProviderModelInfo> =
@@ -855,9 +851,9 @@ impl PioneerDesktop {
         ghost_active: Hsla,
     ) -> AnyElement {
         let model_id = model.id.clone();
-        let display_name = model.name.clone().unwrap_or_else(|| model.id.clone());
+        let display_name = provider_presentation::model_selector_model_display_name(model);
         let is_active = state.selector.borrow().selected_model() == Some(model_id.as_str());
-        let has_name = model.name.is_some();
+        let has_name = provider_presentation::model_selector_model_has_name(model);
         let raw_id = model.id.clone();
         let id: SharedString = format!("model-vl-{ix}").into();
 

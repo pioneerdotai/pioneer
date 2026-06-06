@@ -1,7 +1,5 @@
 use super::*;
 use pioneer_client::gateway::runtime as client_gateway_runtime;
-#[cfg(test)]
-use pioneer_client::threads::resume as thread_resume;
 use pioneer_client::threads::start as thread_start;
 use pioneer_client::transport::ws as client_ws;
 
@@ -61,16 +59,6 @@ pub(crate) fn is_transient_thread_start_error(error: &anyhow::Error) -> bool {
     thread_start::is_transient_thread_start_error_message(format!("{error:#}").as_str())
 }
 
-#[cfg(test)]
-pub(crate) fn thread_start_retry_delay(attempt: u32) -> Duration {
-    thread_start::thread_start_retry_delay(attempt)
-}
-
-#[cfg(test)]
-pub(crate) fn turn_resume_retry_delay(attempt: u32) -> Duration {
-    thread_resume::turn_resume_retry_delay(attempt)
-}
-
 pub(crate) fn should_apply_gateway_operation_result(
     current_epoch: u64,
     operation_epoch: u64,
@@ -112,7 +100,10 @@ pub(crate) fn gateway_has_ready_ws_connection(
     connection_state: GatewayConnectionState,
     ws_connection_id: Option<u64>,
 ) -> bool {
-    connection_state == GatewayConnectionState::Connected && ws_connection_id.is_some()
+    pioneer_client::state::client_state::gateway_has_ready_ws_connection(
+        connection_state,
+        ws_connection_id,
+    )
 }
 
 pub(crate) fn gateway_activation_is_noop(

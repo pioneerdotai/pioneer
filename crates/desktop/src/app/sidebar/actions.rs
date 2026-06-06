@@ -5,6 +5,7 @@ use crate::app::{
 use gpui::{prelude::*, *};
 use pioneer_client::agents_doc::scope as agents_doc_scope;
 use pioneer_client::threads::tree as thread_tree;
+use pioneer_client::workspaces::selectors as workspace_selectors;
 use tracing::warn;
 
 impl PioneerDesktop {
@@ -574,12 +575,15 @@ impl PioneerDesktop {
     }
 
     fn sidebar_workspace_id(&self) -> Option<String> {
-        self.active_workspace_id().map(str::to_owned).or_else(|| {
-            self.gateway
-                .runtime
-                .as_ref()
-                .and_then(crate::gateway::GatewayRuntime::active_workspace_id)
-                .map(str::to_owned)
-        })
+        let runtime_workspace_id = self
+            .gateway
+            .runtime
+            .as_ref()
+            .and_then(crate::gateway::GatewayRuntime::active_workspace_id);
+        workspace_selectors::resolve_workspace_scope(
+            self.active_workspace_id(),
+            None,
+            runtime_workspace_id,
+        )
     }
 }

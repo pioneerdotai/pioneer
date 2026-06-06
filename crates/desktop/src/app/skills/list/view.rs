@@ -6,7 +6,7 @@ use gpui_component::{
     theme::ActiveTheme,
     *,
 };
-use pioneer_client::skills::presentation as skill_presentation;
+use pioneer_client::skills::{presentation as skill_presentation, upload as skill_upload};
 use pioneer_protocol::SkillListItem;
 use std::rc::Rc;
 
@@ -67,21 +67,10 @@ impl PioneerDesktop {
                             .h_full()
                             .gap_3()
                             .when_some(skills_upload_progress, |this, progress| {
-                                let progress_width = if progress.total_bytes == 0 {
-                                    0.0
-                                } else {
-                                    (progress.sent_bytes as f32 / progress.total_bytes as f32)
-                                        .clamp(0.0, 1.0)
-                                };
-                                let progress_text = if progress.total_bytes == 0 {
-                                    progress.label.clone()
-                                } else {
-                                    format!(
-                                        "{} {}%",
-                                        progress.label,
-                                        (progress_width * 100.0).round() as u32
-                                    )
-                                };
+                                let progress_fraction =
+                                    skill_upload::skill_upload_progress_fraction(&progress);
+                                let progress_label =
+                                    skill_upload::skill_upload_progress_text(&progress);
                                 this.child(
                                     h_flex()
                                         .w_full()
@@ -109,7 +98,7 @@ impl PioneerDesktop {
                                                             div()
                                                                 .text_sm()
                                                                 .font_medium()
-                                                                .child(progress_text),
+                                                                .child(progress_label),
                                                         )
                                                         .child(
                                                             div()
@@ -120,9 +109,8 @@ impl PioneerDesktop {
                                                                 .child(
                                                                     div()
                                                                         .h(px(4.0))
-                                                                        .w(px(
-                                                                            240.0 * progress_width
-                                                                        ))
+                                                                        .w(px(240.0
+                                                                            * progress_fraction))
                                                                         .rounded_full()
                                                                         .bg(cx.theme().accent),
                                                                 ),

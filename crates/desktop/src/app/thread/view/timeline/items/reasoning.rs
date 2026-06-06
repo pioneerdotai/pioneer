@@ -8,6 +8,7 @@ use crate::{
 };
 use gpui::{prelude::*, *};
 use gpui_component::{collapsible::Collapsible, h_flex, spinner::Spinner, *};
+use pioneer_client::timeline::labels::reasoning_text;
 use pioneer_protocol::TurnItem;
 use std::hash::{Hash, Hasher};
 
@@ -25,20 +26,7 @@ impl PioneerDesktop {
         let body = match item {
             TurnItem::Reasoning {
                 summary, content, ..
-            } => {
-                let mut parts = Vec::new();
-                if !summary.is_empty() {
-                    parts.push(summary.join("\n"));
-                }
-                if !content.is_empty() {
-                    parts.push(content.join("\n"));
-                }
-                if parts.is_empty() {
-                    Self::timeline_entry_text(item_view).to_owned()
-                } else {
-                    parts.join("\n\n")
-                }
-            }
+            } => reasoning_text(summary, content, Self::timeline_entry_text(item_view)),
             _ => Self::timeline_entry_text(item_view).to_owned(),
         };
 

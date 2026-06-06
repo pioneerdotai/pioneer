@@ -40,8 +40,16 @@ pub fn filter_model_selector_models(
         .collect()
 }
 
+pub fn model_selector_model_display_name(model: &ProviderModelInfo) -> String {
+    model.name.clone().unwrap_or_else(|| model.id.clone())
+}
+
+pub fn model_selector_model_has_name(model: &ProviderModelInfo) -> bool {
+    model.name.is_some()
+}
+
 fn normalize_selector_query(query: &str) -> String {
-    query.to_lowercase()
+    query.trim().to_lowercase()
 }
 
 #[cfg(test)]
@@ -75,7 +83,7 @@ mod tests {
     #[test]
     fn model_selector_filters_providers_by_case_insensitive_name() {
         let rows =
-            filter_model_selector_providers(&[provider("OpenAI"), provider("Anthropic")], "open");
+            filter_model_selector_providers(&[provider("OpenAI"), provider("Anthropic")], " OPEN ");
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "OpenAI");
@@ -88,7 +96,7 @@ mod tests {
                 model("gpt-5.4", Some("GPT 5.4")),
                 model("anthropic/claude", Some("Claude Sonnet")),
             ],
-            "claude",
+            " CLAUDE ",
         );
 
         assert_eq!(rows.len(), 1);
@@ -97,5 +105,16 @@ mod tests {
         let rows = filter_model_selector_models(&[model("o4-mini", None)], "mini");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "o4-mini");
+    }
+
+    #[test]
+    fn model_selector_model_display_name_uses_name_then_id() {
+        let named = model("gpt-5.4", Some("GPT 5.4"));
+        assert_eq!(model_selector_model_display_name(&named), "GPT 5.4");
+        assert!(model_selector_model_has_name(&named));
+
+        let unnamed = model("o4-mini", None);
+        assert_eq!(model_selector_model_display_name(&unnamed), "o4-mini");
+        assert!(!model_selector_model_has_name(&unnamed));
     }
 }

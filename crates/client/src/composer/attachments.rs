@@ -78,6 +78,18 @@ pub fn composer_attachment_has_path(attachments: &[ComposerAttachment], path: &s
     attachments.iter().any(|attachment| attachment.path == path)
 }
 
+pub fn composer_attachment_display_name(attachment: &ComposerAttachment) -> String {
+    if !attachment.file_name.trim().is_empty() {
+        return attachment.file_name.clone();
+    }
+
+    Path::new(attachment.path.as_str())
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| attachment.path.clone())
+}
+
 pub fn composer_attachment_has_artifact(
     attachments: &[ComposerAttachment],
     artifact: &ArtifactRef,
@@ -223,10 +235,26 @@ mod tests {
 
         assert_eq!(attachment.path, "/tmp/snap.png");
         assert_eq!(attachment.file_name, "snap.png");
+        assert_eq!(composer_attachment_display_name(&attachment), "snap.png");
         assert_eq!(attachment.kind, ComposerAttachmentKind::Image);
         assert_eq!(
             attachment.upload_state,
             ComposerAttachmentUploadState::Local
+        );
+    }
+
+    #[test]
+    fn attachment_display_name_falls_back_to_path_file_name() {
+        let attachment = ComposerAttachment {
+            path: "/tmp/fallback.txt".to_owned(),
+            file_name: " ".to_owned(),
+            kind: ComposerAttachmentKind::File,
+            upload_state: ComposerAttachmentUploadState::Local,
+        };
+
+        assert_eq!(
+            composer_attachment_display_name(&attachment),
+            "fallback.txt"
         );
     }
 

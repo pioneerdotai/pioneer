@@ -2,7 +2,9 @@ use crate::gateway::connectivity::is_gateway_reachable;
 use crate::gateway::control::{is_configured_service_active, start_gateway_service};
 use crate::gateway::registry::save_registry;
 use anyhow::{Result, bail};
-use pioneer_client::gateway::runtime::classify_local_gateway_state;
+use pioneer_client::gateway::runtime::{
+    classify_local_gateway_state, normalize_local_service_active,
+};
 use pioneer_client::gateway::types::GatewayEndpointKind;
 use tracing::info;
 
@@ -133,13 +135,4 @@ impl GatewayRuntime {
             warnings,
         })
     }
-}
-
-fn normalize_local_service_active(reachable: bool, service_active: bool) -> bool {
-    // Prefer network reachability when service manager state is stale.
-    if reachable {
-        return true;
-    }
-
-    service_active
 }

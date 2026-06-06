@@ -86,6 +86,25 @@ pub fn gateway_memory_model_selection_from_model_selector(
     }
 }
 
+pub fn gateway_memory_model_selection_has_custom_model(
+    selection: &GatewayMemoryModelSelection,
+) -> bool {
+    selection.model_provider_override().is_some() && selection.model_override().is_some()
+}
+
+pub fn gateway_memory_model_selection_display_label(
+    selection: &GatewayMemoryModelSelection,
+    default_label: impl Into<String>,
+) -> String {
+    match (
+        selection.model_provider_override(),
+        selection.model_override(),
+    ) {
+        (Some(provider), Some(model)) => format!("{provider}/{model}"),
+        _ => default_label.into(),
+    }
+}
+
 pub fn gateway_settings_snapshot_with_memory(
     current: Option<&GatewaySettingsSnapshot>,
     memory: GatewayMemorySettings,
@@ -172,6 +191,29 @@ mod tests {
                 model: Some(" ".to_owned()),
             }),
             GatewayMemoryModelSelection::thread()
+        );
+    }
+
+    #[test]
+    fn model_selection_display_label_uses_custom_provider_model_or_default() {
+        let custom = GatewayMemoryModelSelection::custom(" openai ", " gpt-5.4 ");
+        assert!(gateway_memory_model_selection_has_custom_model(&custom));
+        assert_eq!(
+            gateway_memory_model_selection_display_label(&custom, "Thread default"),
+            "openai/gpt-5.4"
+        );
+
+        let incomplete = GatewayMemoryModelSelection {
+            source: pioneer_protocol::GatewayMemoryModelSelectionSource::Custom,
+            model_provider: Some("openai".to_owned()),
+            model: Some(" ".to_owned()),
+        };
+        assert!(!gateway_memory_model_selection_has_custom_model(
+            &incomplete
+        ));
+        assert_eq!(
+            gateway_memory_model_selection_display_label(&incomplete, "Thread default"),
+            "Thread default"
         );
     }
 

@@ -15,7 +15,7 @@ use pioneer_protocol::{
 };
 use std::{
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
 
@@ -99,6 +99,128 @@ pub trait ArtifactDownloadSink {
     fn finalize(&mut self) -> Result<ClientPath>;
 
     fn cleanup_partial(&mut self);
+}
+
+#[derive(Clone, Debug)]
+pub struct ArtifactDownloadFileCache {
+    runtime_home: PathBuf,
+}
+
+impl ArtifactDownloadFileCache {
+    pub fn new(runtime_home: impl Into<PathBuf>) -> Self {
+        Self {
+            runtime_home: runtime_home.into(),
+        }
+    }
+
+    pub fn runtime_home(&self) -> &Path {
+        self.runtime_home.as_path()
+    }
+}
+
+impl ArtifactDownloadCache for ArtifactDownloadFileCache {
+    type Sink = ArtifactDownloadFileSink;
+
+    fn prune(&self) -> Result<()> {
+        let _ = prune_artifact_download_cache(self.runtime_home(), ARTIFACT_DOWNLOAD_CACHE_MAX_AGE);
+        Ok(())
+    }
+
+    fn create_sink(
+        &self,
+        request: &ArtifactDownloadRequest,
+        start: &ArtifactDownloadStartResponse,
+        version_id: &str,
+    ) -> Result<Self::Sink> {
+        let cache_paths = build_artifact_download_cache_path(
+            self.runtime_home(),
+            request.gateway_profile_id.as_str(),
+            request.workspace_id.as_str(),
+            request.artifact_id.as_str(),
+            version_id,
+            start.file_name.as_str(),
+        )?;
+        Ok(ArtifactDownloadFileSink {
+            cache_paths,
+            expected_size_bytes: start.size_bytes,
+            expected_sha256: start.sha256.clone(),
+            file: None,
+        })
+    }
+}
+
+pub struct ArtifactDownloadFileSink {
+    cache_paths: ArtifactDownloadCachePaths,
+    expected_size_bytes: u64,
+    expected_sha256: String,
+    file: Option<fs::File>,
+}
+
+impl ArtifactDownloadSink for ArtifactDownloadFileSink {
+    fn prepare(&mut self) -> Result<()> {
+        if let Some(parent) = self.cache_paths.part_path.as_path().parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create artifact download cache {}",
+                    parent.display()
+                )
+            })?;
+        }
+        let _ = fs::remove_file(self.cache_paths.part_path.as_path());
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true)
+            .truncate(true)
+            .open(self.cache_paths.part_path.as_path())
+            .with_context(|| {
+                format!(
+                    "failed to create artifact download part file {}",
+                    self.cache_paths.part_path.as_path().display()
+                )
+            })?;
+        self.file = Some(file);
+        Ok(())
+    }
+
+    fn write_chunk(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| anyhow!("artifact download sink is not prepared"))?;
+        write_chunk_at(file, offset, bytes)
+    }
+
+    fn finalize(&mut self) -> Result<ClientPath> {
+        if let Some(file) = self.file.take() {
+            file.sync_data()
+                .context("failed to sync artifact download")?;
+        }
+
+        verify_artifact_download_file(
+            self.cache_paths.part_path.as_path(),
+            self.expected_size_bytes,
+            self.expected_sha256.as_str(),
+        )?;
+
+        let _ = fs::remove_file(self.cache_paths.final_path.as_path());
+        fs::rename(
+            self.cache_paths.part_path.as_path(),
+            self.cache_paths.final_path.as_path(),
+        )
+        .with_context(|| {
+            format!(
+                "failed to finalize artifact download {}",
+                self.cache_paths.final_path.as_path().display()
+            )
+        })?;
+        Ok(self.cache_paths.final_path.clone())
+    }
+
+    fn cleanup_partial(&mut self) {
+        self.file.take();
+        let _ = fs::remove_file(self.cache_paths.part_path.as_path());
+    }
 }
 
 pub fn build_artifact_download_cache_path(
@@ -356,6 +478,16 @@ fn prune_download_cache_dir(dir: &Path, cutoff: SystemTime) -> Result<u64> {
     Ok(removed)
 }
 
+fn write_chunk_at(file: &mut fs::File, offset: u64, bytes: &[u8]) -> Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    file.seek(SeekFrom::Start(offset))
+        .context("failed to seek artifact download part file")?;
+    file.write_all(bytes)
+        .context("failed to write artifact download chunk")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,6 +545,71 @@ mod tests {
         assert_eq!(transport.aborted(), vec!["download_1".to_owned()]);
         assert!(transport.finished().is_empty());
         assert_eq!(cache.cleaned_partials(), vec![true]);
+    }
+
+    #[test]
+    fn artifacts_file_cache_download_writes_verified_file() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let transport = FakeDownloadTransport::new(b"hello world".to_vec());
+        let cache = ArtifactDownloadFileCache::new(temp.path());
+
+        let result = download_artifact_to_cache(
+            &transport,
+            &cache,
+            ArtifactDownloadRequest {
+                gateway_profile_id: "gateway_1".to_owned(),
+                workspace_id: "ws_1".to_owned(),
+                artifact_id: "artifact_1".to_owned(),
+                version_id: Some("version_1".to_owned()),
+            },
+        )
+        .expect("download artifact");
+
+        assert_eq!(
+            fs::read(result.local_path.as_path()).expect("read downloaded artifact"),
+            b"hello world"
+        );
+        verify_artifact_download_file(
+            result.local_path.as_path(),
+            b"hello world".len() as u64,
+            sha256_bytes(b"hello world").as_str(),
+        )
+        .expect("verified artifact file");
+        assert!(transport.aborted().is_empty());
+    }
+
+    #[test]
+    fn artifacts_file_cache_removes_partial_on_download_failure() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let transport = FakeDownloadTransport::new(b"hello".to_vec());
+        transport.fail_waiter("download interrupted");
+        let cache = ArtifactDownloadFileCache::new(temp.path());
+        let paths = build_artifact_download_cache_path(
+            temp.path(),
+            "gateway_1",
+            "ws_1",
+            "artifact_1",
+            "version_1",
+            "artifact.txt",
+        )
+        .expect("cache path");
+
+        let error = download_artifact_to_cache(
+            &transport,
+            &cache,
+            ArtifactDownloadRequest {
+                gateway_profile_id: "gateway_1".to_owned(),
+                workspace_id: "ws_1".to_owned(),
+                artifact_id: "artifact_1".to_owned(),
+                version_id: Some("version_1".to_owned()),
+            },
+        )
+        .expect_err("wait failure should abort");
+
+        assert!(error.to_string().contains("download interrupted"));
+        assert_eq!(transport.aborted(), vec!["download_1".to_owned()]);
+        assert!(!paths.part_path.as_path().exists());
+        assert!(!paths.final_path.as_path().exists());
     }
 
     #[test]

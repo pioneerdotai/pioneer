@@ -1,8 +1,19 @@
 //! Thread history helpers.
 
 use pioneer_protocol::{
-    ThreadHistoryEventPayload, ThreadHistoryResponse, TurnItem, TurnTimelineParams,
+    ThreadHistoryEventPayload, ThreadHistoryParams, ThreadHistoryResponse, TurnItem,
+    TurnTimelineParams,
 };
+
+pub fn thread_history_params(
+    thread_id: impl Into<String>,
+    limit: Option<u32>,
+) -> ThreadHistoryParams {
+    ThreadHistoryParams {
+        thread_id: thread_id.into(),
+        limit,
+    }
+}
 
 pub fn turn_ids_with_task_anchors(response: &ThreadHistoryResponse) -> Vec<String> {
     let mut turn_ids = Vec::new();
@@ -27,14 +38,21 @@ pub fn composed_task_turn_timeline_params(
 ) -> Vec<TurnTimelineParams> {
     turn_ids_with_task_anchors(response)
         .into_iter()
-        .map(|turn_id| TurnTimelineParams {
-            thread_id: response.thread_id.clone(),
-            turn_id,
-            compose_tasks: true,
-            include_collapsed_task_events: false,
-            max_child_items_per_task: Some(500),
-        })
+        .map(|turn_id| composed_task_turn_timeline_param(response.thread_id.clone(), turn_id))
         .collect()
+}
+
+pub fn composed_task_turn_timeline_param(
+    thread_id: impl Into<String>,
+    turn_id: impl Into<String>,
+) -> TurnTimelineParams {
+    TurnTimelineParams {
+        thread_id: thread_id.into(),
+        turn_id: turn_id.into(),
+        compose_tasks: true,
+        include_collapsed_task_events: false,
+        max_child_items_per_task: Some(500),
+    }
 }
 
 #[cfg(test)]

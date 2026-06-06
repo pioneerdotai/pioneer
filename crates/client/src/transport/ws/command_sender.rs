@@ -1616,7 +1616,7 @@ mod tests {
     use crate::rpc::{JsonRpcResponseSender, WEBSOCKET_WORKER_UNAVAILABLE_MESSAGE};
     use pioneer_protocol::{
         ArtifactUploadSourceKind, JsonRpcRequest, McpScopeKind, SkillArchiveFormat,
-        SkillHealthTarget, SkillLifecycleSource, Workspace,
+        SkillHealthTarget, SkillLifecycleSource, TaskCancelScope, Workspace,
     };
     use serde_json::json;
 
@@ -1739,6 +1739,29 @@ mod tests {
         assert_eq!(
             format!(
                 "{:#}",
+                thread_start(
+                    &PanicTransport,
+                    ThreadStartParams {
+                        thread_id: "thread_1".to_owned(),
+                        workspace_id: " ".to_owned(),
+                        name: None,
+                        model: None,
+                        model_provider: None,
+                        sandbox: None,
+                        mode: None,
+                        origin_kind: None,
+                        sidebar_visibility: None,
+                        agent_nickname: None,
+                        agent_role: None,
+                    },
+                )
+                .expect_err("workspace id should be required")
+            ),
+            "workspace_id is required for thread/start"
+        );
+        assert_eq!(
+            format!(
+                "{:#}",
                 thread_update(
                     &PanicTransport,
                     ThreadUpdateParams {
@@ -1777,12 +1800,40 @@ mod tests {
                     &PanicTransport,
                     WorkspaceUpdateParams {
                         workspace_id: "ws_1".to_owned(),
+                        name: None,
+                    },
+                )
+                .expect_err("workspace update field should be required")
+            ),
+            "at least one field is required for workspace/update"
+        );
+        assert_eq!(
+            format!(
+                "{:#}",
+                workspace_update(
+                    &PanicTransport,
+                    WorkspaceUpdateParams {
+                        workspace_id: "ws_1".to_owned(),
                         name: Some(" ".to_owned()),
                     },
                 )
                 .expect_err("workspace name should be non-empty")
             ),
             "name must not be empty for workspace/update"
+        );
+        assert_eq!(
+            format!(
+                "{:#}",
+                workspace_select(
+                    &PanicTransport,
+                    WorkspaceSelectParams {
+                        workspace_id: " ".to_owned(),
+                        make_current: true,
+                    },
+                )
+                .expect_err("workspace id should be required")
+            ),
+            "workspace_id is required for workspace/select"
         );
     }
 
@@ -1873,6 +1924,26 @@ mod tests {
                 .expect_err("thread id should be required")
             ),
             "thread_id is required for turn/start"
+        );
+        assert_eq!(
+            format!(
+                "{:#}",
+                turn_start(
+                    &PanicTransport,
+                    TurnStartParams {
+                        thread_id: "thread_1".to_owned(),
+                        turn_id: " ".to_owned(),
+                        input: Vec::new(),
+                        capabilities: Vec::new(),
+                        model: None,
+                        model_provider: None,
+                        sandbox_policy: None,
+                        mode: None,
+                    },
+                )
+                .expect_err("turn id should be required")
+            ),
+            "turn_id is required for turn/start"
         );
         assert_eq!(
             format!(
@@ -2055,6 +2126,54 @@ mod tests {
                 task_accept(
                     &PanicTransport,
                     TaskAcceptParams {
+                        task_id: " ".to_owned(),
+                        run_id: "run_1".to_owned(),
+                        candidate_id: "candidate_1".to_owned(),
+                        reason: None,
+                    },
+                )
+                .expect_err("task id should be required")
+            ),
+            "task_id is required for task/accept"
+        );
+        assert_eq!(
+            format!(
+                "{:#}",
+                task_revise(
+                    &PanicTransport,
+                    TaskReviseParams {
+                        task_id: "task_1".to_owned(),
+                        run_id: " ".to_owned(),
+                        candidate_id: "candidate_1".to_owned(),
+                        feedback: "feedback".to_owned(),
+                        additional_instructions: Vec::new(),
+                    },
+                )
+                .expect_err("run id should be required")
+            ),
+            "run_id is required for task/revise"
+        );
+        assert_eq!(
+            format!(
+                "{:#}",
+                task_cancel(
+                    &PanicTransport,
+                    TaskCancelParams {
+                        task_id: " ".to_owned(),
+                        reason: None,
+                        scope: TaskCancelScope::AttachedSubtree,
+                    },
+                )
+                .expect_err("task id should be required")
+            ),
+            "task_id is required for task/cancel"
+        );
+        assert_eq!(
+            format!(
+                "{:#}",
+                task_accept(
+                    &PanicTransport,
+                    TaskAcceptParams {
                         task_id: "task_1".to_owned(),
                         run_id: "run_1".to_owned(),
                         candidate_id: " ".to_owned(),
@@ -2086,6 +2205,19 @@ mod tests {
 
     #[test]
     fn ws_command_sender_artifact_validation_matches_desktop_contract() {
+        assert_eq!(
+            format!(
+                "{:#}",
+                artifact_capabilities(
+                    &PanicTransport,
+                    ArtifactCapabilitiesParams {
+                        workspace_id: " ".to_owned(),
+                    },
+                )
+                .expect_err("workspace id should be required")
+            ),
+            "workspace_id is required for artifact/capabilities"
+        );
         assert_eq!(
             format!(
                 "{:#}",

@@ -80,9 +80,9 @@ impl PioneerDesktop {
             async move {
                 let result = cx
                     .background_spawn(async move {
-                        ws_sender.thread_tree(ThreadTreeParams {
-                            workspace_id: workspace_id_for_request,
-                        })
+                        ws_sender.thread_tree(pioneer_client::threads::tree::thread_tree_params(
+                            workspace_id_for_request,
+                        ))
                     })
                     .await;
 
@@ -253,10 +253,12 @@ impl PioneerDesktop {
             async move {
                 let result = cx
                     .background_spawn(async move {
-                        let response = ws_sender.thread_history(ThreadHistoryParams {
-                            thread_id: thread_id_for_request,
-                            limit: None,
-                        })?;
+                        let response = ws_sender.thread_history(
+                            pioneer_client::threads::history::thread_history_params(
+                                thread_id_for_request,
+                                None,
+                            ),
+                        )?;
                         let timelines = load_task_turn_timelines(&ws_sender, &response);
                         Ok::<_, anyhow::Error>((response, timelines))
                     })
@@ -359,13 +361,12 @@ impl PioneerDesktop {
             async move {
                 let result = cx
                     .background_spawn(async move {
-                        ws_sender.turn_timeline(TurnTimelineParams {
-                            thread_id: thread_id_for_request,
-                            turn_id: turn_id_for_request,
-                            compose_tasks: true,
-                            include_collapsed_task_events: false,
-                            max_child_items_per_task: Some(500),
-                        })
+                        ws_sender.turn_timeline(
+                            pioneer_client::threads::history::composed_task_turn_timeline_param(
+                                thread_id_for_request,
+                                turn_id_for_request,
+                            ),
+                        )
                     })
                     .await;
 

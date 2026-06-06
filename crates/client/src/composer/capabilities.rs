@@ -311,6 +311,20 @@ pub fn selected_mcp_server_ids(
         .collect()
 }
 
+pub fn selectable_mcp_server_ids(rows: &[SelectableMcpCapability]) -> Vec<String> {
+    rows.iter()
+        .filter(|row| row.raw_tool_name.is_none() && row.selectable)
+        .map(|row| row.server_id.clone())
+        .collect()
+}
+
+pub fn loaded_mcp_tool_server_ids(rows: &[SelectableMcpCapability]) -> HashSet<String> {
+    rows.iter()
+        .filter(|row| row.raw_tool_name.is_some())
+        .map(|row| row.server_id.clone())
+        .collect()
+}
+
 pub fn replace_skill_capability_rows(
     skill_rows: &mut Vec<SelectableSkillCapability>,
     selected: &mut HashSet<String>,
@@ -564,6 +578,18 @@ pub fn filter_skill_capability_rows(
     rows
 }
 
+pub fn filter_installed_skill_capability_rows(
+    skills: &[SkillListItem],
+    query: &str,
+) -> Vec<SelectableSkillCapability> {
+    let installed = skills
+        .iter()
+        .filter(|skill| skill.install.installed)
+        .cloned()
+        .collect::<Vec<_>>();
+    filter_skill_capability_rows(installed.as_slice(), query)
+}
+
 pub fn selectable_mcp_server_from_item(server: &McpListItem) -> SelectableMcpCapability {
     let unavailable_reason = mcp_server_unavailable_reason(server);
     let label = server
@@ -694,6 +720,10 @@ pub fn mcp_row_to_composer_capability(row: SelectableMcpCapability) -> ComposerC
         label: row.label,
         kind,
     }
+}
+
+pub fn has_capability_query(query: &str) -> bool {
+    !normalize_capability_query(query).is_empty()
 }
 
 fn sort_selectable_skill_capability_rows(rows: &mut [SelectableSkillCapability]) {
@@ -1057,6 +1087,26 @@ mod tests {
     }
 
     #[test]
+    fn capability_query_presence_uses_normalized_query() {
+        assert!(!has_capability_query(" \t\n "));
+        assert!(has_capability_query(" Docs "));
+    }
+
+    #[test]
+    fn installed_skill_rows_filter_out_uninstalled_items() {
+        let mut installed = skill_item("tests/installed");
+        installed.display_name = "Installed".to_owned();
+        let mut uninstalled = skill_item("tests/uninstalled");
+        uninstalled.display_name = "Uninstalled".to_owned();
+        uninstalled.install.installed = false;
+
+        let rows = filter_installed_skill_capability_rows(&[uninstalled, installed], "");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].slug, "tests/installed");
+    }
+
+    #[test]
     fn selected_skill_capabilities_use_only_selectable_selected_rows() {
         let mut selected = HashSet::new();
         let mut docs = selectable_skill_from_item(&skill_item("tests/docs"));
@@ -1116,6 +1166,29 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].key, "mcp-server:workspace:browser");
         assert_eq!(rows[0].tools_count, Some(1));
+    }
+
+    #[test]
+    fn mcp_server_id_helpers_track_selectable_servers_and_loaded_tool_servers() {
+        let mut browser = selectable_mcp_server_from_item(&mcp_server("browser"));
+        let resend = selectable_mcp_server_from_item(&mcp_server("resend"));
+        browser.selectable = false;
+        let tool = filter_mcp_tool_capability_rows(
+            &mcp_details("resend", vec![mcp_tool("add_contact", "Add contact")]),
+            "",
+        )
+        .into_iter()
+        .next()
+        .expect("tool row");
+
+        assert_eq!(
+            selectable_mcp_server_ids(&[browser, resend.clone(), tool.clone()]),
+            vec![resend.server_id.clone()]
+        );
+        assert_eq!(
+            loaded_mcp_tool_server_ids(&[resend, tool]),
+            HashSet::from(["mcp:resend".to_owned()])
+        );
     }
 
     #[test]

@@ -5,8 +5,8 @@ use anyhow::{Context as _, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use pioneer_protocol::{
-    ArtifactPreviewRef, ArtifactProjectionKind, ArtifactProjectionStatus, ArtifactReadResponse,
-    ArtifactRef,
+    ArtifactPreviewRef, ArtifactProjectionKind, ArtifactProjectionStatus, ArtifactReadParams,
+    ArtifactReadResponse, ArtifactRef,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -120,6 +120,21 @@ pub fn thumbnail_preview(artifact: &ArtifactRef) -> Option<&ArtifactPreviewRef> 
         Some(preview)
     } else {
         None
+    }
+}
+
+pub fn artifact_thumbnail_read_params(
+    workspace_id: impl Into<String>,
+    artifact: &ArtifactRef,
+    max_bytes: u64,
+) -> ArtifactReadParams {
+    ArtifactReadParams {
+        workspace_id: workspace_id.into(),
+        artifact_id: artifact.artifact_id.clone(),
+        version_id: artifact.version_id.clone(),
+        projection_kind: Some(ArtifactProjectionKind::Thumbnail),
+        offset: Some(0),
+        max_bytes: Some(max_bytes),
     }
 }
 

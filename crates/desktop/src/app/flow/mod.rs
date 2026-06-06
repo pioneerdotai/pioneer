@@ -42,9 +42,8 @@ use pioneer_client::gateway::types::{GatewayEndpoint, GatewayEndpointKind};
 use pioneer_client::transport::ws::{GatewayWsConnectSpec, GatewayWsEvent};
 use pioneer_protocol::generate_id;
 use pioneer_protocol::{
-    GatewayNotification, ThreadHistoryParams, ThreadHistoryResponse, ThreadTreeParams,
-    TurnTimelineParams, TurnTimelineResponse, Workspace, WorkspaceChangedNotification,
-    WorkspaceSelectParams,
+    GatewayNotification, ThreadHistoryResponse, TurnTimelineResponse, Workspace,
+    WorkspaceChangedNotification,
 };
 use std::time::Duration;
 use tracing::warn;
@@ -52,12 +51,6 @@ use tracing::warn;
 use client_effects::*;
 use helpers::*;
 pub(crate) use workspace_bootstrap::*;
-
-#[cfg(test)]
-use ws_events_notifications::{
-    apply_workspace_changed_to_catalog, should_accept_thread_started_as_local_pending,
-    should_refresh_workspace_bound_data,
-};
 
 const REMOTE_WS_CONNECT_TIMEOUT_MIN_MS: u64 = 5_000;
 const ID_LEN: usize = pioneer_client::threads::start::THREAD_START_ID_LEN;

@@ -14,7 +14,6 @@ use gpui_component::{
     theme::ActiveTheme,
     *,
 };
-use std::path::Path;
 
 const COMPOSER_ATTACHMENT_TEXT_FADE_WIDTH: Pixels = px(24.);
 
@@ -282,15 +281,8 @@ impl PioneerDesktop {
     ) -> AnyElement {
         let group_id = format!("composer-attachment-chip-{index}");
 
-        let file_name = if attachment.file_name.trim().is_empty() {
-            Path::new(attachment.path.as_str())
-                .file_name()
-                .and_then(|value| value.to_str())
-                .map(str::to_owned)
-                .unwrap_or_else(|| attachment.path.clone())
-        } else {
-            attachment.file_name.clone()
-        };
+        let file_name =
+            pioneer_client::composer::attachments::composer_attachment_display_name(&attachment);
 
         let (status_icon, status_color, is_uploading) = match &attachment.upload_state {
             ComposerAttachmentUploadState::Local => (IconName::File, cx.theme().foreground, false),

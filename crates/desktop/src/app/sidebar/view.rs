@@ -3,7 +3,7 @@ use crate::app::{
         MainContentView, PioneerDesktop, ThreadAgentsDocEditorScope, ThreadAgentsDocSummaryKey,
     },
     sidebar::{SidebarTreeDragItem, SidebarTreeDragPayload},
-    thread::{ThreadCoordinator, fallback_title_from_first_user_text},
+    thread::{ThreadCoordinator, thread_display_title},
 };
 use crate::assets::PioneerIconName;
 use gpui::{ClickEvent, prelude::*, *};
@@ -15,17 +15,12 @@ use gpui_component::{
     tree::{TreeItem, tree},
     *,
 };
-use pioneer_protocol::{
-    ThreadAgentsDocStatus, ThreadAgentsDocSummary, ThreadFolder, ThreadPlacement,
-};
+use pioneer_client::agents_doc::scope::{self as agents_doc_scope, AgentsDocEditAction};
+use pioneer_client::threads::tree::{self as client_thread_tree, SidebarTreeNodeKey};
+use pioneer_protocol::{ThreadAgentsDocSummary, ThreadFolder};
 use std::any::Any;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
-const THREAD_NODE_PREFIX: &str = "thread:";
-const FOLDER_NODE_PREFIX: &str = "folder:";
-const AGENTS_DOC_ROOT_NODE_ID: &str = "agents_doc:root";
-const AGENTS_DOC_FOLDER_NODE_PREFIX: &str = "agents_doc:folder:";
-const THREADS_HEADER_NODE_ID: &str = "__threads_header__";
 const TREE_ROW_HEIGHT_PX: f32 = 32.0;
 const TREE_ROW_CONTENT_HEIGHT_PX: f32 = 28.0;
 const TREE_GUIDE_HEIGHT_PX: f32 = 32.0;
@@ -40,55 +35,9 @@ struct SidebarThreadRow {
     title: String,
 }
 
-enum SidebarTreeNodeKey<'a> {
-    ThreadsHeader,
-    Thread(&'a str),
-    Folder(&'a str),
-    AgentsDocRoot,
-    AgentsDocFolder(&'a str),
-    Unknown,
-}
-
 struct SidebarTreeModel {
     items: Vec<TreeItem>,
     visible_node_ids: Vec<String>,
-}
-
-struct SidebarTreeSourceData<'a> {
-    workspace_id: &'a str,
-    folders: Vec<&'a ThreadFolder>,
-    placements: Vec<&'a ThreadPlacement>,
-    sorted_thread_ids: Vec<String>,
-    agents_doc_summaries: Vec<&'a ThreadAgentsDocSummary>,
-    active_agents_doc_editor_scope: Option<&'a ThreadAgentsDocEditorScope>,
-    expanded_folder_ids: HashSet<String>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AgentsDocEditContextMenuLabel {
-    Create,
-    Edit,
-}
-
-fn agents_doc_edit_context_menu_label(
-    summary: Option<&ThreadAgentsDocSummary>,
-) -> AgentsDocEditContextMenuLabel {
-    if summary.is_some() {
-        AgentsDocEditContextMenuLabel::Edit
-    } else {
-        AgentsDocEditContextMenuLabel::Create
-    }
-}
-
-fn agents_doc_has_active_explicit_badge(summary: Option<&ThreadAgentsDocSummary>) -> bool {
-    matches!(
-        summary.map(|summary| summary.status),
-        Some(ThreadAgentsDocStatus::Active)
-    )
-}
-
-fn agents_doc_can_remove_override(summary: Option<&ThreadAgentsDocSummary>) -> bool {
-    summary.is_some()
 }
 
 actions!(
@@ -154,17 +103,19 @@ impl PioneerDesktop {
             active_workspace_id
                 .as_deref()
                 .map(|workspace_id| {
-                    self.thread_agents_doc_summaries
-                        .iter()
-                        .filter(|(_, summary)| summary.workspace_id == workspace_id)
-                        .map(|(key, summary)| (key.clone(), summary.clone()))
-                        .collect()
+                    agents_doc_scope::thread_agents_doc_summaries_for_workspace(
+                        &self.thread_agents_doc_summaries,
+                        workspace_id,
+                    )
+                    .map(|(key, summary)| (key.clone(), summary.clone()))
+                    .collect()
                 })
                 .unwrap_or_default();
         let root_agents_doc_summary = agents_doc_summaries.get(&ThreadAgentsDocSummaryKey::Root);
-        let root_agents_doc_active = agents_doc_has_active_explicit_badge(root_agents_doc_summary);
+        let root_agents_doc_active =
+            agents_doc_scope::agents_doc_has_active_explicit_badge(root_agents_doc_summary);
         let root_agents_doc_edit_menu_label =
-            agents_doc_edit_context_menu_label(root_agents_doc_summary);
+            agents_doc_scope::agents_doc_edit_action(root_agents_doc_summary);
         let root_area_agents_doc_active = root_agents_doc_active;
         let root_area_agents_doc_edit_menu_label = root_agents_doc_edit_menu_label;
         let root_context_area_top_px =
@@ -222,10 +173,10 @@ impl PioneerDesktop {
                                 .context_menu(move |menu, _, _| {
                                     let menu = menu.menu(
                                         match root_agents_doc_edit_menu_label {
-                                            AgentsDocEditContextMenuLabel::Create => {
+                                            AgentsDocEditAction::Create => {
                                                 t!("sidebar.contextmenu.folder.create_agents_doc")
                                             }
-                                            AgentsDocEditContextMenuLabel::Edit => {
+                                            AgentsDocEditAction::Edit => {
                                                 t!("sidebar.contextmenu.folder.edit_agents_doc")
                                             }
                                         },
@@ -389,9 +340,10 @@ impl PioneerDesktop {
                         .get(&ThreadAgentsDocSummaryKey::Folder(folder_id.to_owned()))
                         .cloned();
                     let agents_doc_edit_menu_label =
-                        agents_doc_edit_context_menu_label(agents_doc_summary.as_ref());
-                    let agents_doc_can_remove =
-                        agents_doc_can_remove_override(agents_doc_summary.as_ref());
+                        agents_doc_scope::agents_doc_edit_action(agents_doc_summary.as_ref());
+                    let agents_doc_can_remove = agents_doc_scope::agents_doc_can_remove_override(
+                        agents_doc_summary.as_ref(),
+                    );
                     let folder_id_for_move = folder_id.to_owned();
                     let folder_id_for_click = folder_id.to_owned();
                     let folder_id_for_context_menu_rename = folder_id.to_owned();
@@ -516,12 +468,12 @@ impl PioneerDesktop {
                                         .separator()
                                         .menu(
                                             match agents_doc_edit_menu_label {
-                                                AgentsDocEditContextMenuLabel::Create => {
+                                                AgentsDocEditAction::Create => {
                                                     t!(
                                                         "sidebar.contextmenu.folder.create_agents_doc"
                                                     )
                                                 }
-                                                AgentsDocEditContextMenuLabel::Edit => {
+                                                AgentsDocEditAction::Edit => {
                                                     t!(
                                                         "sidebar.contextmenu.folder.edit_agents_doc"
                                                     )
@@ -710,10 +662,10 @@ impl PioneerDesktop {
                                 .context_menu(move |menu, _, _| {
                                     let menu = menu.menu(
                                         match root_area_agents_doc_edit_menu_label {
-                                            AgentsDocEditContextMenuLabel::Create => {
+                                            AgentsDocEditAction::Create => {
                                                 t!("sidebar.contextmenu.folder.create_agents_doc")
                                             }
-                                            AgentsDocEditContextMenuLabel::Edit => {
+                                            AgentsDocEditAction::Edit => {
                                                 t!("sidebar.contextmenu.folder.edit_agents_doc")
                                             }
                                         },
@@ -753,202 +705,50 @@ impl PioneerDesktop {
     }
 
     fn build_sidebar_tree_model(&self) -> SidebarTreeModel {
-        let items = self.build_sidebar_tree_items();
-        let visible_node_ids = collect_visible_node_ids(items.as_slice());
-        SidebarTreeModel {
-            items,
-            visible_node_ids,
-        }
-    }
-
-    fn build_sidebar_tree_items(&self) -> Vec<TreeItem> {
         let Some(workspace_id) = self.active_workspace_id() else {
-            return sidebar_tree_items_with_header(Vec::new());
+            return SidebarTreeModel {
+                items: Vec::new(),
+                visible_node_ids: Vec::new(),
+            };
         };
 
-        build_sidebar_tree_items_from_workspace_data(SidebarTreeSourceData {
-            workspace_id,
-            folders: self.thread_folders_for_workspace(workspace_id),
-            placements: self.thread_placements_for_workspace(workspace_id),
-            sorted_thread_ids: self.sorted_thread_ids_for_workspace(workspace_id),
-            agents_doc_summaries: self
-                .thread_agents_doc_summaries
-                .values()
-                .filter(|summary| summary.workspace_id == workspace_id)
-                .collect(),
-            active_agents_doc_editor_scope: self.active_agents_doc_editor_scope.as_ref(),
-            expanded_folder_ids: self
-                .thread_folder_expanded
-                .iter()
-                .filter_map(|(folder_id, expanded)| expanded.then_some(folder_id.clone()))
-                .collect(),
-        })
-    }
-}
-
-fn build_sidebar_tree_items_from_workspace_data(data: SidebarTreeSourceData<'_>) -> Vec<TreeItem> {
-    let folders_by_id: HashMap<String, &ThreadFolder> = data
-        .folders
-        .into_iter()
-        .filter(|folder| folder.workspace_id == data.workspace_id)
-        .map(|folder| (folder.id.clone(), folder))
-        .collect();
-    let folder_id_set: HashSet<String> = folders_by_id.keys().cloned().collect();
-    let placements_by_thread_id: HashMap<String, &ThreadPlacement> = data
-        .placements
-        .into_iter()
-        .filter(|placement| placement.workspace_id == data.workspace_id)
-        .map(|placement| (placement.thread_id.clone(), placement))
-        .collect();
-    let mut visible_agents_doc_keys: HashSet<ThreadAgentsDocSummaryKey> = data
-        .agents_doc_summaries
-        .into_iter()
-        .filter(|summary| summary.workspace_id == data.workspace_id)
-        .map(|summary| ThreadAgentsDocSummaryKey::from_folder_id(summary.folder_id.as_deref()))
-        .collect();
-
-    if let Some(scope) = data
-        .active_agents_doc_editor_scope
-        .filter(|scope| scope.workspace_id() == data.workspace_id)
-    {
-        visible_agents_doc_keys
-            .insert(ThreadAgentsDocSummaryKey::from_folder_id(scope.folder_id()));
-    }
-
-    let mut folders_by_parent: HashMap<String, Vec<String>> = HashMap::new();
-    for folder in folders_by_id.values() {
-        let parent_key = folder
-            .parent_folder_id
-            .as_deref()
-            .filter(|parent_id| folder_id_set.contains(*parent_id))
-            .unwrap_or_default()
-            .to_owned();
-        folders_by_parent
-            .entry(parent_key)
-            .or_default()
-            .push(folder.id.clone());
-    }
-
-    for folder_ids in folders_by_parent.values_mut() {
-        folder_ids.sort_by(|lhs, rhs| {
-            let lhs_name = folders_by_id
-                .get(lhs.as_str())
-                .map(|folder| folder.name.as_str())
-                .unwrap_or_default();
-            let rhs_name = folders_by_id
-                .get(rhs.as_str())
-                .map(|folder| folder.name.as_str())
-                .unwrap_or_default();
-            lhs_name
-                .to_lowercase()
-                .cmp(&rhs_name.to_lowercase())
-                .then_with(|| lhs.cmp(rhs))
-        });
-    }
-
-    let mut threads_by_folder: HashMap<String, Vec<String>> = HashMap::new();
-    for thread_id in data.sorted_thread_ids {
-        let folder_key = placements_by_thread_id
-            .get(thread_id.as_str())
-            .and_then(|placement| placement.folder_id.as_deref())
-            .filter(|folder_id| folder_id_set.contains(*folder_id))
-            .unwrap_or_default()
-            .to_owned();
-        threads_by_folder
-            .entry(folder_key)
-            .or_default()
-            .push(thread_id);
-    }
-
-    let mut visited_folders = HashSet::new();
-    let mut items = build_sidebar_tree_branch_from_workspace_data(
-        "",
-        &folders_by_id,
-        &folders_by_parent,
-        &threads_by_folder,
-        &visible_agents_doc_keys,
-        &data.expanded_folder_ids,
-        &mut visited_folders,
-    );
-    if visible_agents_doc_keys.contains(&ThreadAgentsDocSummaryKey::Root) {
-        items.insert(0, TreeItem::new(agents_doc_root_node_key(), "AGENTS.md"));
-    }
-
-    sidebar_tree_items_with_header(items)
-}
-
-fn sidebar_tree_items_with_header(mut items: Vec<TreeItem>) -> Vec<TreeItem> {
-    if items.is_empty() {
-        return items;
-    }
-
-    items.insert(
-        0,
-        TreeItem::new(THREADS_HEADER_NODE_ID, "threads-header").disabled(true),
-    );
-    items
-}
-
-fn build_sidebar_tree_branch_from_workspace_data(
-    parent_key: &str,
-    folders_by_id: &HashMap<String, &ThreadFolder>,
-    folders_by_parent: &HashMap<String, Vec<String>>,
-    threads_by_folder: &HashMap<String, Vec<String>>,
-    visible_agents_doc_keys: &HashSet<ThreadAgentsDocSummaryKey>,
-    expanded_folder_ids: &HashSet<String>,
-    visited_folders: &mut HashSet<String>,
-) -> Vec<TreeItem> {
-    let mut items = Vec::new();
-
-    if let Some(folder_ids) = folders_by_parent.get(parent_key) {
-        for folder_id in folder_ids {
-            if !visited_folders.insert(folder_id.clone()) {
-                continue;
-            }
-
-            let mut children = build_sidebar_tree_branch_from_workspace_data(
-                folder_id.as_str(),
-                folders_by_id,
-                folders_by_parent,
-                threads_by_folder,
-                visible_agents_doc_keys,
-                expanded_folder_ids,
-                visited_folders,
-            );
-            let folder_summary_key = ThreadAgentsDocSummaryKey::Folder(folder_id.clone());
-            if visible_agents_doc_keys.contains(&folder_summary_key) {
-                children.insert(
-                    0,
-                    TreeItem::new(agents_doc_folder_node_key(folder_id.as_str()), "AGENTS.md"),
-                );
-            }
-
-            let folder_name = folders_by_id
-                .get(folder_id.as_str())
-                .map(|folder| folder.name.clone())
-                .unwrap_or_else(|| folder_id.clone());
-
-            let item = TreeItem::new(folder_node_key(folder_id.as_str()), folder_name)
-                .children(children)
-                .expanded(expanded_folder_ids.contains(folder_id.as_str()));
-            items.push(item);
+        let client_model = client_thread_tree::sidebar_tree_model_from_workspace_data(
+            client_thread_tree::SidebarTreeSourceData {
+                workspace_id,
+                folders: self.thread_folders_for_workspace(workspace_id),
+                placements: self.thread_placements_for_workspace(workspace_id),
+                sorted_thread_ids: self.sorted_thread_ids_for_workspace(workspace_id),
+                agents_doc_summaries: self.thread_agents_doc_summaries.values().collect(),
+                active_agents_doc_editor_scope: self.active_agents_doc_editor_scope.as_ref(),
+                expanded_folder_ids: self
+                    .thread_folder_expanded
+                    .iter()
+                    .filter_map(|(folder_id, expanded)| expanded.then_some(folder_id.clone()))
+                    .collect(),
+            },
+        );
+        let items = client_model
+            .items
+            .iter()
+            .map(gpui_tree_item_from_sidebar_item)
+            .collect();
+        SidebarTreeModel {
+            items,
+            visible_node_ids: client_model.visible_node_ids,
         }
     }
-
-    if let Some(thread_ids) = threads_by_folder.get(parent_key) {
-        for thread_id in thread_ids {
-            items.push(TreeItem::new(
-                thread_node_key(thread_id.as_str()),
-                thread_id.clone(),
-            ));
-        }
-    }
-
-    items
 }
 
-fn thread_node_key(thread_id: &str) -> String {
-    format!("{THREAD_NODE_PREFIX}{thread_id}")
+fn gpui_tree_item_from_sidebar_item(item: &client_thread_tree::SidebarTreeItem) -> TreeItem {
+    let children = item
+        .children
+        .iter()
+        .map(gpui_tree_item_from_sidebar_item)
+        .collect::<Vec<_>>();
+    TreeItem::new(item.id.clone(), item.label.clone())
+        .children(children)
+        .expanded(item.expanded)
+        .disabled(item.disabled)
 }
 
 fn sidebar_thread_title_from_coordinator(coordinator: Option<&ThreadCoordinator>) -> String {
@@ -959,38 +759,29 @@ fn sidebar_thread_title_from_coordinator(coordinator: Option<&ThreadCoordinator>
         return t!("sidebar.thread.untitled").to_string();
     };
 
-    if let Some(name) = thread
-        .name
-        .as_ref()
-        .map(|name| name.trim())
-        .filter(|name| !name.is_empty())
-    {
-        return name.to_owned();
-    }
+    thread_display_title(thread).unwrap_or_else(|| t!("sidebar.thread.untitled").to_string())
+}
 
-    fallback_title_from_first_user_text(thread.preview.as_str())
-        .unwrap_or_else(|| t!("sidebar.thread.untitled").to_string())
+fn thread_node_key(thread_id: &str) -> String {
+    client_thread_tree::sidebar_thread_node_id(thread_id)
 }
 
 fn folder_node_key(folder_id: &str) -> String {
-    format!("{FOLDER_NODE_PREFIX}{folder_id}")
+    client_thread_tree::sidebar_folder_node_id(folder_id)
 }
 
 pub(in crate::app) fn agents_doc_tree_node_key(scope: &ThreadAgentsDocEditorScope) -> String {
-    match scope {
-        ThreadAgentsDocEditorScope::Root { .. } => agents_doc_root_node_key(),
-        ThreadAgentsDocEditorScope::Folder { folder_id, .. } => {
-            agents_doc_folder_node_key(folder_id.as_str())
-        }
-    }
+    client_thread_tree::sidebar_agents_doc_node_id_for_scope(scope)
 }
 
+#[cfg(test)]
 fn agents_doc_root_node_key() -> String {
-    AGENTS_DOC_ROOT_NODE_ID.to_owned()
+    client_thread_tree::sidebar_agents_doc_root_node_id()
 }
 
+#[cfg(test)]
 fn agents_doc_folder_node_key(folder_id: &str) -> String {
-    format!("{AGENTS_DOC_FOLDER_NODE_PREFIX}{folder_id}")
+    client_thread_tree::sidebar_agents_doc_folder_node_id(folder_id)
 }
 
 fn render_agents_doc_file_row(
@@ -1073,6 +864,7 @@ fn tree_depth_guides(depth: usize, cx: &mut App) -> AnyElement {
     guides.into_any_element()
 }
 
+#[cfg(test)]
 fn collect_visible_node_ids(items: &[TreeItem]) -> Vec<String> {
     fn visit(items: &[TreeItem], out: &mut Vec<String>) {
         for item in items {
@@ -1089,27 +881,7 @@ fn collect_visible_node_ids(items: &[TreeItem]) -> Vec<String> {
 }
 
 fn parse_sidebar_tree_node_key(value: &str) -> SidebarTreeNodeKey<'_> {
-    if value == THREADS_HEADER_NODE_ID {
-        return SidebarTreeNodeKey::ThreadsHeader;
-    }
-
-    if let Some(thread_id) = value.strip_prefix(THREAD_NODE_PREFIX) {
-        return SidebarTreeNodeKey::Thread(thread_id);
-    }
-
-    if let Some(folder_id) = value.strip_prefix(FOLDER_NODE_PREFIX) {
-        return SidebarTreeNodeKey::Folder(folder_id);
-    }
-
-    if value == AGENTS_DOC_ROOT_NODE_ID {
-        return SidebarTreeNodeKey::AgentsDocRoot;
-    }
-
-    if let Some(folder_id) = value.strip_prefix(AGENTS_DOC_FOLDER_NODE_PREFIX) {
-        return SidebarTreeNodeKey::AgentsDocFolder(folder_id);
-    }
-
-    SidebarTreeNodeKey::Unknown
+    client_thread_tree::parse_sidebar_tree_node_id(value)
 }
 
 fn can_drop_on_root(value: &dyn Any, _: &mut Window, _: &mut App) -> bool {
@@ -1131,94 +903,8 @@ fn can_drop_on_folder(value: &dyn Any, target_folder_id: &str) -> bool {
 mod tests {
     use super::*;
     use pioneer_protocol::{
-        Thread, ThreadAgentsDocStatus, ThreadAgentsDocSummary, ThreadMode, ThreadOriginKind,
-        ThreadSidebarVisibility, ThreadStatus,
+        Thread, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus,
     };
-
-    fn agents_doc_summary(status: ThreadAgentsDocStatus) -> ThreadAgentsDocSummary {
-        agents_doc_summary_for_workspace("ws_1", Some("fld_1"), status)
-    }
-
-    fn agents_doc_summary_for_workspace(
-        workspace_id: &str,
-        folder_id: Option<&str>,
-        status: ThreadAgentsDocStatus,
-    ) -> ThreadAgentsDocSummary {
-        ThreadAgentsDocSummary {
-            id: "agd_1".to_owned(),
-            workspace_id: workspace_id.to_owned(),
-            folder_id: folder_id.map(str::to_owned),
-            status,
-            content_sha256: "sha256:test".to_owned(),
-            version: 1,
-            char_count: 20,
-            updated_at: 1_700_000_000,
-        }
-    }
-
-    fn folder(
-        folder_id: &str,
-        workspace_id: &str,
-        parent_folder_id: Option<&str>,
-        name: &str,
-    ) -> ThreadFolder {
-        ThreadFolder {
-            id: folder_id.to_owned(),
-            workspace_id: workspace_id.to_owned(),
-            parent_folder_id: parent_folder_id.map(str::to_owned),
-            name: name.to_owned(),
-            created_at: 1,
-            updated_at: 1,
-        }
-    }
-
-    fn placement(thread_id: &str, workspace_id: &str, folder_id: Option<&str>) -> ThreadPlacement {
-        ThreadPlacement {
-            thread_id: thread_id.to_owned(),
-            workspace_id: workspace_id.to_owned(),
-            folder_id: folder_id.map(str::to_owned),
-        }
-    }
-
-    #[::core::prelude::v1::test]
-    fn parse_sidebar_tree_node_key_roundtrip() {
-        let thread_id = "thr_123";
-        let folder_id = "fld_123";
-        let thread_key = thread_node_key(thread_id);
-        let folder_key = folder_node_key(folder_id);
-        let root_agents_key = agents_doc_root_node_key();
-        let folder_agents_key = agents_doc_folder_node_key(folder_id);
-
-        let parsed_thread = parse_sidebar_tree_node_key(thread_key.as_str());
-        let parsed_folder = parse_sidebar_tree_node_key(folder_key.as_str());
-        let parsed_root_agents = parse_sidebar_tree_node_key(root_agents_key.as_str());
-        let parsed_folder_agents = parse_sidebar_tree_node_key(folder_agents_key.as_str());
-
-        assert!(matches!(
-            parsed_thread,
-            SidebarTreeNodeKey::Thread("thr_123")
-        ));
-        assert!(matches!(
-            parsed_folder,
-            SidebarTreeNodeKey::Folder("fld_123")
-        ));
-        assert!(matches!(
-            parsed_root_agents,
-            SidebarTreeNodeKey::AgentsDocRoot
-        ));
-        assert!(matches!(
-            parsed_folder_agents,
-            SidebarTreeNodeKey::AgentsDocFolder("fld_123")
-        ));
-        assert!(matches!(
-            parse_sidebar_tree_node_key(THREADS_HEADER_NODE_ID),
-            SidebarTreeNodeKey::ThreadsHeader
-        ));
-        assert!(matches!(
-            parse_sidebar_tree_node_key("unknown"),
-            SidebarTreeNodeKey::Unknown
-        ));
-    }
 
     #[::core::prelude::v1::test]
     fn collect_visible_node_ids_respects_expansion_state() {
@@ -1263,54 +949,6 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
-    fn sidebar_tree_header_is_hidden_for_empty_tree() {
-        assert!(sidebar_tree_items_with_header(Vec::new()).is_empty());
-    }
-
-    #[::core::prelude::v1::test]
-    fn sidebar_tree_builder_filters_folders_placements_and_agents_docs_by_workspace() {
-        let folder_a = folder("fld_a", "ws_a", None, "Alpha");
-        let folder_b = folder("fld_b", "ws_b", None, "Beta");
-        let placement_a = placement("thr_a", "ws_a", Some("fld_a"));
-        let placement_b = placement("thr_b", "ws_b", Some("fld_b"));
-        let root_agents_doc_a =
-            agents_doc_summary_for_workspace("ws_a", None, ThreadAgentsDocStatus::Active);
-        let folder_agents_doc_a =
-            agents_doc_summary_for_workspace("ws_a", Some("fld_a"), ThreadAgentsDocStatus::Active);
-        let root_agents_doc_b =
-            agents_doc_summary_for_workspace("ws_b", None, ThreadAgentsDocStatus::Active);
-
-        let items = build_sidebar_tree_items_from_workspace_data(SidebarTreeSourceData {
-            workspace_id: "ws_a",
-            folders: vec![&folder_a, &folder_b],
-            placements: vec![&placement_a, &placement_b],
-            sorted_thread_ids: vec!["thr_a".to_owned(), "thr_orphan".to_owned()],
-            agents_doc_summaries: vec![
-                &root_agents_doc_a,
-                &folder_agents_doc_a,
-                &root_agents_doc_b,
-            ],
-            active_agents_doc_editor_scope: None,
-            expanded_folder_ids: HashSet::from(["fld_a".to_owned()]),
-        });
-
-        let ids = collect_visible_node_ids(items.as_slice());
-        assert_eq!(
-            ids,
-            vec![
-                THREADS_HEADER_NODE_ID.to_owned(),
-                agents_doc_root_node_key(),
-                folder_node_key("fld_a"),
-                agents_doc_folder_node_key("fld_a"),
-                thread_node_key("thr_a"),
-                thread_node_key("thr_orphan"),
-            ]
-        );
-        assert!(!ids.contains(&folder_node_key("fld_b")));
-        assert!(!ids.contains(&thread_node_key("thr_b")));
-    }
-
-    #[::core::prelude::v1::test]
     fn folder_drop_guard_rejects_self_folder_and_accepts_thread() {
         let thread_payload = SidebarTreeDragPayload {
             label: "t".to_owned(),
@@ -1328,45 +966,6 @@ mod tests {
         assert!(can_drop_on_folder(&thread_payload as &dyn Any, "fld_1"));
         assert!(!can_drop_on_folder(&folder_payload as &dyn Any, "fld_1"));
         assert!(can_drop_on_folder(&folder_payload as &dyn Any, "fld_2"));
-    }
-
-    #[::core::prelude::v1::test]
-    fn agents_doc_menu_label_uses_create_without_summary_and_edit_with_summary() {
-        assert_eq!(
-            agents_doc_edit_context_menu_label(None),
-            AgentsDocEditContextMenuLabel::Create
-        );
-        let draft = agents_doc_summary(ThreadAgentsDocStatus::Draft);
-        assert_eq!(
-            agents_doc_edit_context_menu_label(Some(&draft)),
-            AgentsDocEditContextMenuLabel::Edit
-        );
-    }
-
-    #[::core::prelude::v1::test]
-    fn agents_doc_badge_only_uses_active_but_remove_accepts_any_explicit_summary() {
-        let draft = agents_doc_summary(ThreadAgentsDocStatus::Draft);
-        let active = agents_doc_summary(ThreadAgentsDocStatus::Active);
-
-        assert!(!agents_doc_has_active_explicit_badge(None));
-        assert!(!agents_doc_has_active_explicit_badge(Some(&draft)));
-        assert!(agents_doc_has_active_explicit_badge(Some(&active)));
-
-        assert!(!agents_doc_can_remove_override(None));
-        assert!(agents_doc_can_remove_override(Some(&draft)));
-        assert!(agents_doc_can_remove_override(Some(&active)));
-    }
-
-    #[::core::prelude::v1::test]
-    fn agents_doc_conflict_inherited_only_folder_does_not_show_remove_action() {
-        assert!(!agents_doc_can_remove_override(None));
-    }
-
-    #[::core::prelude::v1::test]
-    fn fallback_title_from_first_user_text_truncates_to_six_words() {
-        let title =
-            fallback_title_from_first_user_text("one two three four five six seven").unwrap();
-        assert_eq!(title, "one two three four five six...");
     }
 
     #[::core::prelude::v1::test]

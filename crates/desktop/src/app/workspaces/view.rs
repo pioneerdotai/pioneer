@@ -13,6 +13,7 @@ use gpui_component::{
     theme::ActiveTheme,
     v_flex,
 };
+use pioneer_client::workspaces::selectors as workspace_selectors;
 use pioneer_protocol::Workspace;
 
 #[derive(IntoElement)]
@@ -212,12 +213,12 @@ impl PioneerDesktop {
         let active_workspace_name = active_workspace_id
             .as_deref()
             .and_then(|_| self.active_workspace())
-            .map(|workspace| workspace.name.clone())
+            .and_then(workspace_selectors::workspace_display_name)
+            .map(str::to_owned)
             .unwrap_or_else(|| t!("workspace.selector_label").to_string());
         let active_workspaces = self
-            .workspaces()
-            .iter()
-            .filter(|workspace| workspace.is_active)
+            .active_workspaces()
+            .into_iter()
             .cloned()
             .collect::<Vec<_>>();
         let selector_disabled = self.gateway.connecting
@@ -385,11 +386,9 @@ impl PioneerDesktop {
         popover_entity: Entity<PopoverState>,
     ) -> AnyElement {
         let workspace_id = workspace.id.clone();
-        let workspace_name = if workspace.name.trim().is_empty() {
-            t!("workspace.unnamed").to_string()
-        } else {
-            workspace.name.clone()
-        };
+        let workspace_name = workspace_selectors::workspace_display_name(workspace)
+            .map(str::to_owned)
+            .unwrap_or_else(|| t!("workspace.unnamed").to_string());
         let is_active = active_workspace_id == Some(workspace_id.as_str());
         let style = if is_active {
             selected_style

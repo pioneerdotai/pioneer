@@ -11,6 +11,7 @@ use gpui::{prelude::*, *};
 use gpui_component::{
     Icon, IconName, clipboard::Clipboard, collapsible::Collapsible, h_flex, v_flex,
 };
+use pioneer_client::timeline::labels::is_task_timeline_agent_message;
 use pioneer_protocol::TurnItem;
 use std::hash::{Hash, Hasher};
 
@@ -183,10 +184,4 @@ impl PioneerDesktop {
         )
         .into_any_element()
     }
-}
-
-fn is_task_timeline_agent_message(item_view: &ItemView) -> bool {
-    item_view.timeline_origin.as_ref().is_some_and(|origin| {
-        origin.task_id.is_some() || origin.run_id.is_some() || origin.child_turn_id.is_some()
-    })
 }

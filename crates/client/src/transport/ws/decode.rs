@@ -119,7 +119,7 @@ mod tests {
     use super::*;
     use crate::gateway::{timings::GatewayWsTimings, types::GatewayEndpointKind};
     use crate::transport::ws::GatewayWsConnectSpec;
-    use pioneer_protocol::{GatewayNotification, TurnItem, constants::events};
+    use pioneer_protocol::{GatewayNotification, TurnItem, WorkspaceChangeKind, constants::events};
     use serde_json::json;
     use std::time::Duration;
 
@@ -231,6 +231,144 @@ mod tests {
             panic!("unexpected event");
         };
         assert!(matches!(notification.item, TurnItem::Task { .. }));
+    }
+
+    #[test]
+    fn decode_routes_thread_updated_notification() {
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let mut pending_requests = PendingJsonRpcRequests::default();
+        let mut pending_upload_chunks = HashMap::new();
+        let mut pending_artifact_upload_chunks = HashMap::new();
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "method": "thread/updated",
+            "params": {
+                "thread": {
+                    "workspace_id": "ws_123",
+                    "id": "thr_123",
+                    "name": "New title",
+                    "preview": "",
+                    "mode": "Chat",
+                    "model": "gpt-5.4",
+                    "model_provider": "openai",
+                    "created_at": 0,
+                    "updated_at": 0,
+                    "status": "Idle",
+                    "turns": []
+                }
+            }
+        })
+        .to_string();
+
+        process_text_payload(
+            payload.as_str(),
+            17,
+            &mut pending_requests,
+            &mut pending_upload_chunks,
+            &mut pending_artifact_upload_chunks,
+            &event_tx,
+        );
+
+        let event = event_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("expected websocket event");
+        let GatewayWsEvent::Notification {
+            notification: GatewayNotification::ThreadUpdated(notification),
+            ..
+        } = event
+        else {
+            panic!("unexpected event");
+        };
+        assert_eq!(notification.thread.workspace_id, "ws_123");
+        assert_eq!(notification.thread.id, "thr_123");
+        assert_eq!(notification.thread.name.as_deref(), Some("New title"));
+    }
+
+    #[test]
+    fn decode_routes_workspace_changed_notification() {
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let mut pending_requests = PendingJsonRpcRequests::default();
+        let mut pending_upload_chunks = HashMap::new();
+        let mut pending_artifact_upload_chunks = HashMap::new();
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "method": events::WORKSPACE_CHANGED,
+            "params": {
+                "kind": "updated",
+                "workspace": {
+                    "id": "ws_123",
+                    "name": "Renamed Workspace",
+                    "is_active": true,
+                    "is_current": false,
+                    "created_at": 1,
+                    "updated_at": 2
+                }
+            }
+        })
+        .to_string();
+
+        process_text_payload(
+            payload.as_str(),
+            17,
+            &mut pending_requests,
+            &mut pending_upload_chunks,
+            &mut pending_artifact_upload_chunks,
+            &event_tx,
+        );
+
+        let event = event_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("expected websocket event");
+        let GatewayWsEvent::Notification {
+            notification: GatewayNotification::WorkspaceChanged(notification),
+            ..
+        } = event
+        else {
+            panic!("unexpected event");
+        };
+        assert_eq!(notification.kind, WorkspaceChangeKind::Updated);
+        assert_eq!(notification.workspace.id, "ws_123");
+        assert_eq!(notification.workspace.name, "Renamed Workspace");
+    }
+
+    #[test]
+    fn decode_routes_artifact_upload_ack_to_pending_sender() {
+        let (event_tx, _event_rx) = std::sync::mpsc::channel();
+        let mut pending_requests = PendingJsonRpcRequests::default();
+        let mut pending_upload_chunks = HashMap::new();
+        let mut pending_artifact_upload_chunks = HashMap::new();
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        pending_artifact_upload_chunks.insert(upload_ack_key("artifact_upload_1", 0), ack_tx);
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "method": events::ARTIFACT_UPLOAD_CHUNK_ACK,
+            "params": {
+                "workspace_id": "ws_1",
+                "upload_id": "artifact_upload_1",
+                "offset": 0,
+                "len": 5,
+                "received_bytes": 5,
+                "next_offset": 5
+            }
+        })
+        .to_string();
+
+        process_text_payload(
+            payload.as_str(),
+            17,
+            &mut pending_requests,
+            &mut pending_upload_chunks,
+            &mut pending_artifact_upload_chunks,
+            &event_tx,
+        );
+
+        let ack = ack_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("expected artifact ack")
+            .expect("ack should be ok");
+        assert_eq!(ack.workspace_id, "ws_1");
+        assert_eq!(ack.upload_id, "artifact_upload_1");
+        assert!(pending_artifact_upload_chunks.is_empty());
     }
 
     #[test]

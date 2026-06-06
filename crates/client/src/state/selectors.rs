@@ -2,6 +2,9 @@
 
 use crate::{
     agents_doc::scope as agents_doc_scope,
+    composer::model_selection::{
+        self as composer_model_selection, ComposerModelSelection, ComposerModelSelectionCandidate,
+    },
     conversation::{Conversation, state_machine::TurnFlowState},
     state::{
         client_state::{ClientState, ThreadAgentsDocSummaryKey, WorkspaceThreadState},
@@ -10,7 +13,7 @@ use crate::{
     threads::{coordinator::ThreadCoordinator, tree as thread_tree},
     workspaces::selectors as workspace_selectors,
 };
-use pioneer_protocol::{ThreadAgentsDocSummary, ThreadFolder, ThreadPlacement, Workspace};
+use pioneer_protocol::{Thread, ThreadAgentsDocSummary, ThreadFolder, ThreadPlacement, Workspace};
 use std::collections::HashMap;
 
 pub fn current_active_thread_id(state: &ClientState) -> Option<&str> {
@@ -143,6 +146,40 @@ pub fn model_selector_workspace_id_from(
         })
         .map(str::to_owned)
         .unwrap_or_default()
+}
+
+pub fn resolve_composer_model_selection_from(
+    active_thread_id: Option<&str>,
+    active_workspace_id: Option<&str>,
+    coordinators: &HashMap<String, ThreadCoordinator>,
+) -> Option<ComposerModelSelection> {
+    composer_model_selection::resolve_composer_model_selection(
+        active_thread_id,
+        active_workspace_id,
+        composer_model_selection_candidates_from(coordinators),
+    )
+}
+
+pub fn composer_model_selection_candidates_from(
+    coordinators: &HashMap<String, ThreadCoordinator>,
+) -> Vec<ComposerModelSelectionCandidate> {
+    coordinators
+        .iter()
+        .filter_map(|(thread_id, coordinator)| {
+            let thread = coordinator.thread()?;
+            Some(ComposerModelSelectionCandidate {
+                thread_id: thread_id.clone(),
+                workspace_id: coordinator.workspace_id.clone(),
+                updated_at: coordinator.updated_at(),
+                has_turns: thread_has_known_turns(coordinator, thread),
+                selection: ComposerModelSelection::from_thread(thread),
+            })
+        })
+        .collect()
+}
+
+fn thread_has_known_turns(coordinator: &ThreadCoordinator, thread: &Thread) -> bool {
+    !thread.turns.is_empty() || !coordinator.conversation.projection().turns.is_empty()
 }
 
 pub fn thread_folders_for_workspace<'a>(
@@ -513,6 +550,89 @@ mod tests {
         assert_eq!(
             model_selector_workspace_id_from(Some("ws_selected"), Some("thread_a"), &coordinators),
             "ws_selected"
+        );
+    }
+
+    #[test]
+    fn composer_model_selection_candidates_include_local_conversation_turns() {
+        let mut coordinators =
+            HashMap::from([("thread_a".to_owned(), coordinator("thread_a", "ws_a", 30))]);
+        coordinators
+            .get_mut("thread_a")
+            .expect("thread fixture")
+            .conversation
+            .apply(ConversationEvent::LocalTurnStartRequested {
+                thread_id: "thread_a".to_owned(),
+                turn_id: "turn_a".to_owned(),
+                pending_request_id: "request_a".to_owned(),
+                user_text: "hello".to_owned(),
+                attachments: Vec::new(),
+            });
+
+        let candidates = composer_model_selection_candidates_from(&coordinators);
+
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].has_turns);
+        assert_eq!(
+            candidates[0]
+                .selection
+                .as_ref()
+                .map(|s| s.provider.as_str()),
+            Some("openai")
+        );
+        assert_eq!(
+            candidates[0].selection.as_ref().map(|s| s.model.as_str()),
+            Some("gpt-5.4")
+        );
+    }
+
+    #[test]
+    fn composer_model_selection_resolves_latest_workspace_thread_when_active_is_empty() {
+        let coordinators = HashMap::from([
+            (
+                "active_empty".to_owned(),
+                coordinator("active_empty", "ws_a", 50),
+            ),
+            (
+                "older_with_turn".to_owned(),
+                coordinator("older_with_turn", "ws_a", 60),
+            ),
+            (
+                "newer_with_turn".to_owned(),
+                coordinator("newer_with_turn", "ws_a", 70),
+            ),
+            (
+                "other_workspace".to_owned(),
+                coordinator("other_workspace", "ws_b", 100),
+            ),
+        ]);
+        let mut coordinators = coordinators;
+        for thread_id in ["older_with_turn", "newer_with_turn", "other_workspace"] {
+            coordinators
+                .get_mut(thread_id)
+                .expect("thread fixture")
+                .conversation
+                .apply(ConversationEvent::LocalTurnStartRequested {
+                    thread_id: thread_id.to_owned(),
+                    turn_id: format!("{thread_id}_turn"),
+                    pending_request_id: format!("{thread_id}_request"),
+                    user_text: "hello".to_owned(),
+                    attachments: Vec::new(),
+                });
+        }
+
+        let selection = resolve_composer_model_selection_from(
+            Some("active_empty"),
+            Some("ws_a"),
+            &coordinators,
+        );
+
+        assert_eq!(
+            selection,
+            Some(ComposerModelSelection {
+                provider: "openai".to_owned(),
+                model: "gpt-5.4".to_owned(),
+            })
         );
     }
 

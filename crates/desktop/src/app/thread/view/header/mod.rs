@@ -1,4 +1,4 @@
-use crate::app::{root::PioneerDesktop, thread::fallback_title_from_first_user_text};
+use crate::app::{root::PioneerDesktop, thread::thread_display_title};
 use gpui::{prelude::*, *};
 use gpui_component::{
     button::*,
@@ -91,16 +91,6 @@ impl PioneerDesktop {
             return t!("sidebar.thread.untitled").to_string();
         };
 
-        if let Some(name) = thread
-            .name
-            .as_ref()
-            .map(|name| name.trim())
-            .filter(|name| !name.is_empty())
-        {
-            return name.to_owned();
-        }
-
-        fallback_title_from_first_user_text(thread.preview.as_str())
-            .unwrap_or_else(|| t!("sidebar.thread.untitled").to_string())
+        thread_display_title(thread).unwrap_or_else(|| t!("sidebar.thread.untitled").to_string())
     }
 }

@@ -18,7 +18,7 @@ use pioneer_client::composer::capabilities::{
     SkillCapabilityUnavailableReason,
 };
 use pioneer_client::mcp::{details as mcp_details, list as mcp_list};
-use pioneer_protocol::SkillListParams;
+use pioneer_client::skills::catalog as skill_catalog;
 use std::collections::HashSet;
 
 struct CapabilityPickerState {
@@ -65,7 +65,7 @@ impl CapabilityPickerState {
     }
 
     fn query(&self, cx: &App) -> String {
-        self.search.read(cx).value().trim().to_ascii_lowercase()
+        self.search.read(cx).value().to_string()
     }
 
     fn toggle_selected(&mut self, key: &str, cx: &mut Context<Self>) {
@@ -339,7 +339,7 @@ impl PioneerDesktop {
             ) = {
                 let state = picker_state.read(cx);
                 let query = state.query(cx);
-                let has_query = !query.is_empty();
+                let has_query = composer_capabilities::has_capability_query(query.as_str());
                 let active_server_id = state.active_mcp_server_id.clone();
                 let selected_server_ids = composer_capabilities::selected_mcp_server_ids(
                     state.mcp_server_rows.as_slice(),
@@ -348,11 +348,9 @@ impl PioneerDesktop {
                 let active_server_selected = active_server_id
                     .as_deref()
                     .is_some_and(|server_id| selected_server_ids.contains(server_id));
-                let loaded_tool_server_ids = state
-                    .mcp_tool_rows
-                    .iter()
-                    .map(|row| row.server_id.clone())
-                    .collect::<HashSet<_>>();
+                let loaded_tool_server_ids = composer_capabilities::loaded_mcp_tool_server_ids(
+                    state.mcp_tool_rows.as_slice(),
+                );
                 (
                     composer_capabilities::filter_selectable_mcp_capability_rows(
                         state.mcp_server_rows.as_slice(),
@@ -459,7 +457,10 @@ impl PioneerDesktop {
         &self,
         query: &str,
     ) -> Vec<SelectableSkillCapability> {
-        composer_capabilities::filter_skill_capability_rows(self.installed_skills.as_slice(), query)
+        composer_capabilities::filter_installed_skill_capability_rows(
+            self.installed_skills.as_slice(),
+            query,
+        )
     }
 
     pub(super) fn selectable_mcp_server_capabilities(
@@ -497,25 +498,16 @@ impl PioneerDesktop {
             async move {
                 let result = cx
                     .background_spawn(async move {
-                        ws_sender.skills_list(SkillListParams {
-                            workspace_id,
-                            include_health: true,
-                            include_policy: true,
-                        })
+                        ws_sender.skills_list(skill_catalog::skill_list_params(workspace_id))
                     })
                     .await;
 
                 let _ = cx.update(|cx| {
                     picker_state.update(cx, |state, cx| match result {
                         Ok(response) => {
-                            let installed = response
-                                .skills
-                                .into_iter()
-                                .filter(|skill| skill.install.installed)
-                                .collect::<Vec<_>>();
                             state.finish_loading_skills(
-                                composer_capabilities::filter_skill_capability_rows(
-                                    installed.as_slice(),
+                                composer_capabilities::filter_installed_skill_capability_rows(
+                                    response.skills.as_slice(),
                                     "",
                                 ),
                                 cx,
@@ -580,11 +572,8 @@ impl PioneerDesktop {
                             .iter()
                             .map(composer_capabilities::selectable_mcp_server_from_item)
                             .collect::<Vec<_>>();
-                        let prefetch_server_ids = rows
-                            .iter()
-                            .filter(|row| row.selectable)
-                            .map(|row| row.server_id.clone())
-                            .collect::<Vec<_>>();
+                        let prefetch_server_ids =
+                            composer_capabilities::selectable_mcp_server_ids(rows.as_slice());
                         let _ = cx.update(|cx| {
                             picker_state.update(cx, |state, cx| {
                                 state.finish_loading_mcp_servers(

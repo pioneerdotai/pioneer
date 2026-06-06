@@ -6,7 +6,7 @@ use crate::app::{
 use gpui::{prelude::*, *};
 use gpui_component::{collapsible::Collapsible, h_flex, spinner::Spinner, v_flex, *};
 use pioneer_client::timeline::labels::{
-    TimelineFinalStatusKind, download_url_from_arguments, final_download_status, format_bytes_human,
+    TimelineFinalStatusKind, download_display_url, final_download_status, format_bytes_human,
 };
 use pioneer_protocol::TurnItem;
 use std::hash::{Hash, Hasher};
@@ -32,11 +32,7 @@ impl PioneerDesktop {
                 bytes_written,
                 ..
             } => (
-                final_url
-                    .as_ref()
-                    .or(url.as_ref())
-                    .cloned()
-                    .or_else(|| download_url_from_arguments(arguments)),
+                download_display_url(arguments, url.as_deref(), final_url.as_deref()),
                 *status_code,
                 *success,
                 *bytes_written,

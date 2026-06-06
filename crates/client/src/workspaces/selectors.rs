@@ -16,6 +16,18 @@ pub fn workspace_by_id<'a>(
         .find(|workspace| workspace.id == workspace_id)
 }
 
+pub fn active_workspaces(workspaces: &[Workspace]) -> Vec<&Workspace> {
+    workspaces
+        .iter()
+        .filter(|workspace| workspace.is_active)
+        .collect()
+}
+
+pub fn workspace_display_name(workspace: &Workspace) -> Option<&str> {
+    let name = workspace.name.trim();
+    (!name.is_empty()).then_some(name)
+}
+
 pub fn resolve_active_workspace_id<'a>(
     persisted_workspace_id: Option<&str>,
     workspaces: &'a [Workspace],
@@ -111,6 +123,32 @@ mod tests {
             resolve_active_workspace_id(None, no_current.as_slice()),
             Some("ws_3")
         );
+    }
+
+    #[test]
+    fn active_workspaces_filters_inactive_catalog_entries() {
+        let workspaces = vec![
+            workspace("ws_1", true, true),
+            workspace("ws_inactive", false, false),
+            workspace("ws_2", true, false),
+        ];
+
+        let active = active_workspaces(workspaces.as_slice())
+            .into_iter()
+            .map(|workspace| workspace.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(active, vec!["ws_1", "ws_2"]);
+    }
+
+    #[test]
+    fn workspace_display_name_uses_trimmed_non_empty_name() {
+        let mut item = workspace("ws_1", true, true);
+        item.name = "  Project Alpha  ".to_owned();
+        assert_eq!(workspace_display_name(&item), Some("Project Alpha"));
+
+        item.name = "   ".to_owned();
+        assert_eq!(workspace_display_name(&item), None);
     }
 
     #[test]

@@ -9,10 +9,7 @@ use crate::{
 use gpui::{prelude::*, *};
 use gpui_component::{collapsible::Collapsible, h_flex, spinner::Spinner, *};
 use gpui_terminal::{ColorPalette, TerminalConfig, TerminalView};
-use pioneer_client::timeline::labels::{
-    command_from_arguments, normalize_for_terminal, shell_output_from_display,
-    shell_output_from_storage,
-};
+use pioneer_client::timeline::labels::command_execution_terminal_text;
 use pioneer_protocol::TurnItem;
 use std::{
     hash::{Hash, Hasher},
@@ -107,42 +104,10 @@ impl PioneerDesktop {
         content_width: Pixels,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let terminal_text = match item {
-            TurnItem::CommandExecution {
-                arguments,
-                command,
-                display,
-                storage,
-                ..
-            } => {
-                let command_line = if command.is_empty() {
-                    command_from_arguments(arguments)
-                        .map(|cmd| format!("$ {cmd}"))
-                        .unwrap_or_default()
-                } else {
-                    format!("$ {}", command.join(" "))
-                };
-
-                let command_output = shell_output_from_display(display)
-                    .or_else(|| shell_output_from_storage(storage))
-                    .unwrap_or_default();
-
-                let output_block = if command_output.trim().is_empty() {
-                    Self::timeline_entry_text(item_view).to_owned()
-                } else {
-                    Self::truncate_for_card(&command_output.replace('\t', "    "), 24_000)
-                };
-
-                let content = if command_line.is_empty() {
-                    output_block
-                } else {
-                    format!("{command_line}\n{output_block}")
-                };
-
-                normalize_for_terminal(content.as_str())
-            }
-            _ => normalize_for_terminal(Self::timeline_entry_text(item_view)),
-        };
+        let terminal_text =
+            command_execution_terminal_text(item, Self::timeline_entry_text(item_view), |output| {
+                Self::truncate_for_card(output, 24_000)
+            });
 
         let cols = Self::estimate_terminal_cols(content_width);
         let line_count = Self::estimate_visual_lines(terminal_text.as_str(), cols);

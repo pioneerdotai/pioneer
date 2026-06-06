@@ -52,21 +52,8 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use pioneer_client::artifacts::download::{
-    ARTIFACT_DOWNLOAD_CACHE_MAX_AGE, ArtifactDownloadCachePaths,
-    build_artifact_download_cache_path, prune_artifact_download_cache,
-    verify_artifact_download_file,
-};
-#[cfg(test)]
-use pioneer_client::transport::ws::backoff::{duration_to_millis_u64, next_backoff};
 use pioneer_client::transport::ws::client::{GatewayWsCommand, spawn_worker};
-#[cfg(test)]
-use pioneer_client::transport::ws::decode::process_text_payload;
 use pioneer_client::transport::ws::download::ArtifactDownloadChunkPayload;
-#[cfg(test)]
-pub(super) use pioneer_client::transport::ws::frames::encode_artifact_upload_chunk_frame;
-#[cfg(test)]
-use pioneer_client::transport::ws::rpc::normalize_ws_url;
 use pioneer_client::transport::ws::{GatewayWsConnectSpec, GatewayWsEvent};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 

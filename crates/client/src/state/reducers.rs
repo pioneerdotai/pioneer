@@ -3,6 +3,7 @@
 use crate::state::client_state::{GatewayConnectionState, GatewayStatusLevel};
 use crate::{
     agents_doc::scope as agents_doc_scope,
+    composer::draft as composer_draft,
     gateway::{runtime::ActiveGatewayState, types::GatewayEndpointKind},
     notifications::effects::ClientEffect,
     state::client_state::{ClientState, ThreadAgentsDocSummaryKey},
@@ -166,6 +167,49 @@ pub fn remove_thread_scoped_entries<AttachmentDraft, CapabilityDraft, RefreshSta
     thread_placements.remove(thread_id);
     turn_timeline_refresh.retain(|(refresh_thread_id, _), _| refresh_thread_id != thread_id);
     cleared_draft
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn clear_thread_client_state<Attachment, Capability, RefreshState>(
+    draft_thread_id: &mut Option<String>,
+    coordinators: &mut HashMap<String, ThreadCoordinator>,
+    thread_drafts: &mut HashMap<String, String>,
+    thread_draft_attachments: &mut HashMap<String, Vec<Attachment>>,
+    thread_draft_capabilities: &mut HashMap<String, Vec<Capability>>,
+    composer_attachments: &mut Vec<Attachment>,
+    composer_capabilities: &mut Vec<Capability>,
+    composer_upload_in_progress: &mut bool,
+    composer_upload_error: &mut Option<String>,
+    composer_selected_provider: &mut Option<String>,
+    composer_selected_model: &mut Option<String>,
+    composer_model_selection_manually_selected: &mut bool,
+    thread_folders: &mut HashMap<String, ThreadFolder>,
+    thread_placements: &mut HashMap<String, ThreadPlacement>,
+    thread_agents_doc_summaries: &mut HashMap<ThreadAgentsDocSummaryKey, ThreadAgentsDocSummary>,
+    thread_folder_expanded: &mut HashMap<String, bool>,
+    thread_tree_selected_node_id: &mut Option<String>,
+    turn_timeline_refresh: &mut HashMap<(String, String), RefreshState>,
+) {
+    *draft_thread_id = None;
+    coordinators.clear();
+    composer_draft::clear_all_composer_drafts(
+        thread_drafts,
+        thread_draft_attachments,
+        thread_draft_capabilities,
+    );
+    composer_attachments.clear();
+    composer_capabilities.clear();
+    *composer_upload_in_progress = false;
+    *composer_upload_error = None;
+    *composer_selected_provider = None;
+    *composer_selected_model = None;
+    *composer_model_selection_manually_selected = false;
+    thread_folders.clear();
+    thread_placements.clear();
+    thread_agents_doc_summaries.clear();
+    thread_folder_expanded.clear();
+    *thread_tree_selected_node_id = None;
+    turn_timeline_refresh.clear();
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -690,7 +734,9 @@ pub fn thread_agents_doc_summaries_by_scope(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pioneer_protocol::{ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus};
+    use pioneer_protocol::{
+        ThreadAgentsDocStatus, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus,
+    };
 
     fn thread(thread_id: &str, workspace_id: &str, updated_at: i64) -> Thread {
         Thread {
@@ -710,6 +756,103 @@ mod tests {
             agent_role: None,
             turns: Vec::new(),
         }
+    }
+
+    #[test]
+    fn clear_thread_client_state_clears_thread_composer_and_selection_state() {
+        let mut draft_thread_id = Some("thread_a".to_owned());
+        let mut coordinators = HashMap::from([(
+            "thread_a".to_owned(),
+            ThreadCoordinator::new(thread("thread_a", "ws", 1)),
+        )]);
+        let mut thread_drafts = HashMap::from([("thread_a".to_owned(), "draft".to_owned())]);
+        let mut thread_draft_attachments =
+            HashMap::from([("thread_a".to_owned(), vec!["attachment".to_owned()])]);
+        let mut thread_draft_capabilities =
+            HashMap::from([("thread_a".to_owned(), vec!["skill".to_owned()])]);
+        let mut composer_attachments = vec!["active-attachment".to_owned()];
+        let mut composer_capabilities = vec!["active-skill".to_owned()];
+        let mut composer_upload_in_progress = true;
+        let mut composer_upload_error = Some("failed".to_owned());
+        let mut composer_selected_provider = Some("openai".to_owned());
+        let mut composer_selected_model = Some("gpt-5.4".to_owned());
+        let mut composer_model_selection_manually_selected = true;
+        let mut thread_folders = HashMap::from([(
+            "folder_a".to_owned(),
+            ThreadFolder {
+                id: "folder_a".to_owned(),
+                workspace_id: "ws".to_owned(),
+                parent_folder_id: None,
+                name: "Folder".to_owned(),
+                created_at: 1,
+                updated_at: 1,
+            },
+        )]);
+        let mut thread_placements = HashMap::from([(
+            "thread_a".to_owned(),
+            ThreadPlacement {
+                thread_id: "thread_a".to_owned(),
+                workspace_id: "ws".to_owned(),
+                folder_id: Some("folder_a".to_owned()),
+            },
+        )]);
+        let mut thread_agents_doc_summaries = HashMap::from([(
+            ThreadAgentsDocSummaryKey::Root,
+            ThreadAgentsDocSummary {
+                id: "agents_doc_root".to_owned(),
+                workspace_id: "ws".to_owned(),
+                folder_id: None,
+                status: ThreadAgentsDocStatus::Active,
+                content_sha256: "sha".to_owned(),
+                version: 1,
+                char_count: 10,
+                updated_at: 1,
+            },
+        )]);
+        let mut thread_folder_expanded = HashMap::from([("folder_a".to_owned(), true)]);
+        let mut thread_tree_selected_node_id = Some("folder_a".to_owned());
+        let mut turn_timeline_refresh =
+            HashMap::from([(("thread_a".to_owned(), "turn_a".to_owned()), true)]);
+
+        clear_thread_client_state(
+            &mut draft_thread_id,
+            &mut coordinators,
+            &mut thread_drafts,
+            &mut thread_draft_attachments,
+            &mut thread_draft_capabilities,
+            &mut composer_attachments,
+            &mut composer_capabilities,
+            &mut composer_upload_in_progress,
+            &mut composer_upload_error,
+            &mut composer_selected_provider,
+            &mut composer_selected_model,
+            &mut composer_model_selection_manually_selected,
+            &mut thread_folders,
+            &mut thread_placements,
+            &mut thread_agents_doc_summaries,
+            &mut thread_folder_expanded,
+            &mut thread_tree_selected_node_id,
+            &mut turn_timeline_refresh,
+        );
+
+        assert!(draft_thread_id.is_none());
+        assert!(coordinators.is_empty());
+        assert!(thread_drafts.is_empty());
+        assert!(thread_draft_attachments.is_empty());
+        assert!(thread_draft_capabilities.is_empty());
+        assert!(composer_attachments.is_empty());
+        assert!(composer_capabilities.is_empty());
+        assert!(!composer_upload_in_progress);
+        assert!(composer_upload_error.is_none());
+        assert!(composer_selected_provider.is_none());
+        assert!(composer_selected_model.is_none());
+        assert!(!composer_model_selection_manually_selected);
+        assert!(thread_folders.is_empty());
+        assert!(thread_placements.is_empty());
+        assert!(thread_agents_doc_summaries.is_empty());
+        assert!(thread_folder_expanded.is_empty());
+        assert!(thread_tree_selected_node_id.is_none());
+        assert!(turn_timeline_refresh.is_empty());
     }
 
     #[test]

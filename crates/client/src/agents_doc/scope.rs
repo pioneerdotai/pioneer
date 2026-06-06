@@ -1,6 +1,8 @@
 //! Agents.md scope helpers.
 
-use pioneer_protocol::{ThreadAgentsDocArchiveParams, ThreadAgentsDocSummary};
+use pioneer_protocol::{
+    ThreadAgentsDocArchiveParams, ThreadAgentsDocStatus, ThreadAgentsDocSummary,
+};
 use std::collections::HashMap;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,6 +101,15 @@ pub fn thread_agents_doc_summary_for_workspace<'a>(
         .filter(|summary| summary.workspace_id == workspace_id)
 }
 
+pub fn thread_agents_doc_summaries_for_workspace<'a>(
+    summaries: &'a HashMap<ThreadAgentsDocSummaryKey, ThreadAgentsDocSummary>,
+    workspace_id: &'a str,
+) -> impl Iterator<Item = (&'a ThreadAgentsDocSummaryKey, &'a ThreadAgentsDocSummary)> + 'a {
+    summaries
+        .iter()
+        .filter(move |(_, summary)| summary.workspace_id == workspace_id)
+}
+
 pub fn remove_thread_agents_doc_summary(
     summaries: &mut HashMap<ThreadAgentsDocSummaryKey, ThreadAgentsDocSummary>,
     folder_id: Option<&str>,
@@ -117,10 +128,34 @@ pub fn agents_doc_archive_params_for_summary(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentsDocEditAction {
+    Create,
+    Edit,
+}
+
+pub fn agents_doc_edit_action(summary: Option<&ThreadAgentsDocSummary>) -> AgentsDocEditAction {
+    if summary.is_some() {
+        AgentsDocEditAction::Edit
+    } else {
+        AgentsDocEditAction::Create
+    }
+}
+
+pub fn agents_doc_has_active_explicit_badge(summary: Option<&ThreadAgentsDocSummary>) -> bool {
+    matches!(
+        summary.map(|summary| summary.status),
+        Some(ThreadAgentsDocStatus::Active)
+    )
+}
+
+pub fn agents_doc_can_remove_override(summary: Option<&ThreadAgentsDocSummary>) -> bool {
+    summary.is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pioneer_protocol::ThreadAgentsDocStatus;
 
     fn summary(
         workspace_id: &str,
@@ -206,6 +241,23 @@ mod tests {
     }
 
     #[test]
+    fn summaries_for_workspace_filters_scope_map() {
+        let summaries = thread_agents_doc_summaries_by_scope(vec![
+            summary("ws_a", None, ThreadAgentsDocStatus::Active),
+            summary("ws_a", Some("fld_1"), ThreadAgentsDocStatus::Draft),
+            summary("ws_b", Some("fld_2"), ThreadAgentsDocStatus::Draft),
+        ]);
+
+        let filtered = thread_agents_doc_summaries_for_workspace(&summaries, "ws_a")
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.contains(&ThreadAgentsDocSummaryKey::Root));
+        assert!(filtered.contains(&ThreadAgentsDocSummaryKey::Folder("fld_1".to_owned())));
+    }
+
+    #[test]
     fn remove_summary_uses_folder_scope_key() {
         let mut summaries = thread_agents_doc_summaries_by_scope(vec![
             summary("ws_a", None, ThreadAgentsDocStatus::Active),
@@ -237,5 +289,29 @@ mod tests {
         assert_eq!(root_params.workspace_id, "ws_a");
         assert_eq!(root_params.folder_id, None);
         assert_eq!(root_params.expected_version, Some(1));
+    }
+
+    #[test]
+    fn edit_action_uses_create_without_summary_and_edit_with_summary() {
+        assert_eq!(agents_doc_edit_action(None), AgentsDocEditAction::Create);
+        let draft = summary("ws_a", Some("fld_1"), ThreadAgentsDocStatus::Draft);
+        assert_eq!(
+            agents_doc_edit_action(Some(&draft)),
+            AgentsDocEditAction::Edit
+        );
+    }
+
+    #[test]
+    fn active_badge_and_remove_override_use_explicit_summary_state() {
+        let draft = summary("ws_a", Some("fld_1"), ThreadAgentsDocStatus::Draft);
+        let active = summary("ws_a", Some("fld_1"), ThreadAgentsDocStatus::Active);
+
+        assert!(!agents_doc_has_active_explicit_badge(None));
+        assert!(!agents_doc_has_active_explicit_badge(Some(&draft)));
+        assert!(agents_doc_has_active_explicit_badge(Some(&active)));
+
+        assert!(!agents_doc_can_remove_override(None));
+        assert!(agents_doc_can_remove_override(Some(&draft)));
+        assert!(agents_doc_can_remove_override(Some(&active)));
     }
 }

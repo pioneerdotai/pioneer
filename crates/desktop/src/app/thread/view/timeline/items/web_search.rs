@@ -5,7 +5,7 @@ use crate::app::{
 };
 use gpui::{prelude::*, *};
 use gpui_component::{collapsible::Collapsible, h_flex, spinner::Spinner, v_flex, *};
-use pioneer_client::timeline::labels::web_search_query_from_arguments;
+use pioneer_client::timeline::labels::web_search_display_query;
 use pioneer_protocol::{TurnItem, WebSearchResultItem};
 use std::hash::{Hash, Hasher};
 
@@ -32,9 +32,7 @@ impl PioneerDesktop {
                 results,
                 ..
             } => (
-                query
-                    .clone()
-                    .or_else(|| web_search_query_from_arguments(arguments))
+                web_search_display_query(arguments, query.as_deref())
                     .unwrap_or_else(|| t!("timeline.web_search.fallback_query").to_string()),
                 result_count.unwrap_or(results.len()),
                 results.clone(),

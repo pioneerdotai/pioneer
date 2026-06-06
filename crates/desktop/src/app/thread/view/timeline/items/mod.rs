@@ -18,26 +18,17 @@ use gpui_component::{Icon, IconName, h_flex, theme::ActiveTheme, v_flex};
 use pioneer_client::tasks::display::task_status_label;
 use pioneer_client::timeline::labels as timeline_labels;
 use pioneer_protocol::TurnItem;
-use pioneer_tools::default_favicon_url;
-
-pub(super) fn now_unix_ms() -> i64 {
-    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
-        Err(_) => 0,
-    }
-}
 
 pub(super) fn format_elapsed_ms(elapsed_ms: u64) -> String {
     timeline_labels::format_elapsed_ms(elapsed_ms)
 }
 
+pub(super) fn now_unix_ms() -> i64 {
+    timeline_labels::now_unix_ms()
+}
+
 pub(super) fn format_elapsed(item_view: &ItemView) -> Option<String> {
-    let started = item_view.started_at_unix_ms?;
-    let ended = item_view
-        .completed_at_unix_ms
-        .or(item_view.updated_at_unix_ms)
-        .unwrap_or(started);
-    Some(format_elapsed_ms(ended.saturating_sub(started) as u64))
+    timeline_labels::format_item_elapsed(item_view)
 }
 
 pub(super) fn host_from_url(url: &str) -> Option<String> {
@@ -50,16 +41,7 @@ impl PioneerDesktop {
         primary: Option<String>,
         page_url: &str,
     ) -> Option<String> {
-        primary
-            .and_then(|value| {
-                let value = value.trim().to_owned();
-                (!value.is_empty()).then_some(value)
-            })
-            .or_else(|| {
-                host_from_url(page_url)
-                    .map(|host| format!("https://icons.duckduckgo.com/ip3/{host}.ico"))
-            })
-            .or_else(|| default_favicon_url(page_url))
+        timeline_labels::timeline_favicon_url(primary, page_url)
     }
 
     pub(super) fn timeline_favicon_icon(

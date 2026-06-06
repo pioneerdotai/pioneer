@@ -1,5 +1,5 @@
 use crate::{
-    app::{PioneerDesktop, thread::fallback_title_from_first_user_text},
+    app::{PioneerDesktop, thread::thread_display_title},
     components::buttonts::{default_outline_button, default_primary_button},
 };
 use gpui::{prelude::*, *};
@@ -24,13 +24,7 @@ impl PioneerDesktop {
         let Some(thread) = coordinator.thread() else {
             return;
         };
-        let initial_name = thread
-            .name
-            .as_ref()
-            .map(|name| name.trim())
-            .filter(|name| !name.is_empty())
-            .map(str::to_owned)
-            .or_else(|| fallback_title_from_first_user_text(thread.preview.as_str()))
+        let initial_name = thread_display_title(thread)
             .unwrap_or_else(|| t!("sidebar.thread.untitled").to_string());
         let rename_input_state = cx.new(|cx| InputState::new(window, cx));
         rename_input_state.update(cx, |state, cx| {

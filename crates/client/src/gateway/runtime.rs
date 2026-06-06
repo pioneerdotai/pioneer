@@ -112,6 +112,14 @@ pub fn classify_local_gateway_state(reachable: bool, service_active: bool) -> Ac
     }
 }
 
+pub fn normalize_local_service_active(reachable: bool, service_active: bool) -> bool {
+    if reachable {
+        return true;
+    }
+
+    service_active
+}
+
 pub fn active_gateway_id(registry: &GatewayRegistry) -> Option<&str> {
     registry.active_gateway_id.as_deref()
 }
@@ -145,6 +153,45 @@ pub fn active_gateway(registry: &GatewayRegistry) -> Option<&GatewayEndpoint> {
 
 pub fn active_workspace_id(registry: &GatewayRegistry) -> Option<&str> {
     active_gateway(registry).and_then(|endpoint| endpoint.workspace_id.as_deref())
+}
+
+pub fn local_gateway_is_selectable(
+    registry: &GatewayRegistry,
+    local_gateway_id: &str,
+    local_gateway_has_auth_token: bool,
+) -> bool {
+    registry.active_gateway_id.as_deref() == Some(local_gateway_id.trim())
+        || local_gateway_has_auth_token
+}
+
+pub fn selectable_gateway_endpoints(
+    registry: &GatewayRegistry,
+    local_gateway_id: &str,
+    local_gateway_has_auth_token: bool,
+) -> Vec<GatewayEndpoint> {
+    let mut endpoints = Vec::with_capacity(registry.remotes.len() + 1);
+    if local_gateway_is_selectable(registry, local_gateway_id, local_gateway_has_auth_token) {
+        endpoints.push(registry.local.clone());
+    }
+    endpoints.extend(registry.remotes.clone());
+    endpoints
+}
+
+pub fn remote_delete_fallback_endpoint(
+    registry: &GatewayRegistry,
+    deleted_id: &str,
+    local_gateway_id: &str,
+    local_gateway_has_auth_token: bool,
+) -> Option<GatewayEndpoint> {
+    if local_gateway_is_selectable(registry, local_gateway_id, local_gateway_has_auth_token) {
+        return Some(registry.local.clone());
+    }
+
+    registry
+        .remotes
+        .iter()
+        .find(|endpoint| endpoint.id != deleted_id)
+        .cloned()
 }
 
 pub fn activate_gateway(
@@ -568,6 +615,10 @@ mod tests {
             classify_local_gateway_state(true, false),
             ActiveGatewayState::LocalAddressConflict
         );
+        assert!(normalize_local_service_active(true, false));
+        assert!(normalize_local_service_active(true, true));
+        assert!(normalize_local_service_active(false, true));
+        assert!(!normalize_local_service_active(false, false));
     }
 
     #[test]
@@ -600,6 +651,66 @@ mod tests {
             endpoint_by_id(&registry, "local")
                 .and_then(|endpoint| endpoint.workspace_id.as_deref()),
             Some("ws-local")
+        );
+    }
+
+    #[test]
+    fn gateway_selectable_endpoints_hide_uncreated_local_gateway() {
+        let mut registry = registry();
+        registry.active_gateway_id = Some("remote".to_owned());
+
+        let endpoints = selectable_gateway_endpoints(&registry, "local", false);
+
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].id, "remote");
+        assert_eq!(endpoints[0].kind, GatewayEndpointKind::Remote);
+    }
+
+    #[test]
+    fn gateway_selectable_endpoints_include_local_after_token_or_active_selection() {
+        let mut registry = registry();
+        registry.active_gateway_id = Some("remote".to_owned());
+
+        let endpoints = selectable_gateway_endpoints(&registry, "local", true);
+
+        assert_eq!(endpoints.len(), 2);
+        assert_eq!(endpoints[0].id, "local");
+        assert_eq!(endpoints[0].kind, GatewayEndpointKind::Local);
+        assert_eq!(endpoints[1].id, "remote");
+
+        registry.active_gateway_id = Some("local".to_owned());
+        let endpoints = selectable_gateway_endpoints(&registry, "local", false);
+
+        assert_eq!(endpoints.len(), 2);
+        assert_eq!(endpoints[0].id, "local");
+        assert_eq!(endpoints[0].kind, GatewayEndpointKind::Local);
+    }
+
+    #[test]
+    fn gateway_remote_delete_fallback_prefers_selectable_local_then_other_remote() {
+        let mut registry = registry();
+        registry.remotes.push(GatewayEndpoint {
+            id: "remote-two".to_owned(),
+            name: "Remote Two".to_owned(),
+            address: "127.0.0.1:24000".to_owned(),
+            kind: GatewayEndpointKind::Remote,
+            auth_token_ref: Some("remote-two".to_owned()),
+            workspace_id: None,
+            service_name: None,
+        });
+
+        let fallback = remote_delete_fallback_endpoint(&registry, "remote", "local", true);
+
+        assert_eq!(
+            fallback.as_ref().map(|endpoint| endpoint.id.as_str()),
+            Some("local")
+        );
+
+        let fallback = remote_delete_fallback_endpoint(&registry, "remote", "local", false);
+
+        assert_eq!(
+            fallback.as_ref().map(|endpoint| endpoint.id.as_str()),
+            Some("remote-two")
         );
     }
 

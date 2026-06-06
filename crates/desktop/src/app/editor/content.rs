@@ -1,7 +1,5 @@
 use anyhow::Error;
 use pioneer_client::agents_doc::content as agents_doc_content;
-#[cfg(test)]
-use pioneer_protocol::ThreadAgentsDocPayload;
 use pioneer_protocol::{
     ThreadAgentsDocGetParams, ThreadAgentsDocGetResponse, ThreadAgentsDocSaveParams,
     ThreadAgentsDocSaveReason,
@@ -10,11 +8,6 @@ use pioneer_protocol::{
 pub(super) use pioneer_client::agents_doc::content::{
     AgentsDocConflictRefreshProjection, AgentsDocLoadProjection,
 };
-
-#[cfg(test)]
-pub(super) fn agents_doc_initial_buffer(explicit_doc: Option<&ThreadAgentsDocPayload>) -> String {
-    agents_doc_content::agents_doc_initial_buffer(explicit_doc)
-}
 
 pub(super) fn agents_doc_load_projection(
     response: ThreadAgentsDocGetResponse,

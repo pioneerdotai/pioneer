@@ -105,6 +105,13 @@ impl GatewayConnectionState {
     }
 }
 
+pub fn gateway_has_ready_ws_connection(
+    connection_state: GatewayConnectionState,
+    ws_connection_id: Option<u64>,
+) -> bool {
+    connection_state == GatewayConnectionState::Connected && ws_connection_id.is_some()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TurnTimelineRefreshKey {
     pub thread_id: String,
@@ -129,5 +136,26 @@ impl From<(String, String)> for TurnTimelineRefreshKey {
 impl From<TurnTimelineRefreshKey> for (String, String) {
     fn from(key: TurnTimelineRefreshKey) -> Self {
         (key.thread_id, key.turn_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ready_ws_connection_requires_connected_state_and_connection_id() {
+        assert!(gateway_has_ready_ws_connection(
+            GatewayConnectionState::Connected,
+            Some(7),
+        ));
+        assert!(!gateway_has_ready_ws_connection(
+            GatewayConnectionState::Connected,
+            None,
+        ));
+        assert!(!gateway_has_ready_ws_connection(
+            GatewayConnectionState::Reconnecting,
+            Some(7),
+        ));
     }
 }

@@ -35,6 +35,9 @@ pub struct Conversation {
 
 pub const MAX_EVENT_LOG_LEN: usize = 2_000;
 
+#[cfg(test)]
+mod tests;
+
 fn history_event_thread_id(payload: &ThreadHistoryEventPayload) -> &str {
     match payload {
         ThreadHistoryEventPayload::TurnStarted { thread_id, .. }

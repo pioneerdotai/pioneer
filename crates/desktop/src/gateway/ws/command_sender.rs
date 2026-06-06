@@ -5,8 +5,8 @@ use pioneer_client::{
     ClientError, ClientResult,
     artifacts::{
         download::{
-            self as client_artifact_download, ArtifactDownloadCache, ArtifactDownloadChunkWaiter,
-            ArtifactDownloadRequest, ArtifactDownloadResult, ArtifactDownloadSink,
+            self as client_artifact_download, ArtifactDownloadChunkWaiter,
+            ArtifactDownloadFileCache, ArtifactDownloadRequest, ArtifactDownloadResult,
             ArtifactDownloadTransport,
         },
         upload::ArtifactUploadTransport,
@@ -524,7 +524,7 @@ impl GatewayWsCommandSender {
     ) -> Result<ArtifactDownloadResult> {
         client_artifact_download::download_artifact_to_cache(
             self,
-            &DesktopArtifactDownloadCache { runtime_home },
+            &ArtifactDownloadFileCache::new(runtime_home),
             request,
         )
     }
@@ -711,119 +711,6 @@ impl ArtifactDownloadChunkWaiter for DesktopArtifactDownloadChunkWaiter {
     }
 }
 
-#[derive(Clone, Debug)]
-struct DesktopArtifactDownloadCache {
-    runtime_home: PathBuf,
-}
-
-impl ArtifactDownloadCache for DesktopArtifactDownloadCache {
-    type Sink = DesktopArtifactDownloadSink;
-
-    fn prune(&self) -> Result<()> {
-        let _ = prune_artifact_download_cache(
-            self.runtime_home.as_path(),
-            ARTIFACT_DOWNLOAD_CACHE_MAX_AGE,
-        );
-        Ok(())
-    }
-
-    fn create_sink(
-        &self,
-        request: &client_artifact_download::ArtifactDownloadRequest,
-        start: &ArtifactDownloadStartResponse,
-        version_id: &str,
-    ) -> Result<Self::Sink> {
-        let cache_paths = build_artifact_download_cache_path(
-            self.runtime_home.as_path(),
-            request.gateway_profile_id.as_str(),
-            request.workspace_id.as_str(),
-            request.artifact_id.as_str(),
-            version_id,
-            start.file_name.as_str(),
-        )?;
-        Ok(DesktopArtifactDownloadSink {
-            cache_paths,
-            expected_size_bytes: start.size_bytes,
-            expected_sha256: start.sha256.clone(),
-            file: None,
-        })
-    }
-}
-
-struct DesktopArtifactDownloadSink {
-    cache_paths: ArtifactDownloadCachePaths,
-    expected_size_bytes: u64,
-    expected_sha256: String,
-    file: Option<fs::File>,
-}
-
-impl ArtifactDownloadSink for DesktopArtifactDownloadSink {
-    fn prepare(&mut self) -> Result<()> {
-        if let Some(parent) = self.cache_paths.part_path.as_path().parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "failed to create artifact download cache {}",
-                    parent.display()
-                )
-            })?;
-        }
-        let _ = fs::remove_file(self.cache_paths.part_path.as_path());
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .read(true)
-            .truncate(true)
-            .open(self.cache_paths.part_path.as_path())
-            .with_context(|| {
-                format!(
-                    "failed to create artifact download part file {}",
-                    self.cache_paths.part_path.as_path().display()
-                )
-            })?;
-        self.file = Some(file);
-        Ok(())
-    }
-
-    fn write_chunk(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
-        let file = self
-            .file
-            .as_mut()
-            .ok_or_else(|| anyhow!("artifact download sink is not prepared"))?;
-        write_chunk_at(file, offset, bytes)
-    }
-
-    fn finalize(&mut self) -> Result<ClientPath> {
-        if let Some(file) = self.file.take() {
-            file.sync_data()
-                .context("failed to sync artifact download")?;
-        }
-
-        verify_artifact_download_file(
-            self.cache_paths.part_path.as_path(),
-            self.expected_size_bytes,
-            self.expected_sha256.as_str(),
-        )?;
-
-        let _ = fs::remove_file(self.cache_paths.final_path.as_path());
-        fs::rename(
-            self.cache_paths.part_path.as_path(),
-            self.cache_paths.final_path.as_path(),
-        )
-        .with_context(|| {
-            format!(
-                "failed to finalize artifact download {}",
-                self.cache_paths.final_path.as_path().display()
-            )
-        })?;
-        Ok(self.cache_paths.final_path.clone())
-    }
-
-    fn cleanup_partial(&mut self) {
-        self.file.take();
-        let _ = fs::remove_file(self.cache_paths.part_path.as_path());
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 struct DesktopClientFileSystem;
 
@@ -870,14 +757,4 @@ impl ClientFileSystem for DesktopClientFileSystem {
         })?;
         Ok(Box::new(file))
     }
-}
-
-fn write_chunk_at(file: &mut fs::File, offset: u64, bytes: &[u8]) -> Result<()> {
-    use std::io::{Seek, SeekFrom, Write};
-
-    file.seek(SeekFrom::Start(offset))
-        .context("failed to seek artifact download part file")?;
-    file.write_all(bytes)
-        .context("failed to write artifact download chunk")?;
-    Ok(())
 }

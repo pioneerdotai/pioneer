@@ -29,11 +29,7 @@ use pioneer_client::workspaces::actions::{
 };
 use pioneer_client::workspaces::selectors as workspace_selectors;
 
-#[cfg(test)]
-pub(super) use pioneer_client::notifications::router::should_accept_thread_started_as_local_pending;
-#[cfg(test)]
-pub(super) use pioneer_client::notifications::router::should_refresh_workspace_bound_data;
-pub(super) use pioneer_client::workspaces::actions::apply_workspace_changed_to_catalog;
+use pioneer_client::workspaces::actions::apply_workspace_changed_to_catalog;
 
 impl PioneerDesktop {
     pub(in crate::app::flow) fn apply_gateway_notification(

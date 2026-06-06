@@ -1,17 +1,25 @@
 //! UI-neutral timeline labels and status codes.
 
 use super::rows::{TimelineCoalescedToolsKind, TimelineCoalescedToolsRow};
-use crate::conversation::TimelineEntryStatus;
+use crate::conversation::{ItemView, TimelineEntryStatus};
 use pioneer_protocol::{
     ArtifactRef, SystemEventLevel, ToolDisplayPayload, ToolMetadataValue, ToolStoragePayload,
-    UserMessageAttachment,
+    TurnItem, UserMessageAttachment,
 };
 use serde_json::Value as JsonValue;
 use std::{
     collections::BTreeMap,
     hash::{Hash, Hasher},
     path::Path,
+    time::{SystemTime, UNIX_EPOCH},
 };
+
+pub fn now_unix_ms() -> i64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
+        Err(_) => 0,
+    }
+}
 
 pub fn format_elapsed_ms(elapsed_ms: u64) -> String {
     let total_seconds = elapsed_ms / 1_000;
@@ -26,6 +34,22 @@ pub fn format_elapsed_ms(elapsed_ms: u64) -> String {
     } else {
         format!("{seconds}s")
     }
+}
+
+pub fn format_item_elapsed(item_view: &ItemView) -> Option<String> {
+    let started = item_view.started_at_unix_ms?;
+    let ended = item_view
+        .completed_at_unix_ms
+        .or(item_view.updated_at_unix_ms)
+        .unwrap_or(started);
+    Some(format_elapsed_ms(ended.saturating_sub(started) as u64))
+}
+
+pub fn timeline_entry_text(item_view: &ItemView) -> &str {
+    item_view
+        .final_text
+        .as_deref()
+        .unwrap_or(item_view.partial_text.as_str())
 }
 
 pub fn timeline_work_group_completed_label() -> &'static str {
@@ -188,6 +212,49 @@ pub fn normalize_for_terminal(text: &str) -> String {
     unified.replace('\n', "\r\n")
 }
 
+pub fn command_execution_terminal_text(
+    item: &TurnItem,
+    fallback_text: &str,
+    truncate_output: impl FnOnce(&str) -> String,
+) -> String {
+    let TurnItem::CommandExecution {
+        arguments,
+        command,
+        display,
+        storage,
+        ..
+    } = item
+    else {
+        return normalize_for_terminal(fallback_text);
+    };
+
+    let command_line = if command.is_empty() {
+        command_from_arguments(arguments)
+            .map(|cmd| format!("$ {cmd}"))
+            .unwrap_or_default()
+    } else {
+        format!("$ {}", command.join(" "))
+    };
+
+    let command_output = shell_output_from_display(display)
+        .or_else(|| shell_output_from_storage(storage))
+        .unwrap_or_default();
+
+    let output_block = if command_output.trim().is_empty() {
+        fallback_text.to_owned()
+    } else {
+        truncate_output(command_output.replace('\t', "    ").as_str())
+    };
+
+    let content = if command_line.is_empty() {
+        output_block
+    } else {
+        format!("{command_line}\n{output_block}")
+    };
+
+    normalize_for_terminal(content.as_str())
+}
+
 pub fn download_url_from_arguments(arguments: &JsonValue) -> Option<String> {
     arguments
         .get("url")
@@ -216,11 +283,105 @@ pub fn web_fetch_url_from_arguments(arguments: &JsonValue) -> Option<String> {
         .map(str::to_owned)
 }
 
+pub fn web_search_display_query(arguments: &JsonValue, query: Option<&str>) -> Option<String> {
+    query
+        .map(str::to_owned)
+        .or_else(|| web_search_query_from_arguments(arguments))
+}
+
+pub fn web_fetch_display_url(
+    arguments: &JsonValue,
+    url: Option<&str>,
+    final_url: Option<&str>,
+) -> Option<String> {
+    preferred_url(arguments, url, final_url, web_fetch_url_from_arguments)
+}
+
+pub fn download_display_url(
+    arguments: &JsonValue,
+    url: Option<&str>,
+    final_url: Option<&str>,
+) -> Option<String> {
+    preferred_url(arguments, url, final_url, download_url_from_arguments)
+}
+
+fn preferred_url(
+    arguments: &JsonValue,
+    url: Option<&str>,
+    final_url: Option<&str>,
+    from_arguments: impl FnOnce(&JsonValue) -> Option<String>,
+) -> Option<String> {
+    final_url
+        .or(url)
+        .filter(|url| !url.is_empty())
+        .map(str::to_owned)
+        .or_else(|| from_arguments(arguments))
+}
+
 pub fn host_from_url(url: &str) -> Option<String> {
     url::Url::parse(url)
         .ok()
         .or_else(|| url::Url::parse(format!("https://{url}").as_str()).ok())
         .and_then(|parsed| parsed.host_str().map(str::to_owned))
+}
+
+pub fn default_favicon_url(page_url: &str) -> Option<String> {
+    let mut parsed = url::Url::parse(page_url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+
+    parsed.set_path("/favicon.ico");
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    Some(parsed.to_string())
+}
+
+pub fn timeline_favicon_url(primary: Option<String>, page_url: &str) -> Option<String> {
+    primary
+        .and_then(|value| {
+            let value = value.trim().to_owned();
+            (!value.is_empty()).then_some(value)
+        })
+        .or_else(|| {
+            host_from_url(page_url)
+                .map(|host| format!("https://icons.duckduckgo.com/ip3/{host}.ico"))
+        })
+        .or_else(|| default_favicon_url(page_url))
+}
+
+pub fn reasoning_text(summary: &[String], content: &[String], fallback: &str) -> String {
+    let mut parts = Vec::new();
+    if !summary.is_empty() {
+        parts.push(summary.join("\n"));
+    }
+    if !content.is_empty() {
+        parts.push(content.join("\n"));
+    }
+
+    if parts.is_empty() {
+        fallback.to_owned()
+    } else {
+        parts.join("\n\n")
+    }
+}
+
+pub fn file_change_display_text(
+    stdout: Option<&str>,
+    stderr: Option<&str>,
+    fallback: Option<&str>,
+) -> Option<String> {
+    stdout
+        .or(stderr)
+        .or(fallback)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+}
+
+pub fn is_task_timeline_agent_message(item_view: &ItemView) -> bool {
+    item_view.timeline_origin.as_ref().is_some_and(|origin| {
+        origin.task_id.is_some() || origin.run_id.is_some() || origin.child_turn_id.is_some()
+    })
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -1079,10 +1240,55 @@ pub fn system_event_presentation(
 mod tests {
     use super::*;
     use pioneer_protocol::{
-        ArtifactKind, ArtifactStatus, McpScopeKind, ToolMetadata, ToolOutputSummary,
+        ArtifactKind, ArtifactStatus, McpScopeKind, TimelineLane, TimelineOrigin,
+        TimelineOriginKind, ToolCallStatus, ToolDisplayPayload, ToolMetadata,
+        ToolOutputPolicySnapshot, ToolOutputSummary, ToolStoragePayload, TurnItem,
         TurnMcpToolCapabilitySummary, TurnSkillCapabilitySummary,
     };
     use serde_json::json;
+
+    fn item_view_with_origin(timeline_origin: Option<TimelineOrigin>) -> ItemView {
+        ItemView {
+            id: "item_1".to_owned(),
+            turn_id: "turn_1".to_owned(),
+            item_type: "agentMessage".to_owned(),
+            status: TimelineEntryStatus::Completed,
+            started_at_unix_ms: None,
+            updated_at_unix_ms: None,
+            completed_at_unix_ms: None,
+            partial_text: String::new(),
+            final_text: None,
+            partial_markdown: None,
+            final_markdown: None,
+            item: TurnItem::AgentMessage {
+                id: "item_1".to_owned(),
+                text: String::new(),
+                markdown: None,
+                markdown_version: None,
+            },
+            timeline_origin,
+            opaque_meta: None,
+        }
+    }
+
+    fn timeline_origin(
+        task_id: Option<&str>,
+        run_id: Option<&str>,
+        child_turn_id: Option<&str>,
+    ) -> TimelineOrigin {
+        TimelineOrigin {
+            kind: TimelineOriginKind::ChildTurn,
+            task_id: task_id.map(str::to_owned),
+            run_id: run_id.map(str::to_owned),
+            child_thread_id: None,
+            child_turn_id: child_turn_id.map(str::to_owned),
+            origin_event_id: None,
+            origin_turn_item_id: None,
+            origin_sequence: 1,
+            occurred_at: 2,
+            lane: TimelineLane::ChildAgent,
+        }
+    }
 
     #[test]
     fn user_attachment_selectors_preserve_display_labels_and_artifacts() {
@@ -1143,6 +1349,51 @@ mod tests {
     }
 
     #[test]
+    fn item_elapsed_uses_completed_then_updated_timestamp() {
+        let mut item_view = item_view_with_origin(None);
+        item_view.started_at_unix_ms = Some(1_000);
+        item_view.updated_at_unix_ms = Some(62_000);
+        item_view.completed_at_unix_ms = None;
+
+        assert_eq!(format_item_elapsed(&item_view).as_deref(), Some("1m 01s"));
+
+        item_view.completed_at_unix_ms = Some(3_661_000);
+
+        assert_eq!(format_item_elapsed(&item_view).as_deref(), Some("1h 01m"));
+    }
+
+    #[test]
+    fn timeline_entry_text_prefers_final_text() {
+        let mut item_view = item_view_with_origin(None);
+        item_view.partial_text = "partial".to_owned();
+
+        assert_eq!(timeline_entry_text(&item_view), "partial");
+
+        item_view.final_text = Some("final".to_owned());
+
+        assert_eq!(timeline_entry_text(&item_view), "final");
+    }
+
+    #[test]
+    fn task_timeline_agent_message_detects_task_run_or_child_turn_origin() {
+        assert!(!is_task_timeline_agent_message(&item_view_with_origin(
+            None
+        )));
+        assert!(is_task_timeline_agent_message(&item_view_with_origin(
+            Some(timeline_origin(Some("task_1"), None, None))
+        )));
+        assert!(is_task_timeline_agent_message(&item_view_with_origin(
+            Some(timeline_origin(None, Some("run_1"), None))
+        )));
+        assert!(is_task_timeline_agent_message(&item_view_with_origin(
+            Some(timeline_origin(None, None, Some("turn_child")))
+        )));
+        assert!(!is_task_timeline_agent_message(&item_view_with_origin(
+            Some(timeline_origin(None, None, None))
+        )));
+    }
+
+    #[test]
     fn command_and_web_fetch_selectors_normalize_shell_neutral_data() {
         assert_eq!(
             command_from_arguments(&json!({ "command": ["cargo", "check"] })).as_deref(),
@@ -1159,12 +1410,51 @@ mod tests {
             Some("rust schemars")
         );
         assert_eq!(
+            web_search_display_query(&json!({ "q": " rust schemars " }), Some("explicit"))
+                .as_deref(),
+            Some("explicit")
+        );
+        assert_eq!(
             web_fetch_url_from_arguments(&json!({ "url": " https://example.com/a " })).as_deref(),
             Some("https://example.com/a")
         );
         assert_eq!(
+            web_fetch_display_url(
+                &json!({ "url": "https://example.com/a" }),
+                Some("https://example.com/b"),
+                Some("https://example.com/final")
+            )
+            .as_deref(),
+            Some("https://example.com/final")
+        );
+        assert_eq!(
+            download_display_url(
+                &json!({ "url": " https://example.com/file.zip " }),
+                None,
+                None
+            )
+            .as_deref(),
+            Some("https://example.com/file.zip")
+        );
+        assert_eq!(
             host_from_url("example.com/a").as_deref(),
             Some("example.com")
+        );
+        assert_eq!(
+            default_favicon_url("https://example.com/a?x=1#frag").as_deref(),
+            Some("https://example.com/favicon.ico")
+        );
+        assert_eq!(
+            timeline_favicon_url(
+                Some(" https://cdn.example/icon.png ".to_owned()),
+                "https://example.com/a"
+            )
+            .as_deref(),
+            Some("https://cdn.example/icon.png")
+        );
+        assert_eq!(
+            timeline_favicon_url(None, "https://example.com/a").as_deref(),
+            Some("https://icons.duckduckgo.com/ip3/example.com.ico")
         );
         assert_eq!(
             final_web_fetch_status(TimelineEntryStatus::Completed, Some(true), Some(200)),
@@ -1183,6 +1473,70 @@ mod tests {
             TimelineFinalStatus::new(TimelineFinalStatusKind::Failed, false)
         );
         assert_eq!(format_bytes_human(1536), "1.5 KB");
+        assert_eq!(
+            reasoning_text(&["summary".to_owned()], &["detail".to_owned()], "fallback"),
+            "summary\n\ndetail"
+        );
+        assert_eq!(
+            file_change_display_text(None, Some(" stderr "), Some("fallback")).as_deref(),
+            Some(" stderr ")
+        );
+    }
+
+    #[test]
+    fn command_execution_terminal_text_builds_command_line_output_and_fallback() {
+        let item = TurnItem::CommandExecution {
+            id: "item_1".to_owned(),
+            tool_name: "exec_command".to_owned(),
+            arguments: json!({ "cmd": "cargo test" }),
+            status: ToolCallStatus::Completed,
+            recovery_policy: None,
+            output_policy: ToolOutputPolicySnapshot::for_tool_name("exec_command"),
+            display: ToolDisplayPayload::Shell {
+                stdout: Some("ok\t1".to_owned()),
+                stderr: None,
+                aggregated_output: None,
+                exit_code: Some(0),
+                duration_ms: None,
+                timed_out: None,
+                truncated: false,
+            },
+            storage: ToolStoragePayload::default(),
+            recovery: None,
+            command: Vec::new(),
+            cwd: None,
+            success: Some(true),
+            outcome: None,
+            observation: None,
+        };
+
+        assert_eq!(
+            command_execution_terminal_text(&item, "fallback", |output| output.to_owned()),
+            "$ cargo test\r\nok    1"
+        );
+
+        let fallback_item = TurnItem::CommandExecution {
+            id: "item_2".to_owned(),
+            tool_name: "exec_command".to_owned(),
+            arguments: json!({ "cmd": "cargo test" }),
+            status: ToolCallStatus::Completed,
+            recovery_policy: None,
+            output_policy: ToolOutputPolicySnapshot::for_tool_name("exec_command"),
+            display: ToolDisplayPayload::default(),
+            storage: ToolStoragePayload::default(),
+            recovery: None,
+            command: Vec::new(),
+            cwd: None,
+            success: Some(true),
+            outcome: None,
+            observation: None,
+        };
+        assert_eq!(
+            command_execution_terminal_text(&fallback_item, "fallback\ntext", |output| {
+                output.to_owned()
+            }),
+            "$ cargo test\r\nfallback\r\ntext"
+        );
     }
 
     #[test]
@@ -1235,6 +1589,32 @@ mod tests {
             task_review_action_key("candidate_1", "accept"),
             "task-review:candidate_1:accept"
         );
+
+        let parent_agent_review_display = ToolDisplayPayload::Summary(ToolOutputSummary {
+            title: "task_wait completed".to_owned(),
+            lines: Vec::new(),
+            metadata: ToolMetadata::from_json(json!({
+                "sanitizedResult": {
+                    "mode": "all_terminal_or_review_required",
+                    "reviewRequiredCount": 1,
+                    "reviewRequired": [{
+                        "taskId": "task_1",
+                        "runId": "run_1",
+                        "candidateId": "candidate_parent_1",
+                        "reviewMode": "parent_agent",
+                        "userApprovalRequired": false,
+                        "allowedActions": ["task_accept", "task_revise", "task_cancel"]
+                    }]
+                }
+            })),
+            truncated: false,
+        });
+        let review =
+            task_wait_review_display("task_wait", &parent_agent_review_display).expect("review");
+        assert_eq!(review.items[0].review_mode.as_deref(), Some("parent_agent"));
+        assert!(!review.items[0].user_controls_allowed());
+        assert!(review.details().contains("Review mode: parent_agent"));
+        assert!(!review.details().contains("User approval required"));
     }
 
     #[test]
@@ -1252,6 +1632,62 @@ mod tests {
         let rows = capability_rejection_rows_for_event(Some("capability.rejected"), Some(&details));
         assert_eq!(rows[0].label, "resend/send");
         assert_eq!(rows[0].kind, "MCP tool");
+
+        let malformed_details = json!({
+            "rejected": [
+                {
+                    "kind": {
+                        "type": "mcpServer",
+                        "name": "github"
+                    },
+                    "message": "MCP server `github` is disabled."
+                },
+                {
+                    "kind": {
+                        "type": "skill",
+                        "slug": "missing-message"
+                    }
+                }
+            ]
+        });
+        assert!(
+            capability_rejection_rows_for_event(Some("other.event"), Some(&malformed_details))
+                .is_empty()
+        );
+        let rows = capability_rejection_rows(Some(&malformed_details));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, "github");
+        assert_eq!(rows[0].kind, "MCP server");
+
+        let continued_details = json!({
+            "window_index": 2,
+            "status": "continued",
+            "previous_window_index": 1,
+            "checkpoint_id": "chk_000000000000000001",
+            "payload": {
+                "large": "payload must not be rendered inline"
+            }
+        });
+        let presentation = system_event_presentation(
+            &SystemEventLevel::Info,
+            "Continued in execution window #2 after window #1 limit",
+            Some("turn_execution_window_continued"),
+            Some(&continued_details),
+        );
+        assert_eq!(presentation.label, "Continued");
+        let rows = execution_window_detail_rows(
+            Some("turn_execution_window_continued"),
+            Some(&continued_details),
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.label == "Previous window" && row.value == "Window #1")
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.label == "payload" || row.value.contains("large"))
+        );
 
         let window_details = json!({
             "window_index": 3,

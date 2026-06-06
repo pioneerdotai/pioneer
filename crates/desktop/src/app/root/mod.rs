@@ -4,9 +4,6 @@ mod queries;
 mod state;
 mod view;
 
-#[cfg(test)]
-pub(in crate::app) use queries::resolve_active_workspace_id;
-
 use crate::{
     app::{
         conversation::Conversation,
@@ -22,8 +19,6 @@ use gpui_component::{
     VirtualListScrollHandle, input::InputState, table::TableState, tree::TreeState,
 };
 use gpui_terminal::TerminalView;
-#[cfg(test)]
-pub(super) use pioneer_client::artifacts::actions::ArtifactLocalFile as ThreadArtifactLocalFile;
 pub(super) use pioneer_client::{
     agents_doc::scope::{
         AgentsDocEditorScope as ThreadAgentsDocEditorScope, ThreadAgentsDocSummaryKey,

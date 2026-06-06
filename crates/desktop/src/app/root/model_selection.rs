@@ -1,9 +1,8 @@
 use super::*;
 use pioneer_client::composer::model_selection::{
-    self as composer_model_selection, ComposerModelSelection, ComposerModelSelectionCandidate,
-    ComposerModelSelectionState,
+    ComposerModelSelection, ComposerModelSelectionState,
 };
-use pioneer_protocol::Thread;
+use pioneer_client::state::selectors as client_selectors;
 
 impl PioneerDesktop {
     pub(in crate::app) fn set_composer_model_selection_from_user(
@@ -56,33 +55,10 @@ impl PioneerDesktop {
             .active_workspace_id()
             .or_else(|| self.thread_workspace_id(active_thread_id));
 
-        composer_model_selection::resolve_composer_model_selection(
+        client_selectors::resolve_composer_model_selection_from(
             Some(active_thread_id),
             active_workspace_id,
-            self.model_selection_candidates(),
+            &self.thread_coordinators,
         )
-    }
-
-    fn model_selection_candidates(&self) -> Vec<ComposerModelSelectionCandidate> {
-        self.thread_coordinators
-            .iter()
-            .filter_map(|(thread_id, coordinator)| {
-                let thread = coordinator.thread()?;
-                Some(ComposerModelSelectionCandidate {
-                    thread_id: thread_id.clone(),
-                    workspace_id: coordinator.workspace_id.clone(),
-                    updated_at: coordinator.updated_at(),
-                    has_turns: self.thread_has_known_turns(thread_id.as_str(), thread),
-                    selection: ComposerModelSelection::from_thread(thread),
-                })
-            })
-            .collect()
-    }
-
-    fn thread_has_known_turns(&self, thread_id: &str, thread: &Thread) -> bool {
-        !thread.turns.is_empty()
-            || self
-                .thread_conversation(thread_id)
-                .is_some_and(|conversation| !conversation.projection().turns.is_empty())
     }
 }

@@ -5,7 +5,7 @@ use crate::app::{
 };
 use gpui::{prelude::*, *};
 use gpui_component::{collapsible::Collapsible, h_flex, spinner::Spinner, v_flex, *};
-use pioneer_client::timeline::labels::{final_web_fetch_status, web_fetch_url_from_arguments};
+use pioneer_client::timeline::labels::{final_web_fetch_status, web_fetch_display_url};
 use pioneer_protocol::TurnItem;
 use std::hash::{Hash, Hasher};
 
@@ -29,11 +29,7 @@ impl PioneerDesktop {
                 success,
                 ..
             } => (
-                final_url
-                    .as_ref()
-                    .or(url.as_ref())
-                    .cloned()
-                    .or_else(|| web_fetch_url_from_arguments(arguments)),
+                web_fetch_display_url(arguments, url.as_deref(), final_url.as_deref()),
                 *status_code,
                 *success,
                 None,

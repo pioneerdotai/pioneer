@@ -5,7 +5,9 @@ use crate::app::{
 };
 use gpui::{prelude::*, *};
 use gpui_component::{collapsible::Collapsible, h_flex, spinner::Spinner, v_flex, *};
-use pioneer_client::timeline::labels::{TimelineFinalStatusKind, final_file_change_status};
+use pioneer_client::timeline::labels::{
+    TimelineFinalStatusKind, file_change_display_text, final_file_change_status,
+};
 use pioneer_protocol::TurnItem;
 use std::hash::{Hash, Hasher};
 
@@ -41,18 +43,14 @@ impl PioneerDesktop {
                 tool_name.clone(),
                 changed_files.clone(),
                 *exit_code,
-                stdout
-                    .as_ref()
-                    .or(stderr.as_ref())
-                    .filter(|value| !value.trim().is_empty())
-                    .cloned(),
+                file_change_display_text(stdout.as_deref(), stderr.as_deref(), None),
                 *success,
             ),
             _ => (
                 "apply_patch".to_owned(),
                 Vec::new(),
                 None,
-                Some(Self::timeline_entry_text(item_view).to_owned()),
+                file_change_display_text(None, None, Some(Self::timeline_entry_text(item_view))),
                 None,
             ),
         };

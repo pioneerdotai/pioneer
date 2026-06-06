@@ -18,6 +18,7 @@ use gpui_component::{
     theme::ActiveTheme,
     *,
 };
+use pioneer_client::settings::memory as settings_memory;
 use pioneer_protocol::{GatewayMemoryModelSelection, GatewayMemorySettings};
 use std::rc::Rc;
 
@@ -366,14 +367,12 @@ impl PioneerDesktop {
     ) -> AnyElement {
         let selected_provider = selection.model_provider_override();
         let selected_model = selection.model_override();
-        let is_custom = selected_provider.is_some() && selected_model.is_some();
-        let selection_label = if let (Some(provider), Some(model)) =
-            (selected_provider.clone(), selected_model.clone())
-        {
-            format!("{provider}/{model}")
-        } else {
-            t!("settings.general.preflight_model.default").to_string()
-        };
+        let is_custom =
+            settings_memory::gateway_memory_model_selection_has_custom_model(&selection);
+        let selection_label = settings_memory::gateway_memory_model_selection_display_label(
+            &selection,
+            t!("settings.general.preflight_model.default").to_string(),
+        );
 
         v_flex()
             .w_full()
@@ -597,14 +596,12 @@ impl PioneerDesktop {
     ) -> AnyElement {
         let selected_provider = selection.model_provider_override();
         let selected_model = selection.model_override();
-        let is_custom = selected_provider.is_some() && selected_model.is_some();
-        let selection_label = if let (Some(provider), Some(model)) =
-            (selected_provider.clone(), selected_model.clone())
-        {
-            format!("{provider}/{model}")
-        } else {
-            t!("settings.memory.model.default").to_string()
-        };
+        let is_custom =
+            settings_memory::gateway_memory_model_selection_has_custom_model(&selection);
+        let selection_label = settings_memory::gateway_memory_model_selection_display_label(
+            &selection,
+            t!("settings.memory.model.default").to_string(),
+        );
 
         v_flex()
             .w_full()

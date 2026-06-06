@@ -2,9 +2,10 @@
 
 use crate::conversation::events::ConversationEvent;
 use pioneer_protocol::{
-    REQUEST_ID_LEN, ThreadMode, TurnCapability, TurnStartParams, UserInput, UserMessageAttachment,
-    generate_id,
+    REQUEST_ID_LEN, Thread, ThreadMode, TurnCapability, TurnStartParams, UserInput,
+    UserMessageAttachment, generate_id,
 };
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const TURN_ID_LEN: usize = 21;
 
@@ -73,6 +74,30 @@ pub fn turn_start_params_from_plan(plan: TurnStartParamsPlan) -> TurnStartParams
         sandbox_policy: None,
         mode: plan.mode,
     }
+}
+
+pub fn now_unix_seconds() -> i64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
+        Err(_) => 0,
+    }
+}
+
+pub fn apply_prepared_turn_to_thread_snapshot(
+    thread: &mut Thread,
+    selected_model: Option<&str>,
+    selected_provider: Option<&str>,
+    user_text: &str,
+    updated_at_unix: i64,
+) {
+    if let (Some(model), Some(provider)) = (selected_model, selected_provider) {
+        thread.model = model.to_owned();
+        thread.model_provider = provider.to_owned();
+    }
+    if thread.preview.trim().is_empty() {
+        thread.preview = user_text.to_owned();
+    }
+    thread.updated_at = updated_at_unix;
 }
 
 pub fn local_turn_start_requested_event(
@@ -179,6 +204,68 @@ mod tests {
         assert_eq!(params.model_provider.as_deref(), Some("openai"));
         assert_eq!(params.mode, Some(ThreadMode::Agent));
         assert_eq!(params.sandbox_policy, None);
+    }
+
+    #[test]
+    fn prepared_turn_snapshot_update_sets_model_preview_and_updated_at() {
+        let mut thread = Thread {
+            workspace_id: "ws_1".to_owned(),
+            id: "thr_1".to_owned(),
+            name: None,
+            preview: "   ".to_owned(),
+            mode: ThreadMode::Chat,
+            model: "old-model".to_owned(),
+            model_provider: "old-provider".to_owned(),
+            created_at: 10,
+            updated_at: 10,
+            status: pioneer_protocol::ThreadStatus::Idle,
+            origin_kind: pioneer_protocol::ThreadOriginKind::User,
+            sidebar_visibility: pioneer_protocol::ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            turns: Vec::new(),
+        };
+
+        apply_prepared_turn_to_thread_snapshot(
+            &mut thread,
+            Some("new-model"),
+            Some("new-provider"),
+            "hello",
+            42,
+        );
+
+        assert_eq!(thread.model, "new-model");
+        assert_eq!(thread.model_provider, "new-provider");
+        assert_eq!(thread.preview, "hello");
+        assert_eq!(thread.updated_at, 42);
+    }
+
+    #[test]
+    fn prepared_turn_snapshot_update_preserves_existing_preview_and_partial_model_selection() {
+        let mut thread = Thread {
+            workspace_id: "ws_1".to_owned(),
+            id: "thr_1".to_owned(),
+            name: None,
+            preview: "existing".to_owned(),
+            mode: ThreadMode::Chat,
+            model: "old-model".to_owned(),
+            model_provider: "old-provider".to_owned(),
+            created_at: 10,
+            updated_at: 10,
+            status: pioneer_protocol::ThreadStatus::Idle,
+            origin_kind: pioneer_protocol::ThreadOriginKind::User,
+            sidebar_visibility: pioneer_protocol::ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            turns: Vec::new(),
+        };
+
+        apply_prepared_turn_to_thread_snapshot(&mut thread, Some("new-model"), None, "hello", 42);
+
+        assert_eq!(thread.model, "old-model");
+        assert_eq!(thread.model_provider, "old-provider");
+        assert_eq!(thread.preview, "existing");
+        assert_eq!(thread.updated_at, 42);
     }
 
     #[test]

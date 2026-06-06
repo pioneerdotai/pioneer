@@ -1,6 +1,5 @@
 use super::*;
 use crate::state;
-use pioneer_client::agents_doc::scope as agents_doc_scope;
 use pioneer_client::composer::draft as composer_draft;
 use pioneer_client::state::reducers as client_state_reducers;
 use pioneer_client::threads::{
@@ -308,26 +307,26 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn clear_thread_conversations(&mut self) {
-        self.draft_thread_id = None;
-        self.thread_coordinators.clear();
-        composer_draft::clear_all_composer_drafts(
+        client_state_reducers::clear_thread_client_state(
+            &mut self.draft_thread_id,
+            &mut self.thread_coordinators,
             &mut self.thread_drafts,
             &mut self.thread_draft_attachments,
             &mut self.thread_draft_capabilities,
+            &mut self.composer_attachments,
+            &mut self.composer_capabilities,
+            &mut self.composer_upload_in_progress,
+            &mut self.composer_upload_error,
+            &mut self.composer_selected_provider,
+            &mut self.composer_selected_model,
+            &mut self.composer_model_selection_manually_selected,
+            &mut self.thread_folders,
+            &mut self.thread_placements,
+            &mut self.thread_agents_doc_summaries,
+            &mut self.thread_folder_expanded,
+            &mut self.thread_tree_selected_node_id,
+            &mut self.turn_timeline_refresh,
         );
-        self.composer_attachments.clear();
-        self.composer_capabilities.clear();
-        self.composer_upload_in_progress = false;
-        self.composer_upload_error = None;
-        self.composer_selected_provider = None;
-        self.composer_selected_model = None;
-        self.composer_model_selection_manually_selected = false;
-        self.thread_folders.clear();
-        self.thread_placements.clear();
-        self.thread_agents_doc_summaries.clear();
-        self.thread_folder_expanded.clear();
-        self.thread_tree_selected_node_id = None;
-        self.turn_timeline_refresh.clear();
     }
 
     pub(in crate::app) fn set_thread_tree_snapshot(
@@ -344,7 +343,8 @@ impl PioneerDesktop {
         self.thread_folders = normalized.folders_by_id;
         self.thread_folder_expanded = normalized.folder_expanded;
         self.thread_placements = normalized.placements_by_thread_id;
-        self.thread_agents_doc_summaries = thread_agents_doc_summaries_by_scope(agents_docs);
+        self.thread_agents_doc_summaries =
+            client_state_reducers::thread_agents_doc_summaries_by_scope(agents_docs);
     }
 
     pub(in crate::app) fn toggle_thread_folder_expanded(
@@ -399,63 +399,5 @@ impl PioneerDesktop {
             .fold(false, |changed, coordinator| {
                 coordinator.conversation.tick() || changed
             })
-    }
-}
-
-pub(super) fn thread_agents_doc_summaries_by_scope(
-    summaries: Vec<ThreadAgentsDocSummary>,
-) -> HashMap<ThreadAgentsDocSummaryKey, ThreadAgentsDocSummary> {
-    agents_doc_scope::thread_agents_doc_summaries_by_scope(summaries)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use pioneer_protocol::ThreadAgentsDocStatus;
-
-    fn summary(folder_id: Option<&str>, status: ThreadAgentsDocStatus) -> ThreadAgentsDocSummary {
-        ThreadAgentsDocSummary {
-            id: format!("agd_{}", folder_id.unwrap_or("root")),
-            workspace_id: "ws_1".to_owned(),
-            folder_id: folder_id.map(str::to_owned),
-            status,
-            content_sha256: "sha256:test".to_owned(),
-            version: 1,
-            char_count: 12,
-            updated_at: 1_700_000_000,
-        }
-    }
-
-    #[::core::prelude::v1::test]
-    fn agents_doc_summary_key_handles_root_and_folder() {
-        assert_eq!(
-            ThreadAgentsDocSummaryKey::from_folder_id(None),
-            ThreadAgentsDocSummaryKey::Root
-        );
-        assert_eq!(
-            ThreadAgentsDocSummaryKey::from_folder_id(Some("fld_1")),
-            ThreadAgentsDocSummaryKey::Folder("fld_1".to_owned())
-        );
-    }
-
-    #[::core::prelude::v1::test]
-    fn agents_doc_summaries_by_scope_stores_root_and_folder() {
-        let summaries = thread_agents_doc_summaries_by_scope(vec![
-            summary(None, ThreadAgentsDocStatus::Active),
-            summary(Some("fld_1"), ThreadAgentsDocStatus::Draft),
-        ]);
-
-        assert_eq!(
-            summaries
-                .get(&ThreadAgentsDocSummaryKey::Root)
-                .map(|summary| summary.status),
-            Some(ThreadAgentsDocStatus::Active)
-        );
-        assert_eq!(
-            summaries
-                .get(&ThreadAgentsDocSummaryKey::Folder("fld_1".to_owned()))
-                .map(|summary| summary.status),
-            Some(ThreadAgentsDocStatus::Draft)
-        );
     }
 }

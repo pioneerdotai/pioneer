@@ -42,10 +42,7 @@ impl PioneerDesktop {
     }
 
     fn timeline_entry_text(item_view: &ItemView) -> &str {
-        item_view
-            .final_text
-            .as_deref()
-            .unwrap_or(item_view.partial_text.as_str())
+        pioneer_client::timeline::labels::timeline_entry_text(item_view)
     }
 
     fn timeline_row_layout_hash(

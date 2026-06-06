@@ -8,7 +8,8 @@ use crate::artifacts::{
     preview::{ArtifactPreviewImagePaths, ThreadArtifactPreviewState},
 };
 use pioneer_protocol::{
-    ArtifactBindingKind, ArtifactCreatedByKind, ArtifactKind, ArtifactRef, ArtifactSummary,
+    ArtifactBindingKind, ArtifactCreatedByKind, ArtifactKind, ArtifactListForThreadParams,
+    ArtifactRef, ArtifactSummary,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -18,6 +19,7 @@ use std::{
 
 const THREAD_ARTIFACTS_TRANSIENT_RETRY_LIMIT: u8 = 5;
 const THREAD_ARTIFACTS_TRANSIENT_RETRY_DELAYS_MS: [u64; 5] = [250, 500, 1_000, 2_000, 4_000];
+pub const THREAD_ARTIFACT_LIST_LIMIT: u64 = 250;
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -72,6 +74,24 @@ impl ThreadArtifactFilter {
             Self::Images,
             Self::Documents,
         ]
+    }
+}
+
+pub fn artifact_list_for_thread_params(
+    workspace_id: impl Into<String>,
+    thread_id: impl Into<String>,
+) -> ArtifactListForThreadParams {
+    ArtifactListForThreadParams {
+        workspace_id: workspace_id.into(),
+        thread_id: Some(thread_id.into()),
+        turn_id: None,
+        message_id: None,
+        task_id: None,
+        task_run_id: None,
+        kinds: Vec::new(),
+        include_deleted: false,
+        cursor: None,
+        limit: Some(THREAD_ARTIFACT_LIST_LIMIT),
     }
 }
 

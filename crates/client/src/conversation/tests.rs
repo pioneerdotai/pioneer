@@ -1,6 +1,6 @@
+use super::events::EventKind;
+use super::reducer::ConversationProjector;
 use super::{Conversation, ConversationEvent, MAX_EVENT_LOG_LEN, TimelineEntryStatus, TurnPhase};
-use pioneer_client::conversation::events::EventKind;
-use pioneer_client::conversation::reducer::ConversationProjector;
 use pioneer_protocol::{
     ArtifactKind, ArtifactRef, ArtifactStatus, ExecutionWindowExhaustionReason,
     ExecutionWindowStatus, ItemDeltaStream, RecoveryAction, RecoveryJobStatus, RecoveryTrigger,
@@ -824,7 +824,7 @@ fn web_fetch_delta_hides_raw_content_but_keeps_progress_updates() {
     );
     assert!(
         item.partial_text
-            .contains(t!("timeline.tool.progress", value = "fetching page metadata").as_ref())
+            .contains("[Progress] fetching page metadata")
     );
 }
 
@@ -914,10 +914,8 @@ fn web_fetch_completion_uses_summary_instead_of_output_blob() {
         .final_text
         .as_deref()
         .expect("completed web_fetch should have final_text");
-    assert!(final_text.contains(t!("timeline.tool.finished", tool_name = "web_fetch").as_ref()));
-    assert!(
-        final_text.contains(t!("timeline.tool.url", url = "https://example.com/page").as_ref())
-    );
+    assert!(final_text.contains("Tool `web_fetch` finished"));
+    assert!(final_text.contains("URL: https://example.com/page"));
     assert!(!final_text.contains("VERY_LONG_OUTPUT_SHOULD_NOT_BE_VISIBLE"));
     assert!(!final_text.contains("VERY_LONG_CONTENT_SHOULD_NOT_BE_VISIBLE"));
 }
@@ -1348,8 +1346,8 @@ fn history_hydration_restores_recovery_events_without_terminal_duplicate() {
     assert_eq!(
         system_events,
         vec![
-            t!("timeline.system.recovery_opened").to_string(),
-            t!("timeline.system.recovery_failed").to_string()
+            "Starting step recovery".to_owned(),
+            "Recovery failed".to_owned()
         ]
     );
     assert!(
@@ -1656,18 +1654,13 @@ fn tool_retry_events_are_logged_without_recovery_projection() {
     assert!(kinds.contains(&EventKind::TurnToolLoopBudgetExceeded));
     assert_eq!(conversation.status_label(), "running");
     assert!(!conversation.can_submit_message());
-    let retry_scheduled = t!(
-        "timeline.system.tool_retry_scheduled_with_attempt",
-        tool_name = "web_fetch",
-        attempt = 1
-    )
-    .to_string();
+    let retry_scheduled = "Retrying tool web_fetch (attempt #1)";
     assert!(
         conversation
             .projection()
             .items
             .iter()
-            .any(|item| item.partial_text.contains(retry_scheduled.as_str()))
+            .any(|item| item.partial_text.contains(retry_scheduled))
     );
     assert!(
         conversation

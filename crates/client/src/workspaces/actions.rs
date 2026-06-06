@@ -6,7 +6,7 @@ use crate::workspaces::selectors::{
 };
 use pioneer_protocol::{
     Workspace, WorkspaceChangeKind, WorkspaceChangedNotification, WorkspaceCreateParams,
-    WorkspaceUpdateParams, generate_id,
+    WorkspaceSelectParams, WorkspaceUpdateParams, generate_id,
 };
 
 pub const WORKSPACE_ID_LEN: usize = 21;
@@ -147,6 +147,16 @@ pub fn workspace_action_result_matches_connection(
     current_connection_id: Option<u64>,
 ) -> bool {
     current_connection_id == Some(expected_connection_id)
+}
+
+pub fn workspace_select_params(
+    workspace_id: impl Into<String>,
+    make_current: bool,
+) -> WorkspaceSelectParams {
+    WorkspaceSelectParams {
+        workspace_id: workspace_id.into(),
+        make_current,
+    }
 }
 
 pub fn plan_active_gateway_workspace_persist(

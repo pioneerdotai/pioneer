@@ -12,10 +12,7 @@ use pioneer_client::artifacts::{
     presentation as client_artifact_presentation, preview as client_artifact_preview,
     state as client_artifact_state,
 };
-use pioneer_protocol::{
-    ArtifactListForThreadParams, ArtifactProjectionKind, ArtifactReadParams, ArtifactReadResponse,
-    ArtifactRef,
-};
+use pioneer_protocol::{ArtifactReadResponse, ArtifactRef};
 use std::{fs, io::Cursor, path::Path, time::Duration};
 use tracing::{debug, warn};
 
@@ -79,18 +76,12 @@ impl PioneerDesktop {
             async move {
                 let result = cx
                     .background_spawn(async move {
-                        ws_sender.artifact_list_for_thread(ArtifactListForThreadParams {
-                            workspace_id: workspace_id_for_request,
-                            thread_id: Some(thread_id_for_request),
-                            turn_id: None,
-                            message_id: None,
-                            task_id: None,
-                            task_run_id: None,
-                            kinds: Vec::new(),
-                            include_deleted: false,
-                            cursor: None,
-                            limit: Some(250),
-                        })
+                        ws_sender.artifact_list_for_thread(
+                            client_artifact_state::artifact_list_for_thread_params(
+                                workspace_id_for_request,
+                                thread_id_for_request,
+                            ),
+                        )
                     })
                     .await;
 
@@ -280,14 +271,13 @@ impl PioneerDesktop {
                 let request_workspace_id = workspace_id.clone();
                 let result = cx
                     .background_spawn(async move {
-                        let response = ws_sender.artifact_read(ArtifactReadParams {
-                            workspace_id: request_workspace_id,
-                            artifact_id: request_artifact.artifact_id.clone(),
-                            version_id: request_artifact.version_id.clone(),
-                            projection_kind: Some(ArtifactProjectionKind::Thumbnail),
-                            offset: Some(0),
-                            max_bytes: Some(client_artifact_preview::ARTIFACT_PREVIEW_MAX_BYTES),
-                        })?;
+                        let response = ws_sender.artifact_read(
+                            client_artifact_preview::artifact_thumbnail_read_params(
+                                request_workspace_id,
+                                &request_artifact,
+                                client_artifact_preview::ARTIFACT_PREVIEW_MAX_BYTES,
+                            ),
+                        )?;
                         let image_path = write_artifact_preview_cache_file(
                             workspace_id.as_str(),
                             &request_artifact,

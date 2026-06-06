@@ -1,11 +1,19 @@
-//! Thread tree normalization and placement rules.
+//! Thread tree normalization, placement rules, and sidebar tree projection.
 
+use crate::agents_doc::scope::{AgentsDocEditorScope, ThreadAgentsDocSummaryKey};
 use crate::threads::coordinator::ThreadCoordinator;
 use pioneer_protocol::{
-    ThreadFolder, ThreadFolderCreateParams, ThreadFolderDeleteParams, ThreadFolderMoveParams,
-    ThreadMoveParams, ThreadPlacement, ThreadUpdateParams,
+    ThreadAgentsDocSummary, ThreadFolder, ThreadFolderCreateParams, ThreadFolderDeleteParams,
+    ThreadFolderMoveParams, ThreadMoveParams, ThreadPlacement, ThreadTreeParams,
+    ThreadUpdateParams,
 };
 use std::collections::{HashMap, HashSet};
+
+pub const SIDEBAR_THREAD_NODE_PREFIX: &str = "thread:";
+pub const SIDEBAR_FOLDER_NODE_PREFIX: &str = "folder:";
+pub const SIDEBAR_AGENTS_DOC_ROOT_NODE_ID: &str = "agents_doc:root";
+pub const SIDEBAR_AGENTS_DOC_FOLDER_NODE_PREFIX: &str = "agents_doc:folder:";
+pub const SIDEBAR_THREADS_HEADER_NODE_ID: &str = "__threads_header__";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ThreadTreeSnapshotNormalization {
@@ -18,6 +26,85 @@ pub struct ThreadTreeSnapshotNormalization {
 pub struct WorkspaceThreadState {
     pub active_thread_id: Option<String>,
     pub draft_thread_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SidebarTreeNodeKind {
+    ThreadsHeader,
+    Thread { thread_id: String },
+    Folder { folder_id: String },
+    AgentsDocRoot,
+    AgentsDocFolder { folder_id: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SidebarTreeNodeKey<'a> {
+    ThreadsHeader,
+    Thread(&'a str),
+    Folder(&'a str),
+    AgentsDocRoot,
+    AgentsDocFolder(&'a str),
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SidebarTreeItem {
+    pub id: String,
+    pub label: String,
+    pub kind: SidebarTreeNodeKind,
+    pub expanded: bool,
+    pub disabled: bool,
+    pub children: Vec<SidebarTreeItem>,
+}
+
+impl SidebarTreeItem {
+    pub fn new(id: String, label: String, kind: SidebarTreeNodeKind) -> Self {
+        Self {
+            id,
+            label,
+            kind,
+            expanded: false,
+            disabled: false,
+            children: Vec::new(),
+        }
+    }
+
+    pub fn expanded(mut self, expanded: bool) -> Self {
+        self.expanded = expanded;
+        self
+    }
+
+    pub fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
+    }
+
+    pub fn children(mut self, children: Vec<SidebarTreeItem>) -> Self {
+        self.children = children;
+        self
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SidebarTreeModel {
+    pub items: Vec<SidebarTreeItem>,
+    pub visible_node_ids: Vec<String>,
+}
+
+pub struct SidebarTreeSourceData<'a> {
+    pub workspace_id: &'a str,
+    pub folders: Vec<&'a ThreadFolder>,
+    pub placements: Vec<&'a ThreadPlacement>,
+    pub sorted_thread_ids: Vec<String>,
+    pub agents_doc_summaries: Vec<&'a ThreadAgentsDocSummary>,
+    pub active_agents_doc_editor_scope: Option<&'a AgentsDocEditorScope>,
+    pub expanded_folder_ids: HashSet<String>,
+}
+
+pub fn thread_tree_params(workspace_id: impl Into<String>) -> ThreadTreeParams {
+    ThreadTreeParams {
+        workspace_id: workspace_id.into(),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -158,6 +245,270 @@ pub fn thread_placements_for_workspace<'a>(
         .values()
         .filter(|placement| placement.workspace_id == workspace_id)
         .collect()
+}
+
+pub fn sidebar_thread_node_id(thread_id: &str) -> String {
+    format!("{SIDEBAR_THREAD_NODE_PREFIX}{thread_id}")
+}
+
+pub fn sidebar_folder_node_id(folder_id: &str) -> String {
+    format!("{SIDEBAR_FOLDER_NODE_PREFIX}{folder_id}")
+}
+
+pub fn sidebar_agents_doc_root_node_id() -> String {
+    SIDEBAR_AGENTS_DOC_ROOT_NODE_ID.to_owned()
+}
+
+pub fn sidebar_agents_doc_folder_node_id(folder_id: &str) -> String {
+    format!("{SIDEBAR_AGENTS_DOC_FOLDER_NODE_PREFIX}{folder_id}")
+}
+
+pub fn sidebar_agents_doc_node_id_for_scope(scope: &AgentsDocEditorScope) -> String {
+    match scope {
+        AgentsDocEditorScope::Root { .. } => sidebar_agents_doc_root_node_id(),
+        AgentsDocEditorScope::Folder { folder_id, .. } => {
+            sidebar_agents_doc_folder_node_id(folder_id.as_str())
+        }
+    }
+}
+
+pub fn parse_sidebar_tree_node_id(value: &str) -> SidebarTreeNodeKey<'_> {
+    if value == SIDEBAR_THREADS_HEADER_NODE_ID {
+        return SidebarTreeNodeKey::ThreadsHeader;
+    }
+
+    if let Some(thread_id) = value.strip_prefix(SIDEBAR_THREAD_NODE_PREFIX) {
+        return SidebarTreeNodeKey::Thread(thread_id);
+    }
+
+    if let Some(folder_id) = value.strip_prefix(SIDEBAR_FOLDER_NODE_PREFIX) {
+        return SidebarTreeNodeKey::Folder(folder_id);
+    }
+
+    if value == SIDEBAR_AGENTS_DOC_ROOT_NODE_ID {
+        return SidebarTreeNodeKey::AgentsDocRoot;
+    }
+
+    if let Some(folder_id) = value.strip_prefix(SIDEBAR_AGENTS_DOC_FOLDER_NODE_PREFIX) {
+        return SidebarTreeNodeKey::AgentsDocFolder(folder_id);
+    }
+
+    SidebarTreeNodeKey::Unknown
+}
+
+pub fn sidebar_tree_model_from_workspace_data(data: SidebarTreeSourceData<'_>) -> SidebarTreeModel {
+    let items = sidebar_tree_items_from_workspace_data(data);
+    let visible_node_ids = collect_visible_sidebar_node_ids(items.as_slice());
+    SidebarTreeModel {
+        items,
+        visible_node_ids,
+    }
+}
+
+pub fn sidebar_tree_items_from_workspace_data(
+    data: SidebarTreeSourceData<'_>,
+) -> Vec<SidebarTreeItem> {
+    let folders_by_id: HashMap<String, &ThreadFolder> = data
+        .folders
+        .into_iter()
+        .filter(|folder| folder.workspace_id == data.workspace_id)
+        .map(|folder| (folder.id.clone(), folder))
+        .collect();
+    let folder_id_set: HashSet<String> = folders_by_id.keys().cloned().collect();
+    let placements_by_thread_id: HashMap<String, &ThreadPlacement> = data
+        .placements
+        .into_iter()
+        .filter(|placement| placement.workspace_id == data.workspace_id)
+        .map(|placement| (placement.thread_id.clone(), placement))
+        .collect();
+    let mut visible_agents_doc_keys: HashSet<ThreadAgentsDocSummaryKey> = data
+        .agents_doc_summaries
+        .into_iter()
+        .filter(|summary| summary.workspace_id == data.workspace_id)
+        .map(|summary| ThreadAgentsDocSummaryKey::from_folder_id(summary.folder_id.as_deref()))
+        .collect();
+
+    if let Some(scope) = data
+        .active_agents_doc_editor_scope
+        .filter(|scope| scope.workspace_id() == data.workspace_id)
+    {
+        visible_agents_doc_keys
+            .insert(ThreadAgentsDocSummaryKey::from_folder_id(scope.folder_id()));
+    }
+
+    let mut folders_by_parent: HashMap<String, Vec<String>> = HashMap::new();
+    for folder in folders_by_id.values() {
+        let parent_key = folder
+            .parent_folder_id
+            .as_deref()
+            .filter(|parent_id| folder_id_set.contains(*parent_id))
+            .unwrap_or_default()
+            .to_owned();
+        folders_by_parent
+            .entry(parent_key)
+            .or_default()
+            .push(folder.id.clone());
+    }
+
+    for folder_ids in folders_by_parent.values_mut() {
+        folder_ids.sort_by(|lhs, rhs| {
+            let lhs_name = folders_by_id
+                .get(lhs.as_str())
+                .map(|folder| folder.name.as_str())
+                .unwrap_or_default();
+            let rhs_name = folders_by_id
+                .get(rhs.as_str())
+                .map(|folder| folder.name.as_str())
+                .unwrap_or_default();
+            lhs_name
+                .to_lowercase()
+                .cmp(&rhs_name.to_lowercase())
+                .then_with(|| lhs.cmp(rhs))
+        });
+    }
+
+    let mut threads_by_folder: HashMap<String, Vec<String>> = HashMap::new();
+    for thread_id in data.sorted_thread_ids {
+        let folder_key = placements_by_thread_id
+            .get(thread_id.as_str())
+            .and_then(|placement| placement.folder_id.as_deref())
+            .filter(|folder_id| folder_id_set.contains(*folder_id))
+            .unwrap_or_default()
+            .to_owned();
+        threads_by_folder
+            .entry(folder_key)
+            .or_default()
+            .push(thread_id);
+    }
+
+    let mut visited_folders = HashSet::new();
+    let mut items = sidebar_tree_branch_from_workspace_data(
+        "",
+        &folders_by_id,
+        &folders_by_parent,
+        &threads_by_folder,
+        &visible_agents_doc_keys,
+        &data.expanded_folder_ids,
+        &mut visited_folders,
+    );
+    if visible_agents_doc_keys.contains(&ThreadAgentsDocSummaryKey::Root) {
+        items.insert(
+            0,
+            SidebarTreeItem::new(
+                sidebar_agents_doc_root_node_id(),
+                "AGENTS.md".to_owned(),
+                SidebarTreeNodeKind::AgentsDocRoot,
+            ),
+        );
+    }
+
+    sidebar_tree_items_with_header(items)
+}
+
+pub fn sidebar_tree_items_with_header(mut items: Vec<SidebarTreeItem>) -> Vec<SidebarTreeItem> {
+    if items.is_empty() {
+        return items;
+    }
+
+    items.insert(
+        0,
+        SidebarTreeItem::new(
+            SIDEBAR_THREADS_HEADER_NODE_ID.to_owned(),
+            "threads-header".to_owned(),
+            SidebarTreeNodeKind::ThreadsHeader,
+        )
+        .disabled(true),
+    );
+    items
+}
+
+pub fn collect_visible_sidebar_node_ids(items: &[SidebarTreeItem]) -> Vec<String> {
+    fn visit(items: &[SidebarTreeItem], out: &mut Vec<String>) {
+        for item in items {
+            out.push(item.id.clone());
+            if item.expanded {
+                visit(item.children.as_slice(), out);
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    visit(items, &mut out);
+    out
+}
+
+fn sidebar_tree_branch_from_workspace_data(
+    parent_key: &str,
+    folders_by_id: &HashMap<String, &ThreadFolder>,
+    folders_by_parent: &HashMap<String, Vec<String>>,
+    threads_by_folder: &HashMap<String, Vec<String>>,
+    visible_agents_doc_keys: &HashSet<ThreadAgentsDocSummaryKey>,
+    expanded_folder_ids: &HashSet<String>,
+    visited_folders: &mut HashSet<String>,
+) -> Vec<SidebarTreeItem> {
+    let mut items = Vec::new();
+
+    if let Some(folder_ids) = folders_by_parent.get(parent_key) {
+        for folder_id in folder_ids {
+            if !visited_folders.insert(folder_id.clone()) {
+                continue;
+            }
+
+            let mut children = sidebar_tree_branch_from_workspace_data(
+                folder_id.as_str(),
+                folders_by_id,
+                folders_by_parent,
+                threads_by_folder,
+                visible_agents_doc_keys,
+                expanded_folder_ids,
+                visited_folders,
+            );
+            let folder_summary_key = ThreadAgentsDocSummaryKey::Folder(folder_id.clone());
+            if visible_agents_doc_keys.contains(&folder_summary_key) {
+                children.insert(
+                    0,
+                    SidebarTreeItem::new(
+                        sidebar_agents_doc_folder_node_id(folder_id.as_str()),
+                        "AGENTS.md".to_owned(),
+                        SidebarTreeNodeKind::AgentsDocFolder {
+                            folder_id: folder_id.clone(),
+                        },
+                    ),
+                );
+            }
+
+            let folder_name = folders_by_id
+                .get(folder_id.as_str())
+                .map(|folder| folder.name.clone())
+                .unwrap_or_else(|| folder_id.clone());
+
+            items.push(
+                SidebarTreeItem::new(
+                    sidebar_folder_node_id(folder_id.as_str()),
+                    folder_name,
+                    SidebarTreeNodeKind::Folder {
+                        folder_id: folder_id.clone(),
+                    },
+                )
+                .children(children)
+                .expanded(expanded_folder_ids.contains(folder_id.as_str())),
+            );
+        }
+    }
+
+    if let Some(thread_ids) = threads_by_folder.get(parent_key) {
+        for thread_id in thread_ids {
+            items.push(SidebarTreeItem::new(
+                sidebar_thread_node_id(thread_id.as_str()),
+                thread_id.clone(),
+                SidebarTreeNodeKind::Thread {
+                    thread_id: thread_id.clone(),
+                },
+            ));
+        }
+    }
+
+    items
 }
 
 pub fn sorted_thread_ids_from_coordinators(
@@ -575,7 +926,8 @@ pub fn restore_workspace_thread_state(
 mod tests {
     use super::*;
     use pioneer_protocol::{
-        Thread, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus,
+        Thread, ThreadAgentsDocStatus, ThreadAgentsDocSummary, ThreadMode, ThreadOriginKind,
+        ThreadSidebarVisibility, ThreadStatus,
     };
 
     fn folder(id: &str) -> ThreadFolder {
@@ -603,6 +955,35 @@ mod tests {
             thread_id: thread_id.to_owned(),
             workspace_id: "ws_a".to_owned(),
             folder_id: folder_id.map(str::to_owned),
+        }
+    }
+
+    fn placement_for_workspace(
+        thread_id: &str,
+        workspace_id: &str,
+        folder_id: Option<&str>,
+    ) -> ThreadPlacement {
+        ThreadPlacement {
+            thread_id: thread_id.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            folder_id: folder_id.map(str::to_owned),
+        }
+    }
+
+    fn agents_doc_summary_for_workspace(
+        workspace_id: &str,
+        folder_id: Option<&str>,
+        status: ThreadAgentsDocStatus,
+    ) -> ThreadAgentsDocSummary {
+        ThreadAgentsDocSummary {
+            id: "agd_1".to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            folder_id: folder_id.map(str::to_owned),
+            status,
+            content_sha256: "sha256:test".to_owned(),
+            version: 1,
+            char_count: 20,
+            updated_at: 1_700_000_000,
         }
     }
 
@@ -733,6 +1114,56 @@ mod tests {
                 .map(|placement| placement.thread_id.as_str())
                 .collect::<Vec<_>>(),
             vec!["thread_a"]
+        );
+    }
+
+    #[test]
+    fn sidebar_tree_projection_filters_workspace_and_includes_agents_doc_nodes() {
+        let folder_a = folder_for_workspace("fld_a", "ws_a", None, "Alpha");
+        let folder_b = folder_for_workspace("fld_b", "ws_b", None, "Beta");
+        let placement_a = placement_for_workspace("thr_a", "ws_a", Some("fld_a"));
+        let placement_b = placement_for_workspace("thr_b", "ws_b", Some("fld_b"));
+        let root_agents_doc_a =
+            agents_doc_summary_for_workspace("ws_a", None, ThreadAgentsDocStatus::Active);
+        let folder_agents_doc_a =
+            agents_doc_summary_for_workspace("ws_a", Some("fld_a"), ThreadAgentsDocStatus::Active);
+        let root_agents_doc_b =
+            agents_doc_summary_for_workspace("ws_b", None, ThreadAgentsDocStatus::Active);
+
+        let model = sidebar_tree_model_from_workspace_data(SidebarTreeSourceData {
+            workspace_id: "ws_a",
+            folders: vec![&folder_a, &folder_b],
+            placements: vec![&placement_a, &placement_b],
+            sorted_thread_ids: vec!["thr_a".to_owned(), "thr_orphan".to_owned()],
+            agents_doc_summaries: vec![
+                &root_agents_doc_a,
+                &folder_agents_doc_a,
+                &root_agents_doc_b,
+            ],
+            active_agents_doc_editor_scope: None,
+            expanded_folder_ids: HashSet::from(["fld_a".to_owned()]),
+        });
+
+        assert_eq!(
+            model.visible_node_ids,
+            vec![
+                SIDEBAR_THREADS_HEADER_NODE_ID.to_owned(),
+                sidebar_agents_doc_root_node_id(),
+                sidebar_folder_node_id("fld_a"),
+                sidebar_agents_doc_folder_node_id("fld_a"),
+                sidebar_thread_node_id("thr_a"),
+                sidebar_thread_node_id("thr_orphan"),
+            ]
+        );
+        assert!(
+            !model
+                .visible_node_ids
+                .contains(&sidebar_folder_node_id("fld_b"))
+        );
+        assert!(
+            !model
+                .visible_node_ids
+                .contains(&sidebar_thread_node_id("thr_b"))
         );
     }
 

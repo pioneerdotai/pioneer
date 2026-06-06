@@ -1,8 +1,6 @@
 use super::*;
 use pioneer_client::threads::start as thread_start;
 use pioneer_client::workspaces::actions as workspace_actions;
-#[cfg(test)]
-use pioneer_client::workspaces::selectors as workspace_selectors;
 
 struct WorkspaceBootstrapOutcome {
     workspace_id: String,
@@ -33,16 +31,6 @@ pub(crate) fn resolve_workspace_id_for_thread_start(
                 .ok_or_else(|| anyhow!("workspace/default returned an empty workspace id"))
         }
     }
-}
-
-#[cfg(test)]
-pub(crate) fn normalize_workspace_id(value: Option<String>) -> Option<String> {
-    workspace_selectors::normalize_workspace_id(value)
-}
-
-#[cfg(test)]
-pub(crate) fn upsert_workspace_catalog_item(workspaces: &mut Vec<Workspace>, workspace: Workspace) {
-    workspace_actions::upsert_workspace_catalog_item(workspaces, workspace);
 }
 
 impl PioneerDesktop {
@@ -95,10 +83,9 @@ impl PioneerDesktop {
                             }
                         };
 
-                        let response = ws_sender.workspace_select(WorkspaceSelectParams {
-                            workspace_id: workspace_id.clone(),
-                            make_current: false,
-                        })?;
+                        let response = ws_sender.workspace_select(
+                            workspace_actions::workspace_select_params(workspace_id.clone(), false),
+                        )?;
                         workspace_id = workspace_actions::apply_workspace_select_response_to_catalog(
                             &mut workspaces,
                             response.workspace,

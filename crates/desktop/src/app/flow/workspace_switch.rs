@@ -1,15 +1,9 @@
 use super::*;
-#[cfg(test)]
-use pioneer_client::threads::tree::WorkspaceThreadState;
 use pioneer_client::threads::tree::{
     remember_workspace_thread_state, restore_workspace_thread_state,
 };
 use pioneer_client::workspaces::actions as workspace_actions;
 use pioneer_client::workspaces::selectors as workspace_selectors;
-#[cfg(test)]
-pub(crate) use pioneer_client::workspaces::selectors::{
-    workspace_switch_is_noop, workspace_switch_target_is_known_active,
-};
 
 impl PioneerDesktop {
     pub(in crate::app) fn switch_workspace_from_ui(
@@ -69,10 +63,10 @@ impl PioneerDesktop {
             async move {
                 let result = cx
                     .background_spawn(async move {
-                        ws_sender.workspace_select(WorkspaceSelectParams {
-                            workspace_id: requested_workspace_id,
-                            make_current: false,
-                        })
+                        ws_sender.workspace_select(workspace_actions::workspace_select_params(
+                            requested_workspace_id,
+                            false,
+                        ))
                     })
                     .await;
 
@@ -175,120 +169,5 @@ impl PioneerDesktop {
             }
             _ => {}
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-
-    fn matches_workspace<'a>(
-        threads: &'a HashMap<&'a str, &'a str>,
-    ) -> impl Fn(&str, &str) -> bool + 'a {
-        |thread_id, workspace_id| threads.get(thread_id).copied() == Some(workspace_id)
-    }
-
-    #[::core::prelude::v1::test]
-    fn workspace_thread_state_restores_a_after_switching_a_to_b_to_a() {
-        let threads = HashMap::from([
-            ("thr_a", "ws_a"),
-            ("draft_a", "ws_a"),
-            ("thr_b", "ws_b"),
-            ("draft_b", "ws_b"),
-        ]);
-        let remembered_a = remember_workspace_thread_state(
-            "ws_a",
-            Some("thr_a"),
-            Some("draft_a"),
-            None,
-            matches_workspace(&threads),
-        );
-        let remembered_b = remember_workspace_thread_state(
-            "ws_b",
-            Some("thr_b"),
-            Some("draft_b"),
-            None,
-            matches_workspace(&threads),
-        );
-
-        let restored_a = restore_workspace_thread_state(
-            "ws_a",
-            remembered_a.active_thread_id.as_deref(),
-            remembered_a.draft_thread_id.as_deref(),
-            matches_workspace(&threads),
-        );
-
-        assert_eq!(
-            restored_a,
-            WorkspaceThreadState {
-                active_thread_id: Some("thr_a".to_owned()),
-                draft_thread_id: Some("draft_a".to_owned()),
-            }
-        );
-        assert_eq!(
-            remembered_b,
-            WorkspaceThreadState {
-                active_thread_id: Some("thr_b".to_owned()),
-                draft_thread_id: Some("draft_b".to_owned()),
-            }
-        );
-    }
-
-    #[::core::prelude::v1::test]
-    fn workspace_thread_state_keeps_drafts_isolated_by_workspace() {
-        let threads = HashMap::from([("draft_a", "ws_a"), ("draft_b", "ws_b")]);
-
-        let remembered_a = remember_workspace_thread_state(
-            "ws_a",
-            None,
-            Some("draft_a"),
-            None,
-            matches_workspace(&threads),
-        );
-        let remembered_b = remember_workspace_thread_state(
-            "ws_b",
-            None,
-            Some("draft_b"),
-            None,
-            matches_workspace(&threads),
-        );
-
-        assert_eq!(remembered_a.draft_thread_id.as_deref(), Some("draft_a"));
-        assert_eq!(remembered_b.draft_thread_id.as_deref(), Some("draft_b"));
-    }
-
-    #[::core::prelude::v1::test]
-    fn workspace_thread_state_falls_back_to_valid_draft_when_last_active_missing() {
-        let threads = HashMap::from([("draft_a", "ws_a"), ("thr_b", "ws_b")]);
-
-        let restored = restore_workspace_thread_state(
-            "ws_a",
-            Some("thr_missing"),
-            Some("draft_a"),
-            matches_workspace(&threads),
-        );
-
-        assert_eq!(
-            restored,
-            WorkspaceThreadState {
-                active_thread_id: Some("draft_a".to_owned()),
-                draft_thread_id: Some("draft_a".to_owned()),
-            }
-        );
-
-        let restored_missing = restore_workspace_thread_state(
-            "ws_a",
-            Some("thr_b"),
-            Some("draft_missing"),
-            matches_workspace(&threads),
-        );
-        assert_eq!(
-            restored_missing,
-            WorkspaceThreadState {
-                active_thread_id: None,
-                draft_thread_id: None,
-            }
-        );
     }
 }

@@ -1,10 +1,13 @@
 //! Stable timeline layout hash helpers.
 
 use super::{
-    labels::{coalesced_tools_label, format_elapsed_ms, timeline_work_group_completed_label},
+    labels::{
+        coalesced_tools_label, format_elapsed_ms, timeline_entry_text,
+        timeline_work_group_completed_label,
+    },
     rows::{TimelineRow, TimelineRowKind},
 };
-use crate::conversation::{ConversationViewState, ItemView};
+use crate::conversation::ConversationViewState;
 use std::{
     collections::HashSet,
     hash::{Hash, Hasher},
@@ -61,10 +64,7 @@ pub fn timeline_row_layout_hash(
                     item_view.status.hash(&mut hasher);
                     item_view.updated_at_unix_ms.hash(&mut hasher);
 
-                    let text = item_view
-                        .final_text
-                        .as_deref()
-                        .unwrap_or(item_view.partial_text.as_str());
+                    let text = timeline_entry_text(item_view);
                     let text_bytes = text.as_bytes();
                     text_bytes.len().hash(&mut hasher);
                     text_bytes
@@ -119,11 +119,4 @@ pub fn timeline_row_toggle_key(row: &TimelineRow) -> Option<&str> {
         TimelineRowKind::CoalescedTools(group) => Some(group.toggle_key.as_str()),
         TimelineRowKind::Item { .. } => None,
     }
-}
-
-fn timeline_entry_text(item_view: &ItemView) -> &str {
-    item_view
-        .final_text
-        .as_deref()
-        .unwrap_or(item_view.partial_text.as_str())
 }
