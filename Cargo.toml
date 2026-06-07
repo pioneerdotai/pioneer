@@ -4,6 +4,7 @@ members = [
   "crates/agent",
   "crates/artifacts",
   "crates/client",
+  "crates/client-ffi",
   "crates/promt",
   "crates/config",
   "crates/keystore",
@@ -35,6 +36,7 @@ authors = ["Pioneer Contributors"]
 pioneer-agent = { path = "crates/agent" }
 pioneer-artifacts = { path = "crates/artifacts" }
 pioneer-client = { path = "crates/client" }
+pioneer-client-ffi = { path = "crates/client-ffi" }
 pioneer-keystore = { path = "crates/keystore" }
 pioneer-gateway = { path = "crates/gateway" }
 pioneer-hooks = { path = "crates/hooks" }
