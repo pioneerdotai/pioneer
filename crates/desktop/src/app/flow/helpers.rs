@@ -1,5 +1,5 @@
 use super::*;
-use pioneer_client::gateway::runtime as client_gateway_runtime;
+use pioneer_client::gateway::{runtime as client_gateway_runtime, setup as client_gateway_setup};
 use pioneer_client::threads::start as thread_start;
 use pioneer_client::transport::ws as client_ws;
 
@@ -34,18 +34,18 @@ pub(crate) fn build_remote_candidate_ws_connect_spec(
 
 pub(crate) fn validate_remote_candidate_gateway_connection(
     runtime: &GatewayRuntime,
-    name: &str,
     address: &str,
     token: &str,
 ) -> anyhow::Result<()> {
     let address = crate::gateway::normalize_address(address)?;
-
-    let validation_client = GatewayWsClient::new();
-    let validation_sender = validation_client.command_sender();
-    let spec = build_remote_candidate_ws_connect_spec(runtime, name, address.as_str(), token);
-    let result = validation_sender.connect_and_wait(spec);
-    let _ = validation_sender.shutdown();
-    result.map(|_| ())
+    let timings = ws_timings_for_endpoint(runtime, GatewayEndpointKind::Remote);
+    client_gateway_setup::validate_remote_gateway_connection_with_timings(
+        address.as_str(),
+        Some(token),
+        timings,
+    )
+    .map(|_| ())
+    .map_err(|error| anyhow::anyhow!(error))
 }
 
 pub(crate) fn should_apply_ws_event(

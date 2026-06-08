@@ -111,6 +111,15 @@ pub fn spawn_worker(
     });
 }
 
+pub fn connect_websocket_once(spec: &GatewayWsConnectSpec) -> Result<()> {
+    let runtime = Runtime::new().context("failed to create tokio runtime for websocket connect")?;
+    runtime.block_on(async {
+        let stream = connect_websocket(spec).await?;
+        drop(stream);
+        Ok(())
+    })
+}
+
 async fn run_worker(
     mut command_rx: UnboundedReceiver<GatewayWsCommand>,
     event_tx: Sender<GatewayWsEvent>,
@@ -477,7 +486,13 @@ mod tests {
     use crate::gateway::{timings::GatewayWsTimings, types::GatewayEndpointKind};
     use std::{net::TcpListener as StdTcpListener, sync::mpsc, time::Duration};
     use tokio::net::TcpListener;
-    use tokio_tungstenite::accept_async;
+    use tokio_tungstenite::{
+        accept_async, accept_hdr_async,
+        tungstenite::{
+            handshake::server::{ErrorResponse, Request, Response},
+            http::{Response as HttpResponse, StatusCode},
+        },
+    };
 
     #[test]
     fn ws_client_worker_connects_and_emits_events() {
@@ -531,6 +546,31 @@ mod tests {
         server.join();
     }
 
+    #[test]
+    fn connect_websocket_once_sends_bearer_token() {
+        let address = reserve_unused_local_address();
+        let server = TestAuthWsServer::start(address.clone(), "valid-token");
+        let mut spec = connect_spec(address);
+        spec.auth_token = Some(" valid-token ".to_owned());
+
+        connect_websocket_once(&spec).expect("connect with bearer token");
+
+        server.join();
+    }
+
+    #[test]
+    fn connect_websocket_once_rejects_invalid_bearer_token() {
+        let address = reserve_unused_local_address();
+        let server = TestAuthWsServer::start(address.clone(), "valid-token");
+        let mut spec = connect_spec(address);
+        spec.auth_token = Some("invalid-token".to_owned());
+
+        let error = connect_websocket_once(&spec).expect_err("invalid bearer token should fail");
+
+        assert!(format!("{error:#}").contains("websocket handshake failed"));
+        server.join();
+    }
+
     fn connect_spec(address: String) -> GatewayWsConnectSpec {
         GatewayWsConnectSpec {
             endpoint_id: "local".to_owned(),
@@ -580,5 +620,61 @@ mod tests {
         fn join(self) {
             let _ = self.handle.join();
         }
+    }
+
+    struct TestAuthWsServer {
+        handle: std::thread::JoinHandle<()>,
+    }
+
+    impl TestAuthWsServer {
+        fn start(address: String, expected_token: &'static str) -> Self {
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                let runtime = Runtime::new().expect("server runtime");
+                runtime.block_on(async move {
+                    let listener = match TcpListener::bind(address.as_str()).await {
+                        Ok(listener) => listener,
+                        Err(error) => {
+                            let _ = ready_tx.send(Err(format!("bind server failed: {error}")));
+                            return;
+                        }
+                    };
+                    let _ = ready_tx.send(Ok(()));
+                    let (stream, _) = listener.accept().await.expect("accept");
+                    let callback = move |request: &Request, response: Response| {
+                        let expected = format!("Bearer {expected_token}");
+                        let authorization = request
+                            .headers()
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok());
+
+                        if authorization == Some(expected.as_str()) {
+                            return Ok(response);
+                        }
+
+                        Err(unauthorized_response())
+                    };
+                    if let Ok(mut websocket) = accept_hdr_async(stream, callback).await {
+                        let _ = timeout(Duration::from_millis(200), websocket.next()).await;
+                    }
+                });
+            });
+            ready_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("server readiness")
+                .expect("server bind");
+            Self { handle }
+        }
+
+        fn join(self) {
+            let _ = self.handle.join();
+        }
+    }
+
+    fn unauthorized_response() -> ErrorResponse {
+        HttpResponse::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .body(Some("unauthorized".to_owned()))
+            .expect("unauthorized response")
     }
 }

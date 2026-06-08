@@ -24,7 +24,7 @@ use super::root::{
     MainContentView, PioneerDesktop,
 };
 use crate::app::gateway_setup::GatewaySetupFormState;
-use crate::gateway::{GatewayInstallWarning, GatewayRuntime, GatewayWsClient};
+use crate::gateway::{GatewayInstallWarning, GatewayRuntime};
 use anyhow::anyhow;
 use gpui::{prelude::*, *};
 use gpui_component::{

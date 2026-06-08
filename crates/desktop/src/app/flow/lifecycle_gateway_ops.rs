@@ -117,7 +117,6 @@ impl PioneerDesktop {
                             let mut runtime = GatewayRuntime::load()?;
                             validate_remote_candidate_gateway_connection(
                                 &runtime,
-                                name.as_str(),
                                 address.as_str(),
                                 token.as_str(),
                             )?;
@@ -357,7 +356,6 @@ impl PioneerDesktop {
 
                             validate_remote_candidate_gateway_connection(
                                 &runtime,
-                                name.as_str(),
                                 address.as_str(),
                                 token.as_str(),
                             )?;

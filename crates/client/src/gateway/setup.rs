@@ -5,20 +5,32 @@ use super::{
     runtime::{
         AddRemoteGatewayProfilePlan, GatewayProfileError, activate_gateway,
         apply_add_remote_gateway_profile_plan, plan_add_remote_gateway_profile,
-        rollback_add_remote_gateway_profile_plan,
+        plan_remote_candidate_connect_spec, rollback_add_remote_gateway_profile_plan,
     },
     secrets::{gateway_auth_token_label, normalize_gateway_auth_token},
-    types::{GatewayEndpoint, GatewayRegistry},
+    timings::{GatewayTimingError, GatewayWsTimings},
+    types::{GatewayEndpoint, GatewayEndpointKind, GatewayRegistry},
 };
+use crate::transport::ws::{GatewayWsConnectSpec, client::connect_websocket_once};
 use pioneer_protocol::generate_id;
 use serde::{Deserialize, Serialize};
 use std::{error::Error, fmt, time::Duration};
+
+const REMOTE_GATEWAY_VALIDATION_ENDPOINT_ID: &str = "remote-validation";
+const REMOTE_GATEWAY_VALIDATION_ENDPOINT_NAME: &str = "Remote Gateway";
+const REMOTE_GATEWAY_VALIDATION_PING_INTERVAL_MS: u64 = 10_000;
+const REMOTE_GATEWAY_VALIDATION_PONG_TIMEOUT_MS: u64 = 30_000;
+const REMOTE_GATEWAY_VALIDATION_RECONNECT_INITIAL_MS: u64 = 500;
+const REMOTE_GATEWAY_VALIDATION_RECONNECT_MAX_MS: u64 = 10_000;
+const REMOTE_GATEWAY_VALIDATION_RECONNECT_JITTER_PERCENT: u8 = 20;
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RemoteGatewayValidationRequest {
     pub address: String,
+    #[serde(default)]
+    pub auth_token: Option<String>,
     pub timeout_ms: u64,
 }
 
@@ -51,6 +63,11 @@ pub enum RemoteGatewayValidationError {
     ResolveFailed {
         address: String,
         source: GatewayAddressError,
+    },
+    InvalidTimings(GatewayTimingError),
+    ConnectionFailed {
+        address: String,
+        reason: String,
     },
 }
 
@@ -202,6 +219,58 @@ pub fn validate_remote_gateway_address(
     }
 }
 
+pub fn validate_remote_gateway_connection(
+    address: &str,
+    auth_token: Option<&str>,
+    connect_timeout_ms: u64,
+) -> Result<RemoteGatewayValidation, RemoteGatewayValidationError> {
+    let timings = GatewayWsTimings::from_millis(
+        connect_timeout_ms,
+        REMOTE_GATEWAY_VALIDATION_PING_INTERVAL_MS,
+        REMOTE_GATEWAY_VALIDATION_PONG_TIMEOUT_MS,
+        REMOTE_GATEWAY_VALIDATION_RECONNECT_INITIAL_MS,
+        REMOTE_GATEWAY_VALIDATION_RECONNECT_MAX_MS,
+        REMOTE_GATEWAY_VALIDATION_RECONNECT_JITTER_PERCENT,
+    )
+    .map_err(RemoteGatewayValidationError::InvalidTimings)?;
+
+    validate_remote_gateway_connection_with_timings(address, auth_token, timings)
+}
+
+pub fn validate_remote_gateway_connection_with_timings(
+    address: &str,
+    auth_token: Option<&str>,
+    timings: GatewayWsTimings,
+) -> Result<RemoteGatewayValidation, RemoteGatewayValidationError> {
+    let address =
+        normalize_address(address).map_err(RemoteGatewayValidationError::InvalidAddress)?;
+    let plan = plan_remote_candidate_connect_spec(
+        REMOTE_GATEWAY_VALIDATION_ENDPOINT_ID.to_owned(),
+        "",
+        REMOTE_GATEWAY_VALIDATION_ENDPOINT_NAME.to_owned(),
+        address.as_str(),
+        auth_token.unwrap_or_default(),
+        timings,
+    );
+    let spec = GatewayWsConnectSpec {
+        endpoint_id: plan.endpoint_id,
+        endpoint_name: plan.endpoint_name,
+        endpoint_kind: GatewayEndpointKind::Remote,
+        address: plan.address,
+        auth_token: plan.auth_token,
+        timings: plan.timings,
+    };
+
+    connect_websocket_once(&spec).map_err(|error| {
+        RemoteGatewayValidationError::ConnectionFailed {
+            address: address.clone(),
+            reason: format!("{error:#}"),
+        }
+    })?;
+
+    Ok(RemoteGatewayValidation::Reachable { address })
+}
+
 pub fn validate_remote_gateway_request(
     request: &RemoteGatewayValidationRequest,
 ) -> Result<RemoteGatewayValidation, RemoteGatewayValidationError> {
@@ -211,9 +280,10 @@ pub fn validate_remote_gateway_request(
         });
     }
 
-    validate_remote_gateway_address(
+    validate_remote_gateway_connection(
         request.address.as_str(),
-        Duration::from_millis(request.timeout_ms),
+        request.auth_token.as_deref(),
+        request.timeout_ms,
     )
 }
 
@@ -345,6 +415,13 @@ impl fmt::Display for RemoteGatewayValidationError {
                 write!(
                     f,
                     "failed to resolve remote gateway address `{address}`: {source}"
+                )
+            }
+            Self::InvalidTimings(error) => write!(f, "{error}"),
+            Self::ConnectionFailed { address, reason } => {
+                write!(
+                    f,
+                    "failed to connect to remote gateway `{address}`: {reason}"
                 )
             }
         }
@@ -579,6 +656,7 @@ mod tests {
     fn remote_gateway_validation_request_rejects_zero_timeout() {
         let error = validate_remote_gateway_request(&RemoteGatewayValidationRequest {
             address: "127.0.0.1:23000".to_owned(),
+            auth_token: None,
             timeout_ms: 0,
         })
         .expect_err("zero timeout should fail");

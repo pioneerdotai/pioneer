@@ -60,5 +60,7 @@ pub(crate) fn validate_remote_gateway_address(
                 )
                 .to_string()
             }),
+        Err(error @ RemoteGatewayValidationError::InvalidTimings(_))
+        | Err(error @ RemoteGatewayValidationError::ConnectionFailed { .. }) => Err(error.into()),
     }
 }
