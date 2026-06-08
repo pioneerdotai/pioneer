@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ProviderListRefreshPlan",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "Send": {
+          "$ref": "#/$defs/ProviderListRefreshRequest"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Send"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "Unavailable": {
+          "$ref": "#/$defs/ProviderListRefreshUnavailable"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Unavailable"
+      ]
+    }
+  ],
+  "$defs": {
+    "ProviderListParams": {
+      "type": "object",
+      "properties": {
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id"
+      ]
+    },
+    "ProviderListRefreshRequest": {
+      "type": "object",
+      "properties": {
+        "connection_id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "params": {
+          "$ref": "#/$defs/ProviderListParams"
+        }
+      },
+      "required": [
+        "connection_id",
+        "params"
+      ]
+    },
+    "ProviderListRefreshUnavailable": {
+      "type": "string",
+      "enum": [
+        "GatewayNotConnected",
+        "WorkspaceNotSelected"
+      ]
+    }
+  }
+}

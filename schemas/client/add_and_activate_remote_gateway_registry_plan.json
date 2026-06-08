@@ -1,41 +1,66 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "PlanAddRemoteGatewayRequest",
+  "title": "AddAndActivateRemoteGatewayRegistryPlan",
   "type": "object",
   "properties": {
-    "address": {
-      "type": "string"
+    "endpoint": {
+      "$ref": "#/$defs/GatewayEndpoint"
     },
-    "auth_token": {
+    "previous_active_gateway_id": {
       "type": [
         "string",
         "null"
       ]
     },
-    "default_remote_name": {
-      "type": "string"
-    },
-    "name": {
-      "type": "string"
-    },
-    "new_endpoint_id": {
-      "type": [
-        "string",
-        "null"
+    "previous_endpoint": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GatewayEndpoint"
+        },
+        {
+          "type": "null"
+        }
       ]
     },
     "registry": {
       "$ref": "#/$defs/GatewayRegistry"
+    },
+    "token_write": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GatewayAuthTokenWrite"
+        },
+        {
+          "type": "null"
+        }
+      ]
     }
   },
-  "additionalProperties": false,
   "required": [
     "registry",
-    "name",
-    "address",
-    "default_remote_name"
+    "endpoint"
   ],
   "$defs": {
+    "GatewayAuthTokenWrite": {
+      "type": "object",
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "token": {
+          "type": "string"
+        },
+        "token_ref": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "token_ref",
+        "token",
+        "label"
+      ]
+    },
     "GatewayEndpoint": {
       "type": "object",
       "properties": {

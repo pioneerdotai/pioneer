@@ -4,14 +4,78 @@
   "type": "object",
   "properties": {
     "label": {
-      "type": "string"
+      "$ref": "#/$defs/SystemEventDetailLabel"
     },
     "value": {
-      "type": "string"
+      "$ref": "#/$defs/SystemEventDetailValue"
     }
   },
   "required": [
     "label",
     "value"
-  ]
+  ],
+  "$defs": {
+    "SystemEventDetailLabel": {
+      "type": "string",
+      "enum": [
+        "Window",
+        "Status",
+        "Reason",
+        "WindowExhaustion",
+        "Checkpoint",
+        "PreviousWindow",
+        "Limit",
+        "AgentRounds",
+        "ToolCalls",
+        "ProviderTokens",
+        "TotalWindows",
+        "CheckpointKind",
+        "CheckpointSize"
+      ]
+    },
+    "SystemEventDetailValue": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "Text": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Text"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "WindowIndex": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "WindowIndex"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Bytes": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Bytes"
+          ]
+        }
+      ]
+    }
+  }
 }

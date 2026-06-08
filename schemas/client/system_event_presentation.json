@@ -4,14 +4,207 @@
   "type": "object",
   "properties": {
     "label": {
-      "type": "string"
+      "$ref": "#/$defs/SystemEventLabel"
     },
     "message": {
-      "type": "string"
+      "$ref": "#/$defs/SystemEventMessage"
     }
   },
   "required": [
     "message",
     "label"
-  ]
+  ],
+  "$defs": {
+    "SystemEventLabel": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "Timeout",
+            "Recovery",
+            "Retry",
+            "Recovered",
+            "Error",
+            "RetryResolved",
+            "RetriesExhausted",
+            "Checkpoint",
+            "Continued",
+            "Paused"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Level": {
+              "$ref": "#/$defs/SystemEventLevel"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Level"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Attempt": {
+              "type": "object",
+              "properties": {
+                "attempt": {
+                  "type": "integer",
+                  "format": "uint64",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "attempt"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Attempt"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ExecutionWindow": {
+              "type": "object",
+              "properties": {
+                "window_index": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "uint64",
+                  "minimum": 0
+                }
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "ExecutionWindow"
+          ]
+        }
+      ]
+    },
+    "SystemEventLevel": {
+      "type": "string",
+      "enum": [
+        "info",
+        "warning",
+        "error"
+      ]
+    },
+    "SystemEventMessage": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "RecoveryOpened",
+            "RecoveryAttached",
+            "RetryScheduled",
+            "RetryStarted",
+            "RecoverySucceeded",
+            "RecoveryFailed",
+            "ToolLoopBudgetExceeded"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Raw": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Raw"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Timeout": {
+              "type": "object",
+              "properties": {
+                "recovery_started": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "recovery_started"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Timeout"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ToolRetryScheduled": {
+              "type": "object",
+              "properties": {
+                "tool_name": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "tool_name"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "ToolRetryScheduled"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ToolRetryResolved": {
+              "type": "object",
+              "properties": {
+                "tool_name": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "tool_name"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "ToolRetryResolved"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ToolRetryExhausted": {
+              "type": "object",
+              "properties": {
+                "tool_name": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "tool_name"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "ToolRetryExhausted"
+          ]
+        }
+      ]
+    }
+  }
 }

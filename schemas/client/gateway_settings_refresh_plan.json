@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GatewaySettingsRefreshPlan",
+  "oneOf": [
+    {
+      "type": "string",
+      "enum": [
+        "SkipAlreadyLoading"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "Send": {
+          "$ref": "#/$defs/GatewaySettingsActionScope"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Send"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "Unavailable": {
+          "$ref": "#/$defs/GatewaySettingsRefreshUnavailable"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Unavailable"
+      ]
+    }
+  ],
+  "$defs": {
+    "GatewaySettingsActionScope": {
+      "type": "object",
+      "properties": {
+        "connection_epoch": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "connection_id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "connection_id",
+        "connection_epoch"
+      ]
+    },
+    "GatewaySettingsRefreshUnavailable": {
+      "type": "string",
+      "enum": [
+        "GatewayNotConnected"
+      ]
+    }
+  }
+}

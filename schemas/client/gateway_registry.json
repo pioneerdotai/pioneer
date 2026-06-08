@@ -10,7 +10,14 @@
       ]
     },
     "local": {
-      "$ref": "#/$defs/GatewayEndpoint"
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GatewayEndpoint"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "remotes": {
       "type": "array",
@@ -27,8 +34,7 @@
   },
   "additionalProperties": false,
   "required": [
-    "version",
-    "local"
+    "version"
   ],
   "$defs": {
     "GatewayEndpoint": {

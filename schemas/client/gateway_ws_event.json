@@ -1,169 +1,233 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "ClientEvent",
+  "title": "GatewayWsEvent",
   "oneOf": [
     {
       "type": "object",
       "properties": {
-        "SnapshotChanged": {
-          "$ref": "#/$defs/ClientSnapshot"
+        "Connecting": {
+          "type": "object",
+          "properties": {
+            "connection_id": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "endpoint_id": {
+              "type": "string"
+            },
+            "endpoint_kind": {
+              "$ref": "#/$defs/GatewayEndpointKind"
+            },
+            "endpoint_name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "connection_id",
+            "endpoint_id",
+            "endpoint_name",
+            "endpoint_kind"
+          ]
         }
       },
       "additionalProperties": false,
       "required": [
-        "SnapshotChanged"
+        "Connecting"
       ]
     },
     {
       "type": "object",
       "properties": {
-        "GatewayConnectionChanged": {
-          "$ref": "#/$defs/ClientGatewayConnectionEvent"
+        "Connected": {
+          "type": "object",
+          "properties": {
+            "address": {
+              "type": "string"
+            },
+            "connection_id": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "endpoint_id": {
+              "type": "string"
+            },
+            "endpoint_name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "connection_id",
+            "endpoint_id",
+            "endpoint_name",
+            "address"
+          ]
         }
       },
       "additionalProperties": false,
       "required": [
-        "GatewayConnectionChanged"
+        "Connected"
       ]
     },
     {
       "type": "object",
       "properties": {
-        "GatewayNotification": {
-          "$ref": "#/$defs/GatewayNotification"
+        "Reconnecting": {
+          "type": "object",
+          "properties": {
+            "attempt": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "connection_id": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "delay_ms": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "endpoint_id": {
+              "type": "string"
+            },
+            "endpoint_name": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "connection_id",
+            "endpoint_id",
+            "endpoint_name",
+            "attempt",
+            "delay_ms",
+            "reason"
+          ]
         }
       },
       "additionalProperties": false,
       "required": [
-        "GatewayNotification"
+        "Reconnecting"
       ]
     },
     {
       "type": "object",
       "properties": {
-        "EffectsPlanned": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/ClientEffect"
-          }
+        "Disconnected": {
+          "type": "object",
+          "properties": {
+            "address": {
+              "type": "string"
+            },
+            "connection_id": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "endpoint_id": {
+              "type": "string"
+            },
+            "endpoint_kind": {
+              "$ref": "#/$defs/GatewayEndpointKind"
+            },
+            "endpoint_name": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "connection_id",
+            "endpoint_id",
+            "endpoint_name",
+            "endpoint_kind",
+            "address",
+            "reason"
+          ]
         }
       },
       "additionalProperties": false,
       "required": [
-        "EffectsPlanned"
+        "Disconnected"
       ]
     },
     {
       "type": "object",
       "properties": {
-        "Error": {
-          "$ref": "#/$defs/ClientErrorEvent"
+        "ConnectFailed": {
+          "type": "object",
+          "properties": {
+            "address": {
+              "type": "string"
+            },
+            "connection_id": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "endpoint_id": {
+              "type": "string"
+            },
+            "endpoint_kind": {
+              "$ref": "#/$defs/GatewayEndpointKind"
+            },
+            "endpoint_name": {
+              "type": "string"
+            },
+            "error": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "connection_id",
+            "endpoint_id",
+            "endpoint_name",
+            "endpoint_kind",
+            "address",
+            "error"
+          ]
         }
       },
       "additionalProperties": false,
       "required": [
-        "Error"
+        "ConnectFailed"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "Notification": {
+          "type": "object",
+          "properties": {
+            "connection_id": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "notification": {
+              "$ref": "#/$defs/GatewayNotification"
+            }
+          },
+          "required": [
+            "connection_id",
+            "notification"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Notification"
       ]
     }
   ],
   "$defs": {
-    "ActiveThreadPhaseSnapshot": {
-      "type": "string",
-      "enum": [
-        "Idle",
-        "Starting",
-        "Running",
-        "Cancelling",
-        "Completing",
-        "Completed",
-        "Failed",
-        "Blocked",
-        "Cancelled"
-      ]
-    },
-    "ActiveThreadSnapshot": {
-      "type": "object",
-      "properties": {
-        "history_loaded": {
-          "type": "boolean"
-        },
-        "history_loading": {
-          "type": "boolean"
-        },
-        "in_flight_turn_id": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "is_draft": {
-          "type": "boolean"
-        },
-        "phase": {
-          "$ref": "#/$defs/ActiveThreadPhaseSnapshot"
-        },
-        "status": {
-          "$ref": "#/$defs/ActiveThreadStatusSnapshot"
-        },
-        "thread_id": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "workspace_id": {
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "is_draft",
-        "history_loading",
-        "history_loaded",
-        "phase",
-        "status"
-      ]
-    },
-    "ActiveThreadStatusSnapshot": {
-      "oneOf": [
-        {
-          "type": "string",
-          "enum": [
-            "GatewayDisconnected",
-            "StartingThread",
-            "FinishingTurn",
-            "PreviousTurnFailed",
-            "TurnCancelled",
-            "TurnCompleted",
-            "Ready",
-            "StartingTurn",
-            "AgentProcessing"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "TurnRunning": {
-              "type": "object",
-              "properties": {
-                "turn_id": {
-                  "type": "string"
-                }
-              },
-              "required": [
-                "turn_id"
-              ]
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "TurnRunning"
-          ]
-        }
-      ]
-    },
     "ArtifactBindingDirection": {
       "type": "string",
       "enum": [
@@ -654,103 +718,6 @@
         "next_offset"
       ]
     },
-    "ClientEffect": {
-      "oneOf": [
-        {
-          "type": "string",
-          "enum": [
-            "RefreshWorkspaceList",
-            "RefreshGatewaySettings",
-            "QueueSkillsRefresh",
-            "EnqueueInFlightTurnsForResume"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "UnsubscribeThreads": {
-              "type": "object",
-              "properties": {
-                "thread_ids": {
-                  "type": "array",
-                  "items": {
-                    "type": "string"
-                  }
-                }
-              },
-              "required": [
-                "thread_ids"
-              ]
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "UnsubscribeThreads"
-          ]
-        }
-      ]
-    },
-    "ClientErrorEvent": {
-      "type": "object",
-      "properties": {
-        "code": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "message": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "message"
-      ]
-    },
-    "ClientGatewayConnectionEvent": {
-      "type": "object",
-      "properties": {
-        "connection_state": {
-          "$ref": "#/$defs/GatewayConnectionState"
-        },
-        "gateway_error": {
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "connection_state"
-      ]
-    },
-    "ClientSnapshot": {
-      "type": "object",
-      "properties": {
-        "active_thread": {
-          "$ref": "#/$defs/ActiveThreadSnapshot"
-        },
-        "has_any_in_flight_turn": {
-          "type": "boolean"
-        },
-        "has_in_flight_thread_start": {
-          "type": "boolean"
-        },
-        "threads": {
-          "$ref": "#/$defs/ThreadListSnapshot"
-        },
-        "workspace": {
-          "$ref": "#/$defs/WorkspaceSnapshot"
-        }
-      },
-      "required": [
-        "workspace",
-        "threads",
-        "active_thread",
-        "has_in_flight_thread_start",
-        "has_any_in_flight_turn"
-      ]
-    },
     "ContextCompressedNotification": {
       "type": "object",
       "properties": {
@@ -919,14 +886,11 @@
         "failed"
       ]
     },
-    "GatewayConnectionState": {
+    "GatewayEndpointKind": {
       "type": "string",
       "enum": [
-        "Idle",
-        "Connecting",
-        "Connected",
-        "Reconnecting",
-        "Disconnected"
+        "local",
+        "remote"
       ]
     },
     "GatewayNotification": {
@@ -6962,40 +6926,6 @@
         "threadId"
       ]
     },
-    "ThreadListSnapshot": {
-      "type": "object",
-      "properties": {
-        "active_thread_id": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "active_workspace_thread_ids": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "draft_thread_id": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "has_known_threads_for_active_workspace": {
-          "type": "boolean"
-        },
-        "loading": {
-          "type": "boolean"
-        }
-      },
-      "required": [
-        "active_workspace_thread_ids",
-        "has_known_threads_for_active_workspace",
-        "loading"
-      ]
-    },
     "ThreadMode": {
       "type": "string",
       "enum": [
@@ -9790,45 +9720,6 @@
       "required": [
         "kind",
         "workspace"
-      ]
-    },
-    "WorkspaceSnapshot": {
-      "type": "object",
-      "properties": {
-        "action_in_progress": {
-          "type": "boolean"
-        },
-        "active_workspace_id": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "error": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "loading": {
-          "type": "boolean"
-        },
-        "preferred_workspace_id": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "workspace_count": {
-          "type": "integer",
-          "format": "uint",
-          "minimum": 0
-        }
-      },
-      "required": [
-        "loading",
-        "action_in_progress",
-        "workspace_count"
       ]
     }
   }

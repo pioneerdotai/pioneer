@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GatewaySettingsActionScope",
+  "type": "object",
+  "properties": {
+    "connection_epoch": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "connection_id": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "connection_id",
+    "connection_epoch"
+  ]
+}
