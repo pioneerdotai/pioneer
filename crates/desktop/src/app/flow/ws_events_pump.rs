@@ -1,4 +1,5 @@
 use super::*;
+use pioneer_client::runtime::ClientRuntimePostEventSink;
 
 impl PioneerDesktop {
     pub(crate) fn start_gateway_ws_event_pump(&self, cx: &mut Context<Self>) {
@@ -40,7 +41,7 @@ impl PioneerDesktop {
         first_event: Option<GatewayWsEvent>,
         cx: &mut Context<Self>,
     ) {
-        let mut changed = false;
+        let mut events_applied = false;
 
         for event in self
             .gateway
@@ -48,34 +49,16 @@ impl PioneerDesktop {
             .drain_applicable_ws_events(self.gateway.ws_connection_id, first_event)
         {
             self.apply_gateway_ws_event(event, cx);
-            changed = true;
+            events_applied = true;
         }
 
-        if self.take_thread_list_refresh_request() {
-            self.refresh_thread_list(cx);
-            changed = true;
-        }
+        let outcome = {
+            let client_runtime = self.gateway.client_runtime.clone();
+            let mut sink = DesktopPostEventSink { app: self, cx };
+            client_runtime.drive_post_event_batch(events_applied, &mut sink)
+        };
 
-        if self.take_skills_refresh_request() {
-            self.refresh_installed_skills(cx);
-            changed = true;
-        }
-
-        if self.take_mcp_refresh_request() {
-            self.refresh_mcp_servers(cx);
-            changed = true;
-        }
-
-        if self.take_mcp_details_refresh_request() {
-            self.refresh_mcp_server_details(cx);
-            changed = true;
-        }
-
-        let started_or_retried = self.drive_thread_start_queue(cx);
-        let resumed = self.drive_turn_resume_queue(cx);
-        let finalized_completion = self.tick_thread_conversations();
-
-        if changed || started_or_retried || resumed || finalized_completion {
+        if outcome.should_notify() {
             cx.notify();
         }
     }
@@ -108,5 +91,56 @@ impl PioneerDesktop {
                 self.apply_gateway_notification(notification, cx);
             }
         }
+    }
+}
+
+struct DesktopPostEventSink<'a, 'cx> {
+    app: &'a mut PioneerDesktop,
+    cx: &'a mut Context<'cx, PioneerDesktop>,
+}
+
+impl ClientRuntimePostEventSink for DesktopPostEventSink<'_, '_> {
+    fn refresh_thread_list_if_requested(&mut self) -> bool {
+        if !self.app.take_thread_list_refresh_request() {
+            return false;
+        }
+        self.app.refresh_thread_list(self.cx);
+        true
+    }
+
+    fn refresh_skills_if_requested(&mut self) -> bool {
+        if !self.app.take_skills_refresh_request() {
+            return false;
+        }
+        self.app.refresh_installed_skills(self.cx);
+        true
+    }
+
+    fn refresh_mcp_if_requested(&mut self) -> bool {
+        if !self.app.take_mcp_refresh_request() {
+            return false;
+        }
+        self.app.refresh_mcp_servers(self.cx);
+        true
+    }
+
+    fn refresh_mcp_details_if_requested(&mut self) -> bool {
+        if !self.app.take_mcp_details_refresh_request() {
+            return false;
+        }
+        self.app.refresh_mcp_server_details(self.cx);
+        true
+    }
+
+    fn drive_thread_start_queue(&mut self) -> bool {
+        self.app.drive_thread_start_queue(self.cx)
+    }
+
+    fn drive_turn_resume_queue(&mut self) -> bool {
+        self.app.drive_turn_resume_queue(self.cx)
+    }
+
+    fn tick_thread_conversations(&mut self) -> bool {
+        self.app.tick_thread_conversations()
     }
 }
