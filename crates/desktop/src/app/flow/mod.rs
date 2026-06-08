@@ -42,7 +42,6 @@ use pioneer_client::gateway::types::{GatewayEndpoint, GatewayEndpointKind};
 use pioneer_client::transport::ws::{GatewayWsConnectSpec, GatewayWsEvent};
 use pioneer_protocol::{
     GatewayNotification, ThreadHistoryResponse, TurnTimelineResponse, Workspace,
-    WorkspaceChangedNotification,
 };
 use std::time::Duration;
 use tracing::warn;

@@ -7,6 +7,38 @@
 //! loops.
 
 use crate::{
+    notifications::router::{
+        ArtifactDeletedRefreshReduction, ArtifactThreadRefreshReduction,
+        ConversationEventReduction, McpRefreshReduction, McpServerCatalogChangedReduction,
+        McpServerStatusChangedReduction, SkillsRefreshReduction, ThreadArtifactsRefreshReduction,
+        ThreadClosedReduction, ThreadStartedContext, ThreadStartedReduction,
+        ThreadUpdatedReduction, TurnLifecycleReduction, TurnTimelineRefreshReduction,
+        WorkspacePreferenceReduction, WorkspaceRefreshReduction,
+        apply_workspace_changed_to_catalog, reduce_artifact_created_notification,
+        reduce_artifact_deleted_notification, reduce_artifact_updated_notification,
+        reduce_item_completed_notification, reduce_item_delta_notification,
+        reduce_item_recovery_attached_notification, reduce_item_recovery_exhausted_notification,
+        reduce_item_recovery_opened_notification, reduce_item_recovery_succeeded_notification,
+        reduce_item_retry_attempt_started_notification, reduce_item_retry_scheduled_notification,
+        reduce_item_started_notification, reduce_item_timeout_detected_notification,
+        reduce_item_tool_retry_exhausted_notification,
+        reduce_item_tool_retry_resolved_notification,
+        reduce_item_tool_retry_scheduled_notification, reduce_item_updated_notification,
+        reduce_mcp_changed_notification, reduce_mcp_server_catalog_changed_notification,
+        reduce_mcp_server_status_changed_notification, reduce_skills_changed_notification,
+        reduce_thread_agents_doc_changed_notification,
+        reduce_thread_artifacts_changed_notification, reduce_thread_closed_notification,
+        reduce_thread_started_notification, reduce_thread_tree_changed_notification,
+        reduce_thread_updated_notification, reduce_turn_blocked_notification,
+        reduce_turn_completed_notification, reduce_turn_execution_window_blocked_notification,
+        reduce_turn_execution_window_checkpointed_notification,
+        reduce_turn_execution_window_continued_notification,
+        reduce_turn_execution_window_exhausted_notification,
+        reduce_turn_execution_window_started_notification, reduce_turn_failed_notification,
+        reduce_turn_started_notification, reduce_turn_timeline_changed_notification,
+        reduce_turn_tool_loop_budget_exceeded_notification,
+        reduce_workspace_preference_after_catalog_change,
+    },
     state::reducers::{
         GatewayConnectionEvent, GatewayConnectionReduction, reduce_gateway_connection_event,
     },
@@ -14,7 +46,9 @@ use crate::{
         GatewayWsClient, GatewayWsCommandSender, GatewayWsEvent, should_apply_ws_event,
     },
 };
-use pioneer_protocol::GatewayNotification;
+use pioneer_protocol::{
+    ArtifactSummary, GatewayNotification, Workspace, WorkspaceChangedNotification,
+};
 
 #[derive(Clone)]
 pub struct ClientRuntime {
@@ -31,6 +65,59 @@ pub struct ClientRuntimeWsEventContext {
 pub enum ClientRuntimeWsEvent {
     Connection(GatewayConnectionReduction),
     Notification(GatewayNotification),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ClientRuntimeNotificationContext<'a> {
+    pub pending_thread_id: Option<&'a str>,
+    pub active_thread_id: Option<&'a str>,
+    pub active_workspace_id: Option<&'a str>,
+    pub notification_thread_workspace_matches: bool,
+    pub active_thread_artifacts: &'a [ArtifactSummary],
+    pub preferred_workspace_id: Option<&'a str>,
+    pub workspaces: &'a [Workspace],
+    pub mcp_workspace_id: Option<&'a str>,
+    pub mcp_selected_server_id: Option<&'a str>,
+    pub mcp_details_loaded: bool,
+}
+
+impl Default for ClientRuntimeNotificationContext<'_> {
+    fn default() -> Self {
+        Self {
+            pending_thread_id: None,
+            active_thread_id: None,
+            active_workspace_id: None,
+            notification_thread_workspace_matches: false,
+            active_thread_artifacts: &[],
+            preferred_workspace_id: None,
+            workspaces: &[],
+            mcp_workspace_id: None,
+            mcp_selected_server_id: None,
+            mcp_details_loaded: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum ClientRuntimeNotification {
+    ThreadStarted(ThreadStartedReduction),
+    TurnLifecycle(TurnLifecycleReduction),
+    ConversationEvent(ConversationEventReduction),
+    ThreadClosed(ThreadClosedReduction),
+    WorkspaceRefresh(WorkspaceRefreshReduction),
+    ThreadUpdated(ThreadUpdatedReduction),
+    SkillsRefresh(SkillsRefreshReduction),
+    McpRefresh(McpRefreshReduction),
+    McpServerStatusChanged(McpServerStatusChangedReduction),
+    McpServerCatalogChanged(McpServerCatalogChangedReduction),
+    ThreadArtifactsRefresh(ThreadArtifactsRefreshReduction),
+    ArtifactThreadRefresh(ArtifactThreadRefreshReduction),
+    ArtifactDeletedRefresh(ArtifactDeletedRefreshReduction),
+    TurnTimelineRefresh(TurnTimelineRefreshReduction),
+    WorkspaceChanged {
+        notification: WorkspaceChangedNotification,
+        preference: WorkspacePreferenceReduction,
+    },
 }
 
 impl ClientRuntime {
@@ -70,6 +157,14 @@ impl ClientRuntime {
         context: ClientRuntimeWsEventContext,
     ) -> ClientRuntimeWsEvent {
         reduce_gateway_ws_event(event, context)
+    }
+
+    pub fn reduce_gateway_notification(
+        &self,
+        notification: GatewayNotification,
+        context: ClientRuntimeNotificationContext<'_>,
+    ) -> Option<ClientRuntimeNotification> {
+        reduce_gateway_notification(notification, context)
     }
 }
 
@@ -156,6 +251,277 @@ pub fn reduce_gateway_ws_event(
     }
 }
 
+pub fn reduce_gateway_notification(
+    notification: GatewayNotification,
+    context: ClientRuntimeNotificationContext<'_>,
+) -> Option<ClientRuntimeNotification> {
+    match notification {
+        GatewayNotification::ThreadStarted(notification) => Some(
+            ClientRuntimeNotification::ThreadStarted(reduce_thread_started_notification(
+                notification,
+                ThreadStartedContext {
+                    pending_thread_id: context.pending_thread_id,
+                    active_thread_id: context.active_thread_id,
+                    active_workspace_id: context.active_workspace_id,
+                },
+            )),
+        ),
+        GatewayNotification::TurnStarted(notification) => {
+            Some(ClientRuntimeNotification::TurnLifecycle(
+                reduce_turn_started_notification(notification),
+            ))
+        }
+        GatewayNotification::TurnCompleted(notification) => {
+            Some(ClientRuntimeNotification::TurnLifecycle(
+                reduce_turn_completed_notification(notification),
+            ))
+        }
+        GatewayNotification::TurnFailed(notification) => Some(
+            ClientRuntimeNotification::TurnLifecycle(reduce_turn_failed_notification(notification)),
+        ),
+        GatewayNotification::TurnBlocked(notification) => {
+            Some(ClientRuntimeNotification::TurnLifecycle(
+                reduce_turn_blocked_notification(notification),
+            ))
+        }
+        GatewayNotification::ItemStarted(notification) => {
+            Some(ClientRuntimeNotification::ConversationEvent(
+                reduce_item_started_notification(notification),
+            ))
+        }
+        GatewayNotification::ItemDelta(notification) => {
+            Some(ClientRuntimeNotification::ConversationEvent(
+                reduce_item_delta_notification(notification),
+            ))
+        }
+        GatewayNotification::ItemCompleted(notification) => {
+            Some(ClientRuntimeNotification::ConversationEvent(
+                reduce_item_completed_notification(notification),
+            ))
+        }
+        GatewayNotification::ItemUpdated(notification) => {
+            Some(ClientRuntimeNotification::ConversationEvent(
+                reduce_item_updated_notification(notification),
+            ))
+        }
+        GatewayNotification::ItemTimeoutDetected(notification) => {
+            Some(ClientRuntimeNotification::ConversationEvent(
+                reduce_item_timeout_detected_notification(notification),
+            ))
+        }
+        GatewayNotification::ItemRecoveryOpened(notification) => {
+            Some(ClientRuntimeNotification::ConversationEvent(
+                reduce_item_recovery_opened_notification(notification),
+            ))
+        }
+        GatewayNotification::ItemRecoveryAttached(notification) => {
+            Some(ClientRuntimeNotification::ConversationEvent(
+                reduce_item_recovery_attached_notification(notification),
+            ))
+        }
+        GatewayNotification::ItemRetryScheduled(notification) => {
+            Some(ClientRuntimeNotification::ConversationEvent(
+                reduce_item_retry_scheduled_notification(notification),
+            ))
+        }
+        GatewayNotification::ItemRetryAttemptStarted(notification) => {
+            Some(ClientRuntimeNotification::ConversationEvent(
+                reduce_item_retry_attempt_started_notification(notification),
+            ))
+        }
+        GatewayNotification::ItemRecoverySucceeded(notification) => {
+            Some(ClientRuntimeNotification::ConversationEvent(
+                reduce_item_recovery_succeeded_notification(notification),
+            ))
+        }
+        GatewayNotification::ItemRecoveryExhausted(notification) => {
+            Some(ClientRuntimeNotification::ConversationEvent(
+                reduce_item_recovery_exhausted_notification(notification),
+            ))
+        }
+        GatewayNotification::ItemToolRetryScheduled(notification) => {
+            Some(ClientRuntimeNotification::ConversationEvent(
+                reduce_item_tool_retry_scheduled_notification(notification),
+            ))
+        }
+        GatewayNotification::ItemToolRetryResolved(notification) => {
+            Some(ClientRuntimeNotification::ConversationEvent(
+                reduce_item_tool_retry_resolved_notification(notification),
+            ))
+        }
+        GatewayNotification::ItemToolRetryExhausted(notification) => {
+            Some(ClientRuntimeNotification::ConversationEvent(
+                reduce_item_tool_retry_exhausted_notification(notification),
+            ))
+        }
+        GatewayNotification::TurnToolLoopBudgetExceeded(notification) => {
+            Some(ClientRuntimeNotification::ConversationEvent(
+                reduce_turn_tool_loop_budget_exceeded_notification(notification),
+            ))
+        }
+        GatewayNotification::TurnExecutionWindowStarted(notification) => {
+            Some(ClientRuntimeNotification::ConversationEvent(
+                reduce_turn_execution_window_started_notification(notification),
+            ))
+        }
+        GatewayNotification::TurnExecutionWindowExhausted(notification) => {
+            Some(ClientRuntimeNotification::ConversationEvent(
+                reduce_turn_execution_window_exhausted_notification(notification),
+            ))
+        }
+        GatewayNotification::TurnExecutionWindowCheckpointed(notification) => {
+            Some(ClientRuntimeNotification::ConversationEvent(
+                reduce_turn_execution_window_checkpointed_notification(notification),
+            ))
+        }
+        GatewayNotification::TurnExecutionWindowContinued(notification) => {
+            Some(ClientRuntimeNotification::ConversationEvent(
+                reduce_turn_execution_window_continued_notification(notification),
+            ))
+        }
+        GatewayNotification::TurnExecutionWindowBlocked(notification) => {
+            Some(ClientRuntimeNotification::ConversationEvent(
+                reduce_turn_execution_window_blocked_notification(notification),
+            ))
+        }
+        GatewayNotification::ThreadClosed(notification) => Some(
+            ClientRuntimeNotification::ThreadClosed(reduce_thread_closed_notification(
+                notification,
+                context.notification_thread_workspace_matches,
+            )),
+        ),
+        GatewayNotification::ThreadTreeChanged(notification) => {
+            Some(ClientRuntimeNotification::WorkspaceRefresh(
+                reduce_thread_tree_changed_notification(notification, context.active_workspace_id),
+            ))
+        }
+        GatewayNotification::ThreadAgentsDocChanged(notification) => {
+            Some(ClientRuntimeNotification::WorkspaceRefresh(
+                reduce_thread_agents_doc_changed_notification(
+                    notification,
+                    context.active_workspace_id,
+                ),
+            ))
+        }
+        GatewayNotification::ThreadUpdated(notification) => {
+            Some(ClientRuntimeNotification::ThreadUpdated(
+                reduce_thread_updated_notification(notification),
+            ))
+        }
+        GatewayNotification::SkillsChanged(notification) => {
+            Some(ClientRuntimeNotification::SkillsRefresh(
+                reduce_skills_changed_notification(notification, context.active_workspace_id),
+            ))
+        }
+        GatewayNotification::McpChanged(notification) => Some(
+            ClientRuntimeNotification::McpRefresh(reduce_mcp_changed_notification(
+                notification,
+                context.mcp_workspace_id,
+                context.mcp_selected_server_id,
+            )),
+        ),
+        GatewayNotification::McpServerStatusChanged(notification) => {
+            Some(ClientRuntimeNotification::McpServerStatusChanged(
+                reduce_mcp_server_status_changed_notification(
+                    notification,
+                    context.mcp_workspace_id,
+                    context.mcp_selected_server_id,
+                    context.mcp_details_loaded,
+                ),
+            ))
+        }
+        GatewayNotification::McpServerCatalogChanged(notification) => {
+            Some(ClientRuntimeNotification::McpServerCatalogChanged(
+                reduce_mcp_server_catalog_changed_notification(
+                    notification,
+                    context.mcp_workspace_id,
+                    context.mcp_selected_server_id,
+                ),
+            ))
+        }
+        GatewayNotification::ThreadArtifactsChanged(notification) => {
+            Some(ClientRuntimeNotification::ThreadArtifactsRefresh(
+                reduce_thread_artifacts_changed_notification(
+                    notification,
+                    context.notification_thread_workspace_matches,
+                ),
+            ))
+        }
+        GatewayNotification::ArtifactCreated(notification) => {
+            Some(ClientRuntimeNotification::ArtifactThreadRefresh(
+                reduce_artifact_created_notification(notification),
+            ))
+        }
+        GatewayNotification::ArtifactUpdated(notification) => {
+            Some(ClientRuntimeNotification::ArtifactThreadRefresh(
+                reduce_artifact_updated_notification(notification),
+            ))
+        }
+        GatewayNotification::ArtifactDeleted(notification) => {
+            Some(ClientRuntimeNotification::ArtifactDeletedRefresh(
+                reduce_artifact_deleted_notification(
+                    notification,
+                    context.active_thread_id,
+                    context.active_thread_artifacts,
+                ),
+            ))
+        }
+        GatewayNotification::TurnTimelineChanged(notification) => {
+            Some(ClientRuntimeNotification::TurnTimelineRefresh(
+                reduce_turn_timeline_changed_notification(notification),
+            ))
+        }
+        GatewayNotification::WorkspaceChanged(notification) => {
+            let mut workspaces = context.workspaces.to_vec();
+            apply_workspace_changed_to_catalog(&mut workspaces, &notification);
+            let preference = reduce_workspace_preference_after_catalog_change(
+                context.preferred_workspace_id,
+                &workspaces,
+            );
+            Some(ClientRuntimeNotification::WorkspaceChanged {
+                notification,
+                preference,
+            })
+        }
+        GatewayNotification::ContextCompressing(_)
+        | GatewayNotification::ContextCompressed(_)
+        | GatewayNotification::Unknown(_)
+        | GatewayNotification::SkillsUploadChunkAck(_)
+        | GatewayNotification::ArtifactProjectionUpdated(_)
+        | GatewayNotification::ArtifactUploadProgress(_)
+        | GatewayNotification::ArtifactDownloadProgress(_)
+        | GatewayNotification::TaskCreated(_)
+        | GatewayNotification::TaskScheduled(_)
+        | GatewayNotification::TaskQueued(_)
+        | GatewayNotification::TaskRunCreated(_)
+        | GatewayNotification::TaskRunStarted(_)
+        | GatewayNotification::TaskProgress(_)
+        | GatewayNotification::TaskRunCompleted(_)
+        | GatewayNotification::TaskRunFailed(_)
+        | GatewayNotification::TaskRunBlocked(_)
+        | GatewayNotification::TaskRunCancelled(_)
+        | GatewayNotification::TaskCompleted(_)
+        | GatewayNotification::TaskFailed(_)
+        | GatewayNotification::TaskBlocked(_)
+        | GatewayNotification::TaskCancelled(_)
+        | GatewayNotification::TaskDetached(_)
+        | GatewayNotification::TaskUpdated(_)
+        | GatewayNotification::TaskRescheduled(_)
+        | GatewayNotification::TaskPaused(_)
+        | GatewayNotification::TaskResumed(_)
+        | GatewayNotification::TaskDeliveryQueued(_)
+        | GatewayNotification::TaskDeliveryStarted(_)
+        | GatewayNotification::TaskDeliveryDelivered(_)
+        | GatewayNotification::TaskDeliveryFailed(_)
+        | GatewayNotification::TaskDeliveryCancelled(_)
+        | GatewayNotification::TaskTreeChanged(_)
+        | GatewayNotification::TaskRecovered(_)
+        | GatewayNotification::MemoryChanged(_)
+        | GatewayNotification::MemoryCandidateCreated(_)
+        | GatewayNotification::MemoryForgotten(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,7 +535,8 @@ mod tests {
         transport::ws::GatewayWsConnectSpec,
     };
     use pioneer_protocol::{
-        UnknownGatewayNotification, Workspace, WorkspaceChangeKind, WorkspaceChangedNotification,
+        SkillsChangedNotification, UnknownGatewayNotification, Workspace, WorkspaceChangeKind,
+        WorkspaceChangedNotification,
     };
     use serde_json::json;
     use std::time::Duration;
@@ -193,6 +560,17 @@ mod tests {
             address: "127.0.0.1:17878".to_owned(),
             auth_token: None,
             timings: timings(),
+        }
+    }
+
+    fn workspace(id: &str, is_active: bool, is_current: bool) -> Workspace {
+        Workspace {
+            id: id.to_owned(),
+            name: format!("{id} workspace"),
+            is_active,
+            is_current,
+            created_at: 1,
+            updated_at: 2,
         }
     }
 
@@ -345,6 +723,71 @@ mod tests {
         };
         assert_eq!(actual.method, "custom.event");
         assert_eq!(actual.params, json!({"ok": true}));
+    }
+
+    #[test]
+    fn runtime_reduces_workspace_changed_notification_with_preference_context() {
+        let workspaces = vec![
+            workspace("ws_a", true, false),
+            workspace("ws_b", true, true),
+        ];
+        let notification = GatewayNotification::WorkspaceChanged(WorkspaceChangedNotification {
+            kind: WorkspaceChangeKind::Updated,
+            workspace: workspace("ws_a", false, false),
+        });
+
+        let reduced = reduce_gateway_notification(
+            notification,
+            ClientRuntimeNotificationContext {
+                preferred_workspace_id: Some("ws_a"),
+                workspaces: workspaces.as_slice(),
+                ..Default::default()
+            },
+        );
+
+        let Some(ClientRuntimeNotification::WorkspaceChanged {
+            notification,
+            preference,
+        }) = reduced
+        else {
+            panic!("expected workspace changed reduction");
+        };
+
+        assert_eq!(notification.workspace.id, "ws_a");
+        assert_eq!(
+            preference.set_preferred_workspace_id,
+            Some(Some("ws_b".to_owned()))
+        );
+        assert_eq!(
+            preference.persist_active_gateway_workspace_id.as_deref(),
+            Some("ws_b")
+        );
+        assert!(preference.queue_thread_list_refresh);
+    }
+
+    #[test]
+    fn runtime_reduces_skills_changed_notification_with_workspace_scope() {
+        let notification = GatewayNotification::SkillsChanged(SkillsChangedNotification {
+            workspace_id: "ws_a".to_owned(),
+            snapshot_version: 42,
+            reason: "updated".to_owned(),
+            changes: Vec::new(),
+            created_at: 123,
+        });
+
+        let reduced = reduce_gateway_notification(
+            notification,
+            ClientRuntimeNotificationContext {
+                active_workspace_id: Some("ws_a"),
+                ..Default::default()
+            },
+        );
+
+        let Some(ClientRuntimeNotification::SkillsRefresh(reduction)) = reduced else {
+            panic!("expected skills refresh reduction");
+        };
+        assert_eq!(reduction.workspace_id, "ws_a");
+        assert!(reduction.queue_skills_refresh);
     }
 
     #[test]

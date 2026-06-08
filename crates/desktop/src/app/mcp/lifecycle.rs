@@ -8,15 +8,10 @@ use pioneer_client::mcp::{
     notifications::{
         McpRefreshReduction, McpServerCatalogChangedReduction, McpServerStatusChangedReduction,
         apply_mcp_server_catalog_changed_to_catalog, apply_mcp_server_status_changed_to_catalog,
-        apply_mcp_server_status_changed_to_details, reduce_mcp_changed_notification,
-        reduce_mcp_server_catalog_changed_notification,
-        reduce_mcp_server_status_changed_notification,
+        apply_mcp_server_status_changed_to_details,
     },
 };
 use pioneer_client::workspaces::selectors as workspace_selectors;
-use pioneer_protocol::{
-    McpChangedNotification, McpServerCatalogChangedNotification, McpServerStatusChangedNotification,
-};
 use std::time::Duration;
 use tracing::warn;
 
@@ -220,20 +215,7 @@ impl PioneerDesktop {
         .detach();
     }
 
-    pub(in crate::app) fn apply_mcp_changed_notification(
-        &mut self,
-        notification: McpChangedNotification,
-    ) {
-        let current_workspace = self.mcp_workspace_scope();
-        let reduction = reduce_mcp_changed_notification(
-            notification,
-            current_workspace.as_deref(),
-            self.mcp_selected_server_id.as_deref(),
-        );
-        self.apply_mcp_refresh_reduction(reduction);
-    }
-
-    fn apply_mcp_refresh_reduction(&mut self, reduction: McpRefreshReduction) {
+    pub(in crate::app) fn apply_mcp_refresh_reduction(&mut self, reduction: McpRefreshReduction) {
         if reduction.queue_mcp_refresh {
             self.queue_mcp_refresh();
         }
@@ -242,21 +224,7 @@ impl PioneerDesktop {
         }
     }
 
-    pub(in crate::app) fn apply_mcp_server_status_changed_notification(
-        &mut self,
-        notification: McpServerStatusChangedNotification,
-    ) {
-        let current_workspace = self.mcp_workspace_scope();
-        let reduction = reduce_mcp_server_status_changed_notification(
-            notification,
-            current_workspace.as_deref(),
-            self.mcp_selected_server_id.as_deref(),
-            self.mcp_server_details.is_some(),
-        );
-        self.apply_mcp_server_status_changed_reduction(reduction);
-    }
-
-    fn apply_mcp_server_status_changed_reduction(
+    pub(in crate::app) fn apply_mcp_server_status_changed_reduction(
         &mut self,
         reduction: McpServerStatusChangedReduction,
     ) {
@@ -277,20 +245,7 @@ impl PioneerDesktop {
         }
     }
 
-    pub(in crate::app) fn apply_mcp_server_catalog_changed_notification(
-        &mut self,
-        notification: McpServerCatalogChangedNotification,
-    ) {
-        let current_workspace = self.mcp_workspace_scope();
-        let reduction = reduce_mcp_server_catalog_changed_notification(
-            notification,
-            current_workspace.as_deref(),
-            self.mcp_selected_server_id.as_deref(),
-        );
-        self.apply_mcp_server_catalog_changed_reduction(reduction);
-    }
-
-    fn apply_mcp_server_catalog_changed_reduction(
+    pub(in crate::app) fn apply_mcp_server_catalog_changed_reduction(
         &mut self,
         reduction: McpServerCatalogChangedReduction,
     ) {
