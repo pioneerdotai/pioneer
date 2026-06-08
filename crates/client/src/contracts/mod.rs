@@ -10,7 +10,10 @@ use crate::{
         types::GatewayEndpoint,
     },
     notifications::effects::ClientEffect,
-    state::snapshot::ClientSnapshot,
+    state::{
+        client_state::GatewayConnectionState, reducers::GatewayConnectionReduction,
+        snapshot::ClientSnapshot,
+    },
 };
 use pioneer_protocol::GatewayNotification;
 
@@ -20,9 +23,26 @@ pub mod export;
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
 pub enum ClientEvent {
     SnapshotChanged(ClientSnapshot),
+    GatewayConnectionChanged(ClientGatewayConnectionEvent),
     GatewayNotification(GatewayNotification),
     EffectsPlanned(Vec<ClientEffect>),
     Error(ClientErrorEvent),
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ClientGatewayConnectionEvent {
+    pub connection_state: GatewayConnectionState,
+    pub gateway_error: Option<String>,
+}
+
+impl From<GatewayConnectionReduction> for ClientGatewayConnectionEvent {
+    fn from(reduction: GatewayConnectionReduction) -> Self {
+        Self {
+            connection_state: reduction.connection_state,
+            gateway_error: reduction.gateway_error,
+        }
+    }
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]

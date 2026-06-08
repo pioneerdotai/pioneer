@@ -5,7 +5,7 @@
 //! only after desktop and mobile can share the same Rust API.
 
 use pioneer_client::{
-    contracts::{ClientGatewayConnectRequest, ClientGatewayConnectResult},
+    contracts::{ClientEvent, ClientGatewayConnectRequest, ClientGatewayConnectResult},
     gateway::{
         runtime::{self as client_gateway_runtime, GatewayProfileError},
         secrets::GatewayAuthTokenRef,
@@ -17,7 +17,6 @@ use pioneer_client::{
         },
     },
     runtime::ClientRuntime,
-    transport::ws::GatewayWsEvent,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -156,7 +155,7 @@ impl ClientFfiRuntime {
         Ok(ClientGatewayConnectResult { connection_id })
     }
 
-    fn gateway_next_events(&self) -> Result<Vec<GatewayWsEvent>, String> {
+    fn gateway_next_events(&self) -> Result<Vec<ClientEvent>, String> {
         loop {
             let active_connection_id = *self
                 .active_connection_id
@@ -179,6 +178,9 @@ impl ClientFfiRuntime {
             let events = self
                 .client_runtime
                 .drain_applicable_ws_events(active_connection_id, Some(first_event));
+            let events = self
+                .client_runtime
+                .reduce_ws_events_to_client_events(events, Default::default());
 
             if !events.is_empty() {
                 return Ok(events);
