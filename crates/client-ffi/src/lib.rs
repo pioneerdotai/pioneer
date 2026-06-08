@@ -4,15 +4,20 @@
 //! remains in `pioneer-client` and should be exposed here as explicit methods
 //! only after desktop and mobile can share the same Rust API.
 
-use pioneer_client::gateway::{
-    runtime::GatewayProfileError,
-    secrets::GatewayAuthTokenRef,
-    setup::{
-        AddAndActivateRemoteGatewayRegistryPlan, AddRemoteGatewayPlan, PlanAddRemoteGatewayRequest,
-        RemoteGatewayValidation, RemoteGatewayValidationRequest,
-        plan_add_and_activate_remote_gateway_registry_request, plan_add_remote_gateway_request,
-        validate_remote_gateway_request,
+use pioneer_client::{
+    contracts::{ClientGatewayConnectRequest, ClientGatewayConnectResult},
+    gateway::{
+        runtime::{self as client_gateway_runtime, GatewayProfileError},
+        secrets::GatewayAuthTokenRef,
+        setup::{
+            AddAndActivateRemoteGatewayRegistryPlan, AddRemoteGatewayPlan,
+            PlanAddRemoteGatewayRequest, RemoteGatewayValidation, RemoteGatewayValidationRequest,
+            plan_add_and_activate_remote_gateway_registry_request, plan_add_remote_gateway_request,
+            validate_remote_gateway_request,
+        },
     },
+    runtime::ClientRuntime,
+    transport::ws::GatewayWsEvent,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -32,6 +37,8 @@ pub struct PioneerClientFfi {
 #[derive(Default)]
 struct ClientFfiRuntime {
     config: Mutex<Option<ClientFfiConfig>>,
+    client_runtime: ClientRuntime,
+    active_connection_id: Mutex<Option<u64>>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -45,6 +52,11 @@ pub struct ClientFfiConfig {
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct ClientFfiInitializeResult {
     pub initialized: bool,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ClientFfiGatewayDisconnectResult {
+    pub disconnected: bool,
 }
 
 #[derive(Serialize)]
@@ -113,6 +125,78 @@ impl ClientFfiRuntime {
         )
         .map_err(|error| error.to_string())
     }
+
+    fn gateway_connect(&self, input_json: &str) -> Result<ClientGatewayConnectResult, String> {
+        let request = serde_json::from_str::<ClientGatewayConnectRequest>(input_json)
+            .map_err(|error| format!("invalid gateway connect request: {error}"))?;
+
+        let timings = request
+            .timings
+            .to_gateway_ws_timings()
+            .map_err(|error| error.to_string())?;
+
+        let plan = client_gateway_runtime::plan_gateway_connect_spec(
+            &request.endpoint,
+            request.auth_token,
+            timings,
+        );
+
+        let connection_id = self
+            .client_runtime
+            .ws_command_sender()
+            .connect_with_retry(plan.into())
+            .map_err(|error| format!("{error:#}"))?;
+
+        *self
+            .active_connection_id
+            .lock()
+            .map_err(|_| "client ffi connection lock is poisoned".to_owned())? =
+            Some(connection_id);
+
+        Ok(ClientGatewayConnectResult { connection_id })
+    }
+
+    fn gateway_next_events(&self) -> Result<Vec<GatewayWsEvent>, String> {
+        loop {
+            let active_connection_id = *self
+                .active_connection_id
+                .lock()
+                .map_err(|_| "client ffi connection lock is poisoned".to_owned())?;
+
+            if active_connection_id.is_none() {
+                return Ok(Vec::new());
+            }
+
+            let Some(first_event) = self.client_runtime.recv_ws_event() else {
+                return Ok(Vec::new());
+            };
+
+            let active_connection_id = *self
+                .active_connection_id
+                .lock()
+                .map_err(|_| "client ffi connection lock is poisoned".to_owned())?;
+
+            let events = self
+                .client_runtime
+                .drain_applicable_ws_events(active_connection_id, Some(first_event));
+
+            if !events.is_empty() {
+                return Ok(events);
+            }
+        }
+    }
+
+    fn gateway_disconnect(&self) -> Result<ClientFfiGatewayDisconnectResult, String> {
+        self.client_runtime
+            .ws_command_sender()
+            .disconnect()
+            .map_err(|error| format!("{error:#}"))?;
+        *self
+            .active_connection_id
+            .lock()
+            .map_err(|_| "client ffi connection lock is poisoned".to_owned())? = None;
+        Ok(ClientFfiGatewayDisconnectResult { disconnected: true })
+    }
 }
 
 fn ffi_client_json_response<T, F>(
@@ -128,6 +212,17 @@ where
         let client = unsafe { ffi_ref(ptr)? };
         let input_json = unsafe { read_c_string(input_json)? };
         operation(&client.runtime, input_json.as_str())
+    })
+}
+
+fn ffi_client_response<T, F>(ptr: *mut PioneerClientFfi, operation: F) -> *mut c_char
+where
+    T: Serialize,
+    F: FnOnce(&ClientFfiRuntime) -> Result<T, String>,
+{
+    into_ffi_response(|| {
+        let client = unsafe { ffi_ref(ptr)? };
+        operation(&client.runtime)
     })
 }
 
@@ -186,6 +281,21 @@ ffi_client_json_method!(
     pioneer_client_ffi_gateway_plan_add_and_activate_remote_registry,
     gateway_plan_add_and_activate_remote_registry
 );
+ffi_client_json_method!(pioneer_client_ffi_gateway_connect, gateway_connect);
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pioneer_client_ffi_gateway_next_events(
+    ptr: *mut PioneerClientFfi,
+) -> *mut c_char {
+    ffi_client_response(ptr, |runtime| runtime.gateway_next_events())
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pioneer_client_ffi_gateway_disconnect(
+    ptr: *mut PioneerClientFfi,
+) -> *mut c_char {
+    ffi_client_response(ptr, |runtime| runtime.gateway_disconnect())
+}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pioneer_client_ffi_string_destroy(value: *mut c_char) {

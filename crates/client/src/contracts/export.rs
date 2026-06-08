@@ -197,6 +197,27 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Provisional
         ),
         contract_type!(
+            "client_gateway_connect_request.json",
+            crate::contracts::ClientGatewayConnectRequest,
+            Domain::Connection,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "client_gateway_connect_result.json",
+            crate::contracts::ClientGatewayConnectResult,
+            Domain::Connection,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "client_gateway_ws_timings.json",
+            crate::contracts::ClientGatewayWsTimings,
+            Domain::Connection,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
             "client_snapshot.json",
             crate::state::snapshot::ClientSnapshot,
             Domain::Root,
@@ -366,6 +387,13 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Domain::Connection,
             Kind::Snapshot,
             Stability::Stable
+        ),
+        contract_type!(
+            "gateway_ws_event.json",
+            crate::transport::ws::GatewayWsEvent,
+            Domain::Connection,
+            Kind::Event,
+            Stability::Provisional
         ),
         contract_type!(
             "mcp_audit_action.json",

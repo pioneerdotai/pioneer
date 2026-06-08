@@ -1,6 +1,8 @@
 //! WebSocket transport client.
 
-use crate::gateway::{timings::GatewayWsTimings, types::GatewayEndpointKind};
+use crate::gateway::{
+    runtime::GatewayConnectSpecPlan, timings::GatewayWsTimings, types::GatewayEndpointKind,
+};
 use pioneer_protocol::GatewayNotification;
 
 pub mod backoff;
@@ -25,7 +27,21 @@ pub struct GatewayWsConnectSpec {
     pub timings: GatewayWsTimings,
 }
 
-#[derive(Clone, Debug)]
+impl From<GatewayConnectSpecPlan> for GatewayWsConnectSpec {
+    fn from(plan: GatewayConnectSpecPlan) -> Self {
+        Self {
+            endpoint_id: plan.endpoint_id,
+            endpoint_name: plan.endpoint_name,
+            endpoint_kind: plan.endpoint_kind,
+            address: plan.address,
+            auth_token: plan.auth_token,
+            timings: plan.timings,
+        }
+    }
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum GatewayWsEvent {
     Connecting {
         connection_id: u64,

@@ -104,6 +104,18 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
         ),
         schema_doc!("client_event.json", crate::contracts::ClientEvent),
         schema_doc!(
+            "client_gateway_connect_request.json",
+            crate::contracts::ClientGatewayConnectRequest
+        ),
+        schema_doc!(
+            "client_gateway_connect_result.json",
+            crate::contracts::ClientGatewayConnectResult
+        ),
+        schema_doc!(
+            "client_gateway_ws_timings.json",
+            crate::contracts::ClientGatewayWsTimings
+        ),
+        schema_doc!(
             "client_snapshot.json",
             crate::state::snapshot::ClientSnapshot
         ),
@@ -187,6 +199,18 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             crate::settings::gateway::GatewaySettingsState
         ),
         schema_doc!(
+            "gateway_settings_action_scope.json",
+            crate::settings::gateway::GatewaySettingsActionScope
+        ),
+        schema_doc!(
+            "gateway_settings_refresh_plan.json",
+            crate::settings::gateway::GatewaySettingsRefreshPlan
+        ),
+        schema_doc!(
+            "gateway_settings_refresh_unavailable.json",
+            crate::settings::gateway::GatewaySettingsRefreshUnavailable
+        ),
+        schema_doc!(
             "gateway_settings_update_plan.json",
             crate::settings::gateway::GatewaySettingsUpdatePlan
         ),
@@ -209,6 +233,10 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "gateway_status_text_update.json",
             crate::state::reducers::GatewayStatusTextUpdate
+        ),
+        schema_doc!(
+            "gateway_ws_event.json",
+            crate::transport::ws::GatewayWsEvent
         ),
         schema_doc!(
             "mcp_audit_action.json",
@@ -254,6 +282,10 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "mcp_detail_value.json",
             crate::mcp::presentation::McpDetailValue
+        ),
+        schema_doc!(
+            "mcp_install_field_error.json",
+            crate::mcp::actions::McpInstallFieldError
         ),
         schema_doc!(
             "mcp_install_field_issue.json",
@@ -339,6 +371,18 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "provider_filter.json",
             crate::providers::selectors::ProviderFilter
+        ),
+        schema_doc!(
+            "provider_list_refresh_plan.json",
+            crate::providers::list::ProviderListRefreshPlan
+        ),
+        schema_doc!(
+            "provider_list_refresh_request.json",
+            crate::providers::list::ProviderListRefreshRequest
+        ),
+        schema_doc!(
+            "provider_list_refresh_unavailable.json",
+            crate::providers::list::ProviderListRefreshUnavailable
         ),
         schema_doc!(
             "provider_set_api_key_action_request.json",

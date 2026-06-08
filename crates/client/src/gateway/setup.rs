@@ -9,9 +9,9 @@ use super::{
     },
     secrets::{gateway_auth_token_label, normalize_gateway_auth_token},
     timings::{GatewayTimingError, GatewayWsTimings},
-    types::{GatewayEndpoint, GatewayEndpointKind, GatewayRegistry},
+    types::{GatewayEndpoint, GatewayRegistry},
 };
-use crate::transport::ws::{GatewayWsConnectSpec, client::connect_websocket_once};
+use crate::transport::ws::client::connect_websocket_once;
 use pioneer_protocol::generate_id;
 use serde::{Deserialize, Serialize};
 use std::{error::Error, fmt, time::Duration};
@@ -252,14 +252,7 @@ pub fn validate_remote_gateway_connection_with_timings(
         auth_token.unwrap_or_default(),
         timings,
     );
-    let spec = GatewayWsConnectSpec {
-        endpoint_id: plan.endpoint_id,
-        endpoint_name: plan.endpoint_name,
-        endpoint_kind: GatewayEndpointKind::Remote,
-        address: plan.address,
-        auth_token: plan.auth_token,
-        timings: plan.timings,
-    };
+    let spec = plan.into();
 
     connect_websocket_once(&spec).map_err(|error| {
         RemoteGatewayValidationError::ConnectionFailed {

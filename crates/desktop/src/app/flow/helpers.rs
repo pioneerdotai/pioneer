@@ -10,7 +10,7 @@ pub(crate) fn build_ws_connect_spec(
         runtime.gateway_auth_token_for_endpoint(endpoint)?,
         ws_timings_for_endpoint(runtime, endpoint.kind),
     );
-    Ok(ws_connect_spec_from_plan(plan))
+    Ok(plan.into())
 }
 
 #[cfg(test)]
@@ -28,7 +28,7 @@ pub(crate) fn build_remote_candidate_ws_connect_spec(
         token,
         ws_timings_for_endpoint(runtime, GatewayEndpointKind::Remote),
     );
-    ws_connect_spec_from_plan(plan)
+    plan.into()
 }
 
 pub(crate) fn validate_remote_candidate_gateway_connection(
@@ -69,19 +69,6 @@ fn ws_timings_for_endpoint(
         endpoint_kind,
         Duration::from_millis(REMOTE_WS_CONNECT_TIMEOUT_MIN_MS),
     )
-}
-
-fn ws_connect_spec_from_plan(
-    plan: client_gateway_runtime::GatewayConnectSpecPlan,
-) -> GatewayWsConnectSpec {
-    GatewayWsConnectSpec {
-        endpoint_id: plan.endpoint_id,
-        endpoint_name: plan.endpoint_name,
-        endpoint_kind: plan.endpoint_kind,
-        address: plan.address,
-        auth_token: plan.auth_token,
-        timings: plan.timings,
-    }
 }
 
 pub(crate) fn gateway_has_ready_ws_connection(
