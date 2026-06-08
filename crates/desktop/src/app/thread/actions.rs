@@ -2,6 +2,7 @@ use super::super::{
     conversation::ConversationEvent,
     root::{ComposerCapability, PioneerDesktop},
 };
+use crate::gateway::DesktopGatewayWsCommandSenderExt;
 use gpui::{prelude::*, *};
 use pioneer_client::composer::attachments as composer_attachments;
 use pioneer_client::composer::capabilities as composer_capabilities;

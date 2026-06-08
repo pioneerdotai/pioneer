@@ -11,6 +11,7 @@ pub(crate) use control::GatewayInstallWarning;
 pub(crate) use timings::GatewayWsTimings;
 
 pub use runtime::{GatewayRuntime, ensure_runtime_home_dir};
+pub(crate) use ws::DesktopGatewayWsCommandSenderExt;
 pub use ws::{GatewayWsClient, GatewayWsCommandSender};
 
 #[cfg(test)]

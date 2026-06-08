@@ -99,6 +99,20 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Stable
         ),
         contract_type!(
+            "add_and_activate_remote_gateway_registry_plan.json",
+            crate::gateway::setup::AddAndActivateRemoteGatewayRegistryPlan,
+            Domain::Connection,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "add_remote_gateway_plan.json",
+            crate::gateway::setup::AddRemoteGatewayPlan,
+            Domain::Connection,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
             "artifact_action_status.json",
             crate::artifacts::actions::ArtifactActionStatus,
             Domain::Artifacts,
@@ -275,6 +289,13 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Domain::Connection,
             Kind::RegistryDto,
             Stability::Stable
+        ),
+        contract_type!(
+            "gateway_auth_token_write.json",
+            crate::gateway::setup::GatewayAuthTokenWrite,
+            Domain::Connection,
+            Kind::ActionPlan,
+            Stability::Provisional
         ),
         contract_type!(
             "gateway_settings_state.json",
@@ -515,6 +536,13 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Stable
         ),
         contract_type!(
+            "plan_add_remote_gateway_request.json",
+            crate::gateway::setup::PlanAddRemoteGatewayRequest,
+            Domain::Connection,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
             "prepared_composer_attachment.json",
             crate::composer::turn_prepare::PreparedComposerAttachment,
             Domain::Composer,
@@ -582,6 +610,20 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             crate::skills::catalog::ReconciledSkillsSnapshot,
             Domain::Skills,
             Kind::Snapshot,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "remote_gateway_validation.json",
+            crate::gateway::setup::RemoteGatewayValidation,
+            Domain::Connection,
+            Kind::ActionState,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "remote_gateway_validation_request.json",
+            crate::gateway::setup::RemoteGatewayValidationRequest,
+            Domain::Connection,
+            Kind::ActionPlan,
             Stability::Provisional
         ),
         contract_type!(

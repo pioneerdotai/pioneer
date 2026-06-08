@@ -1,12 +1,8 @@
-use crate::{
-    app::root::{GatewayConnectionState, PioneerDesktop, ThreadArtifactActionStatus},
-    gateway::GatewayWsCommandSender,
-};
+use crate::app::root::{GatewayConnectionState, PioneerDesktop, ThreadArtifactActionStatus};
 use anyhow::{Context as AnyhowContext, Result};
 use gpui::{prelude::*, *};
 use pioneer_client::artifacts::{
-    actions as client_artifact_actions,
-    download::{ArtifactDownloadRequest, ArtifactDownloadResult},
+    actions as client_artifact_actions, download::ArtifactDownloadRequest,
 };
 use pioneer_client::platform::{ArtifactFileOpener, ClientPath};
 use pioneer_client::{ClientError, ClientResult};
@@ -16,15 +12,6 @@ use std::{
     process::Command,
 };
 use tracing::warn;
-
-impl client_artifact_actions::ArtifactCachedDownloadClient for GatewayWsCommandSender {
-    fn download_artifact_to_cache(
-        &self,
-        request: ArtifactDownloadRequest,
-    ) -> Result<ArtifactDownloadResult> {
-        GatewayWsCommandSender::download_artifact_to_cache(self, request)
-    }
-}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SystemArtifactFileOpener;

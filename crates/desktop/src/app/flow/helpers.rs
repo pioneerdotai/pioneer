@@ -15,6 +15,7 @@ pub(crate) fn build_ws_connect_spec(
     Ok(ws_connect_spec_from_plan(plan))
 }
 
+#[cfg(test)]
 pub(crate) fn build_remote_candidate_ws_connect_spec(
     runtime: &GatewayRuntime,
     name: &str,
@@ -22,7 +23,7 @@ pub(crate) fn build_remote_candidate_ws_connect_spec(
     token: &str,
 ) -> GatewayWsConnectSpec {
     let plan = client_gateway_runtime::plan_remote_candidate_connect_spec(
-        format!("candidate-{}", generate_id(ID_LEN)),
+        format!("candidate-{}", pioneer_protocol::generate_id(ID_LEN)),
         name,
         t!("gateway.endpoint.remote_name", index = 1).to_string(),
         address,

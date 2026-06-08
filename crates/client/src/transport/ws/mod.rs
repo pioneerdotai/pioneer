@@ -10,7 +10,10 @@ pub mod decode;
 pub mod download;
 pub mod frames;
 pub mod rpc;
+pub mod runtime;
 pub mod worker;
+
+pub use runtime::{GatewayWsClient, GatewayWsCommandSender};
 
 #[derive(Clone, Debug)]
 pub struct GatewayWsConnectSpec {

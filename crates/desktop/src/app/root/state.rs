@@ -57,6 +57,9 @@ impl PioneerDesktop {
         });
         let gateway_ws_client = GatewayWsClient::new();
         let gateway_ws_command_sender = gateway_ws_client.command_sender();
+        if let Ok(runtime_home) = state::runtime_home_dir() {
+            let _ = gateway_ws_command_sender.set_artifact_cache_root(runtime_home);
+        }
 
         let mut view = Self {
             thread_coordinators: HashMap::new(),

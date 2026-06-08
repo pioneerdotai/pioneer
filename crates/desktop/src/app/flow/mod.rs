@@ -40,7 +40,6 @@ use gpui_component::{
 };
 use pioneer_client::gateway::types::{GatewayEndpoint, GatewayEndpointKind};
 use pioneer_client::transport::ws::{GatewayWsConnectSpec, GatewayWsEvent};
-use pioneer_protocol::generate_id;
 use pioneer_protocol::{
     GatewayNotification, ThreadHistoryResponse, TurnTimelineResponse, Workspace,
     WorkspaceChangedNotification,
@@ -53,6 +52,7 @@ use helpers::*;
 pub(crate) use workspace_bootstrap::*;
 
 const REMOTE_WS_CONNECT_TIMEOUT_MIN_MS: u64 = 5_000;
+#[cfg(test)]
 const ID_LEN: usize = pioneer_client::threads::start::THREAD_START_ID_LEN;
 
 struct GatewayOperationSuccess {

@@ -1,4 +1,6 @@
-use super::{GatewayWsClient, GatewayWsConnectSpec, GatewayWsEvent};
+use super::{
+    DesktopGatewayWsCommandSenderExt, GatewayWsClient, GatewayWsConnectSpec, GatewayWsEvent,
+};
 use crate::gateway::timings::GatewayWsTimings;
 use futures_util::{SinkExt, StreamExt};
 use pioneer_client::artifacts::download::ArtifactDownloadRequest;
