@@ -46,6 +46,9 @@ pub(crate) fn validate_remote_gateway_address(
         Err(RemoteGatewayValidationError::InvalidAddress(GatewayAddressError::Empty)) => {
             bail!("{}", t!("errors.gateway.address_empty"));
         }
+        Err(RemoteGatewayValidationError::InvalidTimeout { timeout_ms }) => {
+            bail!("remote gateway validation timeout must be positive, got {timeout_ms} ms");
+        }
         Err(RemoteGatewayValidationError::InvalidAddress(error)) => Err(error).with_context(|| {
             t!("errors.gateway.invalid_address", normalized = trimmed).to_string()
         }),

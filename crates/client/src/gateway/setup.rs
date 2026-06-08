@@ -11,9 +11,18 @@ use super::{
     types::{GatewayEndpoint, GatewayRegistry},
 };
 use pioneer_protocol::generate_id;
-use std::time::Duration;
+use serde::{Deserialize, Serialize};
+use std::{error::Error, fmt, time::Duration};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteGatewayValidationRequest {
+    pub address: String,
+    pub timeout_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
 pub enum RemoteGatewayValidation {
     Reachable { address: String },
     Unreachable { address: String },
@@ -33,11 +42,32 @@ impl RemoteGatewayValidation {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RemoteGatewayValidationError {
+    InvalidTimeout {
+        timeout_ms: u64,
+    },
     InvalidAddress(GatewayAddressError),
     ResolveFailed {
         address: String,
         source: GatewayAddressError,
     },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanAddRemoteGatewayRequest {
+    pub registry: GatewayRegistry,
+    pub name: String,
+    pub address: String,
+    pub auth_token: Option<String>,
+    pub new_endpoint_id: Option<String>,
+    pub default_remote_name: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AddRemoteGatewayPlan {
+    pub endpoint: GatewayEndpoint,
+    pub previous_endpoint: Option<GatewayEndpoint>,
+    pub token_write: Option<GatewayAuthTokenWrite>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,7 +79,8 @@ pub struct AddRemoteGatewayInput<'a> {
     pub default_remote_name: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct GatewayAuthTokenWrite {
     pub token_ref: String,
     pub token: String,
@@ -156,6 +187,21 @@ pub fn validate_remote_gateway_address(
     }
 }
 
+pub fn validate_remote_gateway_request(
+    request: &RemoteGatewayValidationRequest,
+) -> Result<RemoteGatewayValidation, RemoteGatewayValidationError> {
+    if request.timeout_ms == 0 {
+        return Err(RemoteGatewayValidationError::InvalidTimeout {
+            timeout_ms: request.timeout_ms,
+        });
+    }
+
+    validate_remote_gateway_address(
+        request.address.as_str(),
+        Duration::from_millis(request.timeout_ms),
+    )
+}
+
 pub fn plan_add_remote_gateway<F>(
     registry: &GatewayRegistry,
     input: AddRemoteGatewayInput<'_>,
@@ -196,6 +242,62 @@ where
         token_write,
     })
 }
+
+pub fn plan_add_remote_gateway_request<F>(
+    request: PlanAddRemoteGatewayRequest,
+    auth_token_ref_for_endpoint: F,
+) -> Result<AddRemoteGatewayPlan, GatewayProfileError>
+where
+    F: FnMut(&str) -> Result<String, GatewayProfileError>,
+{
+    let new_endpoint_id = request
+        .new_endpoint_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(generated_remote_gateway_endpoint_id);
+
+    let change = plan_add_remote_gateway(
+        &request.registry,
+        AddRemoteGatewayInput {
+            name: request.name.as_str(),
+            address: request.address.as_str(),
+            auth_token: request.auth_token.as_deref(),
+            new_endpoint_id,
+            default_remote_name: request.default_remote_name,
+        },
+        auth_token_ref_for_endpoint,
+    )?;
+
+    Ok(AddRemoteGatewayPlan {
+        endpoint: change.endpoint().clone(),
+        previous_endpoint: change.previous_endpoint().cloned(),
+        token_write: change.token_write().cloned(),
+    })
+}
+
+impl fmt::Display for RemoteGatewayValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidTimeout { timeout_ms } => {
+                write!(
+                    f,
+                    "remote gateway validation timeout must be positive, got {timeout_ms} ms"
+                )
+            }
+            Self::InvalidAddress(error) => write!(f, "{error}"),
+            Self::ResolveFailed { address, source } => {
+                write!(
+                    f,
+                    "failed to resolve remote gateway address `{address}`: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for RemoteGatewayValidationError {}
 
 #[cfg(test)]
 mod tests {
@@ -355,6 +457,48 @@ mod tests {
                 token: "new-token".to_owned(),
                 label: "Remote (127.0.0.1:23000)".to_owned(),
             })
+        );
+    }
+
+    #[test]
+    fn add_remote_gateway_request_plans_with_shared_dto() {
+        let plan = plan_add_remote_gateway_request(
+            PlanAddRemoteGatewayRequest {
+                registry: registry(),
+                name: " Remote ".to_owned(),
+                address: "127.0.0.1:23000".to_owned(),
+                auth_token: Some(" token ".to_owned()),
+                new_endpoint_id: Some("remote-one".to_owned()),
+                default_remote_name: "Remote 1".to_owned(),
+            },
+            token_ref,
+        )
+        .expect("plan from request");
+
+        assert_eq!(plan.endpoint.id, "remote-one");
+        assert_eq!(plan.endpoint.name, "Remote");
+        assert_eq!(plan.endpoint.auth_token_ref.as_deref(), Some("remote-one"));
+        assert_eq!(
+            plan.token_write,
+            Some(GatewayAuthTokenWrite {
+                token_ref: "remote-one".to_owned(),
+                token: "token".to_owned(),
+                label: "Remote (127.0.0.1:23000)".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn remote_gateway_validation_request_rejects_zero_timeout() {
+        let error = validate_remote_gateway_request(&RemoteGatewayValidationRequest {
+            address: "127.0.0.1:23000".to_owned(),
+            timeout_ms: 0,
+        })
+        .expect_err("zero timeout should fail");
+
+        assert_eq!(
+            error,
+            RemoteGatewayValidationError::InvalidTimeout { timeout_ms: 0 }
         );
     }
 

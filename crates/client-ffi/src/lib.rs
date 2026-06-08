@@ -4,6 +4,15 @@
 //! remains in `pioneer-client` and should be exposed here as explicit methods
 //! only after desktop and mobile can share the same Rust API.
 
+use pioneer_client::gateway::{
+    runtime::GatewayProfileError,
+    secrets::GatewayAuthTokenRef,
+    setup::{
+        AddRemoteGatewayPlan, PlanAddRemoteGatewayRequest, RemoteGatewayValidation,
+        RemoteGatewayValidationRequest, plan_add_remote_gateway_request,
+        validate_remote_gateway_request,
+    },
+};
 use serde::{Deserialize, Serialize};
 use std::{
     any::Any,
@@ -74,6 +83,21 @@ impl ClientFfiRuntime {
 
         Ok(ClientFfiInitializeResult { initialized: true })
     }
+
+    fn gateway_validate_remote(&self, input_json: &str) -> Result<RemoteGatewayValidation, String> {
+        let request = serde_json::from_str::<RemoteGatewayValidationRequest>(input_json)
+            .map_err(|error| format!("invalid gateway validation request: {error}"))?;
+
+        validate_remote_gateway_request(&request).map_err(|error| error.to_string())
+    }
+
+    fn gateway_plan_add_remote(&self, input_json: &str) -> Result<AddRemoteGatewayPlan, String> {
+        let request = serde_json::from_str::<PlanAddRemoteGatewayRequest>(input_json)
+            .map_err(|error| format!("invalid gateway add remote planning request: {error}"))?;
+
+        plan_add_remote_gateway_request(request, gateway_auth_token_ref_for_endpoint)
+            .map_err(|error| error.to_string())
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -117,6 +141,30 @@ pub unsafe extern "C" fn pioneer_client_ffi_client_initialize(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn pioneer_client_ffi_gateway_validate_remote(
+    ptr: *mut PioneerClientFfi,
+    input_json: *const c_char,
+) -> *mut c_char {
+    into_ffi_response(|| {
+        let client = unsafe { ffi_ref(ptr)? };
+        let input_json = unsafe { read_c_string(input_json)? };
+        client.runtime.gateway_validate_remote(input_json.as_str())
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pioneer_client_ffi_gateway_plan_add_remote(
+    ptr: *mut PioneerClientFfi,
+    input_json: *const c_char,
+) -> *mut c_char {
+    into_ffi_response(|| {
+        let client = unsafe { ffi_ref(ptr)? };
+        let input_json = unsafe { read_c_string(input_json)? };
+        client.runtime.gateway_plan_add_remote(input_json.as_str())
+    })
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pioneer_client_ffi_string_destroy(value: *mut c_char) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         if value.is_null() {
@@ -152,6 +200,15 @@ unsafe fn read_c_string(ptr: *const c_char) -> Result<String, String> {
         .to_str()
         .map(str::to_owned)
         .map_err(|error| format!("received non-utf8 string: {error}"))
+}
+
+fn gateway_auth_token_ref_for_endpoint(endpoint_id: &str) -> Result<String, GatewayProfileError> {
+    GatewayAuthTokenRef::for_endpoint_id(endpoint_id)
+        .map(GatewayAuthTokenRef::into_string)
+        .map_err(|error| GatewayProfileError::InvalidAuthTokenRef {
+            endpoint_id: endpoint_id.to_owned(),
+            reason: error.to_string(),
+        })
 }
 
 fn to_json_response<T: Serialize>(result: Result<T, String>) -> String {
@@ -260,6 +317,61 @@ mod tests {
         let value: serde_json::Value = decode_response(response.as_str());
 
         assert_eq!(value["value"], 1);
+    }
+
+    #[test]
+    fn gateway_validation_uses_shared_request_contract() {
+        let runtime = ClientFfiRuntime::default();
+        let error = runtime
+            .gateway_validate_remote(r#"{"address":"127.0.0.1:23000","timeout_ms":0}"#)
+            .expect_err("zero timeout should fail");
+
+        assert!(error.contains("timeout must be positive"));
+    }
+
+    #[test]
+    fn gateway_add_remote_planning_returns_shared_plan_without_persistence() {
+        let runtime = ClientFfiRuntime::default();
+        let result = runtime
+            .gateway_plan_add_remote(
+                serde_json::json!({
+                    "registry": {
+                        "version": 1,
+                        "active_gateway_id": null,
+                        "local": {
+                            "id": "local",
+                            "name": "Local",
+                            "address": "127.0.0.1:17878",
+                            "kind": "local",
+                            "auth_token_ref": null,
+                            "workspace_id": null,
+                            "service_name": null
+                        },
+                        "remotes": []
+                    },
+                    "name": " Remote ",
+                    "address": "127.0.0.1:23000",
+                    "auth_token": " token ",
+                    "new_endpoint_id": "remote-one",
+                    "default_remote_name": "Remote 1"
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("plan add remote");
+
+        assert_eq!(result.endpoint.id, "remote-one");
+        assert_eq!(
+            result.endpoint.auth_token_ref.as_deref(),
+            Some("remote-one")
+        );
+        assert_eq!(
+            result
+                .token_write
+                .as_ref()
+                .map(|write| write.token.as_str()),
+            Some("token")
+        );
     }
 
     #[test]
