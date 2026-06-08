@@ -2,7 +2,7 @@ mod compat;
 mod discovery;
 mod recovery;
 
-use crate::gateway::connectivity::normalize_address;
+use crate::gateway::connectivity::{normalize_address, validate_remote_gateway_address};
 use crate::gateway::control::{GatewayInstallWarning, request_local_superuser_token};
 use crate::gateway::registry::{
     gateway_auth_token_ref, load_registry, save_registry, setup_required,
@@ -11,7 +11,7 @@ use crate::gateway::secrets::DesktopSecrets;
 use crate::gateway::timings::{
     GatewayTimings, GatewayWsTimings, gateway_timings_from_config, gateway_ws_timings_from_config,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use pioneer_client::gateway::runtime as client_gateway_runtime;
 use pioneer_client::gateway::secrets::{gateway_auth_token_label, normalize_gateway_auth_token};
 use pioneer_client::gateway::setup as client_gateway_setup;
@@ -190,20 +190,7 @@ impl GatewayRuntime {
         address: &str,
         auth_token: Option<&str>,
     ) -> Result<GatewayEndpoint> {
-        let address = normalize_address(address)?;
-
-        if !crate::gateway::connectivity::is_gateway_reachable(
-            &address,
-            self.timings.connect_timeout,
-        )? {
-            bail!(
-                "{}",
-                t!(
-                    "errors.gateway.unreachable_verify",
-                    address = address.as_str()
-                )
-            );
-        }
+        let address = validate_remote_gateway_address(address, self.timings.connect_timeout)?;
 
         let change = client_gateway_setup::plan_add_remote_gateway(
             &self.registry,
@@ -243,12 +230,17 @@ impl GatewayRuntime {
             wrote_token_ref = Some(token_write.token_ref.clone());
         }
 
-        change.apply(&mut self.registry);
+        let commit = change
+            .apply_to_registry(
+                &mut self.registry,
+                client_gateway_setup::AddRemoteGatewayApplyMode::ProfileOnly,
+            )
+            .map_err(map_gateway_profile_error)?;
         if let Err(error) = save_registry(&self.registry_path, &self.registry) {
-            change.rollback(&mut self.registry);
+            change.rollback_commit(&mut self.registry, &commit);
             if let Some(token_ref) = wrote_token_ref.as_deref() {
                 if let Some(previous_token) = previous_token.as_deref() {
-                    if let Some(previous_endpoint) = change.previous_endpoint()
+                    if let Some(previous_endpoint) = commit.previous_endpoint.as_ref()
                         && let Some(previous_token_ref) =
                             previous_endpoint.auth_token_ref.as_deref()
                     {
@@ -267,7 +259,7 @@ impl GatewayRuntime {
             }
             return Err(error);
         }
-        Ok(change.endpoint().clone())
+        Ok(commit.endpoint)
     }
 
     pub fn update_remote_gateway(
