@@ -1,7 +1,9 @@
 use pioneer_client::{
     conversation::{Conversation, ConversationEvent, TimelineEntryStatus},
     gateway::{
-        registry::{GatewayRegistryConfig, default_registry, normalize_registry},
+        registry::{
+            GatewayLocalRegistryConfig, GatewayRegistryConfig, default_registry, normalize_registry,
+        },
         timings::GatewayWsTimings,
         types::{GatewayEndpoint, GatewayEndpointKind},
     },
@@ -281,11 +283,13 @@ fn reconnect_resume_chaos_filters_stale_ws_events_and_bounds_resume_retries() {
 fn remote_gateway_attachment_smoke_builds_authenticated_ws_request() {
     let config = GatewayRegistryConfig {
         version: 1,
-        local_gateway_id: "local".to_owned(),
-        local_name: "Local Gateway".to_owned(),
-        local_address: "127.0.0.1:17878".to_owned(),
-        local_auth_token_ref: None,
-        local_service_name: Some("com.pioneer.gateway".to_owned()),
+        local: Some(GatewayLocalRegistryConfig {
+            gateway_id: "local".to_owned(),
+            name: "Local Gateway".to_owned(),
+            address: "127.0.0.1:17878".to_owned(),
+            auth_token_ref: None,
+            service_name: Some("com.pioneer.gateway".to_owned()),
+        }),
     };
     let mut registry = default_registry(&config);
     registry.remotes.push(GatewayEndpoint {

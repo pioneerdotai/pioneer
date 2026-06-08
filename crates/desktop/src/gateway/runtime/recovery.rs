@@ -104,7 +104,7 @@ impl GatewayRuntime {
                 save_registry(&self.registry_path, &self.registry)?;
             }
             return Ok(LocalGatewayStartOutcome {
-                endpoint: self.registry.local.clone(),
+                endpoint: self.local_gateway()?.clone(),
                 warnings,
             });
         }
@@ -131,7 +131,7 @@ impl GatewayRuntime {
         }
 
         Ok(LocalGatewayStartOutcome {
-            endpoint: self.registry.local.clone(),
+            endpoint: self.local_gateway()?.clone(),
             warnings,
         })
     }

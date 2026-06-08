@@ -314,7 +314,7 @@ mod tests {
         GatewayRegistry {
             version: 1,
             active_gateway_id: None,
-            local: GatewayEndpoint {
+            local: Some(GatewayEndpoint {
                 id: "local".to_owned(),
                 name: "Local".to_owned(),
                 address: "127.0.0.1:17878".to_owned(),
@@ -322,7 +322,7 @@ mod tests {
                 auth_token_ref: None,
                 workspace_id: None,
                 service_name: None,
-            },
+            }),
             remotes: Vec::new(),
         }
     }

@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, bail};
 use pioneer_client::gateway::registry::{
-    GatewayRegistryConfig, GatewayRegistryError, default_registry as default_client_registry,
-    normalize_registry as normalize_client_registry, setup_required as client_setup_required,
+    GatewayLocalRegistryConfig, GatewayRegistryConfig, GatewayRegistryError,
+    default_registry as default_client_registry, normalize_registry as normalize_client_registry,
+    setup_required as client_setup_required,
 };
 use pioneer_client::gateway::secrets::{
     EndpointIdGatewayAuthTokenRefNamer, GatewayAuthTokenRefNamer,
@@ -89,11 +90,13 @@ fn registry_config(config: &AppConfig) -> Result<GatewayRegistryConfig> {
 
     Ok(GatewayRegistryConfig {
         version: current_registry_version(config),
-        local_gateway_id: local_gateway_id.to_owned(),
-        local_name: t!("gateway.endpoint.local_name").to_string(),
-        local_address: config.gateway.listen_addr.trim().to_owned(),
-        local_auth_token_ref: Some(gateway_auth_token_ref(local_gateway_id)?),
-        local_service_name: Some(config.gateway.service_name.trim().to_owned()),
+        local: Some(GatewayLocalRegistryConfig {
+            gateway_id: local_gateway_id.to_owned(),
+            name: t!("gateway.endpoint.local_name").to_string(),
+            address: config.gateway.listen_addr.trim().to_owned(),
+            auth_token_ref: Some(gateway_auth_token_ref(local_gateway_id)?),
+            service_name: Some(config.gateway.service_name.trim().to_owned()),
+        }),
     })
 }
 

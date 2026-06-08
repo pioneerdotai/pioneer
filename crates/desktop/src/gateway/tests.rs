@@ -33,9 +33,10 @@ fn load_registry_creates_file_and_persists_default_state() {
 
     assert!(registry_path.exists());
     assert_eq!(registry.version, config.desktop.gateway.registry_version);
-    assert_eq!(registry.local.id, config.desktop.gateway.local_gateway_id);
+    let local = registry.local.as_ref().expect("desktop local gateway");
+    assert_eq!(local.id, config.desktop.gateway.local_gateway_id);
     assert_eq!(
-        registry.local.auth_token_ref.as_deref(),
+        local.auth_token_ref.as_deref(),
         Some(config.desktop.gateway.local_gateway_id.as_str())
     );
     assert!(registry.active_gateway_id.is_none());

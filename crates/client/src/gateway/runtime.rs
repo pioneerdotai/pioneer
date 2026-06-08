@@ -125,8 +125,8 @@ pub fn active_gateway_id(registry: &GatewayRegistry) -> Option<&str> {
 }
 
 pub fn endpoint_by_id<'a>(registry: &'a GatewayRegistry, id: &str) -> Option<&'a GatewayEndpoint> {
-    if registry.local.id == id {
-        return Some(&registry.local);
+    if let Some(local) = registry.local.as_ref().filter(|local| local.id == id) {
+        return Some(local);
     }
 
     registry.remotes.iter().find(|endpoint| endpoint.id == id)
@@ -136,8 +136,8 @@ pub fn endpoint_by_id_mut<'a>(
     registry: &'a mut GatewayRegistry,
     id: &str,
 ) -> Option<&'a mut GatewayEndpoint> {
-    if registry.local.id == id {
-        return Some(&mut registry.local);
+    if registry.local.as_ref().is_some_and(|local| local.id == id) {
+        return registry.local.as_mut();
     }
 
     registry
@@ -160,8 +160,13 @@ pub fn local_gateway_is_selectable(
     local_gateway_id: &str,
     local_gateway_has_auth_token: bool,
 ) -> bool {
-    registry.active_gateway_id.as_deref() == Some(local_gateway_id.trim())
-        || local_gateway_has_auth_token
+    let local_gateway_id = local_gateway_id.trim();
+    registry
+        .local
+        .as_ref()
+        .is_some_and(|local| local.id == local_gateway_id)
+        && (registry.active_gateway_id.as_deref() == Some(local_gateway_id)
+            || local_gateway_has_auth_token)
 }
 
 pub fn selectable_gateway_endpoints(
@@ -171,7 +176,9 @@ pub fn selectable_gateway_endpoints(
 ) -> Vec<GatewayEndpoint> {
     let mut endpoints = Vec::with_capacity(registry.remotes.len() + 1);
     if local_gateway_is_selectable(registry, local_gateway_id, local_gateway_has_auth_token) {
-        endpoints.push(registry.local.clone());
+        if let Some(local) = registry.local.as_ref() {
+            endpoints.push(local.clone());
+        }
     }
     endpoints.extend(registry.remotes.clone());
     endpoints
@@ -184,7 +191,7 @@ pub fn remote_delete_fallback_endpoint(
     local_gateway_has_auth_token: bool,
 ) -> Option<GatewayEndpoint> {
     if local_gateway_is_selectable(registry, local_gateway_id, local_gateway_has_auth_token) {
-        return Some(registry.local.clone());
+        return registry.local.clone();
     }
 
     registry
@@ -441,7 +448,7 @@ pub fn plan_delete_remote_gateway_profile(
     id: &str,
     fallback_endpoint: Option<GatewayEndpoint>,
 ) -> Result<DeleteRemoteGatewayProfilePlan, GatewayProfileError> {
-    if registry.local.id == id {
+    if registry.local.as_ref().is_some_and(|local| local.id == id) {
         return Err(GatewayProfileError::LocalGatewayDeleteUnsupported);
     }
 
@@ -564,7 +571,7 @@ mod tests {
         GatewayRegistry {
             version: 1,
             active_gateway_id: None,
-            local: GatewayEndpoint {
+            local: Some(GatewayEndpoint {
                 id: "local".to_owned(),
                 name: "Local".to_owned(),
                 address: "127.0.0.1:17878".to_owned(),
@@ -572,7 +579,24 @@ mod tests {
                 auth_token_ref: None,
                 workspace_id: Some("ws-local".to_owned()),
                 service_name: Some("com.pioneer.gateway".to_owned()),
-            },
+            }),
+            remotes: vec![GatewayEndpoint {
+                id: "remote".to_owned(),
+                name: "Remote".to_owned(),
+                address: "127.0.0.1:22000".to_owned(),
+                kind: GatewayEndpointKind::Remote,
+                auth_token_ref: None,
+                workspace_id: Some("ws-remote".to_owned()),
+                service_name: None,
+            }],
+        }
+    }
+
+    fn remote_only_registry() -> GatewayRegistry {
+        GatewayRegistry {
+            version: 1,
+            active_gateway_id: None,
+            local: None,
             remotes: vec![GatewayEndpoint {
                 id: "remote".to_owned(),
                 name: "Remote".to_owned(),
@@ -636,6 +660,24 @@ mod tests {
     }
 
     #[test]
+    fn gateway_profile_helpers_support_remote_only_registry() {
+        let mut registry = remote_only_registry();
+
+        assert!(endpoint_by_id(&registry, "local").is_none());
+        assert_eq!(
+            endpoint_by_id(&registry, "remote").map(|endpoint| endpoint.id.as_str()),
+            Some("remote")
+        );
+
+        activate_gateway(&mut registry, "remote").expect("activate remote");
+        set_gateway_workspace_id(&mut registry, "remote", Some("ws-updated".to_owned()))
+            .expect("set remote workspace");
+
+        assert_eq!(active_gateway_id(&registry), Some("remote"));
+        assert_eq!(active_workspace_id(&registry), Some("ws-updated"));
+    }
+
+    #[test]
     fn gateway_profile_workspace_preference_is_scoped_to_endpoint() {
         let mut registry = registry();
 
@@ -660,6 +702,17 @@ mod tests {
         registry.active_gateway_id = Some("remote".to_owned());
 
         let endpoints = selectable_gateway_endpoints(&registry, "local", false);
+
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].id, "remote");
+        assert_eq!(endpoints[0].kind, GatewayEndpointKind::Remote);
+    }
+
+    #[test]
+    fn gateway_selectable_endpoints_do_not_synthesize_missing_local_gateway() {
+        let registry = remote_only_registry();
+
+        let endpoints = selectable_gateway_endpoints(&registry, "local", true);
 
         assert_eq!(endpoints.len(), 1);
         assert_eq!(endpoints[0].id, "remote");

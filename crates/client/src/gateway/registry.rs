@@ -10,11 +10,16 @@ use std::{collections::HashSet, error::Error, fmt};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GatewayRegistryConfig {
     pub version: u32,
-    pub local_gateway_id: String,
-    pub local_name: String,
-    pub local_address: String,
-    pub local_auth_token_ref: Option<String>,
-    pub local_service_name: Option<String>,
+    pub local: Option<GatewayLocalRegistryConfig>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GatewayLocalRegistryConfig {
+    pub gateway_id: String,
+    pub name: String,
+    pub address: String,
+    pub auth_token_ref: Option<String>,
+    pub service_name: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,7 +40,10 @@ pub fn default_registry(config: &GatewayRegistryConfig) -> GatewayRegistry {
     GatewayRegistry {
         version: config.version,
         active_gateway_id: None,
-        local: local_endpoint_from_config(config, None),
+        local: config
+            .local
+            .as_ref()
+            .map(|local| local_endpoint_from_config(local, None)),
         remotes: Vec::new(),
     }
 }
@@ -54,16 +62,25 @@ where
     F: FnMut(&str) -> Result<String, GatewayRegistryError>,
     G: FnMut(usize) -> String,
 {
-    let local_gateway_id = config.local_gateway_id.trim();
+    let local_gateway_id = config
+        .local
+        .as_ref()
+        .map(|local| local.gateway_id.trim())
+        .filter(|value| !value.is_empty());
     let local_workspace_id = registry
         .local
-        .workspace_id
         .take()
+        .and_then(|mut endpoint| endpoint.workspace_id.take())
         .and_then(normalize_workspace_id);
     registry.version = config.version;
-    registry.local = local_endpoint_from_config(config, local_workspace_id);
+    registry.local = config
+        .local
+        .as_ref()
+        .map(|local| local_endpoint_from_config(local, local_workspace_id));
 
-    let mut seen_ids = HashSet::from([local_gateway_id.to_owned()]);
+    let mut seen_ids = local_gateway_id
+        .map(|id| HashSet::from([id.to_owned()]))
+        .unwrap_or_default();
     let mut seen_addresses = HashSet::new();
     let mut remotes = Vec::new();
 
@@ -90,7 +107,7 @@ where
         }
 
         endpoint.id = endpoint.id.trim().to_owned();
-        if endpoint.id.is_empty() || endpoint.id == local_gateway_id {
+        if endpoint.id.is_empty() || local_gateway_id == Some(endpoint.id.as_str()) {
             endpoint.id = generated_remote_id();
         }
 
@@ -113,14 +130,18 @@ where
 
     registry.remotes = remotes;
 
-    if let Some(active) = registry.active_gateway_id.as_deref()
-        && !registry.local.id.eq(active)
-        && !registry
+    if let Some(active) = registry.active_gateway_id.as_deref() {
+        let active_is_local = registry
+            .local
+            .as_ref()
+            .is_some_and(|endpoint| endpoint.id == active);
+        let active_is_remote = registry
             .remotes
             .iter()
-            .any(|endpoint| endpoint.id == active)
-    {
-        registry.active_gateway_id = None;
+            .any(|endpoint| endpoint.id == active);
+        if !active_is_local && !active_is_remote {
+            registry.active_gateway_id = None;
+        }
     }
 
     Ok(())
@@ -145,18 +166,18 @@ pub fn normalize_workspace_id(value: String) -> Option<String> {
 }
 
 fn local_endpoint_from_config(
-    config: &GatewayRegistryConfig,
+    config: &GatewayLocalRegistryConfig,
     workspace_id: Option<String>,
 ) -> GatewayEndpoint {
     GatewayEndpoint {
-        id: config.local_gateway_id.trim().to_owned(),
-        name: config.local_name.trim().to_owned(),
-        address: config.local_address.trim().to_owned(),
+        id: config.gateway_id.trim().to_owned(),
+        name: config.name.trim().to_owned(),
+        address: config.address.trim().to_owned(),
         kind: GatewayEndpointKind::Local,
-        auth_token_ref: config.local_auth_token_ref.clone(),
+        auth_token_ref: config.auth_token_ref.clone(),
         workspace_id,
         service_name: config
-            .local_service_name
+            .service_name
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -206,11 +227,13 @@ mod tests {
     fn test_config() -> GatewayRegistryConfig {
         GatewayRegistryConfig {
             version: 1,
-            local_gateway_id: "local".to_owned(),
-            local_name: "Local Gateway".to_owned(),
-            local_address: "0.0.0.0:17878".to_owned(),
-            local_auth_token_ref: Some("local".to_owned()),
-            local_service_name: Some("com.pioneer.gateway".to_owned()),
+            local: Some(GatewayLocalRegistryConfig {
+                gateway_id: "local".to_owned(),
+                name: "Local Gateway".to_owned(),
+                address: "0.0.0.0:17878".to_owned(),
+                auth_token_ref: Some("local".to_owned()),
+                service_name: Some("com.pioneer.gateway".to_owned()),
+            }),
         }
     }
 
@@ -231,7 +254,7 @@ mod tests {
         let mut registry = GatewayRegistry {
             version: 99,
             active_gateway_id: Some("unknown-id".to_owned()),
-            local: GatewayEndpoint {
+            local: Some(GatewayEndpoint {
                 id: "bad-local".to_owned(),
                 name: "Old Local".to_owned(),
                 address: "127.0.0.1:9999".to_owned(),
@@ -239,7 +262,7 @@ mod tests {
                 auth_token_ref: None,
                 workspace_id: None,
                 service_name: None,
-            },
+            }),
             remotes: vec![
                 GatewayEndpoint {
                     id: "".to_owned(),
@@ -277,9 +300,10 @@ mod tests {
         .expect("normalize registry");
 
         assert_eq!(registry.version, 1);
-        assert_eq!(registry.local.id, "local");
-        assert_eq!(registry.local.kind, GatewayEndpointKind::Local);
-        assert_eq!(registry.local.auth_token_ref.as_deref(), Some("local"));
+        let local = registry.local.as_ref().expect("local gateway");
+        assert_eq!(local.id, "local");
+        assert_eq!(local.kind, GatewayEndpointKind::Local);
+        assert_eq!(local.auth_token_ref.as_deref(), Some("local"));
         assert_eq!(registry.remotes.len(), 2);
         assert_eq!(
             registry.remotes[0].workspace_id.as_deref(),
@@ -294,11 +318,56 @@ mod tests {
     }
 
     #[test]
+    fn gateway_registry_normalization_allows_remote_only_clients() {
+        let config = GatewayRegistryConfig {
+            version: 1,
+            local: None,
+        };
+        let mut registry = GatewayRegistry {
+            version: 99,
+            active_gateway_id: Some("remote-a".to_owned()),
+            local: Some(GatewayEndpoint {
+                id: "stale-local".to_owned(),
+                name: "Stale Local".to_owned(),
+                address: "127.0.0.1:17878".to_owned(),
+                kind: GatewayEndpointKind::Local,
+                auth_token_ref: None,
+                workspace_id: Some("stale-workspace".to_owned()),
+                service_name: Some("com.pioneer.gateway".to_owned()),
+            }),
+            remotes: vec![GatewayEndpoint {
+                id: "remote-a".to_owned(),
+                name: "Remote A".to_owned(),
+                address: "127.0.0.1:22000".to_owned(),
+                kind: GatewayEndpointKind::Local,
+                auth_token_ref: None,
+                workspace_id: None,
+                service_name: Some("should-be-cleared".to_owned()),
+            }],
+        };
+
+        normalize_registry(&mut registry, &config, token_ref, |index| {
+            format!("Remote Gateway {index}")
+        })
+        .expect("normalize remote-only registry");
+
+        assert_eq!(registry.version, 1);
+        assert!(registry.local.is_none());
+        assert_eq!(registry.active_gateway_id.as_deref(), Some("remote-a"));
+        assert_eq!(registry.remotes.len(), 1);
+        assert_eq!(registry.remotes[0].kind, GatewayEndpointKind::Remote);
+        assert_eq!(registry.remotes[0].service_name, None);
+    }
+
+    #[test]
     fn gateway_registry_duplicate_address_lookup_can_exclude_current_endpoint() {
         let registry = GatewayRegistry {
             version: 1,
             active_gateway_id: None,
-            local: local_endpoint_from_config(&test_config(), None),
+            local: test_config()
+                .local
+                .as_ref()
+                .map(|local| local_endpoint_from_config(local, None)),
             remotes: vec![
                 GatewayEndpoint {
                     id: "remote-a".to_owned(),

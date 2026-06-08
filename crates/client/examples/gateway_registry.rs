@@ -1,16 +1,21 @@
 use pioneer_client::gateway::{
-    registry::{GatewayRegistryConfig, default_registry, normalize_registry, setup_required},
+    registry::{
+        GatewayLocalRegistryConfig, GatewayRegistryConfig, default_registry, normalize_registry,
+        setup_required,
+    },
     types::{GatewayEndpoint, GatewayEndpointKind},
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = GatewayRegistryConfig {
         version: 1,
-        local_gateway_id: "local".to_owned(),
-        local_name: "Local Gateway".to_owned(),
-        local_address: "127.0.0.1:17878".to_owned(),
-        local_auth_token_ref: Some("local-token".to_owned()),
-        local_service_name: Some("com.pioneer.gateway".to_owned()),
+        local: Some(GatewayLocalRegistryConfig {
+            gateway_id: "local".to_owned(),
+            name: "Local Gateway".to_owned(),
+            address: "127.0.0.1:17878".to_owned(),
+            auth_token_ref: Some("local-token".to_owned()),
+            service_name: Some("com.pioneer.gateway".to_owned()),
+        }),
     };
 
     let mut registry = default_registry(&config);
@@ -35,7 +40,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     assert_eq!(registry.active_gateway_id, None);
-    assert_eq!(registry.local.kind, GatewayEndpointKind::Local);
+    assert_eq!(
+        registry.local.as_ref().map(|endpoint| endpoint.kind),
+        Some(GatewayEndpointKind::Local)
+    );
     assert_eq!(registry.remotes.len(), 1);
     assert_eq!(registry.remotes[0].kind, GatewayEndpointKind::Remote);
     assert_eq!(registry.remotes[0].name, "Remote Gateway 1");

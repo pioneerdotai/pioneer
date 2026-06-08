@@ -92,7 +92,7 @@ impl GatewayRuntime {
 
     pub fn local_gateway_provisioned(&self) -> Result<bool> {
         if self
-            .gateway_auth_token_for_endpoint(&self.registry.local)?
+            .gateway_auth_token_for_endpoint(self.local_gateway()?)?
             .is_some()
         {
             return Ok(true);
@@ -394,7 +394,7 @@ impl GatewayRuntime {
     fn sync_local_auth_token_from_gateway_request(&mut self, force_refresh: bool) -> Result<bool> {
         if !force_refresh
             && self
-                .gateway_auth_token_for_endpoint(&self.registry.local)?
+                .gateway_auth_token_for_endpoint(self.local_gateway()?)?
                 .is_some()
         {
             return Ok(false);
@@ -405,8 +405,14 @@ impl GatewayRuntime {
     }
 
     fn store_local_auth_token(&mut self, token: String) -> Result<bool> {
-        let token_ref = gateway_auth_token_ref(self.registry.local.id.as_str())?;
-        if self.registry.local.auth_token_ref.as_deref() == Some(token_ref.as_str())
+        let local = self.local_gateway()?;
+        let local_id = local.id.clone();
+        let local_name = local.name.clone();
+        let local_address = local.address.clone();
+        let local_auth_token_ref = local.auth_token_ref.clone();
+
+        let token_ref = gateway_auth_token_ref(local_id.as_str())?;
+        if local_auth_token_ref.as_deref() == Some(token_ref.as_str())
             && self
                 .secrets
                 .get_gateway_auth_token(token_ref.as_str())?
@@ -420,11 +426,11 @@ impl GatewayRuntime {
             token_ref.as_str(),
             token.as_str(),
             Some(gateway_auth_token_label(
-                self.registry.local.name.as_str(),
-                self.registry.local.address.as_str(),
+                local_name.as_str(),
+                local_address.as_str(),
             )),
         )?;
-        self.registry.local.auth_token_ref = Some(token_ref);
+        self.local_gateway_mut()?.auth_token_ref = Some(token_ref);
         Ok(true)
     }
 
@@ -432,12 +438,29 @@ impl GatewayRuntime {
         client_gateway_runtime::endpoint_by_id(&self.registry, id)
     }
 
+    pub(crate) fn local_gateway(&self) -> Result<&GatewayEndpoint> {
+        self.registry
+            .local
+            .as_ref()
+            .context("desktop gateway registry is missing local gateway")
+    }
+
+    fn local_gateway_mut(&mut self) -> Result<&mut GatewayEndpoint> {
+        self.registry
+            .local
+            .as_mut()
+            .context("desktop gateway registry is missing local gateway")
+    }
+
     fn local_gateway_id(&self) -> &str {
         self.config.desktop.gateway.local_gateway_id.trim()
     }
 
     fn local_gateway_has_auth_token(&self) -> bool {
-        match self.gateway_auth_token_for_endpoint(&self.registry.local) {
+        match self
+            .local_gateway()
+            .and_then(|local| self.gateway_auth_token_for_endpoint(local))
+        {
             Ok(Some(_)) => true,
             Ok(None) => false,
             Err(error) => {
@@ -676,13 +699,11 @@ mod tests {
                 .store_local_auth_token("local-token".to_owned())
                 .expect("store local token")
         );
-        assert_eq!(
-            runtime.registry.local.auth_token_ref.as_deref(),
-            Some("local")
-        );
+        let local = runtime.local_gateway().expect("local gateway");
+        assert_eq!(local.auth_token_ref.as_deref(), Some("local"));
         assert_eq!(
             runtime
-                .gateway_auth_token_for_endpoint(&runtime.registry.local)
+                .gateway_auth_token_for_endpoint(local)
                 .expect("resolve local token")
                 .as_deref(),
             Some("local-token")

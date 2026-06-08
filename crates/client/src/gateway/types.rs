@@ -31,7 +31,8 @@ pub struct GatewayEndpoint {
 pub struct GatewayRegistry {
     pub version: u32,
     pub active_gateway_id: Option<String>,
-    pub local: GatewayEndpoint,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local: Option<GatewayEndpoint>,
     #[serde(default)]
     pub remotes: Vec<GatewayEndpoint>,
 }
