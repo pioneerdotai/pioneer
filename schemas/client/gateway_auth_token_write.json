@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GatewayAuthTokenWrite",
+  "type": "object",
+  "properties": {
+    "label": {
+      "type": "string"
+    },
+    "token": {
+      "type": "string"
+    },
+    "token_ref": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "token_ref",
+    "token",
+    "label"
+  ]
+}

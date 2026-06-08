@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RemoteGatewayValidation",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "address": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string",
+          "const": "reachable"
+        }
+      },
+      "required": [
+        "state",
+        "address"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "address": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string",
+          "const": "unreachable"
+        }
+      },
+      "required": [
+        "state",
+        "address"
+      ]
+    }
+  ]
+}

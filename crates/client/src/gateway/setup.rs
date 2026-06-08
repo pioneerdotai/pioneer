@@ -14,6 +14,7 @@ use pioneer_protocol::generate_id;
 use serde::{Deserialize, Serialize};
 use std::{error::Error, fmt, time::Duration};
 
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RemoteGatewayValidationRequest {
@@ -21,6 +22,7 @@ pub struct RemoteGatewayValidationRequest {
     pub timeout_ms: u64,
 }
 
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum RemoteGatewayValidation {
@@ -52,6 +54,7 @@ pub enum RemoteGatewayValidationError {
     },
 }
 
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanAddRemoteGatewayRequest {
@@ -63,6 +66,7 @@ pub struct PlanAddRemoteGatewayRequest {
     pub default_remote_name: String,
 }
 
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Serialize)]
 pub struct AddRemoteGatewayPlan {
     pub endpoint: GatewayEndpoint,
@@ -79,6 +83,7 @@ pub struct AddRemoteGatewayInput<'a> {
     pub default_remote_name: String,
 }
 
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayAuthTokenWrite {

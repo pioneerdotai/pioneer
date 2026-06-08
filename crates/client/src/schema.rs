@@ -159,6 +159,26 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             crate::gateway::types::GatewayRegistry
         ),
         schema_doc!(
+            "gateway_auth_token_write.json",
+            crate::gateway::setup::GatewayAuthTokenWrite
+        ),
+        schema_doc!(
+            "remote_gateway_validation_request.json",
+            crate::gateway::setup::RemoteGatewayValidationRequest
+        ),
+        schema_doc!(
+            "remote_gateway_validation.json",
+            crate::gateway::setup::RemoteGatewayValidation
+        ),
+        schema_doc!(
+            "plan_add_remote_gateway_request.json",
+            crate::gateway::setup::PlanAddRemoteGatewayRequest
+        ),
+        schema_doc!(
+            "add_remote_gateway_plan.json",
+            crate::gateway::setup::AddRemoteGatewayPlan
+        ),
+        schema_doc!(
             "gateway_settings_state.json",
             crate::settings::gateway::GatewaySettingsState
         ),

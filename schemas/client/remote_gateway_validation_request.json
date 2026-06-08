@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RemoteGatewayValidationRequest",
+  "type": "object",
+  "properties": {
+    "address": {
+      "type": "string"
+    },
+    "timeout_ms": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "address",
+    "timeout_ms"
+  ]
+}
