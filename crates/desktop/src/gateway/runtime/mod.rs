@@ -14,11 +14,11 @@ use crate::gateway::timings::{
 use anyhow::{Context, Result, bail};
 use pioneer_client::gateway::runtime as client_gateway_runtime;
 use pioneer_client::gateway::secrets::{gateway_auth_token_label, normalize_gateway_auth_token};
+use pioneer_client::gateway::setup as client_gateway_setup;
 #[cfg(test)]
 use pioneer_client::gateway::types::GatewayEndpointKind;
 use pioneer_client::gateway::types::{GatewayEndpoint, GatewayRegistry};
 use pioneer_config::AppConfig;
-use pioneer_protocol::generate_id;
 use std::path::PathBuf;
 use tracing::{info, warn};
 
@@ -191,7 +191,6 @@ impl GatewayRuntime {
         auth_token: Option<&str>,
     ) -> Result<GatewayEndpoint> {
         let address = normalize_address(address)?;
-        let auth_token = auth_token.and_then(normalize_gateway_auth_token);
 
         if !crate::gateway::connectivity::is_gateway_reachable(
             &address,
@@ -206,12 +205,19 @@ impl GatewayRuntime {
             );
         }
 
-        let plan = client_gateway_runtime::plan_add_remote_gateway_profile(
+        let change = client_gateway_setup::plan_add_remote_gateway(
             &self.registry,
-            format!("remote-{}", generate_id(8)),
-            name,
-            address.as_str(),
-            auth_token.is_some(),
+            client_gateway_setup::AddRemoteGatewayInput {
+                name,
+                address: address.as_str(),
+                auth_token,
+                new_endpoint_id: client_gateway_setup::generated_remote_gateway_endpoint_id(),
+                default_remote_name: t!(
+                    "gateway.endpoint.remote_name",
+                    index = self.registry.remotes.len() + 1
+                )
+                .to_string(),
+            },
             |endpoint_id| {
                 gateway_auth_token_ref(endpoint_id).map_err(|error| {
                     client_gateway_runtime::GatewayProfileError::InvalidAuthTokenRef {
@@ -220,53 +226,29 @@ impl GatewayRuntime {
                     }
                 })
             },
-            t!(
-                "gateway.endpoint.remote_name",
-                index = self.registry.remotes.len() + 1
-            )
-            .to_string(),
         )
         .map_err(map_gateway_profile_error)?;
 
-        let previous_token = match &plan {
-            client_gateway_runtime::AddRemoteGatewayProfilePlan::UpdateExisting {
-                previous_endpoint,
-                ..
-            } => self.gateway_auth_token_for_endpoint(previous_endpoint)?,
-            client_gateway_runtime::AddRemoteGatewayProfilePlan::Add { .. } => None,
+        let previous_token = match change.previous_endpoint() {
+            Some(previous_endpoint) => self.gateway_auth_token_for_endpoint(previous_endpoint)?,
+            None => None,
         };
         let mut wrote_token_ref: Option<String> = None;
-        if let Some(token) = auth_token.as_deref() {
-            let token_ref = plan
-                .auth_token_ref()
-                .expect("token ref should exist when auth token is present");
+        if let Some(token_write) = change.token_write() {
             self.secrets.put_gateway_auth_token(
-                token_ref,
-                token,
-                Some(gateway_auth_token_label(
-                    plan.endpoint().name.as_str(),
-                    plan.endpoint().address.as_str(),
-                )),
+                token_write.token_ref.as_str(),
+                token_write.token.as_str(),
+                Some(token_write.label.clone()),
             )?;
-            wrote_token_ref = Some(token_ref.to_owned());
+            wrote_token_ref = Some(token_write.token_ref.clone());
         }
 
-        client_gateway_runtime::apply_add_remote_gateway_profile_plan(&mut self.registry, &plan);
+        change.apply(&mut self.registry);
         if let Err(error) = save_registry(&self.registry_path, &self.registry) {
-            client_gateway_runtime::rollback_add_remote_gateway_profile_plan(
-                &mut self.registry,
-                &plan,
-            );
+            change.rollback(&mut self.registry);
             if let Some(token_ref) = wrote_token_ref.as_deref() {
                 if let Some(previous_token) = previous_token.as_deref() {
-                    let previous_endpoint = match &plan {
-                        client_gateway_runtime::AddRemoteGatewayProfilePlan::UpdateExisting {
-                            previous_endpoint,
-                            ..
-                        } => Some(previous_endpoint),
-                        client_gateway_runtime::AddRemoteGatewayProfilePlan::Add { .. } => None,
-                    };
-                    if let Some(previous_endpoint) = previous_endpoint
+                    if let Some(previous_endpoint) = change.previous_endpoint()
                         && let Some(previous_token_ref) =
                             previous_endpoint.auth_token_ref.as_deref()
                     {
@@ -285,7 +267,7 @@ impl GatewayRuntime {
             }
             return Err(error);
         }
-        Ok(plan.endpoint().clone())
+        Ok(change.endpoint().clone())
     }
 
     pub fn update_remote_gateway(
