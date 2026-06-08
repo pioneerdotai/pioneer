@@ -70,6 +70,32 @@ pub struct TurnResumeSnapshotParams {
     pub items: TurnItemsParams,
 }
 
+#[derive(Clone, Debug)]
+pub enum TurnResumeSnapshotReduction {
+    ThreadMismatch {
+        expected_thread_id: String,
+        actual_thread_id: String,
+        retry_after: Duration,
+    },
+    Apply(TurnResumeSnapshotApplyReduction),
+}
+
+#[derive(Clone, Debug)]
+pub struct TurnResumeSnapshotApplyReduction {
+    pub thread_id: String,
+    pub workspace_id: String,
+    pub replay_events: Vec<ConversationEvent>,
+    pub terminal_event: Option<ConversationEvent>,
+    pub schedule_after: Option<Duration>,
+    pub reset_thread_resume: bool,
+    pub tick_conversation_after_terminal_event: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TurnResumeSnapshotFailurePlan {
+    Retry { thread_id: String },
+}
+
 pub fn reset_thread_resume_coordinator(resume: &mut ThreadResumeCoordinator) {
     resume.in_progress = false;
     resume.retry_attempt = 0;
@@ -237,6 +263,63 @@ pub fn turn_resume_snapshot_params(thread_id: String, turn_id: String) -> TurnRe
             turn_id: turn_id.clone(),
         },
         items: TurnItemsParams { thread_id, turn_id },
+    }
+}
+
+pub fn reduce_turn_resume_snapshot_result(
+    expected_thread_id: &str,
+    turn_snapshot: TurnGetResponse,
+    item_snapshot: TurnItemsResponse,
+) -> TurnResumeSnapshotReduction {
+    if !turn_snapshot_matches_thread(expected_thread_id, turn_snapshot.thread_id.as_str()) {
+        return TurnResumeSnapshotReduction::ThreadMismatch {
+            expected_thread_id: expected_thread_id.to_owned(),
+            actual_thread_id: turn_snapshot.thread_id,
+            retry_after: TURN_RESUME_MISMATCH_RETRY_DELAY,
+        };
+    }
+
+    let thread_id = turn_snapshot.thread_id.clone();
+    let workspace_id = turn_snapshot.workspace_id.clone();
+    let replay_events = turn_items_replay_events(&turn_snapshot, item_snapshot);
+
+    let status_plan = plan_turn_resume_after_status(turn_snapshot.turn.status.clone());
+    let (
+        terminal_event,
+        schedule_after,
+        reset_thread_resume,
+        tick_conversation_after_terminal_event,
+    ) = match status_plan {
+        TurnResumeStatusPlan::PollAfter(delay) => (None, Some(delay), false, false),
+        TurnResumeStatusPlan::Complete => (
+            turn_resume_terminal_event(thread_id.clone(), turn_snapshot.turn),
+            None,
+            true,
+            true,
+        ),
+        TurnResumeStatusPlan::Fail | TurnResumeStatusPlan::Block => (
+            turn_resume_terminal_event(thread_id.clone(), turn_snapshot.turn),
+            None,
+            true,
+            false,
+        ),
+        TurnResumeStatusPlan::Reset => (None, None, true, false),
+    };
+
+    TurnResumeSnapshotReduction::Apply(TurnResumeSnapshotApplyReduction {
+        thread_id,
+        workspace_id,
+        replay_events,
+        terminal_event,
+        schedule_after,
+        reset_thread_resume,
+        tick_conversation_after_terminal_event,
+    })
+}
+
+pub fn plan_turn_resume_snapshot_failure(thread_id: &str) -> TurnResumeSnapshotFailurePlan {
+    TurnResumeSnapshotFailurePlan::Retry {
+        thread_id: thread_id.to_owned(),
     }
 }
 
@@ -970,6 +1053,155 @@ mod tests {
             prompt_manifest: None,
         };
         assert!(turn_resume_terminal_event("thread_c".to_owned(), in_progress).is_none());
+    }
+
+    #[test]
+    fn snapshot_reduction_retries_mismatched_thread() {
+        let turn_snapshot = TurnGetResponse {
+            thread_id: "thread_b".to_owned(),
+            workspace_id: "ws_a".to_owned(),
+            turn: Turn {
+                id: "turn_a".to_owned(),
+                status: TurnStatus::InProgress,
+                turn_kind: TurnKind::Conversation,
+                origin: TurnOrigin::User,
+                error: None,
+                prompt_manifest: None,
+            },
+        };
+        let item_snapshot = TurnItemsResponse {
+            thread_id: "thread_b".to_owned(),
+            workspace_id: "ws_a".to_owned(),
+            turn_id: "turn_a".to_owned(),
+            last_sequence: 0,
+            events: Vec::new(),
+        };
+
+        match reduce_turn_resume_snapshot_result("thread_a", turn_snapshot, item_snapshot) {
+            TurnResumeSnapshotReduction::ThreadMismatch {
+                expected_thread_id,
+                actual_thread_id,
+                retry_after,
+            } => {
+                assert_eq!(expected_thread_id, "thread_a");
+                assert_eq!(actual_thread_id, "thread_b");
+                assert_eq!(retry_after, TURN_RESUME_MISMATCH_RETRY_DELAY);
+            }
+            reduction => panic!("unexpected reduction: {reduction:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_reduction_replays_items_and_polls_in_progress() {
+        let turn_snapshot = TurnGetResponse {
+            thread_id: "thread_a".to_owned(),
+            workspace_id: "ws_a".to_owned(),
+            turn: Turn {
+                id: "turn_a".to_owned(),
+                status: TurnStatus::InProgress,
+                turn_kind: TurnKind::Conversation,
+                origin: TurnOrigin::User,
+                error: None,
+                prompt_manifest: None,
+            },
+        };
+        let item_snapshot = TurnItemsResponse {
+            thread_id: "thread_a".to_owned(),
+            workspace_id: "ws_a".to_owned(),
+            turn_id: "turn_a".to_owned(),
+            last_sequence: 1,
+            events: vec![TurnItemEvent {
+                sequence: 1,
+                created_at: 1,
+                payload: TurnItemEventPayload::ItemStarted {
+                    workspace_id: "ws_a".to_owned(),
+                    thread_id: "thread_a".to_owned(),
+                    turn_id: "turn_a".to_owned(),
+                    item: TurnItem::SystemEvent {
+                        id: "item_a".to_owned(),
+                        level: SystemEventLevel::Info,
+                        message: "started".to_owned(),
+                        code: None,
+                        details: None,
+                    },
+                },
+            }],
+        };
+
+        let TurnResumeSnapshotReduction::Apply(reduction) =
+            reduce_turn_resume_snapshot_result("thread_a", turn_snapshot, item_snapshot)
+        else {
+            panic!("expected apply reduction");
+        };
+
+        assert_eq!(reduction.thread_id, "thread_a");
+        assert_eq!(reduction.workspace_id, "ws_a");
+        assert_eq!(
+            reduction.schedule_after,
+            Some(TURN_RESUME_IN_PROGRESS_POLL_DELAY)
+        );
+        assert!(!reduction.reset_thread_resume);
+        assert!(!reduction.tick_conversation_after_terminal_event);
+        assert!(reduction.terminal_event.is_none());
+        assert_eq!(reduction.replay_events.len(), 1);
+        assert!(matches!(
+            &reduction.replay_events[0],
+            ConversationEvent::ItemStarted {
+                thread_id,
+                turn_id,
+                item: TurnItem::SystemEvent { id, .. },
+            } if thread_id == "thread_a" && turn_id == "turn_a" && id == "item_a"
+        ));
+    }
+
+    #[test]
+    fn snapshot_reduction_completed_turn_terminalizes_ticks_and_resets() {
+        let turn_snapshot = TurnGetResponse {
+            thread_id: "thread_a".to_owned(),
+            workspace_id: "ws_a".to_owned(),
+            turn: Turn {
+                id: "turn_a".to_owned(),
+                status: TurnStatus::Completed,
+                turn_kind: TurnKind::Conversation,
+                origin: TurnOrigin::User,
+                error: None,
+                prompt_manifest: None,
+            },
+        };
+        let item_snapshot = TurnItemsResponse {
+            thread_id: "thread_a".to_owned(),
+            workspace_id: "ws_a".to_owned(),
+            turn_id: "turn_a".to_owned(),
+            last_sequence: 0,
+            events: Vec::new(),
+        };
+
+        let TurnResumeSnapshotReduction::Apply(reduction) =
+            reduce_turn_resume_snapshot_result("thread_a", turn_snapshot, item_snapshot)
+        else {
+            panic!("expected apply reduction");
+        };
+
+        assert_eq!(reduction.thread_id, "thread_a");
+        assert_eq!(reduction.workspace_id, "ws_a");
+        assert_eq!(reduction.schedule_after, None);
+        assert!(reduction.reset_thread_resume);
+        assert!(reduction.tick_conversation_after_terminal_event);
+        assert!(matches!(
+            reduction.terminal_event,
+            Some(ConversationEvent::TurnCompleted { thread_id, turn })
+                if thread_id == "thread_a" && turn.status == TurnStatus::Completed
+        ));
+    }
+
+    #[test]
+    fn snapshot_failure_plan_retries_requested_thread() {
+        assert_eq!(
+            plan_turn_resume_snapshot_failure("thread_a"),
+            TurnResumeSnapshotFailurePlan::Retry {
+                thread_id: "thread_a".to_owned()
+            }
+        );
     }
 
     #[test]

@@ -61,15 +61,6 @@ struct GatewayOperationSuccess {
     install_warnings: Vec<GatewayInstallWarning>,
 }
 
-struct ThreadStartBootstrapOutcome {
-    workspace_id: String,
-    response: pioneer_protocol::ThreadStartResponse,
-}
-
-struct ThreadStartBootstrapFailure {
-    error: anyhow::Error,
-}
-
 struct GatewayInstallWarningNotification;
 
 #[cfg(test)]

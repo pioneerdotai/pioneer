@@ -1,7 +1,7 @@
 //! Thread start coordination.
 
 use crate::workspaces::selectors as workspace_selectors;
-use pioneer_protocol::{ThreadStartParams, generate_id};
+use pioneer_protocol::{Thread, ThreadStartParams, ThreadStartResponse, generate_id};
 use std::time::{Duration, Instant};
 
 pub const THREAD_START_ID_LEN: usize = 21;
@@ -48,6 +48,24 @@ pub struct ThreadStartRetryPlan {
 pub enum ThreadStartWorkspaceResolution {
     Requested(String),
     LoadDefaultWorkspace,
+}
+
+#[derive(Clone, Debug)]
+pub struct ThreadStartBootstrapReduction {
+    pub thread: Thread,
+    pub thread_id: String,
+    pub workspace_id: String,
+    pub persist_active_gateway_workspace_id: String,
+    pub set_draft_thread_id: String,
+    pub set_active_thread_id: Option<String>,
+    pub set_preferred_workspace_id: String,
+    pub reset_thread_start: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ThreadStartBootstrapFailurePlan {
+    Retry { thread_id: String },
+    Reset,
 }
 
 pub fn reset_thread_start_coordinator(start: &mut ThreadStartCoordinator) {
@@ -240,6 +258,40 @@ pub fn thread_start_params(thread_id: String, workspace_id: String) -> ThreadSta
     }
 }
 
+pub fn reduce_thread_start_bootstrap_success(
+    resolved_workspace_id: String,
+    response: ThreadStartResponse,
+    active_thread_id: Option<&str>,
+) -> ThreadStartBootstrapReduction {
+    let thread = response.thread;
+    let thread_id = thread.id.clone();
+    let workspace_id = thread.workspace_id.clone();
+
+    ThreadStartBootstrapReduction {
+        thread,
+        thread_id: thread_id.clone(),
+        workspace_id: workspace_id.clone(),
+        persist_active_gateway_workspace_id: resolved_workspace_id,
+        set_draft_thread_id: thread_id.clone(),
+        set_active_thread_id: active_thread_id.is_none().then_some(thread_id),
+        set_preferred_workspace_id: workspace_id,
+        reset_thread_start: true,
+    }
+}
+
+pub fn plan_thread_start_bootstrap_failure(
+    requested_thread_id: &str,
+    error_message: &str,
+) -> ThreadStartBootstrapFailurePlan {
+    if is_transient_thread_start_error_message(error_message) {
+        ThreadStartBootstrapFailurePlan::Retry {
+            thread_id: requested_thread_id.to_owned(),
+        }
+    } else {
+        ThreadStartBootstrapFailurePlan::Reset
+    }
+}
+
 pub fn is_transient_thread_start_error_message(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     if message.contains("invalid json-rpc response payload")
@@ -260,6 +312,37 @@ pub fn is_transient_thread_start_error_message(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pioneer_protocol::{
+        SandboxMode, SandboxPolicy, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility,
+        ThreadStatus,
+    };
+
+    fn thread(id: &str, workspace_id: &str) -> Thread {
+        Thread {
+            workspace_id: workspace_id.to_owned(),
+            id: id.to_owned(),
+            name: None,
+            preview: String::new(),
+            mode: ThreadMode::Chat,
+            model: "gpt-5".to_owned(),
+            model_provider: "openai".to_owned(),
+            created_at: 1,
+            updated_at: 2,
+            status: ThreadStatus::Idle,
+            origin_kind: ThreadOriginKind::User,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            turns: Vec::new(),
+        }
+    }
+
+    fn thread_start_response(thread: Thread) -> ThreadStartResponse {
+        ThreadStartResponse {
+            thread,
+            sandbox: SandboxPolicy::from_mode(SandboxMode::FullAccess),
+        }
+    }
 
     #[test]
     fn request_plan_preserves_existing_draft_and_queues_missing_draft() {
@@ -426,6 +509,51 @@ mod tests {
         assert_eq!(params.thread_id, "thread_a");
         assert_eq!(params.workspace_id, "ws_a");
         assert_eq!(params.name, None);
+    }
+
+    #[test]
+    fn bootstrap_success_reduction_preserves_desktop_state_changes() {
+        let reduction = reduce_thread_start_bootstrap_success(
+            "resolved_ws".to_owned(),
+            thread_start_response(thread("thread_a", "thread_ws")),
+            None,
+        );
+
+        assert_eq!(reduction.thread_id, "thread_a");
+        assert_eq!(reduction.workspace_id, "thread_ws");
+        assert_eq!(reduction.thread.id, "thread_a");
+        assert_eq!(reduction.thread.workspace_id, "thread_ws");
+        assert_eq!(reduction.persist_active_gateway_workspace_id, "resolved_ws");
+        assert_eq!(reduction.set_draft_thread_id, "thread_a");
+        assert_eq!(reduction.set_active_thread_id.as_deref(), Some("thread_a"));
+        assert_eq!(reduction.set_preferred_workspace_id, "thread_ws");
+        assert!(reduction.reset_thread_start);
+    }
+
+    #[test]
+    fn bootstrap_success_reduction_does_not_replace_existing_active_thread() {
+        let reduction = reduce_thread_start_bootstrap_success(
+            "resolved_ws".to_owned(),
+            thread_start_response(thread("thread_a", "thread_ws")),
+            Some("active_thread"),
+        );
+
+        assert_eq!(reduction.set_active_thread_id, None);
+        assert_eq!(reduction.set_draft_thread_id, "thread_a");
+    }
+
+    #[test]
+    fn bootstrap_failure_plan_retries_only_transient_errors() {
+        assert_eq!(
+            plan_thread_start_bootstrap_failure("thread_a", "websocket connection timeout"),
+            ThreadStartBootstrapFailurePlan::Retry {
+                thread_id: "thread_a".to_owned()
+            }
+        );
+        assert_eq!(
+            plan_thread_start_bootstrap_failure("thread_a", "invalid request: workspace_id"),
+            ThreadStartBootstrapFailurePlan::Reset
+        );
     }
 
     #[test]

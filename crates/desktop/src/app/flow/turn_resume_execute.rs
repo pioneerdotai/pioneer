@@ -1,5 +1,5 @@
 use super::*;
-use pioneer_client::threads::resume::{self as thread_resume, TurnResumeStatusPlan};
+use pioneer_client::threads::resume as thread_resume;
 
 impl PioneerDesktop {
     pub(in crate::app::flow) fn resume_in_flight_turn(
@@ -50,111 +50,28 @@ impl PioneerDesktop {
 
                     match result {
                         Ok((turn_snapshot, item_snapshot)) => {
-                            if !thread_resume::turn_snapshot_matches_thread(
+                            let reduction = thread_resume::reduce_turn_resume_snapshot_result(
                                 thread_id.as_str(),
-                                turn_snapshot.thread_id.as_str(),
-                            ) {
-                                view.schedule_turn_resume_after(
-                                    connection_id,
-                                    thread_id.as_str(),
-                                    thread_resume::TURN_RESUME_MISMATCH_RETRY_DELAY,
-                                    cx,
-                                );
-                                warn!(
-                                    expected_thread_id = thread_id.as_str(),
-                                    actual_thread_id = turn_snapshot.thread_id.as_str(),
-                                    "turn/get returned snapshot for another thread; retry later"
-                                );
-                                return;
-                            }
-
-                            let target_thread_id = turn_snapshot.thread_id.clone();
-                            let target_workspace_id = turn_snapshot.workspace_id.clone();
-
-                            view.upsert_thread_for_workspace(
-                                target_thread_id.as_str(),
-                                target_workspace_id.as_str(),
-                            );
-
-                            let replay_events = thread_resume::turn_items_replay_events(
-                                &turn_snapshot,
+                                turn_snapshot,
                                 item_snapshot,
                             );
-                            for event in replay_events {
-                                view.upsert_thread_conversation_mut(
-                                    target_thread_id.as_str(),
-                                    target_workspace_id.as_str(),
-                                )
-                                .apply(event);
-                            }
-
-                            match thread_resume::plan_turn_resume_after_status(
-                                turn_snapshot.turn.status.clone(),
+                            view.apply_turn_resume_snapshot_reduction(connection_id, reduction, cx);
+                        }
+                        Err(error) => {
+                            match thread_resume::plan_turn_resume_snapshot_failure(
+                                thread_id.as_str(),
                             ) {
-                                TurnResumeStatusPlan::PollAfter(delay) => {
-                                    view.schedule_turn_resume_after(
+                                thread_resume::TurnResumeSnapshotFailurePlan::Retry {
+                                    thread_id,
+                                } => {
+                                    view.schedule_turn_resume_retry(
                                         connection_id,
-                                        target_thread_id.as_str(),
-                                        delay,
+                                        thread_id.as_str(),
+                                        &error,
                                         cx,
                                     );
                                 }
-                                TurnResumeStatusPlan::Complete => {
-                                    if let Some(event) = thread_resume::turn_resume_terminal_event(
-                                        target_thread_id.clone(),
-                                        turn_snapshot.turn,
-                                    ) {
-                                        view.upsert_thread_conversation_mut(
-                                            target_thread_id.as_str(),
-                                            target_workspace_id.as_str(),
-                                        )
-                                        .apply(event);
-                                        if let Some(conversation) =
-                                            view.thread_conversation_mut(target_thread_id.as_str())
-                                        {
-                                            let _ = conversation.tick();
-                                        }
-                                    }
-                                    view.reset_thread_resume_state(target_thread_id.as_str());
-                                }
-                                TurnResumeStatusPlan::Fail => {
-                                    if let Some(event) = thread_resume::turn_resume_terminal_event(
-                                        target_thread_id.clone(),
-                                        turn_snapshot.turn,
-                                    ) {
-                                        view.upsert_thread_conversation_mut(
-                                            target_thread_id.as_str(),
-                                            target_workspace_id.as_str(),
-                                        )
-                                        .apply(event);
-                                    }
-                                    view.reset_thread_resume_state(target_thread_id.as_str());
-                                }
-                                TurnResumeStatusPlan::Block => {
-                                    if let Some(event) = thread_resume::turn_resume_terminal_event(
-                                        target_thread_id.clone(),
-                                        turn_snapshot.turn,
-                                    ) {
-                                        view.upsert_thread_conversation_mut(
-                                            target_thread_id.as_str(),
-                                            target_workspace_id.as_str(),
-                                        )
-                                        .apply(event);
-                                    }
-                                    view.reset_thread_resume_state(target_thread_id.as_str());
-                                }
-                                TurnResumeStatusPlan::Reset => {
-                                    view.reset_thread_resume_state(target_thread_id.as_str());
-                                }
                             }
-                        }
-                        Err(error) => {
-                            view.schedule_turn_resume_retry(
-                                connection_id,
-                                thread_id.as_str(),
-                                &error,
-                                cx,
-                            );
                         }
                     }
 
@@ -163,5 +80,69 @@ impl PioneerDesktop {
             }
         })
         .detach();
+    }
+
+    fn apply_turn_resume_snapshot_reduction(
+        &mut self,
+        connection_id: u64,
+        reduction: thread_resume::TurnResumeSnapshotReduction,
+        cx: &mut Context<Self>,
+    ) {
+        match reduction {
+            thread_resume::TurnResumeSnapshotReduction::ThreadMismatch {
+                expected_thread_id,
+                actual_thread_id,
+                retry_after,
+            } => {
+                self.schedule_turn_resume_after(
+                    connection_id,
+                    expected_thread_id.as_str(),
+                    retry_after,
+                    cx,
+                );
+                warn!(
+                    expected_thread_id = expected_thread_id.as_str(),
+                    actual_thread_id = actual_thread_id.as_str(),
+                    "turn/get returned snapshot for another thread; retry later"
+                );
+            }
+            thread_resume::TurnResumeSnapshotReduction::Apply(reduction) => {
+                self.apply_turn_resume_snapshot_apply_reduction(connection_id, reduction, cx);
+            }
+        }
+    }
+
+    fn apply_turn_resume_snapshot_apply_reduction(
+        &mut self,
+        connection_id: u64,
+        reduction: thread_resume::TurnResumeSnapshotApplyReduction,
+        cx: &mut Context<Self>,
+    ) {
+        let thread_id = reduction.thread_id;
+        let workspace_id = reduction.workspace_id;
+
+        self.upsert_thread_for_workspace(thread_id.as_str(), workspace_id.as_str());
+
+        for event in reduction.replay_events {
+            self.upsert_thread_conversation_mut(thread_id.as_str(), workspace_id.as_str())
+                .apply(event);
+        }
+
+        if let Some(event) = reduction.terminal_event {
+            self.upsert_thread_conversation_mut(thread_id.as_str(), workspace_id.as_str())
+                .apply(event);
+            if reduction.tick_conversation_after_terminal_event
+                && let Some(conversation) = self.thread_conversation_mut(thread_id.as_str())
+            {
+                let _ = conversation.tick();
+            }
+        }
+
+        if let Some(delay) = reduction.schedule_after {
+            self.schedule_turn_resume_after(connection_id, thread_id.as_str(), delay, cx);
+        }
+        if reduction.reset_thread_resume {
+            self.reset_thread_resume_state(thread_id.as_str());
+        }
     }
 }

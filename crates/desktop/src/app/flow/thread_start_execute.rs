@@ -97,7 +97,7 @@ impl PioneerDesktop {
 
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
-            let requested_thread_id_for_retry = requested_thread_id.clone();
+            let requested_thread_id_for_failure = requested_thread_id.clone();
             let requested_thread_id_for_request = requested_thread_id.clone();
 
             async move {
@@ -109,7 +109,7 @@ impl PioneerDesktop {
                         ) {
                             Ok(workspace_id) => workspace_id,
                             Err(error) => {
-                                return Err(ThreadStartBootstrapFailure { error });
+                                return Err(error);
                             }
                         };
 
@@ -120,14 +120,11 @@ impl PioneerDesktop {
                             )) {
                                 Ok(response) => response,
                                 Err(error) => {
-                                    return Err(ThreadStartBootstrapFailure { error });
+                                    return Err(error);
                                 }
                             };
 
-                        Ok::<_, ThreadStartBootstrapFailure>(ThreadStartBootstrapOutcome {
-                            workspace_id,
-                            response,
-                        })
+                        Ok::<_, anyhow::Error>((workspace_id, response))
                     })
                     .await;
 
@@ -139,39 +136,37 @@ impl PioneerDesktop {
                     thread_start::finish_thread_start_attempt(app.thread_start_coordinator_mut());
 
                     match result {
-                        Ok(outcome) => {
-                            app.persist_active_gateway_workspace_id(outcome.workspace_id.clone());
-                            let thread = outcome.response.thread;
-                            let thread_id = thread.id.clone();
-                            let thread_workspace_id = thread.workspace_id.clone();
-
-                            app.upsert_thread_snapshot(thread);
-                            app.upsert_thread_for_workspace(
-                                thread_id.as_str(),
-                                thread_workspace_id.as_str(),
+                        Ok((workspace_id, response)) => {
+                            let reduction = thread_start::reduce_thread_start_bootstrap_success(
+                                workspace_id,
+                                response,
+                                app.current_active_thread_id(),
                             );
-                            app.set_draft_thread_id(Some(thread_id.clone()));
-
-                            if app.current_active_thread_id().is_none() {
-                                app.set_active_thread_id(Some(thread_id));
-                            }
-                            app.set_preferred_workspace_id(Some(thread_workspace_id));
-                            app.reset_thread_start_state();
+                            app.apply_thread_start_bootstrap_reduction(reduction);
                         }
-                        Err(failure) => {
-                            if is_transient_thread_start_error(&failure.error) {
-                                app.schedule_thread_start_retry(
-                                    connection_id,
-                                    requested_thread_id_for_retry.as_str(),
-                                    &failure.error,
-                                    cx,
-                                );
-                            } else {
-                                app.reset_thread_start_state();
-                                warn!(
-                                    error = %format!("{:#}", failure.error),
-                                    "failed to start thread after websocket connect"
-                                );
+                        Err(error) => {
+                            let error_message = format!("{error:#}");
+                            match thread_start::plan_thread_start_bootstrap_failure(
+                                requested_thread_id_for_failure.as_str(),
+                                error_message.as_str(),
+                            ) {
+                                thread_start::ThreadStartBootstrapFailurePlan::Retry {
+                                    thread_id,
+                                } => {
+                                    app.schedule_thread_start_retry(
+                                        connection_id,
+                                        thread_id.as_str(),
+                                        &error,
+                                        cx,
+                                    );
+                                }
+                                thread_start::ThreadStartBootstrapFailurePlan::Reset => {
+                                    app.reset_thread_start_state();
+                                    warn!(
+                                        error = %error_message,
+                                        "failed to start thread after websocket connect"
+                                    );
+                                }
                             }
                         }
                     }
@@ -182,5 +177,32 @@ impl PioneerDesktop {
         .detach();
 
         true
+    }
+
+    fn apply_thread_start_bootstrap_reduction(
+        &mut self,
+        reduction: thread_start::ThreadStartBootstrapReduction,
+    ) {
+        let thread = reduction.thread;
+        let thread_id = reduction.thread_id;
+        let workspace_id = reduction.workspace_id;
+        let persist_workspace_id = reduction.persist_active_gateway_workspace_id;
+        let draft_thread_id = reduction.set_draft_thread_id;
+        let active_thread_id = reduction.set_active_thread_id;
+        let preferred_workspace_id = reduction.set_preferred_workspace_id;
+        let reset_thread_start = reduction.reset_thread_start;
+
+        self.persist_active_gateway_workspace_id(persist_workspace_id);
+        self.upsert_thread_snapshot(thread);
+        self.upsert_thread_for_workspace(thread_id.as_str(), workspace_id.as_str());
+        self.set_draft_thread_id(Some(draft_thread_id));
+
+        if let Some(thread_id) = active_thread_id {
+            self.set_active_thread_id(Some(thread_id));
+        }
+        self.set_preferred_workspace_id(Some(preferred_workspace_id));
+        if reset_thread_start {
+            self.reset_thread_start_state();
+        }
     }
 }

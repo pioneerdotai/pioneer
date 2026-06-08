@@ -1,6 +1,5 @@
 use super::*;
 use pioneer_client::gateway::{runtime as client_gateway_runtime, setup as client_gateway_setup};
-use pioneer_client::threads::start as thread_start;
 
 pub(crate) fn build_ws_connect_spec(
     runtime: &GatewayRuntime,
@@ -46,10 +45,6 @@ pub(crate) fn validate_remote_candidate_gateway_connection(
     )
     .map(|_| ())
     .map_err(|error| anyhow::anyhow!(error))
-}
-
-pub(crate) fn is_transient_thread_start_error(error: &anyhow::Error) -> bool {
-    thread_start::is_transient_thread_start_error_message(format!("{error:#}").as_str())
 }
 
 pub(crate) fn should_apply_gateway_operation_result(
