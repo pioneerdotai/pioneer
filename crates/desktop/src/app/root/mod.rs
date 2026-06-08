@@ -12,7 +12,7 @@ use crate::{
         skills::details::table::SkillDiagnosticsTableDelegate,
         thread::{ThreadCoordinator, view::timeline::model::TimelineRow},
     },
-    gateway::{GatewayRuntime, GatewayWsClient, GatewayWsCommandSender},
+    gateway::{ClientRuntime, GatewayRuntime, GatewayWsCommandSender},
 };
 use gpui::{prelude::*, *};
 use gpui_component::{
@@ -120,7 +120,7 @@ pub(super) enum SettingsContentView {
 
 pub(super) struct GatewayCoordinator {
     pub(super) runtime: Option<GatewayRuntime>,
-    pub(super) ws_client: GatewayWsClient,
+    pub(super) client_runtime: ClientRuntime,
     pub(super) ws_command_sender: GatewayWsCommandSender,
     pub(super) ws_connection_id: Option<u64>,
     pub(super) connection_epoch: u64,

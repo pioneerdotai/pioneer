@@ -1,7 +1,6 @@
 use super::*;
 use pioneer_client::gateway::{runtime as client_gateway_runtime, setup as client_gateway_setup};
 use pioneer_client::threads::start as thread_start;
-use pioneer_client::transport::ws as client_ws;
 
 pub(crate) fn build_ws_connect_spec(
     runtime: &GatewayRuntime,
@@ -47,13 +46,6 @@ pub(crate) fn validate_remote_candidate_gateway_connection(
     )
     .map(|_| ())
     .map_err(|error| anyhow::anyhow!(error))
-}
-
-pub(crate) fn should_apply_ws_event(
-    active_connection_id: Option<u64>,
-    event: &GatewayWsEvent,
-) -> bool {
-    client_ws::should_apply_ws_event(active_connection_id, event)
 }
 
 pub(crate) fn is_transient_thread_start_error(error: &anyhow::Error) -> bool {

@@ -55,8 +55,8 @@ impl PioneerDesktop {
             .col_resizable(false)
             .loop_selection(false)
         });
-        let gateway_ws_client = GatewayWsClient::new();
-        let gateway_ws_command_sender = gateway_ws_client.command_sender();
+        let client_runtime = ClientRuntime::new();
+        let gateway_ws_command_sender = client_runtime.ws_command_sender();
         if let Ok(runtime_home) = state::runtime_home_dir() {
             let _ = gateway_ws_command_sender.set_artifact_cache_root(runtime_home);
         }
@@ -144,7 +144,7 @@ impl PioneerDesktop {
             sidebar_panel_width: px(320.),
             gateway: GatewayCoordinator {
                 runtime: None,
-                ws_client: gateway_ws_client,
+                client_runtime,
                 ws_command_sender: gateway_ws_command_sender,
                 ws_connection_id: None,
                 connection_epoch: 0,

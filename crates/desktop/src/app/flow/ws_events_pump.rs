@@ -2,18 +2,18 @@ use super::*;
 
 impl PioneerDesktop {
     pub(crate) fn start_gateway_ws_event_pump(&self, cx: &mut Context<Self>) {
-        let ws_client = self.gateway.ws_client.clone();
+        let client_runtime = self.gateway.client_runtime.clone();
 
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
-            let ws_client = ws_client.clone();
+            let client_runtime = client_runtime.clone();
 
             async move {
                 loop {
                     let first_event = cx
                         .background_spawn({
-                            let ws_client = ws_client.clone();
-                            async move { ws_client.recv_event() }
+                            let client_runtime = client_runtime.clone();
+                            async move { client_runtime.recv_ws_event() }
                         })
                         .await;
                     let should_break = first_event.is_none();
@@ -42,14 +42,11 @@ impl PioneerDesktop {
     ) {
         let mut changed = false;
 
-        for event in first_event
-            .into_iter()
-            .chain(self.gateway.ws_client.drain_events())
+        for event in self
+            .gateway
+            .client_runtime
+            .drain_applicable_ws_events(self.gateway.ws_connection_id, first_event)
         {
-            if !should_apply_ws_event(self.gateway.ws_connection_id, &event) {
-                continue;
-            }
-
             self.apply_gateway_ws_event(event, cx);
             changed = true;
         }
@@ -96,44 +93,18 @@ impl PioneerDesktop {
         event: GatewayWsEvent,
         cx: &mut Context<Self>,
     ) {
-        match event {
-            GatewayWsEvent::Connecting {
-                endpoint_id: _endpoint_id,
-                endpoint_name,
-                endpoint_kind,
-                ..
-            } => self.apply_ws_connecting_event(endpoint_name, endpoint_kind),
-            GatewayWsEvent::Connected {
-                endpoint_id: _endpoint_id,
-                endpoint_name,
-                address,
-                ..
-            } => self.apply_ws_connected_event(endpoint_name, address, cx),
-            GatewayWsEvent::Reconnecting {
-                endpoint_id: _endpoint_id,
-                endpoint_name,
-                attempt,
-                delay_ms,
-                reason,
-                ..
-            } => self.apply_ws_reconnecting_event(endpoint_name, attempt, delay_ms, reason),
-            GatewayWsEvent::Disconnected {
-                endpoint_id: _endpoint_id,
-                endpoint_name,
-                endpoint_kind,
-                address,
-                reason,
-                ..
-            } => self.apply_ws_disconnected_event(endpoint_name, endpoint_kind, address, reason),
-            GatewayWsEvent::ConnectFailed {
-                endpoint_id: _endpoint_id,
-                endpoint_name,
-                endpoint_kind,
-                address,
-                error,
-                ..
-            } => self.apply_ws_connect_failed_event(endpoint_name, endpoint_kind, address, error),
-            GatewayWsEvent::Notification { notification, .. } => {
+        let context = pioneer_client::runtime::ClientRuntimeWsEventContext {
+            queue_skills_refresh: matches!(
+                self.main_content_view,
+                MainContentView::Skills | MainContentView::SkillDetails
+            ),
+            should_resume_in_flight_turn: self.should_resume_in_flight_turn(),
+        };
+        match self.gateway.client_runtime.reduce_ws_event(event, context) {
+            pioneer_client::runtime::ClientRuntimeWsEvent::Connection(reduction) => {
+                self.apply_gateway_connection_reduction(reduction, Some(cx));
+            }
+            pioneer_client::runtime::ClientRuntimeWsEvent::Notification(notification) => {
                 self.apply_gateway_notification(notification, cx);
             }
         }

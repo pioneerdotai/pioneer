@@ -75,6 +75,7 @@ pub mod notifications;
 pub mod platform;
 pub mod providers;
 pub mod rpc;
+pub mod runtime;
 pub mod schema;
 pub mod settings;
 pub mod skills;
