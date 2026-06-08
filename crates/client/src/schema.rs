@@ -179,6 +179,10 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             crate::gateway::setup::AddRemoteGatewayPlan
         ),
         schema_doc!(
+            "add_and_activate_remote_gateway_registry_plan.json",
+            crate::gateway::setup::AddAndActivateRemoteGatewayRegistryPlan
+        ),
+        schema_doc!(
             "gateway_settings_state.json",
             crate::settings::gateway::GatewaySettingsState
         ),

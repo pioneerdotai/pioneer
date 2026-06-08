@@ -74,6 +74,16 @@ pub struct AddRemoteGatewayPlan {
     pub token_write: Option<GatewayAuthTokenWrite>,
 }
 
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Serialize)]
+pub struct AddAndActivateRemoteGatewayRegistryPlan {
+    pub registry: GatewayRegistry,
+    pub endpoint: GatewayEndpoint,
+    pub previous_endpoint: Option<GatewayEndpoint>,
+    pub token_write: Option<GatewayAuthTokenWrite>,
+    pub previous_active_gateway_id: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AddRemoteGatewayInput<'a> {
     pub name: &'a str,
@@ -282,6 +292,45 @@ where
     })
 }
 
+pub fn plan_add_and_activate_remote_gateway_registry_request<F>(
+    request: PlanAddRemoteGatewayRequest,
+    auth_token_ref_for_endpoint: F,
+) -> Result<AddAndActivateRemoteGatewayRegistryPlan, GatewayProfileError>
+where
+    F: FnMut(&str) -> Result<String, GatewayProfileError>,
+{
+    let new_endpoint_id = request
+        .new_endpoint_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(generated_remote_gateway_endpoint_id);
+
+    let mut registry = request.registry;
+    let change = plan_add_remote_gateway(
+        &registry,
+        AddRemoteGatewayInput {
+            name: request.name.as_str(),
+            address: request.address.as_str(),
+            auth_token: request.auth_token.as_deref(),
+            new_endpoint_id,
+            default_remote_name: request.default_remote_name,
+        },
+        auth_token_ref_for_endpoint,
+    )?;
+    let commit =
+        change.apply_to_registry(&mut registry, AddRemoteGatewayApplyMode::ActivateEndpoint)?;
+
+    Ok(AddAndActivateRemoteGatewayRegistryPlan {
+        registry,
+        endpoint: commit.endpoint,
+        previous_endpoint: commit.previous_endpoint,
+        token_write: commit.token_write,
+        previous_active_gateway_id: commit.previous_active_gateway_id,
+    })
+}
+
 impl fmt::Display for RemoteGatewayValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -483,6 +532,39 @@ mod tests {
         assert_eq!(plan.endpoint.id, "remote-one");
         assert_eq!(plan.endpoint.name, "Remote");
         assert_eq!(plan.endpoint.auth_token_ref.as_deref(), Some("remote-one"));
+        assert_eq!(
+            plan.token_write,
+            Some(GatewayAuthTokenWrite {
+                token_ref: "remote-one".to_owned(),
+                token: "token".to_owned(),
+                label: "Remote (127.0.0.1:23000)".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn add_and_activate_remote_gateway_registry_request_returns_next_registry() {
+        let plan = plan_add_and_activate_remote_gateway_registry_request(
+            PlanAddRemoteGatewayRequest {
+                registry: registry(),
+                name: " Remote ".to_owned(),
+                address: "127.0.0.1:23000".to_owned(),
+                auth_token: Some(" token ".to_owned()),
+                new_endpoint_id: Some("remote-one".to_owned()),
+                default_remote_name: "Remote 1".to_owned(),
+            },
+            token_ref,
+        )
+        .expect("plan registry update from request");
+
+        assert_eq!(plan.endpoint.id, "remote-one");
+        assert_eq!(plan.previous_active_gateway_id, None);
+        assert_eq!(
+            plan.registry.active_gateway_id.as_deref(),
+            Some("remote-one")
+        );
+        assert_eq!(plan.registry.remotes.len(), 1);
+        assert_eq!(plan.registry.remotes[0].id, "remote-one");
         assert_eq!(
             plan.token_write,
             Some(GatewayAuthTokenWrite {

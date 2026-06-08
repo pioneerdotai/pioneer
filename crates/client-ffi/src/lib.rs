@@ -8,8 +8,9 @@ use pioneer_client::gateway::{
     runtime::GatewayProfileError,
     secrets::GatewayAuthTokenRef,
     setup::{
-        AddRemoteGatewayPlan, PlanAddRemoteGatewayRequest, RemoteGatewayValidation,
-        RemoteGatewayValidationRequest, plan_add_remote_gateway_request,
+        AddAndActivateRemoteGatewayRegistryPlan, AddRemoteGatewayPlan, PlanAddRemoteGatewayRequest,
+        RemoteGatewayValidation, RemoteGatewayValidationRequest,
+        plan_add_and_activate_remote_gateway_registry_request, plan_add_remote_gateway_request,
         validate_remote_gateway_request,
     },
 };
@@ -98,6 +99,50 @@ impl ClientFfiRuntime {
         plan_add_remote_gateway_request(request, gateway_auth_token_ref_for_endpoint)
             .map_err(|error| error.to_string())
     }
+
+    fn gateway_plan_add_and_activate_remote_registry(
+        &self,
+        input_json: &str,
+    ) -> Result<AddAndActivateRemoteGatewayRegistryPlan, String> {
+        let request = serde_json::from_str::<PlanAddRemoteGatewayRequest>(input_json)
+            .map_err(|error| format!("invalid gateway add remote registry request: {error}"))?;
+
+        plan_add_and_activate_remote_gateway_registry_request(
+            request,
+            gateway_auth_token_ref_for_endpoint,
+        )
+        .map_err(|error| error.to_string())
+    }
+}
+
+fn ffi_client_json_response<T, F>(
+    ptr: *mut PioneerClientFfi,
+    input_json: *const c_char,
+    operation: F,
+) -> *mut c_char
+where
+    T: Serialize,
+    F: FnOnce(&ClientFfiRuntime, &str) -> Result<T, String>,
+{
+    into_ffi_response(|| {
+        let client = unsafe { ffi_ref(ptr)? };
+        let input_json = unsafe { read_c_string(input_json)? };
+        operation(&client.runtime, input_json.as_str())
+    })
+}
+
+macro_rules! ffi_client_json_method {
+    ($export_name:ident, $runtime_method:ident) => {
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn $export_name(
+            ptr: *mut PioneerClientFfi,
+            input_json: *const c_char,
+        ) -> *mut c_char {
+            ffi_client_json_response(ptr, input_json, |runtime, input_json| {
+                runtime.$runtime_method(input_json)
+            })
+        }
+    };
 }
 
 #[unsafe(no_mangle)]
@@ -128,41 +173,19 @@ pub unsafe extern "C" fn pioneer_client_ffi_client_destroy(ptr: *mut PioneerClie
     }));
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn pioneer_client_ffi_client_initialize(
-    ptr: *mut PioneerClientFfi,
-    config_json: *const c_char,
-) -> *mut c_char {
-    into_ffi_response(|| {
-        let client = unsafe { ffi_ref(ptr)? };
-        let config_json = unsafe { read_c_string(config_json)? };
-        client.runtime.initialize(config_json.as_str())
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn pioneer_client_ffi_gateway_validate_remote(
-    ptr: *mut PioneerClientFfi,
-    input_json: *const c_char,
-) -> *mut c_char {
-    into_ffi_response(|| {
-        let client = unsafe { ffi_ref(ptr)? };
-        let input_json = unsafe { read_c_string(input_json)? };
-        client.runtime.gateway_validate_remote(input_json.as_str())
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn pioneer_client_ffi_gateway_plan_add_remote(
-    ptr: *mut PioneerClientFfi,
-    input_json: *const c_char,
-) -> *mut c_char {
-    into_ffi_response(|| {
-        let client = unsafe { ffi_ref(ptr)? };
-        let input_json = unsafe { read_c_string(input_json)? };
-        client.runtime.gateway_plan_add_remote(input_json.as_str())
-    })
-}
+ffi_client_json_method!(pioneer_client_ffi_client_initialize, initialize);
+ffi_client_json_method!(
+    pioneer_client_ffi_gateway_validate_remote,
+    gateway_validate_remote
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_gateway_plan_add_remote,
+    gateway_plan_add_remote
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_gateway_plan_add_and_activate_remote_registry,
+    gateway_plan_add_and_activate_remote_registry
+);
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pioneer_client_ffi_string_destroy(value: *mut c_char) {
@@ -365,6 +388,44 @@ mod tests {
             result.endpoint.auth_token_ref.as_deref(),
             Some("remote-one")
         );
+        assert_eq!(
+            result
+                .token_write
+                .as_ref()
+                .map(|write| write.token.as_str()),
+            Some("token")
+        );
+    }
+
+    #[test]
+    fn gateway_add_and_activate_remote_registry_plan_returns_shared_next_registry() {
+        let runtime = ClientFfiRuntime::default();
+        let result = runtime
+            .gateway_plan_add_and_activate_remote_registry(
+                serde_json::json!({
+                    "registry": {
+                        "version": 1,
+                        "active_gateway_id": null,
+                        "remotes": []
+                    },
+                    "name": " Remote ",
+                    "address": "127.0.0.1:23000",
+                    "auth_token": " token ",
+                    "new_endpoint_id": "remote-one",
+                    "default_remote_name": "Remote 1"
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("plan add remote registry");
+
+        assert_eq!(result.endpoint.id, "remote-one");
+        assert_eq!(
+            result.registry.active_gateway_id.as_deref(),
+            Some("remote-one")
+        );
+        assert!(result.registry.local.is_none());
+        assert_eq!(result.registry.remotes.len(), 1);
         assert_eq!(
             result
                 .token_write
