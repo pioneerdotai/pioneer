@@ -20,6 +20,7 @@ use pioneer_client::threads::tree::{self as client_thread_tree, SidebarTreeNodeK
 use pioneer_protocol::{ThreadAgentsDocSummary, ThreadFolder};
 use std::any::Any;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 const TREE_ROW_HEIGHT_PX: f32 = 32.0;
 const TREE_ROW_CONTENT_HEIGHT_PX: f32 = 28.0;
@@ -90,15 +91,17 @@ impl PioneerDesktop {
         let desktop_entity = cx.entity().clone();
         let active_workspace_id = self.active_workspace_id().map(str::to_owned);
         let rows_by_thread_id = self.sidebar_rows_by_thread_id();
-        let folders_by_id: HashMap<String, ThreadFolder> = active_workspace_id
-            .as_deref()
-            .map(|workspace_id| {
-                self.thread_folders_for_workspace(workspace_id)
-                    .into_iter()
-                    .map(|folder| (folder.id.clone(), folder.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let folders_by_id: Arc<HashMap<String, ThreadFolder>> = Arc::new(
+            active_workspace_id
+                .as_deref()
+                .map(|workspace_id| {
+                    self.thread_folders_for_workspace(workspace_id)
+                        .into_iter()
+                        .map(|folder| (folder.id.clone(), folder.clone()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        );
         let agents_doc_summaries: HashMap<ThreadAgentsDocSummaryKey, ThreadAgentsDocSummary> =
             active_workspace_id
                 .as_deref()
@@ -447,7 +450,16 @@ impl PioneerDesktop {
                                 .on_drag(folder_payload, |drag, _, _, cx| cx.new(|_| drag.clone()))
                                 .can_drop({
                                     let folder_id = folder_id.to_owned();
-                                    move |value, _, _| can_drop_on_folder(value, folder_id.as_str())
+                                    let active_workspace_id = active_workspace_id.clone();
+                                    let folders_by_id = Arc::clone(&folders_by_id);
+                                    move |value, _, _| {
+                                        can_drop_on_folder(
+                                            value,
+                                            active_workspace_id.as_deref(),
+                                            folders_by_id.as_ref(),
+                                            folder_id.as_str(),
+                                        )
+                                    }
                                 })
                                 .drag_over::<SidebarTreeDragPayload>(|style, _, _, cx| {
                                     style.rounded_md().bg(cx.theme().sidebar_accent)
@@ -888,15 +900,35 @@ fn can_drop_on_root(value: &dyn Any, _: &mut Window, _: &mut App) -> bool {
     value.is::<SidebarTreeDragPayload>()
 }
 
-fn can_drop_on_folder(value: &dyn Any, target_folder_id: &str) -> bool {
+fn can_drop_on_folder(
+    value: &dyn Any,
+    active_workspace_id: Option<&str>,
+    folders: &HashMap<String, ThreadFolder>,
+    target_folder_id: &str,
+) -> bool {
     let Some(payload) = value.downcast_ref::<SidebarTreeDragPayload>() else {
         return false;
     };
 
-    match &payload.item {
-        SidebarTreeDragItem::Thread { .. } => true,
-        SidebarTreeDragItem::Folder { folder_id } => folder_id != target_folder_id,
-    }
+    let item = match &payload.item {
+        SidebarTreeDragItem::Thread { thread_id } => {
+            client_thread_tree::SidebarTreeDragItemRef::Thread {
+                thread_id: thread_id.as_str(),
+            }
+        }
+        SidebarTreeDragItem::Folder { folder_id } => {
+            client_thread_tree::SidebarTreeDragItemRef::Folder {
+                folder_id: folder_id.as_str(),
+            }
+        }
+    };
+
+    client_thread_tree::can_drop_sidebar_tree_item_on_folder(
+        folders,
+        active_workspace_id,
+        item,
+        target_folder_id,
+    )
 }
 
 #[cfg(test)]
@@ -950,6 +982,14 @@ mod tests {
 
     #[::core::prelude::v1::test]
     fn folder_drop_guard_rejects_self_folder_and_accepts_thread() {
+        let folders = HashMap::from([
+            ("fld_1".to_owned(), sidebar_test_folder("fld_1", None)),
+            ("fld_2".to_owned(), sidebar_test_folder("fld_2", None)),
+            (
+                "fld_child".to_owned(),
+                sidebar_test_folder("fld_child", Some("fld_1")),
+            ),
+        ]);
         let thread_payload = SidebarTreeDragPayload {
             label: "t".to_owned(),
             item: SidebarTreeDragItem::Thread {
@@ -963,9 +1003,41 @@ mod tests {
             },
         };
 
-        assert!(can_drop_on_folder(&thread_payload as &dyn Any, "fld_1"));
-        assert!(!can_drop_on_folder(&folder_payload as &dyn Any, "fld_1"));
-        assert!(can_drop_on_folder(&folder_payload as &dyn Any, "fld_2"));
+        assert!(can_drop_on_folder(
+            &thread_payload as &dyn Any,
+            Some("ws_1"),
+            &folders,
+            "fld_1"
+        ));
+        assert!(!can_drop_on_folder(
+            &folder_payload as &dyn Any,
+            Some("ws_1"),
+            &folders,
+            "fld_1"
+        ));
+        assert!(can_drop_on_folder(
+            &folder_payload as &dyn Any,
+            Some("ws_1"),
+            &folders,
+            "fld_2"
+        ));
+        assert!(!can_drop_on_folder(
+            &folder_payload as &dyn Any,
+            Some("ws_1"),
+            &folders,
+            "fld_child"
+        ));
+    }
+
+    fn sidebar_test_folder(id: &str, parent_folder_id: Option<&str>) -> ThreadFolder {
+        ThreadFolder {
+            id: id.to_owned(),
+            workspace_id: "ws_1".to_owned(),
+            parent_folder_id: parent_folder_id.map(str::to_owned),
+            name: id.to_owned(),
+            created_at: 0,
+            updated_at: 0,
+        }
     }
 
     #[::core::prelude::v1::test]

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::process::{Command, Output};
+use std::process::Command;
 
 pub(crate) fn is_configured_service_active(service_name: &str) -> Result<bool> {
     #[cfg(target_os = "macos")]
@@ -95,18 +95,4 @@ fn is_service_active_windows(service_name: &str) -> Result<bool> {
         .context(t!("errors.command.powershell_task_status_failed").to_string())?;
 
     Ok(output.status.success())
-}
-
-#[allow(dead_code)]
-fn output_details(output: &Output) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-
-    if !stderr.is_empty() {
-        stderr
-    } else if !stdout.is_empty() {
-        stdout
-    } else {
-        t!("errors.command.exit_status", status = output.status).to_string()
-    }
 }

@@ -36,21 +36,17 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn refresh_configured_providers(&mut self, cx: &mut Context<Self>) {
-        if self.gateway.connection_state != GatewayConnectionState::Connected {
-            self.providers
-                .apply_unavailable(t!("providers.error.gateway_not_connected").to_string());
-            return;
-        }
-
-        let Some(connection_id) = self.gateway.ws_connection_id else {
-            self.providers
-                .apply_unavailable(t!("providers.error.gateway_not_connected").to_string());
-            return;
-        };
-        let Some(workspace_id) = self.active_workspace_id().map(str::to_owned) else {
-            self.providers
-                .apply_unavailable(t!("providers.error.workspace_not_selected").to_string());
-            return;
+        let plan = provider_list::plan_provider_list_refresh(
+            self.gateway.connection_state == GatewayConnectionState::Connected,
+            self.gateway.ws_connection_id,
+            self.active_workspace_id().map(str::to_owned),
+        );
+        let request = match plan {
+            provider_list::ProviderListRefreshPlan::Send(request) => request,
+            provider_list::ProviderListRefreshPlan::Unavailable(reason) => {
+                self.apply_provider_list_refresh_unavailable(reason);
+                return;
+            }
         };
 
         self.providers.mark_refresh_started();
@@ -58,25 +54,24 @@ impl PioneerDesktop {
         let ws_sender = self.gateway.ws_command_sender.clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
+            let connection_id = request.connection_id;
+            let params = request.params;
             async move {
                 let result = cx
-                    .background_spawn(async move {
-                        ws_sender.provider_list(provider_list::provider_list_params(workspace_id))
-                    })
+                    .background_spawn(async move { ws_sender.provider_list(params) })
                     .await;
 
                 let _ = this.update(&mut cx, |view, cx| {
-                    if view.gateway.ws_connection_id != Some(connection_id) {
+                    if !provider_list::provider_list_refresh_matches_connection(
+                        connection_id,
+                        view.gateway.ws_connection_id,
+                    ) {
                         return;
                     }
 
                     match result {
                         Ok(response) => {
-                            let configured =
-                                provider_list::configured_provider_names_from_list(
-                                    &response.providers,
-                                );
-                            view.providers.apply_refresh_success(configured);
+                            view.providers.apply_refresh_response(response);
                         }
                         Err(error) => {
                             view.providers.apply_refresh_failed(format!(
@@ -92,5 +87,20 @@ impl PioneerDesktop {
             }
         })
         .detach();
+    }
+
+    fn apply_provider_list_refresh_unavailable(
+        &mut self,
+        reason: provider_list::ProviderListRefreshUnavailable,
+    ) {
+        let error = match reason {
+            provider_list::ProviderListRefreshUnavailable::GatewayNotConnected => {
+                t!("providers.error.gateway_not_connected").to_string()
+            }
+            provider_list::ProviderListRefreshUnavailable::WorkspaceNotSelected => {
+                t!("providers.error.workspace_not_selected").to_string()
+            }
+        };
+        self.providers.apply_unavailable(error);
     }
 }

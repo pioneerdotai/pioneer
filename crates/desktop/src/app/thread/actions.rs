@@ -1,7 +1,4 @@
-use super::super::{
-    conversation::ConversationEvent,
-    root::{ComposerCapability, PioneerDesktop},
-};
+use super::super::root::{ComposerCapability, PioneerDesktop};
 use crate::gateway::DesktopGatewayWsCommandSenderExt;
 use gpui::{prelude::*, *};
 use pioneer_client::composer::attachments as composer_attachments;
@@ -155,44 +152,68 @@ impl PioneerDesktop {
                         let prepared = match prepare_result {
                             Ok(prepared) => prepared,
                             Err(error) => {
-                                let error = format!("{error:#}");
-                                view.composer_upload_in_progress = false;
-                                view.composer_upload_error = Some(error.clone());
+                                let reduction =
+                                    composer_turn_prepare::reduce_prepare_composer_turn_failure(
+                                        format!("{error:#}"),
+                                    );
+                                view.composer_upload_in_progress =
+                                    reduction.composer_upload_in_progress;
+                                view.composer_upload_error =
+                                    Some(reduction.composer_upload_error.clone());
                                 composer_turn_prepare::mark_uploading_composer_attachments_failed(
                                     &mut view.composer_attachments,
-                                    error.as_str(),
+                                    reduction.mark_uploading_attachments_failed_error.as_str(),
                                 );
                                 cx.notify();
                                 return;
                             }
                         };
 
-                        view.composer_upload_in_progress = false;
-                        view.composer_upload_error = None;
+                        let reduction =
+                            composer_turn_prepare::reduce_prepared_composer_turn_submit_success(
+                                composer_turn_prepare::PreparedComposerTurnSubmitContext {
+                                    thread_id: thread_id.clone(),
+                                    turn_id: turn_id.clone(),
+                                    pending_request_id: pending_request_id.clone(),
+                                    selected_model: selected_model.clone(),
+                                    selected_provider: selected_provider.clone(),
+                                    selected_mode: Some(selected_mode),
+                                    updated_at_unix: turn_start::now_unix_seconds(),
+                                },
+                                prepared,
+                            );
+
+                        view.composer_upload_in_progress = reduction.composer_upload_in_progress;
+                        if reduction.clear_composer_upload_error {
+                            view.composer_upload_error = None;
+                        }
                         composer_turn_prepare::apply_uploaded_composer_attachment_artifacts(
                             &mut view.composer_attachments,
-                            prepared
-                                .attachments
-                                .iter()
-                                .map(|prepared_attachment| prepared_attachment.artifact.clone()),
+                            reduction.uploaded_attachment_artifacts,
                         );
-                        view.clear_composer(window, cx);
-                        view.clear_thread_draft(thread_id.as_str());
+                        if reduction.clear_composer {
+                            view.clear_composer(window, cx);
+                        }
+                        view.clear_thread_draft(reduction.clear_thread_draft_id.as_str());
 
                         if let Some(coordinator) = view.thread_coordinator_mut(thread_id.as_str()) {
                             if let Some(thread) = coordinator.thread_mut() {
                                 turn_start::apply_prepared_turn_to_thread_snapshot(
                                     thread,
-                                    selected_model.as_deref(),
-                                    selected_provider.as_deref(),
-                                    prepared.user_text.as_str(),
-                                    turn_start::now_unix_seconds(),
+                                    reduction.thread_snapshot_update.selected_model.as_deref(),
+                                    reduction
+                                        .thread_snapshot_update
+                                        .selected_provider
+                                        .as_deref(),
+                                    reduction.thread_snapshot_update.user_text.as_str(),
+                                    reduction.thread_snapshot_update.updated_at_unix,
                                 );
                             }
                         }
 
-                        let promoted_from_draft =
-                            view.promote_thread_from_draft(thread_id.as_str());
+                        let promoted_from_draft = view.promote_thread_from_draft(
+                            reduction.promote_thread_from_draft_id.as_str(),
+                        );
                         if promoted_from_draft {
                             view.rebuild_sidebar_tree_state(cx);
                             let _ = view.drive_thread_start_queue(cx);
@@ -203,78 +224,51 @@ impl PioneerDesktop {
                             cx.notify();
                             return;
                         };
-                        conversation.apply(turn_start::local_turn_start_requested_event(
-                            thread_id.clone(),
-                            turn_id.clone(),
-                            pending_request_id.clone(),
-                            prepared.user_message_text.clone(),
-                            prepared.user_attachments.clone(),
-                        ));
+                        conversation.apply(reduction.local_turn_start_requested_event);
 
                         let ws_sender = turn_start_sender.clone();
-                        let thread_id_for_send = thread_id.clone();
-                        let turn_id_for_send = turn_id.clone();
-                        let turn_input_for_send = prepared.input.clone();
-                        let turn_capabilities_for_send = prepared.capabilities.clone();
-                        let pending_request_id_for_send = pending_request_id.clone();
-                        let selected_model_for_send = selected_model.clone();
-                        let selected_provider_for_send = selected_provider.clone();
+                        let turn_start_params_plan = reduction.turn_start_params_plan;
+                        let send_context = reduction.send_context;
 
                         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
                             let mut cx = cx.clone();
+                            let thread_id_for_update = send_context.thread_id.clone();
+                            let send_context_for_update = send_context.clone();
                             async move {
                                 let result = cx
                                     .background_spawn(async move {
                                         ws_sender.turn_start(
                                             turn_start::turn_start_params_from_plan(
-                                                turn_start::TurnStartParamsPlan {
-                                                    thread_id: thread_id_for_send.clone(),
-                                                    turn_id: turn_id_for_send.clone(),
-                                                    input: turn_input_for_send,
-                                                    capabilities: turn_capabilities_for_send,
-                                                    model: selected_model_for_send,
-                                                    model_provider: selected_provider_for_send,
-                                                    mode: Some(selected_mode),
-                                                },
+                                                turn_start_params_plan,
                                             ),
                                         )
                                     })
                                     .await;
 
                                 let _ = this.update(&mut cx, |view, cx| {
-                                    match result {
-                                        Ok(response) => {
-                                            let Some(conversation) =
-                                                view.thread_conversation_mut(thread_id.as_str())
-                                            else {
-                                                return;
-                                            };
-                                            conversation.apply(
-                                                turn_start::local_turn_start_accepted_event(
-                                                    thread_id.clone(),
-                                                    turn_id.clone(),
-                                                    pending_request_id_for_send.clone(),
-                                                ),
-                                            );
-                                            conversation.apply(ConversationEvent::TurnStarted {
-                                                thread_id: thread_id.clone(),
-                                                turn: response.turn,
-                                            });
+                                    let reduction = match result {
+                                        Ok(response) => turn_start::reduce_turn_start_send_success(
+                                            send_context_for_update,
+                                            response,
+                                        ),
+                                        Err(error) => turn_start::reduce_turn_start_send_failure(
+                                            send_context_for_update,
+                                            format!("{error:#}"),
+                                        ),
+                                    };
+                                    let Some(conversation) =
+                                        view.thread_conversation_mut(thread_id_for_update.as_str())
+                                    else {
+                                        return;
+                                    };
+                                    match reduction {
+                                        turn_start::TurnStartSendReduction::Accepted { events } => {
+                                            for event in events {
+                                                conversation.apply(event);
+                                            }
                                         }
-                                        Err(error) => {
-                                            let Some(conversation) =
-                                                view.thread_conversation_mut(thread_id.as_str())
-                                            else {
-                                                return;
-                                            };
-                                            conversation.apply(
-                                                turn_start::local_turn_start_rejected_event(
-                                                    thread_id.clone(),
-                                                    turn_id.clone(),
-                                                    pending_request_id_for_send.clone(),
-                                                    format!("{error:#}"),
-                                                ),
-                                            );
+                                        turn_start::TurnStartSendReduction::Rejected { event } => {
+                                            conversation.apply(event);
                                         }
                                     }
 

@@ -21,6 +21,27 @@ pub struct GatewaySettingsUpdatePlan {
     pub update: GatewaySettingsUpdate,
 }
 
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum GatewaySettingsRefreshUnavailable {
+    GatewayNotConnected,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct GatewaySettingsActionScope {
+    pub connection_id: u64,
+    pub connection_epoch: u64,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum GatewaySettingsRefreshPlan {
+    Send(GatewaySettingsActionScope),
+    SkipAlreadyLoading,
+    Unavailable(GatewaySettingsRefreshUnavailable),
+}
+
 pub fn gateway_settings_get_params() -> GatewaySettingsGetParams {
     GatewaySettingsGetParams::default()
 }
@@ -33,6 +54,37 @@ pub fn gateway_settings_update_params(
 
 pub fn should_start_gateway_settings_refresh(loading: bool) -> bool {
     !loading
+}
+
+pub fn plan_gateway_settings_refresh(
+    loading: bool,
+    gateway_connected: bool,
+    connection_id: Option<u64>,
+    connection_epoch: u64,
+) -> GatewaySettingsRefreshPlan {
+    if !should_start_gateway_settings_refresh(loading) {
+        return GatewaySettingsRefreshPlan::SkipAlreadyLoading;
+    }
+    let Some(connection_id) = gateway_connected.then_some(connection_id).flatten() else {
+        return GatewaySettingsRefreshPlan::Unavailable(
+            GatewaySettingsRefreshUnavailable::GatewayNotConnected,
+        );
+    };
+
+    GatewaySettingsRefreshPlan::Send(GatewaySettingsActionScope {
+        connection_id,
+        connection_epoch,
+    })
+}
+
+pub fn plan_gateway_settings_update_action(
+    connection_id: Option<u64>,
+    connection_epoch: u64,
+) -> Option<GatewaySettingsActionScope> {
+    Some(GatewaySettingsActionScope {
+        connection_id: connection_id?,
+        connection_epoch,
+    })
 }
 
 pub fn settings_action_matches_connection(
@@ -258,6 +310,45 @@ mod tests {
         assert!(!settings_action_matches_connection(7, 3, Some(8), 3));
         assert!(!settings_action_matches_connection(7, 3, Some(7), 4));
         assert!(!settings_action_matches_connection(7, 3, None, 3));
+    }
+
+    #[test]
+    fn refresh_plan_requires_idle_connected_gateway() {
+        assert_eq!(
+            plan_gateway_settings_refresh(true, true, Some(7), 3),
+            GatewaySettingsRefreshPlan::SkipAlreadyLoading
+        );
+        assert_eq!(
+            plan_gateway_settings_refresh(false, false, Some(7), 3),
+            GatewaySettingsRefreshPlan::Unavailable(
+                GatewaySettingsRefreshUnavailable::GatewayNotConnected
+            )
+        );
+        assert_eq!(
+            plan_gateway_settings_refresh(false, true, None, 3),
+            GatewaySettingsRefreshPlan::Unavailable(
+                GatewaySettingsRefreshUnavailable::GatewayNotConnected
+            )
+        );
+        assert_eq!(
+            plan_gateway_settings_refresh(false, true, Some(7), 3),
+            GatewaySettingsRefreshPlan::Send(GatewaySettingsActionScope {
+                connection_id: 7,
+                connection_epoch: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn update_action_plan_requires_connection_id() {
+        assert_eq!(
+            plan_gateway_settings_update_action(Some(7), 3),
+            Some(GatewaySettingsActionScope {
+                connection_id: 7,
+                connection_epoch: 3,
+            })
+        );
+        assert_eq!(plan_gateway_settings_update_action(None, 3), None);
     }
 
     #[test]

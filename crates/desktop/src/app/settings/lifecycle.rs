@@ -141,28 +141,22 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn refresh_gateway_settings(&mut self, cx: &mut Context<Self>) {
-        if !gateway_settings::should_start_gateway_settings_refresh(self.gateway.settings_loading) {
-            return;
-        }
-        if self.gateway.connection_state != GatewayConnectionState::Connected {
-            gateway_settings::apply_gateway_settings_unavailable(
-                &mut self.gateway.settings,
-                &mut self.gateway.settings_loading,
-                &mut self.gateway.settings_error,
-                "Gateway is not connected",
-            );
-            return;
-        }
-        let Some(connection_id) = self.gateway.ws_connection_id else {
-            gateway_settings::apply_gateway_settings_unavailable(
-                &mut self.gateway.settings,
-                &mut self.gateway.settings_loading,
-                &mut self.gateway.settings_error,
-                "Gateway is not connected",
-            );
-            return;
+        let plan = gateway_settings::plan_gateway_settings_refresh(
+            self.gateway.settings_loading,
+            self.gateway.connection_state == GatewayConnectionState::Connected,
+            self.gateway.ws_connection_id,
+            self.gateway.connection_epoch,
+        );
+        let scope = match plan {
+            gateway_settings::GatewaySettingsRefreshPlan::Send(scope) => scope,
+            gateway_settings::GatewaySettingsRefreshPlan::SkipAlreadyLoading => return,
+            gateway_settings::GatewaySettingsRefreshPlan::Unavailable(reason) => {
+                self.apply_gateway_settings_refresh_unavailable(reason);
+                return;
+            }
         };
-        let connection_epoch = self.gateway.connection_epoch;
+        let connection_id = scope.connection_id;
+        let connection_epoch = scope.connection_epoch;
 
         gateway_settings::begin_gateway_settings_refresh(
             &mut self.gateway.settings_loading,
@@ -241,11 +235,15 @@ impl PioneerDesktop {
         update: GatewaySettingsUpdate,
         cx: &mut Context<Self>,
     ) {
-        let Some(connection_id) = self.gateway.ws_connection_id else {
+        let Some(scope) = gateway_settings::plan_gateway_settings_update_action(
+            self.gateway.ws_connection_id,
+            self.gateway.connection_epoch,
+        ) else {
             warn!("cannot update gateway settings without an active gateway connection");
             return;
         };
-        let connection_epoch = self.gateway.connection_epoch;
+        let connection_id = scope.connection_id;
+        let connection_epoch = scope.connection_epoch;
 
         gateway_settings::apply_optimistic_gateway_settings_update(
             &mut self.gateway.settings,
@@ -295,6 +293,23 @@ impl PioneerDesktop {
             }
         })
         .detach();
+    }
+
+    fn apply_gateway_settings_refresh_unavailable(
+        &mut self,
+        reason: gateway_settings::GatewaySettingsRefreshUnavailable,
+    ) {
+        let message = match reason {
+            gateway_settings::GatewaySettingsRefreshUnavailable::GatewayNotConnected => {
+                t!("settings.gateway_not_connected")
+            }
+        };
+        gateway_settings::apply_gateway_settings_unavailable(
+            &mut self.gateway.settings,
+            &mut self.gateway.settings_loading,
+            &mut self.gateway.settings_error,
+            message,
+        );
     }
 }
 

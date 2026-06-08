@@ -394,7 +394,14 @@ pub async fn mark_turn_execution_window_interrupted<C: ConnectionTrait>(
     window_id: &str,
     stats: TurnExecutionWindowStatsRecord,
 ) -> Result<TurnExecutionWindowRecord> {
-    update_window_with_stats(db, window_id, ExecutionWindowStatus::Interrupted, None, stats).await
+    update_window_with_stats(
+        db,
+        window_id,
+        ExecutionWindowStatus::Interrupted,
+        None,
+        stats,
+    )
+    .await
 }
 
 pub async fn mark_turn_execution_window_blocked<C: ConnectionTrait>(

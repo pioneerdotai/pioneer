@@ -20,11 +20,28 @@ pub struct McpListState {
     pub pending_actions: HashSet<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct McpSnapshotApplication {
     pub selected_was_present: bool,
     pub selected_still_present: bool,
     pub selected_removed: bool,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct McpListRefreshSuccessReduction {
+    pub servers: Vec<McpListItem>,
+    pub pending_actions: HashSet<String>,
+    pub selected_server_id: Option<String>,
+    pub server_details: Option<McpServerDetailsResponse>,
+    pub application: McpSnapshotApplication,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct McpListRefreshFailureReduction {
+    pub error: String,
 }
 
 pub fn normalize_mcp_server_name(name: &str) -> Option<String> {
@@ -123,6 +140,36 @@ pub fn apply_mcp_snapshot(
             selected_still_present: false,
             selected_removed: true,
         }
+    }
+}
+
+pub fn reduce_mcp_list_refresh_success(
+    mut servers: Vec<McpListItem>,
+    mut pending_actions: HashSet<String>,
+    mut selected_server_id: Option<String>,
+    mut server_details: Option<McpServerDetailsResponse>,
+    next_servers: Vec<McpListItem>,
+) -> McpListRefreshSuccessReduction {
+    let application = apply_mcp_snapshot(
+        &mut servers,
+        &mut pending_actions,
+        &mut selected_server_id,
+        &mut server_details,
+        next_servers,
+    );
+
+    McpListRefreshSuccessReduction {
+        servers,
+        pending_actions,
+        selected_server_id,
+        server_details,
+        application,
+    }
+}
+
+pub fn reduce_mcp_list_refresh_failure(error: impl Into<String>) -> McpListRefreshFailureReduction {
+    McpListRefreshFailureReduction {
+        error: error.into(),
     }
 }
 
@@ -255,5 +302,29 @@ mod tests {
 
         assert!(result.selected_still_present);
         assert_eq!(selected.as_deref(), Some("id-github"));
+    }
+
+    #[test]
+    fn list_refresh_success_reduction_applies_snapshot_and_selection_state() {
+        let reduction = reduce_mcp_list_refresh_success(
+            vec![server("id-old", "old")],
+            HashSet::from(["old".to_owned()]),
+            Some("id-old".to_owned()),
+            None,
+            vec![server("id-new", "new")],
+        );
+
+        assert_eq!(reduction.servers[0].id, "id-new");
+        assert_eq!(reduction.selected_server_id, None);
+        assert!(reduction.server_details.is_none());
+        assert!(reduction.application.selected_removed);
+        assert!(!reduction.pending_actions.contains("old"));
+    }
+
+    #[test]
+    fn list_refresh_failure_reduction_carries_display_error() {
+        let reduction = reduce_mcp_list_refresh_failure("load failed");
+
+        assert_eq!(reduction.error, "load failed");
     }
 }

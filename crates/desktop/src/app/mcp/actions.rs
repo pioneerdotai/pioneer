@@ -62,37 +62,34 @@ impl PioneerDesktop {
                         return;
                     }
 
-                    view.mark_mcp_pending(name.as_str(), false);
-                    match result {
-                        Ok(_) => {
-                            view.mcp_error = None;
-                            view.queue_mcp_refresh();
-                            if mcp_actions::mcp_action_should_refresh_details(
-                                view.mcp_selected_server_id.as_deref(),
-                            ) {
-                                view.queue_mcp_details_refresh();
-                            }
-                        }
+                    let outcome = match result {
+                        Ok(_) => mcp_actions::McpActionFinishOutcome::Success,
                         Err(error) => {
-                            if let Some((prev_enabled, prev_implicit)) = previous_policy {
-                                view.apply_local_mcp_policy(
-                                    name.as_str(),
-                                    prev_enabled,
-                                    prev_implicit,
-                                );
-                            }
                             let details = format!("{error:#}");
-                            view.mcp_error = Some(
+                            let error =
                                 t!("mcp.error.policy_update_failed", error = details.as_str())
-                                    .to_string(),
-                            );
+                                    .to_string();
                             warn!(
                                 name = name.as_str(),
-                                error = %format!("{error:#}"),
+                                error = %details,
                                 "failed to set MCP policy"
                             );
+                            mcp_actions::McpActionFinishOutcome::Failure { error }
                         }
+                    };
+                    let reduction = mcp_actions::reduce_mcp_action_finish(
+                        mcp_actions::McpActionFinishKind::Policy(
+                            mcp_actions::McpActionTarget::new(name.clone()),
+                        ),
+                        outcome,
+                        view.mcp_selected_server_id.as_deref(),
+                    );
+                    if reduction.rollback_policy
+                        && let Some((prev_enabled, prev_implicit)) = previous_policy
+                    {
+                        view.apply_local_mcp_policy(name.as_str(), prev_enabled, prev_implicit);
                     }
+                    view.apply_mcp_action_finish_reduction(reduction, cx);
 
                     cx.notify();
                 });
@@ -148,30 +145,28 @@ impl PioneerDesktop {
                         return;
                     }
 
-                    view.mark_mcp_pending(name.as_str(), false);
-                    match result {
-                        Ok(_) => {
-                            view.mcp_error = None;
-                            view.queue_mcp_refresh();
-                            if mcp_actions::mcp_action_should_refresh_details(
-                                view.mcp_selected_server_id.as_deref(),
-                            ) {
-                                view.queue_mcp_details_refresh();
-                            }
-                        }
+                    let outcome = match result {
+                        Ok(_) => mcp_actions::McpActionFinishOutcome::Success,
                         Err(error) => {
                             let details = format!("{error:#}");
-                            view.mcp_error = Some(
-                                t!("mcp.error.restart_failed", error = details.as_str())
-                                    .to_string(),
-                            );
+                            let error = t!("mcp.error.restart_failed", error = details.as_str())
+                                .to_string();
                             warn!(
                                 name = name.as_str(),
-                                error = %format!("{error:#}"),
+                                error = %details,
                                 "failed to restart MCP server"
                             );
+                            mcp_actions::McpActionFinishOutcome::Failure { error }
                         }
-                    }
+                    };
+                    let reduction = mcp_actions::reduce_mcp_action_finish(
+                        mcp_actions::McpActionFinishKind::Restart(
+                            mcp_actions::McpActionTarget::new(name.clone()),
+                        ),
+                        outcome,
+                        view.mcp_selected_server_id.as_deref(),
+                    );
+                    view.apply_mcp_action_finish_reduction(reduction, cx);
 
                     cx.notify();
                 });
@@ -227,32 +222,28 @@ impl PioneerDesktop {
                         return;
                     }
 
-                    view.mark_mcp_pending(name.as_str(), false);
-                    match result {
-                        Ok(_) => {
-                            view.mcp_error = None;
-                            mcp_actions::apply_mcp_uninstall_success(
-                                &mut view.mcp_selected_server_id,
-                                &mut view.mcp_server_details,
-                            );
-                            if view.main_content_view == MainContentView::McpDetails {
-                                view.set_main_content_view(MainContentView::Mcp, cx);
-                            }
-                            view.queue_mcp_refresh();
-                        }
+                    let outcome = match result {
+                        Ok(_) => mcp_actions::McpActionFinishOutcome::Success,
                         Err(error) => {
                             let details = format!("{error:#}");
-                            view.mcp_error = Some(
-                                t!("mcp.error.uninstall_failed", error = details.as_str())
-                                    .to_string(),
-                            );
+                            let error = t!("mcp.error.uninstall_failed", error = details.as_str())
+                                .to_string();
                             warn!(
                                 name = name.as_str(),
-                                error = %format!("{error:#}"),
+                                error = %details,
                                 "failed to uninstall MCP server"
                             );
+                            mcp_actions::McpActionFinishOutcome::Failure { error }
                         }
-                    }
+                    };
+                    let reduction = mcp_actions::reduce_mcp_action_finish(
+                        mcp_actions::McpActionFinishKind::Uninstall(
+                            mcp_actions::McpActionTarget::new(name.clone()),
+                        ),
+                        outcome,
+                        view.mcp_selected_server_id.as_deref(),
+                    );
+                    view.apply_mcp_action_finish_reduction(reduction, cx);
 
                     cx.notify();
                 });
@@ -285,5 +276,32 @@ impl PioneerDesktop {
                 t!("mcp.error.workspace_not_selected").to_string()
             }
         });
+    }
+
+    fn apply_mcp_action_finish_reduction(
+        &mut self,
+        reduction: mcp_actions::McpActionFinishReduction,
+        cx: &mut Context<Self>,
+    ) {
+        self.mark_mcp_pending(
+            reduction.pending.target.name.as_str(),
+            reduction.pending.pending,
+        );
+        if reduction.clear_selected_details {
+            mcp_actions::apply_mcp_uninstall_success(
+                &mut self.mcp_selected_server_id,
+                &mut self.mcp_server_details,
+            );
+            if self.main_content_view == MainContentView::McpDetails {
+                self.set_main_content_view(MainContentView::Mcp, cx);
+            }
+        }
+        self.mcp_error = reduction.error;
+        if reduction.queue_refresh {
+            self.queue_mcp_refresh();
+        }
+        if reduction.queue_details_refresh {
+            self.queue_mcp_details_refresh();
+        }
     }
 }

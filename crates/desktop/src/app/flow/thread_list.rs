@@ -1,5 +1,7 @@
 use super::*;
+use pioneer_client::threads::history as thread_history;
 use pioneer_client::threads::start as thread_start;
+use pioneer_client::threads::tree as thread_tree;
 pub(super) use pioneer_client::turns::timeline_refresh::{
     TurnTimelineRefreshTransitionEvent, transition_turn_timeline_refresh_state,
 };
@@ -11,6 +13,111 @@ impl PioneerDesktop {
 
     pub(crate) fn thread_workspace_matches(&self, thread_id: &str, workspace_id: &str) -> bool {
         self.thread_workspace_id(thread_id) == Some(workspace_id)
+    }
+
+    fn apply_thread_tree_refresh_success_reduction(
+        &mut self,
+        reduction: thread_tree::ThreadTreeRefreshSuccessReduction,
+        connection_id: u64,
+        cx: &mut Context<Self>,
+    ) {
+        for thread in reduction.threads {
+            let thread_id = thread.id.clone();
+            let workspace_id = thread.workspace_id.clone();
+            self.upsert_thread_snapshot(thread);
+            self.upsert_thread_for_workspace(thread_id.as_str(), workspace_id.as_str());
+        }
+
+        self.set_thread_tree_snapshot(
+            reduction.folders,
+            reduction.placements,
+            reduction.agents_docs,
+        );
+        self.rebuild_sidebar_tree_state(cx);
+
+        if let Some(thread_id) = reduction.set_active_thread_id {
+            self.set_active_thread_id(Some(thread_id));
+        }
+        if let Some(workspace_id) = reduction.set_preferred_workspace_id {
+            self.set_preferred_workspace_id(Some(workspace_id));
+        }
+        if let Some(action) = reduction.ensure_thread_subscription {
+            self.ensure_thread_subscription(
+                action.thread_id,
+                action.workspace_id,
+                connection_id,
+                cx,
+            );
+        }
+        if let Some(thread_id) = reduction.ensure_thread_history_loaded {
+            self.ensure_thread_history_loaded(thread_id.as_str(), cx);
+        }
+        if reduction.request_thread_start_if_needed {
+            self.request_thread_start_if_needed();
+        }
+        if reduction.drive_thread_start_queue {
+            let _ = self.drive_thread_start_queue(cx);
+        }
+        if reduction.sync_composer_model_selection {
+            self.sync_composer_model_selection_for_active_thread();
+        }
+    }
+
+    fn apply_thread_tree_refresh_failure_reduction(
+        &mut self,
+        reduction: thread_tree::ThreadTreeRefreshFailureReduction,
+        cx: &mut Context<Self>,
+    ) {
+        if reduction.request_thread_start_if_needed {
+            self.request_thread_start_if_needed();
+        }
+        if reduction.drive_thread_start_queue {
+            let _ = self.drive_thread_start_queue(cx);
+        }
+    }
+
+    fn apply_thread_history_load_success_reduction(
+        &mut self,
+        reduction: thread_history::ThreadHistoryLoadSuccessReduction,
+    ) -> bool {
+        let thread_history::ThreadHistoryLoadSuccessReduction::Apply(reduction) = reduction else {
+            return false;
+        };
+
+        if let Some(thread_id) = reduction.clear_draft_thread_id.as_deref() {
+            self.clear_draft_thread_if_matches(thread_id);
+        }
+
+        self.upsert_thread_for_workspace(
+            reduction.thread_id.as_str(),
+            reduction.workspace_id.as_str(),
+        );
+
+        if let Some(coordinator) = self.thread_coordinator_mut(reduction.thread_id.as_str()) {
+            coordinator.conversation.hydrate_history(&reduction.events);
+            for timeline in &reduction.timelines {
+                coordinator
+                    .conversation
+                    .apply_composed_turn_timeline(timeline);
+            }
+        }
+
+        self.mark_thread_history_loaded(
+            reduction.thread_id.as_str(),
+            reduction.mark_history_loaded,
+        );
+        if reduction.sync_composer_model_selection {
+            self.sync_composer_model_selection_for_active_thread();
+        }
+        true
+    }
+
+    fn apply_thread_history_load_failure_reduction(
+        &mut self,
+        thread_id: &str,
+        reduction: thread_history::ThreadHistoryLoadFailureReduction,
+    ) {
+        self.mark_thread_history_loaded(thread_id, reduction.mark_history_loaded);
     }
 
     pub(crate) fn open_thread_from_sidebar(
@@ -109,58 +216,52 @@ impl PioneerDesktop {
 
                     match result {
                         Ok(response) => {
-                            for thread in response.threads {
-                                view.upsert_thread_snapshot(thread.clone());
-                                view.upsert_thread_for_workspace(
-                                    thread.id.as_str(),
-                                    thread.workspace_id.as_str(),
-                                );
-                            }
-
-                            view.set_thread_tree_snapshot(
-                                response.folders,
-                                response.placements,
-                                response.agents_docs,
+                            let active_thread_id =
+                                view.current_active_thread_id().map(str::to_owned);
+                            let (existing_draft_thread_id, existing_draft_thread_workspace_id) =
+                                if active_thread_id.is_none() {
+                                    let draft_thread_id = view.resolve_existing_draft_thread_id();
+                                    let draft_workspace_id = draft_thread_id
+                                        .as_deref()
+                                        .and_then(|thread_id| view.thread_workspace_id(thread_id))
+                                        .map(str::to_owned);
+                                    (draft_thread_id, draft_workspace_id)
+                                } else {
+                                    (None, None)
+                                };
+                            let reduction = thread_tree::reduce_thread_tree_refresh_success(
+                                response,
+                                thread_tree::ThreadTreeRefreshContext {
+                                    active_thread_id: active_thread_id.as_deref(),
+                                    existing_draft_thread_id: existing_draft_thread_id.as_deref(),
+                                    existing_draft_thread_workspace_id:
+                                        existing_draft_thread_workspace_id.as_deref(),
+                                    has_known_threads_for_workspace: false,
+                                },
                             );
-                            view.rebuild_sidebar_tree_state(cx);
-
-                            if view.current_active_thread_id().is_none() {
-                                if let Some(draft_thread_id) =
-                                    view.resolve_existing_draft_thread_id()
-                                {
-                                    view.set_active_thread_id(Some(draft_thread_id.clone()));
-                                    if let Some(workspace_id) = view
-                                        .thread_workspace_id(draft_thread_id.as_str())
-                                        .map(str::to_owned)
-                                    {
-                                        view.set_preferred_workspace_id(Some(workspace_id.clone()));
-                                        view.ensure_thread_subscription(
-                                            draft_thread_id.clone(),
-                                            workspace_id,
-                                            connection_id,
-                                            cx,
-                                        );
-                                    }
-                                    view.ensure_thread_history_loaded(draft_thread_id.as_str(), cx);
-                                }
-                                view.request_thread_start_if_needed();
-                                let _ = view.drive_thread_start_queue(cx);
-                            } else if let Some(active_thread_id) = view.active_thread_id.clone() {
-                                view.ensure_thread_history_loaded(active_thread_id.as_str(), cx);
-                            }
-                            view.sync_composer_model_selection_for_active_thread();
+                            view.apply_thread_tree_refresh_success_reduction(
+                                reduction,
+                                connection_id,
+                                cx,
+                            );
                         }
                         Err(error) => {
                             warn!(
                                 error = %format!("{error:#}"),
                                 "failed to refresh thread tree"
                             );
-                            if !view.has_known_threads_for_workspace(workspace_id.as_str())
-                                && view.current_active_thread_id().is_none()
-                            {
-                                view.request_thread_start_if_needed();
-                                let _ = view.drive_thread_start_queue(cx);
-                            }
+                            let active_thread_id =
+                                view.current_active_thread_id().map(str::to_owned);
+                            let reduction = thread_tree::reduce_thread_tree_refresh_failure(
+                                thread_tree::ThreadTreeRefreshContext {
+                                    active_thread_id: active_thread_id.as_deref(),
+                                    existing_draft_thread_id: None,
+                                    existing_draft_thread_workspace_id: None,
+                                    has_known_threads_for_workspace: view
+                                        .has_known_threads_for_workspace(workspace_id.as_str()),
+                                },
+                            );
+                            view.apply_thread_tree_refresh_failure_reduction(reduction, cx);
                         }
                     }
 
@@ -207,11 +308,12 @@ impl PioneerDesktop {
 
                     match result {
                         Ok(response) => {
-                            let thread = response.thread;
-                            view.upsert_thread_snapshot(thread.clone());
+                            let reduction =
+                                thread_start::reduce_thread_start_subscription_success(response);
+                            view.upsert_thread_snapshot(reduction.thread);
                             view.upsert_thread_for_workspace(
-                                thread.id.as_str(),
-                                thread.workspace_id.as_str(),
+                                reduction.thread_id.as_str(),
+                                reduction.workspace_id.as_str(),
                             );
                         }
                         Err(error) => {
@@ -273,32 +375,14 @@ impl PioneerDesktop {
 
                     match result {
                         Ok((response, timelines)) => {
-                            if response.thread_id != thread_id {
+                            let reduction = thread_history::reduce_thread_history_load_success(
+                                thread_id.as_str(),
+                                response,
+                                timelines,
+                            );
+                            if !view.apply_thread_history_load_success_reduction(reduction) {
                                 return;
                             }
-
-                            if !response.events.is_empty() {
-                                view.clear_draft_thread_if_matches(response.thread_id.as_str());
-                            }
-
-                            view.upsert_thread_for_workspace(
-                                response.thread_id.as_str(),
-                                response.workspace_id.as_str(),
-                            );
-
-                            if let Some(coordinator) =
-                                view.thread_coordinator_mut(response.thread_id.as_str())
-                            {
-                                coordinator.conversation.hydrate_history(&response.events);
-                                for timeline in &timelines {
-                                    coordinator
-                                        .conversation
-                                        .apply_composed_turn_timeline(timeline);
-                                }
-                            }
-
-                            view.mark_thread_history_loaded(thread_id.as_str(), true);
-                            view.sync_composer_model_selection_for_active_thread();
                         }
                         Err(error) => {
                             warn!(
@@ -306,7 +390,11 @@ impl PioneerDesktop {
                                 error = %format!("{error:#}"),
                                 "failed to load thread history"
                             );
-                            view.mark_thread_history_loaded(thread_id.as_str(), false);
+                            let reduction = thread_history::reduce_thread_history_load_failure();
+                            view.apply_thread_history_load_failure_reduction(
+                                thread_id.as_str(),
+                                reduction,
+                            );
                         }
                     }
 
@@ -376,12 +464,16 @@ impl PioneerDesktop {
                     if has_matching_connection {
                         match result {
                             Ok(timeline) => {
+                                let reduction =
+                                    thread_history::reduce_composed_turn_timeline_refresh_success(
+                                        timeline,
+                                    );
                                 if let Some(coordinator) =
-                                    view.thread_coordinator_mut(timeline.thread_id.as_str())
+                                    view.thread_coordinator_mut(reduction.thread_id.as_str())
                                 {
                                     coordinator
                                         .conversation
-                                        .apply_composed_turn_timeline(&timeline);
+                                        .apply_composed_turn_timeline(&reduction.timeline);
                                 }
                             }
                             Err(error) => {

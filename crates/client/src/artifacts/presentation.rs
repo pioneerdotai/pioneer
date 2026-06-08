@@ -129,36 +129,6 @@ pub fn artifact_binding_target_parts(
     parts
 }
 
-pub fn artifact_binding_target_kind_code(kind: ArtifactBindingTargetKind) -> &'static str {
-    match kind {
-        ArtifactBindingTargetKind::Thread => "thread",
-        ArtifactBindingTargetKind::Turn => "turn",
-        ArtifactBindingTargetKind::Message => "message",
-        ArtifactBindingTargetKind::Task => "task",
-        ArtifactBindingTargetKind::Tool => "tool",
-    }
-}
-
-pub fn artifact_binding_target_summary(
-    thread_id: Option<&str>,
-    turn_id: Option<&str>,
-    message_id: Option<&str>,
-    task_id: Option<&str>,
-    tool_call_id: Option<&str>,
-) -> String {
-    artifact_binding_target_parts(thread_id, turn_id, message_id, task_id, tool_call_id)
-        .into_iter()
-        .map(|part| {
-            format!(
-                "{} {}",
-                artifact_binding_target_kind_code(part.kind),
-                part.id
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" / ")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,20 +179,6 @@ mod tests {
                     id: "task_1".to_owned(),
                 },
             ]
-        );
-    }
-
-    #[test]
-    fn binding_target_summary_uses_stable_kind_codes() {
-        assert_eq!(
-            artifact_binding_target_summary(
-                Some("thread_1"),
-                Some("turn_1"),
-                None,
-                Some("task_1"),
-                Some("tool_1"),
-            ),
-            "thread thread_1 / turn turn_1 / task task_1 / tool tool_1"
         );
     }
 }

@@ -2,11 +2,6 @@ use super::*;
 use pioneer_client::threads::start as thread_start;
 use pioneer_client::workspaces::actions as workspace_actions;
 
-struct WorkspaceBootstrapOutcome {
-    workspace_id: String,
-    workspaces: Vec<Workspace>,
-}
-
 pub(crate) fn default_user_command_bin_dir_label() -> &'static str {
     #[cfg(target_os = "windows")]
     {
@@ -28,12 +23,35 @@ pub(crate) fn resolve_workspace_id_for_thread_start(
         thread_start::ThreadStartWorkspaceResolution::LoadDefaultWorkspace => {
             let response = ws_sender.workspace_default()?;
             thread_start::normalize_default_workspace_id_for_thread_start(response.workspace.id)
-                .ok_or_else(|| anyhow!("workspace/default returned an empty workspace id"))
+                .ok_or_else(|| anyhow!("{}", t!("workspace.error.default_workspace_empty")))
         }
     }
 }
 
 impl PioneerDesktop {
+    fn apply_workspace_bootstrap_success_reduction(
+        &mut self,
+        reduction: workspace_actions::WorkspaceBootstrapSuccessReduction,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace_id = reduction.selected.workspace_id.clone();
+        self.set_workspaces(reduction.workspaces);
+        if reduction.clear_workspaces_error {
+            self.set_workspaces_error(None);
+        }
+        self.persist_active_gateway_workspace_id(
+            reduction
+                .selected
+                .persist_active_gateway_workspace_id
+                .clone(),
+        );
+        self.set_preferred_workspace_id(Some(reduction.selected.set_preferred_workspace_id));
+        self.load_thread_folder_expansion_for_workspace(workspace_id.as_str(), cx);
+        if reduction.selected.refresh_thread_list {
+            self.refresh_thread_list(cx);
+        }
+    }
+
     pub(crate) fn refresh_workspace_list(&mut self, cx: &mut Context<Self>) {
         if self.workspaces_loading() {
             return;
@@ -78,7 +96,7 @@ impl PioneerDesktop {
                                     workspace,
                                 )
                                 .ok_or_else(|| {
-                                    anyhow!("workspace/default returned an empty workspace id")
+                                    anyhow!("{}", t!("workspace.error.default_workspace_empty"))
                                 })?
                             }
                         };
@@ -91,7 +109,7 @@ impl PioneerDesktop {
                             response.workspace,
                         );
 
-                        Ok::<_, anyhow::Error>(WorkspaceBootstrapOutcome {
+                        Ok::<_, anyhow::Error>(workspace_actions::WorkspaceBootstrapOutcome {
                             workspace_id,
                             workspaces,
                         })
@@ -110,16 +128,9 @@ impl PioneerDesktop {
 
                     match result {
                         Ok(outcome) => {
-                            let workspace_id = outcome.workspace_id;
-                            view.set_workspaces(outcome.workspaces);
-                            view.set_workspaces_error(None);
-                            view.persist_active_gateway_workspace_id(workspace_id.clone());
-                            view.set_preferred_workspace_id(Some(workspace_id.clone()));
-                            view.load_thread_folder_expansion_for_workspace(
-                                workspace_id.as_str(),
-                                cx,
-                            );
-                            view.refresh_thread_list(cx);
+                            let reduction =
+                                workspace_actions::reduce_workspace_bootstrap_success(outcome);
+                            view.apply_workspace_bootstrap_success_reduction(reduction, cx);
                         }
                         Err(error) => {
                             let message = format!("{error:#}");

@@ -1,5 +1,7 @@
 use super::*;
-use pioneer_client::state::reducers::{GatewayConnectionReduction, GatewayStatusMessage};
+use pioneer_client::state::reducers::{
+    GatewayConnectionReduction, GatewaySettingsConnectionError, GatewayStatusMessage,
+};
 
 impl PioneerDesktop {
     pub(in crate::app::flow) fn apply_gateway_connection_reduction(
@@ -17,7 +19,8 @@ impl PioneerDesktop {
                 self.gateway.settings = None;
             }
             self.gateway.settings_loading = settings.loading;
-            self.gateway.settings_error = settings.error;
+            self.gateway.settings_error =
+                settings.error.map(gateway_settings_connection_error_text);
         }
 
         if let Some(loading) = reduction.thread_list_loading {
@@ -44,6 +47,14 @@ impl PioneerDesktop {
 
         if let Some(cx) = cx.as_deref_mut() {
             execute_desktop_client_effects(self, reduction.effects, cx);
+        }
+    }
+}
+
+fn gateway_settings_connection_error_text(error: GatewaySettingsConnectionError) -> String {
+    match error {
+        GatewaySettingsConnectionError::GatewayNotConnected => {
+            t!("settings.gateway_not_connected").to_string()
         }
     }
 }

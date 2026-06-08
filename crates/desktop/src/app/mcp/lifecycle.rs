@@ -4,7 +4,7 @@ use crate::{
 };
 use gpui::{prelude::*, *};
 use pioneer_client::mcp::{
-    details as mcp_details, list as mcp_list,
+    actions as mcp_actions, details as mcp_details, list as mcp_list,
     notifications::{
         McpRefreshReduction, McpServerCatalogChangedReduction, McpServerStatusChangedReduction,
         apply_mcp_server_catalog_changed_to_catalog, apply_mcp_server_status_changed_to_catalog,
@@ -88,23 +88,22 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn refresh_mcp_servers(&mut self, cx: &mut Context<Self>) {
-        if self.gateway.connection_state != GatewayConnectionState::Connected {
-            self.mcp_loading = false;
-            self.mcp_error = Some(t!("mcp.error.gateway_not_connected").to_string());
-            return;
-        }
-
-        let Some(connection_id) = self.gateway.ws_connection_id else {
-            self.mcp_loading = false;
-            self.mcp_error = Some(t!("mcp.error.gateway_not_connected").to_string());
-            return;
+        let scope = match mcp_actions::plan_mcp_action_scope(
+            matches!(
+                self.gateway.connection_state,
+                GatewayConnectionState::Connected
+            ),
+            self.gateway.ws_connection_id,
+            self.mcp_workspace_scope(),
+        ) {
+            mcp_actions::McpActionScopePlan::Send(scope) => scope,
+            mcp_actions::McpActionScopePlan::Unavailable(reason) => {
+                self.apply_mcp_refresh_unavailable(reason, false);
+                return;
+            }
         };
-
-        let Some(workspace_id) = self.mcp_workspace_scope() else {
-            self.mcp_loading = false;
-            self.mcp_error = Some(t!("mcp.error.workspace_not_selected").to_string());
-            return;
-        };
+        let connection_id = scope.connection_id;
+        let workspace_id = scope.workspace_id;
 
         self.mcp_loading = true;
         self.mcp_error = None;
@@ -127,15 +126,22 @@ impl PioneerDesktop {
                     view.mcp_loading = false;
                     match result {
                         Ok(response) => {
-                            view.apply_mcp_snapshot(response.servers, cx);
-                            view.mcp_error = None;
+                            let reduction = mcp_list::reduce_mcp_list_refresh_success(
+                                std::mem::take(&mut view.mcp_servers),
+                                std::mem::take(&mut view.mcp_pending_actions),
+                                view.mcp_selected_server_id.take(),
+                                view.mcp_server_details.take(),
+                                response.servers,
+                            );
+                            view.apply_mcp_list_refresh_success_reduction(reduction, cx);
                         }
                         Err(error) => {
                             let details = format!("{error:#}");
-                            view.mcp_error = Some(
+                            let reduction = mcp_list::reduce_mcp_list_refresh_failure(
                                 t!("mcp.error.load_servers_failed", error = details.as_str())
                                     .to_string(),
                             );
+                            view.apply_mcp_list_refresh_failure_reduction(reduction);
                             warn!(error = %format!("{error:#}"), "failed to fetch MCP servers");
                         }
                     }
@@ -148,23 +154,22 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn refresh_mcp_server_details(&mut self, cx: &mut Context<Self>) {
-        if self.gateway.connection_state != GatewayConnectionState::Connected {
-            self.mcp_details_loading = false;
-            self.mcp_error = Some(t!("mcp.error.gateway_not_connected").to_string());
-            return;
-        }
-
-        let Some(connection_id) = self.gateway.ws_connection_id else {
-            self.mcp_details_loading = false;
-            self.mcp_error = Some(t!("mcp.error.gateway_not_connected").to_string());
-            return;
+        let scope = match mcp_actions::plan_mcp_action_scope(
+            matches!(
+                self.gateway.connection_state,
+                GatewayConnectionState::Connected
+            ),
+            self.gateway.ws_connection_id,
+            self.mcp_workspace_scope(),
+        ) {
+            mcp_actions::McpActionScopePlan::Send(scope) => scope,
+            mcp_actions::McpActionScopePlan::Unavailable(reason) => {
+                self.apply_mcp_refresh_unavailable(reason, true);
+                return;
+            }
         };
-
-        let Some(workspace_id) = self.mcp_workspace_scope() else {
-            self.mcp_details_loading = false;
-            self.mcp_error = Some(t!("mcp.error.workspace_not_selected").to_string());
-            return;
-        };
+        let connection_id = scope.connection_id;
+        let workspace_id = scope.workspace_id;
 
         let Some(server_id) = self.mcp_selected_server_id.clone() else {
             self.mcp_details_loading = false;
@@ -195,15 +200,21 @@ impl PioneerDesktop {
                     view.mcp_details_loading = false;
                     match result {
                         Ok(details) => {
-                            view.apply_mcp_details_response(details);
-                            view.mcp_error = None;
+                            let reduction = mcp_details::reduce_mcp_details_refresh_success(
+                                std::mem::take(&mut view.mcp_servers),
+                                view.mcp_selected_server_id.take(),
+                                view.mcp_server_details.take(),
+                                details,
+                            );
+                            view.apply_mcp_details_refresh_success_reduction(reduction);
                         }
                         Err(error) => {
                             let details = format!("{error:#}");
-                            view.mcp_error = Some(
+                            let reduction = mcp_details::reduce_mcp_details_refresh_failure(
                                 t!("mcp.error.load_details_failed", error = details.as_str())
                                     .to_string(),
                             );
+                            view.apply_mcp_details_refresh_failure_reduction(reduction);
                             warn!(error = %format!("{error:#}"), "failed to fetch MCP details");
                         }
                     }
@@ -273,6 +284,26 @@ impl PioneerDesktop {
         )
     }
 
+    fn apply_mcp_refresh_unavailable(
+        &mut self,
+        reason: mcp_actions::McpActionUnavailable,
+        details: bool,
+    ) {
+        if details {
+            self.mcp_details_loading = false;
+        } else {
+            self.mcp_loading = false;
+        }
+        self.mcp_error = Some(match reason {
+            mcp_actions::McpActionUnavailable::GatewayNotConnected => {
+                t!("mcp.error.gateway_not_connected").to_string()
+            }
+            mcp_actions::McpActionUnavailable::WorkspaceNotSelected => {
+                t!("mcp.error.workspace_not_selected").to_string()
+            }
+        });
+    }
+
     pub(super) fn is_mcp_pending(&self, name: &str) -> bool {
         mcp_list::is_mcp_pending(&self.mcp_pending_actions, name)
     }
@@ -281,37 +312,50 @@ impl PioneerDesktop {
         mcp_list::set_mcp_pending(&mut self.mcp_pending_actions, name, pending);
     }
 
-    fn apply_mcp_snapshot(
+    fn apply_mcp_list_refresh_success_reduction(
         &mut self,
-        servers: Vec<pioneer_protocol::McpListItem>,
+        reduction: mcp_list::McpListRefreshSuccessReduction,
         cx: &mut Context<Self>,
     ) {
-        let application = mcp_list::apply_mcp_snapshot(
-            &mut self.mcp_servers,
-            &mut self.mcp_pending_actions,
-            &mut self.mcp_selected_server_id,
-            &mut self.mcp_server_details,
-            servers,
-        );
+        self.mcp_servers = reduction.servers;
+        self.mcp_pending_actions = reduction.pending_actions;
+        self.mcp_selected_server_id = reduction.selected_server_id;
+        self.mcp_server_details = reduction.server_details;
+        self.mcp_error = None;
 
-        if application.selected_still_present
+        if reduction.application.selected_still_present
             && self.main_content_view == MainContentView::McpDetails
         {
             self.refresh_mcp_server_details(cx);
-        } else if application.selected_removed
+        } else if reduction.application.selected_removed
             && self.main_content_view == MainContentView::McpDetails
         {
             self.set_main_content_view(MainContentView::Mcp, cx);
         }
     }
 
-    fn apply_mcp_details_response(&mut self, details: pioneer_protocol::McpServerDetailsResponse) {
-        mcp_details::apply_mcp_details_response(
-            &mut self.mcp_servers,
-            &mut self.mcp_selected_server_id,
-            &mut self.mcp_server_details,
-            details,
-        );
+    fn apply_mcp_list_refresh_failure_reduction(
+        &mut self,
+        reduction: mcp_list::McpListRefreshFailureReduction,
+    ) {
+        self.mcp_error = Some(reduction.error);
+    }
+
+    fn apply_mcp_details_refresh_success_reduction(
+        &mut self,
+        reduction: mcp_details::McpDetailsRefreshSuccessReduction,
+    ) {
+        self.mcp_servers = reduction.servers;
+        self.mcp_selected_server_id = reduction.selected_server_id;
+        self.mcp_server_details = reduction.server_details;
+        self.mcp_error = None;
+    }
+
+    fn apply_mcp_details_refresh_failure_reduction(
+        &mut self,
+        reduction: mcp_details::McpDetailsRefreshFailureReduction,
+    ) {
+        self.mcp_error = Some(reduction.error);
     }
 
     fn ensure_mcp_poller(&mut self, cx: &mut Context<Self>) {

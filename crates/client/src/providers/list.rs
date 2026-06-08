@@ -62,6 +62,12 @@ impl ProviderListState {
         self.error = None;
     }
 
+    pub fn apply_refresh_response(&mut self, response: ProviderListResponse) {
+        self.apply_refresh_success(configured_provider_names_from_list(
+            response.providers.as_slice(),
+        ));
+    }
+
     pub fn apply_refresh_failed(&mut self, error: String) {
         self.loading = false;
         self.error = Some(error);
@@ -98,6 +104,56 @@ pub fn configured_provider_names_from_list(providers: &[ProviderSummary]) -> Has
         .iter()
         .map(|provider| catalog::canonical_provider_id(provider.name.as_str()))
         .collect()
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum ProviderListRefreshUnavailable {
+    GatewayNotConnected,
+    WorkspaceNotSelected,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ProviderListRefreshRequest {
+    pub connection_id: u64,
+    pub params: ProviderListParams,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub enum ProviderListRefreshPlan {
+    Send(ProviderListRefreshRequest),
+    Unavailable(ProviderListRefreshUnavailable),
+}
+
+pub fn plan_provider_list_refresh(
+    gateway_connected: bool,
+    connection_id: Option<u64>,
+    workspace_id: Option<String>,
+) -> ProviderListRefreshPlan {
+    let Some(connection_id) = gateway_connected.then_some(connection_id).flatten() else {
+        return ProviderListRefreshPlan::Unavailable(
+            ProviderListRefreshUnavailable::GatewayNotConnected,
+        );
+    };
+    let Some(workspace_id) = workspace_id else {
+        return ProviderListRefreshPlan::Unavailable(
+            ProviderListRefreshUnavailable::WorkspaceNotSelected,
+        );
+    };
+
+    ProviderListRefreshPlan::Send(ProviderListRefreshRequest {
+        connection_id,
+        params: provider_list_params(workspace_id),
+    })
+}
+
+pub fn provider_list_refresh_matches_connection(
+    refresh_connection_id: u64,
+    current_connection_id: Option<u64>,
+) -> bool {
+    current_connection_id == Some(refresh_connection_id)
 }
 
 #[derive(Clone, Debug)]
@@ -253,7 +309,11 @@ mod tests {
         assert!(state.loading());
         assert!(state.error().is_none());
 
-        state.apply_refresh_success(HashSet::from(["openai".to_owned()]));
+        state.apply_refresh_response(ProviderListResponse {
+            providers: vec![ProviderSummary {
+                name: "OpenAI".to_owned(),
+            }],
+        });
         assert!(!state.loading());
         assert!(state.is_configured("openai"));
 
@@ -277,6 +337,42 @@ mod tests {
 
         assert!(configured.contains("bedrock"));
         assert!(configured.contains("lmstudio"));
+    }
+
+    #[test]
+    fn provider_list_refresh_plan_requires_gateway_and_workspace() {
+        assert!(matches!(
+            plan_provider_list_refresh(false, Some(7), Some("ws".to_owned())),
+            ProviderListRefreshPlan::Unavailable(
+                ProviderListRefreshUnavailable::GatewayNotConnected
+            )
+        ));
+        assert!(matches!(
+            plan_provider_list_refresh(true, None, Some("ws".to_owned())),
+            ProviderListRefreshPlan::Unavailable(
+                ProviderListRefreshUnavailable::GatewayNotConnected
+            )
+        ));
+        assert!(matches!(
+            plan_provider_list_refresh(true, Some(7), None),
+            ProviderListRefreshPlan::Unavailable(
+                ProviderListRefreshUnavailable::WorkspaceNotSelected
+            )
+        ));
+
+        let plan = plan_provider_list_refresh(true, Some(7), Some("ws".to_owned()));
+        let ProviderListRefreshPlan::Send(request) = plan else {
+            panic!("expected send plan");
+        };
+        assert_eq!(request.connection_id, 7);
+        assert_eq!(request.params.workspace_id, "ws");
+    }
+
+    #[test]
+    fn provider_list_refresh_connection_guard_detects_stale_results() {
+        assert!(provider_list_refresh_matches_connection(7, Some(7)));
+        assert!(!provider_list_refresh_matches_connection(7, Some(8)));
+        assert!(!provider_list_refresh_matches_connection(7, None));
     }
 
     #[test]

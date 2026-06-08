@@ -1,4 +1,3 @@
-//! Task review and display helpers.
+//! Task review helpers.
 
-pub mod display;
 pub mod review;

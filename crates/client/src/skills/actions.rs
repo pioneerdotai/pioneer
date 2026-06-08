@@ -184,6 +184,106 @@ pub fn skill_action_matches_connection(
     current_connection_id == Some(action_connection_id)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillActionTarget {
+    pub slug: String,
+    pub source_kind: String,
+}
+
+impl SkillActionTarget {
+    pub fn new(slug: impl Into<String>, source_kind: impl Into<String>) -> Self {
+        Self {
+            slug: slug.into(),
+            source_kind: source_kind.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SkillActionFinishKind {
+    Install,
+    Update(SkillActionTarget),
+    Uninstall(SkillActionTarget),
+    Policy(SkillActionTarget),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SkillActionFinishOutcome {
+    Success,
+    Failure { error: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillPendingReduction {
+    pub target: SkillActionTarget,
+    pub pending: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillActionFinishReduction {
+    pub loading: Option<bool>,
+    pub clear_upload_state: bool,
+    pub pending: Option<SkillPendingReduction>,
+    pub error: Option<String>,
+    pub queue_refresh: bool,
+    pub rollback_policy: bool,
+}
+
+pub fn reduce_skill_action_finish(
+    kind: SkillActionFinishKind,
+    outcome: SkillActionFinishOutcome,
+) -> SkillActionFinishReduction {
+    let (loading, clear_upload_state, pending, rollbackable_policy) = match kind {
+        SkillActionFinishKind::Install => (Some(false), true, None, false),
+        SkillActionFinishKind::Update(target) => (
+            None,
+            true,
+            Some(SkillPendingReduction {
+                target,
+                pending: false,
+            }),
+            false,
+        ),
+        SkillActionFinishKind::Uninstall(target) => (
+            None,
+            false,
+            Some(SkillPendingReduction {
+                target,
+                pending: false,
+            }),
+            false,
+        ),
+        SkillActionFinishKind::Policy(target) => (
+            None,
+            false,
+            Some(SkillPendingReduction {
+                target,
+                pending: false,
+            }),
+            true,
+        ),
+    };
+
+    match outcome {
+        SkillActionFinishOutcome::Success => SkillActionFinishReduction {
+            loading,
+            clear_upload_state,
+            pending,
+            error: None,
+            queue_refresh: true,
+            rollback_policy: false,
+        },
+        SkillActionFinishOutcome::Failure { error } => SkillActionFinishReduction {
+            loading,
+            clear_upload_state,
+            pending,
+            error: Some(error),
+            queue_refresh: false,
+            rollback_policy: rollbackable_policy,
+        },
+    }
+}
+
 fn available_connection_id(gateway_connected: bool, connection_id: Option<u64>) -> Option<u64> {
     gateway_connected.then_some(connection_id).flatten()
 }
@@ -318,6 +418,62 @@ mod tests {
             plan_skill_action_scope(true, Some(7), None),
             SkillActionScopePlan::Unavailable(SkillActionUnavailable::WorkspaceNotSelected)
         ));
+    }
+
+    #[test]
+    fn skill_action_finish_reducer_projects_install_success() {
+        let reduction = reduce_skill_action_finish(
+            SkillActionFinishKind::Install,
+            SkillActionFinishOutcome::Success,
+        );
+
+        assert_eq!(reduction.loading, Some(false));
+        assert!(reduction.clear_upload_state);
+        assert!(reduction.pending.is_none());
+        assert!(reduction.error.is_none());
+        assert!(reduction.queue_refresh);
+        assert!(!reduction.rollback_policy);
+    }
+
+    #[test]
+    fn skill_action_finish_reducer_projects_update_failure() {
+        let target = SkillActionTarget::new("alpha", "user");
+        let reduction = reduce_skill_action_finish(
+            SkillActionFinishKind::Update(target.clone()),
+            SkillActionFinishOutcome::Failure {
+                error: "update failed".to_owned(),
+            },
+        );
+
+        assert_eq!(reduction.loading, None);
+        assert!(reduction.clear_upload_state);
+        assert_eq!(
+            reduction.pending,
+            Some(SkillPendingReduction {
+                target,
+                pending: false,
+            })
+        );
+        assert_eq!(reduction.error.as_deref(), Some("update failed"));
+        assert!(!reduction.queue_refresh);
+        assert!(!reduction.rollback_policy);
+    }
+
+    #[test]
+    fn skill_action_finish_reducer_requests_policy_rollback_on_failure() {
+        let target = SkillActionTarget::new("alpha", "user");
+        let reduction = reduce_skill_action_finish(
+            SkillActionFinishKind::Policy(target),
+            SkillActionFinishOutcome::Failure {
+                error: "policy failed".to_owned(),
+            },
+        );
+
+        assert!(!reduction.clear_upload_state);
+        assert!(reduction.pending.is_some());
+        assert_eq!(reduction.error.as_deref(), Some("policy failed"));
+        assert!(!reduction.queue_refresh);
+        assert!(reduction.rollback_policy);
     }
 
     #[test]

@@ -445,11 +445,17 @@ pub enum GatewayConnectionEvent {
     },
 }
 
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum GatewaySettingsConnectionError {
+    GatewayNotConnected,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GatewaySettingsConnectionUpdate {
     pub clear_settings: bool,
     pub loading: bool,
-    pub error: Option<String>,
+    pub error: Option<GatewaySettingsConnectionError>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -467,6 +473,48 @@ pub struct GatewayConnectionReduction {
     pub clear_thread_start_queue: bool,
     pub clear_turn_resume_queue: bool,
     pub effects: Vec<ClientEffect>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GatewayOperationSuccessInfo {
+    pub ws_connection_id: Option<u64>,
+    pub ws_connected_ready: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GatewayOperationFinishOutcome {
+    Success(GatewayOperationSuccessInfo),
+    Failure { error: String },
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct GatewayOperationBeginReduction {
+    pub connecting: bool,
+    pub connection_state: GatewayConnectionState,
+    pub status_level: GatewayStatusLevel,
+    pub gateway_error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GatewayOperationFinishReduction {
+    pub connecting: bool,
+    pub clear_setup_action: bool,
+    pub bootstrap_complete: bool,
+    pub ws_connection_id: Option<u64>,
+    pub status: Option<GatewayStatusMessage>,
+    pub status_level: Option<GatewayStatusLevel>,
+    pub connection_state: GatewayConnectionState,
+    pub gateway_error: Option<String>,
+    pub clear_active_thread: bool,
+    pub reset_thread_start: bool,
+    pub clear_thread_start_queue: bool,
+    pub clear_turn_resume_queue: bool,
+    pub disconnect_ws: bool,
+    pub refresh_gateway_status: bool,
+    pub sync_gateway_setup_form_state: bool,
+    pub effects: Vec<ClientEffect>,
+    pub drive_turn_resume_queue: bool,
 }
 
 pub fn reduce_gateway_connection_event(
@@ -602,11 +650,86 @@ pub fn reduce_gateway_connection_event(
     }
 }
 
+pub fn reduce_gateway_operation_begin() -> GatewayOperationBeginReduction {
+    GatewayOperationBeginReduction {
+        connecting: true,
+        connection_state: GatewayConnectionState::Connecting,
+        status_level: GatewayStatusLevel::Neutral,
+        gateway_error: None,
+    }
+}
+
+pub fn reduce_gateway_operation_finish(
+    outcome: GatewayOperationFinishOutcome,
+) -> GatewayOperationFinishReduction {
+    match outcome {
+        GatewayOperationFinishOutcome::Success(success) => {
+            let waiting_for_ws_ready =
+                success.ws_connection_id.is_some() && !success.ws_connected_ready;
+            let connected_ready = success.ws_connection_id.is_some() && success.ws_connected_ready;
+            let connection_state = if waiting_for_ws_ready {
+                GatewayConnectionState::Connecting
+            } else if success.ws_connection_id.is_some() {
+                GatewayConnectionState::Connected
+            } else {
+                GatewayConnectionState::Idle
+            };
+
+            GatewayOperationFinishReduction {
+                connecting: false,
+                clear_setup_action: true,
+                bootstrap_complete: true,
+                ws_connection_id: success.ws_connection_id,
+                status: waiting_for_ws_ready.then_some(GatewayStatusMessage::Connecting),
+                status_level: waiting_for_ws_ready.then_some(GatewayStatusLevel::Neutral),
+                connection_state,
+                gateway_error: None,
+                clear_active_thread: success.ws_connection_id.is_none(),
+                reset_thread_start: true,
+                clear_thread_start_queue: true,
+                clear_turn_resume_queue: true,
+                disconnect_ws: success.ws_connection_id.is_none(),
+                refresh_gateway_status: !waiting_for_ws_ready,
+                sync_gateway_setup_form_state: !waiting_for_ws_ready,
+                effects: if connected_ready {
+                    vec![
+                        ClientEffect::RefreshWorkspaceList,
+                        ClientEffect::RefreshGatewaySettings,
+                        ClientEffect::EnqueueInFlightTurnsForResume,
+                    ]
+                } else {
+                    Vec::new()
+                },
+                drive_turn_resume_queue: connected_ready,
+            }
+        }
+        GatewayOperationFinishOutcome::Failure { error } => GatewayOperationFinishReduction {
+            connecting: false,
+            clear_setup_action: true,
+            bootstrap_complete: true,
+            ws_connection_id: None,
+            status: None,
+            status_level: None,
+            connection_state: GatewayConnectionState::Disconnected,
+            gateway_error: Some(error),
+            clear_active_thread: true,
+            reset_thread_start: true,
+            clear_thread_start_queue: true,
+            clear_turn_resume_queue: true,
+            disconnect_ws: true,
+            refresh_gateway_status: true,
+            sync_gateway_setup_form_state: true,
+            effects: Vec::new(),
+            drive_turn_resume_queue: false,
+        },
+    }
+}
+
 fn gateway_disconnected_settings_update() -> GatewaySettingsConnectionUpdate {
     GatewaySettingsConnectionUpdate {
         clear_settings: true,
         loading: false,
-        error: Some("Gateway is not connected".to_owned()),
+        error: Some(GatewaySettingsConnectionError::GatewayNotConnected),
     }
 }
 
@@ -1091,6 +1214,98 @@ mod tests {
     }
 
     #[test]
+    fn gateway_operation_begin_reducer_projects_connecting_state() {
+        let reduction = reduce_gateway_operation_begin();
+
+        assert!(reduction.connecting);
+        assert_eq!(
+            reduction.connection_state,
+            GatewayConnectionState::Connecting
+        );
+        assert_eq!(reduction.status_level, GatewayStatusLevel::Neutral);
+        assert!(reduction.gateway_error.is_none());
+    }
+
+    #[test]
+    fn gateway_operation_finish_reducer_projects_ready_connection() {
+        let reduction = reduce_gateway_operation_finish(GatewayOperationFinishOutcome::Success(
+            GatewayOperationSuccessInfo {
+                ws_connection_id: Some(7),
+                ws_connected_ready: true,
+            },
+        ));
+
+        assert!(!reduction.connecting);
+        assert!(reduction.clear_setup_action);
+        assert!(reduction.bootstrap_complete);
+        assert_eq!(reduction.ws_connection_id, Some(7));
+        assert_eq!(
+            reduction.connection_state,
+            GatewayConnectionState::Connected
+        );
+        assert!(reduction.gateway_error.is_none());
+        assert!(!reduction.clear_active_thread);
+        assert!(!reduction.disconnect_ws);
+        assert!(reduction.refresh_gateway_status);
+        assert!(reduction.sync_gateway_setup_form_state);
+        assert!(reduction.drive_turn_resume_queue);
+        assert_eq!(
+            reduction.effects,
+            vec![
+                ClientEffect::RefreshWorkspaceList,
+                ClientEffect::RefreshGatewaySettings,
+                ClientEffect::EnqueueInFlightTurnsForResume,
+            ]
+        );
+    }
+
+    #[test]
+    fn gateway_operation_finish_reducer_waits_for_ws_ready() {
+        let reduction = reduce_gateway_operation_finish(GatewayOperationFinishOutcome::Success(
+            GatewayOperationSuccessInfo {
+                ws_connection_id: Some(7),
+                ws_connected_ready: false,
+            },
+        ));
+
+        assert_eq!(reduction.status, Some(GatewayStatusMessage::Connecting));
+        assert_eq!(reduction.status_level, Some(GatewayStatusLevel::Neutral));
+        assert_eq!(
+            reduction.connection_state,
+            GatewayConnectionState::Connecting
+        );
+        assert!(!reduction.refresh_gateway_status);
+        assert!(!reduction.sync_gateway_setup_form_state);
+        assert!(reduction.effects.is_empty());
+        assert!(!reduction.drive_turn_resume_queue);
+    }
+
+    #[test]
+    fn gateway_operation_finish_reducer_projects_failure() {
+        let reduction = reduce_gateway_operation_finish(GatewayOperationFinishOutcome::Failure {
+            error: "network failed".to_owned(),
+        });
+
+        assert!(!reduction.connecting);
+        assert!(reduction.clear_setup_action);
+        assert!(reduction.bootstrap_complete);
+        assert_eq!(reduction.ws_connection_id, None);
+        assert_eq!(
+            reduction.connection_state,
+            GatewayConnectionState::Disconnected
+        );
+        assert_eq!(reduction.gateway_error.as_deref(), Some("network failed"));
+        assert!(reduction.clear_active_thread);
+        assert!(reduction.reset_thread_start);
+        assert!(reduction.clear_thread_start_queue);
+        assert!(reduction.clear_turn_resume_queue);
+        assert!(reduction.disconnect_ws);
+        assert!(reduction.refresh_gateway_status);
+        assert!(reduction.sync_gateway_setup_form_state);
+        assert!(reduction.effects.is_empty());
+    }
+
+    #[test]
     fn gateway_status_projection_preserves_existing_connecting_text() {
         let projection = project_gateway_status(GatewayStatusInput {
             connecting: true,
@@ -1243,7 +1458,7 @@ mod tests {
             Some(GatewaySettingsConnectionUpdate {
                 clear_settings: true,
                 loading: false,
-                error: Some("Gateway is not connected".to_owned()),
+                error: Some(GatewaySettingsConnectionError::GatewayNotConnected),
             })
         );
     }

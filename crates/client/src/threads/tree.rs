@@ -3,9 +3,9 @@
 use crate::agents_doc::scope::{AgentsDocEditorScope, ThreadAgentsDocSummaryKey};
 use crate::threads::coordinator::ThreadCoordinator;
 use pioneer_protocol::{
-    ThreadAgentsDocSummary, ThreadFolder, ThreadFolderCreateParams, ThreadFolderDeleteParams,
-    ThreadFolderMoveParams, ThreadMoveParams, ThreadPlacement, ThreadTreeParams,
-    ThreadUpdateParams,
+    Thread, ThreadAgentsDocSummary, ThreadFolder, ThreadFolderCreateParams,
+    ThreadFolderDeleteParams, ThreadFolderMoveParams, ThreadMoveParams, ThreadPlacement,
+    ThreadTreeParams, ThreadTreeResponse, ThreadUpdateParams, ThreadUpdateResponse,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -45,6 +45,12 @@ pub enum SidebarTreeNodeKey<'a> {
     AgentsDocRoot,
     AgentsDocFolder(&'a str),
     Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SidebarTreeDragItemRef<'a> {
+    Thread { thread_id: &'a str },
+    Folder { folder_id: &'a str },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -146,6 +152,13 @@ pub enum ThreadRenamePlan {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadRenameSuccessReduction {
+    pub thread: Thread,
+    pub thread_id: String,
+    pub workspace_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ThreadMovePlan {
     Skip(ThreadTreeActionRejection),
     Request(ThreadMoveParams),
@@ -161,6 +174,105 @@ pub enum ThreadFolderMovePlan {
 pub enum ThreadFolderDeletePlan {
     Skip(ThreadTreeActionRejection),
     Request(ThreadFolderDeleteParams),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ThreadTreeRefreshContext<'a> {
+    pub active_thread_id: Option<&'a str>,
+    pub existing_draft_thread_id: Option<&'a str>,
+    pub existing_draft_thread_workspace_id: Option<&'a str>,
+    pub has_known_threads_for_workspace: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadTreeThreadAction {
+    pub thread_id: String,
+    pub workspace_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadTreeRefreshSuccessReduction {
+    pub workspace_id: String,
+    pub threads: Vec<Thread>,
+    pub folders: Vec<ThreadFolder>,
+    pub placements: Vec<ThreadPlacement>,
+    pub agents_docs: Vec<ThreadAgentsDocSummary>,
+    pub set_active_thread_id: Option<String>,
+    pub set_preferred_workspace_id: Option<String>,
+    pub ensure_thread_subscription: Option<ThreadTreeThreadAction>,
+    pub ensure_thread_history_loaded: Option<String>,
+    pub request_thread_start_if_needed: bool,
+    pub drive_thread_start_queue: bool,
+    pub sync_composer_model_selection: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ThreadTreeRefreshFailureReduction {
+    pub request_thread_start_if_needed: bool,
+    pub drive_thread_start_queue: bool,
+}
+
+pub fn reduce_thread_tree_refresh_success(
+    response: ThreadTreeResponse,
+    context: ThreadTreeRefreshContext<'_>,
+) -> ThreadTreeRefreshSuccessReduction {
+    let mut set_active_thread_id = None;
+    let mut set_preferred_workspace_id = None;
+    let mut ensure_thread_subscription = None;
+    let mut ensure_thread_history_loaded = None;
+    let mut request_thread_start_if_needed = false;
+    let mut drive_thread_start_queue = false;
+
+    match context.active_thread_id {
+        Some(active_thread_id) => {
+            ensure_thread_history_loaded = Some(active_thread_id.to_owned());
+        }
+        None => {
+            if let Some(draft_thread_id) = context.existing_draft_thread_id {
+                set_active_thread_id = Some(draft_thread_id.to_owned());
+                ensure_thread_history_loaded = Some(draft_thread_id.to_owned());
+
+                if let Some(workspace_id) = context.existing_draft_thread_workspace_id {
+                    set_preferred_workspace_id = Some(workspace_id.to_owned());
+                    ensure_thread_subscription = Some(ThreadTreeThreadAction {
+                        thread_id: draft_thread_id.to_owned(),
+                        workspace_id: workspace_id.to_owned(),
+                    });
+                }
+            }
+
+            request_thread_start_if_needed = true;
+            drive_thread_start_queue = true;
+        }
+    }
+
+    ThreadTreeRefreshSuccessReduction {
+        workspace_id: response.workspace_id,
+        threads: response.threads,
+        folders: response.folders,
+        placements: response.placements,
+        agents_docs: response.agents_docs,
+        set_active_thread_id,
+        set_preferred_workspace_id,
+        ensure_thread_subscription,
+        ensure_thread_history_loaded,
+        request_thread_start_if_needed,
+        drive_thread_start_queue,
+        sync_composer_model_selection: true,
+    }
+}
+
+pub fn reduce_thread_tree_refresh_failure(
+    context: ThreadTreeRefreshContext<'_>,
+) -> ThreadTreeRefreshFailureReduction {
+    if context.active_thread_id.is_some() || context.has_known_threads_for_workspace {
+        return ThreadTreeRefreshFailureReduction::default();
+    }
+
+    ThreadTreeRefreshFailureReduction {
+        request_thread_start_if_needed: true,
+        drive_thread_start_queue: true,
+    }
 }
 
 pub fn normalize_thread_tree_snapshot(
@@ -623,6 +735,27 @@ pub fn can_move_folder_to(
     true
 }
 
+pub fn can_drop_sidebar_tree_item_on_folder(
+    folders: &HashMap<String, ThreadFolder>,
+    active_workspace_id: Option<&str>,
+    item: SidebarTreeDragItemRef<'_>,
+    target_folder_id: &str,
+) -> bool {
+    let Some(target_folder) = folders.get(target_folder_id) else {
+        return false;
+    };
+    if active_workspace_id.is_some_and(|workspace_id| target_folder.workspace_id != workspace_id) {
+        return false;
+    }
+
+    match item {
+        SidebarTreeDragItemRef::Thread { .. } => true,
+        SidebarTreeDragItemRef::Folder { folder_id } => {
+            can_move_folder_to(folders, folder_id, target_folder_id)
+        }
+    }
+}
+
 pub fn plan_thread_folder_create(
     folders: &HashMap<String, ThreadFolder>,
     workspace_id: Option<&str>,
@@ -753,6 +886,17 @@ pub fn plan_thread_rename(
         thread_id: thread_id.to_owned(),
         name: Some(new_name.to_owned()),
     })
+}
+
+pub fn reduce_thread_rename_success(
+    response: ThreadUpdateResponse,
+) -> ThreadRenameSuccessReduction {
+    let thread = response.thread;
+    ThreadRenameSuccessReduction {
+        thread_id: thread.id.clone(),
+        workspace_id: thread.workspace_id.clone(),
+        thread,
+    }
 }
 
 pub fn plan_thread_move(
@@ -1020,6 +1164,117 @@ mod tests {
         queue_thread_tree_refresh(&mut requested);
         assert!(take_thread_tree_refresh_request(&mut requested));
         assert!(!take_thread_tree_refresh_request(&mut requested));
+    }
+
+    #[test]
+    fn thread_tree_refresh_success_restores_existing_draft_and_requests_start() {
+        let response_thread = thread("thread_draft", "ws_a", 10);
+        let response_folder = folder("folder_a");
+        let response_placement = placement("thread_draft", Some("folder_a"));
+        let response_agents_doc =
+            agents_doc_summary_for_workspace("ws_a", None, ThreadAgentsDocStatus::Active);
+
+        let reduction = reduce_thread_tree_refresh_success(
+            ThreadTreeResponse {
+                workspace_id: "ws_a".to_owned(),
+                threads: vec![response_thread.clone()],
+                folders: vec![response_folder.clone()],
+                placements: vec![response_placement.clone()],
+                agents_docs: vec![response_agents_doc.clone()],
+            },
+            ThreadTreeRefreshContext {
+                active_thread_id: None,
+                existing_draft_thread_id: Some("thread_draft"),
+                existing_draft_thread_workspace_id: Some("ws_a"),
+                has_known_threads_for_workspace: false,
+            },
+        );
+
+        assert_eq!(reduction.workspace_id, "ws_a");
+        assert_eq!(reduction.threads, vec![response_thread]);
+        assert_eq!(reduction.folders, vec![response_folder]);
+        assert_eq!(reduction.placements, vec![response_placement]);
+        assert_eq!(reduction.agents_docs, vec![response_agents_doc]);
+        assert_eq!(
+            reduction.set_active_thread_id.as_deref(),
+            Some("thread_draft")
+        );
+        assert_eq!(
+            reduction.set_preferred_workspace_id.as_deref(),
+            Some("ws_a")
+        );
+        assert_eq!(
+            reduction.ensure_thread_subscription,
+            Some(ThreadTreeThreadAction {
+                thread_id: "thread_draft".to_owned(),
+                workspace_id: "ws_a".to_owned(),
+            })
+        );
+        assert_eq!(
+            reduction.ensure_thread_history_loaded.as_deref(),
+            Some("thread_draft")
+        );
+        assert!(reduction.request_thread_start_if_needed);
+        assert!(reduction.drive_thread_start_queue);
+        assert!(reduction.sync_composer_model_selection);
+    }
+
+    #[test]
+    fn thread_tree_refresh_success_loads_active_thread_history_without_starting_thread() {
+        let reduction = reduce_thread_tree_refresh_success(
+            ThreadTreeResponse {
+                workspace_id: "ws_a".to_owned(),
+                threads: Vec::new(),
+                folders: Vec::new(),
+                placements: Vec::new(),
+                agents_docs: Vec::new(),
+            },
+            ThreadTreeRefreshContext {
+                active_thread_id: Some("thread_active"),
+                existing_draft_thread_id: Some("thread_draft"),
+                existing_draft_thread_workspace_id: Some("ws_a"),
+                has_known_threads_for_workspace: true,
+            },
+        );
+
+        assert_eq!(reduction.set_active_thread_id, None);
+        assert_eq!(reduction.set_preferred_workspace_id, None);
+        assert_eq!(reduction.ensure_thread_subscription, None);
+        assert_eq!(
+            reduction.ensure_thread_history_loaded.as_deref(),
+            Some("thread_active")
+        );
+        assert!(!reduction.request_thread_start_if_needed);
+        assert!(!reduction.drive_thread_start_queue);
+        assert!(reduction.sync_composer_model_selection);
+    }
+
+    #[test]
+    fn thread_tree_refresh_failure_starts_thread_only_when_workspace_is_empty_and_inactive() {
+        let start = reduce_thread_tree_refresh_failure(ThreadTreeRefreshContext {
+            active_thread_id: None,
+            existing_draft_thread_id: None,
+            existing_draft_thread_workspace_id: None,
+            has_known_threads_for_workspace: false,
+        });
+        assert!(start.request_thread_start_if_needed);
+        assert!(start.drive_thread_start_queue);
+
+        let active = reduce_thread_tree_refresh_failure(ThreadTreeRefreshContext {
+            active_thread_id: Some("thread_active"),
+            existing_draft_thread_id: None,
+            existing_draft_thread_workspace_id: None,
+            has_known_threads_for_workspace: false,
+        });
+        assert_eq!(active, ThreadTreeRefreshFailureReduction::default());
+
+        let known_threads = reduce_thread_tree_refresh_failure(ThreadTreeRefreshContext {
+            active_thread_id: None,
+            existing_draft_thread_id: None,
+            existing_draft_thread_workspace_id: None,
+            has_known_threads_for_workspace: true,
+        });
+        assert_eq!(known_threads, ThreadTreeRefreshFailureReduction::default());
     }
 
     #[test]
@@ -1293,6 +1548,63 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_folder_drop_guard_uses_folder_tree_rules() {
+        let folders = HashMap::from([
+            (
+                "root".to_owned(),
+                folder_for_workspace("root", "ws_a", None, "Root"),
+            ),
+            (
+                "child".to_owned(),
+                folder_for_workspace("child", "ws_a", Some("root"), "Child"),
+            ),
+            (
+                "sibling".to_owned(),
+                folder_for_workspace("sibling", "ws_a", None, "Sibling"),
+            ),
+            (
+                "other_ws".to_owned(),
+                folder_for_workspace("other_ws", "ws_b", None, "Other"),
+            ),
+        ]);
+
+        assert!(can_drop_sidebar_tree_item_on_folder(
+            &folders,
+            Some("ws_a"),
+            SidebarTreeDragItemRef::Thread {
+                thread_id: "thread_1"
+            },
+            "root"
+        ));
+        assert!(!can_drop_sidebar_tree_item_on_folder(
+            &folders,
+            Some("ws_a"),
+            SidebarTreeDragItemRef::Folder { folder_id: "root" },
+            "root"
+        ));
+        assert!(!can_drop_sidebar_tree_item_on_folder(
+            &folders,
+            Some("ws_a"),
+            SidebarTreeDragItemRef::Folder { folder_id: "root" },
+            "child"
+        ));
+        assert!(can_drop_sidebar_tree_item_on_folder(
+            &folders,
+            Some("ws_a"),
+            SidebarTreeDragItemRef::Folder { folder_id: "root" },
+            "sibling"
+        ));
+        assert!(!can_drop_sidebar_tree_item_on_folder(
+            &folders,
+            Some("ws_a"),
+            SidebarTreeDragItemRef::Thread {
+                thread_id: "thread_1"
+            },
+            "other_ws"
+        ));
+    }
+
+    #[test]
     fn folder_create_and_rename_plans_build_protocol_requests() {
         let folders = HashMap::from([
             (
@@ -1429,6 +1741,20 @@ mod tests {
             plan_thread_rename(&coordinators, Some("ws_a"), "missing", "Name"),
             ThreadRenamePlan::Skip(ThreadTreeActionRejection::MissingThread)
         );
+    }
+
+    #[test]
+    fn thread_rename_success_reduction_extracts_snapshot_and_workspace_mapping() {
+        let mut thread = thread("thread_a", "ws_a", 10);
+        thread.name = Some("Renamed".to_owned());
+
+        let reduction = reduce_thread_rename_success(ThreadUpdateResponse {
+            thread: thread.clone(),
+        });
+
+        assert_eq!(reduction.thread, thread);
+        assert_eq!(reduction.thread_id, "thread_a");
+        assert_eq!(reduction.workspace_id, "ws_a");
     }
 
     #[test]

@@ -392,8 +392,7 @@ pub(super) async fn run_agent_loop(
                                             .tools
                                             .total_count,
                                         reason: blocked_reason.clone(),
-                                        blocked_at_unix_ms: chrono::Local::now()
-                                            .timestamp_millis(),
+                                        blocked_at_unix_ms: chrono::Local::now().timestamp_millis(),
                                     },
                                 },
                             )

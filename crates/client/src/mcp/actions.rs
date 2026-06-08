@@ -54,6 +54,28 @@ pub enum McpInstallFieldIssue {
     },
 }
 
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum McpInstallFieldError {
+    ValidationIssues(Vec<McpInstallFieldIssue>),
+    Failure { message: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum McpInstallFinishOutcome {
+    Response(McpInstallResponse),
+    Failure { field_error: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpInstallFinishReduction {
+    pub pending: McpPendingReduction,
+    pub field_error: Option<McpInstallFieldError>,
+    pub close_dialog: bool,
+    pub clear_mcp_error: bool,
+    pub queue_refresh: bool,
+}
+
 pub fn normalize_mcp_config_json(raw: &str) -> Option<String> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -215,6 +237,117 @@ pub fn mcp_action_matches_connection(
     current_connection_id: Option<u64>,
 ) -> bool {
     current_connection_id == Some(action_connection_id)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpActionTarget {
+    pub name: String,
+}
+
+impl McpActionTarget {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum McpActionFinishKind {
+    Policy(McpActionTarget),
+    Restart(McpActionTarget),
+    Uninstall(McpActionTarget),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum McpActionFinishOutcome {
+    Success,
+    Failure { error: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpPendingReduction {
+    pub target: McpActionTarget,
+    pub pending: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpActionFinishReduction {
+    pub pending: McpPendingReduction,
+    pub error: Option<String>,
+    pub queue_refresh: bool,
+    pub queue_details_refresh: bool,
+    pub clear_selected_details: bool,
+    pub rollback_policy: bool,
+}
+
+pub fn reduce_mcp_action_finish(
+    kind: McpActionFinishKind,
+    outcome: McpActionFinishOutcome,
+    selected_server_id: Option<&str>,
+) -> McpActionFinishReduction {
+    let (target, clear_selected_details, rollbackable_policy) = match kind {
+        McpActionFinishKind::Policy(target) => (target, false, true),
+        McpActionFinishKind::Restart(target) => (target, false, false),
+        McpActionFinishKind::Uninstall(target) => (target, true, false),
+    };
+    let pending = McpPendingReduction {
+        target,
+        pending: false,
+    };
+
+    match outcome {
+        McpActionFinishOutcome::Success => McpActionFinishReduction {
+            pending,
+            error: None,
+            queue_refresh: true,
+            queue_details_refresh: !clear_selected_details
+                && mcp_action_should_refresh_details(selected_server_id),
+            clear_selected_details,
+            rollback_policy: false,
+        },
+        McpActionFinishOutcome::Failure { error } => McpActionFinishReduction {
+            pending,
+            error: Some(error),
+            queue_refresh: false,
+            queue_details_refresh: false,
+            clear_selected_details: false,
+            rollback_policy: rollbackable_policy,
+        },
+    }
+}
+
+pub fn reduce_mcp_install_finish(outcome: McpInstallFinishOutcome) -> McpInstallFinishReduction {
+    let pending = McpPendingReduction {
+        target: McpActionTarget::new(list::MCP_INSTALL_PENDING_KEY),
+        pending: false,
+    };
+
+    match outcome {
+        McpInstallFinishOutcome::Response(response) => {
+            let close_dialog = mcp_install_should_close_dialog(&response);
+            McpInstallFinishReduction {
+                pending,
+                field_error: if close_dialog {
+                    None
+                } else {
+                    Some(McpInstallFieldError::ValidationIssues(
+                        mcp_install_response_field_issues(&response),
+                    ))
+                },
+                close_dialog,
+                clear_mcp_error: close_dialog,
+                queue_refresh: mcp_install_has_success(&response) || close_dialog,
+            }
+        }
+        McpInstallFinishOutcome::Failure { field_error } => McpInstallFinishReduction {
+            pending,
+            field_error: Some(McpInstallFieldError::Failure {
+                message: field_error,
+            }),
+            close_dialog: false,
+            clear_mcp_error: false,
+            queue_refresh: false,
+        },
+    }
 }
 
 fn available_connection_id(gateway_connected: bool, connection_id: Option<u64>) -> Option<u64> {
@@ -463,6 +596,75 @@ mod tests {
     }
 
     #[test]
+    fn install_finish_reducer_projects_partial_validation_response() {
+        let response = McpInstallResponse {
+            status: McpInstallStatus::Partial,
+            servers: vec![
+                McpInstallResult {
+                    name: "github".to_owned(),
+                    status: McpInstallResultStatus::Installed,
+                    diagnostics: Vec::new(),
+                    server: None,
+                },
+                McpInstallResult {
+                    name: "bad".to_owned(),
+                    status: McpInstallResultStatus::ValidationError,
+                    diagnostics: Vec::new(),
+                    server: None,
+                },
+            ],
+            audit: McpLifecycleAuditSummary { events_written: 1 },
+        };
+
+        let reduction = reduce_mcp_install_finish(McpInstallFinishOutcome::Response(response));
+
+        assert_eq!(reduction.pending.target.name, list::MCP_INSTALL_PENDING_KEY);
+        assert!(!reduction.pending.pending);
+        assert!(reduction.queue_refresh);
+        assert!(!reduction.close_dialog);
+        assert!(!reduction.clear_mcp_error);
+        assert!(matches!(
+            reduction.field_error,
+            Some(McpInstallFieldError::ValidationIssues(ref issues))
+                if matches!(
+                    issues.as_slice(),
+                    [McpInstallFieldIssue::ServerValidationError { name }] if name == "bad"
+                )
+        ));
+    }
+
+    #[test]
+    fn install_finish_reducer_projects_success_and_failure() {
+        let response = McpInstallResponse {
+            status: McpInstallStatus::Ok,
+            servers: vec![McpInstallResult {
+                name: "github".to_owned(),
+                status: McpInstallResultStatus::Updated,
+                diagnostics: Vec::new(),
+                server: None,
+            }],
+            audit: McpLifecycleAuditSummary { events_written: 1 },
+        };
+        let success = reduce_mcp_install_finish(McpInstallFinishOutcome::Response(response));
+        assert!(success.close_dialog);
+        assert!(success.clear_mcp_error);
+        assert!(success.queue_refresh);
+        assert!(success.field_error.is_none());
+
+        let failure = reduce_mcp_install_finish(McpInstallFinishOutcome::Failure {
+            field_error: "install failed".to_owned(),
+        });
+        assert_eq!(
+            failure.field_error,
+            Some(McpInstallFieldError::Failure {
+                message: "install failed".to_owned()
+            })
+        );
+        assert!(!failure.queue_refresh);
+        assert!(!failure.close_dialog);
+    }
+
+    #[test]
     fn action_connection_and_uninstall_helpers_are_deterministic() {
         assert!(mcp_action_matches_connection(5, Some(5)));
         assert!(!mcp_action_matches_connection(5, Some(6)));
@@ -474,5 +676,53 @@ mod tests {
         apply_mcp_uninstall_success(&mut selected, &mut details);
         assert_eq!(selected, None);
         assert!(details.is_none());
+    }
+
+    #[test]
+    fn action_finish_reducer_projects_policy_success() {
+        let reduction = reduce_mcp_action_finish(
+            McpActionFinishKind::Policy(McpActionTarget::new("github")),
+            McpActionFinishOutcome::Success,
+            Some("id-github"),
+        );
+
+        assert_eq!(reduction.pending.target.name, "github");
+        assert!(!reduction.pending.pending);
+        assert!(reduction.error.is_none());
+        assert!(reduction.queue_refresh);
+        assert!(reduction.queue_details_refresh);
+        assert!(!reduction.clear_selected_details);
+        assert!(!reduction.rollback_policy);
+    }
+
+    #[test]
+    fn action_finish_reducer_projects_uninstall_success() {
+        let reduction = reduce_mcp_action_finish(
+            McpActionFinishKind::Uninstall(McpActionTarget::new("github")),
+            McpActionFinishOutcome::Success,
+            Some("id-github"),
+        );
+
+        assert!(reduction.queue_refresh);
+        assert!(!reduction.queue_details_refresh);
+        assert!(reduction.clear_selected_details);
+        assert!(!reduction.rollback_policy);
+    }
+
+    #[test]
+    fn action_finish_reducer_requests_policy_rollback_on_failure() {
+        let reduction = reduce_mcp_action_finish(
+            McpActionFinishKind::Policy(McpActionTarget::new("github")),
+            McpActionFinishOutcome::Failure {
+                error: "policy failed".to_owned(),
+            },
+            Some("id-github"),
+        );
+
+        assert_eq!(reduction.error.as_deref(), Some("policy failed"));
+        assert!(!reduction.queue_refresh);
+        assert!(!reduction.queue_details_refresh);
+        assert!(!reduction.clear_selected_details);
+        assert!(reduction.rollback_policy);
     }
 }

@@ -1,6 +1,5 @@
 //! UI-neutral timeline labels and status codes.
 
-use super::rows::{TimelineCoalescedToolsKind, TimelineCoalescedToolsRow};
 use crate::conversation::{ItemView, TimelineEntryStatus};
 use pioneer_protocol::{
     ArtifactRef, SystemEventLevel, ToolDisplayPayload, ToolMetadataValue, ToolStoragePayload,
@@ -50,21 +49,6 @@ pub fn timeline_entry_text(item_view: &ItemView) -> &str {
         .final_text
         .as_deref()
         .unwrap_or(item_view.partial_text.as_str())
-}
-
-pub fn timeline_work_group_completed_label() -> &'static str {
-    "Completed"
-}
-
-pub fn coalesced_tools_label(group: &TimelineCoalescedToolsRow) -> String {
-    match group.kind {
-        TimelineCoalescedToolsKind::CompletedTaskTools => {
-            format!("{} completed tool calls", group.count)
-        }
-        TimelineCoalescedToolsKind::RepeatedTaskWait => {
-            format!("{} repeated task_wait calls", group.count)
-        }
-    }
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -394,18 +378,6 @@ pub enum TimelineFinalStatusKind {
     Completed,
 }
 
-impl TimelineFinalStatusKind {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Cancelled => "Cancelled",
-            Self::Blocked => "Blocked",
-            Self::Failed => "Failed",
-            Self::Running => "Running",
-            Self::Completed => "Completed",
-        }
-    }
-}
-
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct TimelineFinalStatus {
@@ -416,14 +388,6 @@ pub struct TimelineFinalStatus {
 impl TimelineFinalStatus {
     pub fn new(kind: TimelineFinalStatusKind, successful: bool) -> Self {
         Self { kind, successful }
-    }
-
-    pub fn label(self) -> &'static str {
-        self.kind.label()
-    }
-
-    pub fn into_label_tuple(self) -> (String, bool) {
-        (self.label().to_owned(), self.successful)
     }
 }
 
@@ -439,8 +403,8 @@ pub fn final_web_fetch_status(
     status: TimelineEntryStatus,
     success: Option<bool>,
     status_code: Option<u16>,
-) -> (String, bool) {
-    final_http_tool_status(status, success, status_code).into_label_tuple()
+) -> TimelineFinalStatus {
+    final_http_tool_status(status, success, status_code)
 }
 
 pub fn final_file_change_status(
@@ -530,17 +494,25 @@ fn byte_unit_label(unit_idx: usize) -> &'static str {
 pub fn final_dynamic_tool_status(
     status: TimelineEntryStatus,
     success: Option<bool>,
-) -> (String, bool) {
+) -> TimelineFinalStatus {
     match status {
-        TimelineEntryStatus::Cancelled => ("Cancelled".to_owned(), false),
-        TimelineEntryStatus::Blocked => ("Blocked".to_owned(), false),
-        TimelineEntryStatus::Failed => ("Failed".to_owned(), false),
-        TimelineEntryStatus::Running => ("Running".to_owned(), true),
+        TimelineEntryStatus::Cancelled => {
+            TimelineFinalStatus::new(TimelineFinalStatusKind::Cancelled, false)
+        }
+        TimelineEntryStatus::Blocked => {
+            TimelineFinalStatus::new(TimelineFinalStatusKind::Blocked, false)
+        }
+        TimelineEntryStatus::Failed => {
+            TimelineFinalStatus::new(TimelineFinalStatusKind::Failed, false)
+        }
+        TimelineEntryStatus::Running => {
+            TimelineFinalStatus::new(TimelineFinalStatusKind::Running, true)
+        }
         TimelineEntryStatus::Completed => {
             if matches!(success, Some(false)) {
-                ("Failed".to_owned(), false)
+                TimelineFinalStatus::new(TimelineFinalStatusKind::Failed, false)
             } else {
-                ("Completed".to_owned(), true)
+                TimelineFinalStatus::new(TimelineFinalStatusKind::Completed, true)
             }
         }
     }
@@ -565,6 +537,34 @@ pub struct McpTimelineMetadata {
     pub runtime_state: Option<String>,
     pub duration_ms: Option<u64>,
     pub result_truncated: Option<bool>,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum McpTimelineMetadataDetailKind {
+    Server,
+    Tool,
+    Catalog,
+    Snapshot,
+    Runtime,
+    Duration,
+    Result,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum McpTimelineMetadataDetailValue {
+    Text(String),
+    U64(u64),
+    DurationMs(u64),
+    Truncated,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct McpTimelineMetadataDetail {
+    pub kind: McpTimelineMetadataDetailKind,
+    pub value: McpTimelineMetadataDetailValue,
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -597,55 +597,120 @@ pub struct TaskWaitReviewDisplayItem {
     pub revision_blocked_reason: Option<String>,
 }
 
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum TaskWaitReviewDetailRow {
+    ReviewRequiredCount {
+        count: u32,
+    },
+    WaitMode {
+        mode: String,
+    },
+    Candidate {
+        index: usize,
+    },
+    Field {
+        kind: TaskWaitReviewDetailKind,
+        value: String,
+    },
+    UserApprovalRequired,
+    ActionRequired {
+        actions: Vec<String>,
+    },
+    RevisionRoundsRemaining {
+        remaining: u32,
+        max: Option<u32>,
+    },
+    Diagnostics {
+        diagnostics: Vec<String>,
+    },
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum TaskWaitReviewDetailKind {
+    Task,
+    TaskId,
+    RunId,
+    CandidateId,
+    TaskStatus,
+    CandidateStatus,
+    Round,
+    ReviewMode,
+    RevisionBlocked,
+    Summary,
+    ResultPreview,
+    ExtractionError,
+}
+
 impl McpTimelineMetadata {
     pub fn label(&self) -> String {
         format!("{}/{}", self.server_name, self.raw_tool_name)
     }
 
-    pub fn details(&self) -> String {
-        let mut lines = vec![
-            format!("Server: {}", self.server_name),
-            format!("Tool: {}", self.raw_tool_name),
+    pub fn detail_rows(&self) -> Vec<McpTimelineMetadataDetail> {
+        let mut rows = vec![
+            McpTimelineMetadataDetail {
+                kind: McpTimelineMetadataDetailKind::Server,
+                value: McpTimelineMetadataDetailValue::Text(self.server_name.clone()),
+            },
+            McpTimelineMetadataDetail {
+                kind: McpTimelineMetadataDetailKind::Tool,
+                value: McpTimelineMetadataDetailValue::Text(self.raw_tool_name.clone()),
+            },
         ];
         if let Some(catalog_version) = self.catalog_version.as_deref() {
-            lines.push(format!("Catalog: {catalog_version}"));
+            rows.push(McpTimelineMetadataDetail {
+                kind: McpTimelineMetadataDetailKind::Catalog,
+                value: McpTimelineMetadataDetailValue::Text(catalog_version.to_owned()),
+            });
         }
         if let Some(snapshot_version) = self.snapshot_version {
-            lines.push(format!("Snapshot: {snapshot_version}"));
+            rows.push(McpTimelineMetadataDetail {
+                kind: McpTimelineMetadataDetailKind::Snapshot,
+                value: McpTimelineMetadataDetailValue::U64(snapshot_version),
+            });
         }
         if let Some(runtime_state) = self.runtime_state.as_deref() {
-            lines.push(format!("Runtime: {runtime_state}"));
+            rows.push(McpTimelineMetadataDetail {
+                kind: McpTimelineMetadataDetailKind::Runtime,
+                value: McpTimelineMetadataDetailValue::Text(runtime_state.to_owned()),
+            });
         }
         if let Some(duration_ms) = self.duration_ms {
-            lines.push(format!("Duration: {duration_ms} ms"));
+            rows.push(McpTimelineMetadataDetail {
+                kind: McpTimelineMetadataDetailKind::Duration,
+                value: McpTimelineMetadataDetailValue::DurationMs(duration_ms),
+            });
         }
         if self.result_truncated == Some(true) {
-            lines.push("Result: truncated".to_owned());
+            rows.push(McpTimelineMetadataDetail {
+                kind: McpTimelineMetadataDetailKind::Result,
+                value: McpTimelineMetadataDetailValue::Truncated,
+            });
         }
-        lines.join("\n")
+        rows
     }
 }
 
 impl TaskWaitReviewDisplay {
-    pub fn details(&self) -> String {
-        let mut lines = Vec::new();
-        lines.push(format!(
-            "{} review-required candidate(s)",
-            self.review_required_count.max(self.items.len() as u32)
-        ));
+    pub fn detail_rows(&self) -> Vec<TaskWaitReviewDetailRow> {
+        let mut rows = Vec::new();
+        rows.push(TaskWaitReviewDetailRow::ReviewRequiredCount {
+            count: self.review_required_count.max(self.items.len() as u32),
+        });
         if let Some(mode) = self.mode.as_deref() {
-            lines.push(format!("Wait mode: {mode}"));
+            rows.push(TaskWaitReviewDetailRow::WaitMode {
+                mode: mode.to_owned(),
+            });
         }
 
         for (index, item) in self.items.iter().enumerate() {
-            if !lines.is_empty() {
-                lines.push(String::new());
-            }
-            lines.push(format!("Candidate {}", index + 1));
-            lines.extend(item.details());
+            rows.push(TaskWaitReviewDetailRow::Candidate { index: index + 1 });
+            rows.extend(item.detail_rows());
         }
 
-        lines.join("\n")
+        rows
     }
 }
 
@@ -658,60 +723,96 @@ impl TaskWaitReviewDisplayItem {
         self.allowed_actions.iter().any(|value| value == action)
     }
 
-    pub fn details(&self) -> Vec<String> {
-        let mut lines = Vec::new();
+    pub fn detail_rows(&self) -> Vec<TaskWaitReviewDetailRow> {
+        let mut rows = Vec::new();
         if let Some(title) = self.title.as_deref() {
-            lines.push(format!("Task: {title}"));
+            rows.push(TaskWaitReviewDetailRow::Field {
+                kind: TaskWaitReviewDetailKind::Task,
+                value: title.to_owned(),
+            });
         }
-        lines.push(format!("Task id: {}", self.task_id));
+        rows.push(TaskWaitReviewDetailRow::Field {
+            kind: TaskWaitReviewDetailKind::TaskId,
+            value: self.task_id.clone(),
+        });
         if let Some(run_id) = self.run_id.as_deref() {
-            lines.push(format!("Run id: {run_id}"));
+            rows.push(TaskWaitReviewDetailRow::Field {
+                kind: TaskWaitReviewDetailKind::RunId,
+                value: run_id.to_owned(),
+            });
         }
-        lines.push(format!("Candidate id: {}", self.candidate_id));
+        rows.push(TaskWaitReviewDetailRow::Field {
+            kind: TaskWaitReviewDetailKind::CandidateId,
+            value: self.candidate_id.clone(),
+        });
         if let Some(status) = self.status.as_deref() {
-            lines.push(format!("Task status: {status}"));
+            rows.push(TaskWaitReviewDetailRow::Field {
+                kind: TaskWaitReviewDetailKind::TaskStatus,
+                value: status.to_owned(),
+            });
         }
         if let Some(candidate_status) = self.candidate_status.as_deref() {
-            lines.push(format!("Candidate status: {candidate_status}"));
+            rows.push(TaskWaitReviewDetailRow::Field {
+                kind: TaskWaitReviewDetailKind::CandidateStatus,
+                value: candidate_status.to_owned(),
+            });
         }
         if let Some(round) = self.round {
-            lines.push(format!("Round: {round}"));
+            rows.push(TaskWaitReviewDetailRow::Field {
+                kind: TaskWaitReviewDetailKind::Round,
+                value: round.to_string(),
+            });
         }
         if let Some(review_mode) = self.review_mode.as_deref() {
-            lines.push(format!("Review mode: {review_mode}"));
+            rows.push(TaskWaitReviewDetailRow::Field {
+                kind: TaskWaitReviewDetailKind::ReviewMode,
+                value: review_mode.to_owned(),
+            });
         }
         if self.user_approval_required {
-            lines.push("User approval required".to_owned());
+            rows.push(TaskWaitReviewDetailRow::UserApprovalRequired);
         }
         if !self.allowed_actions.is_empty() {
-            lines.push(format!(
-                "Action required: {}",
-                self.allowed_actions.join(" or ")
-            ));
+            rows.push(TaskWaitReviewDetailRow::ActionRequired {
+                actions: self.allowed_actions.clone(),
+            });
         }
         if let Some(remaining) = self.remaining_revision_rounds {
-            let max = self
-                .max_revision_rounds
-                .map(|max| max.to_string())
-                .unwrap_or_else(|| "?".to_owned());
-            lines.push(format!("Revision rounds remaining: {remaining}/{max}"));
+            rows.push(TaskWaitReviewDetailRow::RevisionRoundsRemaining {
+                remaining,
+                max: self.max_revision_rounds,
+            });
         }
         if let Some(reason) = self.revision_blocked_reason.as_deref() {
-            lines.push(format!("Revision blocked: {reason}"));
+            rows.push(TaskWaitReviewDetailRow::Field {
+                kind: TaskWaitReviewDetailKind::RevisionBlocked,
+                value: reason.to_owned(),
+            });
         }
         if let Some(summary) = self.summary.as_deref() {
-            lines.push(format!("Summary: {summary}"));
+            rows.push(TaskWaitReviewDetailRow::Field {
+                kind: TaskWaitReviewDetailKind::Summary,
+                value: summary.to_owned(),
+            });
         }
         if let Some(result_preview) = self.result_preview.as_deref() {
-            lines.push(format!("Result preview: {result_preview}"));
+            rows.push(TaskWaitReviewDetailRow::Field {
+                kind: TaskWaitReviewDetailKind::ResultPreview,
+                value: result_preview.to_owned(),
+            });
         }
         if let Some(error_preview) = self.extraction_error_preview.as_deref() {
-            lines.push(format!("Extraction error: {error_preview}"));
+            rows.push(TaskWaitReviewDetailRow::Field {
+                kind: TaskWaitReviewDetailKind::ExtractionError,
+                value: error_preview.to_owned(),
+            });
         }
         if !self.diagnostics.is_empty() {
-            lines.push(format!("Diagnostics: {}", self.diagnostics.join("; ")));
+            rows.push(TaskWaitReviewDetailRow::Diagnostics {
+                diagnostics: self.diagnostics.clone(),
+            });
         }
-        lines
+        rows
     }
 }
 
@@ -887,31 +988,107 @@ fn json_string_array(value: &JsonValue, key: &str) -> Vec<String> {
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct SystemEventPresentation {
-    pub message: String,
-    pub label: String,
+    pub message: SystemEventMessage,
+    pub label: SystemEventLabel,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum SystemEventMessage {
+    Raw(String),
+    Timeout { recovery_started: bool },
+    RecoveryOpened,
+    RecoveryAttached,
+    RetryScheduled,
+    RetryStarted,
+    RecoverySucceeded,
+    RecoveryFailed,
+    ToolRetryScheduled { tool_name: String },
+    ToolRetryResolved { tool_name: String },
+    ToolRetryExhausted { tool_name: String },
+    ToolLoopBudgetExceeded,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum SystemEventLabel {
+    Level(SystemEventLevel),
+    Attempt { attempt: u64 },
+    Timeout,
+    Recovery,
+    Retry,
+    Recovered,
+    Error,
+    RetryResolved,
+    RetriesExhausted,
+    ExecutionWindow { window_index: Option<u64> },
+    Checkpoint,
+    Continued,
+    Paused,
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct SystemEventDetailRow {
-    pub label: String,
-    pub value: String,
+    pub label: SystemEventDetailLabel,
+    pub value: SystemEventDetailValue,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum SystemEventDetailLabel {
+    Window,
+    Status,
+    Reason,
+    WindowExhaustion,
+    Checkpoint,
+    PreviousWindow,
+    Limit,
+    AgentRounds,
+    ToolCalls,
+    ProviderTokens,
+    TotalWindows,
+    CheckpointKind,
+    CheckpointSize,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum SystemEventDetailValue {
+    Text(String),
+    WindowIndex(u64),
+    Bytes(u64),
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct CapabilityRejectionRow {
-    pub label: String,
-    pub kind: String,
+    pub label: CapabilityRejectionLabel,
+    pub kind: CapabilityRejectionKind,
     pub message: String,
 }
 
-pub fn system_event_label(level: &SystemEventLevel) -> String {
-    match level {
-        SystemEventLevel::Info => "Info".to_owned(),
-        SystemEventLevel::Warning => "Warning".to_owned(),
-        SystemEventLevel::Error => "Error".to_owned(),
-    }
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum CapabilityRejectionKind {
+    Skill,
+    McpServer,
+    McpTool,
+    Capability,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum CapabilityRejectionLabel {
+    Text(String),
+    Skill,
+    McpServer,
+    McpTool,
+    Capability,
+}
+
+pub fn system_event_label(level: &SystemEventLevel) -> SystemEventLabel {
+    SystemEventLabel::Level(*level)
 }
 
 pub fn pretty_details(details: &JsonValue) -> Option<String> {
@@ -919,39 +1096,46 @@ pub fn pretty_details(details: &JsonValue) -> Option<String> {
     (!text.trim().is_empty() && text.trim() != "null").then_some(text)
 }
 
-fn capability_rejection_kind(kind: &JsonValue) -> String {
+fn capability_rejection_kind(kind: &JsonValue) -> CapabilityRejectionKind {
     match kind.get("type").and_then(JsonValue::as_str) {
-        Some("skill") => "Skill".to_owned(),
-        Some("mcpServer") => "MCP server".to_owned(),
-        Some("mcpTool") => "MCP tool".to_owned(),
-        _ => "Capability".to_owned(),
+        Some("skill") => CapabilityRejectionKind::Skill,
+        Some("mcpServer") => CapabilityRejectionKind::McpServer,
+        Some("mcpTool") => CapabilityRejectionKind::McpTool,
+        _ => CapabilityRejectionKind::Capability,
     }
 }
 
-fn fallback_capability_label(kind: &JsonValue) -> String {
+fn fallback_capability_label(kind: &JsonValue) -> CapabilityRejectionLabel {
     match kind.get("type").and_then(JsonValue::as_str) {
         Some("skill") => kind
             .get("slug")
             .and_then(JsonValue::as_str)
-            .unwrap_or("skill")
-            .to_owned(),
+            .map(|value| CapabilityRejectionLabel::Text(value.to_owned()))
+            .unwrap_or(CapabilityRejectionLabel::Skill),
         Some("mcpServer") => kind
             .get("name")
             .and_then(JsonValue::as_str)
-            .unwrap_or("MCP server")
-            .to_owned(),
+            .map(|value| CapabilityRejectionLabel::Text(value.to_owned()))
+            .unwrap_or(CapabilityRejectionLabel::McpServer),
         Some("mcpTool") => {
             let server = kind
                 .get("serverName")
                 .and_then(JsonValue::as_str)
-                .unwrap_or("MCP");
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
             let tool = kind
                 .get("rawToolName")
                 .and_then(JsonValue::as_str)
-                .unwrap_or("tool");
-            format!("{server}/{tool}")
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            match (server, tool) {
+                (Some(server), Some(tool)) => {
+                    CapabilityRejectionLabel::Text(format!("{server}/{tool}"))
+                }
+                _ => CapabilityRejectionLabel::McpTool,
+            }
         }
-        _ => "Capability".to_owned(),
+        _ => CapabilityRejectionLabel::Capability,
     }
 }
 
@@ -969,7 +1153,7 @@ pub fn capability_rejection_rows(details: Option<&JsonValue>) -> Vec<CapabilityR
                         .and_then(JsonValue::as_str)
                         .map(str::trim)
                         .filter(|value| !value.is_empty())
-                        .map(str::to_owned)
+                        .map(|value| CapabilityRejectionLabel::Text(value.to_owned()))
                         .unwrap_or_else(|| fallback_capability_label(kind));
                     let message = item
                         .get("message")
@@ -1023,21 +1207,27 @@ fn execution_window_code(code: Option<&str>) -> bool {
     )
 }
 
-fn window_index_label(details: Option<&JsonValue>) -> Option<String> {
-    detail_u64(details, "window_index").map(|window_index| format!("Window #{window_index}"))
+fn window_index_value(details: Option<&JsonValue>, key: &str) -> Option<SystemEventDetailValue> {
+    detail_u64(details, key).map(SystemEventDetailValue::WindowIndex)
+}
+
+fn text_detail_value(details: Option<&JsonValue>, key: &str) -> Option<SystemEventDetailValue> {
+    detail_string(details, key).map(SystemEventDetailValue::Text)
 }
 
 fn execution_window_presentation_label(
     code: Option<&str>,
     level: &SystemEventLevel,
     details: Option<&JsonValue>,
-) -> String {
+) -> SystemEventLabel {
     match code {
-        Some("turn_execution_window_checkpointed") => "Checkpoint".to_owned(),
-        Some("turn_execution_window_continued") => "Continued".to_owned(),
-        Some("turn_execution_window_blocked") => "Paused".to_owned(),
+        Some("turn_execution_window_checkpointed") => SystemEventLabel::Checkpoint,
+        Some("turn_execution_window_continued") => SystemEventLabel::Continued,
+        Some("turn_execution_window_blocked") => SystemEventLabel::Paused,
         Some("turn_execution_window_started") | Some("turn_execution_window_exhausted") => {
-            window_index_label(details).unwrap_or_else(|| "Execution window".to_owned())
+            SystemEventLabel::ExecutionWindow {
+                window_index: detail_u64(details, "window_index"),
+            }
         }
         _ => system_event_label(level),
     }
@@ -1045,19 +1235,16 @@ fn execution_window_presentation_label(
 
 fn push_detail_row(
     rows: &mut Vec<SystemEventDetailRow>,
-    label: impl Into<String>,
-    value: Option<String>,
+    label: SystemEventDetailLabel,
+    value: Option<SystemEventDetailValue>,
 ) {
-    let Some(value) = value.map(|value| value.trim().to_owned()) else {
+    let Some(value) = value else {
         return;
     };
-    if value.is_empty() {
+    if matches!(&value, SystemEventDetailValue::Text(value) if value.trim().is_empty()) {
         return;
     }
-    rows.push(SystemEventDetailRow {
-        label: label.into(),
-        value,
-    });
+    rows.push(SystemEventDetailRow { label, value });
 }
 
 pub fn execution_window_detail_rows(
@@ -1069,76 +1256,93 @@ pub fn execution_window_detail_rows(
     }
 
     let mut rows = Vec::new();
-    push_detail_row(&mut rows, "Window", window_index_label(details));
-    push_detail_row(&mut rows, "Status", detail_string(details, "status"));
+    push_detail_row(
+        &mut rows,
+        SystemEventDetailLabel::Window,
+        window_index_value(details, "window_index"),
+    );
+    push_detail_row(
+        &mut rows,
+        SystemEventDetailLabel::Status,
+        text_detail_value(details, "status"),
+    );
     if code == Some("turn_execution_window_blocked") {
-        push_detail_row(&mut rows, "Reason", detail_string(details, "reason"));
         push_detail_row(
             &mut rows,
-            "Window exhaustion",
-            detail_string(details, "exhaustion_reason"),
+            SystemEventDetailLabel::Reason,
+            text_detail_value(details, "reason"),
+        );
+        push_detail_row(
+            &mut rows,
+            SystemEventDetailLabel::WindowExhaustion,
+            text_detail_value(details, "exhaustion_reason"),
         );
     } else {
         push_detail_row(
             &mut rows,
-            "Reason",
+            SystemEventDetailLabel::Reason,
             detail_string(details, "exhaustion_reason")
-                .or_else(|| detail_string(details, "reason")),
+                .or_else(|| detail_string(details, "reason"))
+                .map(SystemEventDetailValue::Text),
         );
     }
     push_detail_row(
         &mut rows,
-        "Checkpoint",
-        detail_string(details, "checkpoint_id"),
+        SystemEventDetailLabel::Checkpoint,
+        text_detail_value(details, "checkpoint_id"),
     );
     push_detail_row(
         &mut rows,
-        "Previous window",
-        detail_u64(details, "previous_window_index")
-            .map(|window_index| format!("Window #{window_index}")),
+        SystemEventDetailLabel::PreviousWindow,
+        window_index_value(details, "previous_window_index"),
     );
     push_detail_row(
         &mut rows,
-        "Limit",
+        SystemEventDetailLabel::Limit,
         match (
             detail_u64(details, "observed"),
             detail_u64(details, "limit"),
         ) {
-            (Some(observed), Some(limit)) => Some(format!("{observed}/{limit}")),
+            (Some(observed), Some(limit)) => {
+                Some(SystemEventDetailValue::Text(format!("{observed}/{limit}")))
+            }
             _ => None,
         },
     );
     push_detail_row(
         &mut rows,
-        "Agent rounds",
-        detail_u64(details, "agent_round_count").map(|value| value.to_string()),
+        SystemEventDetailLabel::AgentRounds,
+        detail_u64(details, "agent_round_count")
+            .map(|value| SystemEventDetailValue::Text(value.to_string())),
     );
     push_detail_row(
         &mut rows,
-        "Tool calls",
+        SystemEventDetailLabel::ToolCalls,
         detail_u64(details, "tool_call_count")
             .or_else(|| detail_u64(details, "total_tool_calls"))
-            .map(|value| value.to_string()),
+            .map(|value| SystemEventDetailValue::Text(value.to_string())),
     );
     push_detail_row(
         &mut rows,
-        "Provider tokens",
-        detail_u64(details, "provider_token_count").map(|value| value.to_string()),
+        SystemEventDetailLabel::ProviderTokens,
+        detail_u64(details, "provider_token_count")
+            .map(|value| SystemEventDetailValue::Text(value.to_string())),
     );
     push_detail_row(
         &mut rows,
-        "Total windows",
-        detail_u64(details, "total_windows").map(|value| value.to_string()),
+        SystemEventDetailLabel::TotalWindows,
+        detail_u64(details, "total_windows")
+            .map(|value| SystemEventDetailValue::Text(value.to_string())),
     );
     push_detail_row(
         &mut rows,
-        "Checkpoint kind",
-        detail_string(details, "checkpoint_kind"),
+        SystemEventDetailLabel::CheckpointKind,
+        text_detail_value(details, "checkpoint_kind"),
     );
     push_detail_row(
         &mut rows,
-        "Checkpoint size",
-        detail_u64(details, "payload_bytes").map(|value| format!("{value} bytes")),
+        SystemEventDetailLabel::CheckpointSize,
+        detail_u64(details, "payload_bytes").map(SystemEventDetailValue::Bytes),
     );
     rows
 }
@@ -1147,12 +1351,12 @@ fn tool_name_from_details(details: Option<&JsonValue>) -> String {
     detail_string(details, "tool_name").unwrap_or_else(|| "Tool".to_owned())
 }
 
-fn attempt_label(details: Option<&JsonValue>) -> Option<String> {
-    detail_u64(details, "attempt_no").map(|attempt| format!("Attempt {attempt}"))
+fn attempt_label(details: Option<&JsonValue>) -> Option<SystemEventLabel> {
+    detail_u64(details, "attempt_no").map(|attempt| SystemEventLabel::Attempt { attempt })
 }
 
-fn next_attempt_label(details: Option<&JsonValue>) -> Option<String> {
-    detail_u64(details, "next_attempt_no").map(|attempt| format!("Attempt {attempt}"))
+fn next_attempt_label(details: Option<&JsonValue>) -> Option<SystemEventLabel> {
+    detail_u64(details, "next_attempt_no").map(|attempt| SystemEventLabel::Attempt { attempt })
 }
 
 fn detail_has_string(details: Option<&JsonValue>, key: &str) -> bool {
@@ -1173,73 +1377,69 @@ pub fn system_event_presentation(
         Some("item_timeout_detected") => {
             let recovery_started = detail_has_string(details, "recovery_job_id");
             SystemEventPresentation {
-                message: if recovery_started {
-                    "Timeout detected; recovery started".to_owned()
-                } else {
-                    "Timeout detected".to_owned()
-                },
-                label: attempt_label(details).unwrap_or_else(|| "Timeout".to_owned()),
+                message: SystemEventMessage::Timeout { recovery_started },
+                label: attempt_label(details).unwrap_or(SystemEventLabel::Timeout),
             }
         }
         Some("item_recovery_opened") => SystemEventPresentation {
-            message: "Recovery opened".to_owned(),
-            label: attempt_label(details).unwrap_or_else(|| "Recovery".to_owned()),
+            message: SystemEventMessage::RecoveryOpened,
+            label: attempt_label(details).unwrap_or(SystemEventLabel::Recovery),
         },
         Some("item_recovery_attached") => SystemEventPresentation {
-            message: "Recovery attached".to_owned(),
-            label: next_attempt_label(details).unwrap_or_else(|| "Recovery".to_owned()),
+            message: SystemEventMessage::RecoveryAttached,
+            label: next_attempt_label(details).unwrap_or(SystemEventLabel::Recovery),
         },
         Some("item_retry_scheduled") => SystemEventPresentation {
-            message: "Retry scheduled".to_owned(),
-            label: attempt_label(details).unwrap_or_else(|| "Retry".to_owned()),
+            message: SystemEventMessage::RetryScheduled,
+            label: attempt_label(details).unwrap_or(SystemEventLabel::Retry),
         },
         Some("item_retry_attempt_started") => SystemEventPresentation {
-            message: "Retry started".to_owned(),
-            label: attempt_label(details).unwrap_or_else(|| "Retry".to_owned()),
+            message: SystemEventMessage::RetryStarted,
+            label: attempt_label(details).unwrap_or(SystemEventLabel::Retry),
         },
         Some("item_recovery_succeeded") => SystemEventPresentation {
-            message: "Recovery succeeded".to_owned(),
-            label: "Recovered".to_owned(),
+            message: SystemEventMessage::RecoverySucceeded,
+            label: SystemEventLabel::Recovered,
         },
         Some("item_recovery_exhausted") => SystemEventPresentation {
-            message: "Recovery failed".to_owned(),
-            label: "Error".to_owned(),
+            message: SystemEventMessage::RecoveryFailed,
+            label: SystemEventLabel::Error,
         },
         Some("item_tool_retry_scheduled") => {
             let tool_name = tool_name_from_details(details);
             SystemEventPresentation {
-                message: format!("{tool_name} retry scheduled"),
-                label: attempt_label(details).unwrap_or_else(|| "Retry".to_owned()),
+                message: SystemEventMessage::ToolRetryScheduled { tool_name },
+                label: attempt_label(details).unwrap_or(SystemEventLabel::Retry),
             }
         }
         Some("item_tool_retry_resolved") => {
             let tool_name = tool_name_from_details(details);
             SystemEventPresentation {
-                message: format!("{tool_name} retry resolved"),
-                label: "Retry resolved".to_owned(),
+                message: SystemEventMessage::ToolRetryResolved { tool_name },
+                label: SystemEventLabel::RetryResolved,
             }
         }
         Some("item_tool_retry_exhausted") => {
             let tool_name = tool_name_from_details(details);
             SystemEventPresentation {
-                message: format!("{tool_name} retries exhausted"),
-                label: "Retries exhausted".to_owned(),
+                message: SystemEventMessage::ToolRetryExhausted { tool_name },
+                label: SystemEventLabel::RetriesExhausted,
             }
         }
         Some("turn_tool_loop_budget_exceeded") => SystemEventPresentation {
-            message: "Tool loop budget exceeded".to_owned(),
+            message: SystemEventMessage::ToolLoopBudgetExceeded,
             label: system_event_label(level),
         },
         code if execution_window_code(code) => SystemEventPresentation {
-            message: message.to_owned(),
+            message: SystemEventMessage::Raw(message.to_owned()),
             label: execution_window_presentation_label(code, level, details),
         },
         Some("turn_failed") if is_recovery_failure_message(message) => SystemEventPresentation {
-            message: "Recovery failed".to_owned(),
+            message: SystemEventMessage::RecoveryFailed,
             label: system_event_label(level),
         },
         _ => SystemEventPresentation {
-            message: message.to_owned(),
+            message: SystemEventMessage::Raw(message.to_owned()),
             label: system_event_label(level),
         },
     }
@@ -1467,11 +1667,11 @@ mod tests {
         );
         assert_eq!(
             final_web_fetch_status(TimelineEntryStatus::Completed, Some(true), Some(200)),
-            ("Completed".to_owned(), true)
+            TimelineFinalStatus::new(TimelineFinalStatusKind::Completed, true)
         );
         assert_eq!(
             final_web_fetch_status(TimelineEntryStatus::Completed, Some(true), Some(500)),
-            ("Failed".to_owned(), false)
+            TimelineFinalStatus::new(TimelineFinalStatusKind::Failed, false)
         );
         assert_eq!(
             final_download_status(TimelineEntryStatus::Completed, Some(true), Some(200)),
@@ -1622,8 +1822,21 @@ mod tests {
             task_wait_review_display("task_wait", &parent_agent_review_display).expect("review");
         assert_eq!(review.items[0].review_mode.as_deref(), Some("parent_agent"));
         assert!(!review.items[0].user_controls_allowed());
-        assert!(review.details().contains("Review mode: parent_agent"));
-        assert!(!review.details().contains("User approval required"));
+        let detail_rows = review.detail_rows();
+        assert!(detail_rows.iter().any(|row| {
+            matches!(
+                row,
+                TaskWaitReviewDetailRow::Field {
+                    kind: TaskWaitReviewDetailKind::ReviewMode,
+                    value,
+                } if value == "parent_agent"
+            )
+        }));
+        assert!(
+            !detail_rows
+                .iter()
+                .any(|row| matches!(row, TaskWaitReviewDetailRow::UserApprovalRequired))
+        );
     }
 
     #[test]
@@ -1639,8 +1852,11 @@ mod tests {
             }]
         });
         let rows = capability_rejection_rows_for_event(Some("capability.rejected"), Some(&details));
-        assert_eq!(rows[0].label, "resend/send");
-        assert_eq!(rows[0].kind, "MCP tool");
+        assert_eq!(
+            rows[0].label,
+            CapabilityRejectionLabel::Text("resend/send".to_owned())
+        );
+        assert_eq!(rows[0].kind, CapabilityRejectionKind::McpTool);
 
         let malformed_details = json!({
             "rejected": [
@@ -1665,8 +1881,11 @@ mod tests {
         );
         let rows = capability_rejection_rows(Some(&malformed_details));
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].label, "github");
-        assert_eq!(rows[0].kind, "MCP server");
+        assert_eq!(
+            rows[0].label,
+            CapabilityRejectionLabel::Text("github".to_owned())
+        );
+        assert_eq!(rows[0].kind, CapabilityRejectionKind::McpServer);
 
         let continued_details = json!({
             "window_index": 2,
@@ -1683,19 +1902,20 @@ mod tests {
             Some("turn_execution_window_continued"),
             Some(&continued_details),
         );
-        assert_eq!(presentation.label, "Continued");
+        assert_eq!(presentation.label, SystemEventLabel::Continued);
         let rows = execution_window_detail_rows(
             Some("turn_execution_window_continued"),
             Some(&continued_details),
         );
         assert!(
             rows.iter()
-                .any(|row| row.label == "Previous window" && row.value == "Window #1")
+                .any(|row| row.label == SystemEventDetailLabel::PreviousWindow
+                    && row.value == SystemEventDetailValue::WindowIndex(1))
         );
         assert!(
             !rows
                 .iter()
-                .any(|row| row.label == "payload" || row.value.contains("large"))
+                .any(|row| matches!(&row.value, SystemEventDetailValue::Text(value) if value.contains("large")))
         );
 
         let window_details = json!({
@@ -1713,14 +1933,16 @@ mod tests {
             Some("turn_execution_window_blocked"),
             Some(&window_details),
         );
-        assert_eq!(presentation.label, "Paused");
+        assert_eq!(presentation.label, SystemEventLabel::Paused);
         let rows = execution_window_detail_rows(
             Some("turn_execution_window_blocked"),
             Some(&window_details),
         );
         assert!(
             rows.iter()
-                .any(|row| row.label == "Reason" && row.value == "max_total_windows_exceeded")
+                .any(|row| row.label == SystemEventDetailLabel::Reason
+                    && row.value
+                        == SystemEventDetailValue::Text("max_total_windows_exceeded".to_owned()))
         );
     }
 }

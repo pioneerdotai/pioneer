@@ -15,9 +15,8 @@ use crate::app::{
 };
 use gpui::{prelude::*, *};
 use gpui_component::{Icon, IconName, h_flex, theme::ActiveTheme, v_flex};
-use pioneer_client::tasks::display::task_status_label;
 use pioneer_client::timeline::labels as timeline_labels;
-use pioneer_protocol::TurnItem;
+use pioneer_protocol::{TaskStatus, TurnItem};
 
 pub(super) fn format_elapsed_ms(elapsed_ms: u64) -> String {
     timeline_labels::format_elapsed_ms(elapsed_ms)
@@ -33,6 +32,21 @@ pub(super) fn format_elapsed(item_view: &ItemView) -> Option<String> {
 
 pub(super) fn host_from_url(url: &str) -> Option<String> {
     timeline_labels::host_from_url(url)
+}
+
+fn task_status_label(status: TaskStatus) -> String {
+    match status {
+        TaskStatus::Draft => t!("timeline.task.status.draft").to_string(),
+        TaskStatus::Scheduled => t!("timeline.task.status.scheduled").to_string(),
+        TaskStatus::Queued => t!("timeline.task.status.queued").to_string(),
+        TaskStatus::Running => t!("timeline.task.status.running").to_string(),
+        TaskStatus::Waiting => t!("timeline.task.status.waiting").to_string(),
+        TaskStatus::WaitingReview => t!("timeline.task.status.waiting_review").to_string(),
+        TaskStatus::Completed => t!("timeline.task.status.completed").to_string(),
+        TaskStatus::Blocked => t!("timeline.task.status.blocked").to_string(),
+        TaskStatus::Failed => t!("timeline.task.status.failed").to_string(),
+        TaskStatus::Cancelled => t!("timeline.task.status.cancelled").to_string(),
+    }
 }
 
 impl PioneerDesktop {

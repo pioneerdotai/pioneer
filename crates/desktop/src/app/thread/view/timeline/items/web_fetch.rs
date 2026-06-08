@@ -5,7 +5,9 @@ use crate::app::{
 };
 use gpui::{prelude::*, *};
 use gpui_component::{collapsible::Collapsible, h_flex, spinner::Spinner, v_flex, *};
-use pioneer_client::timeline::labels::{final_web_fetch_status, web_fetch_display_url};
+use pioneer_client::timeline::labels::{
+    TimelineFinalStatusKind, final_web_fetch_status, web_fetch_display_url,
+};
 use pioneer_protocol::TurnItem;
 use std::hash::{Hash, Hasher};
 
@@ -64,8 +66,9 @@ impl PioneerDesktop {
         entry.id.hash(&mut toggle_id_hasher);
         let toggle_id = toggle_id_hasher.finish();
 
-        let (final_status, is_successful) =
-            final_web_fetch_status(item_view.status, success, status_code);
+        let status = final_web_fetch_status(item_view.status, success, status_code);
+        let final_status = web_fetch_status_label(status.kind);
+        let is_successful = status.successful;
 
         let content = if item_view.status == TimelineEntryStatus::Running {
             v_flex()
@@ -197,5 +200,15 @@ impl PioneerDesktop {
         };
 
         self.render_item_row(is_first_row, is_last_row, content_width, content)
+    }
+}
+
+fn web_fetch_status_label(kind: TimelineFinalStatusKind) -> String {
+    match kind {
+        TimelineFinalStatusKind::Cancelled => t!("timeline.web_fetch.cancelled").to_string(),
+        TimelineFinalStatusKind::Blocked => t!("timeline.web_fetch.blocked").to_string(),
+        TimelineFinalStatusKind::Failed => t!("timeline.web_fetch.failed").to_string(),
+        TimelineFinalStatusKind::Running => t!("timeline.web_fetch.running").to_string(),
+        TimelineFinalStatusKind::Completed => t!("timeline.web_fetch.completed").to_string(),
     }
 }

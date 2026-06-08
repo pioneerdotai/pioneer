@@ -45,6 +45,23 @@ pub struct ReconciledSkillsSnapshot {
     pub selected_target_cleared: bool,
 }
 
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct SkillsCatalogRefreshSuccessReduction {
+    pub catalog: Vec<SkillListItem>,
+    pub installed: Vec<SkillListItem>,
+    pub health_details: HashMap<String, SkillHealthItem>,
+    pub pending_actions: HashSet<String>,
+    pub selected_target: Option<(String, String)>,
+    pub selected_target_cleared: bool,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct SkillsCatalogRefreshFailureReduction {
+    pub error: String,
+}
+
 pub trait SkillSnapshotTransport {
     fn skills_list(&self, params: SkillListParams) -> Result<SkillListResponse>;
 
@@ -148,6 +165,32 @@ pub fn reconcile_skills_snapshot(
         snapshot,
         selected_target,
         selected_target_cleared,
+    }
+}
+
+pub fn reduce_skills_catalog_refresh_success(
+    snapshot: SkillsCatalogSnapshot,
+    mut pending_actions: HashSet<String>,
+    selected_target: Option<(String, String)>,
+) -> SkillsCatalogRefreshSuccessReduction {
+    let reconciled = reconcile_skills_snapshot(snapshot, &mut pending_actions, selected_target);
+    let snapshot = reconciled.snapshot;
+
+    SkillsCatalogRefreshSuccessReduction {
+        catalog: snapshot.catalog,
+        installed: snapshot.installed,
+        health_details: snapshot.health_details,
+        pending_actions,
+        selected_target: reconciled.selected_target,
+        selected_target_cleared: reconciled.selected_target_cleared,
+    }
+}
+
+pub fn reduce_skills_catalog_refresh_failure(
+    error: impl Into<String>,
+) -> SkillsCatalogRefreshFailureReduction {
+    SkillsCatalogRefreshFailureReduction {
+        error: error.into(),
     }
 }
 
@@ -361,6 +404,41 @@ mod tests {
         assert_eq!(pending, HashSet::from([skill_key("alpha", "user")]));
         assert!(reconciled.selected_target.is_none());
         assert!(reconciled.selected_target_cleared);
+    }
+
+    #[test]
+    fn refresh_success_reduction_applies_snapshot_and_returns_owned_pending_actions() {
+        let snapshot = project_skills_snapshot(
+            vec![skill("alpha", "user", true), skill("beta", "user", false)],
+            vec![health("alpha", "user")],
+        );
+        let pending = HashSet::from([skill_key("alpha", "user"), skill_key("missing", "user")]);
+
+        let reduction = reduce_skills_catalog_refresh_success(
+            snapshot,
+            pending,
+            Some(("alpha".to_owned(), "user".to_owned())),
+        );
+
+        assert_eq!(reduction.catalog.len(), 2);
+        assert_eq!(reduction.installed.len(), 1);
+        assert!(reduction.health_details.contains_key("alpha::user"));
+        assert_eq!(
+            reduction.pending_actions,
+            HashSet::from([skill_key("alpha", "user")])
+        );
+        assert_eq!(
+            reduction.selected_target,
+            Some(("alpha".to_owned(), "user".to_owned()))
+        );
+        assert!(!reduction.selected_target_cleared);
+    }
+
+    #[test]
+    fn refresh_failure_reduction_carries_display_error() {
+        let reduction = reduce_skills_catalog_refresh_failure("load failed");
+
+        assert_eq!(reduction.error, "load failed");
     }
 
     #[test]

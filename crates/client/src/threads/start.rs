@@ -63,6 +63,13 @@ pub struct ThreadStartBootstrapReduction {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadStartSubscriptionReduction {
+    pub thread: Thread,
+    pub thread_id: String,
+    pub workspace_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ThreadStartBootstrapFailurePlan {
     Retry { thread_id: String },
     Reset,
@@ -276,6 +283,20 @@ pub fn reduce_thread_start_bootstrap_success(
         set_active_thread_id: active_thread_id.is_none().then_some(thread_id),
         set_preferred_workspace_id: workspace_id,
         reset_thread_start: true,
+    }
+}
+
+pub fn reduce_thread_start_subscription_success(
+    response: ThreadStartResponse,
+) -> ThreadStartSubscriptionReduction {
+    let thread = response.thread;
+    let thread_id = thread.id.clone();
+    let workspace_id = thread.workspace_id.clone();
+
+    ThreadStartSubscriptionReduction {
+        thread,
+        thread_id,
+        workspace_id,
     }
 }
 
@@ -540,6 +561,18 @@ mod tests {
 
         assert_eq!(reduction.set_active_thread_id, None);
         assert_eq!(reduction.set_draft_thread_id, "thread_a");
+    }
+
+    #[test]
+    fn subscription_success_reduction_extracts_thread_snapshot_and_workspace_mapping() {
+        let reduction = reduce_thread_start_subscription_success(thread_start_response(thread(
+            "thread_a", "ws_a",
+        )));
+
+        assert_eq!(reduction.thread.id, "thread_a");
+        assert_eq!(reduction.thread.workspace_id, "ws_a");
+        assert_eq!(reduction.thread_id, "thread_a");
+        assert_eq!(reduction.workspace_id, "ws_a");
     }
 
     #[test]

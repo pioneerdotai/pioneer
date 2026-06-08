@@ -1,11 +1,8 @@
 //! Stable timeline layout hash helpers.
 
 use super::{
-    labels::{
-        coalesced_tools_label, format_elapsed_ms, timeline_entry_text,
-        timeline_work_group_completed_label,
-    },
-    rows::{TimelineRow, TimelineRowKind},
+    labels::{format_elapsed_ms, timeline_entry_text},
+    rows::{TimelineCoalescedToolsKind, TimelineCoalescedToolsRow, TimelineRow, TimelineRowKind},
 };
 use crate::conversation::ConversationViewState;
 use std::{
@@ -103,14 +100,25 @@ pub fn timeline_row_text_len(projection: &ConversationViewState, row: &TimelineR
             .map(|item_view| timeline_entry_text(item_view).len())
             .unwrap_or_default(),
         TimelineRowKind::TurnWorkToggle(group) => {
-            let mut len = timeline_work_group_completed_label().len();
+            let mut len = TURN_WORK_GROUP_COMPLETED_TEXT_LEN_ESTIMATE;
             if let Some(elapsed_ms) = group.elapsed_ms {
                 len = len.saturating_add(format_elapsed_ms(elapsed_ms).len());
             }
             len
         }
-        TimelineRowKind::CoalescedTools(group) => coalesced_tools_label(group).len(),
+        TimelineRowKind::CoalescedTools(group) => coalesced_tools_text_len_estimate(group),
     }
+}
+
+const TURN_WORK_GROUP_COMPLETED_TEXT_LEN_ESTIMATE: usize = 9;
+
+fn coalesced_tools_text_len_estimate(group: &TimelineCoalescedToolsRow) -> usize {
+    let count_len = group.count.to_string().len();
+    let label_len = match group.kind {
+        TimelineCoalescedToolsKind::CompletedTaskTools => 21,
+        TimelineCoalescedToolsKind::RepeatedTaskWait => 24,
+    };
+    count_len.saturating_add(1).saturating_add(label_len)
 }
 
 pub fn timeline_row_toggle_key(row: &TimelineRow) -> Option<&str> {

@@ -421,7 +421,6 @@ impl ConversationEvent {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct EventEnvelope {
     pub sequence: u64,
     pub thread_id: String,

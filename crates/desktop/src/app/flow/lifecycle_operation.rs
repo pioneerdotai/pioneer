@@ -1,7 +1,8 @@
 use super::*;
 use pioneer_client::state::reducers::{
-    GatewayStatusEndpoint, GatewayStatusInput, GatewayStatusProjection, GatewayStatusTextUpdate,
-    project_gateway_status,
+    GatewayOperationFinishOutcome, GatewayOperationSuccessInfo, GatewayStatusEndpoint,
+    GatewayStatusInput, GatewayStatusProjection, GatewayStatusTextUpdate, project_gateway_status,
+    reduce_gateway_operation_begin, reduce_gateway_operation_finish,
 };
 
 impl PioneerDesktop {
@@ -16,12 +17,13 @@ impl PioneerDesktop {
         }
 
         let operation_epoch = self.next_gateway_connection_epoch();
-        self.gateway.connecting = true;
-        self.gateway.connection_state = GatewayConnectionState::Connecting;
+        let reduction = reduce_gateway_operation_begin();
+        self.gateway.connecting = reduction.connecting;
+        self.gateway.connection_state = reduction.connection_state;
         self.gateway.setup_action = setup_action;
-        self.gateway.error = None;
+        self.gateway.error = reduction.gateway_error;
         self.gateway.status = status.into();
-        self.gateway.status_level = GatewayStatusLevel::Neutral;
+        self.gateway.status_level = reduction.status_level;
         cx.notify();
         Some(operation_epoch)
     }
@@ -56,61 +58,64 @@ impl PioneerDesktop {
             return;
         }
 
-        self.gateway.connecting = false;
-        self.gateway.setup_action = None;
-        self.gateway.bootstrap_complete = true;
-
-        match result {
+        let outcome = match result {
             Ok(success) => {
                 self.gateway.runtime = Some(success.runtime);
-                self.gateway.ws_connection_id = success.ws_connection_id;
-                self.gateway.error = None;
-                self.reset_thread_start_state();
-                self.clear_thread_start_queue();
-                self.clear_turn_resume_queue();
-                if self.gateway.ws_connection_id.is_none() {
-                    self.set_active_thread_id(None);
-                }
-
-                if self.gateway.ws_connection_id.is_none() {
-                    let _ = self.gateway.ws_command_sender.disconnect();
-                }
-
-                if self.gateway.ws_connection_id.is_some() && !success.ws_connected_ready {
-                    self.gateway.status = t!("gateway.status.connecting").to_string();
-                    self.gateway.status_level = GatewayStatusLevel::Neutral;
-                    self.gateway.connection_state = GatewayConnectionState::Connecting;
-                    cx.notify();
-                    return;
-                }
-
-                self.gateway.connection_state = if self.gateway.ws_connection_id.is_some() {
-                    GatewayConnectionState::Connected
-                } else {
-                    GatewayConnectionState::Idle
-                };
+                GatewayOperationFinishOutcome::Success(GatewayOperationSuccessInfo {
+                    ws_connection_id: success.ws_connection_id,
+                    ws_connected_ready: success.ws_connected_ready,
+                })
             }
-            Err(error) => {
-                self.gateway.ws_connection_id = None;
-                let _ = self.gateway.ws_command_sender.disconnect();
-                self.gateway.connection_state = GatewayConnectionState::Disconnected;
-                self.gateway.error = Some(format!("{error:#}"));
-                self.set_active_thread_id(None);
-                self.reset_thread_start_state();
-                self.clear_thread_start_queue();
-                self.clear_turn_resume_queue();
-            }
+            Err(error) => GatewayOperationFinishOutcome::Failure {
+                error: format!("{error:#}"),
+            },
+        };
+        let reduction = reduce_gateway_operation_finish(outcome);
+
+        self.gateway.connecting = reduction.connecting;
+        if reduction.clear_setup_action {
+            self.gateway.setup_action = None;
+        }
+        self.gateway.bootstrap_complete = reduction.bootstrap_complete;
+        self.gateway.ws_connection_id = reduction.ws_connection_id;
+        self.gateway.error = reduction.gateway_error;
+        self.gateway.connection_state = reduction.connection_state;
+        if let Some(status) = reduction.status {
+            self.gateway.status = super::ws_events_connection::gateway_status_message_text(&status);
+        }
+        if let Some(status_level) = reduction.status_level {
+            self.gateway.status_level = status_level;
+        }
+        if reduction.clear_active_thread {
+            self.set_active_thread_id(None);
+        }
+        if reduction.reset_thread_start {
+            self.reset_thread_start_state();
+        }
+        if reduction.clear_thread_start_queue {
+            self.clear_thread_start_queue();
+        }
+        if reduction.clear_turn_resume_queue {
+            self.clear_turn_resume_queue();
+        }
+        if reduction.disconnect_ws {
+            let _ = self.gateway.ws_command_sender.disconnect();
         }
 
-        if self.gateway.connection_state == GatewayConnectionState::Connected {
-            self.refresh_workspace_list(cx);
-            self.refresh_gateway_settings(cx);
-            self.enqueue_in_flight_turns_for_resume();
+        execute_desktop_client_effects(self, reduction.effects, cx);
+        if reduction.drive_turn_resume_queue {
             let _ = self.drive_turn_resume_queue(cx);
         }
 
+        if !reduction.refresh_gateway_status {
+            cx.notify();
+            return;
+        }
+
         self.refresh_gateway_status();
-        self.sync_gateway_setup_form_state(Some(&self.gateway_setup_form_state), cx);
+        if reduction.sync_gateway_setup_form_state {
+            self.sync_gateway_setup_form_state(Some(&self.gateway_setup_form_state), cx);
+        }
         cx.notify();
     }
 

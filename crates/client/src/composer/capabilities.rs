@@ -1,9 +1,10 @@
 //! Composer capability selection helpers.
 
 use pioneer_protocol::{
-    McpListItem, McpRuntimeState, McpScopeKind, McpServerDetailsResponse, SkillListItem,
-    TurnCapability, TurnCapabilityKind, TurnMcpServerCapabilitySummary,
-    TurnMcpToolCapabilitySummary, TurnSkillCapabilitySummary, UserMessageAttachment,
+    McpListItem, McpListResponse, McpRuntimeState, McpScopeKind, McpServerDetailsResponse,
+    SkillListItem, SkillListResponse, TurnCapability, TurnCapabilityKind,
+    TurnMcpServerCapabilitySummary, TurnMcpToolCapabilitySummary, TurnSkillCapabilitySummary,
+    UserMessageAttachment,
 };
 use std::collections::HashSet;
 
@@ -80,6 +81,25 @@ pub enum McpCapabilityUnavailableReason {
 #[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct McpCapabilitySelectionToggle {
     pub collapse_active_server: bool,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ComposerSkillPickerRowsReduction {
+    pub rows: Vec<SelectableSkillCapability>,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ComposerMcpServerPickerRowsReduction {
+    pub rows: Vec<SelectableMcpCapability>,
+    pub prefetch_server_ids: Vec<String>,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ComposerMcpToolPickerRowsReduction {
+    pub rows: Vec<SelectableMcpCapability>,
 }
 
 impl ComposerCapability {
@@ -590,6 +610,15 @@ pub fn filter_installed_skill_capability_rows(
     filter_skill_capability_rows(installed.as_slice(), query)
 }
 
+pub fn reduce_composer_skill_picker_rows_response(
+    response: SkillListResponse,
+    query: &str,
+) -> ComposerSkillPickerRowsReduction {
+    ComposerSkillPickerRowsReduction {
+        rows: filter_installed_skill_capability_rows(response.skills.as_slice(), query),
+    }
+}
+
 pub fn selectable_mcp_server_from_item(server: &McpListItem) -> SelectableMcpCapability {
     let unavailable_reason = mcp_server_unavailable_reason(server);
     let label = server
@@ -650,6 +679,19 @@ pub fn filter_mcp_server_capability_rows(
     rows
 }
 
+pub fn reduce_composer_mcp_server_picker_rows_response(
+    response: McpListResponse,
+    query: &str,
+) -> ComposerMcpServerPickerRowsReduction {
+    let rows = filter_mcp_server_capability_rows(response.servers.as_slice(), query);
+    let prefetch_server_ids = selectable_mcp_server_ids(rows.as_slice());
+
+    ComposerMcpServerPickerRowsReduction {
+        rows,
+        prefetch_server_ids,
+    }
+}
+
 pub fn filter_mcp_tool_capability_rows(
     details: &McpServerDetailsResponse,
     query: &str,
@@ -701,6 +743,15 @@ pub fn filter_mcp_tool_capability_rows(
         .collect::<Vec<_>>();
     sort_selectable_mcp_capability_rows(&mut rows);
     rows
+}
+
+pub fn reduce_composer_mcp_tool_picker_rows_response(
+    response: McpServerDetailsResponse,
+    query: &str,
+) -> ComposerMcpToolPickerRowsReduction {
+    ComposerMcpToolPickerRowsReduction {
+        rows: filter_mcp_tool_capability_rows(&response, query),
+    }
 }
 
 pub fn mcp_row_to_composer_capability(row: SelectableMcpCapability) -> ComposerCapability {
@@ -1107,6 +1158,26 @@ mod tests {
     }
 
     #[test]
+    fn skill_picker_response_reduction_returns_installed_rows() {
+        let mut installed = skill_item("tests/installed");
+        installed.display_name = "Installed".to_owned();
+        let mut uninstalled = skill_item("tests/uninstalled");
+        uninstalled.install.installed = false;
+
+        let reduction = reduce_composer_skill_picker_rows_response(
+            SkillListResponse {
+                snapshot_version: 1,
+                generated_at: 1,
+                skills: vec![uninstalled, installed],
+            },
+            "",
+        );
+
+        assert_eq!(reduction.rows.len(), 1);
+        assert_eq!(reduction.rows[0].slug, "tests/installed");
+    }
+
+    #[test]
     fn selected_skill_capabilities_use_only_selectable_selected_rows() {
         let mut selected = HashSet::new();
         let mut docs = selectable_skill_from_item(&skill_item("tests/docs"));
@@ -1169,6 +1240,23 @@ mod tests {
     }
 
     #[test]
+    fn mcp_server_picker_response_reduction_returns_rows_and_prefetch_ids() {
+        let browser = mcp_server("browser");
+
+        let reduction = reduce_composer_mcp_server_picker_rows_response(
+            McpListResponse {
+                snapshot_version: 1,
+                generated_at: 1,
+                servers: vec![browser],
+            },
+            "",
+        );
+
+        assert_eq!(reduction.rows.len(), 1);
+        assert_eq!(reduction.prefetch_server_ids, vec!["mcp:browser"]);
+    }
+
+    #[test]
     fn mcp_server_id_helpers_track_selectable_servers_and_loaded_tool_servers() {
         let mut browser = selectable_mcp_server_from_item(&mcp_server("browser"));
         let resend = selectable_mcp_server_from_item(&mcp_server("resend"));
@@ -1204,6 +1292,17 @@ mod tests {
 
         let capability = mcp_row_to_composer_capability(rows[0].clone());
         assert_eq!(capability.id, "mcp-tool:workspace:browser:open");
+    }
+
+    #[test]
+    fn mcp_tool_picker_response_reduction_returns_tool_rows() {
+        let details = mcp_details("browser", vec![mcp_tool("open", "Open page")]);
+
+        let reduction = reduce_composer_mcp_tool_picker_rows_response(details, "");
+
+        assert_eq!(reduction.rows.len(), 1);
+        assert_eq!(reduction.rows[0].server_name, "browser");
+        assert_eq!(reduction.rows[0].raw_tool_name.as_deref(), Some("open"));
     }
 
     #[test]

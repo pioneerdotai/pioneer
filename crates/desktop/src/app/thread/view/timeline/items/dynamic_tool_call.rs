@@ -20,7 +20,9 @@ use gpui_component::{
 use pioneer_client::{
     tasks::review as task_review,
     timeline::labels::{
-        McpTimelineMetadata, TaskWaitReviewDisplay, TaskWaitReviewDisplayItem,
+        McpTimelineMetadata, McpTimelineMetadataDetail, McpTimelineMetadataDetailKind,
+        McpTimelineMetadataDetailValue, TaskWaitReviewDetailKind, TaskWaitReviewDetailRow,
+        TaskWaitReviewDisplay, TaskWaitReviewDisplayItem, TimelineFinalStatusKind,
         final_dynamic_tool_status, mcp_timeline_metadata, pretty_json, task_review_button_id,
         task_wait_review_display,
     },
@@ -111,7 +113,9 @@ impl PioneerDesktop {
         entry.id.hash(&mut toggle_id_hasher);
         let toggle_id = toggle_id_hasher.finish();
 
-        let (final_status, is_successful) = final_dynamic_tool_status(item_view.status, success);
+        let status = final_dynamic_tool_status(item_view.status, success);
+        let final_status = dynamic_tool_status_label(status.kind);
+        let is_successful = status.successful;
 
         let content = if is_running {
             v_flex()
@@ -234,7 +238,7 @@ impl PioneerDesktop {
             has_details = true;
             details = details.child(self.timeline_detail_block(
                 "MCP".to_owned(),
-                mcp_metadata.details(),
+                mcp_timeline_details_text(mcp_metadata.detail_rows().as_slice()),
                 false,
                 cx,
             ));
@@ -248,12 +252,18 @@ impl PioneerDesktop {
 
         if let Some(task_wait_review) = task_wait_review {
             has_details = true;
-            details = details.child(self.timeline_detail_block(
-                "Review required".to_owned(),
-                Self::truncate_for_card(task_wait_review.details().as_str(), 4_000),
-                false,
-                cx,
-            ));
+            details = details.child(
+                self.timeline_detail_block(
+                    t!("timeline.task_review.details.title").to_string(),
+                    Self::truncate_for_card(
+                        task_wait_review_details_text(task_wait_review.detail_rows().as_slice())
+                            .as_str(),
+                        4_000,
+                    ),
+                    false,
+                    cx,
+                ),
+            );
             if let Some(controls) = self.render_task_wait_review_controls(task_wait_review, cx) {
                 details = details.child(controls);
             }
@@ -348,89 +358,99 @@ impl PioneerDesktop {
             let accept_item = item.clone();
             let revise_item = item.clone();
             let cancel_item = item.clone();
-            let candidate_label =
-                format!("Candidate {}", Self::truncate_for_card(&candidate_id, 96));
+            let candidate_label = t!(
+                "timeline.task_review.candidate",
+                candidate_id = Self::truncate_for_card(&candidate_id, 96).as_str()
+            )
+            .to_string();
 
-            controls =
-                controls.child(
-                    div()
-                        .w_full()
-                        .overflow_hidden()
-                        .rounded_lg()
-                        .bg(cx.theme().muted)
-                        .p_3()
-                        .child(
-                            v_flex()
-                                .w_full()
-                                .gap_2()
-                                .child(div().text_xs().opacity(0.6).child(candidate_label))
-                                .child(
-                                    h_flex()
-                                        .w_full()
-                                        .flex_wrap()
-                                        .gap_2()
-                                        .child(
-                                            Button::new(task_review_button_id(
-                                                &candidate_id,
-                                                "task-review-accept",
-                                            ))
-                                            .small()
-                                            .primary()
-                                            .label("Accept result")
-                                            .disabled(!accept_enabled)
-                                            .on_click(cx.listener(move |view, _, _, cx| {
+            controls = controls.child(
+                div()
+                    .w_full()
+                    .overflow_hidden()
+                    .rounded_lg()
+                    .bg(cx.theme().muted)
+                    .p_3()
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .gap_2()
+                            .child(div().text_xs().opacity(0.6).child(candidate_label))
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .flex_wrap()
+                                    .gap_2()
+                                    .child(
+                                        Button::new(task_review_button_id(
+                                            &candidate_id,
+                                            "task-review-accept",
+                                        ))
+                                        .small()
+                                        .primary()
+                                        .label(t!("timeline.task_review.accept_result").to_string())
+                                        .disabled(!accept_enabled)
+                                        .on_click(
+                                            cx.listener(move |view, _, _, cx| {
                                                 view.perform_task_review_accept(
                                                     accept_item.clone(),
                                                     cx,
                                                 );
-                                            })),
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        Button::new(task_review_button_id(
+                                            &candidate_id,
+                                            "task-review-revise",
+                                        ))
+                                        .small()
+                                        .outline()
+                                        .label(
+                                            t!("timeline.task_review.request_revision").to_string(),
                                         )
-                                        .child(
-                                            Button::new(task_review_button_id(
-                                                &candidate_id,
-                                                "task-review-revise",
-                                            ))
-                                            .small()
-                                            .outline()
-                                            .label("Request revision")
-                                            .disabled(!revise_enabled)
-                                            .on_click(cx.listener(move |view, _, window, cx| {
+                                        .disabled(!revise_enabled)
+                                        .on_click(
+                                            cx.listener(move |view, _, window, cx| {
                                                 view.open_task_review_revise_dialog(
                                                     revise_item.clone(),
                                                     window,
                                                     cx,
                                                 );
-                                            })),
-                                        )
-                                        .child(
-                                            Button::new(task_review_button_id(
-                                                &candidate_id,
-                                                "task-review-cancel",
-                                            ))
-                                            .small()
-                                            .danger()
-                                            .label("Cancel task")
-                                            .disabled(!cancel_enabled)
-                                            .on_click(cx.listener(move |view, _, _, cx| {
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        Button::new(task_review_button_id(
+                                            &candidate_id,
+                                            "task-review-cancel",
+                                        ))
+                                        .small()
+                                        .danger()
+                                        .label(t!("timeline.task_review.cancel_task").to_string())
+                                        .disabled(!cancel_enabled)
+                                        .on_click(
+                                            cx.listener(move |view, _, _, cx| {
                                                 view.perform_task_review_cancel(
                                                     cancel_item.clone(),
                                                     cx,
                                                 );
-                                            })),
+                                            }),
                                         ),
+                                    ),
+                            )
+                            .when_some(error, |this, error| {
+                                this.child(
+                                    div()
+                                        .text_xs()
+                                        .line_height(relative(1.35))
+                                        .text_color(cx.theme().danger)
+                                        .whitespace_normal()
+                                        .child(error),
                                 )
-                                .when_some(error, |this, error| {
-                                    this.child(
-                                        div()
-                                            .text_xs()
-                                            .line_height(relative(1.35))
-                                            .text_color(cx.theme().danger)
-                                            .whitespace_normal()
-                                            .child(error),
-                                    )
-                                }),
-                        ),
-                );
+                            }),
+                    ),
+            );
         }
 
         Some(controls.into_any_element())
@@ -495,15 +515,17 @@ impl PioneerDesktop {
 
     fn task_review_plan_error_message(error: task_review::TaskReviewPlanError) -> String {
         match error {
-            task_review::TaskReviewPlanError::BlankFeedback => "Feedback is required".to_owned(),
+            task_review::TaskReviewPlanError::BlankFeedback => {
+                t!("timeline.task_review.error.feedback_required").to_string()
+            }
             task_review::TaskReviewPlanError::MissingRunId
             | task_review::TaskReviewPlanError::MissingTaskId
             | task_review::TaskReviewPlanError::MissingCandidateId => {
-                "Task review target is incomplete".to_owned()
+                t!("timeline.task_review.error.target_incomplete").to_string()
             }
             task_review::TaskReviewPlanError::UserControlsNotAllowed
             | task_review::TaskReviewPlanError::ActionNotAllowed { .. } => {
-                "Task review action is unavailable".to_owned()
+                t!("timeline.task_review.error.action_unavailable").to_string()
             }
         }
     }
@@ -522,7 +544,7 @@ impl PioneerDesktop {
             InputState::new(window, cx)
                 .multi_line(true)
                 .auto_grow(3, 8)
-                .placeholder("Revision feedback")
+                .placeholder(t!("timeline.task_review.revision_feedback_placeholder").to_string())
         });
         let field_error: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let desktop_entity = cx.entity().clone();
@@ -563,7 +585,12 @@ impl PioneerDesktop {
                 .close_button(true)
                 .overlay_closable(true)
                 .keyboard(true)
-                .title(div().text_base().font_semibold().child("Request revision"))
+                .title(
+                    div()
+                        .text_base()
+                        .font_semibold()
+                        .child(t!("timeline.task_review.request_revision").to_string()),
+                )
                 .on_ok({
                     let submit_revision = submit_revision.clone();
                     move |_, _, cx| submit_revision(cx)
@@ -575,7 +602,7 @@ impl PioneerDesktop {
                             Button::new("task-review-revise-cancel")
                                 .small()
                                 .outline()
-                                .label("Cancel")
+                                .label(t!("buttons.cancel").to_string())
                                 .on_click(|_, window, cx| {
                                     window.close_dialog(cx);
                                 })
@@ -583,7 +610,7 @@ impl PioneerDesktop {
                             Button::new("task-review-revise-submit")
                                 .small()
                                 .primary()
-                                .label("Request revision")
+                                .label(t!("timeline.task_review.request_revision").to_string())
                                 .disabled(!can_submit)
                                 .on_click({
                                     let submit_revision = submit_revision.clone();
@@ -601,7 +628,7 @@ impl PioneerDesktop {
                     v_form()
                         .child(
                             field()
-                                .label("Feedback")
+                                .label(t!("timeline.task_review.feedback_label").to_string())
                                 .child(Input::new(&feedback_state).min_w_0()),
                         )
                         .when_some(error, |this, error| {
@@ -745,5 +772,153 @@ impl PioneerDesktop {
                     ),
             )
             .into_any_element()
+    }
+}
+
+fn dynamic_tool_status_label(kind: TimelineFinalStatusKind) -> String {
+    match kind {
+        TimelineFinalStatusKind::Cancelled => t!("timeline.tool.cancelled").to_string(),
+        TimelineFinalStatusKind::Blocked => t!("timeline.tool.blocked").to_string(),
+        TimelineFinalStatusKind::Failed => t!("timeline.tool.failed").to_string(),
+        TimelineFinalStatusKind::Running => t!("timeline.tool.running").to_string(),
+        TimelineFinalStatusKind::Completed => t!("timeline.tool.completed").to_string(),
+    }
+}
+
+fn mcp_timeline_details_text(rows: &[McpTimelineMetadataDetail]) -> String {
+    rows.iter()
+        .map(|row| {
+            format!(
+                "{}: {}",
+                mcp_timeline_detail_kind_label(row.kind),
+                mcp_timeline_detail_value_label(&row.value)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn mcp_timeline_detail_kind_label(kind: McpTimelineMetadataDetailKind) -> String {
+    match kind {
+        McpTimelineMetadataDetailKind::Server => t!("timeline.tool.mcp_detail_server").to_string(),
+        McpTimelineMetadataDetailKind::Tool => t!("timeline.tool.mcp_detail_tool").to_string(),
+        McpTimelineMetadataDetailKind::Catalog => {
+            t!("timeline.tool.mcp_detail_catalog").to_string()
+        }
+        McpTimelineMetadataDetailKind::Snapshot => {
+            t!("timeline.tool.mcp_detail_snapshot").to_string()
+        }
+        McpTimelineMetadataDetailKind::Runtime => {
+            t!("timeline.tool.mcp_detail_runtime").to_string()
+        }
+        McpTimelineMetadataDetailKind::Duration => {
+            t!("timeline.tool.mcp_detail_duration").to_string()
+        }
+        McpTimelineMetadataDetailKind::Result => t!("timeline.tool.mcp_detail_result").to_string(),
+    }
+}
+
+fn mcp_timeline_detail_value_label(value: &McpTimelineMetadataDetailValue) -> String {
+    match value {
+        McpTimelineMetadataDetailValue::Text(value) => value.clone(),
+        McpTimelineMetadataDetailValue::U64(value) => value.to_string(),
+        McpTimelineMetadataDetailValue::DurationMs(duration_ms) => t!(
+            "timeline.tool.duration_value_ms",
+            duration_ms = *duration_ms
+        )
+        .to_string(),
+        McpTimelineMetadataDetailValue::Truncated => {
+            t!("timeline.tool.mcp_detail_truncated").to_string()
+        }
+    }
+}
+
+fn task_wait_review_details_text(rows: &[TaskWaitReviewDetailRow]) -> String {
+    let mut lines = Vec::new();
+    for row in rows {
+        match row {
+            TaskWaitReviewDetailRow::ReviewRequiredCount { count } => lines.push(
+                t!(
+                    "timeline.task_review.details.review_required_count",
+                    count = *count
+                )
+                .to_string(),
+            ),
+            TaskWaitReviewDetailRow::WaitMode { mode } => lines.push(format!(
+                "{}: {mode}",
+                t!("timeline.task_review.details.wait_mode")
+            )),
+            TaskWaitReviewDetailRow::Candidate { index } => {
+                if !lines.is_empty() {
+                    lines.push(String::new());
+                }
+                lines
+                    .push(t!("timeline.task_review.details.candidate", index = *index).to_string());
+            }
+            TaskWaitReviewDetailRow::Field { kind, value } => lines.push(format!(
+                "{}: {value}",
+                task_wait_review_detail_kind_label(*kind)
+            )),
+            TaskWaitReviewDetailRow::UserApprovalRequired => {
+                lines.push(t!("timeline.task_review.details.user_approval_required").to_string())
+            }
+            TaskWaitReviewDetailRow::ActionRequired { actions } => {
+                let separator = format!(
+                    " {} ",
+                    t!("timeline.task_review.details.action_separator_or")
+                );
+                lines.push(format!(
+                    "{}: {}",
+                    t!("timeline.task_review.details.action_required"),
+                    actions.join(separator.as_str())
+                ));
+            }
+            TaskWaitReviewDetailRow::RevisionRoundsRemaining { remaining, max } => {
+                let max = max
+                    .map(|max| max.to_string())
+                    .unwrap_or_else(|| t!("timeline.task_review.details.unknown").to_string());
+                lines.push(format!(
+                    "{}: {remaining}/{max}",
+                    t!("timeline.task_review.details.revision_rounds_remaining")
+                ));
+            }
+            TaskWaitReviewDetailRow::Diagnostics { diagnostics } => lines.push(format!(
+                "{}: {}",
+                t!("timeline.task_review.details.diagnostics"),
+                diagnostics.join("; ")
+            )),
+        }
+    }
+    lines.join("\n")
+}
+
+fn task_wait_review_detail_kind_label(kind: TaskWaitReviewDetailKind) -> String {
+    match kind {
+        TaskWaitReviewDetailKind::Task => t!("timeline.task_review.details.task").to_string(),
+        TaskWaitReviewDetailKind::TaskId => t!("timeline.task_review.details.task_id").to_string(),
+        TaskWaitReviewDetailKind::RunId => t!("timeline.task_review.details.run_id").to_string(),
+        TaskWaitReviewDetailKind::CandidateId => {
+            t!("timeline.task_review.details.candidate_id").to_string()
+        }
+        TaskWaitReviewDetailKind::TaskStatus => {
+            t!("timeline.task_review.details.task_status").to_string()
+        }
+        TaskWaitReviewDetailKind::CandidateStatus => {
+            t!("timeline.task_review.details.candidate_status").to_string()
+        }
+        TaskWaitReviewDetailKind::Round => t!("timeline.task_review.details.round").to_string(),
+        TaskWaitReviewDetailKind::ReviewMode => {
+            t!("timeline.task_review.details.review_mode").to_string()
+        }
+        TaskWaitReviewDetailKind::RevisionBlocked => {
+            t!("timeline.task_review.details.revision_blocked").to_string()
+        }
+        TaskWaitReviewDetailKind::Summary => t!("timeline.task_review.details.summary").to_string(),
+        TaskWaitReviewDetailKind::ResultPreview => {
+            t!("timeline.task_review.details.result_preview").to_string()
+        }
+        TaskWaitReviewDetailKind::ExtractionError => {
+            t!("timeline.task_review.details.extraction_error").to_string()
+        }
     }
 }

@@ -505,13 +505,11 @@ impl PioneerDesktop {
                 let _ = cx.update(|cx| {
                     picker_state.update(cx, |state, cx| match result {
                         Ok(response) => {
-                            state.finish_loading_skills(
-                                composer_capabilities::filter_installed_skill_capability_rows(
-                                    response.skills.as_slice(),
-                                    "",
-                                ),
-                                cx,
-                            );
+                            let reduction =
+                                composer_capabilities::reduce_composer_skill_picker_rows_response(
+                                    response, "",
+                                );
+                            state.finish_loading_skills(reduction.rows, cx);
                         }
                         Err(error) => {
                             state.fail_loading_skills(
@@ -567,22 +565,14 @@ impl PioneerDesktop {
 
                 let prefetch_server_ids = match result {
                     Ok(response) => {
-                        let rows = response
-                            .servers
-                            .iter()
-                            .map(composer_capabilities::selectable_mcp_server_from_item)
-                            .collect::<Vec<_>>();
-                        let prefetch_server_ids =
-                            composer_capabilities::selectable_mcp_server_ids(rows.as_slice());
+                        let reduction =
+                            composer_capabilities::reduce_composer_mcp_server_picker_rows_response(
+                                response, "",
+                            );
+                        let prefetch_server_ids = reduction.prefetch_server_ids.clone();
                         let _ = cx.update(|cx| {
                             picker_state.update(cx, |state, cx| {
-                                state.finish_loading_mcp_servers(
-                                    composer_capabilities::filter_selectable_mcp_capability_rows(
-                                        rows.as_slice(),
-                                        "",
-                                    ),
-                                    cx,
-                                );
+                                state.finish_loading_mcp_servers(reduction.rows, cx);
                             });
                         });
                         prefetch_server_ids
@@ -618,9 +608,10 @@ impl PioneerDesktop {
                             );
                             if let Ok(details) = details {
                                 rows.extend(
-                                    composer_capabilities::filter_mcp_tool_capability_rows(
-                                        &details, "",
-                                    ),
+                                    composer_capabilities::reduce_composer_mcp_tool_picker_rows_response(
+                                        details, "",
+                                    )
+                                    .rows,
                                 );
                             }
                         }
@@ -687,10 +678,15 @@ impl PioneerDesktop {
                 let _ = cx.update(|cx| {
                     picker_state.update(cx, |state, cx| match result {
                         Ok(response) => {
-                            let rows = composer_capabilities::filter_mcp_tool_capability_rows(
-                                &response, "",
+                            let reduction =
+                                composer_capabilities::reduce_composer_mcp_tool_picker_rows_response(
+                                    response, "",
+                                );
+                            state.finish_loading_mcp_tools(
+                                server_id.as_str(),
+                                reduction.rows,
+                                cx,
                             );
-                            state.finish_loading_mcp_tools(server_id.as_str(), rows, cx);
                         }
                         Err(error) => {
                             let error = format!("{error:#}");

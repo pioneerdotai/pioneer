@@ -51,6 +51,50 @@ pub struct WorkspaceMutationApplied {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceBootstrapOutcome {
+    pub workspace_id: String,
+    pub workspaces: Vec<Workspace>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceSelectionReduction {
+    pub workspace_id: String,
+    pub persist_active_gateway_workspace_id: String,
+    pub set_preferred_workspace_id: String,
+    pub refresh_thread_list: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceBootstrapSuccessReduction {
+    pub workspaces: Vec<Workspace>,
+    pub selected: WorkspaceSelectionReduction,
+    pub clear_workspaces_error: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceSwitchSuccessReduction {
+    pub workspaces: Vec<Workspace>,
+    pub selected: WorkspaceSelectionReduction,
+    pub clear_thread_list_loading: bool,
+    pub refresh_workspace_bound_screens: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceCreateSuccessReduction {
+    pub workspaces: Vec<Workspace>,
+    pub workspace_id: String,
+    pub switch_workspace_id: String,
+    pub clear_workspaces_error: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceRenameSuccessReduction {
+    pub workspaces: Vec<Workspace>,
+    pub workspace_id: String,
+    pub clear_workspaces_error: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GatewayWorkspacePreferencePersistPlan {
     pub gateway_id: String,
     pub workspace_id: String,
@@ -199,6 +243,54 @@ pub fn apply_workspace_select_response_to_catalog(
     workspace_id
 }
 
+pub fn reduce_workspace_bootstrap_success(
+    outcome: WorkspaceBootstrapOutcome,
+) -> WorkspaceBootstrapSuccessReduction {
+    WorkspaceBootstrapSuccessReduction {
+        selected: workspace_selection_reduction(outcome.workspace_id),
+        workspaces: outcome.workspaces,
+        clear_workspaces_error: true,
+    }
+}
+
+pub fn reduce_workspace_switch_success(
+    mut workspaces: Vec<Workspace>,
+    workspace: Workspace,
+) -> WorkspaceSwitchSuccessReduction {
+    let workspace_id = apply_workspace_select_response_to_catalog(&mut workspaces, workspace);
+    WorkspaceSwitchSuccessReduction {
+        workspaces,
+        selected: workspace_selection_reduction(workspace_id),
+        clear_thread_list_loading: true,
+        refresh_workspace_bound_screens: true,
+    }
+}
+
+pub fn reduce_workspace_create_success(
+    mut workspaces: Vec<Workspace>,
+    workspace: Workspace,
+) -> WorkspaceCreateSuccessReduction {
+    let applied = apply_workspace_create_response_to_catalog(&mut workspaces, workspace);
+    WorkspaceCreateSuccessReduction {
+        switch_workspace_id: applied.workspace_id.clone(),
+        workspace_id: applied.workspace_id,
+        workspaces,
+        clear_workspaces_error: true,
+    }
+}
+
+pub fn reduce_workspace_rename_success(
+    mut workspaces: Vec<Workspace>,
+    workspace: Workspace,
+) -> WorkspaceRenameSuccessReduction {
+    let applied = apply_workspace_update_response_to_catalog(&mut workspaces, workspace);
+    WorkspaceRenameSuccessReduction {
+        workspace_id: applied.workspace_id,
+        workspaces,
+        clear_workspaces_error: true,
+    }
+}
+
 pub fn apply_workspace_changed_to_catalog(
     workspaces: &mut Vec<Workspace>,
     notification: &WorkspaceChangedNotification,
@@ -279,6 +371,15 @@ pub fn upsert_workspace_catalog_item(workspaces: &mut Vec<Workspace>, workspace:
         *existing = workspace;
     } else {
         workspaces.push(workspace);
+    }
+}
+
+fn workspace_selection_reduction(workspace_id: String) -> WorkspaceSelectionReduction {
+    WorkspaceSelectionReduction {
+        persist_active_gateway_workspace_id: workspace_id.clone(),
+        set_preferred_workspace_id: workspace_id.clone(),
+        workspace_id,
+        refresh_thread_list: true,
     }
 }
 
@@ -444,6 +545,85 @@ mod tests {
         );
         assert_eq!(update_applied.workspace_id, "ws_created");
         assert_eq!(workspaces.len(), 2);
+    }
+
+    #[test]
+    fn workspace_bootstrap_success_reduction_selects_workspace_and_clears_error() {
+        let workspaces = vec![workspace("ws_a", true, true)];
+
+        let reduction = reduce_workspace_bootstrap_success(WorkspaceBootstrapOutcome {
+            workspace_id: "ws_a".to_owned(),
+            workspaces: workspaces.clone(),
+        });
+
+        assert_eq!(reduction.workspaces, workspaces);
+        assert_eq!(
+            reduction.selected,
+            WorkspaceSelectionReduction {
+                workspace_id: "ws_a".to_owned(),
+                persist_active_gateway_workspace_id: "ws_a".to_owned(),
+                set_preferred_workspace_id: "ws_a".to_owned(),
+                refresh_thread_list: true,
+            }
+        );
+        assert!(reduction.clear_workspaces_error);
+    }
+
+    #[test]
+    fn workspace_switch_success_reduction_updates_catalog_and_refreshes_bound_screens() {
+        let workspaces = vec![workspace("ws_a", true, true)];
+
+        let reduction = reduce_workspace_switch_success(workspaces, workspace("ws_b", true, false));
+
+        assert_eq!(
+            reduction
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ws_a", "ws_b"]
+        );
+        assert_eq!(reduction.selected.workspace_id, "ws_b");
+        assert_eq!(
+            reduction.selected.persist_active_gateway_workspace_id,
+            "ws_b"
+        );
+        assert_eq!(reduction.selected.set_preferred_workspace_id, "ws_b");
+        assert!(reduction.selected.refresh_thread_list);
+        assert!(reduction.clear_thread_list_loading);
+        assert!(reduction.refresh_workspace_bound_screens);
+    }
+
+    #[test]
+    fn workspace_create_success_reduction_updates_catalog_and_requests_switch() {
+        let workspaces = vec![workspace("ws_a", true, true)];
+
+        let reduction =
+            reduce_workspace_create_success(workspaces, workspace("ws_new", true, false));
+
+        assert_eq!(reduction.workspace_id, "ws_new");
+        assert_eq!(reduction.switch_workspace_id, "ws_new");
+        assert!(reduction.clear_workspaces_error);
+        assert_eq!(
+            reduction
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ws_a", "ws_new"]
+        );
+    }
+
+    #[test]
+    fn workspace_rename_success_reduction_updates_catalog_without_switch() {
+        let workspaces = vec![workspace("ws_a", true, true)];
+
+        let reduction = reduce_workspace_rename_success(workspaces, workspace("ws_a", true, true));
+
+        assert_eq!(reduction.workspace_id, "ws_a");
+        assert!(reduction.clear_workspaces_error);
+        assert_eq!(reduction.workspaces.len(), 1);
+        assert_eq!(reduction.workspaces[0].id, "ws_a");
     }
 
     #[test]

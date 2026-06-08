@@ -54,14 +54,9 @@ impl PioneerDesktop {
 
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
-            let workspace_for_request = workspace_id.clone();
             async move {
                 let result = cx
-                    .background_spawn(async move {
-                        let mut params = create_params.clone();
-                        params.workspace_id = workspace_for_request;
-                        ws_sender.thread_folder_create(params)
-                    })
+                    .background_spawn(async move { ws_sender.thread_folder_create(create_params) })
                     .await;
 
                 let _ = this.update(&mut cx, |view, cx| {
@@ -204,13 +199,11 @@ impl PioneerDesktop {
 
                     match result {
                         Ok(response) => {
-                            let thread = response.thread;
-                            let thread_id = thread.id.clone();
-                            let workspace_id = thread.workspace_id.clone();
-                            view.upsert_thread_snapshot(thread);
+                            let reduction = thread_tree::reduce_thread_rename_success(response);
+                            view.upsert_thread_snapshot(reduction.thread);
                             view.upsert_thread_for_workspace(
-                                thread_id.as_str(),
-                                workspace_id.as_str(),
+                                reduction.thread_id.as_str(),
+                                reduction.workspace_id.as_str(),
                             );
                             view.rebuild_sidebar_tree_state(cx);
                         }
@@ -443,7 +436,16 @@ impl PioneerDesktop {
                 self.request_thread_move(thread_id, Some(target_folder_id), cx);
             }
             SidebarTreeDragItem::Folder { folder_id } => {
-                if folder_id == target_folder_id {
+                let workspace_id = self.sidebar_workspace_id();
+                let can_drop = thread_tree::can_drop_sidebar_tree_item_on_folder(
+                    &self.thread_folders,
+                    workspace_id.as_deref(),
+                    thread_tree::SidebarTreeDragItemRef::Folder {
+                        folder_id: folder_id.as_str(),
+                    },
+                    target_folder_id.as_str(),
+                );
+                if !can_drop {
                     return;
                 }
                 self.request_folder_move(folder_id, Some(target_folder_id), cx);

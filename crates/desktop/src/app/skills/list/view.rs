@@ -294,11 +294,11 @@ impl PioneerDesktop {
         desktop_entity: Entity<Self>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (owner, _slug_label) = Self::split_skill_slug_for_view(skill.slug.as_str());
-        let status_color = Self::status_color(skill.status.as_str(), cx);
-        let status_label = Self::status_label(skill.status.as_str());
-        let version_label = skill_presentation::optional_non_empty_text(skill.version.as_deref())
-            .unwrap_or_else(|| "-".to_owned());
+        let summary = skill_presentation::skill_summary_presentation(skill);
+        let owner = summary.slug.owner.as_deref();
+        let status_color = Self::status_color(summary.status_tone, cx);
+        let status_label = Self::status_label(&summary.status);
+        let version_label = summary.version.as_deref().unwrap_or("-");
 
         v_flex()
             .id(("installed-skill-row", index))
@@ -446,19 +446,19 @@ impl PioneerDesktop {
             .into_any_element()
     }
 
-    pub(crate) fn source_label(source_kind: &str) -> String {
-        match skill_presentation::skill_source_kind(source_kind) {
+    pub(crate) fn source_label(source_kind: &skill_presentation::SkillSourceKind) -> String {
+        match source_kind {
             skill_presentation::SkillSourceKind::System => t!("skills.source.system").to_string(),
             skill_presentation::SkillSourceKind::User => t!("skills.source.user").to_string(),
             skill_presentation::SkillSourceKind::Registry => {
                 t!("skills.source.registry").to_string()
             }
-            skill_presentation::SkillSourceKind::Other(value) => value,
+            skill_presentation::SkillSourceKind::Other(value) => value.clone(),
         }
     }
 
-    pub(crate) fn trust_label(trust_level: &str) -> String {
-        match skill_presentation::skill_trust_level(trust_level) {
+    pub(crate) fn trust_label(trust_level: &skill_presentation::SkillTrustLevel) -> String {
+        match trust_level {
             skill_presentation::SkillTrustLevel::Internal => {
                 t!("skills.trust.internal").to_string()
             }
@@ -471,30 +471,28 @@ impl PioneerDesktop {
             skill_presentation::SkillTrustLevel::Untrusted => {
                 t!("skills.trust.untrusted").to_string()
             }
-            skill_presentation::SkillTrustLevel::Other(value) => value,
+            skill_presentation::SkillTrustLevel::Other(value) => value.clone(),
             skill_presentation::SkillTrustLevel::None => String::new(),
         }
     }
 
-    pub(crate) fn status_label(status: &str) -> String {
-        match skill_presentation::skill_status(status) {
+    pub(crate) fn status_label(status: &skill_presentation::SkillStatus) -> String {
+        match status {
             skill_presentation::SkillStatus::Active => t!("skills.status.active").to_string(),
             skill_presentation::SkillStatus::Blocked => t!("skills.status.blocked").to_string(),
             skill_presentation::SkillStatus::Disabled => t!("skills.status.disabled").to_string(),
-            skill_presentation::SkillStatus::Other(value) => value,
+            skill_presentation::SkillStatus::Other(value) => value.clone(),
         }
     }
 
-    pub(crate) fn status_color(status: &str, cx: &mut Context<Self>) -> Hsla {
-        match skill_presentation::skill_status_tone(status) {
+    pub(crate) fn status_color(
+        tone: skill_presentation::SkillDiagnosticsTone,
+        cx: &mut Context<Self>,
+    ) -> Hsla {
+        match tone {
             skill_presentation::SkillDiagnosticsTone::Success => cx.theme().success,
             skill_presentation::SkillDiagnosticsTone::Warning => cx.theme().warning,
             _ => cx.theme().foreground.opacity(1.),
         }
-    }
-
-    pub(crate) fn split_skill_slug_for_view(skill_slug: &str) -> (Option<String>, String) {
-        let split = skill_presentation::split_skill_slug_for_view(skill_slug);
-        (split.owner, split.slug)
     }
 }

@@ -38,50 +38,42 @@ impl PioneerDesktop {
         force: bool,
         cx: &mut Context<Self>,
     ) {
-        if self.gateway.connection_state != GatewayConnectionState::Connected {
-            return;
-        }
-        if !self.is_thread_materialized_for_artifacts(thread_id.as_str()) {
-            self.thread_artifacts.clear_error(thread_id.as_str());
-            return;
-        }
-        let Some(connection_id) = self.gateway.ws_connection_id else {
-            return;
-        };
-        let Some(workspace_id) = self
-            .thread_workspace_id(thread_id.as_str())
-            .map(str::to_owned)
-        else {
-            return;
-        };
-        if !force && !self.thread_artifacts.needs_load(thread_id.as_str()) {
-            return;
-        }
-        if self.thread_artifacts.is_loading_thread(thread_id.as_str()) {
-            if force {
+        let plan = client_artifact_state::plan_thread_artifacts_refresh(
+            &self.thread_artifacts,
+            thread_id.as_str(),
+            force,
+            self.gateway.connection_state == GatewayConnectionState::Connected,
+            self.gateway.ws_connection_id,
+            self.thread_workspace_id(thread_id.as_str())
+                .map(str::to_owned),
+            self.is_thread_materialized_for_artifacts(thread_id.as_str()),
+        );
+        let request = match plan {
+            client_artifact_state::ThreadArtifactsRefreshPlan::Send(request) => request,
+            client_artifact_state::ThreadArtifactsRefreshPlan::ClearError => {
+                self.thread_artifacts.clear_error(thread_id.as_str());
+                return;
+            }
+            client_artifact_state::ThreadArtifactsRefreshPlan::RequestRefreshAfterCurrent => {
                 self.thread_artifacts
                     .request_refresh_after_current(thread_id.as_str());
+                return;
             }
-            return;
-        }
+            client_artifact_state::ThreadArtifactsRefreshPlan::Skip => return,
+        };
+        let connection_id = request.connection_id;
+        let params = request.params;
 
         self.thread_artifacts.mark_loading(thread_id.as_str());
         let ws_sender = self.gateway.ws_command_sender.clone();
 
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
-            let workspace_id_for_request = workspace_id.clone();
-            let thread_id_for_request = thread_id.clone();
 
             async move {
                 let result = cx
                     .background_spawn(async move {
-                        ws_sender.artifact_list_for_thread(
-                            client_artifact_state::artifact_list_for_thread_params(
-                                workspace_id_for_request,
-                                thread_id_for_request,
-                            ),
-                        )
+                        ws_sender.artifact_list_for_thread(params)
                     })
                     .await;
 

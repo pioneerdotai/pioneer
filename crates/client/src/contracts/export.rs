@@ -305,6 +305,27 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Stable
         ),
         contract_type!(
+            "gateway_settings_action_scope.json",
+            crate::settings::gateway::GatewaySettingsActionScope,
+            Domain::Settings,
+            Kind::ActionPlan,
+            Stability::Stable
+        ),
+        contract_type!(
+            "gateway_settings_refresh_plan.json",
+            crate::settings::gateway::GatewaySettingsRefreshPlan,
+            Domain::Settings,
+            Kind::ActionPlan,
+            Stability::Stable
+        ),
+        contract_type!(
+            "gateway_settings_refresh_unavailable.json",
+            crate::settings::gateway::GatewaySettingsRefreshUnavailable,
+            Domain::Settings,
+            Kind::ActionPlan,
+            Stability::Stable
+        ),
+        contract_type!(
             "gateway_settings_update_plan.json",
             crate::settings::gateway::GatewaySettingsUpdatePlan,
             Domain::Settings,
@@ -414,6 +435,13 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             crate::mcp::presentation::McpDetailValue,
             Domain::Mcp,
             Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "mcp_install_field_error.json",
+            crate::mcp::actions::McpInstallFieldError,
+            Domain::Mcp,
+            Kind::ActionPlan,
             Stability::Stable
         ),
         contract_type!(
@@ -589,6 +617,27 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             crate::providers::selectors::ProviderFilter,
             Domain::Providers,
             Kind::SelectorDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "provider_list_refresh_plan.json",
+            crate::providers::list::ProviderListRefreshPlan,
+            Domain::Providers,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "provider_list_refresh_request.json",
+            crate::providers::list::ProviderListRefreshRequest,
+            Domain::Providers,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "provider_list_refresh_unavailable.json",
+            crate::providers::list::ProviderListRefreshUnavailable,
+            Domain::Providers,
+            Kind::ActionPlan,
             Stability::Stable
         ),
         contract_type!(
@@ -1008,6 +1057,18 @@ pub fn client_schema_internal_exclusions() -> Vec<ClientSchemaInternalExclusion>
         ),
         internal_exclusion!(
             crate::state::reducers::GatewayConnectionReduction,
+            "reducer implementation detail"
+        ),
+        internal_exclusion!(
+            crate::state::reducers::GatewayOperationSuccessInfo,
+            "reducer implementation detail"
+        ),
+        internal_exclusion!(
+            crate::state::reducers::GatewayOperationFinishOutcome,
+            "reducer implementation detail"
+        ),
+        internal_exclusion!(
+            crate::state::reducers::GatewayOperationFinishReduction,
             "reducer implementation detail"
         ),
         internal_exclusion!(

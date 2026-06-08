@@ -3026,7 +3026,10 @@ mod tests {
 
     #[test]
     fn tool_loop_budget_action_includes_continuation_wire_value() {
-        let cases = [(ToolLoopBudgetAction::ContinueInNextWindow, "continue_in_next_window")];
+        let cases = [(
+            ToolLoopBudgetAction::ContinueInNextWindow,
+            "continue_in_next_window",
+        )];
 
         for (value, expected) in cases {
             let encoded = serde_json::to_value(value).expect("action should serialize");

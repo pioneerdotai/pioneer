@@ -15,8 +15,8 @@ use crate::{
 };
 use anyhow::{Context as _, Result, anyhow};
 use pioneer_protocol::{
-    ArtifactCapabilitiesParams, ArtifactCapabilitiesResponse, ArtifactRef, TurnCapability,
-    UserInput, UserMessageAttachment,
+    ArtifactCapabilitiesParams, ArtifactCapabilitiesResponse, ArtifactRef, ThreadMode,
+    TurnCapability, UserInput, UserMessageAttachment,
 };
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -47,6 +47,46 @@ pub struct PreparedComposerTurn {
     pub user_message_text: String,
     pub user_attachments: Vec<UserMessageAttachment>,
     pub attachments: Vec<PreparedComposerAttachment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedComposerTurnSubmitContext {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub pending_request_id: String,
+    pub selected_model: Option<String>,
+    pub selected_provider: Option<String>,
+    pub selected_mode: Option<ThreadMode>,
+    pub updated_at_unix: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedComposerThreadSnapshotUpdate {
+    pub selected_model: Option<String>,
+    pub selected_provider: Option<String>,
+    pub user_text: String,
+    pub updated_at_unix: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedComposerTurnSubmitReduction {
+    pub composer_upload_in_progress: bool,
+    pub clear_composer_upload_error: bool,
+    pub uploaded_attachment_artifacts: Vec<Option<ArtifactRef>>,
+    pub clear_composer: bool,
+    pub clear_thread_draft_id: String,
+    pub thread_snapshot_update: PreparedComposerThreadSnapshotUpdate,
+    pub promote_thread_from_draft_id: String,
+    pub local_turn_start_requested_event: crate::conversation::ConversationEvent,
+    pub turn_start_params_plan: turn_start::TurnStartParamsPlan,
+    pub send_context: turn_start::TurnStartSendContext,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrepareComposerTurnFailureReduction {
+    pub composer_upload_in_progress: bool,
+    pub composer_upload_error: String,
+    pub mark_uploading_attachments_failed_error: String,
 }
 
 pub trait ComposerTurnPrepareTransport: ArtifactUploadTransport {
@@ -155,6 +195,65 @@ pub fn build_prepared_composer_turn(
     }
 }
 
+pub fn reduce_prepared_composer_turn_submit_success(
+    context: PreparedComposerTurnSubmitContext,
+    prepared: PreparedComposerTurn,
+) -> PreparedComposerTurnSubmitReduction {
+    let uploaded_attachment_artifacts = prepared
+        .attachments
+        .iter()
+        .map(|prepared_attachment| prepared_attachment.artifact.clone())
+        .collect::<Vec<_>>();
+    let send_context = turn_start::TurnStartSendContext {
+        thread_id: context.thread_id.clone(),
+        turn_id: context.turn_id.clone(),
+        pending_request_id: context.pending_request_id.clone(),
+    };
+
+    PreparedComposerTurnSubmitReduction {
+        composer_upload_in_progress: false,
+        clear_composer_upload_error: true,
+        uploaded_attachment_artifacts,
+        clear_composer: true,
+        clear_thread_draft_id: context.thread_id.clone(),
+        thread_snapshot_update: PreparedComposerThreadSnapshotUpdate {
+            selected_model: context.selected_model.clone(),
+            selected_provider: context.selected_provider.clone(),
+            user_text: prepared.user_text.clone(),
+            updated_at_unix: context.updated_at_unix,
+        },
+        promote_thread_from_draft_id: context.thread_id.clone(),
+        local_turn_start_requested_event: turn_start::local_turn_start_requested_event(
+            context.thread_id.clone(),
+            context.turn_id.clone(),
+            context.pending_request_id.clone(),
+            prepared.user_message_text.clone(),
+            prepared.user_attachments.clone(),
+        ),
+        turn_start_params_plan: turn_start::TurnStartParamsPlan {
+            thread_id: context.thread_id,
+            turn_id: context.turn_id,
+            input: prepared.input,
+            capabilities: prepared.capabilities,
+            model: context.selected_model,
+            model_provider: context.selected_provider,
+            mode: context.selected_mode,
+        },
+        send_context,
+    }
+}
+
+pub fn reduce_prepare_composer_turn_failure(
+    error: impl Into<String>,
+) -> PrepareComposerTurnFailureReduction {
+    let error = error.into();
+    PrepareComposerTurnFailureReduction {
+        composer_upload_in_progress: false,
+        composer_upload_error: error.clone(),
+        mark_uploading_attachments_failed_error: error,
+    }
+}
+
 pub fn artifact_capabilities_params_for_attachments(
     workspace_id: &str,
     has_attachments: bool,
@@ -162,6 +261,27 @@ pub fn artifact_capabilities_params_for_attachments(
     has_attachments.then(|| ArtifactCapabilitiesParams {
         workspace_id: workspace_id.to_owned(),
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComposerSubmitAvailabilityInput<'a> {
+    pub gateway_connected: bool,
+    pub upload_in_progress: bool,
+    pub has_active_thread: bool,
+    pub has_complete_model_selection: bool,
+    pub conversation_can_submit: bool,
+    pub text: &'a str,
+    pub has_attachments: bool,
+    pub has_capabilities: bool,
+}
+
+pub fn can_submit_composer_message(input: ComposerSubmitAvailabilityInput<'_>) -> bool {
+    input.gateway_connected
+        && !input.upload_in_progress
+        && input.has_active_thread
+        && input.has_complete_model_selection
+        && input.conversation_can_submit
+        && composer_has_sendable_content(input.text, input.has_attachments, input.has_capabilities)
 }
 
 pub fn composer_has_sendable_content(
@@ -459,6 +579,65 @@ mod tests {
     }
 
     #[test]
+    fn composer_submit_availability_requires_ready_shell_and_sendable_content() {
+        let ready = ComposerSubmitAvailabilityInput {
+            gateway_connected: true,
+            upload_in_progress: false,
+            has_active_thread: true,
+            has_complete_model_selection: true,
+            conversation_can_submit: true,
+            text: "hello",
+            has_attachments: false,
+            has_capabilities: false,
+        };
+
+        assert!(can_submit_composer_message(ready));
+        assert!(!can_submit_composer_message(
+            ComposerSubmitAvailabilityInput {
+                gateway_connected: false,
+                ..ready
+            }
+        ));
+        assert!(!can_submit_composer_message(
+            ComposerSubmitAvailabilityInput {
+                upload_in_progress: true,
+                ..ready
+            }
+        ));
+        assert!(!can_submit_composer_message(
+            ComposerSubmitAvailabilityInput {
+                has_active_thread: false,
+                ..ready
+            }
+        ));
+        assert!(!can_submit_composer_message(
+            ComposerSubmitAvailabilityInput {
+                has_complete_model_selection: false,
+                ..ready
+            }
+        ));
+        assert!(!can_submit_composer_message(
+            ComposerSubmitAvailabilityInput {
+                conversation_can_submit: false,
+                ..ready
+            }
+        ));
+        assert!(!can_submit_composer_message(
+            ComposerSubmitAvailabilityInput {
+                text: "   ",
+                ..ready
+            }
+        ));
+        assert!(can_submit_composer_message(
+            ComposerSubmitAvailabilityInput {
+                text: "   ",
+                has_attachments: true,
+                ..ready
+            }
+        ));
+    }
+
+    #[test]
     fn remote_gateway_requires_artifact_upload_even_when_capability_is_permissive() {
         let caps = capabilities(false);
 
@@ -660,6 +839,110 @@ mod tests {
             attachments[1],
             UserMessageAttachment::LocalFile { ref path } if path == "/tmp/b.txt"
         ));
+    }
+
+    #[test]
+    fn prepared_composer_submit_success_reduction_builds_local_event_and_turn_start_plan() {
+        let artifact = artifact_ref("art_a");
+        let prepared = build_prepared_composer_turn(
+            "  hello  ".to_owned(),
+            vec![PreparedComposerAttachment {
+                attachment: attachment("/tmp/a.txt", ComposerAttachmentUploadState::Uploading),
+                artifact: Some(artifact.clone()),
+            }],
+            Vec::new(),
+        );
+
+        let reduction = reduce_prepared_composer_turn_submit_success(
+            PreparedComposerTurnSubmitContext {
+                thread_id: "thread_a".to_owned(),
+                turn_id: "turn_a".to_owned(),
+                pending_request_id: "pending_a".to_owned(),
+                selected_model: Some("gpt-5".to_owned()),
+                selected_provider: Some("openai".to_owned()),
+                selected_mode: Some(ThreadMode::Agent),
+                updated_at_unix: 42,
+            },
+            prepared,
+        );
+
+        assert!(!reduction.composer_upload_in_progress);
+        assert!(reduction.clear_composer_upload_error);
+        assert_eq!(
+            reduction.uploaded_attachment_artifacts,
+            vec![Some(artifact.clone())]
+        );
+        assert!(reduction.clear_composer);
+        assert_eq!(reduction.clear_thread_draft_id, "thread_a");
+        assert_eq!(reduction.promote_thread_from_draft_id, "thread_a");
+        assert_eq!(
+            reduction.thread_snapshot_update.user_text,
+            "hello\nart_a.txt"
+        );
+        assert_eq!(
+            reduction.thread_snapshot_update.selected_model.as_deref(),
+            Some("gpt-5")
+        );
+        assert_eq!(
+            reduction
+                .thread_snapshot_update
+                .selected_provider
+                .as_deref(),
+            Some("openai")
+        );
+        assert_eq!(reduction.thread_snapshot_update.updated_at_unix, 42);
+
+        assert!(matches!(
+            reduction.local_turn_start_requested_event,
+            crate::conversation::ConversationEvent::LocalTurnStartRequested {
+                ref thread_id,
+                ref turn_id,
+                ref pending_request_id,
+                ref user_text,
+                ref attachments,
+            } if thread_id == "thread_a"
+                && turn_id == "turn_a"
+                && pending_request_id == "pending_a"
+                && user_text == "hello"
+                && attachments.len() == 1
+        ));
+        assert_eq!(reduction.turn_start_params_plan.thread_id, "thread_a");
+        assert_eq!(reduction.turn_start_params_plan.turn_id, "turn_a");
+        assert_eq!(
+            reduction.turn_start_params_plan.model.as_deref(),
+            Some("gpt-5")
+        );
+        assert_eq!(
+            reduction.turn_start_params_plan.model_provider.as_deref(),
+            Some("openai")
+        );
+        assert_eq!(
+            reduction.turn_start_params_plan.mode,
+            Some(ThreadMode::Agent)
+        );
+        assert_eq!(reduction.turn_start_params_plan.capabilities, Vec::new());
+        assert_eq!(reduction.turn_start_params_plan.input.len(), 2);
+        assert!(matches!(
+            reduction.turn_start_params_plan.input[1],
+            UserInput::Artifact {
+                ref artifact_id, ..
+            } if artifact_id == "art_a"
+        ));
+        assert_eq!(reduction.send_context.thread_id, "thread_a");
+        assert_eq!(reduction.send_context.turn_id, "turn_a");
+        assert_eq!(reduction.send_context.pending_request_id, "pending_a");
+    }
+
+    #[test]
+    fn prepare_composer_turn_failure_reduction_clears_uploading_state_with_error() {
+        assert_eq!(
+            reduce_prepare_composer_turn_failure("boom"),
+            PrepareComposerTurnFailureReduction {
+                composer_upload_in_progress: false,
+                composer_upload_error: "boom".to_owned(),
+                mark_uploading_attachments_failed_error: "boom".to_owned(),
+            }
+        );
     }
 
     #[test]

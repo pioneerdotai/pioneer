@@ -55,13 +55,16 @@ impl PioneerDesktop {
 
                     match result {
                         Ok(response) => {
-                            let applied =
-                                workspace_actions::apply_workspace_create_response_to_catalog(
-                                    &mut view.workspaces,
-                                    response.workspace,
-                                );
-                            view.set_workspaces_error(None);
-                            view.switch_workspace_from_ui(applied.workspace_id, cx);
+                            let workspaces = std::mem::take(&mut view.workspaces);
+                            let reduction = workspace_actions::reduce_workspace_create_success(
+                                workspaces,
+                                response.workspace,
+                            );
+                            view.set_workspaces(reduction.workspaces);
+                            if reduction.clear_workspaces_error {
+                                view.set_workspaces_error(None);
+                            }
+                            view.switch_workspace_from_ui(reduction.switch_workspace_id, cx);
                         }
                         Err(error) => {
                             let message = format!("{error:#}");
@@ -140,11 +143,15 @@ impl PioneerDesktop {
 
                     match result {
                         Ok(response) => {
-                            workspace_actions::apply_workspace_update_response_to_catalog(
-                                &mut view.workspaces,
+                            let workspaces = std::mem::take(&mut view.workspaces);
+                            let reduction = workspace_actions::reduce_workspace_rename_success(
+                                workspaces,
                                 response.workspace,
                             );
-                            view.set_workspaces_error(None);
+                            view.set_workspaces(reduction.workspaces);
+                            if reduction.clear_workspaces_error {
+                                view.set_workspaces_error(None);
+                            }
                         }
                         Err(error) => {
                             let message = format!("{error:#}");

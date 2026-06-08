@@ -92,20 +92,19 @@ impl PioneerDesktop {
                         return;
                     }
 
-                    view.skills_loading = false;
-                    view.skills_upload_progress = None;
-                    view.skills_upload_cancel_token = None;
-                    match result {
-                        Ok(_) => {
-                            view.skills_error = None;
-                            view.queue_skills_refresh();
-                        }
+                    let outcome = match result {
+                        Ok(_) => skill_actions::SkillActionFinishOutcome::Success,
                         Err(error) => {
-                            view.skills_error =
-                                Some(format!("{}: {error:#}", t!("skills.error.install_failed")));
+                            let error = format!("{}: {error:#}", t!("skills.error.install_failed"));
                             warn!(error = %format!("{error:#}"), "failed to install skill");
+                            skill_actions::SkillActionFinishOutcome::Failure { error }
                         }
-                    }
+                    };
+                    let reduction = skill_actions::reduce_skill_action_finish(
+                        skill_actions::SkillActionFinishKind::Install,
+                        outcome,
+                    );
+                    view.apply_skill_action_finish_reduction(reduction);
 
                     cx.notify();
                 });
@@ -214,25 +213,29 @@ impl PioneerDesktop {
                         return;
                     }
 
-                    view.skills_upload_progress = None;
-                    view.skills_upload_cancel_token = None;
-                    view.mark_skill_pending(slug.as_str(), source_kind.as_str(), false);
-                    match result {
-                        Ok(_) => {
-                            view.skills_error = None;
-                            view.queue_skills_refresh();
-                        }
+                    let outcome = match result {
+                        Ok(_) => skill_actions::SkillActionFinishOutcome::Success,
                         Err(error) => {
-                            view.skills_error =
-                                Some(format!("{}: {error:#}", t!("skills.error.update_failed")));
+                            let error = format!("{}: {error:#}", t!("skills.error.update_failed"));
                             warn!(
                                 slug = slug.as_str(),
                                 source_kind = source_kind.as_str(),
                                 error = %format!("{error:#}"),
                                 "failed to update skill"
                             );
+                            skill_actions::SkillActionFinishOutcome::Failure { error }
                         }
-                    }
+                    };
+                    let reduction = skill_actions::reduce_skill_action_finish(
+                        skill_actions::SkillActionFinishKind::Update(
+                            skill_actions::SkillActionTarget::new(
+                                slug.clone(),
+                                source_kind.clone(),
+                            ),
+                        ),
+                        outcome,
+                    );
+                    view.apply_skill_action_finish_reduction(reduction);
 
                     cx.notify();
                 });
@@ -308,25 +311,30 @@ impl PioneerDesktop {
                         return;
                     }
 
-                    view.mark_skill_pending(slug.as_str(), source_kind.as_str(), false);
-                    match result {
-                        Ok(_) => {
-                            view.skills_error = None;
-                            view.queue_skills_refresh();
-                        }
+                    let outcome = match result {
+                        Ok(_) => skill_actions::SkillActionFinishOutcome::Success,
                         Err(error) => {
-                            view.skills_error = Some(format!(
-                                "{}: {error:#}",
-                                t!("skills.error.uninstall_failed")
-                            ));
+                            let error =
+                                format!("{}: {error:#}", t!("skills.error.uninstall_failed"));
                             warn!(
                                 slug = slug.as_str(),
                                 source_kind = source_kind.as_str(),
                                 error = %format!("{error:#}"),
                                 "failed to uninstall skill"
                             );
+                            skill_actions::SkillActionFinishOutcome::Failure { error }
                         }
-                    }
+                    };
+                    let reduction = skill_actions::reduce_skill_action_finish(
+                        skill_actions::SkillActionFinishKind::Uninstall(
+                            skill_actions::SkillActionTarget::new(
+                                slug.clone(),
+                                source_kind.clone(),
+                            ),
+                        ),
+                        outcome,
+                    );
+                    view.apply_skill_action_finish_reduction(reduction);
 
                     cx.notify();
                 });
@@ -419,34 +427,41 @@ impl PioneerDesktop {
                         return;
                     }
 
-                    view.mark_skill_pending(slug.as_str(), source_kind.as_str(), false);
-                    match result {
-                        Ok(_) => {
-                            view.skills_error = None;
-                            view.queue_skills_refresh();
-                        }
+                    let outcome = match result {
+                        Ok(_) => skill_actions::SkillActionFinishOutcome::Success,
                         Err(error) => {
-                            if let Some((prev_enabled, prev_implicit)) = previous_policy {
-                                skill_actions::apply_local_skill_policy(
-                                    view.skills_catalog.as_mut_slice(),
-                                    view.installed_skills.as_mut_slice(),
-                                    slug.as_str(),
-                                    source_kind.as_str(),
-                                    prev_enabled,
-                                    prev_implicit,
-                                );
-                            }
-
-                            view.skills_error =
-                                Some(format!("{}: {error:#}", t!("skills.error.policy_failed")));
+                            let error = format!("{}: {error:#}", t!("skills.error.policy_failed"));
                             warn!(
                                 slug = slug.as_str(),
                                 source_kind = source_kind.as_str(),
                                 error = %format!("{error:#}"),
                                 "failed to set skill policy"
                             );
+                            skill_actions::SkillActionFinishOutcome::Failure { error }
                         }
+                    };
+                    let reduction = skill_actions::reduce_skill_action_finish(
+                        skill_actions::SkillActionFinishKind::Policy(
+                            skill_actions::SkillActionTarget::new(
+                                slug.clone(),
+                                source_kind.clone(),
+                            ),
+                        ),
+                        outcome,
+                    );
+                    if reduction.rollback_policy
+                        && let Some((prev_enabled, prev_implicit)) = previous_policy
+                    {
+                        skill_actions::apply_local_skill_policy(
+                            view.skills_catalog.as_mut_slice(),
+                            view.installed_skills.as_mut_slice(),
+                            slug.as_str(),
+                            source_kind.as_str(),
+                            prev_enabled,
+                            prev_implicit,
+                        );
                     }
+                    view.apply_skill_action_finish_reduction(reduction);
 
                     cx.notify();
                 });
@@ -474,6 +489,30 @@ impl PioneerDesktop {
                 t!("skills.error.workspace_not_selected").to_string()
             }
         });
+    }
+
+    fn apply_skill_action_finish_reduction(
+        &mut self,
+        reduction: skill_actions::SkillActionFinishReduction,
+    ) {
+        if let Some(loading) = reduction.loading {
+            self.skills_loading = loading;
+        }
+        if reduction.clear_upload_state {
+            self.skills_upload_progress = None;
+            self.skills_upload_cancel_token = None;
+        }
+        if let Some(pending) = reduction.pending {
+            self.mark_skill_pending(
+                pending.target.slug.as_str(),
+                pending.target.source_kind.as_str(),
+                pending.pending,
+            );
+        }
+        self.skills_error = reduction.error;
+        if reduction.queue_refresh {
+            self.queue_skills_refresh();
+        }
     }
 }
 

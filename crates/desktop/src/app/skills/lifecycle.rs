@@ -4,7 +4,8 @@ use crate::{
 };
 use gpui::{prelude::*, *};
 use pioneer_client::{
-    skills::catalog as skill_catalog, workspaces::selectors as workspace_selectors,
+    skills::actions as skill_actions, skills::catalog as skill_catalog,
+    workspaces::selectors as workspace_selectors,
 };
 use std::time::Duration;
 use tracing::warn;
@@ -57,23 +58,22 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn refresh_installed_skills(&mut self, cx: &mut Context<Self>) {
-        if self.gateway.connection_state != GatewayConnectionState::Connected {
-            self.skills_loading = false;
-            self.skills_error = Some(t!("skills.error.gateway_not_connected").to_string());
-            return;
-        }
-
-        let Some(connection_id) = self.gateway.ws_connection_id else {
-            self.skills_loading = false;
-            self.skills_error = Some(t!("skills.error.gateway_not_connected").to_string());
-            return;
+        let scope = match skill_actions::plan_skill_action_scope(
+            matches!(
+                self.gateway.connection_state,
+                GatewayConnectionState::Connected
+            ),
+            self.gateway.ws_connection_id,
+            self.skills_workspace_scope(),
+        ) {
+            skill_actions::SkillActionScopePlan::Send(scope) => scope,
+            skill_actions::SkillActionScopePlan::Unavailable(reason) => {
+                self.apply_skills_refresh_unavailable(reason);
+                return;
+            }
         };
-
-        let Some(workspace_id) = self.skills_workspace_scope() else {
-            self.skills_loading = false;
-            self.skills_error = Some(t!("skills.error.workspace_not_selected").to_string());
-            return;
-        };
+        let connection_id = scope.connection_id;
+        let workspace_id = scope.workspace_id;
 
         self.skills_loading = true;
         self.skills_error = None;
@@ -99,12 +99,18 @@ impl PioneerDesktop {
 
                     match result {
                         Ok(snapshot) => {
-                            view.apply_skills_snapshot(snapshot, cx);
-                            view.skills_error = None;
+                            let reduction = skill_catalog::reduce_skills_catalog_refresh_success(
+                                snapshot,
+                                std::mem::take(&mut view.skills_pending_actions),
+                                view.selected_skill_target.clone(),
+                            );
+                            view.apply_skills_catalog_refresh_success_reduction(reduction, cx);
                         }
                         Err(error) => {
-                            view.skills_error =
-                                Some(format!("{}: {error:#}", t!("skills.error.load_failed")));
+                            let reduction = skill_catalog::reduce_skills_catalog_refresh_failure(
+                                format!("{}: {error:#}", t!("skills.error.load_failed")),
+                            );
+                            view.apply_skills_catalog_refresh_failure_reduction(reduction);
                             warn!(error = %format!("{error:#}"), "failed to fetch skills snapshot");
                         }
                     }
@@ -129,6 +135,18 @@ impl PioneerDesktop {
         )
     }
 
+    fn apply_skills_refresh_unavailable(&mut self, reason: skill_actions::SkillActionUnavailable) {
+        self.skills_loading = false;
+        self.skills_error = Some(match reason {
+            skill_actions::SkillActionUnavailable::GatewayNotConnected => {
+                t!("skills.error.gateway_not_connected").to_string()
+            }
+            skill_actions::SkillActionUnavailable::WorkspaceNotSelected => {
+                t!("skills.error.workspace_not_selected").to_string()
+            }
+        });
+    }
+
     pub(super) fn is_skill_pending(&self, slug: &str, source_kind: &str) -> bool {
         skill_catalog::is_skill_pending(&self.skills_pending_actions, slug, source_kind)
     }
@@ -142,28 +160,30 @@ impl PioneerDesktop {
         );
     }
 
-    pub(super) fn apply_skills_snapshot(
+    pub(super) fn apply_skills_catalog_refresh_success_reduction(
         &mut self,
-        snapshot: skill_catalog::SkillsCatalogSnapshot,
+        reduction: skill_catalog::SkillsCatalogRefreshSuccessReduction,
         cx: &mut Context<Self>,
     ) {
-        let reconciled = skill_catalog::reconcile_skills_snapshot(
-            snapshot,
-            &mut self.skills_pending_actions,
-            self.selected_skill_target.clone(),
-        );
-        let snapshot = reconciled.snapshot;
+        self.skills_catalog = reduction.catalog;
+        self.installed_skills = reduction.installed;
+        self.skills_health_details = reduction.health_details;
+        self.skills_pending_actions = reduction.pending_actions;
+        self.selected_skill_target = reduction.selected_target;
+        self.skills_error = None;
 
-        self.skills_catalog = snapshot.catalog;
-        self.installed_skills = snapshot.installed;
-        self.skills_health_details = snapshot.health_details;
-        self.selected_skill_target = reconciled.selected_target;
-
-        if reconciled.selected_target_cleared {
+        if reduction.selected_target_cleared {
             if self.main_content_view == MainContentView::SkillDetails {
                 self.set_main_content_view(MainContentView::Skills, cx);
             }
         }
+    }
+
+    pub(super) fn apply_skills_catalog_refresh_failure_reduction(
+        &mut self,
+        reduction: skill_catalog::SkillsCatalogRefreshFailureReduction,
+    ) {
+        self.skills_error = Some(reduction.error);
     }
 
     fn ensure_skills_poller(&mut self, cx: &mut Context<Self>) {

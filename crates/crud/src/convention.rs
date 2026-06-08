@@ -1087,9 +1087,9 @@ pub fn prompt_manifest_profile_to_db(profile: PromptManifestProfile) -> &'static
 #[cfg(test)]
 mod tests {
     use super::{
-        recovery_job_status_from_db, recovery_job_status_to_db,
-        sandbox_mode_to_db, thread_mode_from_db, thread_mode_to_db, thread_status_from_db,
-        thread_status_to_db, turn_status_from_db, turn_status_to_db,
+        recovery_job_status_from_db, recovery_job_status_to_db, sandbox_mode_to_db,
+        thread_mode_from_db, thread_mode_to_db, thread_status_from_db, thread_status_to_db,
+        turn_status_from_db, turn_status_to_db,
     };
     use pioneer_protocol::{RecoveryJobStatus, SandboxMode, ThreadMode, ThreadStatus, TurnStatus};
 

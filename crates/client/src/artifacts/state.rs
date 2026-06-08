@@ -95,6 +95,58 @@ pub fn artifact_list_for_thread_params(
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadArtifactsRefreshRequest {
+    pub connection_id: u64,
+    pub params: ArtifactListForThreadParams,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ThreadArtifactsRefreshPlan {
+    Send(ThreadArtifactsRefreshRequest),
+    RequestRefreshAfterCurrent,
+    ClearError,
+    Skip,
+}
+
+pub fn plan_thread_artifacts_refresh(
+    state: &ThreadArtifactsState,
+    thread_id: &str,
+    force: bool,
+    gateway_connected: bool,
+    connection_id: Option<u64>,
+    workspace_id: Option<String>,
+    thread_materialized: bool,
+) -> ThreadArtifactsRefreshPlan {
+    if !gateway_connected {
+        return ThreadArtifactsRefreshPlan::Skip;
+    }
+    if !thread_materialized {
+        return ThreadArtifactsRefreshPlan::ClearError;
+    }
+    let Some(connection_id) = connection_id else {
+        return ThreadArtifactsRefreshPlan::Skip;
+    };
+    let Some(workspace_id) = workspace_id else {
+        return ThreadArtifactsRefreshPlan::Skip;
+    };
+    if !force && !state.needs_load(thread_id) {
+        return ThreadArtifactsRefreshPlan::Skip;
+    }
+    if state.is_loading_thread(thread_id) {
+        return if force {
+            ThreadArtifactsRefreshPlan::RequestRefreshAfterCurrent
+        } else {
+            ThreadArtifactsRefreshPlan::Skip
+        };
+    }
+
+    ThreadArtifactsRefreshPlan::Send(ThreadArtifactsRefreshRequest {
+        connection_id,
+        params: artifact_list_for_thread_params(workspace_id, thread_id.to_owned()),
+    })
+}
+
 impl ThreadArtifactsState {
     pub fn activate_thread(&mut self, thread_id: Option<&str>) {
         self.cache.activate_thread(thread_id);
@@ -687,6 +739,95 @@ mod tests {
             "thread_a",
             "thread `thread_b` not found"
         ));
+    }
+
+    #[test]
+    fn artifact_refresh_plan_requires_connection_and_materialized_thread() {
+        let state = ThreadArtifactsState::default();
+
+        assert_eq!(
+            plan_thread_artifacts_refresh(
+                &state,
+                "thread",
+                false,
+                false,
+                Some(7),
+                Some("ws".to_owned()),
+                true,
+            ),
+            ThreadArtifactsRefreshPlan::Skip
+        );
+        assert_eq!(
+            plan_thread_artifacts_refresh(
+                &state,
+                "thread",
+                false,
+                true,
+                Some(7),
+                Some("ws".to_owned()),
+                false,
+            ),
+            ThreadArtifactsRefreshPlan::ClearError
+        );
+        assert_eq!(
+            plan_thread_artifacts_refresh(
+                &state,
+                "thread",
+                false,
+                true,
+                None,
+                Some("ws".to_owned()),
+                true,
+            ),
+            ThreadArtifactsRefreshPlan::Skip
+        );
+    }
+
+    #[test]
+    fn artifact_refresh_plan_builds_request_or_defers_force_refresh() {
+        let mut state = ThreadArtifactsState::default();
+
+        let plan = plan_thread_artifacts_refresh(
+            &state,
+            "thread",
+            false,
+            true,
+            Some(7),
+            Some("ws".to_owned()),
+            true,
+        );
+        let ThreadArtifactsRefreshPlan::Send(request) = plan else {
+            panic!("expected artifact refresh request");
+        };
+        assert_eq!(request.connection_id, 7);
+        assert_eq!(request.params.workspace_id, "ws");
+        assert_eq!(request.params.thread_id.as_deref(), Some("thread"));
+
+        state.mark_loading("thread");
+        assert_eq!(
+            plan_thread_artifacts_refresh(
+                &state,
+                "thread",
+                false,
+                true,
+                Some(7),
+                Some("ws".to_owned()),
+                true,
+            ),
+            ThreadArtifactsRefreshPlan::Skip
+        );
+        assert_eq!(
+            plan_thread_artifacts_refresh(
+                &state,
+                "thread",
+                true,
+                true,
+                Some(7),
+                Some("ws".to_owned()),
+                true,
+            ),
+            ThreadArtifactsRefreshPlan::RequestRefreshAfterCurrent
+        );
     }
 
     fn artifact_summary(

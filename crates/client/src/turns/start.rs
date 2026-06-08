@@ -2,8 +2,8 @@
 
 use crate::conversation::events::ConversationEvent;
 use pioneer_protocol::{
-    REQUEST_ID_LEN, Thread, ThreadMode, TurnCapability, TurnStartParams, UserInput,
-    UserMessageAttachment, generate_id,
+    REQUEST_ID_LEN, Thread, ThreadMode, TurnCapability, TurnStartParams, TurnStartResponse,
+    UserInput, UserMessageAttachment, generate_id,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -31,6 +31,19 @@ pub struct TurnStartParamsPlan {
     pub model: Option<String>,
     pub model_provider: Option<String>,
     pub mode: Option<ThreadMode>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TurnStartSendContext {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub pending_request_id: String,
+}
+
+#[derive(Clone, Debug)]
+pub enum TurnStartSendReduction {
+    Accepted { events: Vec<ConversationEvent> },
+    Rejected { event: ConversationEvent },
 }
 
 pub fn plan_turn_start_ids() -> TurnStartIds {
@@ -80,6 +93,39 @@ pub fn now_unix_seconds() -> i64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
         Err(_) => 0,
+    }
+}
+
+pub fn reduce_turn_start_send_success(
+    context: TurnStartSendContext,
+    response: TurnStartResponse,
+) -> TurnStartSendReduction {
+    TurnStartSendReduction::Accepted {
+        events: vec![
+            local_turn_start_accepted_event(
+                context.thread_id.clone(),
+                context.turn_id,
+                context.pending_request_id,
+            ),
+            ConversationEvent::TurnStarted {
+                thread_id: context.thread_id,
+                turn: response.turn,
+            },
+        ],
+    }
+}
+
+pub fn reduce_turn_start_send_failure(
+    context: TurnStartSendContext,
+    error: impl Into<String>,
+) -> TurnStartSendReduction {
+    TurnStartSendReduction::Rejected {
+        event: local_turn_start_rejected_event(
+            context.thread_id,
+            context.turn_id,
+            context.pending_request_id,
+            error,
+        ),
     }
 }
 
@@ -145,7 +191,10 @@ pub fn local_turn_start_rejected_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pioneer_protocol::{McpScopeKind, TurnCapabilityKind, UserMessageAttachment};
+    use pioneer_protocol::{
+        McpScopeKind, Turn, TurnCapabilityKind, TurnKind, TurnOrigin, TurnStartResponse,
+        TurnStatus, UserMessageAttachment,
+    };
 
     fn skill_capability() -> TurnCapability {
         TurnCapability {
@@ -319,6 +368,73 @@ mod tests {
                 ref turn_id,
                 ref pending_request_id,
                 ref error,
+            } if thread_id == "thread"
+                && turn_id == "turn"
+                && pending_request_id == "pending"
+                && error == "boom"
+        ));
+    }
+
+    #[test]
+    fn turn_start_send_success_reduction_accepts_local_turn_and_applies_protocol_turn() {
+        let turn = Turn {
+            id: "turn".to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: TurnKind::Conversation,
+            origin: TurnOrigin::User,
+            error: None,
+            prompt_manifest: None,
+        };
+
+        let reduction = reduce_turn_start_send_success(
+            TurnStartSendContext {
+                thread_id: "thread".to_owned(),
+                turn_id: "turn".to_owned(),
+                pending_request_id: "pending".to_owned(),
+            },
+            TurnStartResponse { turn: turn.clone() },
+        );
+
+        let TurnStartSendReduction::Accepted { events } = reduction else {
+            panic!("success should accept the local turn");
+        };
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            ConversationEvent::LocalTurnStartAccepted {
+                thread_id,
+                turn_id,
+                pending_request_id,
+            } if thread_id == "thread" && turn_id == "turn" && pending_request_id == "pending"
+        ));
+        assert!(matches!(
+            &events[1],
+            ConversationEvent::TurnStarted { thread_id, turn: started }
+                if thread_id == "thread" && started == &turn
+        ));
+    }
+
+    #[test]
+    fn turn_start_send_failure_reduction_rejects_local_turn() {
+        let reduction = reduce_turn_start_send_failure(
+            TurnStartSendContext {
+                thread_id: "thread".to_owned(),
+                turn_id: "turn".to_owned(),
+                pending_request_id: "pending".to_owned(),
+            },
+            "boom",
+        );
+
+        let TurnStartSendReduction::Rejected { event } = reduction else {
+            panic!("failure should reject the local turn");
+        };
+        assert!(matches!(
+            event,
+            ConversationEvent::LocalTurnStartRejected {
+                thread_id,
+                turn_id,
+                pending_request_id,
+                error,
             } if thread_id == "thread"
                 && turn_id == "turn"
                 && pending_request_id == "pending"

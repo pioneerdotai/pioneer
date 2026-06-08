@@ -6,6 +6,33 @@ use pioneer_client::workspaces::actions as workspace_actions;
 use pioneer_client::workspaces::selectors as workspace_selectors;
 
 impl PioneerDesktop {
+    fn apply_workspace_switch_success_reduction(
+        &mut self,
+        reduction: workspace_actions::WorkspaceSwitchSuccessReduction,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace_id = reduction.selected.workspace_id.clone();
+        self.set_workspaces(reduction.workspaces);
+        self.persist_active_gateway_workspace_id(
+            reduction
+                .selected
+                .persist_active_gateway_workspace_id
+                .clone(),
+        );
+        self.set_preferred_workspace_id(Some(reduction.selected.set_preferred_workspace_id));
+        self.load_thread_folder_expansion_for_workspace(workspace_id.as_str(), cx);
+        self.restore_workspace_thread_state(workspace_id.as_str());
+        if reduction.clear_thread_list_loading {
+            self.thread_list_loading = false;
+        }
+        if reduction.selected.refresh_thread_list {
+            self.refresh_thread_list(cx);
+        }
+        if reduction.refresh_workspace_bound_screens {
+            self.refresh_workspace_bound_screens_after_switch(cx);
+        }
+    }
+
     pub(in crate::app) fn switch_workspace_from_ui(
         &mut self,
         workspace_id: String,
@@ -21,14 +48,17 @@ impl PioneerDesktop {
         let workspace_id = match switch_plan {
             workspace_actions::WorkspaceSwitchPlan::Switch { workspace_id } => workspace_id,
             workspace_actions::WorkspaceSwitchPlan::MissingWorkspaceId => {
-                self.set_workspaces_error(Some("workspace id is required".to_owned()));
+                self.set_workspaces_error(Some(t!("workspace.error.id_required").to_string()));
                 return;
             }
             workspace_actions::WorkspaceSwitchPlan::UnknownTarget { workspace_id } => {
-                self.set_workspaces_error(Some(format!(
-                    "workspace `{}` is not available",
-                    workspace_id
-                )));
+                self.set_workspaces_error(Some(
+                    t!(
+                        "workspace.error.not_available",
+                        workspace_id = workspace_id.as_str()
+                    )
+                    .to_string(),
+                ));
                 return;
             }
             workspace_actions::WorkspaceSwitchPlan::Busy
@@ -36,11 +66,15 @@ impl PioneerDesktop {
         };
 
         if self.gateway.connection_state != GatewayConnectionState::Connected {
-            self.set_workspaces_error(Some(t!("mcp.error.gateway_not_connected").to_string()));
+            self.set_workspaces_error(Some(
+                t!("workspace.error.gateway_not_connected").to_string(),
+            ));
             return;
         }
         let Some(connection_id) = self.gateway.ws_connection_id else {
-            self.set_workspaces_error(Some(t!("mcp.error.gateway_not_connected").to_string()));
+            self.set_workspaces_error(Some(
+                t!("workspace.error.gateway_not_connected").to_string(),
+            ));
             return;
         };
 
@@ -82,21 +116,12 @@ impl PioneerDesktop {
 
                     match result {
                         Ok(response) => {
-                            let selected_workspace_id =
-                                workspace_actions::apply_workspace_select_response_to_catalog(
-                                    &mut view.workspaces,
-                                    response.workspace,
-                                );
-                            view.persist_active_gateway_workspace_id(selected_workspace_id.clone());
-                            view.set_preferred_workspace_id(Some(selected_workspace_id.clone()));
-                            view.load_thread_folder_expansion_for_workspace(
-                                selected_workspace_id.as_str(),
-                                cx,
+                            let workspaces = std::mem::take(&mut view.workspaces);
+                            let reduction = workspace_actions::reduce_workspace_switch_success(
+                                workspaces,
+                                response.workspace,
                             );
-                            view.restore_workspace_thread_state(selected_workspace_id.as_str());
-                            view.thread_list_loading = false;
-                            view.refresh_thread_list(cx);
-                            view.refresh_workspace_bound_screens_after_switch(cx);
+                            view.apply_workspace_switch_success_reduction(reduction, cx);
                         }
                         Err(error) => {
                             let message = format!("{error:#}");

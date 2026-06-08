@@ -3,6 +3,20 @@
 use super::list;
 use pioneer_protocol::{McpListItem, McpServerDetailsParams, McpServerDetailsResponse};
 
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct McpDetailsRefreshSuccessReduction {
+    pub servers: Vec<McpListItem>,
+    pub selected_server_id: Option<String>,
+    pub server_details: Option<McpServerDetailsResponse>,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct McpDetailsRefreshFailureReduction {
+    pub error: String,
+}
+
 pub fn mcp_server_details_params(
     workspace_id: impl Into<String>,
     server_id: impl Into<String>,
@@ -53,6 +67,34 @@ pub fn apply_mcp_details_response(
         }
     }
     *server_details = Some(details);
+}
+
+pub fn reduce_mcp_details_refresh_success(
+    mut servers: Vec<McpListItem>,
+    mut selected_server_id: Option<String>,
+    mut server_details: Option<McpServerDetailsResponse>,
+    details: McpServerDetailsResponse,
+) -> McpDetailsRefreshSuccessReduction {
+    apply_mcp_details_response(
+        servers.as_mut_slice(),
+        &mut selected_server_id,
+        &mut server_details,
+        details,
+    );
+
+    McpDetailsRefreshSuccessReduction {
+        servers,
+        selected_server_id,
+        server_details,
+    }
+}
+
+pub fn reduce_mcp_details_refresh_failure(
+    error: impl Into<String>,
+) -> McpDetailsRefreshFailureReduction {
+    McpDetailsRefreshFailureReduction {
+        error: error.into(),
+    }
 }
 
 #[cfg(test)]
@@ -164,5 +206,29 @@ mod tests {
             stored_details.as_ref(),
             selected.as_deref()
         ));
+    }
+
+    #[test]
+    fn details_refresh_success_reduction_updates_selection_and_matching_list_item() {
+        let reduction = reduce_mcp_details_refresh_success(
+            vec![server("id-github", "old-name")],
+            None,
+            None,
+            details("id-github", "github"),
+        );
+
+        assert_eq!(reduction.selected_server_id.as_deref(), Some("id-github"));
+        assert_eq!(reduction.servers[0].name, "github");
+        assert!(mcp_details_match_selected(
+            reduction.server_details.as_ref(),
+            reduction.selected_server_id.as_deref()
+        ));
+    }
+
+    #[test]
+    fn details_refresh_failure_reduction_carries_display_error() {
+        let reduction = reduce_mcp_details_refresh_failure("load failed");
+
+        assert_eq!(reduction.error, "load failed");
     }
 }

@@ -636,7 +636,24 @@ fn kind_icon(_kind: ArtifactKind) -> IconName {
 }
 
 fn artifact_kind_label(kind: ArtifactKind) -> String {
-    client_artifact_presentation::artifact_kind_code(kind)
+    match kind {
+        ArtifactKind::File => t!("artifacts.kind_label.file").to_string(),
+        ArtifactKind::Text => t!("artifacts.kind_label.text").to_string(),
+        ArtifactKind::Image => t!("artifacts.kind_label.image").to_string(),
+        ArtifactKind::Audio => t!("artifacts.kind_label.audio").to_string(),
+        ArtifactKind::Video => t!("artifacts.kind_label.video").to_string(),
+        ArtifactKind::Pdf => t!("artifacts.kind_label.pdf").to_string(),
+        ArtifactKind::Spreadsheet => t!("artifacts.kind_label.spreadsheet").to_string(),
+        ArtifactKind::Archive => t!("artifacts.kind_label.archive").to_string(),
+        ArtifactKind::Json => t!("artifacts.kind_label.json").to_string(),
+        ArtifactKind::GeneratedImage => t!("artifacts.kind_label.generated_image").to_string(),
+        ArtifactKind::Screenshot => t!("artifacts.kind_label.screenshot").to_string(),
+        ArtifactKind::WorkspaceFile => t!("artifacts.kind_label.workspace_file").to_string(),
+        ArtifactKind::DirectoryManifest => {
+            t!("artifacts.kind_label.directory_manifest").to_string()
+        }
+        ArtifactKind::Unknown => t!("artifacts.kind_label.unknown").to_string(),
+    }
 }
 
 fn created_by_label(kind: ArtifactCreatedByKind) -> String {
@@ -665,11 +682,31 @@ fn status_label(status: ArtifactStatus) -> String {
 }
 
 fn binding_kind_label(kind: ArtifactBindingKind) -> String {
-    client_artifact_presentation::artifact_binding_kind_code(kind)
+    match kind {
+        ArtifactBindingKind::UserInput => t!("artifacts.binding_kind.user_input").to_string(),
+        ArtifactBindingKind::AgentOutput => t!("artifacts.binding_kind.agent_output").to_string(),
+        ArtifactBindingKind::ToolOutput => t!("artifacts.binding_kind.tool_output").to_string(),
+        ArtifactBindingKind::TaskResult => t!("artifacts.binding_kind.task_result").to_string(),
+        ArtifactBindingKind::TaskResultCandidate => {
+            t!("artifacts.binding_kind.task_result_candidate").to_string()
+        }
+        ArtifactBindingKind::ContextAttachment => {
+            t!("artifacts.binding_kind.context_attachment").to_string()
+        }
+        ArtifactBindingKind::DerivedFrom => t!("artifacts.binding_kind.derived_from").to_string(),
+        ArtifactBindingKind::Preview => t!("artifacts.binding_kind.preview").to_string(),
+        ArtifactBindingKind::ManualAttach => t!("artifacts.binding_kind.manual_attach").to_string(),
+        ArtifactBindingKind::DraftUpload => t!("artifacts.binding_kind.draft_upload").to_string(),
+    }
 }
 
 fn binding_direction_label(direction: ArtifactBindingDirection) -> String {
-    client_artifact_presentation::artifact_binding_direction_code(direction)
+    match direction {
+        ArtifactBindingDirection::Input => t!("artifacts.binding_direction.input").to_string(),
+        ArtifactBindingDirection::Output => t!("artifacts.binding_direction.output").to_string(),
+        ArtifactBindingDirection::Context => t!("artifacts.binding_direction.context").to_string(),
+        ArtifactBindingDirection::Derived => t!("artifacts.binding_direction.derived").to_string(),
+    }
 }
 
 fn binding_target_label(
@@ -679,17 +716,49 @@ fn binding_target_label(
     task_id: Option<&str>,
     tool_call_id: Option<&str>,
 ) -> String {
-    let summary = client_artifact_presentation::artifact_binding_target_summary(
+    let parts = client_artifact_presentation::artifact_binding_target_parts(
         thread_id,
         turn_id,
         message_id,
         task_id,
         tool_call_id,
     );
-    if summary.is_empty() {
+    if parts.is_empty() {
         t!("artifacts.provenance_unknown").to_string()
     } else {
-        summary
+        parts
+            .into_iter()
+            .map(|part| {
+                format!(
+                    "{} {}",
+                    artifact_binding_target_kind_label(part.kind),
+                    part.id
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" / ")
+    }
+}
+
+fn artifact_binding_target_kind_label(
+    kind: client_artifact_presentation::ArtifactBindingTargetKind,
+) -> String {
+    match kind {
+        client_artifact_presentation::ArtifactBindingTargetKind::Thread => {
+            t!("artifacts.binding_target.thread").to_string()
+        }
+        client_artifact_presentation::ArtifactBindingTargetKind::Turn => {
+            t!("artifacts.binding_target.turn").to_string()
+        }
+        client_artifact_presentation::ArtifactBindingTargetKind::Message => {
+            t!("artifacts.binding_target.message").to_string()
+        }
+        client_artifact_presentation::ArtifactBindingTargetKind::Task => {
+            t!("artifacts.binding_target.task").to_string()
+        }
+        client_artifact_presentation::ArtifactBindingTargetKind::Tool => {
+            t!("artifacts.binding_target.tool").to_string()
+        }
     }
 }
 

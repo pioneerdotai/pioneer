@@ -11,7 +11,7 @@ use pioneer_client::mcp::{
     actions as mcp_actions,
     list::{self as mcp_list, MCP_INSTALL_PENDING_KEY},
 };
-use pioneer_protocol::{McpDiagnosticLevel, McpInstallResponse};
+use pioneer_protocol::McpDiagnosticLevel;
 use std::{cell::RefCell, rc::Rc};
 use tracing::warn;
 
@@ -165,21 +165,10 @@ impl PioneerDesktop {
                                 })
                                 .await;
 
-                            let mut close_dialog = false;
-                            let mut should_refresh = false;
-                            let mut error_message = None;
-
-                            match result {
-                                Ok(response) => {
-                                    should_refresh =
-                                        mcp_actions::mcp_install_has_success(&response);
-                                    if mcp_actions::mcp_install_should_close_dialog(&response) {
-                                        close_dialog = true;
-                                    } else {
-                                        error_message =
-                                            Some(mcp_install_response_field_error(&response));
-                                    }
-                                }
+                            let reduction = match result {
+                                Ok(response) => mcp_actions::reduce_mcp_install_finish(
+                                    mcp_actions::McpInstallFinishOutcome::Response(response),
+                                ),
                                 Err(error) => {
                                     let details = format!("{error:#}");
                                     let message = t!(
@@ -187,34 +176,42 @@ impl PioneerDesktop {
                                         error = details.as_str()
                                     )
                                     .to_string();
-                                    error_message = Some(message);
                                     warn!(
                                         error = %format!("{error:#}"),
                                         "failed to install MCP server"
                                     );
+                                    mcp_actions::reduce_mcp_install_finish(
+                                        mcp_actions::McpInstallFinishOutcome::Failure {
+                                            field_error: message,
+                                        },
+                                    )
                                 }
-                            }
+                            };
 
                             *install_pending.borrow_mut() = false;
-                            *field_error.borrow_mut() = error_message;
+                            *field_error.borrow_mut() =
+                                reduction.field_error.as_ref().map(mcp_install_field_error);
 
                             let _ = desktop_entity.update(cx, |view, cx| {
                                 if mcp_actions::mcp_action_matches_connection(
                                     connection_id,
                                     view.gateway.ws_connection_id,
                                 ) {
-                                    view.mark_mcp_pending(MCP_INSTALL_PENDING_KEY, false);
-                                    if close_dialog {
+                                    view.mark_mcp_pending(
+                                        reduction.pending.target.name.as_str(),
+                                        reduction.pending.pending,
+                                    );
+                                    if reduction.clear_mcp_error {
                                         view.mcp_error = None;
                                     }
-                                    if should_refresh || close_dialog {
+                                    if reduction.queue_refresh {
                                         view.queue_mcp_refresh();
                                     }
                                 }
                                 cx.notify();
                             });
 
-                            if close_dialog {
+                            if reduction.close_dialog {
                                 let _ = cx.update(|window, cx| window.close_dialog(cx));
                             }
                         }
@@ -329,9 +326,14 @@ fn mcp_config_field_error(error: String, cx: &mut App) -> AnyElement {
         .into_any_element()
 }
 
-fn mcp_install_response_field_error(response: &McpInstallResponse) -> String {
-    let mut lines = mcp_actions::mcp_install_response_field_issues(response)
-        .into_iter()
+fn mcp_install_field_error(error: &mcp_actions::McpInstallFieldError) -> String {
+    let issues = match error {
+        mcp_actions::McpInstallFieldError::Failure { message } => return message.clone(),
+        mcp_actions::McpInstallFieldError::ValidationIssues(issues) => issues,
+    };
+
+    let mut lines = issues
+        .iter()
         .map(|issue| match issue {
             mcp_actions::McpInstallFieldIssue::ServerValidationError { name } => t!(
                 "mcp.dialog.error.server_validation_error",
@@ -344,7 +346,7 @@ fn mcp_install_response_field_error(response: &McpInstallResponse) -> String {
                 message,
                 field_path,
             } => {
-                let level = match level {
+                let level = match *level {
                     McpDiagnosticLevel::Error => t!("mcp.dialog.error.level_error").to_string(),
                     McpDiagnosticLevel::Warning => t!("mcp.dialog.error.level_warning").to_string(),
                 };

@@ -78,11 +78,11 @@ impl PioneerDesktop {
             .version
             .clone()
             .unwrap_or_else(|| "-".to_owned());
-        let source_label = Self::source_label(skill.source_kind.as_str());
-        let trust_label = Self::trust_label(skill.trust_level.as_str());
-        let status_label = Self::status_label(skill.status.as_str());
+        let source_label = Self::source_label(&skill_summary.source);
+        let trust_label = Self::trust_label(&skill_summary.trust);
+        let status_label = Self::status_label(&skill_summary.status);
         let fingerprint_short = skill_summary.fingerprint_short.clone();
-        let status_color = Self::status_color(skill.status.as_str(), cx);
+        let status_color = Self::status_color(skill_summary.status_tone, cx);
         let owner = skill_summary.slug.owner.as_deref();
         let meta_grid_columns = self.skill_details_meta_grid_columns(window);
         let diagnostics_grid_columns = self.skill_details_diagnostics_grid_columns(window);

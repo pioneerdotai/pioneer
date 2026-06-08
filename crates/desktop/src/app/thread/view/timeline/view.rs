@@ -1,8 +1,8 @@
 use super::{
     items::format_elapsed_ms,
     model::{
-        TimelineCoalescedToolsRow, TimelineRow, TimelineRowKind, TurnWorkGroupRow,
-        build_timeline_rows, coalesced_tools_label, timeline_rows_layout_hash,
+        TimelineCoalescedToolsKind, TimelineCoalescedToolsRow, TimelineRow, TimelineRowKind,
+        TurnWorkGroupRow, build_timeline_rows, timeline_rows_layout_hash,
     },
 };
 use crate::app::{conversation::ConversationViewState, root::PioneerDesktop};
@@ -326,5 +326,20 @@ impl PioneerDesktop {
         projection_revision.hash(&mut hasher);
         expanded_revision.hash(&mut hasher);
         hasher.finish()
+    }
+}
+
+fn coalesced_tools_label(group: &TimelineCoalescedToolsRow) -> String {
+    match group.kind {
+        TimelineCoalescedToolsKind::CompletedTaskTools => t!(
+            "timeline.coalesced_tools.completed_task_tools",
+            count = group.count
+        )
+        .to_string(),
+        TimelineCoalescedToolsKind::RepeatedTaskWait => t!(
+            "timeline.coalesced_tools.repeated_task_wait",
+            count = group.count
+        )
+        .to_string(),
     }
 }
