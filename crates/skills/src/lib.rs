@@ -4,6 +4,7 @@ pub mod compile;
 pub mod contract;
 pub mod dependencies;
 pub mod error;
+pub mod file_metadata;
 pub mod installer;
 pub mod path_match;
 pub mod policy;
@@ -30,6 +31,7 @@ pub use dependencies::{
     DependencyCheckInput, DependencyCheckResult, DependencyDiagnostic, DependencyKind,
     DependencyStatus, evaluate_dependency_set, evaluate_skill_dependencies,
 };
+pub use file_metadata::file_link_count;
 pub use installer::{
     CommitPreparedSkillRequest, InstallOperation, InstallSkillRequest, InstallSkillResult,
     PrepareMaterializedSkillRequest, PreparedMaterializedSkill, SkillInstallerPolicy,

@@ -178,11 +178,9 @@ fn normalize_relative_path(path: &Path) -> Result<String> {
     Ok(parts.join("/"))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn reject_hardlinked_file(path: &Path, metadata: &fs::Metadata, relative_path: &str) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-
-    if metadata.nlink() > 1 {
+    if pioneer_skills::file_link_count(path, metadata)? > 1 {
         bail!(
             "skill archive cannot include hardlinked file `{}` at `{}`",
             relative_path,
@@ -190,78 +188,6 @@ fn reject_hardlinked_file(path: &Path, metadata: &fs::Metadata, relative_path: &
         );
     }
     Ok(())
-}
-
-#[cfg(windows)]
-fn reject_hardlinked_file(
-    path: &Path,
-    _metadata: &fs::Metadata,
-    relative_path: &str,
-) -> Result<()> {
-    if windows_file_link_count(path)? > 1 {
-        bail!(
-            "skill archive cannot include hardlinked file `{}` at `{}`",
-            relative_path,
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn windows_file_link_count(path: &Path) -> Result<u32> {
-    use std::mem::MaybeUninit;
-    use std::os::windows::ffi::OsStrExt;
-    use std::ptr;
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, OPEN_EXISTING,
-    };
-
-    let wide_path = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let handle = unsafe {
-        CreateFileW(
-            wide_path.as_ptr(),
-            0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            ptr::null(),
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            ptr::null_mut(),
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(io::Error::last_os_error())
-            .with_context(|| format!("failed to open `{}` for hardlink check", path.display()));
-    }
-
-    let mut info = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
-    let result = unsafe { GetFileInformationByHandle(handle, info.as_mut_ptr()) };
-    let result_error = if result == 0 {
-        Some(io::Error::last_os_error())
-    } else {
-        None
-    };
-    let close_result = unsafe { CloseHandle(handle) };
-    if let Some(error) = result_error {
-        return Err(error).with_context(|| {
-            format!(
-                "failed to read file information for hardlink check `{}`",
-                path.display()
-            )
-        });
-    }
-    if close_result == 0 {
-        return Err(io::Error::last_os_error())
-            .with_context(|| format!("failed to close `{}` after hardlink check", path.display()));
-    }
-
-    Ok(unsafe { info.assume_init() }.nNumberOfLinks)
 }
 
 #[cfg(not(unix))]
