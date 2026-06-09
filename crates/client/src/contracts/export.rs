@@ -113,6 +113,13 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Provisional
         ),
         contract_type!(
+            "activate_gateway_registry_plan.json",
+            crate::gateway::setup::ActivateGatewayRegistryPlan,
+            Domain::Connection,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
             "artifact_action_status.json",
             crate::artifacts::actions::ArtifactActionStatus,
             Domain::Artifacts,
@@ -599,6 +606,27 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Provisional
         ),
         contract_type!(
+            "plan_activate_gateway_request.json",
+            crate::gateway::setup::PlanActivateGatewayRequest,
+            Domain::Connection,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "plan_delete_remote_gateway_request.json",
+            crate::gateway::setup::PlanDeleteRemoteGatewayRequest,
+            Domain::Connection,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "plan_update_remote_gateway_request.json",
+            crate::gateway::setup::PlanUpdateRemoteGatewayRequest,
+            Domain::Connection,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
             "prepared_composer_attachment.json",
             crate::composer::turn_prepare::PreparedComposerAttachment,
             Domain::Composer,
@@ -699,6 +727,27 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
         contract_type!(
             "remote_gateway_validation_request.json",
             crate::gateway::setup::RemoteGatewayValidationRequest,
+            Domain::Connection,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "delete_remote_gateway_registry_plan.json",
+            crate::gateway::setup::DeleteRemoteGatewayRegistryPlan,
+            Domain::Connection,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "gateway_auth_token_update.json",
+            crate::gateway::setup::GatewayAuthTokenUpdate,
+            Domain::Connection,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "update_remote_gateway_registry_plan.json",
+            crate::gateway::setup::UpdateRemoteGatewayRegistryPlan,
             Domain::Connection,
             Kind::ActionPlan,
             Stability::Provisional

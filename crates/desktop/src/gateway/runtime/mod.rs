@@ -2,7 +2,7 @@ mod compat;
 mod discovery;
 mod recovery;
 
-use crate::gateway::connectivity::{normalize_address, validate_remote_gateway_address};
+use crate::gateway::connectivity::validate_remote_gateway_address;
 use crate::gateway::control::{GatewayInstallWarning, request_local_superuser_token};
 use crate::gateway::registry::{
     gateway_auth_token_ref, load_registry, save_registry, setup_required,
@@ -165,9 +165,12 @@ impl GatewayRuntime {
     }
 
     pub fn activate_gateway(&mut self, id: &str) -> Result<()> {
-        client_gateway_runtime::activate_gateway(&mut self.registry, id)
+        let plan = client_gateway_setup::plan_activate_gateway_registry(&self.registry, id)
             .map_err(map_gateway_profile_error)?;
-        save_registry(&self.registry_path, &self.registry)
+
+        save_registry(&self.registry_path, &plan.registry)?;
+        self.registry = plan.registry;
+        Ok(())
     }
 
     pub fn set_gateway_workspace_id(
@@ -205,14 +208,7 @@ impl GatewayRuntime {
                 )
                 .to_string(),
             },
-            |endpoint_id| {
-                gateway_auth_token_ref(endpoint_id).map_err(|error| {
-                    client_gateway_runtime::GatewayProfileError::InvalidAuthTokenRef {
-                        endpoint_id: endpoint_id.to_owned(),
-                        reason: format!("{error:#}"),
-                    }
-                })
-            },
+            desktop_gateway_auth_token_ref_for_endpoint,
         )
         .map_err(map_gateway_profile_error)?;
 
@@ -269,8 +265,10 @@ impl GatewayRuntime {
         address: &str,
         auth_token: Option<&str>,
     ) -> Result<GatewayEndpoint> {
-        let address = normalize_address(address)?;
-        let auth_token = auth_token.and_then(normalize_gateway_auth_token);
+        let auth_token_update = match auth_token.and_then(normalize_gateway_auth_token) {
+            Some(token) => client_gateway_setup::GatewayAuthTokenUpdate::Replace { token },
+            None => client_gateway_setup::GatewayAuthTokenUpdate::Clear,
+        };
         let default_index = self
             .registry
             .remotes
@@ -278,45 +276,30 @@ impl GatewayRuntime {
             .position(|remote| remote.id == id)
             .map(|index| index + 1)
             .unwrap_or_else(|| self.registry.remotes.len() + 1);
-        let plan = client_gateway_runtime::plan_update_remote_gateway_profile(
+        let plan = client_gateway_setup::plan_update_remote_gateway_registry(
             &self.registry,
-            id,
-            name,
-            address.as_str(),
-            auth_token.is_some(),
-            |endpoint_id| {
-                gateway_auth_token_ref(endpoint_id).map_err(|error| {
-                    client_gateway_runtime::GatewayProfileError::InvalidAuthTokenRef {
-                        endpoint_id: endpoint_id.to_owned(),
-                        reason: format!("{error:#}"),
-                    }
-                })
+            client_gateway_setup::UpdateRemoteGatewayRegistryInput {
+                gateway_id: id,
+                name,
+                address,
+                auth_token_update,
+                default_remote_name: t!("gateway.endpoint.remote_name", index = default_index)
+                    .to_string(),
             },
-            t!("gateway.endpoint.remote_name", index = default_index).to_string(),
+            desktop_gateway_auth_token_ref_for_endpoint,
         )
         .map_err(map_gateway_profile_error)?;
         let old_token = self.gateway_auth_token_for_endpoint(&plan.previous_endpoint)?;
 
-        if let Some(token) = auth_token.as_deref() {
-            let token_ref = plan
-                .auth_token_ref()
-                .expect("token ref should exist when auth token is present");
+        if let Some(token_write) = plan.token_write.as_ref() {
             self.secrets.put_gateway_auth_token(
-                token_ref,
-                token,
-                Some(gateway_auth_token_label(
-                    plan.endpoint.name.as_str(),
-                    plan.endpoint.address.as_str(),
-                )),
+                token_write.token_ref.as_str(),
+                token_write.token.as_str(),
+                Some(token_write.label.clone()),
             )?;
         }
 
-        client_gateway_runtime::apply_update_remote_gateway_profile_plan(&mut self.registry, &plan);
-        if let Err(error) = save_registry(&self.registry_path, &self.registry) {
-            client_gateway_runtime::rollback_update_remote_gateway_profile_plan(
-                &mut self.registry,
-                &plan,
-            );
+        if let Err(error) = save_registry(&self.registry_path, &plan.registry) {
             if let Some(old_token) = old_token.as_deref() {
                 if let Some(token_ref) = plan.previous_endpoint.auth_token_ref.as_deref() {
                     let _ = self.secrets.put_gateway_auth_token(
@@ -328,14 +311,17 @@ impl GatewayRuntime {
                         )),
                     );
                 }
-            } else if let Some(token_ref) = plan.auth_token_ref() {
-                let _ = self.secrets.delete_gateway_auth_token(token_ref);
+            } else if let Some(token_write) = plan.token_write.as_ref() {
+                let _ = self
+                    .secrets
+                    .delete_gateway_auth_token(token_write.token_ref.as_str());
             }
             return Err(error);
         }
 
-        if auth_token.is_none()
-            && let Some(token_ref) = plan.previous_endpoint.auth_token_ref.as_deref()
+        self.registry = plan.registry;
+
+        if let Some(token_ref) = plan.deleted_token_ref.as_deref()
             && let Err(error) = self.secrets.delete_gateway_auth_token(token_ref)
         {
             warn!(
@@ -349,33 +335,20 @@ impl GatewayRuntime {
     }
 
     pub fn delete_gateway(&mut self, id: &str) -> Result<GatewayDeleteOutcome> {
-        let fallback_endpoint = if self.registry.active_gateway_id.as_deref() == Some(id) {
-            client_gateway_runtime::remote_delete_fallback_endpoint(
-                &self.registry,
-                id,
-                self.local_gateway_id(),
-                self.local_gateway_has_auth_token(),
-            )
-        } else {
-            None
-        };
-        let plan = client_gateway_runtime::plan_delete_remote_gateway_profile(
+        let plan = client_gateway_setup::plan_delete_remote_gateway_registry(
             &self.registry,
-            id,
-            fallback_endpoint,
+            client_gateway_setup::DeleteRemoteGatewayRegistryInput {
+                gateway_id: id,
+                local_gateway_id: Some(self.local_gateway_id()),
+                local_gateway_has_auth_token: self.local_gateway_has_auth_token(),
+            },
         )
         .map_err(map_gateway_profile_error)?;
 
-        client_gateway_runtime::apply_delete_remote_gateway_profile_plan(&mut self.registry, &plan);
-        if let Err(error) = save_registry(&self.registry_path, &self.registry) {
-            client_gateway_runtime::rollback_delete_remote_gateway_profile_plan(
-                &mut self.registry,
-                &plan,
-            );
-            return Err(error);
-        }
+        save_registry(&self.registry_path, &plan.registry)?;
+        self.registry = plan.registry;
 
-        if let Some(token_ref) = plan.endpoint.auth_token_ref.as_deref()
+        if let Some(token_ref) = plan.deleted_token_ref.as_deref()
             && let Err(error) = self.secrets.delete_gateway_auth_token(token_ref)
         {
             warn!(
@@ -518,6 +491,17 @@ fn map_gateway_profile_error(error: client_gateway_runtime::GatewayProfileError)
             anyhow::anyhow!("{reason}")
         }
     }
+}
+
+fn desktop_gateway_auth_token_ref_for_endpoint(
+    endpoint_id: &str,
+) -> Result<String, client_gateway_runtime::GatewayProfileError> {
+    gateway_auth_token_ref(endpoint_id).map_err(|error| {
+        client_gateway_runtime::GatewayProfileError::InvalidAuthTokenRef {
+            endpoint_id: endpoint_id.to_owned(),
+            reason: format!("{error:#}"),
+        }
+    })
 }
 
 #[cfg(test)]

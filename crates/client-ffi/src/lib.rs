@@ -10,10 +10,15 @@ use pioneer_client::{
         runtime::{self as client_gateway_runtime, GatewayProfileError},
         secrets::GatewayAuthTokenRef,
         setup::{
-            AddAndActivateRemoteGatewayRegistryPlan, AddRemoteGatewayPlan,
-            PlanAddRemoteGatewayRequest, RemoteGatewayValidation, RemoteGatewayValidationRequest,
+            ActivateGatewayRegistryPlan, AddAndActivateRemoteGatewayRegistryPlan,
+            AddRemoteGatewayPlan, DeleteRemoteGatewayRegistryPlan, PlanActivateGatewayRequest,
+            PlanAddRemoteGatewayRequest, PlanDeleteRemoteGatewayRequest,
+            PlanUpdateRemoteGatewayRequest, RemoteGatewayValidation,
+            RemoteGatewayValidationRequest, UpdateRemoteGatewayRegistryPlan,
+            plan_activate_gateway_registry_request,
             plan_add_and_activate_remote_gateway_registry_request, plan_add_remote_gateway_request,
-            validate_remote_gateway_request,
+            plan_delete_remote_gateway_registry_request,
+            plan_update_remote_gateway_registry_request, validate_remote_gateway_request,
         },
     },
     runtime::ClientRuntime,
@@ -123,6 +128,37 @@ impl ClientFfiRuntime {
             gateway_auth_token_ref_for_endpoint,
         )
         .map_err(|error| error.to_string())
+    }
+
+    fn gateway_plan_activate_registry(
+        &self,
+        input_json: &str,
+    ) -> Result<ActivateGatewayRegistryPlan, String> {
+        let request = serde_json::from_str::<PlanActivateGatewayRequest>(input_json)
+            .map_err(|error| format!("invalid gateway activation request: {error}"))?;
+
+        plan_activate_gateway_registry_request(request).map_err(|error| error.to_string())
+    }
+
+    fn gateway_plan_update_remote_registry(
+        &self,
+        input_json: &str,
+    ) -> Result<UpdateRemoteGatewayRegistryPlan, String> {
+        let request = serde_json::from_str::<PlanUpdateRemoteGatewayRequest>(input_json)
+            .map_err(|error| format!("invalid gateway update remote request: {error}"))?;
+
+        plan_update_remote_gateway_registry_request(request, gateway_auth_token_ref_for_endpoint)
+            .map_err(|error| error.to_string())
+    }
+
+    fn gateway_plan_delete_remote_registry(
+        &self,
+        input_json: &str,
+    ) -> Result<DeleteRemoteGatewayRegistryPlan, String> {
+        let request = serde_json::from_str::<PlanDeleteRemoteGatewayRequest>(input_json)
+            .map_err(|error| format!("invalid gateway delete remote request: {error}"))?;
+
+        plan_delete_remote_gateway_registry_request(request).map_err(|error| error.to_string())
     }
 
     fn gateway_connect(&self, input_json: &str) -> Result<ClientGatewayConnectResult, String> {
@@ -282,6 +318,18 @@ ffi_client_json_method!(
 ffi_client_json_method!(
     pioneer_client_ffi_gateway_plan_add_and_activate_remote_registry,
     gateway_plan_add_and_activate_remote_registry
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_gateway_plan_activate_registry,
+    gateway_plan_activate_registry
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_gateway_plan_update_remote_registry,
+    gateway_plan_update_remote_registry
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_gateway_plan_delete_remote_registry,
+    gateway_plan_delete_remote_registry
 );
 ffi_client_json_method!(pioneer_client_ffi_gateway_connect, gateway_connect);
 
@@ -544,6 +592,129 @@ mod tests {
                 .as_ref()
                 .map(|write| write.token.as_str()),
             Some("token")
+        );
+    }
+
+    #[test]
+    fn gateway_activate_registry_plan_returns_shared_next_registry() {
+        let runtime = ClientFfiRuntime::default();
+        let result = runtime
+            .gateway_plan_activate_registry(
+                serde_json::json!({
+                    "registry": {
+                        "version": 1,
+                        "active_gateway_id": null,
+                        "remotes": [{
+                            "id": "remote-one",
+                            "name": "Remote",
+                            "address": "127.0.0.1:23000",
+                            "kind": "remote",
+                            "auth_token_ref": null,
+                            "workspace_id": null,
+                            "service_name": null
+                        }]
+                    },
+                    "gateway_id": "remote-one"
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("plan activate gateway registry");
+
+        assert_eq!(result.endpoint.id, "remote-one");
+        assert_eq!(
+            result.registry.active_gateway_id.as_deref(),
+            Some("remote-one")
+        );
+    }
+
+    #[test]
+    fn gateway_update_remote_registry_plan_returns_token_write() {
+        let runtime = ClientFfiRuntime::default();
+        let result = runtime
+            .gateway_plan_update_remote_registry(
+                serde_json::json!({
+                    "registry": {
+                        "version": 1,
+                        "active_gateway_id": "remote-one",
+                        "remotes": [{
+                            "id": "remote-one",
+                            "name": "Remote",
+                            "address": "127.0.0.1:23000",
+                            "kind": "remote",
+                            "auth_token_ref": null,
+                            "workspace_id": null,
+                            "service_name": null
+                        }]
+                    },
+                    "gateway_id": "remote-one",
+                    "name": "Renamed",
+                    "address": "127.0.0.1:24000",
+                    "auth_token_update": {
+                        "mode": "replace",
+                        "token": " token "
+                    },
+                    "default_remote_name": "Remote 1"
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("plan update remote registry");
+
+        assert_eq!(result.endpoint.name, "Renamed");
+        assert_eq!(result.endpoint.address, "127.0.0.1:24000");
+        assert_eq!(
+            result
+                .token_write
+                .as_ref()
+                .map(|write| write.token.as_str()),
+            Some("token")
+        );
+    }
+
+    #[test]
+    fn gateway_delete_remote_registry_plan_returns_fallback() {
+        let runtime = ClientFfiRuntime::default();
+        let result = runtime
+            .gateway_plan_delete_remote_registry(
+                serde_json::json!({
+                    "registry": {
+                        "version": 1,
+                        "active_gateway_id": "remote-one",
+                        "remotes": [
+                            {
+                                "id": "remote-one",
+                                "name": "One",
+                                "address": "127.0.0.1:23000",
+                                "kind": "remote",
+                                "auth_token_ref": "remote-one",
+                                "workspace_id": null,
+                                "service_name": null
+                            },
+                            {
+                                "id": "remote-two",
+                                "name": "Two",
+                                "address": "127.0.0.1:24000",
+                                "kind": "remote",
+                                "auth_token_ref": null,
+                                "workspace_id": null,
+                                "service_name": null
+                            }
+                        ]
+                    },
+                    "gateway_id": "remote-one"
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("plan delete remote registry");
+
+        assert!(result.deleted_active);
+        assert_eq!(result.endpoint.id, "remote-one");
+        assert_eq!(result.deleted_token_ref.as_deref(), Some("remote-one"));
+        assert_eq!(
+            result.registry.active_gateway_id.as_deref(),
+            Some("remote-two")
         );
     }
 
