@@ -8,7 +8,7 @@ use super::{
         apply_update_remote_gateway_profile_plan, endpoint_by_id, plan_add_remote_gateway_profile,
         plan_delete_remote_gateway_profile, plan_remote_candidate_connect_spec,
         plan_update_remote_gateway_profile, remote_delete_fallback_endpoint,
-        rollback_add_remote_gateway_profile_plan,
+        rollback_add_remote_gateway_profile_plan, set_gateway_workspace_id,
     },
     secrets::{gateway_auth_token_label, normalize_gateway_auth_token},
     timings::{GatewayTimingError, GatewayWsTimings},
@@ -26,16 +26,6 @@ const REMOTE_GATEWAY_VALIDATION_PONG_TIMEOUT_MS: u64 = 30_000;
 const REMOTE_GATEWAY_VALIDATION_RECONNECT_INITIAL_MS: u64 = 500;
 const REMOTE_GATEWAY_VALIDATION_RECONNECT_MAX_MS: u64 = 10_000;
 const REMOTE_GATEWAY_VALIDATION_RECONNECT_JITTER_PERCENT: u8 = 20;
-
-#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct RemoteGatewayValidationRequest {
-    pub address: String,
-    #[serde(default)]
-    pub auth_token: Option<String>,
-    pub timeout_ms: u64,
-}
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -75,49 +65,19 @@ pub enum RemoteGatewayValidationError {
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PlanAddRemoteGatewayRequest {
-    pub registry: GatewayRegistry,
-    pub name: String,
-    pub address: String,
-    pub auth_token: Option<String>,
-    pub new_endpoint_id: Option<String>,
-    pub default_remote_name: String,
-}
-
-#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Serialize)]
-pub struct AddRemoteGatewayPlan {
-    pub endpoint: GatewayEndpoint,
-    pub previous_endpoint: Option<GatewayEndpoint>,
-    pub token_write: Option<GatewayAuthTokenWrite>,
-}
-
-#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Serialize)]
-pub struct AddAndActivateRemoteGatewayRegistryPlan {
-    pub registry: GatewayRegistry,
-    pub endpoint: GatewayEndpoint,
-    pub previous_endpoint: Option<GatewayEndpoint>,
-    pub token_write: Option<GatewayAuthTokenWrite>,
-    pub previous_active_gateway_id: Option<String>,
-}
-
-#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PlanActivateGatewayRequest {
-    pub registry: GatewayRegistry,
-    pub gateway_id: String,
-}
-
-#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Serialize)]
 pub struct ActivateGatewayRegistryPlan {
     pub registry: GatewayRegistry,
     pub endpoint: GatewayEndpoint,
     pub previous_active_gateway_id: Option<String>,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Serialize)]
+pub struct SetGatewayWorkspaceRegistryPlan {
+    pub registry: GatewayRegistry,
+    pub endpoint: GatewayEndpoint,
+    pub previous_endpoint: GatewayEndpoint,
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -130,18 +90,6 @@ pub enum GatewayAuthTokenUpdate {
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PlanUpdateRemoteGatewayRequest {
-    pub registry: GatewayRegistry,
-    pub gateway_id: String,
-    pub name: String,
-    pub address: String,
-    pub auth_token_update: GatewayAuthTokenUpdate,
-    pub default_remote_name: String,
-}
-
-#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Serialize)]
 pub struct UpdateRemoteGatewayRegistryPlan {
     pub registry: GatewayRegistry,
@@ -149,18 +97,6 @@ pub struct UpdateRemoteGatewayRegistryPlan {
     pub previous_endpoint: GatewayEndpoint,
     pub token_write: Option<GatewayAuthTokenWrite>,
     pub deleted_token_ref: Option<String>,
-}
-
-#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PlanDeleteRemoteGatewayRequest {
-    pub registry: GatewayRegistry,
-    pub gateway_id: String,
-    #[serde(default)]
-    pub local_gateway_id: Option<String>,
-    #[serde(default)]
-    pub local_gateway_has_auth_token: bool,
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -353,22 +289,6 @@ pub fn validate_remote_gateway_connection_with_timings(
     Ok(RemoteGatewayValidation::Reachable { address })
 }
 
-pub fn validate_remote_gateway_request(
-    request: &RemoteGatewayValidationRequest,
-) -> Result<RemoteGatewayValidation, RemoteGatewayValidationError> {
-    if request.timeout_ms == 0 {
-        return Err(RemoteGatewayValidationError::InvalidTimeout {
-            timeout_ms: request.timeout_ms,
-        });
-    }
-
-    validate_remote_gateway_connection(
-        request.address.as_str(),
-        request.auth_token.as_deref(),
-        request.timeout_ms,
-    )
-}
-
 pub fn plan_add_remote_gateway<F>(
     registry: &GatewayRegistry,
     input: AddRemoteGatewayInput<'_>,
@@ -410,85 +330,6 @@ where
     })
 }
 
-pub fn plan_add_remote_gateway_request<F>(
-    request: PlanAddRemoteGatewayRequest,
-    auth_token_ref_for_endpoint: F,
-) -> Result<AddRemoteGatewayPlan, GatewayProfileError>
-where
-    F: FnMut(&str) -> Result<String, GatewayProfileError>,
-{
-    let new_endpoint_id = request
-        .new_endpoint_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(generated_remote_gateway_endpoint_id);
-
-    let change = plan_add_remote_gateway(
-        &request.registry,
-        AddRemoteGatewayInput {
-            name: request.name.as_str(),
-            address: request.address.as_str(),
-            auth_token: request.auth_token.as_deref(),
-            new_endpoint_id,
-            default_remote_name: request.default_remote_name,
-        },
-        auth_token_ref_for_endpoint,
-    )?;
-
-    Ok(AddRemoteGatewayPlan {
-        endpoint: change.endpoint().clone(),
-        previous_endpoint: change.previous_endpoint().cloned(),
-        token_write: change.token_write().cloned(),
-    })
-}
-
-pub fn plan_add_and_activate_remote_gateway_registry_request<F>(
-    request: PlanAddRemoteGatewayRequest,
-    auth_token_ref_for_endpoint: F,
-) -> Result<AddAndActivateRemoteGatewayRegistryPlan, GatewayProfileError>
-where
-    F: FnMut(&str) -> Result<String, GatewayProfileError>,
-{
-    let new_endpoint_id = request
-        .new_endpoint_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(generated_remote_gateway_endpoint_id);
-
-    let mut registry = request.registry;
-    let change = plan_add_remote_gateway(
-        &registry,
-        AddRemoteGatewayInput {
-            name: request.name.as_str(),
-            address: request.address.as_str(),
-            auth_token: request.auth_token.as_deref(),
-            new_endpoint_id,
-            default_remote_name: request.default_remote_name,
-        },
-        auth_token_ref_for_endpoint,
-    )?;
-    let commit =
-        change.apply_to_registry(&mut registry, AddRemoteGatewayApplyMode::ActivateEndpoint)?;
-
-    Ok(AddAndActivateRemoteGatewayRegistryPlan {
-        registry,
-        endpoint: commit.endpoint,
-        previous_endpoint: commit.previous_endpoint,
-        token_write: commit.token_write,
-        previous_active_gateway_id: commit.previous_active_gateway_id,
-    })
-}
-
-pub fn plan_activate_gateway_registry_request(
-    request: PlanActivateGatewayRequest,
-) -> Result<ActivateGatewayRegistryPlan, GatewayProfileError> {
-    plan_activate_gateway_registry(&request.registry, request.gateway_id.as_str())
-}
-
 pub fn plan_activate_gateway_registry(
     registry: &GatewayRegistry,
     gateway_id: &str,
@@ -509,33 +350,29 @@ pub fn plan_activate_gateway_registry(
     })
 }
 
-pub fn plan_update_remote_gateway_registry_request<F>(
-    request: PlanUpdateRemoteGatewayRequest,
-    auth_token_ref_for_endpoint: F,
-) -> Result<UpdateRemoteGatewayRegistryPlan, GatewayProfileError>
-where
-    F: FnMut(&str) -> Result<String, GatewayProfileError>,
-{
-    let PlanUpdateRemoteGatewayRequest {
-        registry,
-        gateway_id,
-        name,
-        address,
-        auth_token_update,
-        default_remote_name,
-    } = request;
+pub fn plan_set_gateway_workspace_registry(
+    registry: &GatewayRegistry,
+    gateway_id: &str,
+    workspace_id: Option<String>,
+) -> Result<SetGatewayWorkspaceRegistryPlan, GatewayProfileError> {
+    let previous_endpoint = endpoint_by_id(registry, gateway_id)
+        .cloned()
+        .ok_or_else(|| GatewayProfileError::EndpointNotFound {
+            id: gateway_id.to_owned(),
+        })?;
+    let mut next_registry = registry.clone();
+    set_gateway_workspace_id(&mut next_registry, gateway_id, workspace_id)?;
+    let endpoint = endpoint_by_id(&next_registry, gateway_id)
+        .cloned()
+        .ok_or_else(|| GatewayProfileError::EndpointNotFound {
+            id: gateway_id.to_owned(),
+        })?;
 
-    plan_update_remote_gateway_registry(
-        &registry,
-        UpdateRemoteGatewayRegistryInput {
-            gateway_id: gateway_id.as_str(),
-            name: name.as_str(),
-            address: address.as_str(),
-            auth_token_update,
-            default_remote_name,
-        },
-        auth_token_ref_for_endpoint,
-    )
+    Ok(SetGatewayWorkspaceRegistryPlan {
+        registry: next_registry,
+        endpoint,
+        previous_endpoint,
+    })
 }
 
 pub fn plan_update_remote_gateway_registry<F>(
@@ -614,19 +451,6 @@ where
         token_write,
         deleted_token_ref,
     })
-}
-
-pub fn plan_delete_remote_gateway_registry_request(
-    request: PlanDeleteRemoteGatewayRequest,
-) -> Result<DeleteRemoteGatewayRegistryPlan, GatewayProfileError> {
-    plan_delete_remote_gateway_registry(
-        &request.registry,
-        DeleteRemoteGatewayRegistryInput {
-            gateway_id: request.gateway_id.as_str(),
-            local_gateway_id: request.local_gateway_id.as_deref(),
-            local_gateway_has_auth_token: request.local_gateway_has_auth_token,
-        },
-    )
 }
 
 pub fn plan_delete_remote_gateway_registry(
@@ -847,239 +671,6 @@ mod tests {
                 token: "new-token".to_owned(),
                 label: "Remote (127.0.0.1:23000)".to_owned(),
             })
-        );
-    }
-
-    #[test]
-    fn add_remote_gateway_request_plans_with_shared_dto() {
-        let plan = plan_add_remote_gateway_request(
-            PlanAddRemoteGatewayRequest {
-                registry: registry(),
-                name: " Remote ".to_owned(),
-                address: "127.0.0.1:23000".to_owned(),
-                auth_token: Some(" token ".to_owned()),
-                new_endpoint_id: Some("remote-one".to_owned()),
-                default_remote_name: "Remote 1".to_owned(),
-            },
-            token_ref,
-        )
-        .expect("plan from request");
-
-        assert_eq!(plan.endpoint.id, "remote-one");
-        assert_eq!(plan.endpoint.name, "Remote");
-        assert_eq!(plan.endpoint.auth_token_ref.as_deref(), Some("remote-one"));
-        assert_eq!(
-            plan.token_write,
-            Some(GatewayAuthTokenWrite {
-                token_ref: "remote-one".to_owned(),
-                token: "token".to_owned(),
-                label: "Remote (127.0.0.1:23000)".to_owned(),
-            })
-        );
-    }
-
-    #[test]
-    fn add_and_activate_remote_gateway_registry_request_returns_next_registry() {
-        let plan = plan_add_and_activate_remote_gateway_registry_request(
-            PlanAddRemoteGatewayRequest {
-                registry: registry(),
-                name: " Remote ".to_owned(),
-                address: "127.0.0.1:23000".to_owned(),
-                auth_token: Some(" token ".to_owned()),
-                new_endpoint_id: Some("remote-one".to_owned()),
-                default_remote_name: "Remote 1".to_owned(),
-            },
-            token_ref,
-        )
-        .expect("plan registry update from request");
-
-        assert_eq!(plan.endpoint.id, "remote-one");
-        assert_eq!(plan.previous_active_gateway_id, None);
-        assert_eq!(
-            plan.registry.active_gateway_id.as_deref(),
-            Some("remote-one")
-        );
-        assert_eq!(plan.registry.remotes.len(), 1);
-        assert_eq!(plan.registry.remotes[0].id, "remote-one");
-        assert_eq!(
-            plan.token_write,
-            Some(GatewayAuthTokenWrite {
-                token_ref: "remote-one".to_owned(),
-                token: "token".to_owned(),
-                label: "Remote (127.0.0.1:23000)".to_owned(),
-            })
-        );
-    }
-
-    #[test]
-    fn activate_gateway_registry_request_switches_active_gateway() {
-        let mut registry = registry();
-        registry.remotes.push(GatewayEndpoint {
-            id: "remote-one".to_owned(),
-            name: "Remote".to_owned(),
-            address: "127.0.0.1:23000".to_owned(),
-            kind: GatewayEndpointKind::Remote,
-            auth_token_ref: None,
-            workspace_id: None,
-            service_name: None,
-        });
-        registry.active_gateway_id = Some("local".to_owned());
-
-        let plan = plan_activate_gateway_registry_request(PlanActivateGatewayRequest {
-            registry,
-            gateway_id: "remote-one".to_owned(),
-        })
-        .expect("plan activation");
-
-        assert_eq!(plan.endpoint.id, "remote-one");
-        assert_eq!(plan.previous_active_gateway_id.as_deref(), Some("local"));
-        assert_eq!(
-            plan.registry.active_gateway_id.as_deref(),
-            Some("remote-one")
-        );
-    }
-
-    #[test]
-    fn update_remote_gateway_registry_request_preserves_replaces_and_clears_token() {
-        let mut registry = registry();
-        registry.remotes.push(GatewayEndpoint {
-            id: "remote-one".to_owned(),
-            name: "Remote".to_owned(),
-            address: "127.0.0.1:23000".to_owned(),
-            kind: GatewayEndpointKind::Remote,
-            auth_token_ref: Some("remote-one".to_owned()),
-            workspace_id: Some("workspace".to_owned()),
-            service_name: None,
-        });
-
-        let preserved = plan_update_remote_gateway_registry_request(
-            PlanUpdateRemoteGatewayRequest {
-                registry: registry.clone(),
-                gateway_id: "remote-one".to_owned(),
-                name: "Renamed".to_owned(),
-                address: "127.0.0.1:23000".to_owned(),
-                auth_token_update: GatewayAuthTokenUpdate::Preserve,
-                default_remote_name: "Remote 1".to_owned(),
-            },
-            token_ref,
-        )
-        .expect("plan preserve token update");
-
-        assert_eq!(preserved.endpoint.name, "Renamed");
-        assert_eq!(
-            preserved.endpoint.auth_token_ref.as_deref(),
-            Some("remote-one")
-        );
-        assert_eq!(
-            preserved.endpoint.workspace_id.as_deref(),
-            Some("workspace")
-        );
-        assert!(preserved.token_write.is_none());
-        assert!(preserved.deleted_token_ref.is_none());
-
-        let replaced = plan_update_remote_gateway_registry_request(
-            PlanUpdateRemoteGatewayRequest {
-                registry: registry.clone(),
-                gateway_id: "remote-one".to_owned(),
-                name: "Remote".to_owned(),
-                address: "127.0.0.1:24000".to_owned(),
-                auth_token_update: GatewayAuthTokenUpdate::Replace {
-                    token: " new-token ".to_owned(),
-                },
-                default_remote_name: "Remote 1".to_owned(),
-            },
-            token_ref,
-        )
-        .expect("plan replace token update");
-
-        assert_eq!(replaced.endpoint.address, "127.0.0.1:24000");
-        assert_eq!(
-            replaced.token_write,
-            Some(GatewayAuthTokenWrite {
-                token_ref: "remote-one".to_owned(),
-                token: "new-token".to_owned(),
-                label: "Remote (127.0.0.1:24000)".to_owned(),
-            })
-        );
-
-        let cleared = plan_update_remote_gateway_registry_request(
-            PlanUpdateRemoteGatewayRequest {
-                registry,
-                gateway_id: "remote-one".to_owned(),
-                name: "Remote".to_owned(),
-                address: "127.0.0.1:23000".to_owned(),
-                auth_token_update: GatewayAuthTokenUpdate::Clear,
-                default_remote_name: "Remote 1".to_owned(),
-            },
-            token_ref,
-        )
-        .expect("plan clear token update");
-
-        assert!(cleared.endpoint.auth_token_ref.is_none());
-        assert_eq!(cleared.deleted_token_ref.as_deref(), Some("remote-one"));
-    }
-
-    #[test]
-    fn delete_remote_gateway_registry_request_selects_fallback_for_deleted_active() {
-        let mut registry = registry();
-        registry.local = None;
-        registry.remotes.push(GatewayEndpoint {
-            id: "remote-one".to_owned(),
-            name: "One".to_owned(),
-            address: "127.0.0.1:23000".to_owned(),
-            kind: GatewayEndpointKind::Remote,
-            auth_token_ref: Some("remote-one".to_owned()),
-            workspace_id: None,
-            service_name: None,
-        });
-        registry.remotes.push(GatewayEndpoint {
-            id: "remote-two".to_owned(),
-            name: "Two".to_owned(),
-            address: "127.0.0.1:24000".to_owned(),
-            kind: GatewayEndpointKind::Remote,
-            auth_token_ref: None,
-            workspace_id: None,
-            service_name: None,
-        });
-        registry.active_gateway_id = Some("remote-one".to_owned());
-
-        let plan = plan_delete_remote_gateway_registry_request(PlanDeleteRemoteGatewayRequest {
-            registry,
-            gateway_id: "remote-one".to_owned(),
-            local_gateway_id: None,
-            local_gateway_has_auth_token: false,
-        })
-        .expect("plan delete active remote");
-
-        assert!(plan.deleted_active);
-        assert_eq!(plan.endpoint.id, "remote-one");
-        assert_eq!(plan.deleted_token_ref.as_deref(), Some("remote-one"));
-        assert_eq!(
-            plan.fallback_endpoint
-                .as_ref()
-                .map(|endpoint| endpoint.id.as_str()),
-            Some("remote-two")
-        );
-        assert_eq!(
-            plan.registry.active_gateway_id.as_deref(),
-            Some("remote-two")
-        );
-        assert_eq!(plan.registry.remotes.len(), 1);
-        assert_eq!(plan.registry.remotes[0].id, "remote-two");
-    }
-
-    #[test]
-    fn remote_gateway_validation_request_rejects_zero_timeout() {
-        let error = validate_remote_gateway_request(&RemoteGatewayValidationRequest {
-            address: "127.0.0.1:23000".to_owned(),
-            auth_token: None,
-            timeout_ms: 0,
-        })
-        .expect_err("zero timeout should fail");
-
-        assert_eq!(
-            error,
-            RemoteGatewayValidationError::InvalidTimeout { timeout_ms: 0 }
         );
     }
 

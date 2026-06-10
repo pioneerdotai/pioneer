@@ -178,13 +178,16 @@ impl GatewayRuntime {
         gateway_id: &str,
         workspace_id: Option<String>,
     ) -> Result<()> {
-        client_gateway_runtime::set_gateway_workspace_id(
-            &mut self.registry,
+        let plan = client_gateway_setup::plan_set_gateway_workspace_registry(
+            &self.registry,
             gateway_id,
             workspace_id,
         )
         .map_err(map_gateway_profile_error)?;
-        save_registry(&self.registry_path, &self.registry)
+
+        save_registry(&self.registry_path, &plan.registry)?;
+        self.registry = plan.registry;
+        Ok(())
     }
 
     pub fn add_remote_gateway(

@@ -7206,7 +7206,10 @@ dependencies = [
 name = "pioneer-client-ffi"
 version = "0.11.0"
 dependencies = [
+ "anyhow",
  "pioneer-client",
+ "pioneer-protocol",
+ "schemars",
  "serde",
  "serde_json",
 ]

@@ -8,7 +8,19 @@ authors.workspace = true
 [lib]
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+default = []
+schema = ["dep:schemars", "pioneer-client/schema"]
+
+[[bin]]
+name = "schema"
+path = "src/bin/schema.rs"
+required-features = ["schema"]
+
 [dependencies]
+anyhow.workspace = true
 pioneer-client.workspace = true
+pioneer-protocol.workspace = true
+schemars = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true

@@ -1,6 +1,6 @@
 use super::*;
 use pioneer_client::threads::start as thread_start;
-use pioneer_client::workspaces::actions as workspace_actions;
+use pioneer_client::workspaces::{actions as workspace_actions, bootstrap as workspace_bootstrap};
 
 pub(crate) fn default_user_command_bin_dir_label() -> &'static str {
     #[cfg(target_os = "windows")]
@@ -81,37 +81,17 @@ impl PioneerDesktop {
             async move {
                 let result = cx
                     .background_spawn(async move {
-                        let mut workspaces = ws_sender.workspace_list()?.workspaces;
-                        let mut workspace_id = match workspace_actions::plan_workspace_bootstrap_after_list(
-                            persisted_workspace_id.as_deref(),
-                            workspaces.as_slice(),
-                        ) {
-                            workspace_actions::WorkspaceBootstrapAfterList::SelectWorkspace {
-                                workspace_id,
-                            } => workspace_id,
-                            workspace_actions::WorkspaceBootstrapAfterList::LoadDefaultWorkspace => {
-                                let workspace = ws_sender.workspace_default()?.workspace;
-                                workspace_actions::apply_workspace_default_for_bootstrap(
-                                    &mut workspaces,
-                                    workspace,
-                                )
-                                .ok_or_else(|| {
-                                    anyhow!("{}", t!("workspace.error.default_workspace_empty"))
-                                })?
+                        workspace_bootstrap::bootstrap_workspace_catalog(
+                            &ws_sender,
+                            workspace_bootstrap::WorkspaceBootstrapRequest {
+                                persisted_workspace_id,
+                            },
+                        )
+                        .map_err(|error| match error {
+                            workspace_bootstrap::WorkspaceBootstrapError::DefaultWorkspaceEmpty => {
+                                anyhow!("{}", t!("workspace.error.default_workspace_empty"))
                             }
-                        };
-
-                        let response = ws_sender.workspace_select(
-                            workspace_actions::workspace_select_params(workspace_id.clone(), false),
-                        )?;
-                        workspace_id = workspace_actions::apply_workspace_select_response_to_catalog(
-                            &mut workspaces,
-                            response.workspace,
-                        );
-
-                        Ok::<_, anyhow::Error>(workspace_actions::WorkspaceBootstrapOutcome {
-                            workspace_id,
-                            workspaces,
+                            workspace_bootstrap::WorkspaceBootstrapError::Transport(error) => error,
                         })
                     })
                     .await;
@@ -127,9 +107,7 @@ impl PioneerDesktop {
                     view.set_workspaces_loading(false);
 
                     match result {
-                        Ok(outcome) => {
-                            let reduction =
-                                workspace_actions::reduce_workspace_bootstrap_success(outcome);
+                        Ok(reduction) => {
                             view.apply_workspace_bootstrap_success_reduction(reduction, cx);
                         }
                         Err(error) => {

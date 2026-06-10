@@ -7,7 +7,6 @@
 //! loops.
 
 use crate::{
-    contracts::ClientEvent,
     notifications::router::{
         ArtifactDeletedRefreshReduction, ArtifactThreadRefreshReduction,
         ConversationEventReduction, McpRefreshReduction, McpServerCatalogChangedReduction,
@@ -195,14 +194,6 @@ impl ClientRuntime {
         reduce_gateway_ws_event(event, context)
     }
 
-    pub fn reduce_ws_events_to_client_events(
-        &self,
-        events: impl IntoIterator<Item = GatewayWsEvent>,
-        context: ClientRuntimeWsEventContext,
-    ) -> Vec<ClientEvent> {
-        reduce_gateway_ws_events_to_client_events(events, context)
-    }
-
     pub fn reduce_gateway_notification(
         &self,
         notification: GatewayNotification,
@@ -323,24 +314,6 @@ where
         drove_turn_resume: sink.drive_turn_resume_queue(),
         ticked_thread_conversations: sink.tick_thread_conversations(),
     }
-}
-
-pub fn reduce_gateway_ws_events_to_client_events(
-    events: impl IntoIterator<Item = GatewayWsEvent>,
-    context: ClientRuntimeWsEventContext,
-) -> Vec<ClientEvent> {
-    events
-        .into_iter()
-        .map(|event| reduce_gateway_ws_event(event, context))
-        .map(|event| match event {
-            ClientRuntimeWsEvent::Connection(reduction) => {
-                ClientEvent::GatewayConnectionChanged(reduction.into())
-            }
-            ClientRuntimeWsEvent::Notification(notification) => {
-                ClientEvent::GatewayNotification(notification)
-            }
-        })
-        .collect()
 }
 
 pub fn reduce_gateway_notification(

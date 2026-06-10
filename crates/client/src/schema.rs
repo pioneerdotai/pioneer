@@ -93,27 +93,9 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             "capability_rejection_row.json",
             crate::timeline::labels::CapabilityRejectionRow
         ),
-        schema_doc!("client_command.json", crate::contracts::ClientCommand),
         schema_doc!(
             "client_effect.json",
             crate::notifications::effects::ClientEffect
-        ),
-        schema_doc!(
-            "client_error_event.json",
-            crate::contracts::ClientErrorEvent
-        ),
-        schema_doc!("client_event.json", crate::contracts::ClientEvent),
-        schema_doc!(
-            "client_gateway_connect_request.json",
-            crate::contracts::ClientGatewayConnectRequest
-        ),
-        schema_doc!(
-            "client_gateway_connect_result.json",
-            crate::contracts::ClientGatewayConnectResult
-        ),
-        schema_doc!(
-            "client_gateway_ws_timings.json",
-            crate::contracts::ClientGatewayWsTimings
         ),
         schema_doc!(
             "client_snapshot.json",
@@ -175,48 +157,24 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             crate::gateway::setup::GatewayAuthTokenWrite
         ),
         schema_doc!(
-            "remote_gateway_validation_request.json",
-            crate::gateway::setup::RemoteGatewayValidationRequest
-        ),
-        schema_doc!(
             "remote_gateway_validation.json",
             crate::gateway::setup::RemoteGatewayValidation
-        ),
-        schema_doc!(
-            "plan_add_remote_gateway_request.json",
-            crate::gateway::setup::PlanAddRemoteGatewayRequest
-        ),
-        schema_doc!(
-            "add_remote_gateway_plan.json",
-            crate::gateway::setup::AddRemoteGatewayPlan
-        ),
-        schema_doc!(
-            "add_and_activate_remote_gateway_registry_plan.json",
-            crate::gateway::setup::AddAndActivateRemoteGatewayRegistryPlan
-        ),
-        schema_doc!(
-            "plan_activate_gateway_request.json",
-            crate::gateway::setup::PlanActivateGatewayRequest
         ),
         schema_doc!(
             "activate_gateway_registry_plan.json",
             crate::gateway::setup::ActivateGatewayRegistryPlan
         ),
         schema_doc!(
+            "set_gateway_workspace_registry_plan.json",
+            crate::gateway::setup::SetGatewayWorkspaceRegistryPlan
+        ),
+        schema_doc!(
             "gateway_auth_token_update.json",
             crate::gateway::setup::GatewayAuthTokenUpdate
         ),
         schema_doc!(
-            "plan_update_remote_gateway_request.json",
-            crate::gateway::setup::PlanUpdateRemoteGatewayRequest
-        ),
-        schema_doc!(
             "update_remote_gateway_registry_plan.json",
             crate::gateway::setup::UpdateRemoteGatewayRegistryPlan
-        ),
-        schema_doc!(
-            "plan_delete_remote_gateway_request.json",
-            crate::gateway::setup::PlanDeleteRemoteGatewayRequest
         ),
         schema_doc!(
             "delete_remote_gateway_registry_plan.json",
@@ -577,6 +535,14 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             crate::state::snapshot::ThreadListSnapshot
         ),
         schema_doc!(
+            "thread_tree_refresh_failure_reduction.json",
+            crate::threads::tree::ThreadTreeRefreshFailureReduction
+        ),
+        schema_doc!(
+            "thread_tree_refresh_success_reduction.json",
+            crate::threads::tree::ThreadTreeRefreshSuccessReduction
+        ),
+        schema_doc!(
             "timeline_coalesced_tools_kind.json",
             crate::timeline::rows::TimelineCoalescedToolsKind
         ),
@@ -604,6 +570,18 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "workspace_snapshot.json",
             crate::state::snapshot::WorkspaceSnapshot
+        ),
+        schema_doc!(
+            "workspace_bootstrap_request.json",
+            crate::workspaces::bootstrap::WorkspaceBootstrapRequest
+        ),
+        schema_doc!(
+            "workspace_bootstrap_success_reduction.json",
+            crate::workspaces::actions::WorkspaceBootstrapSuccessReduction
+        ),
+        schema_doc!(
+            "workspace_selection_reduction.json",
+            crate::workspaces::actions::WorkspaceSelectionReduction
         ),
     ];
 

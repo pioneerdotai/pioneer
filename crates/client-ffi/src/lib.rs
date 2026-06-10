@@ -1,27 +1,42 @@
 //! C ABI boundary for native Pioneer client shells.
 //!
-//! This crate intentionally owns only ABI/runtime glue. Client domain logic
-//! remains in `pioneer-client` and should be exposed here as explicit methods
-//! only after desktop and mobile can share the same Rust API.
+//! This crate intentionally owns ABI/runtime glue and shell-boundary DTOs.
+//! Client domain logic remains in `pioneer-client`.
 
+mod contracts;
+mod gateway;
+#[cfg(feature = "schema")]
+pub mod schema;
+mod threads;
+mod workspaces;
+
+use contracts::{
+    ClientEvent, ClientGatewayConnectRequest, ClientGatewayConnectResult,
+    reduce_gateway_ws_events_to_client_events,
+};
+use gateway::{
+    AddAndActivateRemoteGatewayRegistryPlan, AddRemoteGatewayPlan, PlanActivateGatewayRequest,
+    PlanAddRemoteGatewayRequest, PlanDeleteRemoteGatewayRequest, PlanSetGatewayWorkspaceRequest,
+    PlanUpdateRemoteGatewayRequest, RemoteGatewayValidationRequest,
+    plan_activate_gateway_registry_request, plan_add_and_activate_remote_gateway_registry_request,
+    plan_add_remote_gateway_request, plan_delete_remote_gateway_registry_request,
+    plan_set_gateway_workspace_registry_request, plan_update_remote_gateway_registry_request,
+    validate_remote_gateway_request,
+};
 use pioneer_client::{
-    contracts::{ClientEvent, ClientGatewayConnectRequest, ClientGatewayConnectResult},
     gateway::{
         runtime::{self as client_gateway_runtime, GatewayProfileError},
         secrets::GatewayAuthTokenRef,
         setup::{
-            ActivateGatewayRegistryPlan, AddAndActivateRemoteGatewayRegistryPlan,
-            AddRemoteGatewayPlan, DeleteRemoteGatewayRegistryPlan, PlanActivateGatewayRequest,
-            PlanAddRemoteGatewayRequest, PlanDeleteRemoteGatewayRequest,
-            PlanUpdateRemoteGatewayRequest, RemoteGatewayValidation,
-            RemoteGatewayValidationRequest, UpdateRemoteGatewayRegistryPlan,
-            plan_activate_gateway_registry_request,
-            plan_add_and_activate_remote_gateway_registry_request, plan_add_remote_gateway_request,
-            plan_delete_remote_gateway_registry_request,
-            plan_update_remote_gateway_registry_request, validate_remote_gateway_request,
+            ActivateGatewayRegistryPlan, DeleteRemoteGatewayRegistryPlan, RemoteGatewayValidation,
+            SetGatewayWorkspaceRegistryPlan, UpdateRemoteGatewayRegistryPlan,
         },
     },
     runtime::ClientRuntime,
+    workspaces::{
+        actions::WorkspaceBootstrapSuccessReduction,
+        bootstrap::{WorkspaceBootstrapRequest, bootstrap_workspace_catalog},
+    },
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -30,6 +45,15 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     ptr,
     sync::Mutex,
+};
+use threads::{
+    ClientThreadTreeLevel, ClientThreadTreeQueryData, ThreadTreeLevelRequest,
+    ThreadTreeRefreshRequest, client_thread_tree_level, refresh_thread_tree,
+};
+use workspaces::{
+    WorkspaceCreateRequest, WorkspaceCreateResult, WorkspaceRenameRequest, WorkspaceRenameResult,
+    WorkspaceSwitchRequest, WorkspaceSwitchResult, create_workspace, rename_workspace,
+    switch_workspace,
 };
 
 const FFI_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -161,6 +185,16 @@ impl ClientFfiRuntime {
         plan_delete_remote_gateway_registry_request(request).map_err(|error| error.to_string())
     }
 
+    fn gateway_plan_set_workspace_registry(
+        &self,
+        input_json: &str,
+    ) -> Result<SetGatewayWorkspaceRegistryPlan, String> {
+        let request = serde_json::from_str::<PlanSetGatewayWorkspaceRequest>(input_json)
+            .map_err(|error| format!("invalid gateway set workspace request: {error}"))?;
+
+        plan_set_gateway_workspace_registry_request(request).map_err(|error| error.to_string())
+    }
+
     fn gateway_connect(&self, input_json: &str) -> Result<ClientGatewayConnectResult, String> {
         let request = serde_json::from_str::<ClientGatewayConnectRequest>(input_json)
             .map_err(|error| format!("invalid gateway connect request: {error}"))?;
@@ -214,9 +248,7 @@ impl ClientFfiRuntime {
             let events = self
                 .client_runtime
                 .drain_applicable_ws_events(active_connection_id, Some(first_event));
-            let events = self
-                .client_runtime
-                .reduce_ws_events_to_client_events(events, Default::default());
+            let events = reduce_gateway_ws_events_to_client_events(events, Default::default());
 
             if !events.is_empty() {
                 return Ok(events);
@@ -234,6 +266,56 @@ impl ClientFfiRuntime {
             .lock()
             .map_err(|_| "client ffi connection lock is poisoned".to_owned())? = None;
         Ok(ClientFfiGatewayDisconnectResult { disconnected: true })
+    }
+
+    fn workspace_bootstrap(
+        &self,
+        input_json: &str,
+    ) -> Result<WorkspaceBootstrapSuccessReduction, String> {
+        let request = serde_json::from_str::<WorkspaceBootstrapRequest>(input_json)
+            .map_err(|error| format!("invalid workspace bootstrap request: {error}"))?;
+
+        bootstrap_workspace_catalog(&self.client_runtime.ws_command_sender(), request)
+            .map_err(|error| error.to_string())
+    }
+
+    fn workspace_switch(&self, input_json: &str) -> Result<WorkspaceSwitchResult, String> {
+        let request = serde_json::from_str::<WorkspaceSwitchRequest>(input_json)
+            .map_err(|error| format!("invalid workspace switch request: {error}"))?;
+
+        switch_workspace(&self.client_runtime.ws_command_sender(), request)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn workspace_create(&self, input_json: &str) -> Result<WorkspaceCreateResult, String> {
+        let request = serde_json::from_str::<WorkspaceCreateRequest>(input_json)
+            .map_err(|error| format!("invalid workspace create request: {error}"))?;
+
+        create_workspace(&self.client_runtime.ws_command_sender(), request)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn workspace_rename(&self, input_json: &str) -> Result<WorkspaceRenameResult, String> {
+        let request = serde_json::from_str::<WorkspaceRenameRequest>(input_json)
+            .map_err(|error| format!("invalid workspace rename request: {error}"))?;
+
+        rename_workspace(&self.client_runtime.ws_command_sender(), request)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn thread_tree_refresh(&self, input_json: &str) -> Result<ClientThreadTreeQueryData, String> {
+        let request = serde_json::from_str::<ThreadTreeRefreshRequest>(input_json)
+            .map_err(|error| format!("invalid thread tree refresh request: {error}"))?;
+
+        refresh_thread_tree(&self.client_runtime.ws_command_sender(), request)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn thread_tree_level(&self, input_json: &str) -> Result<ClientThreadTreeLevel, String> {
+        let request = serde_json::from_str::<ThreadTreeLevelRequest>(input_json)
+            .map_err(|error| format!("invalid thread tree level request: {error}"))?;
+
+        Ok(client_thread_tree_level(request))
     }
 }
 
@@ -331,7 +413,17 @@ ffi_client_json_method!(
     pioneer_client_ffi_gateway_plan_delete_remote_registry,
     gateway_plan_delete_remote_registry
 );
+ffi_client_json_method!(
+    pioneer_client_ffi_gateway_plan_set_workspace_registry,
+    gateway_plan_set_workspace_registry
+);
 ffi_client_json_method!(pioneer_client_ffi_gateway_connect, gateway_connect);
+ffi_client_json_method!(pioneer_client_ffi_workspace_bootstrap, workspace_bootstrap);
+ffi_client_json_method!(pioneer_client_ffi_workspace_switch, workspace_switch);
+ffi_client_json_method!(pioneer_client_ffi_workspace_create, workspace_create);
+ffi_client_json_method!(pioneer_client_ffi_workspace_rename, workspace_rename);
+ffi_client_json_method!(pioneer_client_ffi_thread_tree_refresh, thread_tree_refresh);
+ffi_client_json_method!(pioneer_client_ffi_thread_tree_level, thread_tree_level);
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pioneer_client_ffi_gateway_next_events(
@@ -715,6 +807,41 @@ mod tests {
         assert_eq!(
             result.registry.active_gateway_id.as_deref(),
             Some("remote-two")
+        );
+    }
+
+    #[test]
+    fn gateway_set_workspace_registry_plan_returns_shared_next_registry() {
+        let runtime = ClientFfiRuntime::default();
+        let result = runtime
+            .gateway_plan_set_workspace_registry(
+                serde_json::json!({
+                    "registry": {
+                        "version": 1,
+                        "active_gateway_id": "remote-one",
+                        "remotes": [{
+                            "id": "remote-one",
+                            "name": "Remote",
+                            "address": "127.0.0.1:23000",
+                            "kind": "remote",
+                            "auth_token_ref": null,
+                            "workspace_id": null,
+                            "service_name": null
+                        }]
+                    },
+                    "gateway_id": "remote-one",
+                    "workspace_id": "ws-selected"
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("plan gateway workspace registry");
+
+        assert_eq!(result.endpoint.id, "remote-one");
+        assert_eq!(result.endpoint.workspace_id.as_deref(), Some("ws-selected"));
+        assert_eq!(
+            result.registry.remotes[0].workspace_id.as_deref(),
+            Some("ws-selected")
         );
     }
 

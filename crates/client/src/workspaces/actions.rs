@@ -56,7 +56,8 @@ pub struct WorkspaceBootstrapOutcome {
     pub workspaces: Vec<Workspace>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct WorkspaceSelectionReduction {
     pub workspace_id: String,
     pub persist_active_gateway_workspace_id: String,
@@ -64,14 +65,16 @@ pub struct WorkspaceSelectionReduction {
     pub refresh_thread_list: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct WorkspaceBootstrapSuccessReduction {
     pub workspaces: Vec<Workspace>,
     pub selected: WorkspaceSelectionReduction,
     pub clear_workspaces_error: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct WorkspaceSwitchSuccessReduction {
     pub workspaces: Vec<Workspace>,
     pub selected: WorkspaceSelectionReduction,
@@ -79,7 +82,8 @@ pub struct WorkspaceSwitchSuccessReduction {
     pub refresh_workspace_bound_screens: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct WorkspaceCreateSuccessReduction {
     pub workspaces: Vec<Workspace>,
     pub workspace_id: String,
@@ -87,7 +91,8 @@ pub struct WorkspaceCreateSuccessReduction {
     pub clear_workspaces_error: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct WorkspaceRenameSuccessReduction {
     pub workspaces: Vec<Workspace>,
     pub workspace_id: String,

@@ -7,6 +7,7 @@ use pioneer_protocol::{
     ThreadFolderDeleteParams, ThreadFolderMoveParams, ThreadMoveParams, ThreadPlacement,
     ThreadTreeParams, ThreadTreeResponse, ThreadUpdateParams, ThreadUpdateResponse,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 pub const SIDEBAR_THREAD_NODE_PREFIX: &str = "thread:";
@@ -184,13 +185,15 @@ pub struct ThreadTreeRefreshContext<'a> {
     pub has_known_threads_for_workspace: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ThreadTreeThreadAction {
     pub thread_id: String,
     pub workspace_id: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ThreadTreeRefreshSuccessReduction {
     pub workspace_id: String,
     pub threads: Vec<Thread>,
@@ -206,7 +209,8 @@ pub struct ThreadTreeRefreshSuccessReduction {
     pub sync_composer_model_selection: bool,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ThreadTreeRefreshFailureReduction {
     pub request_thread_start_if_needed: bool,
     pub drive_thread_start_queue: bool,

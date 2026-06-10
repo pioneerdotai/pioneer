@@ -99,20 +99,6 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Stable
         ),
         contract_type!(
-            "add_and_activate_remote_gateway_registry_plan.json",
-            crate::gateway::setup::AddAndActivateRemoteGatewayRegistryPlan,
-            Domain::Connection,
-            Kind::ActionPlan,
-            Stability::Provisional
-        ),
-        contract_type!(
-            "add_remote_gateway_plan.json",
-            crate::gateway::setup::AddRemoteGatewayPlan,
-            Domain::Connection,
-            Kind::ActionPlan,
-            Stability::Provisional
-        ),
-        contract_type!(
             "activate_gateway_registry_plan.json",
             crate::gateway::setup::ActivateGatewayRegistryPlan,
             Domain::Connection,
@@ -176,53 +162,11 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Stable
         ),
         contract_type!(
-            "client_command.json",
-            crate::contracts::ClientCommand,
-            Domain::Root,
-            Kind::Command,
-            Stability::Provisional
-        ),
-        contract_type!(
             "client_effect.json",
             crate::notifications::effects::ClientEffect,
             Domain::Root,
             Kind::Effect,
             Stability::Stable
-        ),
-        contract_type!(
-            "client_error_event.json",
-            crate::contracts::ClientErrorEvent,
-            Domain::Root,
-            Kind::Event,
-            Stability::Provisional
-        ),
-        contract_type!(
-            "client_event.json",
-            crate::contracts::ClientEvent,
-            Domain::Root,
-            Kind::Event,
-            Stability::Provisional
-        ),
-        contract_type!(
-            "client_gateway_connect_request.json",
-            crate::contracts::ClientGatewayConnectRequest,
-            Domain::Connection,
-            Kind::ActionPlan,
-            Stability::Provisional
-        ),
-        contract_type!(
-            "client_gateway_connect_result.json",
-            crate::contracts::ClientGatewayConnectResult,
-            Domain::Connection,
-            Kind::ActionPlan,
-            Stability::Provisional
-        ),
-        contract_type!(
-            "client_gateway_ws_timings.json",
-            crate::contracts::ClientGatewayWsTimings,
-            Domain::Connection,
-            Kind::ActionPlan,
-            Stability::Provisional
         ),
         contract_type!(
             "client_snapshot.json",
@@ -321,6 +265,13 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
         contract_type!(
             "gateway_auth_token_write.json",
             crate::gateway::setup::GatewayAuthTokenWrite,
+            Domain::Connection,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "set_gateway_workspace_registry_plan.json",
+            crate::gateway::setup::SetGatewayWorkspaceRegistryPlan,
             Domain::Connection,
             Kind::ActionPlan,
             Stability::Provisional
@@ -599,34 +550,6 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Stable
         ),
         contract_type!(
-            "plan_add_remote_gateway_request.json",
-            crate::gateway::setup::PlanAddRemoteGatewayRequest,
-            Domain::Connection,
-            Kind::ActionPlan,
-            Stability::Provisional
-        ),
-        contract_type!(
-            "plan_activate_gateway_request.json",
-            crate::gateway::setup::PlanActivateGatewayRequest,
-            Domain::Connection,
-            Kind::ActionPlan,
-            Stability::Provisional
-        ),
-        contract_type!(
-            "plan_delete_remote_gateway_request.json",
-            crate::gateway::setup::PlanDeleteRemoteGatewayRequest,
-            Domain::Connection,
-            Kind::ActionPlan,
-            Stability::Provisional
-        ),
-        contract_type!(
-            "plan_update_remote_gateway_request.json",
-            crate::gateway::setup::PlanUpdateRemoteGatewayRequest,
-            Domain::Connection,
-            Kind::ActionPlan,
-            Stability::Provisional
-        ),
-        contract_type!(
             "prepared_composer_attachment.json",
             crate::composer::turn_prepare::PreparedComposerAttachment,
             Domain::Composer,
@@ -722,13 +645,6 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             crate::gateway::setup::RemoteGatewayValidation,
             Domain::Connection,
             Kind::ActionState,
-            Stability::Provisional
-        ),
-        contract_type!(
-            "remote_gateway_validation_request.json",
-            crate::gateway::setup::RemoteGatewayValidationRequest,
-            Domain::Connection,
-            Kind::ActionPlan,
             Stability::Provisional
         ),
         contract_type!(
@@ -1033,6 +949,20 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Stable
         ),
         contract_type!(
+            "thread_tree_refresh_failure_reduction.json",
+            crate::threads::tree::ThreadTreeRefreshFailureReduction,
+            Domain::Root,
+            Kind::ActionState,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "thread_tree_refresh_success_reduction.json",
+            crate::threads::tree::ThreadTreeRefreshSuccessReduction,
+            Domain::Root,
+            Kind::ActionState,
+            Stability::Provisional
+        ),
+        contract_type!(
             "timeline_coalesced_tools_kind.json",
             crate::timeline::rows::TimelineCoalescedToolsKind,
             Domain::Timeline,
@@ -1087,6 +1017,27 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Domain::Root,
             Kind::Snapshot,
             Stability::Stable
+        ),
+        contract_type!(
+            "workspace_bootstrap_request.json",
+            crate::workspaces::bootstrap::WorkspaceBootstrapRequest,
+            Domain::Root,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "workspace_bootstrap_success_reduction.json",
+            crate::workspaces::actions::WorkspaceBootstrapSuccessReduction,
+            Domain::Root,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "workspace_selection_reduction.json",
+            crate::workspaces::actions::WorkspaceSelectionReduction,
+            Domain::Root,
+            Kind::ActionPlan,
+            Stability::Provisional
         ),
     ];
 
