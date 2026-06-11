@@ -43,7 +43,7 @@ impl PioneerDesktop {
         cx: &mut Context<Self>,
     ) -> ProviderModelDisplayState {
         let Some(key) = self.composer_model_display_key() else {
-            return if self.thread_list_loading || self.workspaces_loading {
+            return if self.composer_model_selection_pending() {
                 ProviderModelDisplayState::Loading
             } else {
                 ProviderModelDisplayState::Missing
@@ -63,6 +63,25 @@ impl PioneerDesktop {
         }
 
         ProviderModelDisplayState::Loading
+    }
+
+    fn composer_model_selection_pending(&self) -> bool {
+        if self.composer_model_selection_manually_selected {
+            return false;
+        }
+
+        if self.gateway.connection_state.is_transitioning()
+            || self.workspaces_loading
+            || self.thread_list_loading
+            || self.thread_start_requested
+            || self.thread_start.in_progress
+            || self.thread_start.pending_thread_id.is_some()
+        {
+            return true;
+        }
+
+        self.current_active_thread_id()
+            .is_some_and(|thread_id| self.is_thread_history_loading(thread_id))
     }
 
     fn composer_model_selection_state(&self) -> ComposerModelSelectionState {
