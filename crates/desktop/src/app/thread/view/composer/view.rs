@@ -18,7 +18,7 @@ use gpui_component::{
 const COMPOSER_ATTACHMENT_TEXT_FADE_WIDTH: Pixels = px(24.);
 
 impl PioneerDesktop {
-    pub(crate) fn render_composer(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(crate) fn render_composer(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let composer_state = self.composer_state.clone();
         let attachments = self.composer_attachments.clone();
         let capabilities = self.composer_capabilities.clone();

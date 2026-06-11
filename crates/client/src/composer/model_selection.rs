@@ -153,12 +153,13 @@ pub fn resolve_composer_model_selection(
     active_workspace_id: Option<&str>,
     candidates: Vec<ComposerModelSelectionCandidate>,
 ) -> Option<ComposerModelSelection> {
-    let active_thread_id = active_thread_id?;
-
-    let active_candidate = candidates
-        .iter()
-        .find(|candidate| candidate.thread_id == active_thread_id);
+    let active_candidate = active_thread_id.and_then(|active_thread_id| {
+        candidates
+            .iter()
+            .find(|candidate| candidate.thread_id == active_thread_id)
+    });
     let workspace_id = active_workspace_id.map(str::to_owned).or_else(|| {
+        let active_thread_id = active_thread_id?;
         candidates
             .iter()
             .find(|candidate| candidate.thread_id == active_thread_id)
@@ -174,7 +175,7 @@ pub fn resolve_composer_model_selection(
     candidates
         .into_iter()
         .filter(|candidate| candidate.workspace_id == workspace_id)
-        .filter(|candidate| candidate.thread_id != active_thread_id)
+        .filter(|candidate| Some(candidate.thread_id.as_str()) != active_thread_id)
         .filter(|candidate| candidate.has_turns)
         .filter_map(|candidate| {
             let selection = candidate.selection.clone()?;
@@ -293,6 +294,29 @@ mod tests {
                     "openrouter",
                     "anthropic/claude",
                 ),
+            ],
+        );
+
+        assert_eq!(resolved, selection("openrouter", "anthropic/claude"));
+    }
+
+    #[test]
+    fn workspace_without_active_thread_uses_latest_workspace_turn() {
+        let resolved = resolve_composer_model_selection(
+            None,
+            Some("ws"),
+            vec![
+                candidate("thread_empty", "ws", 30, false, "openai", "default"),
+                candidate("thread_old", "ws", 10, true, "openai", "gpt-5.4"),
+                candidate(
+                    "thread_new",
+                    "ws",
+                    20,
+                    true,
+                    "openrouter",
+                    "anthropic/claude",
+                ),
+                candidate("thread_other", "other", 40, true, "anthropic", "claude"),
             ],
         );
 

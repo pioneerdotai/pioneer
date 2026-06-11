@@ -1,4 +1,5 @@
 use pioneer_client::{
+    composer::model_selection::ComposerModelSelection,
     rpc::JsonRpcRequestTransport,
     threads::tree::{ThreadTreeRefreshContext, reduce_thread_tree_refresh_success},
     transport::ws::command_sender as ws_commands,
@@ -44,6 +45,7 @@ pub struct ClientThreadTreeSnapshot {
 #[serde(deny_unknown_fields)]
 pub struct ClientThreadTreeQueryData {
     pub snapshot: ClientThreadTreeSnapshot,
+    pub composer_model_selection: Option<ComposerModelSelection>,
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -93,6 +95,7 @@ where
 
     Ok(ClientThreadTreeQueryData {
         snapshot: client_thread_tree_snapshot_from_reduction(reduction),
+        composer_model_selection: None,
     })
 }
 

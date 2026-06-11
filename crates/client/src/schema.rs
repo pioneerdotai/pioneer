@@ -137,6 +137,14 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             crate::composer::model_selection::ComposerModelSelectionCandidate
         ),
         schema_doc!(
+            "provider_model_display_key.json",
+            crate::providers::presentation::ProviderModelDisplayKey
+        ),
+        schema_doc!(
+            "provider_model_display_resolution.json",
+            crate::providers::presentation::ProviderModelDisplayResolution
+        ),
+        schema_doc!(
             "gateway_connection_state.json",
             crate::state::client_state::GatewayConnectionState
         ),
@@ -359,6 +367,18 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             crate::providers::selectors::ProviderFilter
         ),
         schema_doc!(
+            "provider_list_models_params.json",
+            pioneer_protocol::ProviderListModelsParams
+        ),
+        schema_doc!(
+            "provider_list_models_response.json",
+            pioneer_protocol::ProviderListModelsResponse
+        ),
+        schema_doc!(
+            "provider_list_params.json",
+            pioneer_protocol::ProviderListParams
+        ),
+        schema_doc!(
             "provider_list_refresh_plan.json",
             crate::providers::list::ProviderListRefreshPlan
         ),
@@ -370,6 +390,15 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             "provider_list_refresh_unavailable.json",
             crate::providers::list::ProviderListRefreshUnavailable
         ),
+        schema_doc!(
+            "provider_list_response.json",
+            pioneer_protocol::ProviderListResponse
+        ),
+        schema_doc!(
+            "provider_model_info.json",
+            pioneer_protocol::ProviderModelInfo
+        ),
+        schema_doc!("provider_summary.json", pioneer_protocol::ProviderSummary),
         schema_doc!(
             "provider_set_api_key_action_request.json",
             crate::providers::actions::ProviderSetApiKeyActionRequest

@@ -3,6 +3,7 @@
 //! This crate intentionally owns ABI/runtime glue and shell-boundary DTOs.
 //! Client domain logic remains in `pioneer-client`.
 
+mod active_thread;
 mod contracts;
 mod gateway;
 #[cfg(feature = "schema")]
@@ -10,6 +11,11 @@ pub mod schema;
 mod threads;
 mod workspaces;
 
+use active_thread::{
+    ClientActiveThreadClearResult, ClientActiveThreadEventRequest, ClientActiveThreadOpenRequest,
+    ClientActiveThreadSendTextRequest, ClientActiveThreadSendTextResult,
+    ClientActiveThreadSnapshot, ClientActiveThreadSnapshotRequest, ClientFfiActiveThreadState,
+};
 use contracts::{
     ClientEvent, ClientGatewayConnectRequest, ClientGatewayConnectResult,
     reduce_gateway_ws_events_to_client_events,
@@ -32,11 +38,18 @@ use pioneer_client::{
             SetGatewayWorkspaceRegistryPlan, UpdateRemoteGatewayRegistryPlan,
         },
     },
+    providers::presentation::{
+        ProviderModelDisplayKey, ProviderModelDisplayResolution, provider_model_display_key,
+        provider_model_display_models_params, resolve_provider_model_display_from_response,
+    },
     runtime::ClientRuntime,
     workspaces::{
         actions::WorkspaceBootstrapSuccessReduction,
         bootstrap::{WorkspaceBootstrapRequest, bootstrap_workspace_catalog},
     },
+};
+use pioneer_protocol::{
+    ProviderListModelsParams, ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -66,6 +79,7 @@ pub struct PioneerClientFfi {
 struct ClientFfiRuntime {
     config: Mutex<Option<ClientFfiConfig>>,
     client_runtime: ClientRuntime,
+    active_thread: ClientFfiActiveThreadState,
     active_connection_id: Mutex<Option<u64>>,
 }
 
@@ -303,12 +317,68 @@ impl ClientFfiRuntime {
             .map_err(|error| format!("{error:#}"))
     }
 
+    fn provider_list(&self, input_json: &str) -> Result<ProviderListResponse, String> {
+        let params = serde_json::from_str::<ProviderListParams>(input_json)
+            .map_err(|error| format!("invalid provider list params: {error}"))?;
+
+        self.client_runtime
+            .ws_command_sender()
+            .provider_list(params)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn provider_list_models(&self, input_json: &str) -> Result<ProviderListModelsResponse, String> {
+        let params = serde_json::from_str::<ProviderListModelsParams>(input_json)
+            .map_err(|error| format!("invalid provider list models params: {error}"))?;
+
+        self.client_runtime
+            .ws_command_sender()
+            .provider_list_models(params)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn provider_model_display(
+        &self,
+        input_json: &str,
+    ) -> Result<ProviderModelDisplayResolution, String> {
+        let request = serde_json::from_str::<ProviderModelDisplayKey>(input_json)
+            .map_err(|error| format!("invalid provider model display request: {error}"))?;
+        let key = provider_model_display_key(
+            Some(request.workspace_id.as_str()),
+            Some(request.provider.as_str()),
+            Some(request.model.as_str()),
+        )
+        .ok_or_else(|| "invalid provider model display request: empty selection".to_owned())?;
+        let response = self
+            .client_runtime
+            .ws_command_sender()
+            .provider_list_models(provider_model_display_models_params(&key))
+            .map_err(|error| format!("{error:#}"))?;
+
+        Ok(resolve_provider_model_display_from_response(
+            &key, &response,
+        ))
+    }
+
     fn thread_tree_refresh(&self, input_json: &str) -> Result<ClientThreadTreeQueryData, String> {
         let request = serde_json::from_str::<ThreadTreeRefreshRequest>(input_json)
             .map_err(|error| format!("invalid thread tree refresh request: {error}"))?;
+        let active_thread_id = request.active_thread_id.clone();
 
-        refresh_thread_tree(&self.client_runtime.ws_command_sender(), request)
-            .map_err(|error| format!("{error:#}"))
+        let mut result = refresh_thread_tree(&self.client_runtime.ws_command_sender(), request)
+            .map_err(|error| format!("{error:#}"))?;
+        self.active_thread
+            .apply_thread_tree_snapshot(&result.snapshot)
+            .map_err(|error| format!("{error:#}"))?;
+        result.composer_model_selection = self
+            .active_thread
+            .resolve_composer_model_selection(
+                active_thread_id.as_deref(),
+                Some(result.snapshot.workspace_id.as_str()),
+            )
+            .map_err(|error| format!("{error:#}"))?;
+
+        Ok(result)
     }
 
     fn thread_tree_level(&self, input_json: &str) -> Result<ClientThreadTreeLevel, String> {
@@ -316,6 +386,57 @@ impl ClientFfiRuntime {
             .map_err(|error| format!("invalid thread tree level request: {error}"))?;
 
         Ok(client_thread_tree_level(request))
+    }
+
+    fn active_thread_open(&self, input_json: &str) -> Result<ClientActiveThreadSnapshot, String> {
+        let request = serde_json::from_str::<ClientActiveThreadOpenRequest>(input_json)
+            .map_err(|error| format!("invalid active thread open request: {error}"))?;
+
+        self.active_thread
+            .open_thread(&self.client_runtime, request)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn active_thread_snapshot(
+        &self,
+        input_json: &str,
+    ) -> Result<ClientActiveThreadSnapshot, String> {
+        let request = serde_json::from_str::<ClientActiveThreadSnapshotRequest>(input_json)
+            .map_err(|error| format!("invalid active thread snapshot request: {error}"))?;
+
+        self.active_thread
+            .snapshot(request)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn active_thread_apply_event(
+        &self,
+        input_json: &str,
+    ) -> Result<ClientActiveThreadSnapshot, String> {
+        let request = serde_json::from_str::<ClientActiveThreadEventRequest>(input_json)
+            .map_err(|error| format!("invalid active thread event request: {error}"))?;
+
+        self.active_thread
+            .apply_event(&self.client_runtime, request)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn active_thread_send_text(
+        &self,
+        input_json: &str,
+    ) -> Result<ClientActiveThreadSendTextResult, String> {
+        let request = serde_json::from_str::<ClientActiveThreadSendTextRequest>(input_json)
+            .map_err(|error| format!("invalid active thread send text request: {error}"))?;
+
+        self.active_thread
+            .send_text_turn(&self.client_runtime, request)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn active_thread_clear(&self) -> Result<ClientActiveThreadClearResult, String> {
+        self.active_thread
+            .clear(&self.client_runtime)
+            .map_err(|error| format!("{error:#}"))
     }
 }
 
@@ -422,8 +543,37 @@ ffi_client_json_method!(pioneer_client_ffi_workspace_bootstrap, workspace_bootst
 ffi_client_json_method!(pioneer_client_ffi_workspace_switch, workspace_switch);
 ffi_client_json_method!(pioneer_client_ffi_workspace_create, workspace_create);
 ffi_client_json_method!(pioneer_client_ffi_workspace_rename, workspace_rename);
+ffi_client_json_method!(pioneer_client_ffi_provider_list, provider_list);
+ffi_client_json_method!(
+    pioneer_client_ffi_provider_list_models,
+    provider_list_models
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_provider_model_display,
+    provider_model_display
+);
 ffi_client_json_method!(pioneer_client_ffi_thread_tree_refresh, thread_tree_refresh);
 ffi_client_json_method!(pioneer_client_ffi_thread_tree_level, thread_tree_level);
+ffi_client_json_method!(pioneer_client_ffi_active_thread_open, active_thread_open);
+ffi_client_json_method!(
+    pioneer_client_ffi_active_thread_snapshot,
+    active_thread_snapshot
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_active_thread_apply_event,
+    active_thread_apply_event
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_active_thread_send_text,
+    active_thread_send_text
+);
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pioneer_client_ffi_active_thread_clear(
+    ptr: *mut PioneerClientFfi,
+) -> *mut c_char {
+    ffi_client_response(ptr, |runtime| runtime.active_thread_clear())
+}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pioneer_client_ffi_gateway_next_events(

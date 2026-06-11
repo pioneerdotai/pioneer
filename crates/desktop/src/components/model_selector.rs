@@ -11,6 +11,7 @@ use gpui_component::{
     input::{Input, InputState},
     popover::{Popover, PopoverState},
     scroll::Scrollbar,
+    spinner::Spinner,
     theme::ActiveTheme,
     *,
 };
@@ -73,6 +74,7 @@ struct SelectorPopoverTrigger {
     label: SharedString,
     icon: IconName,
     selected: bool,
+    loading: bool,
 }
 
 impl SelectorPopoverTrigger {
@@ -82,7 +84,13 @@ impl SelectorPopoverTrigger {
             label: label.into(),
             icon,
             selected: false,
+            loading: false,
         }
+    }
+
+    fn loading(mut self, loading: bool) -> Self {
+        self.loading = loading;
+        self
     }
 }
 
@@ -130,14 +138,19 @@ impl RenderOnce for SelectorPopoverTrigger {
                     .w_full()
                     .items_center()
                     .justify_between()
-                    .child(
+                    .child(div().flex_1().child(if self.loading {
+                        Spinner::new()
+                            .with_size(gpui_component::Size::Small)
+                            .color(theme.muted_foreground)
+                            .into_any_element()
+                    } else {
                         div()
-                            .flex_1()
                             .text_sm()
                             .overflow_hidden()
                             .text_ellipsis()
-                            .child(self.label),
-                    )
+                            .child(self.label)
+                            .into_any_element()
+                    }))
                     .child(Icon::new(self.icon).size_3p5()),
             )
     }
@@ -296,6 +309,7 @@ impl PioneerDesktop {
             let save_selection = Self::save_model_selector_selection(state.clone());
             let provider_trigger_label = Self::provider_trigger_label(&state);
             let model_trigger_label = Self::model_trigger_label(&state);
+            let model_trigger_loading = Self::model_trigger_loading(&state);
 
             dialog
                 .gap_1()
@@ -340,6 +354,7 @@ impl PioneerDesktop {
                             .child(Self::render_model_selector_section(
                                 state.clone(),
                                 model_trigger_label,
+                                model_trigger_loading,
                             )),
                     ),
                 )
@@ -369,12 +384,30 @@ impl PioneerDesktop {
     }
 
     fn model_trigger_label(state: &ModelSelectorDialogState) -> String {
-        state
-            .selector
-            .borrow()
-            .selected_model()
-            .map(str::to_owned)
-            .unwrap_or_else(|| t!("chat.composer.model.model_placeholder").to_string())
+        let selector = state.selector.borrow();
+        match provider_presentation::model_selector_selected_model_display_state(
+            selector.selected_model(),
+            selector.models(),
+            selector.loading_models(),
+        ) {
+            provider_presentation::ProviderModelDisplayState::Label(label) => label,
+            provider_presentation::ProviderModelDisplayState::Loading
+            | provider_presentation::ProviderModelDisplayState::Missing => {
+                t!("chat.composer.model.model_placeholder").to_string()
+            }
+        }
+    }
+
+    fn model_trigger_loading(state: &ModelSelectorDialogState) -> bool {
+        let selector = state.selector.borrow();
+        matches!(
+            provider_presentation::model_selector_selected_model_display_state(
+                selector.selected_model(),
+                selector.models(),
+                selector.loading_models(),
+            ),
+            provider_presentation::ProviderModelDisplayState::Loading
+        )
     }
 
     fn render_provider_selector_section(
@@ -561,6 +594,7 @@ impl PioneerDesktop {
     fn render_model_selector_section(
         state: ModelSelectorDialogState,
         model_trigger_label: String,
+        model_trigger_loading: bool,
     ) -> Field {
         let model_trigger_width_px = state.model_trigger_width_px.clone();
         let desktop_entity = state.desktop_entity.clone();
@@ -574,11 +608,14 @@ impl PioneerDesktop {
                         Popover::new("model-model-popover")
                             .anchor(Corner::TopLeft)
                             .p_0()
-                            .trigger(SelectorPopoverTrigger::new(
-                                "model-model-trigger",
-                                model_trigger_label,
-                                IconName::ChevronsUpDown,
-                            ))
+                            .trigger(
+                                SelectorPopoverTrigger::new(
+                                    "model-model-trigger",
+                                    model_trigger_label,
+                                    IconName::ChevronsUpDown,
+                                )
+                                .loading(model_trigger_loading),
+                            )
                             .content(move |_, window, popover_cx| {
                                 Self::render_model_popover_content(
                                     state.clone(),

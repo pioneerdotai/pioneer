@@ -327,6 +327,8 @@ impl PioneerDesktop {
             &mut self.thread_tree_selected_node_id,
             &mut self.turn_timeline_refresh,
         );
+        self.composer_model_display_cache.clear();
+        self.composer_model_display_loading_key = None;
     }
 
     pub(in crate::app) fn set_thread_tree_snapshot(

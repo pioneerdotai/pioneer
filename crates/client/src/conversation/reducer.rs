@@ -66,7 +66,8 @@ macro_rules! client_system_label {
     };
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
 pub enum TimelineEntryStatus {
     Running,
     Completed,
@@ -75,7 +76,8 @@ pub enum TimelineEntryStatus {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub enum TurnPhase {
     Starting,
     Running,
@@ -86,7 +88,8 @@ pub enum TurnPhase {
     Cancelled,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct TurnView {
     pub id: String,
     pub phase: TurnPhase,
@@ -95,7 +98,8 @@ pub struct TurnView {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct ItemView {
     pub id: String,
     pub turn_id: String,
@@ -113,7 +117,8 @@ pub struct ItemView {
     pub opaque_meta: Option<JsonValue>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct TimelineEntry {
     pub id: String,
     pub turn_id: String,
@@ -121,7 +126,8 @@ pub struct TimelineEntry {
     pub item_index: usize,
 }
 
-#[derive(Debug, Clone, Default)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ConversationViewState {
     pub timeline: Vec<TimelineEntry>,
     pub turns: Vec<TurnView>,

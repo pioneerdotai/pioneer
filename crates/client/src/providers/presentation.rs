@@ -1,6 +1,60 @@
 //! UI-neutral provider presentation rows.
 
-use pioneer_protocol::{ProviderModelInfo, ProviderSummary};
+use pioneer_protocol::{
+    ProviderListModelsParams, ProviderListModelsResponse, ProviderModelInfo, ProviderSummary,
+};
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderModelDisplayKey {
+    pub workspace_id: String,
+    pub provider: String,
+    pub model: String,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderModelDisplayResolution {
+    pub label: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProviderModelDisplayState {
+    Loading,
+    Label(String),
+    Missing,
+}
+
+pub fn provider_model_display_key(
+    workspace_id: Option<&str>,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> Option<ProviderModelDisplayKey> {
+    let workspace_id = workspace_id?.trim();
+    let provider = provider?.trim();
+    let model = model?.trim();
+
+    if workspace_id.is_empty() || provider.is_empty() || model.is_empty() {
+        return None;
+    }
+
+    Some(ProviderModelDisplayKey {
+        workspace_id: workspace_id.to_owned(),
+        provider: provider.to_owned(),
+        model: model.to_owned(),
+    })
+}
+
+pub fn provider_model_display_models_params(
+    key: &ProviderModelDisplayKey,
+) -> ProviderListModelsParams {
+    ProviderListModelsParams {
+        workspace_id: key.workspace_id.clone(),
+        provider: key.provider.clone(),
+    }
+}
 
 pub fn filter_model_selector_providers(
     providers: &[ProviderSummary],
@@ -46,6 +100,47 @@ pub fn model_selector_model_display_name(model: &ProviderModelInfo) -> String {
 
 pub fn model_selector_model_has_name(model: &ProviderModelInfo) -> bool {
     model.name.is_some()
+}
+
+pub fn resolve_provider_model_display_name(
+    models: &[ProviderModelInfo],
+    selected_model: &str,
+) -> Option<String> {
+    models
+        .iter()
+        .find(|model| model.id.as_str() == selected_model)
+        .map(model_selector_model_display_name)
+}
+
+pub fn resolve_provider_model_display_from_response(
+    key: &ProviderModelDisplayKey,
+    response: &ProviderListModelsResponse,
+) -> ProviderModelDisplayResolution {
+    let label = (response.provider == key.provider)
+        .then(|| {
+            resolve_provider_model_display_name(response.models.as_slice(), key.model.as_str())
+        })
+        .flatten();
+
+    ProviderModelDisplayResolution { label }
+}
+
+pub fn model_selector_selected_model_display_state(
+    selected_model: Option<&str>,
+    models: &[ProviderModelInfo],
+    loading_models: bool,
+) -> ProviderModelDisplayState {
+    let Some(selected_model) = selected_model else {
+        return ProviderModelDisplayState::Missing;
+    };
+
+    if loading_models {
+        return ProviderModelDisplayState::Loading;
+    }
+
+    resolve_provider_model_display_name(models, selected_model)
+        .map(ProviderModelDisplayState::Label)
+        .unwrap_or(ProviderModelDisplayState::Missing)
 }
 
 fn normalize_selector_query(query: &str) -> String {
@@ -116,5 +211,79 @@ mod tests {
         let unnamed = model("o4-mini", None);
         assert_eq!(model_selector_model_display_name(&unnamed), "o4-mini");
         assert!(!model_selector_model_has_name(&unnamed));
+    }
+
+    #[test]
+    fn provider_model_display_key_trims_and_rejects_incomplete_selection() {
+        let key = provider_model_display_key(Some(" ws "), Some(" openai "), Some(" gpt-5 "))
+            .expect("valid key");
+
+        assert_eq!(
+            key,
+            ProviderModelDisplayKey {
+                workspace_id: "ws".to_owned(),
+                provider: "openai".to_owned(),
+                model: "gpt-5".to_owned(),
+            }
+        );
+        assert!(provider_model_display_key(Some("ws"), Some("openai"), Some("")).is_none());
+        assert!(provider_model_display_key(Some("ws"), None, Some("gpt-5")).is_none());
+    }
+
+    #[test]
+    fn provider_model_display_resolution_matches_provider_and_model() {
+        let key = ProviderModelDisplayKey {
+            workspace_id: "ws".to_owned(),
+            provider: "openai".to_owned(),
+            model: "gpt-5".to_owned(),
+        };
+        let response = pioneer_protocol::ProviderListModelsResponse {
+            provider: "openai".to_owned(),
+            models: vec![model("gpt-5", Some("GPT 5"))],
+        };
+
+        assert_eq!(
+            resolve_provider_model_display_from_response(&key, &response),
+            ProviderModelDisplayResolution {
+                label: Some("GPT 5".to_owned()),
+            }
+        );
+
+        let response = pioneer_protocol::ProviderListModelsResponse {
+            provider: "anthropic".to_owned(),
+            models: vec![model("gpt-5", Some("GPT 5"))],
+        };
+        assert_eq!(
+            resolve_provider_model_display_from_response(&key, &response),
+            ProviderModelDisplayResolution { label: None }
+        );
+    }
+
+    #[test]
+    fn model_selector_selected_model_display_state_tracks_loading_label_and_missing() {
+        assert_eq!(
+            model_selector_selected_model_display_state(Some("gpt-5"), &[], true),
+            ProviderModelDisplayState::Loading
+        );
+        assert_eq!(
+            model_selector_selected_model_display_state(
+                Some("gpt-5"),
+                &[model("gpt-5", Some("GPT 5"))],
+                false,
+            ),
+            ProviderModelDisplayState::Label("GPT 5".to_owned())
+        );
+        assert_eq!(
+            model_selector_selected_model_display_state(
+                Some("missing"),
+                &[model("gpt-5", Some("GPT 5"))],
+                false,
+            ),
+            ProviderModelDisplayState::Missing
+        );
+        assert_eq!(
+            model_selector_selected_model_display_state(None, &[model("gpt-5", None)], false),
+            ProviderModelDisplayState::Missing
+        );
     }
 }

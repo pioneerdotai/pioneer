@@ -36,6 +36,34 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
         ),
         schema_doc!("client_event.json", crate::contracts::ClientEvent),
         schema_doc!(
+            "client_active_thread_clear_result.json",
+            crate::active_thread::ClientActiveThreadClearResult
+        ),
+        schema_doc!(
+            "client_active_thread_event_request.json",
+            crate::active_thread::ClientActiveThreadEventRequest
+        ),
+        schema_doc!(
+            "client_active_thread_open_request.json",
+            crate::active_thread::ClientActiveThreadOpenRequest
+        ),
+        schema_doc!(
+            "client_active_thread_send_text_request.json",
+            crate::active_thread::ClientActiveThreadSendTextRequest
+        ),
+        schema_doc!(
+            "client_active_thread_send_text_result.json",
+            crate::active_thread::ClientActiveThreadSendTextResult
+        ),
+        schema_doc!(
+            "client_active_thread_snapshot.json",
+            crate::active_thread::ClientActiveThreadSnapshot
+        ),
+        schema_doc!(
+            "client_active_thread_snapshot_request.json",
+            crate::active_thread::ClientActiveThreadSnapshotRequest
+        ),
+        schema_doc!(
             "client_gateway_connect_request.json",
             crate::contracts::ClientGatewayConnectRequest
         ),

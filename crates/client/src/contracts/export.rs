@@ -599,6 +599,41 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Stable
         ),
         contract_type!(
+            "provider_model_display_key.json",
+            crate::providers::presentation::ProviderModelDisplayKey,
+            Domain::Providers,
+            Kind::SelectorDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "provider_model_display_resolution.json",
+            crate::providers::presentation::ProviderModelDisplayResolution,
+            Domain::Providers,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "provider_list_models_params.json",
+            pioneer_protocol::ProviderListModelsParams,
+            Domain::Providers,
+            Kind::Command,
+            Stability::Stable
+        ),
+        contract_type!(
+            "provider_list_models_response.json",
+            pioneer_protocol::ProviderListModelsResponse,
+            Domain::Providers,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "provider_list_params.json",
+            pioneer_protocol::ProviderListParams,
+            Domain::Providers,
+            Kind::Command,
+            Stability::Stable
+        ),
+        contract_type!(
             "provider_list_refresh_plan.json",
             crate::providers::list::ProviderListRefreshPlan,
             Domain::Providers,
@@ -617,6 +652,27 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             crate::providers::list::ProviderListRefreshUnavailable,
             Domain::Providers,
             Kind::ActionPlan,
+            Stability::Stable
+        ),
+        contract_type!(
+            "provider_list_response.json",
+            pioneer_protocol::ProviderListResponse,
+            Domain::Providers,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "provider_model_info.json",
+            pioneer_protocol::ProviderModelInfo,
+            Domain::Providers,
+            Kind::SelectorDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "provider_summary.json",
+            pioneer_protocol::ProviderSummary,
+            Domain::Providers,
+            Kind::SelectorDto,
             Stability::Stable
         ),
         contract_type!(

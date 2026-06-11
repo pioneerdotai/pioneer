@@ -94,6 +94,8 @@ impl PioneerDesktop {
             composer_selected_provider: None,
             composer_selected_model: None,
             composer_model_selection_manually_selected: false,
+            composer_model_display_cache: HashMap::new(),
+            composer_model_display_loading_key: None,
             main_content_view: MainContentView::Threads,
             providers: Default::default(),
             mcp_servers: Vec::new(),

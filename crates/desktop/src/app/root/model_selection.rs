@@ -2,6 +2,10 @@ use super::*;
 use pioneer_client::composer::model_selection::{
     ComposerModelSelection, ComposerModelSelectionState,
 };
+use pioneer_client::providers::presentation::{
+    ProviderModelDisplayKey, ProviderModelDisplayState, provider_model_display_key,
+    provider_model_display_models_params, resolve_provider_model_display_from_response,
+};
 use pioneer_client::state::selectors as client_selectors;
 
 impl PioneerDesktop {
@@ -34,6 +38,33 @@ impl PioneerDesktop {
             .has_complete_selection()
     }
 
+    pub(in crate::app) fn composer_model_display_state(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> ProviderModelDisplayState {
+        let Some(key) = self.composer_model_display_key() else {
+            return if self.thread_list_loading || self.workspaces_loading {
+                ProviderModelDisplayState::Loading
+            } else {
+                ProviderModelDisplayState::Missing
+            };
+        };
+
+        if let Some(label) = self.composer_model_display_cache.get(&key) {
+            return label
+                .clone()
+                .map(ProviderModelDisplayState::Label)
+                .unwrap_or(ProviderModelDisplayState::Missing);
+        }
+
+        if self.composer_model_display_loading_key.as_ref() != Some(&key) {
+            self.composer_model_display_loading_key = Some(key.clone());
+            self.spawn_composer_model_display_resolve(key, cx);
+        }
+
+        ProviderModelDisplayState::Loading
+    }
+
     fn composer_model_selection_state(&self) -> ComposerModelSelectionState {
         ComposerModelSelectionState::new(
             self.composer_selected_provider.clone(),
@@ -47,6 +78,47 @@ impl PioneerDesktop {
         self.composer_selected_provider = provider;
         self.composer_selected_model = model;
         self.composer_model_selection_manually_selected = manually_selected;
+    }
+
+    fn composer_model_display_key(&self) -> Option<ProviderModelDisplayKey> {
+        let workspace_id = self.model_selector_workspace_id();
+        provider_model_display_key(
+            Some(workspace_id.as_str()),
+            self.composer_selected_provider.as_deref(),
+            self.composer_selected_model.as_deref(),
+        )
+    }
+
+    fn spawn_composer_model_display_resolve(
+        &self,
+        key: ProviderModelDisplayKey,
+        cx: &mut Context<Self>,
+    ) {
+        let ws_sender = self.gateway.ws_command_sender.clone();
+
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                let params = provider_model_display_models_params(&key);
+                let result = cx
+                    .background_spawn(async move { ws_sender.provider_list_models(params) })
+                    .await;
+                let _ = this.update(&mut cx, |view, cx| {
+                    if view.composer_model_display_loading_key.as_ref() != Some(&key) {
+                        return;
+                    }
+
+                    let label = result.ok().and_then(|response| {
+                        resolve_provider_model_display_from_response(&key, &response).label
+                    });
+
+                    view.composer_model_display_cache.insert(key.clone(), label);
+                    view.composer_model_display_loading_key = None;
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
     }
 
     fn resolve_composer_model_selection(&self) -> Option<ComposerModelSelection> {
