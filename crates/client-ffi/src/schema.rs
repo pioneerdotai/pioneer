@@ -64,6 +64,66 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             crate::active_thread::ClientActiveThreadSnapshotRequest
         ),
         schema_doc!(
+            "client_composer_attachment_from_path_request.json",
+            crate::composer::ClientComposerAttachmentFromPathRequest
+        ),
+        schema_doc!(
+            "client_composer_attachments_update_request.json",
+            crate::composer::ClientComposerAttachmentsUpdateRequest
+        ),
+        schema_doc!(
+            "client_composer_capabilities_update_request.json",
+            crate::composer::ClientComposerCapabilitiesUpdateRequest
+        ),
+        schema_doc!(
+            "client_composer_filter_mcp_rows_request.json",
+            crate::composer::ClientComposerFilterMcpRowsRequest
+        ),
+        schema_doc!(
+            "client_composer_filter_mcp_rows_result.json",
+            crate::composer::ClientComposerFilterMcpRowsResult
+        ),
+        schema_doc!(
+            "client_composer_filter_skill_rows_request.json",
+            crate::composer::ClientComposerFilterSkillRowsRequest
+        ),
+        schema_doc!(
+            "client_composer_mcp_capability_from_row_request.json",
+            crate::composer::ClientComposerMcpCapabilityFromRowRequest
+        ),
+        schema_doc!(
+            "client_composer_mcp_picker_rows_request.json",
+            crate::composer::ClientComposerMcpPickerRowsRequest
+        ),
+        schema_doc!(
+            "client_composer_mcp_picker_rows_result.json",
+            crate::composer::ClientComposerMcpPickerRowsResult
+        ),
+        schema_doc!(
+            "client_composer_mcp_toggle_request.json",
+            crate::composer::ClientComposerMcpToggleRequest
+        ),
+        schema_doc!(
+            "client_composer_mcp_toggle_result.json",
+            crate::composer::ClientComposerMcpToggleResult
+        ),
+        schema_doc!(
+            "client_composer_skill_capability_from_row_request.json",
+            crate::composer::ClientComposerSkillCapabilityFromRowRequest
+        ),
+        schema_doc!(
+            "client_composer_skill_picker_rows_request.json",
+            crate::composer::ClientComposerSkillPickerRowsRequest
+        ),
+        schema_doc!(
+            "client_composer_skill_toggle_request.json",
+            crate::composer::ClientComposerSkillToggleRequest
+        ),
+        schema_doc!(
+            "client_composer_skill_toggle_result.json",
+            crate::composer::ClientComposerSkillToggleResult
+        ),
+        schema_doc!(
             "client_gateway_connect_request.json",
             crate::contracts::ClientGatewayConnectRequest
         ),

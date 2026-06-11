@@ -524,7 +524,9 @@ pub fn filter_selectable_mcp_capability_rows(
 ) -> Vec<SelectableMcpCapability> {
     let query = normalize_capability_query(query);
     rows.iter()
-        .filter(|row| selectable_mcp_capability_matches_query(row, query.as_str()))
+        .filter(|row| {
+            row.selectable && selectable_mcp_capability_matches_query(row, query.as_str())
+        })
         .cloned()
         .collect()
 }
@@ -739,7 +741,9 @@ pub fn filter_mcp_tool_capability_rows(
                 unavailable_reason,
             }
         })
-        .filter(|row| selectable_mcp_capability_matches_query(row, query.as_str()))
+        .filter(|row| {
+            row.selectable && selectable_mcp_capability_matches_query(row, query.as_str())
+        })
         .collect::<Vec<_>>();
     sort_selectable_mcp_capability_rows(&mut rows);
     rows
@@ -1240,6 +1244,19 @@ mod tests {
     }
 
     #[test]
+    fn mcp_server_rows_hide_unavailable_servers() {
+        let mut unavailable = mcp_server("unavailable");
+        unavailable.runtime.live = false;
+        let available = mcp_server("available");
+
+        let rows = filter_mcp_server_capability_rows(&[unavailable, available], "");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].server_name, "available");
+        assert!(rows[0].selectable);
+    }
+
+    #[test]
     fn mcp_server_picker_response_reduction_returns_rows_and_prefetch_ids() {
         let browser = mcp_server("browser");
 
@@ -1292,6 +1309,16 @@ mod tests {
 
         let capability = mcp_row_to_composer_capability(rows[0].clone());
         assert_eq!(capability.id, "mcp-tool:workspace:browser:open");
+    }
+
+    #[test]
+    fn mcp_tool_rows_hide_unavailable_tools() {
+        let mut details = mcp_details("browser", vec![mcp_tool("open", "Open page")]);
+        details.server.runtime.live = false;
+
+        let rows = filter_mcp_tool_capability_rows(&details, "");
+
+        assert!(rows.is_empty());
     }
 
     #[test]

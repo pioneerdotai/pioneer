@@ -4,6 +4,7 @@
 //! Client domain logic remains in `pioneer-client`.
 
 mod active_thread;
+mod composer;
 mod contracts;
 mod gateway;
 #[cfg(feature = "schema")]
@@ -15,6 +16,20 @@ use active_thread::{
     ClientActiveThreadClearResult, ClientActiveThreadEventRequest, ClientActiveThreadOpenRequest,
     ClientActiveThreadSendTextRequest, ClientActiveThreadSendTextResult,
     ClientActiveThreadSnapshot, ClientActiveThreadSnapshotRequest, ClientFfiActiveThreadState,
+};
+use composer::{
+    ClientComposerAttachmentFromPathRequest, ClientComposerAttachmentsUpdateRequest,
+    ClientComposerCapabilitiesUpdateRequest, ClientComposerFilterMcpRowsRequest,
+    ClientComposerFilterMcpRowsResult, ClientComposerFilterSkillRowsRequest,
+    ClientComposerMcpCapabilityFromRowRequest, ClientComposerMcpPickerRowsRequest,
+    ClientComposerMcpPickerRowsResult, ClientComposerMcpToggleRequest,
+    ClientComposerMcpToggleResult, ClientComposerSkillCapabilityFromRowRequest,
+    ClientComposerSkillPickerRowsRequest, ClientComposerSkillToggleRequest,
+    ClientComposerSkillToggleResult, composer_attachment_from_path_request,
+    composer_mcp_picker_rows, composer_skill_picker_rows, filter_mcp_picker_rows,
+    filter_skill_picker_rows, mcp_capability_from_row, skill_capability_from_row,
+    toggle_mcp_picker_selection, toggle_skill_picker_selection, update_composer_attachments,
+    update_composer_capabilities,
 };
 use contracts::{
     ClientEvent, ClientGatewayConnectRequest, ClientGatewayConnectResult,
@@ -360,6 +375,122 @@ impl ClientFfiRuntime {
         ))
     }
 
+    fn composer_attachment_from_path(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_client::composer::attachments::ComposerAttachment, String> {
+        let request = serde_json::from_str::<ClientComposerAttachmentFromPathRequest>(input_json)
+            .map_err(|error| format!("invalid composer attachment request: {error}"))?;
+
+        composer_attachment_from_path_request(request).map_err(|error| format!("{error:#}"))
+    }
+
+    fn composer_attachments_update(
+        &self,
+        input_json: &str,
+    ) -> Result<Vec<pioneer_client::composer::attachments::ComposerAttachment>, String> {
+        let request = serde_json::from_str::<ClientComposerAttachmentsUpdateRequest>(input_json)
+            .map_err(|error| format!("invalid composer attachments update request: {error}"))?;
+
+        Ok(update_composer_attachments(request))
+    }
+
+    fn composer_skill_picker_rows(
+        &self,
+        input_json: &str,
+    ) -> Result<Vec<pioneer_client::composer::capabilities::SelectableSkillCapability>, String>
+    {
+        let request = serde_json::from_str::<ClientComposerSkillPickerRowsRequest>(input_json)
+            .map_err(|error| format!("invalid composer skill picker request: {error}"))?;
+
+        composer_skill_picker_rows(&self.client_runtime.ws_command_sender(), request)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn composer_mcp_picker_rows(
+        &self,
+        input_json: &str,
+    ) -> Result<ClientComposerMcpPickerRowsResult, String> {
+        let request = serde_json::from_str::<ClientComposerMcpPickerRowsRequest>(input_json)
+            .map_err(|error| format!("invalid composer mcp picker request: {error}"))?;
+
+        composer_mcp_picker_rows(&self.client_runtime.ws_command_sender(), request)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn composer_capabilities_update(
+        &self,
+        input_json: &str,
+    ) -> Result<Vec<pioneer_client::composer::capabilities::ComposerCapability>, String> {
+        let parse_error = |error| format!("invalid composer capabilities update request: {error}");
+        let request = serde_json::from_str::<ClientComposerCapabilitiesUpdateRequest>(input_json)
+            .map_err(parse_error)?;
+
+        Ok(update_composer_capabilities(request))
+    }
+
+    fn composer_skill_capability_from_row(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_client::composer::capabilities::ComposerCapability, String> {
+        let request =
+            serde_json::from_str::<ClientComposerSkillCapabilityFromRowRequest>(input_json)
+                .map_err(|error| format!("invalid composer skill capability request: {error}"))?;
+
+        Ok(skill_capability_from_row(request))
+    }
+
+    fn composer_mcp_capability_from_row(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_client::composer::capabilities::ComposerCapability, String> {
+        let request = serde_json::from_str::<ClientComposerMcpCapabilityFromRowRequest>(input_json)
+            .map_err(|error| format!("invalid composer mcp capability request: {error}"))?;
+
+        Ok(mcp_capability_from_row(request))
+    }
+
+    fn composer_skill_toggle(
+        &self,
+        input_json: &str,
+    ) -> Result<ClientComposerSkillToggleResult, String> {
+        let request = serde_json::from_str::<ClientComposerSkillToggleRequest>(input_json)
+            .map_err(|error| format!("invalid composer skill toggle request: {error}"))?;
+
+        Ok(toggle_skill_picker_selection(request))
+    }
+
+    fn composer_mcp_toggle(
+        &self,
+        input_json: &str,
+    ) -> Result<ClientComposerMcpToggleResult, String> {
+        let request = serde_json::from_str::<ClientComposerMcpToggleRequest>(input_json)
+            .map_err(|error| format!("invalid composer mcp toggle request: {error}"))?;
+
+        Ok(toggle_mcp_picker_selection(request))
+    }
+
+    fn composer_filter_skill_rows(
+        &self,
+        input_json: &str,
+    ) -> Result<Vec<pioneer_client::composer::capabilities::SelectableSkillCapability>, String>
+    {
+        let request = serde_json::from_str::<ClientComposerFilterSkillRowsRequest>(input_json)
+            .map_err(|error| format!("invalid composer skill row filter request: {error}"))?;
+
+        Ok(filter_skill_picker_rows(request))
+    }
+
+    fn composer_filter_mcp_rows(
+        &self,
+        input_json: &str,
+    ) -> Result<ClientComposerFilterMcpRowsResult, String> {
+        let request = serde_json::from_str::<ClientComposerFilterMcpRowsRequest>(input_json)
+            .map_err(|error| format!("invalid composer mcp row filter request: {error}"))?;
+
+        Ok(filter_mcp_picker_rows(request))
+    }
+
     fn thread_tree_refresh(&self, input_json: &str) -> Result<ClientThreadTreeQueryData, String> {
         let request = serde_json::from_str::<ThreadTreeRefreshRequest>(input_json)
             .map_err(|error| format!("invalid thread tree refresh request: {error}"))?;
@@ -551,6 +682,47 @@ ffi_client_json_method!(
 ffi_client_json_method!(
     pioneer_client_ffi_provider_model_display,
     provider_model_display
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_composer_attachment_from_path,
+    composer_attachment_from_path
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_composer_attachments_update,
+    composer_attachments_update
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_composer_skill_picker_rows,
+    composer_skill_picker_rows
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_composer_mcp_picker_rows,
+    composer_mcp_picker_rows
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_composer_capabilities_update,
+    composer_capabilities_update
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_composer_skill_capability_from_row,
+    composer_skill_capability_from_row
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_composer_mcp_capability_from_row,
+    composer_mcp_capability_from_row
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_composer_skill_toggle,
+    composer_skill_toggle
+);
+ffi_client_json_method!(pioneer_client_ffi_composer_mcp_toggle, composer_mcp_toggle);
+ffi_client_json_method!(
+    pioneer_client_ffi_composer_filter_skill_rows,
+    composer_filter_skill_rows
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_composer_filter_mcp_rows,
+    composer_filter_mcp_rows
 );
 ffi_client_json_method!(pioneer_client_ffi_thread_tree_refresh, thread_tree_refresh);
 ffi_client_json_method!(pioneer_client_ffi_thread_tree_level, thread_tree_level);

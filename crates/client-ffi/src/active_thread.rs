@@ -1,11 +1,15 @@
 use crate::contracts::ClientEvent;
 use crate::threads::ClientThreadTreeSnapshot;
 use pioneer_client::{
+    ClientError, ClientResult,
     composer::{
+        attachments::ComposerAttachment,
+        capabilities::ComposerCapability,
         model_selection as composer_model_selection,
         turn_prepare::{
-            ComposerSubmitAvailabilityInput, PreparedComposerTurnSubmitContext,
-            build_prepared_composer_turn, can_submit_composer_message,
+            ComposerSubmitAvailabilityInput, PrepareComposerTurnRequest,
+            PreparedComposerTurnSubmitContext, can_submit_composer_message,
+            composer_has_sendable_content, prepare_composer_turn,
             reduce_prepared_composer_turn_submit_success,
         },
     },
@@ -37,6 +41,7 @@ use pioneer_protocol::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
+    fs,
     sync::Mutex,
 };
 
@@ -81,6 +86,10 @@ pub struct ClientActiveThreadSendTextRequest {
     pub selected_provider: Option<String>,
     #[serde(default)]
     pub selected_mode: Option<ThreadMode>,
+    #[serde(default)]
+    pub attachments: Vec<ComposerAttachment>,
+    #[serde(default)]
+    pub capabilities: Vec<ComposerCapability>,
     #[serde(default)]
     pub expanded_keys: Vec<String>,
 }
@@ -263,13 +272,18 @@ impl ClientFfiActiveThreadState {
             selected_model,
             selected_provider,
             selected_mode,
+            attachments,
+            capabilities,
             expanded_keys,
         } = request;
 
-        let prepared = build_prepared_composer_turn(text, Vec::new(), Vec::new());
-        if prepared.input.is_empty() {
+        if !composer_has_sendable_content(
+            text.as_str(),
+            !attachments.is_empty(),
+            !capabilities.is_empty(),
+        ) {
             return Err(anyhow::anyhow!(
-                "message text is required before starting turn"
+                "message content is required before starting turn"
             ));
         }
 
@@ -281,6 +295,29 @@ impl ClientFfiActiveThreadState {
         let ids = plan_turn_start_ids();
         let turn_id = ids.turn_id;
         let pending_request_id = ids.pending_request_id;
+        let (workspace_id, endpoint_kind) = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
+            let coordinator = inner.coordinators.get(thread_id.as_str()).ok_or_else(|| {
+                anyhow::anyhow!("active thread must be opened before starting turn")
+            })?;
+            (coordinator.workspace_id.clone(), None)
+        };
+        let prepared = prepare_composer_turn(
+            &runtime.ws_command_sender(),
+            &ClientFfiFileSystem,
+            PrepareComposerTurnRequest {
+                workspace_id,
+                thread_id: thread_id.clone(),
+                turn_id: turn_id.clone(),
+                endpoint_kind,
+                text,
+                attachments,
+                capabilities,
+            },
+        )?;
         let selection = {
             let inner = self
                 .inner
@@ -293,6 +330,8 @@ impl ClientFfiActiveThreadState {
                 selected_model,
                 selected_mode,
                 prepared.user_text.as_str(),
+                !prepared.attachments.is_empty(),
+                !prepared.capabilities.is_empty(),
             )?
         };
         let submit_reduction = reduce_prepared_composer_turn_submit_success(
@@ -784,6 +823,8 @@ fn resolve_turn_selection(
     requested_model: Option<String>,
     requested_mode: Option<ThreadMode>,
     text: &str,
+    has_attachments: bool,
+    has_capabilities: bool,
 ) -> anyhow::Result<ClientActiveThreadTurnSelection> {
     let requested_provider = non_empty_string(requested_provider);
     let requested_model = non_empty_string(requested_model);
@@ -823,8 +864,8 @@ fn resolve_turn_selection(
         has_complete_model_selection: true,
         conversation_can_submit: coordinator.conversation.can_submit_message(),
         text,
-        has_attachments: false,
-        has_capabilities: false,
+        has_attachments,
+        has_capabilities,
     }) {
         return Err(anyhow::anyhow!(
             "active thread is not ready to start a new turn"
@@ -836,6 +877,61 @@ fn resolve_turn_selection(
         selected_provider: resolved_selection.provider,
         selected_mode,
     })
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ClientFfiFileSystem;
+
+impl pioneer_client::platform::ClientFileSystem for ClientFfiFileSystem {
+    fn read_file(&self, path: &pioneer_client::platform::ClientPath) -> ClientResult<Vec<u8>> {
+        fs::read(path.as_path()).map_err(|error| {
+            ClientError::platform(format!(
+                "failed to read `{}`: {error}",
+                path.as_path().display()
+            ))
+        })
+    }
+
+    fn metadata(
+        &self,
+        path: &pioneer_client::platform::ClientPath,
+    ) -> ClientResult<pioneer_client::platform::ClientFileMetadata> {
+        let metadata = fs::metadata(path.as_path()).map_err(|error| {
+            ClientError::platform(format!(
+                "failed to stat `{}`: {error}",
+                path.as_path().display()
+            ))
+        })?;
+        Ok(pioneer_client::platform::ClientFileMetadata {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            is_file: metadata.is_file(),
+            is_dir: metadata.is_dir(),
+        })
+    }
+
+    fn write_cache_file(
+        &self,
+        _key: &str,
+        _bytes: &[u8],
+    ) -> ClientResult<pioneer_client::platform::ClientPath> {
+        Err(ClientError::platform(
+            "cache writes are not supported by composer upload filesystem adapter",
+        ))
+    }
+
+    fn open_read(
+        &self,
+        path: &pioneer_client::platform::ClientPath,
+    ) -> ClientResult<Box<dyn pioneer_client::platform::ClientFileReader>> {
+        let file = fs::File::open(path.as_path()).map_err(|error| {
+            ClientError::platform(format!(
+                "failed to open `{}`: {error}",
+                path.as_path().display()
+            ))
+        })?;
+        Ok(Box::new(file))
+    }
 }
 
 fn load_task_turn_timelines(
