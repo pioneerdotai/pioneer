@@ -136,6 +136,46 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             crate::contracts::ClientGatewayWsTimings
         ),
         schema_doc!(
+            "thread_agents_doc_archive_params.json",
+            pioneer_protocol::ThreadAgentsDocArchiveParams
+        ),
+        schema_doc!(
+            "thread_agents_doc_archive_response.json",
+            pioneer_protocol::ThreadAgentsDocArchiveResponse
+        ),
+        schema_doc!(
+            "thread_agents_doc_get_params.json",
+            pioneer_protocol::ThreadAgentsDocGetParams
+        ),
+        schema_doc!(
+            "thread_agents_doc_get_response.json",
+            pioneer_protocol::ThreadAgentsDocGetResponse
+        ),
+        schema_doc!(
+            "thread_agents_doc_payload.json",
+            pioneer_protocol::ThreadAgentsDocPayload
+        ),
+        schema_doc!(
+            "thread_agents_doc_resolved_payload.json",
+            pioneer_protocol::ThreadAgentsDocResolvedPayload
+        ),
+        schema_doc!(
+            "thread_agents_doc_save_params.json",
+            pioneer_protocol::ThreadAgentsDocSaveParams
+        ),
+        schema_doc!(
+            "thread_agents_doc_save_reason.json",
+            pioneer_protocol::ThreadAgentsDocSaveReason
+        ),
+        schema_doc!(
+            "thread_agents_doc_save_response.json",
+            pioneer_protocol::ThreadAgentsDocSaveResponse
+        ),
+        schema_doc!(
+            "thread_agents_doc_status.json",
+            pioneer_protocol::ThreadAgentsDocStatus
+        ),
+        schema_doc!(
             "plan_activate_gateway_request.json",
             crate::gateway::PlanActivateGatewayRequest
         ),

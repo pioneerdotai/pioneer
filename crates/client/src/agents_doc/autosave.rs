@@ -1,7 +1,7 @@
 //! Agents.md autosave state machine.
 
 use crate::agents_doc::content::agents_doc_content_hash;
-use pioneer_protocol::ThreadAgentsDocPayload;
+use pioneer_protocol::{ThreadAgentsDocPayload, ThreadAgentsDocResolvedPayload};
 use std::time::Duration;
 
 pub const AGENTS_DOC_AUTOSAVE_DELAY: Duration = Duration::from_millis(700);
@@ -61,8 +61,18 @@ impl AgentsDocAutosaveState {
     }
 
     pub fn reset_from_explicit(&mut self, explicit_doc: Option<&ThreadAgentsDocPayload>) {
+        self.reset_from_loaded(explicit_doc, None);
+    }
+
+    pub fn reset_from_loaded(
+        &mut self,
+        explicit_doc: Option<&ThreadAgentsDocPayload>,
+        effective_doc: Option<&ThreadAgentsDocResolvedPayload>,
+    ) {
         self.save_state = AgentsDocEditorSaveState::Clean;
-        self.last_saved_hash = explicit_doc.map(|doc| doc.content_sha256.clone());
+        self.last_saved_hash = explicit_doc
+            .map(|doc| doc.content_sha256.clone())
+            .or_else(|| effective_doc.map(|payload| payload.doc.content_sha256.clone()));
         self.last_saved_version = explicit_doc.map(|doc| doc.version);
         self.pending_hash = None;
         self.generation = self.generation.saturating_add(1);
@@ -207,7 +217,9 @@ impl Default for AgentsDocAutosaveState {
 mod tests {
     use super::*;
     use crate::agents_doc::content::agents_doc_content_hash;
-    use pioneer_protocol::{ThreadAgentsDocPayload, ThreadAgentsDocStatus};
+    use pioneer_protocol::{
+        ThreadAgentsDocPayload, ThreadAgentsDocResolvedPayload, ThreadAgentsDocStatus,
+    };
 
     fn payload(status: ThreadAgentsDocStatus, content: &str) -> ThreadAgentsDocPayload {
         ThreadAgentsDocPayload {
@@ -221,6 +233,17 @@ mod tests {
             version: 1,
             created_at: 1_700_000_000,
             updated_at: 1_700_000_000,
+        }
+    }
+
+    fn effective(content: &str) -> ThreadAgentsDocResolvedPayload {
+        ThreadAgentsDocResolvedPayload {
+            doc: payload(ThreadAgentsDocStatus::Active, content),
+            source_folder_id: None,
+            source_path: Vec::new(),
+            inherited: true,
+            resolved_for_folder_id: Some("fld_1".to_owned()),
+            resolved_at: 1_700_000_000,
         }
     }
 
@@ -252,6 +275,23 @@ mod tests {
         assert_eq!(decision, AgentsDocAutosaveDecision::Noop);
         assert_eq!(state.save_state, AgentsDocEditorSaveState::Clean);
         assert_eq!(state.pending_hash, None);
+    }
+
+    #[test]
+    fn inherited_effective_content_is_clean_baseline_without_version() {
+        let mut state = AgentsDocAutosaveState::new();
+        let effective_doc = effective("inherited");
+        state.reset_from_loaded(None, Some(&effective_doc));
+
+        let decision = state.mark_changed("inherited");
+
+        assert_eq!(decision, AgentsDocAutosaveDecision::Noop);
+        assert_eq!(
+            state.last_saved_hash,
+            Some(agents_doc_content_hash("inherited"))
+        );
+        assert_eq!(state.last_saved_version, None);
+        assert_eq!(state.save_state, AgentsDocEditorSaveState::Clean);
     }
 
     #[test]

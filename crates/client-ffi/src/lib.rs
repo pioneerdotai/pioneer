@@ -45,6 +45,10 @@ use gateway::{
     validate_remote_gateway_request,
 };
 use pioneer_client::{
+    agents_doc::content::{
+        AgentsDocSaveErrorKind, agents_doc_get_params, agents_doc_save_error_kind,
+        agents_doc_save_params,
+    },
     gateway::{
         runtime::{self as client_gateway_runtime, GatewayProfileError},
         secrets::GatewayAuthTokenRef,
@@ -65,6 +69,8 @@ use pioneer_client::{
 };
 use pioneer_protocol::{
     ProviderListModelsParams, ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
+    ThreadAgentsDocArchiveParams, ThreadAgentsDocArchiveResponse, ThreadAgentsDocGetParams,
+    ThreadAgentsDocGetResponse, ThreadAgentsDocSaveParams, ThreadAgentsDocSaveResponse,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -519,6 +525,54 @@ impl ClientFfiRuntime {
         Ok(client_thread_tree_level(request))
     }
 
+    fn agents_doc_get(&self, input_json: &str) -> Result<ThreadAgentsDocGetResponse, String> {
+        let request = serde_json::from_str::<ThreadAgentsDocGetParams>(input_json)
+            .map_err(|error| format!("invalid agents doc get request: {error}"))?;
+        let params =
+            agents_doc_get_params(request.workspace_id.as_str(), request.folder_id.as_deref());
+
+        self.client_runtime
+            .ws_command_sender()
+            .thread_agents_doc_get(params)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn agents_doc_save(&self, input_json: &str) -> Result<ThreadAgentsDocSaveResponse, String> {
+        let request = serde_json::from_str::<ThreadAgentsDocSaveParams>(input_json)
+            .map_err(|error| format!("invalid agents doc save request: {error}"))?;
+        let params = agents_doc_save_params(
+            request.workspace_id.as_str(),
+            request.folder_id.as_deref(),
+            request.content.as_str(),
+            request.expected_version,
+            request.save_reason,
+        );
+
+        self.client_runtime
+            .ws_command_sender()
+            .thread_agents_doc_save(params)
+            .map_err(|error| {
+                let message = format!("{error:#}");
+                match agents_doc_save_error_kind(message.as_str()) {
+                    AgentsDocSaveErrorKind::VersionConflict => "version conflict".to_owned(),
+                    AgentsDocSaveErrorKind::Other => message,
+                }
+            })
+    }
+
+    fn agents_doc_archive(
+        &self,
+        input_json: &str,
+    ) -> Result<ThreadAgentsDocArchiveResponse, String> {
+        let request = serde_json::from_str::<ThreadAgentsDocArchiveParams>(input_json)
+            .map_err(|error| format!("invalid agents doc archive request: {error}"))?;
+
+        self.client_runtime
+            .ws_command_sender()
+            .thread_agents_doc_archive(request)
+            .map_err(|error| format!("{error:#}"))
+    }
+
     fn active_thread_open(&self, input_json: &str) -> Result<ClientActiveThreadSnapshot, String> {
         let request = serde_json::from_str::<ClientActiveThreadOpenRequest>(input_json)
             .map_err(|error| format!("invalid active thread open request: {error}"))?;
@@ -726,6 +780,9 @@ ffi_client_json_method!(
 );
 ffi_client_json_method!(pioneer_client_ffi_thread_tree_refresh, thread_tree_refresh);
 ffi_client_json_method!(pioneer_client_ffi_thread_tree_level, thread_tree_level);
+ffi_client_json_method!(pioneer_client_ffi_agents_doc_get, agents_doc_get);
+ffi_client_json_method!(pioneer_client_ffi_agents_doc_save, agents_doc_save);
+ffi_client_json_method!(pioneer_client_ffi_agents_doc_archive, agents_doc_archive);
 ffi_client_json_method!(pioneer_client_ffi_active_thread_open, active_thread_open);
 ffi_client_json_method!(
     pioneer_client_ffi_active_thread_snapshot,

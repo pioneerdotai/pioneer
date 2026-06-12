@@ -27,14 +27,18 @@ pub struct AgentsDocConflictRefreshProjection {
     pub remote_doc: Option<ThreadAgentsDocPayload>,
 }
 
-pub fn agents_doc_initial_buffer(explicit_doc: Option<&ThreadAgentsDocPayload>) -> String {
+pub fn agents_doc_initial_buffer(
+    explicit_doc: Option<&ThreadAgentsDocPayload>,
+    effective_doc: Option<&ThreadAgentsDocResolvedPayload>,
+) -> String {
     explicit_doc
         .map(|doc| doc.content.clone())
+        .or_else(|| effective_doc.map(|payload| payload.doc.content.clone()))
         .unwrap_or_default()
 }
 
 pub fn agents_doc_load_projection(response: ThreadAgentsDocGetResponse) -> AgentsDocLoadProjection {
-    let buffer = agents_doc_initial_buffer(response.explicit.as_ref());
+    let buffer = agents_doc_initial_buffer(response.explicit.as_ref(), response.effective.as_ref());
     AgentsDocLoadProjection {
         explicit_doc: response.explicit,
         effective_doc: response.effective,
@@ -148,12 +152,26 @@ mod tests {
     }
 
     #[test]
-    fn initial_buffer_uses_explicit_content_or_empty_default() {
+    fn initial_buffer_prefers_explicit_then_effective_content() {
         assert_eq!(
-            agents_doc_initial_buffer(Some(&payload("Use cargo."))),
+            agents_doc_initial_buffer(Some(&payload("Use cargo.")), None),
             "Use cargo."
         );
-        assert_eq!(agents_doc_initial_buffer(None), String::new());
+        assert_eq!(
+            agents_doc_initial_buffer(
+                None,
+                Some(&ThreadAgentsDocResolvedPayload {
+                    doc: payload("Inherited instructions."),
+                    source_folder_id: None,
+                    source_path: Vec::new(),
+                    inherited: true,
+                    resolved_for_folder_id: None,
+                    resolved_at: 1_700_000_000,
+                })
+            ),
+            "Inherited instructions."
+        );
+        assert_eq!(agents_doc_initial_buffer(None, None), String::new());
     }
 
     #[test]
@@ -162,6 +180,15 @@ mod tests {
 
         assert_eq!(projection.buffer, "local");
         assert!(projection.explicit_doc.is_some());
+        assert!(projection.effective_doc.is_some());
+    }
+
+    #[test]
+    fn load_projection_uses_effective_content_without_explicit_doc() {
+        let projection = agents_doc_load_projection(get_response(None));
+
+        assert_eq!(projection.buffer, "effective");
+        assert!(projection.explicit_doc.is_none());
         assert!(projection.effective_doc.is_some());
     }
 

@@ -116,7 +116,7 @@ impl AgentsDocEditor {
         self.effective_doc = projection.effective_doc;
         self.load_state = AgentsDocEditorLoadState::Loaded;
         self.autosave
-            .reset_from_explicit(self.explicit_doc.as_ref());
+            .reset_from_loaded(self.explicit_doc.as_ref(), self.effective_doc.as_ref());
         self.set_input_value_suppressed(input, projection.buffer, window, cx);
     }
 
