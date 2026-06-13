@@ -177,6 +177,36 @@ pub async fn claim_due_jobs<C: ConnectionTrait>(
     Ok(claimed)
 }
 
+pub async fn list_due_pending_jobs_by_action<C: ConnectionTrait>(
+    db: &C,
+    action: RecoveryAction,
+    now: DateTimeWithTimeZone,
+    limit: u64,
+) -> Result<Vec<recovery_job::Model>> {
+    let pending = recovery_job_status_to_db(RecoveryJobStatus::Pending);
+    let action_db = recovery_action_to_db(action);
+
+    recovery_job::Entity::find()
+        .filter(recovery_job::Column::Status.eq(pending))
+        .filter(recovery_job::Column::Action.eq(action_db))
+        .filter(recovery_job::Column::NextRunAt.lte(now))
+        .filter(
+            Condition::any()
+                .add(recovery_job::Column::ClaimExpiresAt.is_null())
+                .add(recovery_job::Column::ClaimExpiresAt.lte(now)),
+        )
+        .order_by_asc(recovery_job::Column::NextRunAt)
+        .limit(limit)
+        .all(db)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to load due pending recovery jobs for action `{}`",
+                recovery_action_to_db(action)
+            )
+        })
+}
+
 pub async fn mark_job_retrying<C: ConnectionTrait>(
     db: &C,
     job_id: &str,
@@ -445,6 +475,98 @@ pub async fn release_claimed_job<C: ConnectionTrait>(
         .exec(db)
         .await
         .with_context(|| format!("failed to release claimed recovery job `{job_id}`"))?
+        .rows_affected
+        > 0;
+
+    Ok(affected)
+}
+
+pub async fn mark_due_pending_job_terminal_if_turn_idle<C: ConnectionTrait>(
+    db: &C,
+    job_id: &str,
+    action: RecoveryAction,
+    status: RecoveryJobStatus,
+    last_error: Option<String>,
+    now: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let pending = recovery_job_status_to_db(RecoveryJobStatus::Pending);
+    let active = recovery_job_status_to_db(RecoveryJobStatus::Active);
+    let action_db = recovery_action_to_db(action);
+    let status_db = recovery_job_status_to_db(status).to_owned();
+
+    let claim_is_available = || {
+        Condition::any()
+            .add(recovery_job::Column::ClaimExpiresAt.is_null())
+            .add(recovery_job::Column::ClaimExpiresAt.lte(now))
+    };
+
+    let Some(job) = recovery_job::Entity::find()
+        .filter(recovery_job::Column::Id.eq(job_id.to_owned()))
+        .filter(recovery_job::Column::Status.eq(pending))
+        .filter(recovery_job::Column::Action.eq(action_db))
+        .filter(recovery_job::Column::NextRunAt.lte(now))
+        .filter(claim_is_available())
+        .one(db)
+        .await
+        .with_context(|| format!("failed to load due pending recovery job `{job_id}`"))?
+    else {
+        return Ok(false);
+    };
+
+    let active_for_turn = recovery_job::Entity::find()
+        .filter(recovery_job::Column::TurnId.eq(job.turn_id))
+        .filter(recovery_job::Column::Status.eq(active))
+        .filter(recovery_job::Column::Id.ne(job_id.to_owned()))
+        .one(db)
+        .await
+        .with_context(|| {
+            format!("failed to check active recovery jobs before terminalizing `{job_id}`")
+        })?;
+    if active_for_turn.is_some() {
+        return Ok(false);
+    }
+
+    let affected = recovery_job::Entity::update_many()
+        .col_expr(
+            recovery_job::Column::Status,
+            sea_orm::sea_query::Expr::value(status_db),
+        )
+        .col_expr(
+            recovery_job::Column::LastError,
+            sea_orm::sea_query::Expr::value(last_error),
+        )
+        .col_expr(
+            recovery_job::Column::ClaimToken,
+            sea_orm::sea_query::Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            recovery_job::Column::ClaimedAt,
+            sea_orm::sea_query::Expr::value(Option::<DateTimeWithTimeZone>::None),
+        )
+        .col_expr(
+            recovery_job::Column::ClaimExpiresAt,
+            sea_orm::sea_query::Expr::value(Option::<DateTimeWithTimeZone>::None),
+        )
+        .col_expr(
+            recovery_job::Column::ActiveAttemptId,
+            sea_orm::sea_query::Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            recovery_job::Column::ActiveAttemptStartedAt,
+            sea_orm::sea_query::Expr::value(Option::<DateTimeWithTimeZone>::None),
+        )
+        .col_expr(
+            recovery_job::Column::UpdatedAt,
+            sea_orm::sea_query::Expr::value(now),
+        )
+        .filter(recovery_job::Column::Id.eq(job_id.to_owned()))
+        .filter(recovery_job::Column::Status.eq(pending))
+        .filter(recovery_job::Column::Action.eq(action_db))
+        .filter(recovery_job::Column::NextRunAt.lte(now))
+        .filter(claim_is_available())
+        .exec(db)
+        .await
+        .with_context(|| format!("failed to mark due pending recovery job `{job_id}` terminal"))?
         .rows_affected
         > 0;
 

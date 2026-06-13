@@ -2042,46 +2042,68 @@ impl MessageProcessor {
                 let is_created = outcome.is_created();
                 let next_attempt_number = outcome.next_attempt_number();
                 let job = outcome.into_job();
-                let Some((_, workspace_id)) = self
+                let should_terminalize = job.action == pioneer_protocol::RecoveryAction::MarkFailed;
+                if let Some((_, workspace_id)) = self
                     .crud_store
                     .get_turn_location(turn_id.as_str())
                     .await
                     .ok()
                     .flatten()
-                else {
-                    return;
-                };
-                if is_created {
-                    let opened = pioneer_protocol::ItemRecoveryOpenedNotification {
-                        workspace_id,
-                        thread_id: thread_id.clone(),
-                        turn_id,
-                        item_id,
-                        item_type,
-                        recovery_job_id: job.id,
-                        trigger: job.trigger,
-                        action: job.action,
-                        attempt_number: next_attempt_number,
-                    };
-                    self.persist_and_send_item_recovery_opened(opened, now_unix)
-                        .await;
-                } else {
-                    let attached = pioneer_protocol::ItemRecoveryAttachedNotification {
-                        workspace_id,
-                        thread_id: thread_id.clone(),
-                        turn_id,
-                        item_id,
-                        item_type,
-                        recovery_job_id: job.id,
-                        recovery_item_id: job.item_id,
-                        recovery_item_type: job.item_type,
-                        trigger: pioneer_protocol::RecoveryTrigger::ProviderError,
-                        action: job.action,
-                        existing_status: job.status,
-                        next_attempt_number,
-                    };
-                    self.persist_and_send_item_recovery_attached(attached, now_unix)
-                        .await;
+                {
+                    if is_created {
+                        let opened = pioneer_protocol::ItemRecoveryOpenedNotification {
+                            workspace_id,
+                            thread_id: thread_id.clone(),
+                            turn_id: turn_id.clone(),
+                            item_id: item_id.clone(),
+                            item_type,
+                            recovery_job_id: job.id.clone(),
+                            trigger: job.trigger,
+                            action: job.action,
+                            attempt_number: next_attempt_number,
+                        };
+                        self.persist_and_send_item_recovery_opened(opened, now_unix)
+                            .await;
+                    } else {
+                        let attached = pioneer_protocol::ItemRecoveryAttachedNotification {
+                            workspace_id,
+                            thread_id: thread_id.clone(),
+                            turn_id: turn_id.clone(),
+                            item_id: item_id.clone(),
+                            item_type,
+                            recovery_job_id: job.id.clone(),
+                            recovery_item_id: job.item_id.clone(),
+                            recovery_item_type: job.item_type,
+                            trigger: pioneer_protocol::RecoveryTrigger::ProviderError,
+                            action: job.action,
+                            existing_status: job.status,
+                            next_attempt_number,
+                        };
+                        self.persist_and_send_item_recovery_attached(attached, now_unix)
+                            .await;
+                    }
+                }
+
+                if should_terminalize {
+                    match self
+                        .recovery_coordinator
+                        .terminalize_pending_mark_failed_job(job, now_unix)
+                        .await
+                    {
+                        Ok(events) => {
+                            for event in events {
+                                self.handle_recovery_event(event, now_unix).await;
+                            }
+                        }
+                        Err(error) => {
+                            self.mark_turn_failed(
+                                thread_id,
+                                turn_id,
+                                format!("failed to apply terminal provider recovery: {error:#}"),
+                            )
+                            .await;
+                        }
+                    }
                 }
             }
             Err(error) => {

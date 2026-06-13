@@ -46,40 +46,41 @@ use pioneer_protocol::{
     MemorySensitivity, PromptManifest, PromptManifestDiagnostic, PromptManifestDiagnosticCode,
     PromptManifestHookContributionKind, PromptManifestHookPhase, PromptManifestHookSource,
     PromptManifestHookSourceEntry, PromptManifestHookTruncation, PromptManifestProfile,
-    ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse, ProviderListParams,
-    ProviderListResponse, ProviderSetApiKeyParams, ProviderSetApiKeyResponse, RecoveryAction,
-    RecoveryTrigger, SandboxMode, SkillArchiveFormat, SkillAuditEvent as ProtocolSkillAuditEvent,
-    SkillListResponse, SkillsChangedNotification, SkillsHealthResponse, SkillsInstallResponse,
-    SkillsPolicySetResponse, SkillsUninstallResponse, SkillsUpdateResponse,
-    SkillsUploadAbortResponse, SkillsUploadChunkHeader, SkillsUploadFinishResponse,
-    SkillsUploadStartResponse, TaskAcceptResponse, TaskAgendaResponse, TaskAgentPrompt,
-    TaskAgentResultContract, TaskAgentResultFormat, TaskAgentReviewMode, TaskAgentReviewPolicy,
-    TaskAgentSpecInput, TaskAgentToolPolicy, TaskAgentWriteMode, TaskAttachmentMode,
-    TaskCompletionBehavior, TaskCreateParams, TaskDeliveriesParams, TaskDeliveriesResponse,
-    TaskDeliveryFormat, TaskDeliveryMode, TaskDeliveryPolicy, TaskDeliveryStatus, TaskEventPayload,
-    TaskExecutorKind, TaskLifecyclePolicy, TaskOwnerKind, TaskParentTerminalAction,
-    TaskPauseResponse, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
-    TaskResultReviewDecision, TaskResultReviewEventKind, TaskResultReviewResolutionStrategy,
-    TaskResultReviewerKind, TaskResumeResponse, TaskRetryBackoffKind, TaskRetryPolicy,
-    TaskReviseParams, TaskReviseResponse, TaskRun, TaskRunExecutionStatus, TaskRunStatus,
-    TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind,
-    TaskRunTurnStatus, TaskThreadLineage, TaskTriggerInput, TaskTriggerSpec, TaskTriggerStatus,
-    TaskValue, TaskWaitParams, TaskWriteLockStatus, Thread, ThreadAgentsDocArchiveResponse,
-    ThreadAgentsDocGetResponse, ThreadAgentsDocResolveForThreadResponse,
-    ThreadAgentsDocSaveResponse, ThreadAgentsDocStatus, ThreadClosedNotification,
-    ThreadFolderCreateResponse, ThreadFolderDeleteResponse, ThreadFolderMoveResponse,
-    ThreadHistoryEventPayload, ThreadHistoryResponse, ThreadMode, ThreadMoveResponse,
-    ThreadOriginKind, ThreadSidebarVisibility, ThreadStartParams, ThreadStartResponse,
-    ThreadStatus, ThreadTreeResponse, ThreadUnsubscribeResponse, ThreadUnsubscribeStatus,
-    TimelineOriginKind, ToolCallStatus, ToolDisplayPayload, ToolMetadata, ToolOutputPolicySnapshot,
-    ToolResultView, ToolStoragePayload, Turn, TurnAcceptedCapability, TurnCancelResponse,
-    TurnCapabilityAcceptedReason, TurnCapabilityKind, TurnCapabilityRejectedReason,
-    TurnCompletedNotification, TurnFailedNotification, TurnGetResponse, TurnItem,
-    TurnItemEventPayload, TurnItemType, TurnKind, TurnOrigin, TurnRejectedCapability,
-    TurnSkillBinding, TurnStartResponse, TurnStatus, TurnTimelineParams, TurnTimelineResponse,
-    UserInput, UserMessageAttachment, WorkspaceChangeKind, WorkspaceChangedNotification,
-    WorkspaceCreateResponse, WorkspaceDefaultResponse, WorkspaceListResponse,
-    WorkspaceSelectResponse, WorkspaceUpdateResponse, constants::events,
+    ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse, ProviderFailureClass,
+    ProviderFailureDetails, ProviderFailureStage, ProviderListParams, ProviderListResponse,
+    ProviderSetApiKeyParams, ProviderSetApiKeyResponse, ProviderTransportKind, RecoveryAction,
+    RecoveryJobStatus, RecoveryTrigger, SandboxMode, SkillArchiveFormat,
+    SkillAuditEvent as ProtocolSkillAuditEvent, SkillListResponse, SkillsChangedNotification,
+    SkillsHealthResponse, SkillsInstallResponse, SkillsPolicySetResponse, SkillsUninstallResponse,
+    SkillsUpdateResponse, SkillsUploadAbortResponse, SkillsUploadChunkHeader,
+    SkillsUploadFinishResponse, SkillsUploadStartResponse, TaskAcceptResponse, TaskAgendaResponse,
+    TaskAgentPrompt, TaskAgentResultContract, TaskAgentResultFormat, TaskAgentReviewMode,
+    TaskAgentReviewPolicy, TaskAgentSpecInput, TaskAgentToolPolicy, TaskAgentWriteMode,
+    TaskAttachmentMode, TaskCompletionBehavior, TaskCreateParams, TaskDeliveriesParams,
+    TaskDeliveriesResponse, TaskDeliveryFormat, TaskDeliveryMode, TaskDeliveryPolicy,
+    TaskDeliveryStatus, TaskEventPayload, TaskExecutorKind, TaskLifecyclePolicy, TaskOwnerKind,
+    TaskParentTerminalAction, TaskPauseResponse, TaskResult, TaskResultCandidate,
+    TaskResultCandidateStatus, TaskResultReviewDecision, TaskResultReviewEventKind,
+    TaskResultReviewResolutionStrategy, TaskResultReviewerKind, TaskResumeResponse,
+    TaskRetryBackoffKind, TaskRetryPolicy, TaskReviseParams, TaskReviseResponse, TaskRun,
+    TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind,
+    TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskThreadLineage, TaskTriggerInput,
+    TaskTriggerSpec, TaskTriggerStatus, TaskValue, TaskWaitParams, TaskWriteLockStatus, Thread,
+    ThreadAgentsDocArchiveResponse, ThreadAgentsDocGetResponse,
+    ThreadAgentsDocResolveForThreadResponse, ThreadAgentsDocSaveResponse, ThreadAgentsDocStatus,
+    ThreadClosedNotification, ThreadFolderCreateResponse, ThreadFolderDeleteResponse,
+    ThreadFolderMoveResponse, ThreadHistoryEventPayload, ThreadHistoryResponse, ThreadMode,
+    ThreadMoveResponse, ThreadOriginKind, ThreadSidebarVisibility, ThreadStartParams,
+    ThreadStartResponse, ThreadStatus, ThreadTreeResponse, ThreadUnsubscribeResponse,
+    ThreadUnsubscribeStatus, TimelineOriginKind, ToolCallStatus, ToolDisplayPayload, ToolMetadata,
+    ToolOutputPolicySnapshot, ToolResultView, ToolStoragePayload, Turn, TurnAcceptedCapability,
+    TurnCancelResponse, TurnCapabilityAcceptedReason, TurnCapabilityKind,
+    TurnCapabilityRejectedReason, TurnCompletedNotification, TurnFailedNotification,
+    TurnGetResponse, TurnItem, TurnItemEventPayload, TurnItemType, TurnKind, TurnOrigin,
+    TurnRejectedCapability, TurnSkillBinding, TurnStartResponse, TurnStatus, TurnTimelineParams,
+    TurnTimelineResponse, UserInput, UserMessageAttachment, WorkspaceChangeKind,
+    WorkspaceChangedNotification, WorkspaceCreateResponse, WorkspaceDefaultResponse,
+    WorkspaceListResponse, WorkspaceSelectResponse, WorkspaceUpdateResponse, constants::events,
 };
 use pioneer_provider::providers::EchoProvider;
 use pioneer_provider::{
@@ -10227,6 +10228,75 @@ async fn terminal_turn_failure_closes_running_execution_window() {
         .expect("turn should load")
         .expect("turn should exist");
     assert_eq!(turn.status, TurnStatus::Failed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mark_failed_provider_failure_closes_turn_without_polling() {
+    let thread_id = "thr_provider_terminal_sync";
+    let turn_id = "turn_provider_terminal_sync";
+    let item_id = "reasoning_provider_terminal_sync";
+    let (processor, crud_store, workspace_id) =
+        setup_execution_window_terminal_turn(thread_id, turn_id).await;
+
+    start_terminal_test_execution_window(
+        &processor,
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+        "runtime_win_provider_terminal_sync",
+    )
+    .await;
+
+    processor
+        .handle_provider_failure_detected(
+            thread_id.to_owned(),
+            turn_id.to_owned(),
+            item_id.to_owned(),
+            TurnItemType::Reasoning,
+            ProviderFailureDetails {
+                provider: "test-provider".to_owned(),
+                model: "test-model".to_owned(),
+                transport: ProviderTransportKind::Stream,
+                class: ProviderFailureClass::InvalidRequest,
+                stage: ProviderFailureStage::MidStream,
+                http_status: Some(400),
+                provider_code: Some("400".to_owned()),
+                retry_after_ms: None,
+                is_recoverable_hint: false,
+                message: Some("bad request".to_owned()),
+            },
+            None,
+        )
+        .await;
+
+    let failed_jobs = crud_store
+        .find_recovery_jobs_by_turn_and_status(turn_id, RecoveryJobStatus::Failed)
+        .await
+        .expect("failed recovery jobs should load");
+    assert_eq!(failed_jobs.len(), 1);
+    assert_eq!(failed_jobs[0].action, RecoveryAction::MarkFailed);
+    assert!(
+        failed_jobs[0]
+            .last_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("bad request")
+    );
+
+    let window = crud_store
+        .latest_turn_execution_window(turn_id)
+        .await
+        .expect("latest window should load")
+        .expect("window should exist");
+    assert_eq!(window.status, ExecutionWindowStatus::Failed);
+
+    let (_workspace_id, turn) = crud_store
+        .get_turn(thread_id, turn_id)
+        .await
+        .expect("turn should load")
+        .expect("turn should exist");
+    assert_eq!(turn.status, TurnStatus::Failed);
+    assert!(turn.error.as_deref().unwrap_or("").contains("bad request"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

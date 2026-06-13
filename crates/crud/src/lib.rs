@@ -7242,6 +7242,28 @@ impl CrudStore {
         .await
     }
 
+    pub async fn list_due_pending_recovery_jobs_by_action(
+        &self,
+        action: RecoveryAction,
+        now_unix: i64,
+        limit: u64,
+    ) -> Result<Vec<RecoveryJobRecord>> {
+        self.run_serialized_write(|| async {
+            let jobs = recovery_job::list_due_pending_jobs_by_action(
+                &self.connection,
+                action,
+                unix_to_datetime(now_unix),
+                limit,
+            )
+            .await?;
+            Ok(jobs
+                .into_iter()
+                .map(recovery_job_record_from_model)
+                .collect::<Vec<_>>())
+        })
+        .await
+    }
+
     pub async fn get_recovery_job(&self, job_id: &str) -> Result<Option<RecoveryJobRecord>> {
         self.run_serialized_write(|| async {
             Ok(recovery_job::find_job_by_id(&self.connection, job_id)
@@ -7347,6 +7369,45 @@ impl CrudStore {
                 unix_to_datetime(now_unix),
             )
             .await
+        })
+        .await
+    }
+
+    pub async fn mark_due_pending_recovery_job_terminal_if_turn_idle(
+        &self,
+        job_id: &str,
+        action: RecoveryAction,
+        status: RecoveryJobStatus,
+        last_error: Option<String>,
+        now_unix: i64,
+    ) -> Result<bool> {
+        let last_error_value = last_error.clone();
+        self.run_serialized_write(|| async {
+            let tx = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin due pending recovery terminal transaction")?;
+            let affected = match recovery_job::mark_due_pending_job_terminal_if_turn_idle(
+                &tx,
+                job_id,
+                action,
+                status,
+                last_error_value.clone(),
+                unix_to_datetime(now_unix),
+            )
+            .await
+            {
+                Ok(affected) => affected,
+                Err(error) => {
+                    let _ = tx.rollback().await;
+                    return Err(error);
+                }
+            };
+            tx.commit()
+                .await
+                .context("failed to commit due pending recovery terminal transaction")?;
+            Ok(affected)
         })
         .await
     }

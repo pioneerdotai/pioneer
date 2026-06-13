@@ -2012,6 +2012,7 @@ pub enum ProviderFailureClass {
     StreamStall,
     StreamTruncated,
     EmptyResponse,
+    ProviderRejected,
     InvalidRequest,
     PermissionDenied,
     Unknown,

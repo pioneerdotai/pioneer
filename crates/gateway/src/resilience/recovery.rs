@@ -15,6 +15,7 @@ use pioneer_skills::SkillPolicyKey;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::time::{Duration, timeout};
+use tracing::warn;
 
 const RECOVERY_JOB_CLAIM_LEASE_SECS: u64 = 45;
 const ACTIVE_RECOVERY_RECHECK_SECS: i64 = 2;
@@ -275,6 +276,16 @@ impl Default for RecoveryPolicyRegistry {
                 max_attempts: 2,
                 base_backoff_secs: 2,
                 max_wall_clock_secs: 300,
+                no_progress_limit: 2,
+            },
+        );
+        by_provider_failure_class.insert(
+            ProviderFailureClass::ProviderRejected,
+            ProviderRecoveryPolicy {
+                action: RetryWithBackoff,
+                max_attempts: 2,
+                base_backoff_secs: 2,
+                max_wall_clock_secs: 120,
                 no_progress_limit: 2,
             },
         );
@@ -1059,18 +1070,146 @@ impl RecoveryCoordinator {
         now_unix: i64,
         limit: u64,
     ) -> Result<Vec<RecoveryCoordinatorEvent>> {
-        let mut events = self.backfill_timeout_jobs(now_unix, limit).await?;
-        events.extend(self.expire_active_recovery_jobs(now_unix, limit).await?);
+        let mut events = Vec::new();
+        let mut phase_errors = Vec::new();
 
-        let jobs = self
+        match self.backfill_timeout_jobs(now_unix, limit).await {
+            Ok(mut phase_events) => events.append(&mut phase_events),
+            Err(error) => {
+                warn!(
+                    error = %format!("{error:#}"),
+                    "recovery coordinator timeout backfill phase failed"
+                );
+                phase_errors.push(format!("timeout backfill: {error:#}"));
+            }
+        }
+
+        match self.expire_active_recovery_jobs(now_unix, limit).await {
+            Ok(mut phase_events) => events.append(&mut phase_events),
+            Err(error) => {
+                warn!(
+                    error = %format!("{error:#}"),
+                    "recovery coordinator active expiration phase failed"
+                );
+                phase_errors.push(format!("active expiration: {error:#}"));
+            }
+        }
+
+        match self
+            .repair_due_terminal_recovery_jobs(now_unix, limit)
+            .await
+        {
+            Ok(mut phase_events) => events.append(&mut phase_events),
+            Err(error) => {
+                warn!(
+                    error = %format!("{error:#}"),
+                    "recovery coordinator terminal repair phase failed"
+                );
+                phase_errors.push(format!("terminal repair: {error:#}"));
+            }
+        }
+
+        match self
             .crud_store
             .claim_due_recovery_jobs(now_unix, RECOVERY_JOB_CLAIM_LEASE_SECS, limit)
+            .await
+        {
+            Ok(jobs) => {
+                for job in jobs {
+                    match self.run_single_job(job, now_unix).await {
+                        Ok(mut job_events) => events.append(&mut job_events),
+                        Err(error) => {
+                            warn!(
+                                error = %format!("{error:#}"),
+                                "recovery coordinator due job phase failed"
+                            );
+                            phase_errors.push(format!("due job: {error:#}"));
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                warn!(
+                    error = %format!("{error:#}"),
+                    "recovery coordinator due claim phase failed"
+                );
+                phase_errors.push(format!("due claim: {error:#}"));
+            }
+        }
+
+        if events.is_empty() && !phase_errors.is_empty() {
+            bail!(
+                "recovery coordinator phases failed: {}",
+                phase_errors.join("; ")
+            );
+        }
+
+        Ok(events)
+    }
+
+    pub async fn repair_due_terminal_recovery_jobs(
+        &self,
+        now_unix: i64,
+        limit: u64,
+    ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+        let jobs = self
+            .crud_store
+            .list_due_pending_recovery_jobs_by_action(RecoveryAction::MarkFailed, now_unix, limit)
             .await?;
+        let mut events = Vec::new();
 
         for job in jobs {
-            events.extend(self.run_single_job(job, now_unix).await?);
+            events.extend(
+                self.terminalize_pending_mark_failed_job(job, now_unix)
+                    .await?,
+            );
         }
+
         Ok(events)
+    }
+
+    pub async fn terminalize_pending_mark_failed_job(
+        &self,
+        job: RecoveryJobRecord,
+        now_unix: i64,
+    ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+        if job.status != RecoveryJobStatus::Pending || job.action != RecoveryAction::MarkFailed {
+            return Ok(Vec::new());
+        }
+
+        let attempt_number = attempt_number_for_job(&job);
+        let message = terminal_policy_error_message(&job);
+        if self
+            .crud_store
+            .mark_due_pending_recovery_job_terminal_if_turn_idle(
+                job.id.as_str(),
+                RecoveryAction::MarkFailed,
+                RecoveryJobStatus::Failed,
+                Some(message.clone()),
+                now_unix,
+            )
+            .await?
+        {
+            self.cancel_other_open_jobs_after_terminal_recovery(
+                job.turn_id.as_str(),
+                job.id.as_str(),
+                now_unix,
+            )
+            .await?;
+            return Ok(vec![RecoveryCoordinatorEvent::RecoveryExhausted(
+                RecoveryTerminalOutcome {
+                    job_id: job.id,
+                    turn_id: job.turn_id,
+                    item_id: job.item_id,
+                    item_type: job.item_type,
+                    attempt_number,
+                    status: RecoveryJobStatus::Failed,
+                    error_message: message,
+                },
+            )]);
+        }
+
+        Ok(Vec::new())
     }
 
     async fn expire_active_recovery_jobs(
@@ -1182,7 +1321,7 @@ impl RecoveryCoordinator {
         }
 
         if policy.action == RecoveryAction::MarkFailed {
-            let message = "recovery policy marks this failure as terminal".to_owned();
+            let message = terminal_policy_error_message(&job);
             if self
                 .crud_store
                 .mark_claimed_recovery_job_terminal(
@@ -1904,6 +2043,7 @@ impl RecoveryCoordinator {
             | ProviderFailureClass::RateLimit
             | ProviderFailureClass::Provider5xx
             | ProviderFailureClass::EmptyResponse => {}
+            ProviderFailureClass::ProviderRejected => {}
             ProviderFailureClass::StreamStall | ProviderFailureClass::StreamTruncated => {
                 if attempt_number >= STREAM_TO_NON_STREAM_FALLBACK_ATTEMPT {
                     plan.force_non_stream = true;
@@ -2078,6 +2218,19 @@ fn policy_action_name(action: RecoveryAction) -> &'static str {
         RecoveryAction::RestartTurn => "restart_turn",
         RecoveryAction::Fallback => "fallback",
         RecoveryAction::MarkFailed => "mark_failed",
+    }
+}
+
+fn terminal_policy_error_message(job: &RecoveryJobRecord) -> String {
+    const BASE: &str = "recovery policy marks this failure as terminal";
+    match job
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+    {
+        Some(reason) => format!("{BASE}: {reason}"),
+        None => BASE.to_owned(),
     }
 }
 
@@ -3904,5 +4057,77 @@ mod tests {
             .unwrap();
         assert_eq!(reloaded.status, RecoveryJobStatus::Failed);
         assert_eq!(reloaded.run_count, 0);
+    }
+
+    #[tokio::test]
+    async fn provider_rejected_policy_retries_instead_of_marking_failed() {
+        let (_crud_store, coordinator) = setup_coordinator().await;
+        let job = coordinator
+            .enqueue_provider_failure_job(
+                &ProviderFailureCandidate {
+                    turn_id: "turn_provider_rejected_fallback".to_owned(),
+                    item_id: "reasoning_provider_rejected".to_owned(),
+                    item_type: TurnItemType::Reasoning,
+                    failure: provider_failure(
+                        ProviderFailureClass::ProviderRejected,
+                        "provider rejected request",
+                    ),
+                },
+                1_700_000_000,
+            )
+            .await
+            .expect("provider rejection should enqueue retry recovery")
+            .into_job();
+
+        assert_eq!(job.action, RecoveryAction::RetryWithBackoff);
+        assert_eq!(job.max_attempts, 2);
+        assert_eq!(job.status, RecoveryJobStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn due_pending_mark_failed_repair_fails_without_claim() {
+        let (crud_store, coordinator) = setup_coordinator().await;
+        let job = coordinator
+            .enqueue_provider_failure_job(
+                &ProviderFailureCandidate {
+                    turn_id: "turn_due_pending_mark_failed".to_owned(),
+                    item_id: "reasoning_due_pending".to_owned(),
+                    item_type: TurnItemType::Reasoning,
+                    failure: provider_failure(ProviderFailureClass::InvalidRequest, "bad request"),
+                },
+                1_700_000_000,
+            )
+            .await
+            .expect("initial provider failure should enqueue")
+            .into_job();
+
+        let pending = crud_store
+            .get_recovery_job(job.id.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.status, RecoveryJobStatus::Pending);
+        assert!(pending.claim_token.is_none());
+
+        let events = coordinator
+            .repair_due_terminal_recovery_jobs(1_700_000_001, 64)
+            .await
+            .expect("terminal repair should run");
+
+        assert!(matches!(
+            events.as_slice(),
+            [RecoveryCoordinatorEvent::RecoveryExhausted(outcome)]
+                if outcome.job_id == job.id
+                    && outcome.status == RecoveryJobStatus::Failed
+                    && outcome.error_message.contains("bad request")
+        ));
+        let reloaded = crud_store
+            .get_recovery_job(job.id.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.status, RecoveryJobStatus::Failed);
+        assert_eq!(reloaded.run_count, 0);
+        assert!(reloaded.claim_token.is_none());
     }
 }

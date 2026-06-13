@@ -787,7 +787,7 @@ fn classify_provider_failure_class(
         return ProviderFailureClass::AuthExpired;
     }
     if is_image_input_capability_mismatch(message_lower) {
-        return ProviderFailureClass::InvalidRequest;
+        return ProviderFailureClass::ProviderRejected;
     }
     if http_status == Some(404)
         || message_lower.contains("model not found")
@@ -806,7 +806,7 @@ fn classify_provider_failure_class(
         || message_lower.contains("invalid request")
         || message_lower.contains("bad request")
     {
-        return ProviderFailureClass::InvalidRequest;
+        return ProviderFailureClass::ProviderRejected;
     }
     if message_lower.contains("error sending request")
         || message_lower.contains("connection")
@@ -873,7 +873,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn openrouter_image_input_endpoint_error_is_terminal_invalid_request() {
+    fn openrouter_image_input_endpoint_error_is_recoverable_provider_rejection() {
         let error = r#"provider stream error: OpenRouter API error (404 Not Found): {"error":{"message":"No endpoints found that support image input","code":404}}"#;
 
         let ChatTurnError::ProviderFailure { failure, .. } = provider_failure_error(
@@ -888,9 +888,9 @@ mod tests {
             panic!("expected provider failure");
         };
 
-        assert_eq!(failure.class, ProviderFailureClass::InvalidRequest);
+        assert_eq!(failure.class, ProviderFailureClass::ProviderRejected);
         assert_eq!(failure.http_status, Some(404));
-        assert!(!failure.is_recoverable_hint);
+        assert!(failure.is_recoverable_hint);
     }
 
     #[test]
@@ -904,6 +904,27 @@ mod tests {
             ),
             ProviderFailureClass::ModelNotFound
         );
+    }
+
+    #[test]
+    fn provider_400_bad_request_is_recoverable_provider_rejection() {
+        let error = r#"provider stream error: API error (400 Bad Request): {"error":{"message":"bad request","code":400}}"#;
+
+        let ChatTurnError::ProviderFailure { failure, .. } = provider_failure_error(
+            "reasoning_item",
+            TurnItemType::Reasoning,
+            "openrouter",
+            "minimax/minimax-m3",
+            ProviderTransportKind::Stream,
+            ProviderFailureStage::MidStream,
+            error.to_owned(),
+        ) else {
+            panic!("expected provider failure");
+        };
+
+        assert_eq!(failure.class, ProviderFailureClass::ProviderRejected);
+        assert_eq!(failure.http_status, Some(400));
+        assert!(failure.is_recoverable_hint);
     }
 
     #[test]
