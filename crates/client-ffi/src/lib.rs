@@ -13,9 +13,10 @@ mod threads;
 mod workspaces;
 
 use active_thread::{
+    ClientActiveThreadCancelTurnRequest, ClientActiveThreadCancelTurnResult,
     ClientActiveThreadClearResult, ClientActiveThreadEventRequest, ClientActiveThreadOpenRequest,
-    ClientActiveThreadSendTextRequest, ClientActiveThreadSendTextResult,
-    ClientActiveThreadSnapshot, ClientActiveThreadSnapshotRequest, ClientFfiActiveThreadState,
+    ClientActiveThreadSendTextRequest, ClientActiveThreadSendTextResult, ClientActiveThreadSnapshot,
+    ClientActiveThreadSnapshotRequest, ClientFfiActiveThreadState,
 };
 use composer::{
     ClientComposerAttachmentFromPathRequest, ClientComposerAttachmentsUpdateRequest,
@@ -618,6 +619,18 @@ impl ClientFfiRuntime {
             .map_err(|error| format!("{error:#}"))
     }
 
+    fn active_thread_cancel_turn(
+        &self,
+        input_json: &str,
+    ) -> Result<ClientActiveThreadCancelTurnResult, String> {
+        let request = serde_json::from_str::<ClientActiveThreadCancelTurnRequest>(input_json)
+            .map_err(|error| format!("invalid active thread cancel turn request: {error}"))?;
+
+        self.active_thread
+            .cancel_turn(&self.client_runtime, request)
+            .map_err(|error| format!("{error:#}"))
+    }
+
     fn active_thread_clear(&self) -> Result<ClientActiveThreadClearResult, String> {
         self.active_thread
             .clear(&self.client_runtime)
@@ -795,6 +808,10 @@ ffi_client_json_method!(
 ffi_client_json_method!(
     pioneer_client_ffi_active_thread_send_text,
     active_thread_send_text
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_active_thread_cancel_turn,
+    active_thread_cancel_turn
 );
 
 #[unsafe(no_mangle)]

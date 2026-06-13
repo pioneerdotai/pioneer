@@ -29,10 +29,13 @@ use pioneer_client::{
     },
     timeline::rows::{TimelineRow, build_timeline_rows},
     transport::ws::command_sender as ws_commands,
-    turns::start::{
-        TurnStartSendReduction, apply_prepared_turn_to_thread_snapshot, now_unix_seconds,
-        plan_turn_start_ids, reduce_turn_start_send_failure, reduce_turn_start_send_success,
-        turn_start_params_from_plan,
+    turns::{
+        cancel as turn_cancel,
+        start::{
+            TurnStartSendReduction, apply_prepared_turn_to_thread_snapshot, now_unix_seconds,
+            plan_turn_start_ids, reduce_turn_start_send_failure, reduce_turn_start_send_success,
+            turn_start_params_from_plan,
+        },
     },
 };
 use pioneer_protocol::{
@@ -100,6 +103,25 @@ pub struct ClientActiveThreadSendTextResult {
     pub thread_id: String,
     pub turn_id: String,
     pub pending_request_id: String,
+    pub snapshot: ClientActiveThreadSnapshot,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientActiveThreadCancelTurnRequest {
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub expanded_keys: Vec<String>,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Serialize)]
+pub struct ClientActiveThreadCancelTurnResult {
+    pub cancelled: bool,
+    pub thread_id: Option<String>,
+    pub turn_id: Option<String>,
     pub snapshot: ClientActiveThreadSnapshot,
 }
 
@@ -409,6 +431,51 @@ impl ClientFfiActiveThreadState {
         })
     }
 
+    pub fn cancel_turn(
+        &self,
+        runtime: &ClientRuntime,
+        request: ClientActiveThreadCancelTurnRequest,
+    ) -> anyhow::Result<ClientActiveThreadCancelTurnResult> {
+        let expanded_keys = expanded_key_set(&request.expanded_keys);
+        let Some((thread_id, turn_id, params)) =
+            self.apply_local_turn_cancel_request(request.reason)?
+        else {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
+
+            return Ok(ClientActiveThreadCancelTurnResult {
+                cancelled: false,
+                thread_id: inner.active_thread_id.clone(),
+                turn_id: None,
+                snapshot: snapshot_from_inner(&inner, &expanded_keys),
+            });
+        };
+
+        if let Err(error) = ws_commands::turn_cancel(&runtime.ws_command_sender(), params) {
+            let message = format!("{error:#}");
+            self.apply_local_turn_cancel_rejected(
+                thread_id.as_str(),
+                turn_id.as_str(),
+                message.as_str(),
+            )?;
+            return Err(anyhow::anyhow!(message));
+        }
+
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
+
+        Ok(ClientActiveThreadCancelTurnResult {
+            cancelled: true,
+            thread_id: Some(thread_id),
+            turn_id: Some(turn_id),
+            snapshot: snapshot_from_inner(&inner, &expanded_keys),
+        })
+    }
+
     pub fn clear(&self, runtime: &ClientRuntime) -> anyhow::Result<ClientActiveThreadClearResult> {
         let thread_ids = {
             let mut inner = self
@@ -457,6 +524,62 @@ impl ClientFfiActiveThreadState {
             .entry(reduction.thread_id.clone())
             .and_modify(|coordinator| coordinator.set_snapshot(reduction.thread.clone()))
             .or_insert_with(|| ThreadCoordinator::new(reduction.thread));
+
+        Ok(())
+    }
+
+    fn apply_local_turn_cancel_request(
+        &self,
+        reason: Option<String>,
+    ) -> anyhow::Result<Option<(String, String, pioneer_protocol::TurnCancelParams)>> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
+        let Some(thread_id) = inner.active_thread_id.clone() else {
+            return Ok(None);
+        };
+        let Some(coordinator) = inner.coordinators.get_mut(thread_id.as_str()) else {
+            return Ok(None);
+        };
+        let Some(turn_id) = coordinator.conversation.in_flight_turn_id().map(str::to_owned) else {
+            return Ok(None);
+        };
+        let Some(cancel_request) = turn_cancel::plan_turn_cancel_request(
+            thread_id.clone(),
+            turn_id.clone(),
+            coordinator.conversation.is_cancelling_turn(),
+            reason,
+        ) else {
+            return Ok(None);
+        };
+
+        coordinator
+            .conversation
+            .apply(cancel_request.requested_event);
+
+        Ok(Some((thread_id, turn_id, cancel_request.params)))
+    }
+
+    fn apply_local_turn_cancel_rejected(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        error: &str,
+    ) -> anyhow::Result<()> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
+        if let Some(coordinator) = inner.coordinators.get_mut(thread_id) {
+            coordinator
+                .conversation
+                .apply(turn_cancel::local_turn_cancel_rejected_event(
+                    thread_id.to_owned(),
+                    turn_id.to_owned(),
+                    error.to_owned(),
+                ));
+        }
 
         Ok(())
     }

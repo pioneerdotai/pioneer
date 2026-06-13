@@ -40,6 +40,14 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             crate::active_thread::ClientActiveThreadClearResult
         ),
         schema_doc!(
+            "client_active_thread_cancel_turn_request.json",
+            crate::active_thread::ClientActiveThreadCancelTurnRequest
+        ),
+        schema_doc!(
+            "client_active_thread_cancel_turn_result.json",
+            crate::active_thread::ClientActiveThreadCancelTurnResult
+        ),
+        schema_doc!(
             "client_active_thread_event_request.json",
             crate::active_thread::ClientActiveThreadEventRequest
         ),
