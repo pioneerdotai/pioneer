@@ -138,6 +138,10 @@ impl TurnEventPayload {
 
 #[derive(Debug, Clone)]
 pub struct AppendedTurnEvent {
+    pub id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub sequence: i64,
     pub payload: TurnEventPayload,
     pub created_at: DateTimeWithTimeZone,
 }

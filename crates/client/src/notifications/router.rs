@@ -253,6 +253,7 @@ pub fn reduce_turn_blocked_notification(
         conversation_event: ConversationEvent::TurnBlocked {
             thread_id,
             turn: notification.turn,
+            resume: notification.resume,
         },
         tick_conversation: false,
         reset_thread_resume: true,

@@ -3,10 +3,10 @@ use pioneer_protocol::{
     ExecutionWindowExhaustionReason, ExecutionWindowStatus, MarkdownDocument, RecoveryJobStatus,
     SystemEventLevel, TimelineOrigin, ToolLoopBudgetAction, ToolLoopBudgetLimitKind,
     ToolRetryBudgetUsage, ToolRetryErrorClass, ToolRetryExhaustionKind, ToolRetryResolution, Turn,
-    TurnExecutionWindowBlockedNotification, TurnExecutionWindowCheckpointedNotification,
-    TurnExecutionWindowContinuedNotification, TurnExecutionWindowExhaustedNotification,
-    TurnExecutionWindowStartedNotification, TurnItem, TurnItemTimeoutReason, TurnItemType,
-    TurnStatus, UserMessageAttachment,
+    TurnBlockedResumeMetadata, TurnExecutionWindowBlockedNotification,
+    TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
+    TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification, TurnItem,
+    TurnItemTimeoutReason, TurnItemType, TurnStatus, UserMessageAttachment,
 };
 use serde_json::Value as JsonValue;
 use std::{
@@ -96,6 +96,8 @@ pub struct TurnView {
     pub started_at_unix_ms: Option<i64>,
     pub completed_at_unix_ms: Option<i64>,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<TurnBlockedResumeMetadata>,
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -348,7 +350,12 @@ impl ConversationProjector {
         }
     }
 
-    pub fn apply_turn_blocked(&mut self, turn: &Turn, ts_unix_ms: i64) {
+    pub fn apply_turn_blocked(
+        &mut self,
+        turn: &Turn,
+        resume: Option<&TurnBlockedResumeMetadata>,
+        ts_unix_ms: i64,
+    ) {
         self.upsert_turn(
             turn.id.as_str(),
             TurnPhase::Blocked,
@@ -356,7 +363,22 @@ impl ConversationProjector {
             Some(ts_unix_ms),
             turn.error.clone(),
         );
+        if let Some(index) = self.turn_index.get(turn.id.as_str()).copied()
+            && let Some(view) = self.view_state.turns.get_mut(index)
+        {
+            view.resume = resume.cloned();
+        }
         self.mark_turn_items_terminal(turn.id.as_str(), TimelineEntryStatus::Blocked, ts_unix_ms);
+        if let Some(resume) = resume {
+            self.push_system_event_item(
+                turn.id.as_str(),
+                SystemEventLevel::Warning,
+                format!("Turn blocked: {}", resume.human_message),
+                Some("turn_blocked_resumable".to_owned()),
+                Some(turn_blocked_resume_details(resume)),
+                ts_unix_ms,
+            );
+        }
     }
 
     pub fn apply_item_timeout_detected(
@@ -1050,6 +1072,7 @@ impl ConversationProjector {
             started_at_unix_ms,
             completed_at_unix_ms,
             error,
+            resume: None,
         });
         let index = self.view_state.turns.len().saturating_sub(1);
         self.turn_index.insert(turn_id.to_owned(), index);
@@ -1265,6 +1288,18 @@ fn timeout_reason_label(reason: TurnItemTimeoutReason) -> &'static str {
         TurnItemTimeoutReason::HardDeadlineExceeded => "hard deadline exceeded",
         TurnItemTimeoutReason::LeaseExpired => "lease expired",
     }
+}
+
+fn turn_blocked_resume_details(resume: &TurnBlockedResumeMetadata) -> JsonValue {
+    serde_json::json!({
+        "reason_class": &resume.reason_class,
+        "human_message": &resume.human_message,
+        "resume_requirements": &resume.resume_requirements,
+        "resume_command": &resume.resume_command,
+        "blocked_recovery_job_id": &resume.blocked_recovery_job_id,
+        "latest_checkpoint_id": &resume.latest_checkpoint_id,
+        "can_resume_same_turn": resume.can_resume_same_turn,
+    })
 }
 
 fn turn_item_type_label(item_type: TurnItemType) -> &'static str {

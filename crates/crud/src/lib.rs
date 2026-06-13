@@ -55,6 +55,7 @@ use crate::convention::{
     task_write_lock_scope_kind_from_db, task_write_lock_status_from_db, thread_mode_from_db,
     thread_origin_kind_from_db, thread_sidebar_visibility_from_db, thread_status_from_db,
     turn_item_type_from_db, turn_kind_from_db, turn_origin_from_db, turn_status_from_db,
+    turn_status_to_db,
 };
 use crate::events::{TurnEventPayload, TurnStartedEventPayload};
 use crate::projector::TurnProjector;
@@ -211,8 +212,9 @@ use crate::repositories::{
     task as task_repository, task_agent_spec, task_delivery, task_dependency, task_event,
     task_result_candidate, task_result_review_event, task_run, task_run_execution,
     task_run_thread_binding, task_run_turn, task_trigger, task_write_lock, thread,
-    thread_agents_doc, thread_lineage, thread_tree, turn, turn_event, turn_execution_window,
-    turn_item_attempt, turn_llm_context, turn_mcp_binding, turn_skill_binding,
+    thread_agents_doc, thread_lineage, thread_tree, turn, turn_event, turn_event_projection_state,
+    turn_execution_window, turn_item_attempt, turn_llm_context, turn_mcp_binding,
+    turn_runtime_snapshot, turn_skill_binding,
 };
 pub use crate::task_events::{AppendedTaskEvent, TaskEventAppendStatus, TaskEventPayload};
 use crate::task_projector::TaskProjector;
@@ -246,6 +248,9 @@ pub use crate::repositories::turn_execution_window::{
     TurnExecutionWindowUsageAggregateRecord,
 };
 pub use crate::repositories::turn_llm_context::{NewTurnLlmContextEntry, TurnLlmContextEntry};
+pub use crate::repositories::turn_runtime_snapshot::{
+    NewTurnRuntimeSnapshot, TurnRuntimeSnapshotRecord,
+};
 use crate::util::{optional_typed_json_from_db, typed_json_from_db, unix_to_datetime};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 
@@ -353,11 +358,35 @@ pub struct TimeoutCandidate {
     pub timeout_reason: TurnItemTimeoutReason,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize, serde::Serialize)]
 pub struct TurnItemAttemptDeadlines {
     pub lease_expires_at_unix: Option<i64>,
     pub idle_deadline_at_unix: Option<i64>,
     pub hard_deadline_at_unix: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TurnProjectionReplaySummary {
+    pub claimed: usize,
+    pub projected: usize,
+    pub failed: usize,
+    pub exhausted: usize,
+    pub missing_events: usize,
+    pub exhausted_records: Vec<TurnProjectionReplayExhaustedRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnProjectionReplayExhaustedRecord {
+    pub event_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub error_message: String,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+struct TurnEventProjectionContext {
+    #[serde(default)]
+    item_started_deadlines: Option<TurnItemAttemptDeadlines>,
 }
 
 #[derive(Debug, Clone)]
@@ -416,6 +445,13 @@ pub struct RecoveryJobRecord {
     pub claim_token: Option<String>,
     pub active_attempt_id: Option<String>,
     pub active_attempt_started_at_unix: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub enum BlockedTurnRecoveryResumeOutcome {
+    Resumed(RecoveryJobRecord),
+    NotFound,
+    MissingRuntimeSnapshot { recovery_job_id: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -623,6 +659,46 @@ impl CrudStore {
         turn_llm_context::delete_turn_llm_context_for_terminal_turns(&self.connection).await
     }
 
+    pub async fn upsert_turn_runtime_snapshot(
+        &self,
+        snapshot: NewTurnRuntimeSnapshot,
+    ) -> Result<TurnRuntimeSnapshotRecord> {
+        self.run_serialized_write(|| async {
+            turn_runtime_snapshot::upsert_turn_runtime_snapshot(&self.connection, snapshot.clone())
+                .await
+        })
+        .await
+    }
+
+    pub async fn get_turn_runtime_snapshot(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<TurnRuntimeSnapshotRecord>> {
+        let turn_id = turn_id.to_owned();
+        self.run_serialized_write(|| async {
+            turn_runtime_snapshot::find_turn_runtime_snapshot(&self.connection, turn_id.as_str())
+                .await
+        })
+        .await
+    }
+
+    pub async fn delete_turn_runtime_snapshot(&self, turn_id: &str) -> Result<u64> {
+        let turn_id = turn_id.to_owned();
+        self.run_serialized_write(|| async {
+            turn_runtime_snapshot::delete_turn_runtime_snapshot(&self.connection, turn_id.as_str())
+                .await
+        })
+        .await
+    }
+
+    pub async fn delete_turn_runtime_snapshots_for_closed_turns(&self) -> Result<u64> {
+        self.run_serialized_write(|| async {
+            turn_runtime_snapshot::delete_turn_runtime_snapshots_for_closed_turns(&self.connection)
+                .await
+        })
+        .await
+    }
+
     pub async fn create_turn_execution_window(
         &self,
         record: NewTurnExecutionWindowRecord,
@@ -755,6 +831,20 @@ impl CrudStore {
             reason,
             stats,
         )
+        .await
+    }
+
+    pub async fn close_active_execution_windows_for_terminal_turns(
+        &self,
+        now: DateTimeWithTimeZone,
+    ) -> Result<u64> {
+        self.run_serialized_write(|| async {
+            turn_execution_window::close_active_execution_windows_for_terminal_turns(
+                &self.connection,
+                now,
+            )
+            .await
+        })
         .await
     }
 
@@ -4692,6 +4782,67 @@ impl CrudStore {
         )))
     }
 
+    pub async fn complete_in_progress_turns_after_final_agent_message(
+        &self,
+        event_timestamp_secs: i64,
+    ) -> Result<u64> {
+        let turns = pioneer_entity::turn::Entity::find()
+            .filter(
+                pioneer_entity::turn::Column::Status.eq(turn_status_to_db(TurnStatus::InProgress)),
+            )
+            .all(&self.connection)
+            .await
+            .context("failed to query in-progress turns for final-agent-message repair")?;
+
+        let mut completed = 0u64;
+        for turn_model in turns {
+            let Some(latest_event) =
+                turn_event::latest_event_for_turn(&self.connection, turn_model.id.as_str()).await?
+            else {
+                continue;
+            };
+            let TurnEventPayload::ItemCompleted(notification) = latest_event.payload else {
+                continue;
+            };
+            if !matches!(&notification.item, TurnItem::AgentMessage { .. }) {
+                continue;
+            }
+            let Some(thread_model) =
+                thread::find_thread_by_id(&self.connection, turn_model.thread_id.as_str()).await?
+            else {
+                continue;
+            };
+
+            let prompt_manifest = parse_turn_prompt_manifest(&turn_model)?;
+            self.materialize_turn_completed(
+                pioneer_protocol::TurnCompletedNotification {
+                    workspace_id: thread_model.workspace_id,
+                    thread_id: turn_model.thread_id.clone(),
+                    turn: Turn {
+                        id: turn_model.id,
+                        status: TurnStatus::Completed,
+                        turn_kind: turn_kind_from_db(turn_model.turn_kind.as_str())
+                            .unwrap_or_default(),
+                        origin: turn_origin_from_db(turn_model.origin.as_str()).unwrap_or_default(),
+                        error: None,
+                        prompt_manifest,
+                    },
+                },
+                event_timestamp_secs,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to materialize completion repair for turn `{}`",
+                    notification.turn_id
+                )
+            })?;
+            completed = completed.saturating_add(1);
+        }
+
+        Ok(completed)
+    }
+
     pub async fn get_turn_inputs(&self, turn_id: &str) -> Result<Vec<UserInput>> {
         let rows = turn::find_turn_inputs(&self.connection, turn_id).await?;
         let mut inputs = Vec::with_capacity(rows.len());
@@ -6676,6 +6827,7 @@ impl CrudStore {
                         workspace_id: notification.workspace_id,
                         thread_id: notification.thread_id,
                         turn: notification.turn,
+                        resume: notification.resume,
                     }
                 }
             };
@@ -7517,6 +7669,116 @@ impl CrudStore {
         .await
     }
 
+    pub async fn resume_blocked_turn_recovery(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        recovery_job_id: Option<&str>,
+        now_unix: i64,
+    ) -> Result<BlockedTurnRecoveryResumeOutcome> {
+        self.run_serialized_write(|| async {
+            let now = unix_to_datetime(now_unix);
+            let tx = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin blocked turn resume transaction")?;
+
+            let Some(turn_model) =
+                turn::find_turn_by_thread_and_id(&tx, thread_id, turn_id).await?
+            else {
+                tx.rollback()
+                    .await
+                    .context("failed to rollback missing blocked turn resume transaction")?;
+                return Ok(BlockedTurnRecoveryResumeOutcome::NotFound);
+            };
+            if turn_status_from_db(turn_model.status.as_str()) != Some(TurnStatus::Blocked) {
+                tx.rollback()
+                    .await
+                    .context("failed to rollback non-blocked turn resume transaction")?;
+                return Ok(BlockedTurnRecoveryResumeOutcome::NotFound);
+            }
+
+            let Some(job) =
+                recovery_job::find_blocked_job_by_turn(&tx, turn_id, recovery_job_id).await?
+            else {
+                tx.rollback()
+                    .await
+                    .context("failed to rollback blocked turn resume without recovery job")?;
+                return Ok(BlockedTurnRecoveryResumeOutcome::NotFound);
+            };
+
+            let item_type = turn_item_type_from_db(job.item_type.as_str())
+                .unwrap_or(TurnItemType::DynamicToolCall);
+            if item_type.is_tool_item()
+                && turn_runtime_snapshot::find_turn_runtime_snapshot(&tx, turn_id)
+                    .await?
+                    .is_none()
+            {
+                let recovery_job_id = job.id.clone();
+                tx.rollback()
+                    .await
+                    .context("failed to rollback blocked tool recovery without snapshot")?;
+                return Ok(BlockedTurnRecoveryResumeOutcome::MissingRuntimeSnapshot {
+                    recovery_job_id,
+                });
+            }
+
+            let max_attempts = job.max_attempts.max(job.run_count.saturating_add(1));
+            let resumed = recovery_job::resume_blocked_job(
+                &tx,
+                &job,
+                RecoveryAction::RestartTurn,
+                max_attempts,
+                now,
+            )
+            .await?;
+            if !resumed {
+                tx.rollback()
+                    .await
+                    .context("failed to rollback stale blocked recovery resume transaction")?;
+                return Ok(BlockedTurnRecoveryResumeOutcome::NotFound);
+            }
+
+            let updated = turn::update_turn_status(
+                &tx,
+                thread_id,
+                turn_id,
+                TurnStatus::InProgress,
+                None,
+                now,
+            )
+            .await?;
+            if !updated {
+                tx.rollback()
+                    .await
+                    .context("failed to rollback blocked turn resume after status miss")?;
+                return Ok(BlockedTurnRecoveryResumeOutcome::NotFound);
+            }
+            turn::append_turn_status_history(
+                &tx,
+                turn_id,
+                TurnStatus::InProgress,
+                Some("blocked turn resumed by explicit request".to_owned()),
+                now,
+            )
+            .await?;
+
+            tx.commit()
+                .await
+                .context("failed to commit blocked turn resume transaction")?;
+
+            Ok(
+                recovery_job::find_job_by_id(&self.connection, job.id.as_str())
+                    .await?
+                    .map(recovery_job_record_from_model)
+                    .map(BlockedTurnRecoveryResumeOutcome::Resumed)
+                    .unwrap_or(BlockedTurnRecoveryResumeOutcome::NotFound),
+            )
+        })
+        .await
+    }
+
     pub async fn list_active_recovery_jobs(&self, limit: u64) -> Result<Vec<RecoveryJobRecord>> {
         self.run_serialized_write(|| async {
             let jobs = recovery_job::list_active_jobs(&self.connection, limit).await?;
@@ -7582,29 +7844,77 @@ impl CrudStore {
         event_timestamp_secs: i64,
         item_started_deadlines: Option<TurnItemAttemptDeadlines>,
     ) -> Result<()> {
-        self.run_serialized_write(|| {
-            self.materialize_turn_event_once(
-                event.clone(),
-                event_timestamp_secs,
-                item_started_deadlines,
-            )
-        })
-        .await
+        let projection_context = TurnEventProjectionContext {
+            item_started_deadlines,
+        };
+        let claim_token = generate_id(DB_ID_LEN);
+        let created_at = unix_to_datetime(event_timestamp_secs);
+        let claim_expires_at =
+            unix_to_datetime(event_timestamp_secs.saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS));
+
+        let appended_event = self
+            .run_serialized_write(|| {
+                self.append_claimed_turn_event_projection_once(
+                    event.clone(),
+                    created_at,
+                    projection_context.clone(),
+                    claim_token.clone(),
+                    claim_expires_at,
+                )
+            })
+            .await?;
+
+        if let Err(error) = self
+            .run_serialized_write(|| {
+                self.project_claimed_turn_event_once(
+                    appended_event.clone(),
+                    projection_context.clone(),
+                    claim_token.clone(),
+                    created_at,
+                )
+            })
+            .await
+        {
+            let error_message = format!("{error:#}");
+            if let Err(mark_error) = self
+                .run_serialized_write(|| {
+                    self.mark_turn_event_projection_failure_once(
+                        appended_event.id.clone(),
+                        claim_token.clone(),
+                        0,
+                        error_message.clone(),
+                        event_timestamp_secs,
+                        false,
+                    )
+                })
+                .await
+            {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to persist turn event projection failure for event `{}`: {mark_error:#}",
+                        appended_event.id
+                    )
+                });
+            }
+            return Err(error);
+        }
+
+        Ok(())
     }
 
-    async fn materialize_turn_event_once(
+    async fn append_claimed_turn_event_projection_once(
         &self,
         event: TurnEventPayload,
-        event_timestamp_secs: i64,
-        item_started_deadlines: Option<TurnItemAttemptDeadlines>,
-    ) -> Result<()> {
+        created_at: DateTimeWithTimeZone,
+        projection_context: TurnEventProjectionContext,
+        claim_token: String,
+        claim_expires_at: DateTimeWithTimeZone,
+    ) -> Result<crate::events::AppendedTurnEvent> {
         let transaction = self
             .connection
             .begin()
             .await
-            .context("failed to begin materialization transaction")?;
-
-        let created_at = unix_to_datetime(event_timestamp_secs);
+            .context("failed to begin turn event append transaction")?;
 
         validate_turn_event_for_permanent_storage(&event).await?;
 
@@ -7617,6 +7927,80 @@ impl CrudStore {
             }
         };
 
+        let projection_context_json = match serialize_turn_event_projection_context(
+            &projection_context,
+            appended_event.id.as_str(),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+        };
+
+        if let Err(error) = turn_event_projection_state::insert_claimed(
+            &transaction,
+            turn_event_projection_state::NewTurnEventProjectionState {
+                event_id: appended_event.id.clone(),
+                thread_id: appended_event.thread_id.clone(),
+                turn_id: appended_event.turn_id.clone(),
+                sequence: appended_event.sequence,
+                projection_context_json,
+                claim_token,
+                claim_expires_at,
+                created_at,
+            },
+        )
+        .await
+        {
+            let _ = transaction.rollback().await;
+            return Err(error);
+        }
+
+        transaction
+            .commit()
+            .await
+            .context("failed to commit turn event append transaction")?;
+
+        Ok(appended_event)
+    }
+
+    async fn project_claimed_turn_event_once(
+        &self,
+        appended_event: crate::events::AppendedTurnEvent,
+        projection_context: TurnEventProjectionContext,
+        claim_token: String,
+        projected_at: DateTimeWithTimeZone,
+    ) -> Result<()> {
+        let transaction = self
+            .connection
+            .begin()
+            .await
+            .context("failed to begin turn event projection transaction")?;
+
+        let has_unprojected_predecessor =
+            match turn_event_projection_state::has_unprojected_predecessor(
+                &transaction,
+                appended_event.turn_id.as_str(),
+                appended_event.sequence,
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = transaction.rollback().await;
+                    return Err(error);
+                }
+            };
+        if has_unprojected_predecessor {
+            let _ = transaction.rollback().await;
+            anyhow::bail!(
+                "turn event projection `{}` is waiting for an earlier event in turn `{}`",
+                appended_event.id,
+                appended_event.turn_id
+            );
+        }
+
         if let Err(error) = self
             .projector
             .project(&transaction, &appended_event)
@@ -7627,14 +8011,15 @@ impl CrudStore {
             return Err(error);
         }
 
-        if let (TurnEventPayload::ItemStarted(notification), Some(deadlines)) =
-            (&event, item_started_deadlines)
-        {
+        if let (TurnEventPayload::ItemStarted(notification), Some(deadlines)) = (
+            &appended_event.payload,
+            projection_context.item_started_deadlines,
+        ) {
             let configured = turn_item_attempt::configure_running_attempt_deadlines(
                 &transaction,
                 notification.turn_id.as_str(),
                 notification.item.item_id(),
-                created_at,
+                appended_event.created_at,
                 deadlines.lease_expires_at_unix.map(unix_to_datetime),
                 deadlines.idle_deadline_at_unix.map(unix_to_datetime),
                 deadlines.hard_deadline_at_unix.map(unix_to_datetime),
@@ -7650,12 +8035,246 @@ impl CrudStore {
             }
         }
 
+        let projected = match turn_event_projection_state::mark_projected_claimed(
+            &transaction,
+            appended_event.id.as_str(),
+            claim_token.as_str(),
+            projected_at,
+        )
+        .await
+        {
+            Ok(projected) => projected,
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+        };
+
+        if !projected {
+            let _ = transaction.rollback().await;
+            anyhow::bail!(
+                "turn event projection `{}` is no longer claimed by this worker",
+                appended_event.id
+            );
+        }
+
         transaction
             .commit()
             .await
-            .context("failed to commit turn event materialization transaction")?;
+            .context("failed to commit turn event projection transaction")?;
 
         Ok(())
+    }
+
+    async fn mark_turn_event_projection_failure_once(
+        &self,
+        event_id: String,
+        claim_token: String,
+        attempt_count: i64,
+        error_message: String,
+        failed_at_unix: i64,
+        force_exhausted: bool,
+    ) -> Result<bool> {
+        let transaction = self
+            .connection
+            .begin()
+            .await
+            .context("failed to begin turn event projection failure transaction")?;
+
+        let failed_at = unix_to_datetime(failed_at_unix);
+        let exhausted = force_exhausted
+            || attempt_count.saturating_add(1) >= TURN_EVENT_PROJECTION_MAX_ATTEMPTS;
+        let marked = if exhausted {
+            turn_event_projection_state::mark_exhausted_claimed(
+                &transaction,
+                event_id.as_str(),
+                claim_token.as_str(),
+                error_message,
+                failed_at,
+            )
+            .await
+        } else {
+            let next_run_at = unix_to_datetime(
+                failed_at_unix
+                    .saturating_add(turn_event_projection_retry_delay_secs(attempt_count)),
+            );
+            turn_event_projection_state::mark_failed_claimed(
+                &transaction,
+                event_id.as_str(),
+                claim_token.as_str(),
+                error_message,
+                next_run_at,
+                failed_at,
+            )
+            .await
+        };
+
+        let marked = match marked {
+            Ok(marked) => marked,
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+        };
+
+        transaction
+            .commit()
+            .await
+            .context("failed to commit turn event projection failure transaction")?;
+
+        Ok(marked)
+    }
+
+    pub async fn replay_due_turn_event_projections(
+        &self,
+        now_unix: i64,
+        limit: u64,
+    ) -> Result<TurnProjectionReplaySummary> {
+        let now = unix_to_datetime(now_unix);
+        let claim_expires_at =
+            unix_to_datetime(now_unix.saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS));
+        let claimed = self
+            .run_serialized_write(|| {
+                turn_event_projection_state::claim_due(
+                    &self.connection,
+                    now,
+                    claim_expires_at,
+                    limit,
+                )
+            })
+            .await?;
+
+        let mut summary = TurnProjectionReplaySummary {
+            claimed: claimed.len(),
+            ..TurnProjectionReplaySummary::default()
+        };
+
+        for claimed_projection in claimed {
+            let event_id = claimed_projection.state.event_id.clone();
+            let thread_id = claimed_projection.state.thread_id.clone();
+            let turn_id = claimed_projection.state.turn_id.clone();
+            let claim_token = claimed_projection.claim_token.clone();
+            let attempt_count = claimed_projection.state.attempt_count;
+
+            let Some(appended_event) = turn_event::find_event_by_id(&self.connection, &event_id)
+                .await
+                .with_context(|| {
+                    format!("failed to load raw turn event `{event_id}` for projection replay")
+                })?
+            else {
+                let marked = self
+                    .run_serialized_write(|| {
+                        self.mark_turn_event_projection_failure_once(
+                            event_id.clone(),
+                            claim_token.clone(),
+                            attempt_count,
+                            "raw turn_event row is missing for projection replay".to_owned(),
+                            now_unix,
+                            true,
+                        )
+                    })
+                    .await?;
+                summary.missing_events += 1;
+                if marked {
+                    summary.exhausted += 1;
+                    summary
+                        .exhausted_records
+                        .push(TurnProjectionReplayExhaustedRecord {
+                            event_id: event_id.clone(),
+                            thread_id: thread_id.clone(),
+                            turn_id: turn_id.clone(),
+                            error_message: "raw turn_event row is missing for projection replay"
+                                .to_owned(),
+                        });
+                }
+                continue;
+            };
+
+            let projection_context = match deserialize_turn_event_projection_context(
+                claimed_projection.state.projection_context_json.as_str(),
+                event_id.as_str(),
+            ) {
+                Ok(context) => context,
+                Err(error) => {
+                    let error_message = format!("{error:#}");
+                    let marked = self
+                        .run_serialized_write(|| {
+                            self.mark_turn_event_projection_failure_once(
+                                event_id.clone(),
+                                claim_token.clone(),
+                                attempt_count,
+                                error_message.clone(),
+                                now_unix,
+                                true,
+                            )
+                        })
+                        .await?;
+                    if marked {
+                        summary.exhausted += 1;
+                        summary
+                            .exhausted_records
+                            .push(TurnProjectionReplayExhaustedRecord {
+                                event_id: event_id.clone(),
+                                thread_id: thread_id.clone(),
+                                turn_id: turn_id.clone(),
+                                error_message,
+                            });
+                    }
+                    continue;
+                }
+            };
+
+            let projected = self
+                .run_serialized_write(|| {
+                    self.project_claimed_turn_event_once(
+                        appended_event.clone(),
+                        projection_context.clone(),
+                        claim_token.clone(),
+                        now,
+                    )
+                })
+                .await;
+
+            match projected {
+                Ok(()) => {
+                    summary.projected += 1;
+                }
+                Err(error) => {
+                    let error_message = format!("{error:#}");
+                    let will_exhaust =
+                        attempt_count.saturating_add(1) >= TURN_EVENT_PROJECTION_MAX_ATTEMPTS;
+                    let marked = self
+                        .run_serialized_write(|| {
+                            self.mark_turn_event_projection_failure_once(
+                                event_id.clone(),
+                                claim_token.clone(),
+                                attempt_count,
+                                error_message.clone(),
+                                now_unix,
+                                false,
+                            )
+                        })
+                        .await?;
+                    if marked {
+                        if will_exhaust {
+                            summary.exhausted += 1;
+                            summary
+                                .exhausted_records
+                                .push(TurnProjectionReplayExhaustedRecord {
+                                    event_id: event_id.clone(),
+                                    thread_id: thread_id.clone(),
+                                    turn_id: turn_id.clone(),
+                                    error_message,
+                                });
+                        } else {
+                            summary.failed += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(summary)
     }
 
     async fn append_task_event_once(
@@ -7844,6 +8463,32 @@ impl CrudStore {
             .run_serialized_with_retry(operation, is_anyhow_sqlite_lock)
             .await
     }
+}
+
+const TURN_EVENT_PROJECTION_LEASE_SECS: i64 = 120;
+const TURN_EVENT_PROJECTION_MAX_ATTEMPTS: i64 = 10;
+
+fn turn_event_projection_retry_delay_secs(attempt_count: i64) -> i64 {
+    let exponent = attempt_count.clamp(0, 6) as u32;
+    2_i64.saturating_pow(exponent).max(2)
+}
+
+fn serialize_turn_event_projection_context(
+    context: &TurnEventProjectionContext,
+    event_id: &str,
+) -> Result<String> {
+    serde_json::to_string(context).with_context(|| {
+        format!("failed to serialize turn event projection context for event `{event_id}`")
+    })
+}
+
+fn deserialize_turn_event_projection_context(
+    context_json: &str,
+    event_id: &str,
+) -> Result<TurnEventProjectionContext> {
+    serde_json::from_str(context_json).with_context(|| {
+        format!("failed to deserialize turn event projection context for event `{event_id}`")
+    })
 }
 
 fn memory_event_for_record(
@@ -8771,14 +9416,14 @@ fn recovery_job_record_from_model(model: pioneer_entity::recovery_job::Model) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        ClaimedRecoveryActivation, CrudStore, McpAuditEventRecord, McpServerCatalogSnapshotRecord,
-        McpServerInstallationRecord, NewTurnExecutionCheckpointRecord,
-        NewTurnExecutionWindowRecord, NewTurnLlmContextEntry, SkillAuditEventRecord,
-        SkillInstallationRecord, TaskEventPayload, TaskRunChildAnchor, ThreadAgentsDocError,
-        ThreadAgentsDocSaveReason, ThreadAgentsDocStatus, TurnExecutionCheckpointKind,
-        TurnExecutionWindowStatsRecord, TurnExecutionWindowUsageAggregateRecord,
-        TurnItemAttemptDeadlines, TurnMcpBindingRecord, TurnSkillBindingRecord,
-        WorkspaceSkillPolicyRecord,
+        BlockedTurnRecoveryResumeOutcome, ClaimedRecoveryActivation, CrudStore,
+        McpAuditEventRecord, McpServerCatalogSnapshotRecord, McpServerInstallationRecord,
+        NewTurnExecutionCheckpointRecord, NewTurnExecutionWindowRecord, NewTurnLlmContextEntry,
+        NewTurnRuntimeSnapshot, SkillAuditEventRecord, SkillInstallationRecord, TaskEventPayload,
+        TaskRunChildAnchor, ThreadAgentsDocError, ThreadAgentsDocSaveReason, ThreadAgentsDocStatus,
+        TurnExecutionCheckpointKind, TurnExecutionWindowStatsRecord,
+        TurnExecutionWindowUsageAggregateRecord, TurnItemAttemptDeadlines, TurnMcpBindingRecord,
+        TurnSkillBindingRecord, WorkspaceSkillPolicyRecord,
     };
     use crate::util::unix_to_datetime;
     use migration::{Migrator, MigratorTrait};
@@ -8810,8 +9455,8 @@ mod tests {
         UserInput,
     };
     use sea_orm::{
-        ColumnTrait, ConnectionTrait, Database, DatabaseBackend, EntityTrait, QueryFilter, Set,
-        Statement,
+        ColumnTrait, ConnectionTrait, Database, DatabaseBackend, EntityTrait, QueryFilter,
+        QueryOrder, Set, Statement,
     };
     use std::collections::BTreeMap;
 
@@ -8870,6 +9515,246 @@ mod tests {
             agent_role: None,
             turns: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn turn_runtime_snapshot_upsert_round_trips_and_updates() {
+        let store = test_store_with_workspace("ws_turn_runtime_snapshot").await;
+        let created_at = unix_to_datetime(1_700_000_000);
+        let updated_at = unix_to_datetime(1_700_000_010);
+        let snapshot = NewTurnRuntimeSnapshot {
+            turn_id: "turn_runtime_snapshot".to_owned(),
+            thread_id: "thread_runtime_snapshot".to_owned(),
+            workspace_id: "ws_turn_runtime_snapshot".to_owned(),
+            mode_json: r#""Agent""#.to_owned(),
+            model: "model-a".to_owned(),
+            provider_name: "provider-a".to_owned(),
+            hook_runtime_context_json: r#"{"mode":"agent","actor_kind":"agent"}"#.to_owned(),
+            workspace_skill_policies_json: "[]".to_owned(),
+            input_json: r#"[{"type":"text","text":"hello","textElements":[]}]"#.to_owned(),
+            capabilities_json: "[]".to_owned(),
+            resolved_artifacts_json: "[]".to_owned(),
+            runtime_environment_json: r#"{"PIONEER_ARTIFACT_OUTPUT_DIR":"/tmp/a"}"#.to_owned(),
+            history_json: r#"[{"role":"User","content":"hello"}]"#.to_owned(),
+            created_at,
+            updated_at: created_at,
+        };
+
+        let inserted = store
+            .upsert_turn_runtime_snapshot(snapshot.clone())
+            .await
+            .expect("snapshot insert should succeed");
+        assert_eq!(inserted.model, "model-a");
+        assert_eq!(inserted.created_at, created_at);
+
+        let mut replacement = snapshot;
+        replacement.model = "model-b".to_owned();
+        replacement.provider_name = "provider-b".to_owned();
+        replacement.runtime_environment_json =
+            r#"{"PIONEER_ARTIFACT_OUTPUT_DIR":"/tmp/b"}"#.to_owned();
+        replacement.created_at = updated_at;
+        replacement.updated_at = updated_at;
+
+        let updated = store
+            .upsert_turn_runtime_snapshot(replacement)
+            .await
+            .expect("snapshot update should succeed");
+        assert_eq!(updated.model, "model-b");
+        assert_eq!(updated.provider_name, "provider-b");
+        assert_eq!(updated.created_at, created_at);
+        assert_eq!(updated.updated_at, updated_at);
+
+        let fetched = store
+            .get_turn_runtime_snapshot("turn_runtime_snapshot")
+            .await
+            .expect("snapshot read should succeed")
+            .expect("snapshot should exist");
+        assert_eq!(
+            fetched.runtime_environment_json,
+            updated.runtime_environment_json
+        );
+
+        assert_eq!(
+            store
+                .delete_turn_runtime_snapshot("turn_runtime_snapshot")
+                .await
+                .expect("snapshot delete should succeed"),
+            1
+        );
+        assert!(
+            store
+                .get_turn_runtime_snapshot("turn_runtime_snapshot")
+                .await
+                .expect("snapshot read after delete should succeed")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_runtime_snapshot_cleanup_removes_closed_turns_only() {
+        let store = test_store_with_workspace("ws_turn_runtime_snapshot_cleanup").await;
+        let now = unix_to_datetime(1_700_000_000);
+        for (turn_id, status) in [
+            ("completed_turn", "completed"),
+            ("failed_turn", "failed"),
+            ("interrupted_turn", "interrupted"),
+            ("blocked_turn", "blocked"),
+            ("active_turn", "in_progress"),
+        ] {
+            pioneer_entity::turn::Entity::insert(pioneer_entity::turn::ActiveModel {
+                id: Set(turn_id.to_owned()),
+                thread_id: Set("thread_runtime_snapshot_cleanup".to_owned()),
+                status: Set(status.to_owned()),
+                turn_kind: Set("conversation".to_owned()),
+                origin: Set("user".to_owned()),
+                error: Set(None),
+                prompt_manifest_json: Set("{}".to_owned()),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            })
+            .exec(&store.connection)
+            .await
+            .expect("turn insert should succeed");
+        }
+
+        for turn_id in [
+            "completed_turn",
+            "failed_turn",
+            "interrupted_turn",
+            "blocked_turn",
+            "active_turn",
+        ] {
+            store
+                .upsert_turn_runtime_snapshot(NewTurnRuntimeSnapshot {
+                    turn_id: turn_id.to_owned(),
+                    thread_id: "thread_runtime_snapshot_cleanup".to_owned(),
+                    workspace_id: "ws_turn_runtime_snapshot_cleanup".to_owned(),
+                    mode_json: r#""Agent""#.to_owned(),
+                    model: "model-a".to_owned(),
+                    provider_name: "provider-a".to_owned(),
+                    hook_runtime_context_json: r#"{"mode":"agent","actor_kind":"agent"}"#
+                        .to_owned(),
+                    workspace_skill_policies_json: "[]".to_owned(),
+                    input_json: "[]".to_owned(),
+                    capabilities_json: "[]".to_owned(),
+                    resolved_artifacts_json: "[]".to_owned(),
+                    runtime_environment_json: "{}".to_owned(),
+                    history_json: "[]".to_owned(),
+                    created_at: now,
+                    updated_at: now,
+                })
+                .await
+                .expect("runtime snapshot insert should succeed");
+        }
+
+        let deleted = store
+            .delete_turn_runtime_snapshots_for_closed_turns()
+            .await
+            .expect("runtime snapshot cleanup should succeed");
+        assert_eq!(deleted, 3);
+
+        for turn_id in ["completed_turn", "failed_turn", "interrupted_turn"] {
+            assert!(
+                store
+                    .get_turn_runtime_snapshot(turn_id)
+                    .await
+                    .expect("runtime snapshot read should succeed")
+                    .is_none(),
+                "{turn_id} snapshot should be removed"
+            );
+        }
+        for turn_id in ["blocked_turn", "active_turn"] {
+            assert!(
+                store
+                    .get_turn_runtime_snapshot(turn_id)
+                    .await
+                    .expect("runtime snapshot read should succeed")
+                    .is_some(),
+                "{turn_id} snapshot should be retained"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_tool_recovery_resume_without_snapshot_leaves_turn_blocked() {
+        let store = test_store_with_workspace("ws_resume_missing_snapshot").await;
+        let now = unix_to_datetime(1_700_000_000);
+        let thread_id = "thread_resume_missing_snapshot";
+        let turn_id = "turn_resume_missing_snapshot";
+        pioneer_entity::turn::Entity::insert(pioneer_entity::turn::ActiveModel {
+            id: Set(turn_id.to_owned()),
+            thread_id: Set(thread_id.to_owned()),
+            status: Set("blocked".to_owned()),
+            turn_kind: Set("conversation".to_owned()),
+            origin: Set("user".to_owned()),
+            error: Set(Some("waiting for runtime snapshot".to_owned())),
+            prompt_manifest_json: Set("{}".to_owned()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        })
+        .exec(&store.connection)
+        .await
+        .expect("turn insert should succeed");
+
+        let job = store
+            .enqueue_recovery_job(
+                turn_id.to_owned(),
+                "tool_item_missing_snapshot".to_owned(),
+                TurnItemType::WebFetch,
+                None,
+                RecoveryTrigger::Timeout,
+                RecoveryAction::BlockResumable,
+                Some("tool recovery blocked".to_owned()),
+                None,
+                None,
+                None,
+                0,
+                0,
+                serde_json::json!({}),
+                serde_json::json!({
+                    "base_backoff_secs": 0,
+                    "max_wall_clock_secs": 60,
+                    "no_progress_limit": 3,
+                }),
+                1_700_000_001,
+            )
+            .await
+            .expect("recovery job should enqueue");
+        store
+            .mark_recovery_job_terminal(
+                job.id.as_str(),
+                RecoveryJobStatus::Blocked,
+                Some("waiting for operator resume".to_owned()),
+                1_700_000_002,
+            )
+            .await
+            .expect("recovery job should be marked blocked");
+
+        let outcome = store
+            .resume_blocked_turn_recovery(thread_id, turn_id, Some(job.id.as_str()), 1_700_000_003)
+            .await
+            .expect("blocked resume should evaluate");
+
+        match outcome {
+            BlockedTurnRecoveryResumeOutcome::MissingRuntimeSnapshot { recovery_job_id } => {
+                assert_eq!(recovery_job_id, job.id);
+            }
+            other => panic!("expected missing runtime snapshot, got {other:?}"),
+        }
+        let turn = pioneer_entity::turn::Entity::find_by_id(turn_id.to_owned())
+            .one(&store.connection)
+            .await
+            .expect("turn read should succeed")
+            .expect("turn should exist");
+        assert_eq!(turn.status, "blocked");
+        let blocked_job = store
+            .get_recovery_job(job.id.as_str())
+            .await
+            .expect("job read should succeed")
+            .expect("job should exist");
+        assert_eq!(blocked_job.status, RecoveryJobStatus::Blocked);
     }
 
     #[tokio::test]
@@ -10859,6 +11744,149 @@ mod tests {
         assert!(
             missing.is_empty(),
             "attempt with all deadlines should not require repair"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_event_projection_failure_keeps_raw_event_and_replays_in_order() {
+        let store = test_store_with_workspace("ws_projection_replay").await;
+        let timestamp = 1_700_000_000;
+        let workspace_id = "ws_projection_replay";
+        let thread_id = "thr_projection_replay";
+        let turn_id = "turn_projection_replay";
+        let item_id = "call_projection_replay";
+        let thread = sample_thread(workspace_id, thread_id, timestamp);
+        let turn = sample_turn(turn_id);
+
+        store
+            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+            .await
+            .expect("turn start should persist");
+
+        let start_event = pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn_id))
+            .filter(pioneer_entity::turn_event::Column::Sequence.eq(1))
+            .one(&store.connection)
+            .await
+            .expect("turn event lookup should succeed")
+            .expect("turn/start event should exist");
+
+        pioneer_entity::turn_event_projection_state::Entity::update_many()
+            .col_expr(
+                pioneer_entity::turn_event_projection_state::Column::Status,
+                sea_orm::sea_query::Expr::value(
+                    crate::repositories::turn_event_projection_state::PROJECTION_STATUS_FAILED,
+                ),
+            )
+            .col_expr(
+                pioneer_entity::turn_event_projection_state::Column::NextRunAt,
+                sea_orm::sea_query::Expr::value(unix_to_datetime(timestamp + 2)),
+            )
+            .col_expr(
+                pioneer_entity::turn_event_projection_state::Column::ClaimToken,
+                sea_orm::sea_query::Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                pioneer_entity::turn_event_projection_state::Column::ClaimExpiresAt,
+                sea_orm::sea_query::Expr::value(
+                    Option::<sea_orm::entity::prelude::DateTimeWithTimeZone>::None,
+                ),
+            )
+            .col_expr(
+                pioneer_entity::turn_event_projection_state::Column::UpdatedAt,
+                sea_orm::sea_query::Expr::value(unix_to_datetime(timestamp + 2)),
+            )
+            .filter(pioneer_entity::turn_event_projection_state::Column::EventId.eq(start_event.id))
+            .exec(&store.connection)
+            .await
+            .expect("projection state should be marked failed");
+
+        let deadlines = TurnItemAttemptDeadlines {
+            lease_expires_at_unix: Some(timestamp + 121),
+            idle_deadline_at_unix: Some(timestamp + 91),
+            hard_deadline_at_unix: Some(timestamp + 301),
+        };
+
+        let projection_error = store
+            .materialize_item_started_with_attempt_deadlines(
+                ItemStartedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: safe_web_fetch_item(item_id),
+                },
+                timestamp + 1,
+                deadlines,
+            )
+            .await
+            .expect_err("item projection should wait for earlier turn event");
+        assert!(
+            format!("{projection_error:#}").contains("waiting for an earlier event"),
+            "projection should fail because an earlier event is not projected"
+        );
+
+        let events = pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn_id))
+            .order_by_asc(pioneer_entity::turn_event::Column::Sequence)
+            .all(&store.connection)
+            .await
+            .expect("turn event list should succeed");
+        assert_eq!(
+            events.len(),
+            2,
+            "failed projection must not roll back raw event"
+        );
+
+        let item_state =
+            pioneer_entity::turn_event_projection_state::Entity::find_by_id(events[1].id.clone())
+                .one(&store.connection)
+                .await
+                .expect("projection state lookup should succeed")
+                .expect("item projection state should exist");
+        assert_eq!(
+            item_state.status,
+            crate::repositories::turn_event_projection_state::PROJECTION_STATUS_FAILED
+        );
+
+        let replay = store
+            .replay_due_turn_event_projections(timestamp + 10, 10)
+            .await
+            .expect("projection replay should succeed");
+        assert_eq!(replay.claimed, 2);
+        assert_eq!(replay.projected, 2);
+        assert_eq!(replay.failed, 0);
+        assert_eq!(replay.exhausted, 0);
+
+        let states = pioneer_entity::turn_event_projection_state::Entity::find()
+            .filter(pioneer_entity::turn_event_projection_state::Column::TurnId.eq(turn_id))
+            .order_by_asc(pioneer_entity::turn_event_projection_state::Column::Sequence)
+            .all(&store.connection)
+            .await
+            .expect("projection states should query");
+        assert_eq!(states.len(), 2);
+        assert!(states.iter().all(|state| {
+            state.status
+                == crate::repositories::turn_event_projection_state::PROJECTION_STATUS_PROJECTED
+        }));
+
+        let attempt = pioneer_entity::turn_item_attempt::Entity::find()
+            .filter(pioneer_entity::turn_item_attempt::Column::TurnId.eq(turn_id))
+            .filter(pioneer_entity::turn_item_attempt::Column::ItemId.eq(item_id))
+            .one(&store.connection)
+            .await
+            .expect("attempt lookup should succeed")
+            .expect("attempt should be projected during replay");
+        assert_eq!(
+            attempt.lease_expires_at,
+            deadlines.lease_expires_at_unix.map(unix_to_datetime)
+        );
+        assert_eq!(
+            attempt.idle_deadline_at,
+            deadlines.idle_deadline_at_unix.map(unix_to_datetime)
+        );
+        assert_eq!(
+            attempt.hard_deadline_at,
+            deadlines.hard_deadline_at_unix.map(unix_to_datetime)
         );
     }
 

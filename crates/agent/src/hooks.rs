@@ -14,6 +14,7 @@ use pioneer_hooks::{
 };
 use pioneer_memory::hooks::MemoryToolBundleArtifactStore;
 use pioneer_tools::ToolExtensionBundle;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -24,7 +25,7 @@ const REDACTED_HOOK_DIAGNOSTIC_MESSAGE: &str = "Hook diagnostic redacted.";
 const HOOK_BEST_EFFORT_FAILED_MESSAGE: &str = "Best-effort hook failed before prompt compilation.";
 const TOOL_BUNDLE_MISSING_ARTIFACT_DIAGNOSTIC_CODE: &str = "tool_bundle.missing_artifact";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentTurnHookRuntimeContext {
     pub mode: HookContextMode,
     pub actor_kind: HookActorKind,

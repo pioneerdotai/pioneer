@@ -10,11 +10,11 @@ use pioneer_protocol::{
     ToolLoopBudgetLimitKind, ToolMetadata, ToolOutputPolicySnapshot, ToolRecoveryIdempotencyMode,
     ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass, ToolRetryBudgetKind, ToolRetryBudgetUsage,
     ToolRetryErrorClass, ToolRetryExhaustionKind, ToolRetryResolution, ToolStoragePayload, Turn,
-    TurnExecutionWindowBlockedNotification, TurnExecutionWindowCheckpointedNotification,
-    TurnExecutionWindowContinuedNotification, TurnExecutionWindowExhaustedNotification,
-    TurnExecutionWindowStartedNotification, TurnItem, TurnItemEvent, TurnItemEventPayload,
-    TurnItemTimeoutReason, TurnItemType, TurnStatus, TurnTimelineResponse, UserInput,
-    UserMessageAttachment,
+    TurnBlockedResumeMetadata, TurnExecutionWindowBlockedNotification,
+    TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
+    TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification, TurnItem,
+    TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType, TurnStatus,
+    TurnTimelineResponse, UserInput, UserMessageAttachment,
 };
 
 const THREAD_ID: &str = "thr_000000000000000001";
@@ -1844,6 +1844,112 @@ fn execution_window_blocked_projects_controlled_pause_not_failure() {
         Some("max_agent_rounds_per_window")
     );
     assert!(details.get("payload").is_none());
+}
+
+#[test]
+fn turn_blocked_resume_metadata_projects_live_and_history() {
+    let resume = TurnBlockedResumeMetadata {
+        reason_class: "model_not_found".to_owned(),
+        human_message: "Model is unavailable".to_owned(),
+        resume_requirements: vec!["Configure an available model".to_owned()],
+        resume_command: format!("turn.resume:{TURN_ID}"),
+        blocked_recovery_job_id: Some("rec_000000000000000001".to_owned()),
+        latest_checkpoint_id: Some("chk_000000000000000001".to_owned()),
+        can_resume_same_turn: true,
+    };
+    let blocked_turn = Turn {
+        id: TURN_ID.to_owned(),
+        status: TurnStatus::Blocked,
+        turn_kind: Default::default(),
+        origin: Default::default(),
+        error: Some("model unavailable".to_owned()),
+        prompt_manifest: None,
+    };
+
+    let mut live = Conversation::new(THREAD_ID);
+    apply_in_progress_turn(&mut live);
+    live.apply(ConversationEvent::TurnBlocked {
+        thread_id: THREAD_ID.to_owned(),
+        turn: blocked_turn.clone(),
+        resume: Some(resume.clone()),
+    });
+
+    let live_turn = live
+        .projection()
+        .turns
+        .iter()
+        .find(|turn| turn.id == TURN_ID)
+        .expect("blocked turn should be projected");
+    assert_eq!(live_turn.phase, TurnPhase::Blocked);
+    assert_eq!(live_turn.resume.as_ref(), Some(&resume));
+    let (live_message, live_details) = system_event_details(&live, "turn_blocked_resumable");
+    assert_eq!(live_message, "Turn blocked: Model is unavailable");
+    assert_eq!(
+        live_details
+            .get("resume_command")
+            .and_then(|value| value.as_str()),
+        Some("turn.resume:turn_000000000000000001")
+    );
+    assert_eq!(
+        live_details
+            .get("blocked_recovery_job_id")
+            .and_then(|value| value.as_str()),
+        Some("rec_000000000000000001")
+    );
+
+    let mut replay = Conversation::new(THREAD_ID);
+    replay.hydrate_history(&[
+        ThreadHistoryEvent {
+            turn_id: TURN_ID.to_owned(),
+            sequence: 1,
+            created_at: 1_000,
+            payload: ThreadHistoryEventPayload::TurnStarted {
+                workspace_id: WORKSPACE_ID.to_owned(),
+                thread_id: THREAD_ID.to_owned(),
+                turn: Turn {
+                    id: TURN_ID.to_owned(),
+                    status: TurnStatus::InProgress,
+                    turn_kind: Default::default(),
+                    origin: Default::default(),
+                    error: None,
+                    prompt_manifest: None,
+                },
+                input: Vec::new(),
+            },
+        },
+        ThreadHistoryEvent {
+            turn_id: TURN_ID.to_owned(),
+            sequence: 2,
+            created_at: 1_100,
+            payload: ThreadHistoryEventPayload::TurnBlocked {
+                workspace_id: WORKSPACE_ID.to_owned(),
+                thread_id: THREAD_ID.to_owned(),
+                turn: blocked_turn,
+                resume: Some(resume.clone()),
+            },
+        },
+    ]);
+
+    let replay_turn = replay
+        .projection()
+        .turns
+        .iter()
+        .find(|turn| turn.id == TURN_ID)
+        .expect("blocked turn should replay");
+    assert_eq!(replay_turn.resume.as_ref(), Some(&resume));
+    let (_replay_message, replay_details) = system_event_details(&replay, "turn_blocked_resumable");
+    assert_eq!(
+        replay_details
+            .get("latest_checkpoint_id")
+            .and_then(|value| value.as_str()),
+        Some("chk_000000000000000001")
+    );
+    assert_eq!(
+        replay_details
+            .get("can_resume_same_turn")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
 }
 
 #[test]

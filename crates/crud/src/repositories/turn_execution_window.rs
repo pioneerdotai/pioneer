@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
-use pioneer_entity::{turn_execution_checkpoint, turn_execution_window, turn_item};
-use pioneer_protocol::{ExecutionWindowExhaustionReason, ExecutionWindowStatus, generate_id};
+use pioneer_entity::{turn, turn_execution_checkpoint, turn_execution_window, turn_item};
+use pioneer_protocol::{
+    ExecutionWindowExhaustionReason, ExecutionWindowStatus, TurnStatus, generate_id,
+};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::{
     ActiveModelTrait, ActiveValue, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter,
@@ -11,7 +13,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use crate::convention::{
     DB_ID_LEN, execution_window_exhaustion_reason_from_db,
     execution_window_exhaustion_reason_to_db, execution_window_status_from_db,
-    execution_window_status_to_db, turn_item_type_from_db,
+    execution_window_status_to_db, turn_item_type_from_db, turn_status_from_db, turn_status_to_db,
 };
 
 pub const TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES: usize = 128 * 1024;
@@ -413,6 +415,102 @@ pub async fn mark_turn_execution_window_blocked<C: ConnectionTrait>(
     update_window_with_stats(db, window_id, ExecutionWindowStatus::Blocked, reason, stats).await
 }
 
+pub async fn close_active_execution_windows_for_terminal_turns<C: ConnectionTrait>(
+    db: &C,
+    now: DateTimeWithTimeZone,
+) -> Result<u64> {
+    let active_window_statuses = [
+        execution_window_status_to_db(ExecutionWindowStatus::Running),
+        execution_window_status_to_db(ExecutionWindowStatus::Checkpointed),
+    ];
+    let terminal_turn_statuses = [
+        turn_status_to_db(TurnStatus::Completed).to_owned(),
+        turn_status_to_db(TurnStatus::Failed).to_owned(),
+        turn_status_to_db(TurnStatus::Interrupted).to_owned(),
+        turn_status_to_db(TurnStatus::Blocked).to_owned(),
+    ];
+
+    let terminal_turn_ids = turn::Entity::find()
+        .filter(turn::Column::Status.is_in(terminal_turn_statuses))
+        .all(db)
+        .await
+        .context("failed to list terminal turns for execution-window repair")?
+        .into_iter()
+        .map(|turn| turn.id)
+        .collect::<Vec<_>>();
+    if terminal_turn_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let windows = turn_execution_window::Entity::find()
+        .filter(turn_execution_window::Column::TurnId.is_in(terminal_turn_ids))
+        .filter(turn_execution_window::Column::Status.is_in(active_window_statuses))
+        .all(db)
+        .await
+        .context("failed to list active execution windows for terminal turn repair")?;
+
+    let mut repaired = 0u64;
+    for window_model in windows {
+        let window = window_record_from_model(window_model)?;
+        let Some(turn_model) = turn::Entity::find_by_id(window.turn_id.clone())
+            .one(db)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to query turn `{}` for execution-window repair",
+                    window.turn_id
+                )
+            })?
+        else {
+            continue;
+        };
+        let Some(turn_status) = turn_status_from_db(turn_model.status.as_str()) else {
+            continue;
+        };
+        let Some(window_status) = terminal_window_status_for_turn_status(turn_status) else {
+            continue;
+        };
+
+        let counts = count_turn_execution_window_terminal_items(db, window.turn_id.as_str())
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to count terminal items for execution-window repair on turn `{}`",
+                    window.turn_id
+                )
+            })?;
+        let metadata_json = repaired_terminal_turn_window_metadata(
+            &window.metadata_json,
+            window_status,
+            turn_model.error.as_deref(),
+        );
+        update_window_with_stats(
+            db,
+            window.id.as_str(),
+            window_status,
+            None,
+            TurnExecutionWindowStatsRecord {
+                agent_round_count: window.agent_round_count.max(counts.agent_round_count),
+                tool_call_count: window.tool_call_count.max(counts.tool_call_count),
+                provider_token_count: window.provider_token_count,
+                metadata_json,
+                completed_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed to repair active execution window `{}` for terminal turn `{}`",
+                window.id, window.turn_id
+            )
+        })?;
+        repaired = repaired.saturating_add(1);
+    }
+
+    Ok(repaired)
+}
+
 pub async fn count_turn_execution_window_terminal_items<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
@@ -542,6 +640,39 @@ pub async fn delete_turn_execution_data_for_turn<C: ConnectionTrait>(
         checkpoints_deleted,
         windows_deleted,
     })
+}
+
+fn terminal_window_status_for_turn_status(status: TurnStatus) -> Option<ExecutionWindowStatus> {
+    match status {
+        TurnStatus::Completed => Some(ExecutionWindowStatus::Completed),
+        TurnStatus::Failed => Some(ExecutionWindowStatus::Failed),
+        TurnStatus::Interrupted => Some(ExecutionWindowStatus::Interrupted),
+        TurnStatus::Blocked => Some(ExecutionWindowStatus::Blocked),
+        TurnStatus::InProgress => None,
+    }
+}
+
+fn repaired_terminal_turn_window_metadata(
+    existing: &serde_json::Value,
+    status: ExecutionWindowStatus,
+    reason: Option<&str>,
+) -> serde_json::Value {
+    let mut metadata = existing.as_object().cloned().unwrap_or_default();
+    metadata.insert(
+        "repairedBy".to_owned(),
+        serde_json::Value::String("bootstrap_terminal_turn_window_repair".to_owned()),
+    );
+    metadata.insert(
+        "terminalStatus".to_owned(),
+        serde_json::Value::String(execution_window_status_to_db(status)),
+    );
+    if let Some(reason) = reason.map(str::trim).filter(|reason| !reason.is_empty()) {
+        metadata.insert(
+            "terminalReason".to_owned(),
+            serde_json::Value::String(reason.to_owned()),
+        );
+    }
+    serde_json::Value::Object(metadata)
 }
 
 pub fn checkpoint_kind_to_db(kind: TurnExecutionCheckpointKind) -> String {

@@ -542,7 +542,11 @@ impl ClientFfiActiveThreadState {
         let Some(coordinator) = inner.coordinators.get_mut(thread_id.as_str()) else {
             return Ok(None);
         };
-        let Some(turn_id) = coordinator.conversation.in_flight_turn_id().map(str::to_owned) else {
+        let Some(turn_id) = coordinator
+            .conversation
+            .in_flight_turn_id()
+            .map(str::to_owned)
+        else {
             return Ok(None);
         };
         let Some(cancel_request) = turn_cancel::plan_turn_cancel_request(

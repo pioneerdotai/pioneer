@@ -1,3 +1,4 @@
+use super::agent_runtime::TurnFailureRecoveryKind;
 use super::*;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -341,13 +342,42 @@ impl TaskAgentExecutor {
             .context("failed to prepare hidden task artifact output directory")?
             .into_iter()
             .collect();
+        let hook_runtime_context = AgentTurnHookRuntimeContext::task(task.id.clone());
+        if let Err(error) = processor
+            .persist_turn_runtime_snapshot(
+                child_thread_id.as_str(),
+                task.workspace_id.as_str(),
+                child_turn_id.as_str(),
+                ThreadMode::Agent,
+                &hook_runtime_context,
+                &thread_outcome.started_notification.thread.model,
+                &thread_outcome.started_notification.thread.model_provider,
+                &workspace_skill_policies,
+                turn_outcome.materialization.input.as_slice(),
+                turn_outcome.materialization.capabilities.as_slice(),
+                resolved_artifacts.as_slice(),
+                &runtime_environment,
+                &[],
+            )
+            .await
+        {
+            processor
+                .report_turn_failure(
+                    child_thread_id,
+                    child_turn_id,
+                    TurnFailureRecoveryKind::TaskDispatch,
+                    format!("failed to persist child task turn runtime snapshot: {error:#}"),
+                )
+                .await;
+            return Ok(TaskExecutorStartOutcome::Started);
+        }
         if let Err(error) = processor
             .agent_manager
             .start_turn_with_hook_context(
                 child_thread_id.as_str(),
                 child_turn_id.as_str(),
                 ThreadMode::Agent,
-                AgentTurnHookRuntimeContext::task(task.id.clone()),
+                hook_runtime_context,
                 &thread_outcome.started_notification.thread.model,
                 &thread_outcome.started_notification.thread.model_provider,
                 workspace_skill_policies,
@@ -360,9 +390,10 @@ impl TaskAgentExecutor {
             .await
         {
             processor
-                .mark_turn_failed(
+                .report_turn_failure(
                     child_thread_id,
                     child_turn_id,
+                    TurnFailureRecoveryKind::TaskDispatch,
                     format!("failed to dispatch child task turn: {error}"),
                 )
                 .await;
@@ -521,7 +552,7 @@ impl TaskAgentExecutor {
             .get_thread_model(child_thread_id.as_str())
             .await?
         else {
-            self.fail_revision_dispatch_turn(
+            self.block_revision_dispatch_turn(
                 processor,
                 child_runtime,
                 handle,
@@ -614,7 +645,7 @@ impl TaskAgentExecutor {
                 return Ok(());
             }
             Err(error) => {
-                self.fail_revision_dispatch_turn(
+                self.block_revision_dispatch_turn(
                     processor,
                     child_runtime,
                     handle,
@@ -641,7 +672,7 @@ impl TaskAgentExecutor {
                 .thread_manager
                 .rollback_turn_start(turn_outcome.rollback_context)
                 .await;
-            self.fail_revision_dispatch_turn(
+            self.block_revision_dispatch_turn(
                 processor,
                 child_runtime,
                 handle,
@@ -669,7 +700,7 @@ impl TaskAgentExecutor {
                 .thread_manager
                 .rollback_turn_start(turn_outcome.rollback_context)
                 .await;
-            self.fail_revision_dispatch_turn(
+            self.block_revision_dispatch_turn(
                 processor,
                 child_runtime,
                 handle,
@@ -725,13 +756,54 @@ impl TaskAgentExecutor {
             .collect();
         let execution_checkpoint_context =
             load_execution_checkpoint_context_for_turn(processor, child_turn_id.as_str()).await?;
+        let hook_runtime_context = AgentTurnHookRuntimeContext::task(task.id.clone());
+        if let Err(error) = processor
+            .persist_turn_runtime_snapshot(
+                child_thread_id.as_str(),
+                task.workspace_id.as_str(),
+                child_turn_id.as_str(),
+                ThreadMode::Agent,
+                &hook_runtime_context,
+                &thread_outcome.started_notification.thread.model,
+                &thread_outcome.started_notification.thread.model_provider,
+                &workspace_skill_policies,
+                turn_outcome.materialization.input.as_slice(),
+                turn_outcome.materialization.capabilities.as_slice(),
+                resolved_artifacts.as_slice(),
+                &runtime_environment,
+                &[],
+            )
+            .await
+        {
+            processor
+                .report_turn_failure(
+                    child_thread_id.clone(),
+                    child_turn_id.clone(),
+                    TurnFailureRecoveryKind::TaskDispatch,
+                    format!("failed to persist revision task turn runtime snapshot: {error:#}"),
+                )
+                .await;
+            self.block_revision_dispatch_turn(
+                processor,
+                child_runtime,
+                handle,
+                task_error(
+                    "revision_dispatch_snapshot_failed",
+                    format!("failed to persist revision task turn runtime snapshot: {error:#}"),
+                    TaskErrorClass::Internal,
+                    Some(run.id.clone()),
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
         if let Err(error) = processor
             .agent_manager
             .start_turn_with_hook_context_and_execution_checkpoint(
                 child_thread_id.as_str(),
                 child_turn_id.as_str(),
                 ThreadMode::Agent,
-                AgentTurnHookRuntimeContext::task(task.id.clone()),
+                hook_runtime_context,
                 &thread_outcome.started_notification.thread.model,
                 &thread_outcome.started_notification.thread.model_provider,
                 workspace_skill_policies,
@@ -745,13 +817,14 @@ impl TaskAgentExecutor {
             .await
         {
             processor
-                .mark_turn_failed(
+                .report_turn_failure(
                     child_thread_id.clone(),
                     child_turn_id.clone(),
+                    TurnFailureRecoveryKind::TaskDispatch,
                     format!("failed to dispatch revision task turn: {error}"),
                 )
                 .await;
-            self.fail_revision_dispatch_turn(
+            self.block_revision_dispatch_turn(
                 processor,
                 child_runtime,
                 handle,
@@ -1012,13 +1085,32 @@ impl TaskAgentExecutor {
             .collect();
         let execution_checkpoint_context =
             load_execution_checkpoint_context_for_turn(processor, child_turn_id).await?;
+        let hook_runtime_context = AgentTurnHookRuntimeContext::task(task.id.clone());
+        processor
+            .persist_turn_runtime_snapshot(
+                child_thread_id,
+                task.workspace_id.as_str(),
+                child_turn_id,
+                ThreadMode::Agent,
+                &hook_runtime_context,
+                &thread_outcome.started_notification.thread.model,
+                &thread_outcome.started_notification.thread.model_provider,
+                &workspace_skill_policies,
+                turn_outcome.materialization.input.as_slice(),
+                turn_outcome.materialization.capabilities.as_slice(),
+                resolved_artifacts.as_slice(),
+                &runtime_environment,
+                &[],
+            )
+            .await
+            .context("failed to persist restored task turn runtime snapshot")?;
         processor
             .agent_manager
             .start_turn_with_hook_context_and_execution_checkpoint(
                 child_thread_id,
                 child_turn_id,
                 ThreadMode::Agent,
-                AgentTurnHookRuntimeContext::task(task.id.clone()),
+                hook_runtime_context,
                 &thread_outcome.started_notification.thread.model,
                 &thread_outcome.started_notification.thread.model_provider,
                 workspace_skill_policies,
@@ -1651,13 +1743,42 @@ impl TaskAgentExecutor {
             .context("failed to prepare reviewer artifact output directory")?
             .into_iter()
             .collect();
+        let hook_runtime_context = AgentTurnHookRuntimeContext::task(task.id.clone());
+        if let Err(error) = processor
+            .persist_turn_runtime_snapshot(
+                task_run_turn.thread_id.as_str(),
+                task.workspace_id.as_str(),
+                task_run_turn.turn_id.as_str(),
+                ThreadMode::Agent,
+                &hook_runtime_context,
+                &thread_outcome.started_notification.thread.model,
+                &thread_outcome.started_notification.thread.model_provider,
+                &workspace_skill_policies,
+                turn_outcome.materialization.input.as_slice(),
+                turn_outcome.materialization.capabilities.as_slice(),
+                resolved_artifacts.as_slice(),
+                &runtime_environment,
+                &[],
+            )
+            .await
+        {
+            processor
+                .report_turn_failure(
+                    task_run_turn.thread_id,
+                    task_run_turn.turn_id,
+                    TurnFailureRecoveryKind::TaskDispatch,
+                    format!("failed to persist reviewer task turn runtime snapshot: {error:#}"),
+                )
+                .await;
+            return Ok(());
+        }
         if let Err(error) = processor
             .agent_manager
             .start_turn_with_hook_context(
                 task_run_turn.thread_id.as_str(),
                 task_run_turn.turn_id.as_str(),
                 ThreadMode::Agent,
-                AgentTurnHookRuntimeContext::task(task.id.clone()),
+                hook_runtime_context,
                 &thread_outcome.started_notification.thread.model,
                 &thread_outcome.started_notification.thread.model_provider,
                 workspace_skill_policies,
@@ -1670,9 +1791,10 @@ impl TaskAgentExecutor {
             .await
         {
             processor
-                .mark_turn_failed(
+                .report_turn_failure(
                     task_run_turn.thread_id,
                     task_run_turn.turn_id,
+                    TurnFailureRecoveryKind::TaskDispatch,
                     format!("failed to dispatch reviewer task turn: {error}"),
                 )
                 .await;
@@ -1836,28 +1958,27 @@ impl TaskAgentExecutor {
         Ok(())
     }
 
-    async fn fail_revision_dispatch_turn(
+    async fn block_revision_dispatch_turn(
         &self,
         processor: &Arc<MessageProcessor>,
         child_runtime: TaskRunChildRuntime,
         handle: TaskExecutionHandle,
         mut error: TaskError,
     ) -> Result<()> {
-        let failed_at = now_timestamp_secs();
+        let blocked_at = now_timestamp_secs();
         error.details = Some(revision_dispatch_error_details(
             &child_runtime.task_run_turn,
         ));
         let message = error.message.clone();
-        record_task_run_turn_failure(
-            &handle,
-            &child_runtime.task_run_turn,
-            TaskRunTurnStatus::Failed,
-            Some(error.clone()),
-            failed_at,
-        )
-        .await?;
-        handle.fail_run(Some(error), failed_at).await?;
-        mark_task_run_occurrence_turn_failed(processor, &child_runtime.lineage, message.as_str())
+        handle
+            .record_task_run_turn_blocked(
+                blocked_task_run_turn(&child_runtime.task_run_turn, blocked_at),
+                Some(error.clone()),
+                blocked_at,
+            )
+            .await?;
+        handle.block_run(Some(error), blocked_at).await?;
+        mark_task_run_occurrence_turn_blocked(processor, &child_runtime.lineage, message.as_str())
             .await?;
         Ok(())
     }
@@ -2304,6 +2425,7 @@ async fn mark_task_run_occurrence_turn_terminal(
                 workspace_id,
                 thread_id: parent_thread_id.to_owned(),
                 turn,
+                resume: None,
             };
             processor
                 .crud_store

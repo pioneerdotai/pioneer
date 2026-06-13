@@ -37,10 +37,12 @@ pub mod thread_lineage;
 pub mod thread_tree;
 pub mod turn;
 pub mod turn_event;
+pub mod turn_event_projection_state;
 pub mod turn_execution_window;
 pub mod turn_item_attempt;
 pub mod turn_llm_context;
 pub mod turn_mcp_binding;
+pub mod turn_runtime_snapshot;
 pub mod turn_skill_binding;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

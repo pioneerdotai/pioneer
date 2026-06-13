@@ -712,10 +712,7 @@ pub(super) fn provider_failure_error(
         http_status,
         provider_code.as_deref(),
     );
-    let is_recoverable_hint = !matches!(
-        class,
-        ProviderFailureClass::InvalidRequest | ProviderFailureClass::PermissionDenied
-    );
+    let is_recoverable_hint = !matches!(class, ProviderFailureClass::InvalidRequest);
 
     ChatTurnError::ProviderFailure {
         item_id: item_id.to_owned(),
@@ -760,9 +757,11 @@ fn classify_provider_failure_class(
     if message_lower.contains("prompt too long")
         || message_lower.contains("context length")
         || message_lower.contains("maximum context")
+        || message_lower.contains("context too long")
+        || message_lower.contains("context window")
         || http_status == Some(413)
     {
-        return ProviderFailureClass::PromptTooLong;
+        return ProviderFailureClass::ContextTooLarge;
     }
     if http_status == Some(429) || message_lower.contains("rate limit") {
         return ProviderFailureClass::RateLimit;
@@ -787,7 +786,19 @@ fn classify_provider_failure_class(
         return ProviderFailureClass::AuthExpired;
     }
     if is_image_input_capability_mismatch(message_lower) {
-        return ProviderFailureClass::ProviderRejected;
+        return ProviderFailureClass::UnsupportedImageInput;
+    }
+    if is_tool_calling_capability_mismatch(message_lower) {
+        return ProviderFailureClass::UnsupportedToolCalling;
+    }
+    if is_streaming_capability_mismatch(message_lower) {
+        return ProviderFailureClass::UnsupportedStreaming;
+    }
+    if is_unsupported_parameter(message_lower, provider_code) {
+        return ProviderFailureClass::UnsupportedParameter;
+    }
+    if is_generic_capability_mismatch(message_lower) {
+        return ProviderFailureClass::UnsupportedCapability;
     }
     if http_status == Some(404)
         || message_lower.contains("model not found")
@@ -800,7 +811,10 @@ fn classify_provider_failure_class(
         || message_lower.contains("permission denied")
         || message_lower.contains("forbidden")
     {
-        return ProviderFailureClass::PermissionDenied;
+        return ProviderFailureClass::AuthOrPermission;
+    }
+    if is_malformed_provider_request(message_lower, provider_code) {
+        return ProviderFailureClass::MalformedProviderRequest;
     }
     if http_status == Some(400)
         || message_lower.contains("invalid request")
@@ -832,6 +846,64 @@ fn is_image_input_capability_mismatch(message_lower: &str) -> bool {
             || message_lower.contains("does not support")
             || message_lower.contains("not support")
             || message_lower.contains("unsupported"))
+}
+
+fn is_tool_calling_capability_mismatch(message_lower: &str) -> bool {
+    (message_lower.contains("tool call")
+        || message_lower.contains("tool use")
+        || message_lower.contains("function call")
+        || message_lower.contains("tools"))
+        && (message_lower.contains("does not support")
+            || message_lower.contains("not support")
+            || message_lower.contains("unsupported")
+            || message_lower.contains("no endpoints found"))
+}
+
+fn is_streaming_capability_mismatch(message_lower: &str) -> bool {
+    message_lower.contains("stream")
+        && (message_lower.contains("does not support")
+            || message_lower.contains("not support")
+            || message_lower.contains("unsupported")
+            || message_lower.contains("streaming disabled"))
+}
+
+fn is_unsupported_parameter(message_lower: &str, provider_code: Option<&str>) -> bool {
+    provider_code
+        .map(|value| {
+            value.contains("unsupported_parameter")
+                || value.contains("unknown_parameter")
+                || value.contains("unrecognized_parameter")
+        })
+        .unwrap_or(false)
+        || message_lower.contains("unsupported parameter")
+        || message_lower.contains("unknown parameter")
+        || message_lower.contains("unrecognized parameter")
+        || message_lower.contains("unrecognized request argument")
+        || message_lower.contains("extra inputs are not permitted")
+}
+
+fn is_generic_capability_mismatch(message_lower: &str) -> bool {
+    (message_lower.contains("does not support")
+        || message_lower.contains("not support")
+        || message_lower.contains("unsupported"))
+        && (message_lower.contains("capability")
+            || message_lower.contains("feature")
+            || message_lower.contains("modality")
+            || message_lower.contains("endpoint"))
+}
+
+fn is_malformed_provider_request(message_lower: &str, provider_code: Option<&str>) -> bool {
+    provider_code
+        .map(|value| {
+            value.contains("invalid_request_error")
+                || value.contains("invalid_request")
+                || value.contains("bad_request")
+        })
+        .unwrap_or(false)
+        && (message_lower.contains("schema")
+            || message_lower.contains("malformed")
+            || message_lower.contains("invalid json")
+            || message_lower.contains("parse"))
 }
 
 fn extract_http_status(message: &str) -> Option<u16> {
@@ -873,7 +945,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn openrouter_image_input_endpoint_error_is_recoverable_provider_rejection() {
+    fn openrouter_image_input_endpoint_error_is_recoverable_capability_rejection() {
         let error = r#"provider stream error: OpenRouter API error (404 Not Found): {"error":{"message":"No endpoints found that support image input","code":404}}"#;
 
         let ChatTurnError::ProviderFailure { failure, .. } = provider_failure_error(
@@ -888,7 +960,7 @@ mod tests {
             panic!("expected provider failure");
         };
 
-        assert_eq!(failure.class, ProviderFailureClass::ProviderRejected);
+        assert_eq!(failure.class, ProviderFailureClass::UnsupportedImageInput);
         assert_eq!(failure.http_status, Some(404));
         assert!(failure.is_recoverable_hint);
     }
@@ -925,6 +997,45 @@ mod tests {
         assert_eq!(failure.class, ProviderFailureClass::ProviderRejected);
         assert_eq!(failure.http_status, Some(400));
         assert!(failure.is_recoverable_hint);
+    }
+
+    #[test]
+    fn unsupported_streaming_maps_to_provider_neutral_class() {
+        assert_eq!(
+            classify_provider_failure_class(
+                "provider error: this model does not support streaming",
+                ProviderFailureStage::Connect,
+                Some(400),
+                None,
+            ),
+            ProviderFailureClass::UnsupportedStreaming
+        );
+    }
+
+    #[test]
+    fn unsupported_parameter_maps_to_provider_neutral_class() {
+        assert_eq!(
+            classify_provider_failure_class(
+                "provider error: unrecognized request argument: reasoning_effort",
+                ProviderFailureStage::Connect,
+                Some(400),
+                Some("unsupported_parameter"),
+            ),
+            ProviderFailureClass::UnsupportedParameter
+        );
+    }
+
+    #[test]
+    fn context_length_maps_to_context_too_large() {
+        assert_eq!(
+            classify_provider_failure_class(
+                "provider error: maximum context length exceeded",
+                ProviderFailureStage::Connect,
+                Some(400),
+                None,
+            ),
+            ProviderFailureClass::ContextTooLarge
+        );
     }
 
     #[test]

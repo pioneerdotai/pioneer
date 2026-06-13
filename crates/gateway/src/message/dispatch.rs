@@ -17,7 +17,7 @@ use pioneer_protocol::{
     TaskPauseParams, TaskRescheduleParams, TaskResumeParams, TaskReviseParams,
     TaskTreeParams as TaskTreeTaskParams, TaskWaitParams, ThreadAgentsDocArchiveParams,
     ThreadAgentsDocGetParams, ThreadAgentsDocResolveForThreadParams, ThreadAgentsDocSaveParams,
-    TurnCancelParams, TurnTimelineParams,
+    TurnCancelParams, TurnResumeParams, TurnTimelineParams,
 };
 
 impl MessageProcessor {
@@ -638,6 +638,25 @@ impl MessageProcessor {
                                 Some(request.id),
                                 INVALID_PARAMS_CODE,
                                 format!("invalid params for `{}`: {error}", methods::TURN_CANCEL),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::TURN_RESUME => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<TurnResumeParams>(params_value) {
+                    Ok(params) => {
+                        self.turn_resume(connection_id, request.id, params).await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!("invalid params for `{}`: {error}", methods::TURN_RESUME),
                             ),
                         )
                         .await;

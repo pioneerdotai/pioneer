@@ -241,6 +241,73 @@ fn normalized_titles_equal(left: &str, right: &str) -> bool {
     summary::normalize_title_for_compare(left) == summary::normalize_title_for_compare(right)
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) enum TurnFailureRecoveryKind {
+    TurnStart,
+    TurnDispatch,
+    ProjectionFailure,
+    ExecutionWindowContinuation,
+    ArtifactFinalization,
+    TaskDispatch,
+    RuntimeFailure,
+}
+
+impl TurnFailureRecoveryKind {
+    const fn trigger(self) -> pioneer_protocol::RecoveryTrigger {
+        match self {
+            Self::TurnStart => pioneer_protocol::RecoveryTrigger::TurnStart,
+            Self::TurnDispatch => pioneer_protocol::RecoveryTrigger::TurnDispatch,
+            Self::ProjectionFailure => pioneer_protocol::RecoveryTrigger::ProjectionFailure,
+            Self::ExecutionWindowContinuation => {
+                pioneer_protocol::RecoveryTrigger::ExecutionWindowContinuation
+            }
+            Self::ArtifactFinalization => pioneer_protocol::RecoveryTrigger::ArtifactFinalization,
+            Self::TaskDispatch => pioneer_protocol::RecoveryTrigger::TaskDispatch,
+            Self::RuntimeFailure => pioneer_protocol::RecoveryTrigger::RuntimeFailure,
+        }
+    }
+
+    const fn action(self) -> pioneer_protocol::RecoveryAction {
+        match self {
+            Self::ProjectionFailure => pioneer_protocol::RecoveryAction::RetryWithBackoff,
+            Self::ArtifactFinalization => {
+                pioneer_protocol::RecoveryAction::RepairArtifactFinalization
+            }
+            Self::TurnStart
+            | Self::TurnDispatch
+            | Self::ExecutionWindowContinuation
+            | Self::TaskDispatch
+            | Self::RuntimeFailure => pioneer_protocol::RecoveryAction::RestartTurn,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::TurnStart => "turn_start",
+            Self::TurnDispatch => "turn_dispatch",
+            Self::ProjectionFailure => "projection_failure",
+            Self::ExecutionWindowContinuation => "execution_window_continuation",
+            Self::ArtifactFinalization => "artifact_finalization",
+            Self::TaskDispatch => "task_dispatch",
+            Self::RuntimeFailure => "runtime_failure",
+        }
+    }
+}
+
+fn classify_legacy_turn_failure(error_message: &str) -> TurnFailureRecoveryKind {
+    let normalized = error_message.trim().to_ascii_lowercase();
+    if normalized.starts_with("failed to persist")
+        || normalized.starts_with("failed to load")
+        || normalized.starts_with("failed to create execution window")
+        || normalized.starts_with("failed to mark execution window")
+        || normalized.contains("projection")
+        || normalized.contains("materialize")
+    {
+        return TurnFailureRecoveryKind::ProjectionFailure;
+    }
+    TurnFailureRecoveryKind::RuntimeFailure
+}
+
 impl MessageProcessor {
     async fn close_latest_active_execution_window_for_terminal_turn(
         &self,
@@ -725,6 +792,23 @@ impl MessageProcessor {
         self.turn_llm_context_sequences.lock().await.remove(turn_id);
     }
 
+    async fn delete_turn_runtime_snapshot_for_closed_turn(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        status: &str,
+    ) {
+        if let Err(error) = self.crud_store.delete_turn_runtime_snapshot(turn_id).await {
+            warn!(
+                thread_id,
+                turn_id,
+                status,
+                error = %format!("{error:#}"),
+                "failed to delete turn_runtime_snapshot row after turn close"
+            );
+        }
+    }
+
     pub(super) async fn handle_durable_agent_event(&self, event: AgentDurableEvent) {
         let thread_id = durable_event_thread_id(&event).map(str::to_owned);
         let committed = message_future(self.persist_durable_agent_event(event.clone())).await;
@@ -963,7 +1047,7 @@ impl MessageProcessor {
                     expires_at: Some(llm_context_expires_at(created_at)),
                 };
                 if let Err(error) = self.crud_store.insert_turn_llm_context(entry).await {
-                    self.mark_turn_failed(
+                    self.report_legacy_turn_failure(
                         thread_id,
                         turn_id,
                         format!("failed to persist turn llm context: {error:#}"),
@@ -993,7 +1077,7 @@ impl MessageProcessor {
                 )
                 .await
                 {
-                    self.mark_turn_failed(
+                    self.report_legacy_turn_failure(
                         thread_id,
                         turn_id,
                         format!("failed to persist item/started: {error:#}"),
@@ -1036,7 +1120,7 @@ impl MessageProcessor {
                 )
                 .await
                 {
-                    self.mark_turn_failed(
+                    self.report_legacy_turn_failure(
                         thread_id,
                         turn_id,
                         format!("failed to persist item/completed: {error:#}"),
@@ -1069,7 +1153,7 @@ impl MessageProcessor {
                     .materialize_item_tool_retry_scheduled(notification.clone(), event_timestamp)
                     .await
                 {
-                    self.mark_turn_failed(
+                    self.report_legacy_turn_failure(
                         thread_id,
                         turn_id,
                         format!("failed to persist item/tool/retry_scheduled: {error:#}"),
@@ -1100,7 +1184,7 @@ impl MessageProcessor {
                     .materialize_item_tool_retry_resolved(notification.clone(), event_timestamp)
                     .await
                 {
-                    self.mark_turn_failed(
+                    self.report_legacy_turn_failure(
                         thread_id,
                         turn_id,
                         format!("failed to persist item/tool/retry_resolved: {error:#}"),
@@ -1131,7 +1215,7 @@ impl MessageProcessor {
                     .materialize_item_tool_retry_exhausted(notification.clone(), event_timestamp)
                     .await
                 {
-                    self.mark_turn_failed(
+                    self.report_legacy_turn_failure(
                         thread_id,
                         turn_id,
                         format!("failed to persist item/tool/retry_exhausted: {error:#}"),
@@ -1165,7 +1249,7 @@ impl MessageProcessor {
                     )
                     .await
                 {
-                    self.mark_turn_failed(
+                    self.report_legacy_turn_failure(
                         thread_id,
                         turn_id,
                         format!("failed to persist turn/tool_loop/budget_exceeded: {error:#}"),
@@ -1199,7 +1283,7 @@ impl MessageProcessor {
                     )
                     .await
                 {
-                    self.mark_turn_failed(
+                    self.report_legacy_turn_failure(
                         thread_id.clone(),
                         turn_id.clone(),
                         format!("failed to persist turn/execution_window/started: {error:#}"),
@@ -1214,7 +1298,7 @@ impl MessageProcessor {
                 {
                     Ok(latest) => latest,
                     Err(error) => {
-                        self.mark_turn_failed(
+                        self.report_legacy_turn_failure(
                             thread_id.clone(),
                             turn_id.clone(),
                             format!("failed to load latest execution window: {error:#}"),
@@ -1249,7 +1333,7 @@ impl MessageProcessor {
                         )
                         .await
                     {
-                        self.mark_turn_failed(
+                        self.report_legacy_turn_failure(
                             thread_id.clone(),
                             turn_id.clone(),
                             format!("failed to create execution window: {error:#}"),
@@ -1287,7 +1371,7 @@ impl MessageProcessor {
                     )
                     .await
                 {
-                    self.mark_turn_failed(
+                    self.report_legacy_turn_failure(
                         thread_id.clone(),
                         turn_id.clone(),
                         format!("failed to persist turn/execution_window/exhausted: {error:#}"),
@@ -1302,7 +1386,7 @@ impl MessageProcessor {
                 {
                     Ok(latest) => latest,
                     Err(error) => {
-                        self.mark_turn_failed(
+                        self.report_legacy_turn_failure(
                             thread_id.clone(),
                             turn_id.clone(),
                             format!("failed to load execution window for exhaustion: {error:#}"),
@@ -1347,7 +1431,7 @@ impl MessageProcessor {
                     {
                         Ok(window) => Some(window),
                         Err(error) => {
-                            self.mark_turn_failed(
+                            self.report_legacy_turn_failure(
                                 thread_id.clone(),
                                 turn_id.clone(),
                                 format!(
@@ -1393,7 +1477,7 @@ impl MessageProcessor {
                         )
                         .await
                 {
-                    self.mark_turn_failed(
+                    self.report_legacy_turn_failure(
                         thread_id.clone(),
                         turn_id.clone(),
                         format!("failed to mark execution window exhausted: {error:#}"),
@@ -1423,7 +1507,7 @@ impl MessageProcessor {
                     )
                     .await
                 {
-                    self.mark_turn_failed(
+                    self.report_legacy_turn_failure(
                         thread_id.clone(),
                         turn_id.clone(),
                         format!("failed to persist turn/execution_window/checkpointed: {error:#}"),
@@ -1438,7 +1522,7 @@ impl MessageProcessor {
                 {
                     Ok(latest) => latest,
                     Err(error) => {
-                        self.mark_turn_failed(
+                        self.report_legacy_turn_failure(
                             thread_id.clone(),
                             turn_id.clone(),
                             format!("failed to load execution window for checkpoint: {error:#}"),
@@ -1519,7 +1603,7 @@ impl MessageProcessor {
                         )
                         .await
                     {
-                        self.mark_turn_failed(
+                        self.report_legacy_turn_failure(
                             thread_id.clone(),
                             turn_id.clone(),
                             format!("failed to save execution window checkpoint: {error:#}"),
@@ -1535,7 +1619,7 @@ impl MessageProcessor {
                         )
                         .await
                     {
-                        self.mark_turn_failed(
+                        self.report_legacy_turn_failure(
                             thread_id.clone(),
                             turn_id.clone(),
                             format!("failed to mark execution window checkpointed: {error:#}"),
@@ -1567,7 +1651,7 @@ impl MessageProcessor {
                     )
                     .await
                 {
-                    self.mark_turn_failed(
+                    self.report_legacy_turn_failure(
                         notification.thread_id.clone(),
                         notification.turn_id.clone(),
                         format!("failed to persist turn/execution_window/continued: {error:#}"),
@@ -1591,7 +1675,7 @@ impl MessageProcessor {
                             )
                             .await
                         {
-                            self.mark_turn_failed(
+                            self.report_legacy_turn_failure(
                                 notification.thread_id.clone(),
                                 notification.turn_id.clone(),
                                 format!("failed to mark execution window continued: {error:#}"),
@@ -1616,7 +1700,7 @@ impl MessageProcessor {
                         );
                     }
                     Err(error) => {
-                        self.mark_turn_failed(
+                        self.report_legacy_turn_failure(
                             notification.thread_id.clone(),
                             notification.turn_id.clone(),
                             format!("failed to load execution window for continuation: {error:#}"),
@@ -1642,7 +1726,7 @@ impl MessageProcessor {
                     )
                     .await
                 {
-                    self.mark_turn_failed(
+                    self.report_legacy_turn_failure(
                         notification.thread_id.clone(),
                         notification.turn_id.clone(),
                         format!("failed to persist turn/execution_window/blocked: {error:#}"),
@@ -1657,7 +1741,7 @@ impl MessageProcessor {
                 {
                     Ok(latest) => latest,
                     Err(error) => {
-                        self.mark_turn_failed(
+                        self.report_legacy_turn_failure(
                             notification.thread_id.clone(),
                             notification.turn_id.clone(),
                             format!("failed to load execution window for blocked state: {error:#}"),
@@ -1702,7 +1786,7 @@ impl MessageProcessor {
                     {
                         Ok(window) => Some(window),
                         Err(error) => {
-                            self.mark_turn_failed(
+                            self.report_legacy_turn_failure(
                                 notification.thread_id.clone(),
                                 notification.turn_id.clone(),
                                 format!(
@@ -1746,7 +1830,7 @@ impl MessageProcessor {
                         )
                         .await
                 {
-                    self.mark_turn_failed(
+                    self.report_legacy_turn_failure(
                         notification.thread_id.clone(),
                         notification.turn_id.clone(),
                         format!("failed to mark execution window blocked: {error:#}"),
@@ -1754,7 +1838,22 @@ impl MessageProcessor {
                     .await;
                     return false;
                 }
-                if !self
+                if notification
+                    .reason
+                    .contains("execution window continuation could not resume")
+                {
+                    if !self
+                        .report_turn_failure(
+                            notification.thread_id.clone(),
+                            notification.turn_id.clone(),
+                            TurnFailureRecoveryKind::ExecutionWindowContinuation,
+                            notification.reason.clone(),
+                        )
+                        .await
+                    {
+                        return false;
+                    }
+                } else if !self
                     .mark_turn_blocked(
                         notification.thread_id.clone(),
                         notification.turn_id.clone(),
@@ -1807,8 +1906,20 @@ impl MessageProcessor {
                 error,
                 recovery,
             } => {
-                if !self
-                    .mark_turn_failed_with_recovery(thread_id, turn_id, error, recovery)
+                if recovery.is_some() {
+                    if !self
+                        .mark_turn_failed_with_recovery(thread_id, turn_id, error, recovery)
+                        .await
+                    {
+                        return false;
+                    }
+                } else if !self
+                    .report_turn_failure(
+                        thread_id,
+                        turn_id,
+                        TurnFailureRecoveryKind::RuntimeFailure,
+                        error,
+                    )
                     .await
                 {
                     return false;
@@ -1820,7 +1931,21 @@ impl MessageProcessor {
                 reason,
                 recovery,
             } => {
-                if !self
+                if recovery.is_none()
+                    && reason.contains("execution window continuation could not resume")
+                {
+                    if !self
+                        .report_turn_failure(
+                            thread_id,
+                            turn_id,
+                            TurnFailureRecoveryKind::ExecutionWindowContinuation,
+                            reason,
+                        )
+                        .await
+                    {
+                        return false;
+                    }
+                } else if !self
                     .mark_turn_blocked_with_recovery(thread_id, turn_id, reason, recovery)
                     .await
                 {
@@ -1977,7 +2102,7 @@ impl MessageProcessor {
                 }
             }
             Err(error) => {
-                self.mark_turn_failed(
+                self.report_legacy_turn_failure(
                     thread_id,
                     turn_id,
                     format!("failed to mark recovery attempt succeeded: {error:#}"),
@@ -1985,6 +2110,111 @@ impl MessageProcessor {
                 .await;
             }
         }
+    }
+
+    pub(super) async fn report_turn_failure(
+        &self,
+        thread_id: String,
+        turn_id: String,
+        kind: TurnFailureRecoveryKind,
+        error_message: String,
+    ) -> bool {
+        let turn_state = match self
+            .crud_store
+            .get_turn(thread_id.as_str(), turn_id.as_str())
+            .await
+        {
+            Ok(state) => state,
+            Err(error) => {
+                warn!(
+                    thread_id,
+                    turn_id,
+                    failure_kind = kind.label(),
+                    error = %format!("{error:#}"),
+                    "failed to load turn before reporting recoverable failure"
+                );
+                return false;
+            }
+        };
+        let Some((_workspace_id, turn)) = turn_state else {
+            warn!(
+                thread_id,
+                turn_id,
+                failure_kind = kind.label(),
+                "turn missing before reporting recoverable failure"
+            );
+            return false;
+        };
+        if turn.status != TurnStatus::InProgress {
+            return false;
+        }
+
+        let now_unix = now_timestamp_secs();
+        let candidate = crate::resilience::RuntimeFailureCandidate {
+            turn_id: turn_id.clone(),
+            item_id: format!("runtime:{}", kind.label()),
+            item_type: TurnItemType::SystemEvent,
+            trigger: kind.trigger(),
+            action: kind.action(),
+            reason: error_message.clone(),
+            base_backoff_secs: 2,
+            max_attempts: 3,
+            max_wall_clock_secs: 180,
+            no_progress_limit: 3,
+            metadata: serde_json::json!({
+                "thread_id": thread_id,
+                "turn_id": turn_id,
+                "failure_kind": kind.label(),
+                "error": error_message,
+            }),
+        };
+
+        let outcome = match self
+            .recovery_coordinator
+            .enqueue_runtime_failure_job(&candidate, now_unix)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                warn!(
+                    turn_id = candidate.turn_id,
+                    failure_kind = kind.label(),
+                    error = %format!("{error:#}"),
+                    "failed to enqueue recoverable turn failure"
+                );
+                return false;
+            }
+        };
+
+        let is_created = outcome.is_created();
+        let next_attempt_number = outcome.next_attempt_number();
+        let job = outcome.into_job();
+        let event = if is_created {
+            crate::resilience::RecoveryCoordinatorEvent::RecoveryOpened {
+                job_id: job.id,
+                turn_id: candidate.turn_id,
+                item_id: candidate.item_id,
+                item_type: candidate.item_type,
+                trigger: job.trigger,
+                action: job.action,
+                attempt_number: next_attempt_number,
+            }
+        } else {
+            crate::resilience::RecoveryCoordinatorEvent::RecoveryAttached {
+                job_id: job.id,
+                turn_id: candidate.turn_id,
+                item_id: candidate.item_id,
+                item_type: candidate.item_type,
+                recovery_item_id: job.item_id,
+                recovery_item_type: job.item_type,
+                trigger: candidate.trigger,
+                action: job.action,
+                existing_status: job.status,
+                next_attempt_number,
+            }
+        };
+        self.handle_recovery_event(event, now_unix).await;
+        true
     }
 
     pub(super) async fn handle_provider_failure_detected(
@@ -2015,7 +2245,7 @@ impl MessageProcessor {
                     }
                 }
                 Err(error) => {
-                    self.mark_turn_failed(
+                    self.report_legacy_turn_failure(
                         thread_id,
                         turn_id,
                         format!("failed to update provider recovery: {error:#}"),
@@ -2096,7 +2326,7 @@ impl MessageProcessor {
                             }
                         }
                         Err(error) => {
-                            self.mark_turn_failed(
+                            self.report_legacy_turn_failure(
                                 thread_id,
                                 turn_id,
                                 format!("failed to apply terminal provider recovery: {error:#}"),
@@ -2107,7 +2337,7 @@ impl MessageProcessor {
                 }
             }
             Err(error) => {
-                self.mark_turn_failed(
+                self.report_legacy_turn_failure(
                     thread_id,
                     turn_id,
                     format!("failed to schedule provider recovery: {error:#}"),
@@ -2383,7 +2613,7 @@ impl MessageProcessor {
                 "recovery {status_label} for item `{}`: {}",
                 outcome.item_id, outcome.error_message
             );
-            self.mark_turn_failed(thread_id, outcome.turn_id, turn_error)
+            self.mark_turn_failed_terminal(thread_id, outcome.turn_id, turn_error)
                 .await;
         }
     }
@@ -2551,6 +2781,44 @@ impl MessageProcessor {
                 };
                 self.persist_and_send_item_recovery_succeeded(notification, event_timestamp)
                     .await;
+            }
+            crate::resilience::RecoveryCoordinatorEvent::RecoveryBlocked {
+                job_id,
+                turn_id,
+                reason,
+            } => {
+                let Some((thread_id, _workspace_id)) = self
+                    .crud_store
+                    .get_turn_location(turn_id.as_str())
+                    .await
+                    .ok()
+                    .flatten()
+                else {
+                    return;
+                };
+                let resume = self
+                    .build_recovery_blocked_resume_metadata(
+                        turn_id.as_str(),
+                        job_id.as_str(),
+                        reason.as_str(),
+                    )
+                    .await;
+                if !self
+                    .mark_turn_blocked_with_resume_metadata(
+                        thread_id,
+                        turn_id,
+                        format!("{reason} (recovery job {job_id})"),
+                        None,
+                        Some(resume),
+                    )
+                    .await
+                {
+                    warn!(
+                        recovery_job_id = %job_id,
+                        error = %reason,
+                        "failed to mark turn blocked for blocked recovery job"
+                    );
+                }
             }
             crate::resilience::RecoveryCoordinatorEvent::RecoveryExhausted(outcome) => {
                 self.send_recovery_exhausted_notification(&outcome, event_timestamp)
@@ -2999,7 +3267,7 @@ impl MessageProcessor {
                 .rollback_turn_finish(finish_outcome.rollback_context)
                 .await;
 
-            self.mark_turn_failed(
+            self.report_legacy_turn_failure(
                 thread_id,
                 turn_id,
                 format!("failed to persist turn/completed: {error:#}"),
@@ -3049,6 +3317,12 @@ impl MessageProcessor {
                 "failed to delete turn_llm_context rows after turn completion"
             );
         }
+        self.delete_turn_runtime_snapshot_for_closed_turn(
+            thread_id.as_str(),
+            turn_id.as_str(),
+            "completed",
+        )
+        .await;
         self.clear_turn_llm_context_state(turn_id.as_str()).await;
         self.clear_artifact_finalization_state(turn_id.as_str())
             .await;
@@ -3103,8 +3377,108 @@ impl MessageProcessor {
         turn_id: String,
         reason: String,
     ) -> bool {
-        self.mark_turn_blocked_with_recovery(thread_id, turn_id, reason, None)
+        self.mark_turn_blocked_with_resume_metadata(thread_id, turn_id, reason, None, None)
             .await
+    }
+
+    async fn build_recovery_blocked_resume_metadata(
+        &self,
+        turn_id: &str,
+        recovery_job_id: &str,
+        reason: &str,
+    ) -> pioneer_protocol::TurnBlockedResumeMetadata {
+        let latest_checkpoint_id = self
+            .crud_store
+            .latest_turn_execution_checkpoint_for_turn(turn_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|checkpoint| checkpoint.id);
+        let recovery_job = self
+            .crud_store
+            .get_recovery_job(recovery_job_id)
+            .await
+            .ok()
+            .flatten();
+        let has_runtime_snapshot = self
+            .crud_store
+            .get_turn_runtime_snapshot(turn_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+        let can_resume_same_turn = recovery_job
+            .as_ref()
+            .is_some_and(|job| !job.item_type.is_tool_item() || has_runtime_snapshot);
+
+        let normalized = reason.to_ascii_lowercase();
+        let reason_class = if normalized.contains("auth")
+            || normalized.contains("permission")
+            || normalized.contains("credential")
+            || normalized.contains("api key")
+        {
+            "auth_or_config"
+        } else if normalized.contains("model") {
+            "model_unavailable"
+        } else if normalized.contains("capability") || normalized.contains("unsupported") {
+            "unsupported_capability"
+        } else {
+            "recovery_blocked"
+        };
+
+        let mut resume_requirements = Vec::new();
+        match reason_class {
+            "auth_or_config" => {
+                resume_requirements.push(
+                    "Fix provider authentication/configuration for the selected model/provider."
+                        .to_owned(),
+                );
+            }
+            "model_unavailable" => {
+                resume_requirements.push(
+                    "Configure an available model or an explicit fallback policy.".to_owned(),
+                );
+            }
+            "unsupported_capability" => {
+                resume_requirements.push(
+                    "Disable the unsupported capability or configure a provider/model that supports it."
+                        .to_owned(),
+                );
+            }
+            _ => {
+                resume_requirements.push(
+                    "Resolve the blocked recovery condition reported in the reason.".to_owned(),
+                );
+            }
+        }
+        resume_requirements
+            .push("Resume the same turn after the requirement is satisfied.".to_owned());
+        if !can_resume_same_turn {
+            if recovery_job
+                .as_ref()
+                .is_some_and(|job| job.item_type.is_tool_item())
+            {
+                resume_requirements.push(
+                    "This blocked tool recovery has no durable turn runtime snapshot; operator recovery is required."
+                        .to_owned(),
+                );
+            } else {
+                resume_requirements.push(
+                    "This blocked recovery cannot be resumed automatically; operator recovery is required."
+                        .to_owned(),
+                );
+            }
+        }
+
+        pioneer_protocol::TurnBlockedResumeMetadata {
+            reason_class: reason_class.to_owned(),
+            human_message: reason.to_owned(),
+            resume_requirements,
+            resume_command: format!("turn.resume:{turn_id}"),
+            blocked_recovery_job_id: Some(recovery_job_id.to_owned()),
+            latest_checkpoint_id,
+            can_resume_same_turn,
+        }
     }
 
     pub(super) async fn mark_turn_blocked_with_recovery(
@@ -3114,12 +3488,51 @@ impl MessageProcessor {
         reason: String,
         recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
     ) -> bool {
+        self.mark_turn_blocked_with_resume_metadata(thread_id, turn_id, reason, recovery, None)
+            .await
+    }
+
+    pub(super) async fn mark_turn_blocked_with_resume_metadata(
+        &self,
+        thread_id: String,
+        turn_id: String,
+        reason: String,
+        recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
+        resume: Option<pioneer_protocol::TurnBlockedResumeMetadata>,
+    ) -> bool {
         if let Some((_workspace_id, current_turn)) = self
             .thread_manager
             .turn_get(thread_id.as_str(), turn_id.as_str())
             .await
         {
             if current_turn.status == TurnStatus::Blocked {
+                let block_reason = current_turn
+                    .error
+                    .as_deref()
+                    .unwrap_or_else(|| reason.as_str());
+                self.ensure_blocked_turn_terminal_cleanup(
+                    thread_id.as_str(),
+                    turn_id.as_str(),
+                    Some(block_reason),
+                )
+                .await;
+                if let Err(error) = self
+                    .recovery_coordinator
+                    .block_active_recoveries_for_turn(
+                        turn_id.as_str(),
+                        recovery.as_ref(),
+                        block_reason,
+                        now_timestamp_secs(),
+                    )
+                    .await
+                {
+                    warn!(
+                        thread_id,
+                        turn_id,
+                        error = %format!("{error:#}"),
+                        "failed to mark active recovery jobs blocked for already blocked turn"
+                    );
+                }
                 return true;
             }
             if current_turn.status != TurnStatus::InProgress {
@@ -3175,6 +3588,7 @@ impl MessageProcessor {
             workspace_id: finish_outcome.workspace_id.clone(),
             thread_id: finish_outcome.thread_id.clone(),
             turn: finish_outcome.turn.clone(),
+            resume,
         };
 
         let event_timestamp = now_timestamp_secs();
@@ -3196,21 +3610,12 @@ impl MessageProcessor {
             return false;
         }
 
-        if let Err(error) = self
-            .close_latest_active_execution_window_for_terminal_turn(
-                turn_id.as_str(),
-                pioneer_protocol::ExecutionWindowStatus::Blocked,
-                turn_blocked.turn.error.as_deref(),
-            )
-            .await
-        {
-            warn!(
-                thread_id,
-                turn_id,
-                error = %format!("{error:#}"),
-                "failed to close execution window after turn block"
-            );
-        }
+        self.ensure_blocked_turn_terminal_cleanup(
+            thread_id.as_str(),
+            turn_id.as_str(),
+            turn_blocked.turn.error.as_deref(),
+        )
+        .await;
 
         if let Err(error) = self
             .task_agent_executor
@@ -3228,22 +3633,6 @@ impl MessageProcessor {
                 "failed to reconcile blocked child task turn"
             );
         }
-
-        if let Err(error) = self
-            .crud_store
-            .delete_turn_llm_context_for_turn(turn_id.as_str())
-            .await
-        {
-            warn!(
-                thread_id,
-                turn_id,
-                error = %format!("{error:#}"),
-                "failed to delete turn_llm_context rows after turn block"
-            );
-        }
-        self.clear_turn_llm_context_state(turn_id.as_str()).await;
-        self.clear_artifact_finalization_state(turn_id.as_str())
-            .await;
 
         if let Err(error) = self
             .recovery_coordinator
@@ -3288,14 +3677,76 @@ impl MessageProcessor {
         true
     }
 
-    pub(super) async fn mark_turn_failed(
+    async fn ensure_blocked_turn_terminal_cleanup(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        reason: Option<&str>,
+    ) {
+        if let Err(error) = self
+            .close_latest_active_execution_window_for_terminal_turn(
+                turn_id,
+                pioneer_protocol::ExecutionWindowStatus::Blocked,
+                reason,
+            )
+            .await
+        {
+            warn!(
+                thread_id,
+                turn_id,
+                error = %format!("{error:#}"),
+                "failed to close execution window after turn block"
+            );
+        }
+
+        if let Err(error) = self
+            .crud_store
+            .delete_turn_llm_context_for_turn(turn_id)
+            .await
+        {
+            warn!(
+                thread_id,
+                turn_id,
+                error = %format!("{error:#}"),
+                "failed to delete turn_llm_context rows after turn block"
+            );
+        }
+        self.clear_turn_llm_context_state(turn_id).await;
+        self.clear_artifact_finalization_state(turn_id).await;
+    }
+
+    pub(super) async fn report_legacy_turn_failure(
         &self,
         thread_id: String,
         turn_id: String,
         error_message: String,
     ) {
+        if !self
+            .report_turn_failure(
+                thread_id.clone(),
+                turn_id.clone(),
+                classify_legacy_turn_failure(error_message.as_str()),
+                error_message.clone(),
+            )
+            .await
+        {
+            warn!(
+                thread_id,
+                turn_id,
+                error = %error_message,
+                "recoverable turn failure could not be reported"
+            );
+        }
+    }
+
+    pub(super) async fn mark_turn_failed_terminal(
+        &self,
+        thread_id: String,
+        turn_id: String,
+        error_message: String,
+    ) -> bool {
         self.mark_turn_failed_with_recovery(thread_id, turn_id, error_message, None)
-            .await;
+            .await
     }
 
     pub(super) async fn mark_turn_interrupted(
@@ -3446,6 +3897,12 @@ impl MessageProcessor {
                 "failed to delete turn_llm_context rows after turn interruption"
             );
         }
+        self.delete_turn_runtime_snapshot_for_closed_turn(
+            thread_id.as_str(),
+            turn_id.as_str(),
+            "interrupted",
+        )
+        .await;
         self.clear_turn_llm_context_state(turn_id.as_str()).await;
         self.clear_artifact_finalization_state(turn_id.as_str())
             .await;
@@ -3629,6 +4086,12 @@ impl MessageProcessor {
                 "failed to delete turn_llm_context rows after turn failure"
             );
         }
+        self.delete_turn_runtime_snapshot_for_closed_turn(
+            thread_id.as_str(),
+            turn_id.as_str(),
+            "failed",
+        )
+        .await;
         self.clear_turn_llm_context_state(turn_id.as_str()).await;
         self.clear_artifact_finalization_state(turn_id.as_str())
             .await;

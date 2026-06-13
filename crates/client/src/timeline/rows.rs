@@ -2489,6 +2489,7 @@ mod desktop_parity_tests {
                 started_at_unix_ms: Some(1),
                 completed_at_unix_ms: Some(5),
                 error: None,
+                resume: None,
             }],
             ..ConversationViewState::default()
         };

@@ -613,14 +613,19 @@ impl Conversation {
                 self.projector.apply_turn_failed(turn, event.created_at);
             }
             ThreadHistoryEventPayload::TurnBlocked {
-                thread_id, turn, ..
+                thread_id,
+                turn,
+                resume,
+                ..
             } => {
                 let conversation_event = ConversationEvent::TurnBlocked {
                     thread_id: thread_id.clone(),
                     turn: turn.clone(),
+                    resume: resume.clone(),
                 };
                 self.apply_history_conversation_event(conversation_event, event.created_at);
-                self.projector.apply_turn_blocked(turn, event.created_at);
+                self.projector
+                    .apply_turn_blocked(turn, resume.as_ref(), event.created_at);
             }
         }
     }

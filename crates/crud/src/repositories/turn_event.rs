@@ -54,9 +54,53 @@ pub async fn append_event<C: ConnectionTrait>(
         .context("failed to append turn event")?;
 
     Ok(AppendedTurnEvent {
+        id,
+        thread_id,
+        turn_id,
+        sequence,
         payload: payload.clone(),
         created_at,
     })
+}
+
+pub fn appended_event_from_model(model: turn_event::Model) -> Result<AppendedTurnEvent> {
+    let payload: TurnEventPayload = serde_json::from_str(model.payload.as_str())
+        .with_context(|| format!("failed to deserialize turn_event `{}` payload", model.id))?;
+
+    Ok(AppendedTurnEvent {
+        id: model.id,
+        thread_id: model.thread_id,
+        turn_id: model.turn_id,
+        sequence: model.sequence,
+        payload,
+        created_at: model.created_at,
+    })
+}
+
+pub async fn find_event_by_id<C: ConnectionTrait>(
+    db: &C,
+    event_id: &str,
+) -> Result<Option<AppendedTurnEvent>> {
+    turn_event::Entity::find_by_id(event_id.to_owned())
+        .one(db)
+        .await
+        .context("failed to query turn_event by id")?
+        .map(appended_event_from_model)
+        .transpose()
+}
+
+pub async fn latest_event_for_turn<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+) -> Result<Option<AppendedTurnEvent>> {
+    turn_event::Entity::find()
+        .filter(turn_event::Column::TurnId.eq(turn_id.to_owned()))
+        .order_by_desc(turn_event::Column::Sequence)
+        .one(db)
+        .await
+        .context("failed to query latest turn_event")?
+        .map(appended_event_from_model)
+        .transpose()
 }
 
 async fn next_sequence_for_turn<C: ConnectionTrait>(db: &C, turn_id: &str) -> Result<i64> {

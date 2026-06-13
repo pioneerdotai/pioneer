@@ -207,6 +207,90 @@ pub async fn list_due_pending_jobs_by_action<C: ConnectionTrait>(
         })
 }
 
+pub async fn find_blocked_job_by_turn<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    job_id: Option<&str>,
+) -> Result<Option<recovery_job::Model>> {
+    let blocked = recovery_job_status_to_db(RecoveryJobStatus::Blocked);
+    let mut query = recovery_job::Entity::find()
+        .filter(recovery_job::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(recovery_job::Column::Status.eq(blocked));
+    if let Some(job_id) = job_id {
+        query = query.filter(recovery_job::Column::Id.eq(job_id.to_owned()));
+    }
+    query
+        .order_by_desc(recovery_job::Column::UpdatedAt)
+        .one(db)
+        .await
+        .with_context(|| format!("failed to find blocked recovery job for turn `{turn_id}`"))
+}
+
+pub async fn resume_blocked_job<C: ConnectionTrait>(
+    db: &C,
+    job: &recovery_job::Model,
+    action: RecoveryAction,
+    max_attempts: i64,
+    now: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let blocked = recovery_job_status_to_db(RecoveryJobStatus::Blocked);
+    let pending = recovery_job_status_to_db(RecoveryJobStatus::Pending);
+    let affected = recovery_job::Entity::update_many()
+        .col_expr(
+            recovery_job::Column::Status,
+            sea_orm::sea_query::Expr::value(pending.to_owned()),
+        )
+        .col_expr(
+            recovery_job::Column::Action,
+            sea_orm::sea_query::Expr::value(recovery_action_to_db(action).to_owned()),
+        )
+        .col_expr(
+            recovery_job::Column::MaxAttempts,
+            sea_orm::sea_query::Expr::value(max_attempts),
+        )
+        .col_expr(
+            recovery_job::Column::NextRunAt,
+            sea_orm::sea_query::Expr::value(now),
+        )
+        .col_expr(
+            recovery_job::Column::LastError,
+            sea_orm::sea_query::Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            recovery_job::Column::ClaimToken,
+            sea_orm::sea_query::Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            recovery_job::Column::ClaimedAt,
+            sea_orm::sea_query::Expr::value(Option::<DateTimeWithTimeZone>::None),
+        )
+        .col_expr(
+            recovery_job::Column::ClaimExpiresAt,
+            sea_orm::sea_query::Expr::value(Option::<DateTimeWithTimeZone>::None),
+        )
+        .col_expr(
+            recovery_job::Column::ActiveAttemptId,
+            sea_orm::sea_query::Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            recovery_job::Column::ActiveAttemptStartedAt,
+            sea_orm::sea_query::Expr::value(Option::<DateTimeWithTimeZone>::None),
+        )
+        .col_expr(
+            recovery_job::Column::UpdatedAt,
+            sea_orm::sea_query::Expr::value(now),
+        )
+        .filter(recovery_job::Column::Id.eq(job.id.clone()))
+        .filter(recovery_job::Column::Status.eq(blocked))
+        .exec(db)
+        .await
+        .with_context(|| format!("failed to resume blocked recovery job `{}`", job.id))?
+        .rows_affected
+        > 0;
+
+    Ok(affected)
+}
+
 pub async fn mark_job_retrying<C: ConnectionTrait>(
     db: &C,
     job_id: &str,

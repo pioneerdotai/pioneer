@@ -6,7 +6,7 @@ use crate::thread_agents_doc::ThreadAgentsDocSummary;
 use crate::turn::{
     ItemDeltaStream, RecoveryAction, RecoveryJobStatus, RecoveryTrigger, ToolLoopBudgetAction,
     ToolLoopBudgetLimitKind, ToolRetryBudgetUsage, ToolRetryErrorClass, ToolRetryExhaustionKind,
-    ToolRetryResolution, Turn, TurnExecutionWindowBlockedNotification,
+    ToolRetryResolution, Turn, TurnBlockedResumeMetadata, TurnExecutionWindowBlockedNotification,
     TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
     TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification, TurnItem,
     TurnItemTimeoutReason, TurnItemType, UserInput,
@@ -424,6 +424,8 @@ pub enum ThreadHistoryEventPayload {
         workspace_id: String,
         thread_id: String,
         turn: Turn,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resume: Option<TurnBlockedResumeMetadata>,
     },
 }
 

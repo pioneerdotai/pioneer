@@ -20,6 +20,7 @@ pub mod methods {
     pub const THREAD_UNSUBSCRIBE: &str = "thread/unsubscribe";
     pub const TURN_START: &str = "turn/start";
     pub const TURN_CANCEL: &str = "turn/cancel";
+    pub const TURN_RESUME: &str = "turn/resume";
     pub const TURN_GET: &str = "turn/get";
     pub const TURN_ITEMS: &str = "turn/items";
     pub const TURN_TIMELINE: &str = "turn/timeline";

@@ -1,3 +1,4 @@
+use super::agent_runtime::TurnFailureRecoveryKind;
 use super::*;
 use pioneer_protocol::{
     TaskAttachmentMode, TaskEvent, TaskEventPayload, TaskGetResponse, TaskRunThreadBindingKind,
@@ -110,9 +111,10 @@ impl MessageProcessor {
             )
             .await
         {
-            self.mark_turn_failed(
+            self.report_turn_failure(
                 outcome.started_notification.thread_id.clone(),
                 outcome.started_notification.turn.id.clone(),
+                TurnFailureRecoveryKind::TurnStart,
                 format!("failed to prepare agent thread runtime: {error}"),
             )
             .await;
@@ -170,9 +172,10 @@ impl MessageProcessor {
         {
             Ok(resolved_artifacts) => resolved_artifacts,
             Err(error) => {
-                self.mark_turn_failed(
+                self.report_turn_failure(
                     outcome.started_notification.thread_id.clone(),
                     outcome.started_notification.turn.id.clone(),
+                    TurnFailureRecoveryKind::TurnStart,
                     format!("failed to resolve artifact input for provider: {error:#}"),
                 )
                 .await;
@@ -198,9 +201,10 @@ impl MessageProcessor {
         {
             Ok(runtime_environment) => runtime_environment.into_iter().collect(),
             Err(error) => {
-                self.mark_turn_failed(
+                self.report_turn_failure(
                     outcome.started_notification.thread_id.clone(),
                     outcome.started_notification.turn.id.clone(),
+                    TurnFailureRecoveryKind::TurnStart,
                     format!("failed to prepare artifact output directory: {error:#}"),
                 )
                 .await;
@@ -216,6 +220,43 @@ impl MessageProcessor {
                 return;
             }
         };
+        let hook_runtime_context = pioneer_agent::AgentTurnHookRuntimeContext::default();
+        if let Err(error) = self
+            .persist_turn_runtime_snapshot(
+                outcome.started_notification.thread_id.as_str(),
+                outcome.started_notification.workspace_id.as_str(),
+                outcome.started_notification.turn.id.as_str(),
+                outcome.materialization.thread.mode,
+                &hook_runtime_context,
+                &outcome.materialization.thread.model,
+                &outcome.materialization.thread.model_provider,
+                &workspace_skill_policies,
+                outcome.materialization.input.as_slice(),
+                outcome.materialization.capabilities.as_slice(),
+                resolved_artifacts.as_slice(),
+                &runtime_environment,
+                history.as_slice(),
+            )
+            .await
+        {
+            self.report_turn_failure(
+                outcome.started_notification.thread_id.clone(),
+                outcome.started_notification.turn.id.clone(),
+                TurnFailureRecoveryKind::TurnStart,
+                format!("failed to persist turn runtime snapshot: {error:#}"),
+            )
+            .await;
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_REQUEST_CODE,
+                    format!("failed to persist turn runtime snapshot: {error:#}"),
+                ),
+            )
+            .await;
+            return;
+        }
         if let Err(error) = self
             .agent_manager
             .start_turn_with_resolved_artifacts_and_environment(
@@ -233,9 +274,10 @@ impl MessageProcessor {
             )
             .await
         {
-            self.mark_turn_failed(
+            self.report_turn_failure(
                 outcome.started_notification.thread_id.clone(),
                 outcome.started_notification.turn.id.clone(),
+                TurnFailureRecoveryKind::TurnDispatch,
                 format!("failed to dispatch turn to agent runtime: {error}"),
             )
             .await;
@@ -513,6 +555,226 @@ impl MessageProcessor {
                 connection_id,
                 error = %format!("{error:#}"),
                 "failed to send turn/cancel response"
+            );
+        }
+    }
+
+    pub(super) async fn turn_resume(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        params: TurnResumeParams,
+    ) {
+        if params.thread_id.trim().is_empty() || params.turn_id.trim().is_empty() {
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_PARAMS_CODE,
+                    format!(
+                        "invalid params for `{}`: `thread_id` and `turn_id` are required",
+                        methods::TURN_RESUME
+                    ),
+                ),
+            )
+            .await;
+            return;
+        }
+
+        let thread_id = params.thread_id.trim().to_owned();
+        let turn_id = params.turn_id.trim().to_owned();
+        let recovery_job_id = params
+            .recovery_job_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+
+        let subscribed = self
+            .thread_manager
+            .subscribed_connection_ids(thread_id.as_str())
+            .await
+            .contains(&connection_id);
+        if !subscribed {
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_REQUEST_CODE,
+                    format!(
+                        "connection `{connection_id}` is not subscribed to thread `{thread_id}`"
+                    ),
+                ),
+            )
+            .await;
+            return;
+        }
+
+        let Some((workspace_id, turn)) = (match self
+            .crud_store
+            .get_turn(thread_id.as_str(), turn_id.as_str())
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to fetch turn before resume: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        }) else {
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_REQUEST_CODE,
+                    format!("turn `{turn_id}` not found in thread `{thread_id}`"),
+                ),
+            )
+            .await;
+            return;
+        };
+
+        if turn.status != TurnStatus::Blocked {
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_REQUEST_CODE,
+                    format!("turn `{turn_id}` is not blocked and cannot be resumed"),
+                ),
+            )
+            .await;
+            return;
+        }
+
+        let now_unix = now_timestamp_secs();
+        let resumed_job = match self
+            .recovery_coordinator
+            .resume_blocked_turn(
+                thread_id.as_str(),
+                turn_id.as_str(),
+                recovery_job_id.as_deref(),
+                now_unix,
+            )
+            .await
+        {
+            Ok(Some(job)) => job,
+            Ok(None) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("turn `{turn_id}` has no blocked recovery job to resume"),
+                    ),
+                )
+                .await;
+                return;
+            }
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to resume turn `{turn_id}`: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+
+        match self.recovery_coordinator.run_ready_jobs(now_unix, 16).await {
+            Ok(events) => {
+                for event in events {
+                    self.handle_recovery_event(event, now_unix).await;
+                }
+            }
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!(
+                            "turn `{turn_id}` was resumed but recovery start failed: {error:#}"
+                        ),
+                    ),
+                )
+                .await;
+                return;
+            }
+        }
+
+        let turn = match self
+            .crud_store
+            .get_turn(thread_id.as_str(), turn_id.as_str())
+            .await
+        {
+            Ok(Some((_workspace_id, turn))) => turn,
+            Ok(None) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("turn `{turn_id}` disappeared after resume"),
+                    ),
+                )
+                .await;
+                return;
+            }
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to fetch turn after resume: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+
+        let response = match JsonRpcResponse::from_result(
+            request_id,
+            &TurnResumeResponse {
+                thread_id,
+                workspace_id,
+                turn,
+                recovery_job_id: resumed_job.id,
+            },
+        ) {
+            Ok(response) => response,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        None,
+                        INVALID_REQUEST_CODE,
+                        format!("failed to encode response: {error}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+
+        if let Err(error) = self.send_json(connection_id, &response).await {
+            warn!(
+                connection_id,
+                error = %format!("{error:#}"),
+                "failed to send turn/resume response"
             );
         }
     }

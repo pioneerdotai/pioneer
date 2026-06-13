@@ -82,11 +82,12 @@ use pioneer_protocol::{
     ToolCallStatus, ToolStoragePayload, TurnBlockedNotification, TurnCancelParams,
     TurnCancelResponse, TurnCompletedNotification, TurnFailedNotification, TurnGetParams,
     TurnGetResponse, TurnItem, TurnItemEvent, TurnItemEventPayload, TurnItemType, TurnItemsParams,
-    TurnStartParams, TurnStatus, TurnTimelineChangedNotification, TurnTimelineChangedReason,
-    TurnTimelineParams, TurnTimelineResponse, Workspace, WorkspaceChangeKind,
-    WorkspaceChangedNotification, WorkspaceCreateParams, WorkspaceCreateResponse,
-    WorkspaceDefaultParams, WorkspaceDefaultResponse, WorkspaceListParams, WorkspaceListResponse,
-    WorkspaceSelectParams, WorkspaceSelectResponse, WorkspaceUpdateParams, WorkspaceUpdateResponse,
+    TurnResumeParams, TurnResumeResponse, TurnStartParams, TurnStatus,
+    TurnTimelineChangedNotification, TurnTimelineChangedReason, TurnTimelineParams,
+    TurnTimelineResponse, Workspace, WorkspaceChangeKind, WorkspaceChangedNotification,
+    WorkspaceCreateParams, WorkspaceCreateResponse, WorkspaceDefaultParams,
+    WorkspaceDefaultResponse, WorkspaceListParams, WorkspaceListResponse, WorkspaceSelectParams,
+    WorkspaceSelectResponse, WorkspaceUpdateParams, WorkspaceUpdateResponse,
     constants::{events, methods},
 };
 use pioneer_provider::{ChatMessage, ProviderRegistry};
@@ -595,6 +596,56 @@ impl MessageProcessor {
                     }
                 }
 
+                match this
+                    .crud_store
+                    .replay_due_turn_event_projections(now, 64)
+                    .await
+                {
+                    Ok(summary) => {
+                        if summary.exhausted > 0 || summary.missing_events > 0 {
+                            warn!(
+                                claimed = summary.claimed,
+                                projected = summary.projected,
+                                failed = summary.failed,
+                                exhausted = summary.exhausted,
+                                missing_events = summary.missing_events,
+                                "turn event projection replay found unrecoverable records"
+                            );
+                            for record in &summary.exhausted_records {
+                                let _ = this
+                                    .report_turn_failure(
+                                        record.thread_id.clone(),
+                                        record.turn_id.clone(),
+                                        agent_runtime::TurnFailureRecoveryKind::ProjectionFailure,
+                                        format!(
+                                            "turn event projection replay exhausted for event `{}`: {}",
+                                            record.event_id, record.error_message
+                                        ),
+                                    )
+                                    .await;
+                            }
+                        } else if summary.projected > 0 || summary.failed > 0 {
+                            info!(
+                                claimed = summary.claimed,
+                                projected = summary.projected,
+                                failed = summary.failed,
+                                "turn event projection replay completed"
+                            );
+                        } else if summary.claimed > 0 {
+                            debug!(
+                                claimed = summary.claimed,
+                                "turn event projection replay claimed records with no changes"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        warn!(
+                            error = %format!("{error:#}"),
+                            "turn event projection replay poll failed"
+                        );
+                    }
+                }
+
                 if let Err(error) = this.process_due_task_deliveries(now, 64).await {
                     warn!(error = %format!("{error:#}"), "task delivery worker poll failed");
                 }
@@ -964,6 +1015,48 @@ impl MessageProcessor {
         }
 
         Ok(resolved)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn persist_turn_runtime_snapshot(
+        &self,
+        thread_id: &str,
+        workspace_id: &str,
+        turn_id: &str,
+        mode: pioneer_protocol::ThreadMode,
+        hook_runtime_context: &pioneer_agent::AgentTurnHookRuntimeContext,
+        model: &str,
+        provider_name: &str,
+        workspace_skill_policies: &HashMap<
+            pioneer_skills::SkillPolicyKey,
+            pioneer_agent::WorkspaceSkillPolicy,
+        >,
+        input: &[pioneer_protocol::UserInput],
+        capabilities: &[pioneer_protocol::TurnCapability],
+        resolved_artifacts: &[ResolvedArtifactInput],
+        runtime_environment: &HashMap<String, String>,
+        history: &[ChatMessage],
+    ) -> anyhow::Result<()> {
+        let snapshot = crate::turn_runtime_snapshot::new_turn_runtime_snapshot(
+            thread_id,
+            workspace_id,
+            turn_id,
+            mode,
+            hook_runtime_context,
+            model,
+            provider_name,
+            workspace_skill_policies,
+            input,
+            capabilities,
+            resolved_artifacts,
+            runtime_environment,
+            history,
+        )?;
+        self.crud_store
+            .upsert_turn_runtime_snapshot(snapshot)
+            .await
+            .with_context(|| format!("failed to persist runtime snapshot for turn `{turn_id}`"))?;
+        Ok(())
     }
 
     async fn user_message_payload_from_input_resolved(

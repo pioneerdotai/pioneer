@@ -57,7 +57,7 @@ use pioneer_tools::{
     WebToolsConfig,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ResolvedArtifactInput {
     pub artifact_id: String,
     pub version_id: Option<String>,
@@ -230,7 +230,7 @@ impl SkillsDependenciesLoopConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct WorkspaceSkillPolicy {
     pub enabled: Option<bool>,
     pub allow_implicit_invocation: Option<bool>,
@@ -1307,6 +1307,8 @@ pub struct RecoveryAttemptRequest {
     pub item_id: String,
     pub item_type: TurnItemType,
     pub force_non_stream: bool,
+    pub disable_tool_calling: bool,
+    pub disable_image_input: bool,
     pub refresh_provider_auth: bool,
     pub compact_history: bool,
     pub continue_generation: bool,
@@ -1391,7 +1393,9 @@ fn execution_checkpoint_payload_is_failure_heavy(payload: &ExecutionCheckpointPa
 #[derive(Debug, Clone)]
 pub struct RestoredRecoveryTurnRequest {
     pub turn_id: String,
+    pub execution_window_index: u32,
     pub mode: ThreadMode,
+    pub hook_runtime_context: AgentTurnHookRuntimeContext,
     pub model: String,
     pub provider_name: String,
     pub workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
@@ -1405,6 +1409,7 @@ pub struct RestoredRecoveryTurnRequest {
 #[derive(Debug, Clone, Default)]
 struct TurnExecutionOptions {
     force_non_stream: bool,
+    disable_tool_calling: bool,
     continue_generation_hint: bool,
 }
 

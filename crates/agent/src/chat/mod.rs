@@ -96,7 +96,8 @@ use serde_json::{Value as JsonValue, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tokio::time::{Duration, sleep};
+use tokio::task::JoinHandle;
+use tokio::time::{Duration, sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
@@ -108,6 +109,31 @@ const MCP_TOOL_BUNDLE_PRIORITY: i32 = 300;
 const TURN_TOOL_BUNDLE_PRIORITY: i32 = 250;
 const TASK_TOOL_BUNDLE_PRIORITY: i32 = 200;
 const MAX_CONSECUTIVE_REJECTED_NO_TOOL_ROUNDS: usize = 3;
+const TOOL_EVENT_FORWARDER_DRAIN_TIMEOUT_MS: u64 = 250;
+
+async fn finish_tool_event_forwarder(mut forwarder: JoinHandle<()>) {
+    match timeout(
+        Duration::from_millis(TOOL_EVENT_FORWARDER_DRAIN_TIMEOUT_MS),
+        &mut forwarder,
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            if !error.is_cancelled() {
+                warn!(error = %error, "tool event forwarder failed during turn shutdown");
+            }
+        }
+        Err(_) => {
+            forwarder.abort();
+            if let Err(error) = forwarder.await
+                && !error.is_cancelled()
+            {
+                warn!(error = %error, "tool event forwarder failed after abort");
+            }
+        }
+    }
+}
 
 #[derive(Debug, Default, Clone)]
 struct PendingToolUiState {
@@ -2036,6 +2062,7 @@ pub(super) async fn execute_chat_turn_flow(
     execution_window_index: u32,
     execution_checkpoint_context: Option<ExecutionCheckpointContext>,
     force_non_stream: bool,
+    disable_tool_calling: bool,
     continue_generation_hint: bool,
     tool_loop_config: ToolLoopConfig,
     mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
@@ -2087,6 +2114,7 @@ pub(super) async fn execute_chat_turn_flow(
                 execution_window_index,
                 execution_checkpoint_context,
                 force_non_stream,
+                disable_tool_calling,
                 continue_generation_hint,
                 tool_loop_config,
                 mcp_tool_provider,
@@ -2654,6 +2682,7 @@ async fn execute_agent_provider_response(
     execution_window_index: u32,
     execution_checkpoint_context: Option<ExecutionCheckpointContext>,
     force_non_stream: bool,
+    disable_tool_calling: bool,
     continue_generation_hint: bool,
     tool_loop_config: ToolLoopConfig,
     mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
@@ -2675,7 +2704,7 @@ async fn execute_agent_provider_response(
         .map_err(|error| ChatTurnError::Terminal(format!("failed to resolve cwd: {error}")))?;
 
     let tool_loop_config = tool_loop_config.normalized();
-    let provider_tool_calling = provider.capabilities().tool_calling;
+    let provider_tool_calling = provider.capabilities().tool_calling && !disable_tool_calling;
     let post_turn_model = model.clone();
     let post_turn_model_provider = provider.name().to_owned();
     let hook_context = AgentTurnHookContext::with_runtime_context(
@@ -4830,7 +4859,7 @@ async fn execute_agent_provider_response(
     drop(router);
     drop(tools);
 
-    let _ = tool_event_forwarder.await;
+    finish_tool_event_forwarder(tool_event_forwarder).await;
 
     match turn_result {
         Ok(AgentProviderLoopOutcome::Completed) => {

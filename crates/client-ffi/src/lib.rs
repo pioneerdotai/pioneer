@@ -15,8 +15,8 @@ mod workspaces;
 use active_thread::{
     ClientActiveThreadCancelTurnRequest, ClientActiveThreadCancelTurnResult,
     ClientActiveThreadClearResult, ClientActiveThreadEventRequest, ClientActiveThreadOpenRequest,
-    ClientActiveThreadSendTextRequest, ClientActiveThreadSendTextResult, ClientActiveThreadSnapshot,
-    ClientActiveThreadSnapshotRequest, ClientFfiActiveThreadState,
+    ClientActiveThreadSendTextRequest, ClientActiveThreadSendTextResult,
+    ClientActiveThreadSnapshot, ClientActiveThreadSnapshotRequest, ClientFfiActiveThreadState,
 };
 use composer::{
     ClientComposerAttachmentFromPathRequest, ClientComposerAttachmentsUpdateRequest,

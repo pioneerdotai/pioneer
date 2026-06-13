@@ -1,4 +1,6 @@
-use super::{MessageProcessor, artifact_finalization_diagnostics};
+use super::{
+    MessageProcessor, agent_runtime::TurnFailureRecoveryKind, artifact_finalization_diagnostics,
+};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use pioneer_agent::{
@@ -250,9 +252,10 @@ impl MessageProcessor {
         }
 
         self.log_artifact_finalization_diagnostics(thread_id, turn_id, diagnostics.as_slice());
-        self.mark_turn_failed(
+        self.report_turn_failure(
             thread_id.to_owned(),
             turn_id.to_owned(),
+            TurnFailureRecoveryKind::ArtifactFinalization,
             artifact_finalization_diagnostics::artifact_finalization_terminal_error(
                 diagnostics.as_slice(),
             ),

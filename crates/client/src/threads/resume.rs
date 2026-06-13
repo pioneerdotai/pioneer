@@ -788,7 +788,11 @@ pub fn turn_resume_terminal_event(thread_id: String, turn: Turn) -> Option<Conve
         TurnStatus::Failed | TurnStatus::Interrupted => {
             Some(ConversationEvent::TurnFailed { thread_id, turn })
         }
-        TurnStatus::Blocked => Some(ConversationEvent::TurnBlocked { thread_id, turn }),
+        TurnStatus::Blocked => Some(ConversationEvent::TurnBlocked {
+            thread_id,
+            turn,
+            resume: None,
+        }),
         TurnStatus::InProgress => None,
     }
 }
@@ -1036,7 +1040,9 @@ mod tests {
             prompt_manifest: None,
         };
         match turn_resume_terminal_event("thread_blocked".to_owned(), blocked) {
-            Some(ConversationEvent::TurnBlocked { thread_id, turn }) => {
+            Some(ConversationEvent::TurnBlocked {
+                thread_id, turn, ..
+            }) => {
                 assert_eq!(thread_id, "thread_blocked");
                 assert_eq!(turn.status, TurnStatus::Blocked);
                 assert_eq!(turn.error.as_deref(), Some("needs review"));

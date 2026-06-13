@@ -387,6 +387,22 @@ pub struct TurnCancelResponse {
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq, Default)]
+pub struct TurnResumeParams {
+    pub thread_id: String,
+    pub turn_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_job_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnResumeResponse {
+    pub thread_id: String,
+    pub workspace_id: String,
+    pub turn: Turn,
+    pub recovery_job_id: String,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq, Default)]
 pub struct TurnGetParams {
     pub thread_id: String,
     pub turn_id: String,
@@ -1630,6 +1646,20 @@ pub enum RecoveryTrigger {
     Timeout,
     /// Any provider/model/transport failure in LLM interaction path.
     ProviderError,
+    /// Turn runtime could not be prepared after the turn was persisted.
+    TurnStart,
+    /// Turn could not be dispatched to the agent runtime.
+    TurnDispatch,
+    /// A durable event could not be projected/materialized.
+    ProjectionFailure,
+    /// A same-turn execution window continuation could not be opened directly.
+    ExecutionWindowContinuation,
+    /// Final artifact validation/registration failed after model output.
+    ArtifactFinalization,
+    /// Child/reviewer/revision task turn dispatch failed.
+    TaskDispatch,
+    /// Generic runtime failure routed through the central terminal decision gate.
+    RuntimeFailure,
     /// Forward-compatibility fallback for unknown persisted values.
     Unknown,
 }
@@ -1640,6 +1670,17 @@ pub enum RecoveryAction {
     RetryAttempt,
     RetryWithBackoff,
     RestartTurn,
+    ReplayDurableEvent,
+    RehydrateTurnState,
+    OpenNextExecutionWindow,
+    AdaptProviderRequest,
+    RefreshProviderAuth,
+    CompactHistory,
+    DisableStreaming,
+    DisableUnsupportedCapability,
+    RepairArtifactFinalization,
+    RequeueTaskDispatch,
+    BlockResumable,
     Fallback,
     MarkFailed,
 }
@@ -2006,13 +2047,21 @@ pub enum ProviderFailureClass {
     #[serde(rename = "provider_5xx")]
     Provider5xx,
     AuthExpired,
+    AuthOrPermission,
     ModelNotFound,
     PromptTooLong,
+    ContextTooLarge,
     MaxOutputTokens,
     StreamStall,
     StreamTruncated,
     EmptyResponse,
     ProviderRejected,
+    UnsupportedParameter,
+    UnsupportedCapability,
+    UnsupportedImageInput,
+    UnsupportedToolCalling,
+    UnsupportedStreaming,
+    MalformedProviderRequest,
     InvalidRequest,
     PermissionDenied,
     Unknown,
@@ -2664,6 +2713,21 @@ pub struct TurnBlockedNotification {
     pub workspace_id: String,
     pub thread_id: String,
     pub turn: Turn,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<TurnBlockedResumeMetadata>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnBlockedResumeMetadata {
+    pub reason_class: String,
+    pub human_message: String,
+    pub resume_requirements: Vec<String>,
+    pub resume_command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_recovery_job_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_checkpoint_id: Option<String>,
+    pub can_resume_same_turn: bool,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]

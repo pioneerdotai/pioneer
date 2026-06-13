@@ -7,7 +7,7 @@ use super::{
     MemoryTurnPolicyContext, MemoryTurnPolicyRequest, PendingAttachedTask, RecoveryAttemptRequest,
     ReviewRequiredTaskObservation, TaskToolMaterialization, TaskToolProvider, TaskTurnContext,
     ToolLoopConfig, TurnExecutionControl, TurnFinalizationContext, TurnFinalizationDecision,
-    TurnFinalizationProvider,
+    TurnFinalizationProvider, TurnToolContext, TurnToolMaterialization, TurnToolProvider,
 };
 use futures_util::StreamExt;
 use pioneer_hooks::{
@@ -1205,6 +1205,15 @@ struct StaticTaskToolProvider {
     bundle: ToolExtensionBundle,
 }
 
+#[derive(Clone)]
+struct StaticTurnToolProvider {
+    bundle: ToolExtensionBundle,
+}
+
+struct RetainingTraceHandler {
+    retained_traces: Arc<std::sync::Mutex<Vec<ToolEventTrace>>>,
+}
+
 struct ReviewGuardProvider {
     requests: std::sync::Mutex<Vec<ChatRequest>>,
     steps: std::sync::Mutex<VecDeque<ReviewGuardProviderStep>>,
@@ -1596,6 +1605,19 @@ impl TaskToolProvider for StaticTaskToolProvider {
     }
 }
 
+#[async_trait::async_trait]
+impl TurnToolProvider for StaticTurnToolProvider {
+    async fn materialize_turn_tools(
+        &self,
+        _context: TurnToolContext,
+    ) -> Result<TurnToolMaterialization, String> {
+        Ok(TurnToolMaterialization {
+            bundles: vec![self.bundle.clone()],
+            diagnostics: Vec::new(),
+        })
+    }
+}
+
 #[derive(Clone, Copy)]
 enum LoopBudgetProviderMode {
     ToolWhileAvailableThenFinal,
@@ -1917,6 +1939,21 @@ impl ToolHandler for RecordingMemoryToolHandler {
             .expect("memory tool calls lock poisoned")
             .push(invocation.tool_name);
         Ok(Box::new(FunctionToolOutput::new("memory-ok", true)))
+    }
+}
+
+#[async_trait::async_trait]
+impl ToolHandler for RetainingTraceHandler {
+    async fn handle(
+        &self,
+        _invocation: ToolInvocation,
+        trace: ToolEventTrace,
+    ) -> Result<Box<dyn pioneer_tools::ToolOutput>, pioneer_tools::ToolError> {
+        self.retained_traces
+            .lock()
+            .expect("retained trace lock poisoned")
+            .push(trace);
+        Ok(Box::new(FunctionToolOutput::new("trace-retained", true)))
     }
 }
 
@@ -4259,6 +4296,56 @@ async fn phase_12_post_turn_hook_receives_tool_event_summaries() {
             && event.code.as_deref() == Some("tool.succeeded")
     }));
     assert_eq!(provider.snapshot_requests().len(), 2);
+}
+
+#[tokio::test]
+async fn turn_completes_when_tool_event_trace_outlives_tool_runtime() {
+    let retained_traces = Arc::new(std::sync::Mutex::new(Vec::<ToolEventTrace>::new()));
+    let handler: Arc<dyn ToolHandler> = Arc::new(RetainingTraceHandler {
+        retained_traces: retained_traces.clone(),
+    });
+    let provider = Arc::new(SequencedToolProvider::new(
+        vec![ProviderToolCall {
+            id: "call_retained_trace".to_owned(),
+            name: "retain_trace".to_owned(),
+            arguments: serde_json::json!({}).to_string(),
+        }],
+        "final after retained trace",
+    ));
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "sequenced-tools",
+        provider.clone(),
+    ));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_turn_tool_provider(Some(Arc::new(StaticTurnToolProvider {
+            bundle: fake_task_tool_bundle_for_names(&["retain_trace"], handler),
+        })))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_retained_tool_trace",
+        "ws_retained_tool_trace",
+        "turn_retained_tool_trace",
+        ThreadMode::Agent,
+        "sequenced-tools",
+        "run retained trace tool",
+    )
+    .await;
+
+    assert!(
+        !retained_traces
+            .lock()
+            .expect("retained trace lock poisoned")
+            .is_empty(),
+        "test must keep a ToolEventTrace sender alive after the tool call"
+    );
+    assert_turn_completed(&observed);
+    assert_eq!(
+        completed_agent_message_text(&observed).as_deref(),
+        Some("final after retained trace")
+    );
 }
 
 #[tokio::test]
@@ -8855,6 +8942,8 @@ async fn provider_recovery_success_boundary_survives_execution_window_continuati
                 item_id: "reasoning_item".to_owned(),
                 item_type: TurnItemType::Reasoning,
                 force_non_stream: false,
+                disable_tool_calling: false,
+                disable_image_input: false,
                 refresh_provider_auth: false,
                 compact_history: false,
                 continue_generation: true,
@@ -10101,6 +10190,8 @@ async fn non_tool_recovery_request_restarts_turn_without_failing() {
                 item_id: "reasoning_item".to_owned(),
                 item_type: TurnItemType::Reasoning,
                 force_non_stream: false,
+                disable_tool_calling: false,
+                disable_image_input: false,
                 refresh_provider_auth: false,
                 compact_history: false,
                 continue_generation: false,
@@ -10198,6 +10289,8 @@ async fn continue_generation_recovery_is_compiled_into_system_prompt() {
                 item_id: "reasoning_item".to_owned(),
                 item_type: TurnItemType::Reasoning,
                 force_non_stream: false,
+                disable_tool_calling: false,
+                disable_image_input: false,
                 refresh_provider_auth: false,
                 compact_history: false,
                 continue_generation: true,
@@ -10327,6 +10420,8 @@ async fn provider_recovery_success_boundary_clears_recovery_before_later_provide
                 item_id: "reasoning_item".to_owned(),
                 item_type: TurnItemType::Reasoning,
                 force_non_stream: false,
+                disable_tool_calling: false,
+                disable_image_input: false,
                 refresh_provider_auth: false,
                 compact_history: false,
                 continue_generation: false,
@@ -11406,6 +11501,8 @@ async fn tool_recovery_succeeds_at_tool_attempt_boundary() {
                         item_id: tool_call_id.to_owned(),
                         item_type: TurnItemType::DynamicToolCall,
                         force_non_stream: false,
+                        disable_tool_calling: false,
+                        disable_image_input: false,
                         refresh_provider_auth: false,
                         compact_history: false,
                         continue_generation: false,

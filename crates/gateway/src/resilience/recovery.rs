@@ -1,26 +1,26 @@
 use anyhow::{Result, bail};
 use pioneer_agent::{
     AgentControlError, AgentManager, ExecutionCheckpointContext, RecoveryAttemptRequest,
-    RestoredRecoveryTurnRequest, RetainedToolLlmContext, WorkspaceSkillPolicy,
+    RestoredRecoveryTurnRequest, RetainedToolLlmContext,
 };
-use pioneer_crud::{ClaimedRecoveryActivation, CrudStore, RecoveryJobRecord, TimeoutCandidate};
+use pioneer_crud::{
+    BlockedTurnRecoveryResumeOutcome, ClaimedRecoveryActivation, CrudStore, RecoveryJobRecord,
+    TimeoutCandidate,
+};
 use pioneer_protocol::{
     ExecutionCheckpointPayload, ExecutionWindowStatus, ProviderFailureClass,
     ProviderFailureDetails, RecoveryAction, RecoveryAttemptContext, RecoveryJobStatus,
     RecoveryTrigger, ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot,
     ToolRecoveryRetryClass, TurnItem, TurnItemType, TurnStatus, generate_id,
 };
-use pioneer_provider::{ChatMessage, ProviderRegistry};
-use pioneer_skills::SkillPolicyKey;
+use pioneer_provider::ProviderRegistry;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::time::{Duration, timeout};
 use tracing::warn;
 
 const RECOVERY_JOB_CLAIM_LEASE_SECS: u64 = 45;
 const ACTIVE_RECOVERY_RECHECK_SECS: i64 = 2;
 const RECOVERY_ATTEMPT_ID_LEN: usize = 21;
-const MODEL_FALLBACK_LOOKUP_TIMEOUT: Duration = Duration::from_secs(8);
 const STREAM_TO_NON_STREAM_FALLBACK_ATTEMPT: u32 = 2;
 
 #[derive(Debug, Clone, Copy)]
@@ -212,7 +212,7 @@ impl Default for RecoveryPolicyRegistry {
         by_provider_failure_class.insert(
             ProviderFailureClass::AuthExpired,
             ProviderRecoveryPolicy {
-                action: RetryWithBackoff,
+                action: RefreshProviderAuth,
                 max_attempts: 2,
                 base_backoff_secs: 2,
                 max_wall_clock_secs: 120,
@@ -220,22 +220,102 @@ impl Default for RecoveryPolicyRegistry {
             },
         );
         by_provider_failure_class.insert(
+            ProviderFailureClass::AuthOrPermission,
+            ProviderRecoveryPolicy {
+                action: RefreshProviderAuth,
+                max_attempts: 1,
+                base_backoff_secs: 2,
+                max_wall_clock_secs: 60,
+                no_progress_limit: 1,
+            },
+        );
+        by_provider_failure_class.insert(
             ProviderFailureClass::ModelNotFound,
             ProviderRecoveryPolicy {
-                action: Fallback,
-                max_attempts: 1,
-                base_backoff_secs: 1,
-                max_wall_clock_secs: 30,
-                no_progress_limit: 1,
+                action: BlockResumable,
+                max_attempts: 0,
+                base_backoff_secs: 0,
+                max_wall_clock_secs: 10,
+                no_progress_limit: 0,
             },
         );
         by_provider_failure_class.insert(
             ProviderFailureClass::PromptTooLong,
             ProviderRecoveryPolicy {
-                action: Fallback,
+                action: CompactHistory,
+                max_attempts: 2,
+                base_backoff_secs: 1,
+                max_wall_clock_secs: 120,
+                no_progress_limit: 2,
+            },
+        );
+        by_provider_failure_class.insert(
+            ProviderFailureClass::ContextTooLarge,
+            ProviderRecoveryPolicy {
+                action: CompactHistory,
+                max_attempts: 2,
+                base_backoff_secs: 1,
+                max_wall_clock_secs: 120,
+                no_progress_limit: 2,
+            },
+        );
+        by_provider_failure_class.insert(
+            ProviderFailureClass::UnsupportedStreaming,
+            ProviderRecoveryPolicy {
+                action: DisableStreaming,
+                max_attempts: 2,
+                base_backoff_secs: 1,
+                max_wall_clock_secs: 120,
+                no_progress_limit: 2,
+            },
+        );
+        by_provider_failure_class.insert(
+            ProviderFailureClass::UnsupportedParameter,
+            ProviderRecoveryPolicy {
+                action: AdaptProviderRequest,
+                max_attempts: 2,
+                base_backoff_secs: 1,
+                max_wall_clock_secs: 120,
+                no_progress_limit: 2,
+            },
+        );
+        by_provider_failure_class.insert(
+            ProviderFailureClass::UnsupportedCapability,
+            ProviderRecoveryPolicy {
+                action: DisableUnsupportedCapability,
                 max_attempts: 1,
                 base_backoff_secs: 1,
-                max_wall_clock_secs: 45,
+                max_wall_clock_secs: 60,
+                no_progress_limit: 1,
+            },
+        );
+        by_provider_failure_class.insert(
+            ProviderFailureClass::UnsupportedImageInput,
+            ProviderRecoveryPolicy {
+                action: DisableUnsupportedCapability,
+                max_attempts: 1,
+                base_backoff_secs: 1,
+                max_wall_clock_secs: 60,
+                no_progress_limit: 1,
+            },
+        );
+        by_provider_failure_class.insert(
+            ProviderFailureClass::UnsupportedToolCalling,
+            ProviderRecoveryPolicy {
+                action: DisableUnsupportedCapability,
+                max_attempts: 1,
+                base_backoff_secs: 1,
+                max_wall_clock_secs: 60,
+                no_progress_limit: 1,
+            },
+        );
+        by_provider_failure_class.insert(
+            ProviderFailureClass::MalformedProviderRequest,
+            ProviderRecoveryPolicy {
+                action: AdaptProviderRequest,
+                max_attempts: 1,
+                base_backoff_secs: 1,
+                max_wall_clock_secs: 60,
                 no_progress_limit: 1,
             },
         );
@@ -292,21 +372,21 @@ impl Default for RecoveryPolicyRegistry {
         by_provider_failure_class.insert(
             ProviderFailureClass::InvalidRequest,
             ProviderRecoveryPolicy {
-                action: MarkFailed,
-                max_attempts: 0,
-                base_backoff_secs: 0,
-                max_wall_clock_secs: 30,
-                no_progress_limit: 0,
+                action: RetryWithBackoff,
+                max_attempts: 2,
+                base_backoff_secs: 2,
+                max_wall_clock_secs: 120,
+                no_progress_limit: 2,
             },
         );
         by_provider_failure_class.insert(
             ProviderFailureClass::PermissionDenied,
             ProviderRecoveryPolicy {
-                action: MarkFailed,
-                max_attempts: 0,
-                base_backoff_secs: 0,
-                max_wall_clock_secs: 30,
-                no_progress_limit: 0,
+                action: RefreshProviderAuth,
+                max_attempts: 1,
+                base_backoff_secs: 2,
+                max_wall_clock_secs: 60,
+                no_progress_limit: 1,
             },
         );
         by_provider_failure_class.insert(
@@ -366,11 +446,25 @@ pub struct ProviderFailureCandidate {
     pub failure: ProviderFailureDetails,
 }
 
+#[derive(Debug, Clone)]
+pub struct RuntimeFailureCandidate {
+    pub turn_id: String,
+    pub item_id: String,
+    pub item_type: TurnItemType,
+    pub trigger: RecoveryTrigger,
+    pub action: RecoveryAction,
+    pub reason: String,
+    pub base_backoff_secs: u64,
+    pub max_attempts: i64,
+    pub max_wall_clock_secs: u64,
+    pub no_progress_limit: i64,
+    pub metadata: serde_json::Value,
+}
+
 #[derive(Clone)]
 pub struct RecoveryCoordinator {
     crud_store: Arc<CrudStore>,
     agent_manager: Arc<AgentManager>,
-    provider_registry: Arc<ProviderRegistry>,
     policy_registry: RecoveryPolicyRegistry,
 }
 
@@ -459,12 +553,19 @@ pub enum RecoveryCoordinatorEvent {
         item_type: TurnItemType,
         attempt_number: u32,
     },
+    RecoveryBlocked {
+        job_id: String,
+        turn_id: String,
+        reason: String,
+    },
     RecoveryExhausted(RecoveryTerminalOutcome),
 }
 
 #[derive(Debug, Default, Clone)]
 struct RecoveryAttemptPlan {
     force_non_stream: bool,
+    disable_tool_calling: bool,
+    disable_image_input: bool,
     refresh_provider_auth: bool,
     compact_history: bool,
     continue_generation: bool,
@@ -472,17 +573,60 @@ struct RecoveryAttemptPlan {
     terminal_reason: Option<String>,
 }
 
+#[derive(Debug)]
+enum RestoredRecoveryTurnRequestLookup {
+    Available(RestoredRecoveryTurnRequest),
+    Unavailable(RestoredRecoveryTurnUnavailable),
+}
+
+#[cfg(test)]
+impl RestoredRecoveryTurnRequestLookup {
+    fn into_available(self) -> Option<RestoredRecoveryTurnRequest> {
+        match self {
+            Self::Available(request) => Some(request),
+            Self::Unavailable(_) => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum RestoredRecoveryTurnUnavailable {
+    TurnNotFound,
+    TurnNotInProgress,
+    MissingRuntimeSnapshot,
+    SnapshotMismatch,
+    SnapshotInvalid { error: String },
+}
+
+impl RestoredRecoveryTurnUnavailable {
+    fn lost_loop_block_reason(&self) -> Option<String> {
+        match self {
+            Self::MissingRuntimeSnapshot => Some(
+                "cannot restore recovery after agent loop loss because durable turn runtime snapshot is missing"
+                    .to_owned(),
+            ),
+            Self::SnapshotMismatch => Some(
+                "cannot restore recovery after agent loop loss because durable turn runtime snapshot does not match the turn"
+                    .to_owned(),
+            ),
+            Self::SnapshotInvalid { error } => Some(format!(
+                "cannot restore recovery after agent loop loss because durable turn runtime snapshot is invalid: {error}"
+            )),
+            Self::TurnNotFound | Self::TurnNotInProgress => None,
+        }
+    }
+}
+
 impl RecoveryCoordinator {
     pub fn new(
         crud_store: Arc<CrudStore>,
         agent_manager: Arc<AgentManager>,
-        provider_registry: Arc<ProviderRegistry>,
+        _provider_registry: Arc<ProviderRegistry>,
         policy_registry: RecoveryPolicyRegistry,
     ) -> Self {
         Self {
             crud_store,
             agent_manager,
-            provider_registry,
             policy_registry,
         }
     }
@@ -614,6 +758,55 @@ impl RecoveryCoordinator {
                     .map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
                 0,
                 provider_policy.max_attempts,
+                snapshot.clone(),
+                snapshot,
+                now_unix,
+            )
+            .await?;
+        Ok(RecoveryJobEnqueueOutcome::Created(record))
+    }
+
+    pub async fn enqueue_runtime_failure_job(
+        &self,
+        candidate: &RuntimeFailureCandidate,
+        now_unix: i64,
+    ) -> Result<RecoveryJobEnqueueOutcome> {
+        if let Some(existing) = self
+            .open_recovery_for_turn(candidate.turn_id.as_str())
+            .await?
+        {
+            return Ok(RecoveryJobEnqueueOutcome::Reused(existing));
+        }
+
+        let mut snapshot = serde_json::json!({
+            "source": "runtime_failure",
+            "trigger": recovery_trigger_name(candidate.trigger),
+            "action": policy_action_name(candidate.action),
+            "base_backoff_secs": candidate.base_backoff_secs,
+            "max_attempts": candidate.max_attempts,
+            "max_wall_clock_secs": candidate.max_wall_clock_secs,
+            "no_progress_limit": candidate.no_progress_limit,
+        });
+
+        if let serde_json::Value::Object(snapshot_object) = &mut snapshot {
+            snapshot_object.insert("metadata".to_owned(), candidate.metadata.clone());
+        }
+
+        let record = self
+            .crud_store
+            .enqueue_recovery_job(
+                candidate.turn_id.clone(),
+                candidate.item_id.clone(),
+                candidate.item_type,
+                None,
+                candidate.trigger,
+                candidate.action,
+                Some(candidate.reason.clone()),
+                None,
+                None,
+                None,
+                0,
+                candidate.max_attempts,
                 snapshot.clone(),
                 snapshot,
                 now_unix,
@@ -1147,6 +1340,44 @@ impl RecoveryCoordinator {
         Ok(events)
     }
 
+    pub async fn resume_blocked_turn(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        recovery_job_id: Option<&str>,
+        now_unix: i64,
+    ) -> Result<Option<RecoveryJobRecord>> {
+        let outcome = self
+            .crud_store
+            .resume_blocked_turn_recovery(thread_id, turn_id, recovery_job_id, now_unix)
+            .await?;
+
+        let job = match outcome {
+            BlockedTurnRecoveryResumeOutcome::Resumed(job) => job,
+            BlockedTurnRecoveryResumeOutcome::NotFound => return Ok(None),
+            BlockedTurnRecoveryResumeOutcome::MissingRuntimeSnapshot { recovery_job_id } => {
+                let _ = self
+                    .crud_store
+                    .mark_recovery_job_terminal(
+                        recovery_job_id.as_str(),
+                        RecoveryJobStatus::Blocked,
+                        Some(
+                            "blocked tool-item recovery cannot resume without a durable turn runtime snapshot"
+                                .to_owned(),
+                        ),
+                        now_unix,
+                    )
+                    .await?;
+                bail!(
+                    "blocked recovery job `{}` is attached to a tool item and has no durable turn runtime snapshot",
+                    recovery_job_id
+                );
+            }
+        };
+
+        Ok(Some(job))
+    }
+
     pub async fn repair_due_terminal_recovery_jobs(
         &self,
         now_unix: i64,
@@ -1354,6 +1585,34 @@ impl RecoveryCoordinator {
             return Ok(events);
         }
 
+        if policy.action == RecoveryAction::BlockResumable {
+            let message = block_resumable_policy_message(&job);
+            if self
+                .crud_store
+                .mark_claimed_recovery_job_terminal(
+                    job.id.as_str(),
+                    claim_token.as_str(),
+                    RecoveryJobStatus::Blocked,
+                    Some(message.clone()),
+                    now_unix,
+                )
+                .await?
+            {
+                self.cancel_other_open_jobs_after_terminal_recovery(
+                    job.turn_id.as_str(),
+                    job.id.as_str(),
+                    now_unix,
+                )
+                .await?;
+                events.push(RecoveryCoordinatorEvent::RecoveryBlocked {
+                    job_id: job.id,
+                    turn_id: job.turn_id,
+                    reason: message,
+                });
+            }
+            return Ok(events);
+        }
+
         let wall_clock_exceeded = i64::try_from(policy.max_wall_clock_secs)
             .ok()
             .is_some_and(|limit| now_unix.saturating_sub(job.scheduled_at_unix) > limit);
@@ -1521,6 +1780,8 @@ impl RecoveryCoordinator {
             item_id: job.item_id.clone(),
             item_type: job.item_type,
             force_non_stream: execution_plan.force_non_stream,
+            disable_tool_calling: execution_plan.disable_tool_calling,
+            disable_image_input: execution_plan.disable_image_input,
             refresh_provider_auth: execution_plan.refresh_provider_auth,
             compact_history: execution_plan.compact_history,
             continue_generation,
@@ -1547,43 +1808,61 @@ impl RecoveryCoordinator {
                 if matches!(
                     &error,
                     AgentControlError::ThreadNotFound | AgentControlError::NoActiveTurn
-                ) && !request.item_type.is_tool_item()
-                    && request.execution_checkpoint_context.is_some()
-                    && let Some(restored_turn_request) = self
-                        .restored_recovery_turn_request(thread_id.as_str(), job.turn_id.as_str())
-                        .await?
-                {
+                ) {
                     match self
-                        .agent_manager
-                        .start_restored_recovery_turn(
+                        .restored_recovery_turn_request(
                             thread_id.as_str(),
-                            workspace_id.as_str(),
-                            restored_turn_request,
-                            request.clone(),
+                            job.turn_id.as_str(),
+                            now_unix,
                         )
-                        .await
+                        .await?
                     {
-                        Ok(()) => {
-                            events.push(RecoveryCoordinatorEvent::RetryAttemptStarted {
-                                job_id: job.id.clone(),
-                                turn_id: job.turn_id.clone(),
-                                item_id: job.item_id.clone(),
-                                item_type: job.item_type,
-                                attempt_number,
-                            });
-                            return Ok(events);
-                        }
-                        Err(restored_error) => {
-                            return self
-                                .handle_recovery_start_error(
-                                    job,
-                                    active_attempt_id,
-                                    restored_error,
-                                    policy,
-                                    attempt_number,
-                                    now_unix,
+                        RestoredRecoveryTurnRequestLookup::Available(restored_turn_request) => {
+                            match self
+                                .agent_manager
+                                .start_restored_recovery_turn(
+                                    thread_id.as_str(),
+                                    workspace_id.as_str(),
+                                    restored_turn_request,
+                                    request.clone(),
                                 )
-                                .await;
+                                .await
+                            {
+                                Ok(()) => {
+                                    events.push(RecoveryCoordinatorEvent::RetryAttemptStarted {
+                                        job_id: job.id.clone(),
+                                        turn_id: job.turn_id.clone(),
+                                        item_id: job.item_id.clone(),
+                                        item_type: job.item_type,
+                                        attempt_number,
+                                    });
+                                    return Ok(events);
+                                }
+                                Err(restored_error) => {
+                                    return self
+                                        .handle_recovery_start_error(
+                                            job,
+                                            active_attempt_id,
+                                            restored_error,
+                                            policy,
+                                            attempt_number,
+                                            now_unix,
+                                        )
+                                        .await;
+                                }
+                            }
+                        }
+                        RestoredRecoveryTurnRequestLookup::Unavailable(unavailable) => {
+                            if let Some(reason) = unavailable.lost_loop_block_reason() {
+                                return self
+                                    .block_recovery_without_restorable_runtime_snapshot(
+                                        job,
+                                        active_attempt_id,
+                                        reason,
+                                        now_unix,
+                                    )
+                                    .await;
+                            }
                         }
                     }
                 }
@@ -1599,6 +1878,41 @@ impl RecoveryCoordinator {
                     )
                     .await;
             }
+        }
+
+        Ok(events)
+    }
+
+    async fn block_recovery_without_restorable_runtime_snapshot(
+        &self,
+        job: RecoveryJobRecord,
+        active_attempt_id: String,
+        reason: String,
+        now_unix: i64,
+    ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+        let mut events = Vec::new();
+        if self
+            .crud_store
+            .mark_recovery_job_terminal_after_attempt(
+                job.id.as_str(),
+                active_attempt_id.as_str(),
+                RecoveryJobStatus::Blocked,
+                Some(reason.clone()),
+                now_unix,
+            )
+            .await?
+        {
+            self.cancel_other_open_jobs_after_terminal_recovery(
+                job.turn_id.as_str(),
+                job.id.as_str(),
+                now_unix,
+            )
+            .await?;
+            events.push(RecoveryCoordinatorEvent::RecoveryBlocked {
+                job_id: job.id,
+                turn_id: job.turn_id,
+                reason,
+            });
         }
 
         Ok(events)
@@ -1742,76 +2056,116 @@ impl RecoveryCoordinator {
         &self,
         thread_id: &str,
         turn_id: &str,
-    ) -> Result<Option<RestoredRecoveryTurnRequest>> {
-        let Some(thread) = self.crud_store.get_thread_model(thread_id).await? else {
-            return Ok(None);
-        };
-        let Some((_workspace_id, turn)) = self.crud_store.get_turn(thread_id, turn_id).await?
-        else {
-            return Ok(None);
+        now_unix: i64,
+    ) -> Result<RestoredRecoveryTurnRequestLookup> {
+        let Some((workspace_id, turn)) = self.crud_store.get_turn(thread_id, turn_id).await? else {
+            return Ok(RestoredRecoveryTurnRequestLookup::Unavailable(
+                RestoredRecoveryTurnUnavailable::TurnNotFound,
+            ));
         };
         if turn.status != TurnStatus::InProgress {
-            return Ok(None);
+            return Ok(RestoredRecoveryTurnRequestLookup::Unavailable(
+                RestoredRecoveryTurnUnavailable::TurnNotInProgress,
+            ));
         }
 
-        let input = self.crud_store.get_turn_inputs(turn_id).await?;
-        let history = self.history_messages_for_thread(thread_id).await?;
-        let workspace_skill_policies = self
-            .workspace_skill_policies_for_workspace(thread.workspace_id.as_str())
-            .await?;
-
-        Ok(Some(RestoredRecoveryTurnRequest {
-            turn_id: turn_id.to_owned(),
-            mode: thread.mode,
-            model: thread.model,
-            provider_name: thread.model_provider,
-            workspace_skill_policies,
-            input,
-            capabilities: Vec::new(),
-            resolved_artifacts: Vec::new(),
-            runtime_environment: HashMap::new(),
-            history,
-        }))
-    }
-
-    async fn history_messages_for_thread(&self, thread_id: &str) -> Result<Vec<ChatMessage>> {
-        const MAX_TURNS: usize = 200;
-
-        let entries = self
-            .crud_store
-            .get_thread_conversation_history(thread_id, MAX_TURNS)
-            .await?;
-        let mut messages = Vec::with_capacity(entries.len() * 2);
-        for entry in entries {
-            if let Some(user_text) = entry.user_text {
-                messages.push(ChatMessage::user(user_text));
-            }
-            if let Some(assistant_text) = entry.assistant_text {
-                messages.push(ChatMessage::assistant(assistant_text));
-            }
+        let Some(snapshot) = self.crud_store.get_turn_runtime_snapshot(turn_id).await? else {
+            return Ok(RestoredRecoveryTurnRequestLookup::Unavailable(
+                RestoredRecoveryTurnUnavailable::MissingRuntimeSnapshot,
+            ));
+        };
+        if snapshot.thread_id != thread_id || snapshot.workspace_id != workspace_id {
+            warn!(
+                thread_id,
+                turn_id,
+                workspace_id,
+                snapshot_thread_id = snapshot.thread_id,
+                snapshot_workspace_id = snapshot.workspace_id,
+                "turn runtime snapshot does not match recovery target"
+            );
+            return Ok(RestoredRecoveryTurnRequestLookup::Unavailable(
+                RestoredRecoveryTurnUnavailable::SnapshotMismatch,
+            ));
         }
-        Ok(messages)
+
+        let mut request =
+            match crate::turn_runtime_snapshot::restored_recovery_turn_request_from_snapshot(
+                &snapshot,
+            ) {
+                Ok(request) => request,
+                Err(error) => {
+                    return Ok(RestoredRecoveryTurnRequestLookup::Unavailable(
+                        RestoredRecoveryTurnUnavailable::SnapshotInvalid {
+                            error: format!("{error:#}"),
+                        },
+                    ));
+                }
+            };
+        let execution_window_index = self
+            .next_restored_execution_window_index(turn_id, now_unix)
+            .await?;
+        request.execution_window_index = execution_window_index;
+        Ok(RestoredRecoveryTurnRequestLookup::Available(request))
     }
 
-    async fn workspace_skill_policies_for_workspace(
+    async fn next_restored_execution_window_index(
         &self,
-        workspace_id: &str,
-    ) -> Result<HashMap<SkillPolicyKey, WorkspaceSkillPolicy>> {
-        Ok(self
+        turn_id: &str,
+        now_unix: i64,
+    ) -> Result<u32> {
+        let Some(window) = self
             .crud_store
-            .list_workspace_skill_policies(workspace_id)
+            .latest_turn_execution_window(turn_id)
             .await?
-            .into_iter()
-            .map(|record| {
-                (
-                    SkillPolicyKey::new(record.skill_slug, record.source_kind),
-                    WorkspaceSkillPolicy {
-                        enabled: record.enabled,
-                        allow_implicit_invocation: record.allow_implicit_invocation,
+        else {
+            return Ok(1);
+        };
+
+        if window.status == ExecutionWindowStatus::Running {
+            let counts = self
+                .crud_store
+                .count_turn_execution_window_terminal_items(turn_id)
+                .await?;
+            let completed_at = chrono::DateTime::<chrono::Utc>::from_timestamp(now_unix, 0)
+                .map(|timestamp| timestamp.fixed_offset())
+                .unwrap_or_else(|| chrono::Utc::now().fixed_offset());
+            let mut metadata_json = window.metadata_json.clone();
+            match metadata_json.as_object_mut() {
+                Some(metadata) => {
+                    metadata.insert(
+                        "interruptedBy".to_owned(),
+                        serde_json::Value::String("startup_recovery".to_owned()),
+                    );
+                    metadata.insert(
+                        "terminalReason".to_owned(),
+                        serde_json::Value::String(
+                            "agent loop was restored after process loss".to_owned(),
+                        ),
+                    );
+                }
+                None => {
+                    metadata_json = serde_json::json!({
+                        "interruptedBy": "startup_recovery",
+                        "terminalReason": "agent loop was restored after process loss",
+                    });
+                }
+            }
+            self.crud_store
+                .mark_turn_execution_window_interrupted(
+                    window.id.as_str(),
+                    pioneer_crud::TurnExecutionWindowStatsRecord {
+                        agent_round_count: window.agent_round_count.max(counts.agent_round_count),
+                        tool_call_count: window.tool_call_count.max(counts.tool_call_count),
+                        provider_token_count: window.provider_token_count,
+                        metadata_json,
+                        completed_at,
+                        updated_at: completed_at,
                     },
                 )
-            })
-            .collect())
+                .await?;
+        }
+
+        Ok(window.window_index.saturating_add(1).max(1))
     }
 }
 
@@ -2043,13 +2397,17 @@ impl RecoveryCoordinator {
             | ProviderFailureClass::RateLimit
             | ProviderFailureClass::Provider5xx
             | ProviderFailureClass::EmptyResponse => {}
-            ProviderFailureClass::ProviderRejected => {}
             ProviderFailureClass::StreamStall | ProviderFailureClass::StreamTruncated => {
                 if attempt_number >= STREAM_TO_NON_STREAM_FALLBACK_ATTEMPT {
                     plan.force_non_stream = true;
                 }
             }
-            ProviderFailureClass::AuthExpired => {
+            ProviderFailureClass::UnsupportedStreaming => {
+                plan.force_non_stream = true;
+            }
+            ProviderFailureClass::AuthExpired
+            | ProviderFailureClass::AuthOrPermission
+            | ProviderFailureClass::PermissionDenied => {
                 plan.refresh_provider_auth = true;
             }
             ProviderFailureClass::ModelNotFound => {
@@ -2059,13 +2417,35 @@ impl RecoveryCoordinator {
                         Some("model_not_found recovery has no fallback model".to_owned());
                 }
             }
-            ProviderFailureClass::PromptTooLong => {
+            ProviderFailureClass::PromptTooLong | ProviderFailureClass::ContextTooLarge => {
                 plan.compact_history = true;
             }
             ProviderFailureClass::MaxOutputTokens => {
                 plan.continue_generation = true;
             }
-            ProviderFailureClass::InvalidRequest | ProviderFailureClass::PermissionDenied => {}
+            ProviderFailureClass::UnsupportedParameter
+            | ProviderFailureClass::MalformedProviderRequest
+            | ProviderFailureClass::ProviderRejected
+            | ProviderFailureClass::InvalidRequest => {
+                if attempt_number >= STREAM_TO_NON_STREAM_FALLBACK_ATTEMPT
+                    && provider_snapshot_field(job, "transport") == Some("stream")
+                {
+                    plan.force_non_stream = true;
+                }
+            }
+            ProviderFailureClass::UnsupportedCapability
+            | ProviderFailureClass::UnsupportedToolCalling => {
+                if provider_snapshot_field(job, "transport") == Some("stream") {
+                    plan.force_non_stream = true;
+                }
+                plan.disable_tool_calling = true;
+            }
+            ProviderFailureClass::UnsupportedImageInput => {
+                if provider_snapshot_field(job, "transport") == Some("stream") {
+                    plan.force_non_stream = true;
+                }
+                plan.disable_image_input = true;
+            }
             ProviderFailureClass::Unknown => {
                 if attempt_number >= STREAM_TO_NON_STREAM_FALLBACK_ATTEMPT
                     && provider_snapshot_field(job, "transport") == Some("stream")
@@ -2085,39 +2465,7 @@ impl RecoveryCoordinator {
             return Ok(Some(configured.to_owned()));
         }
 
-        // TODO(fallback_model): replace "first different model" heuristic with ranked selection
-        // (compatibility class, capabilities, and provider preferences).
-        let Some(provider_name) = provider_snapshot_field(job, "provider") else {
-            return Ok(None);
-        };
-        let Some(failed_model) = provider_snapshot_field(job, "model") else {
-            return Ok(None);
-        };
-        let workspace_id = self
-            .crud_store
-            .get_turn_location(job.turn_id.as_str())
-            .await?
-            .map(|(_, workspace_id)| workspace_id);
-        let Some(workspace_id) = workspace_id else {
-            return Ok(None);
-        };
-        let provider = match self
-            .provider_registry
-            .get_or_create_for_workspace(workspace_id.as_str(), provider_name)
-        {
-            Ok(provider) => provider,
-            Err(_) => return Ok(None),
-        };
-
-        let models = match timeout(MODEL_FALLBACK_LOOKUP_TIMEOUT, provider.list_models()).await {
-            Ok(Ok(models)) => models,
-            _ => return Ok(None),
-        };
-
-        Ok(models
-            .into_iter()
-            .map(|model| model.id)
-            .find(|candidate| !candidate.trim().is_empty() && candidate != failed_model))
+        Ok(None)
     }
 }
 
@@ -2204,11 +2552,26 @@ fn policy_from_tool_snapshot(snapshot: &ToolRecoveryPolicySnapshot) -> RecoveryP
 }
 
 fn conservative_missing_tool_snapshot_policy(mut base: RecoveryPolicy) -> RecoveryPolicy {
-    base.action = RecoveryAction::MarkFailed;
-    base.max_attempts = 1;
-    base.base_backoff_secs = 1;
-    base.no_progress_limit = 1;
+    base.action = RecoveryAction::BlockResumable;
+    base.max_attempts = 0;
+    base.base_backoff_secs = 0;
+    base.no_progress_limit = 0;
     base
+}
+
+fn recovery_trigger_name(trigger: RecoveryTrigger) -> &'static str {
+    match trigger {
+        RecoveryTrigger::Timeout => "timeout",
+        RecoveryTrigger::ProviderError => "provider_error",
+        RecoveryTrigger::TurnStart => "turn_start",
+        RecoveryTrigger::TurnDispatch => "turn_dispatch",
+        RecoveryTrigger::ProjectionFailure => "projection_failure",
+        RecoveryTrigger::ExecutionWindowContinuation => "execution_window_continuation",
+        RecoveryTrigger::ArtifactFinalization => "artifact_finalization",
+        RecoveryTrigger::TaskDispatch => "task_dispatch",
+        RecoveryTrigger::RuntimeFailure => "runtime_failure",
+        RecoveryTrigger::Unknown => "unknown",
+    }
 }
 
 fn policy_action_name(action: RecoveryAction) -> &'static str {
@@ -2216,8 +2579,46 @@ fn policy_action_name(action: RecoveryAction) -> &'static str {
         RecoveryAction::RetryAttempt => "retry_attempt",
         RecoveryAction::RetryWithBackoff => "retry_with_backoff",
         RecoveryAction::RestartTurn => "restart_turn",
+        RecoveryAction::ReplayDurableEvent => "replay_durable_event",
+        RecoveryAction::RehydrateTurnState => "rehydrate_turn_state",
+        RecoveryAction::OpenNextExecutionWindow => "open_next_execution_window",
+        RecoveryAction::AdaptProviderRequest => "adapt_provider_request",
+        RecoveryAction::RefreshProviderAuth => "refresh_provider_auth",
+        RecoveryAction::CompactHistory => "compact_history",
+        RecoveryAction::DisableStreaming => "disable_streaming",
+        RecoveryAction::DisableUnsupportedCapability => "disable_unsupported_capability",
+        RecoveryAction::RepairArtifactFinalization => "repair_artifact_finalization",
+        RecoveryAction::RequeueTaskDispatch => "requeue_task_dispatch",
+        RecoveryAction::BlockResumable => "block_resumable",
         RecoveryAction::Fallback => "fallback",
         RecoveryAction::MarkFailed => "mark_failed",
+    }
+}
+
+fn provider_failure_class_name(class: ProviderFailureClass) -> &'static str {
+    match class {
+        ProviderFailureClass::NetworkTransient => "network_transient",
+        ProviderFailureClass::RateLimit => "rate_limit",
+        ProviderFailureClass::Provider5xx => "provider_5xx",
+        ProviderFailureClass::AuthExpired => "auth_expired",
+        ProviderFailureClass::AuthOrPermission => "auth_or_permission",
+        ProviderFailureClass::ModelNotFound => "model_not_found",
+        ProviderFailureClass::PromptTooLong => "prompt_too_long",
+        ProviderFailureClass::ContextTooLarge => "context_too_large",
+        ProviderFailureClass::MaxOutputTokens => "max_output_tokens",
+        ProviderFailureClass::StreamStall => "stream_stall",
+        ProviderFailureClass::StreamTruncated => "stream_truncated",
+        ProviderFailureClass::EmptyResponse => "empty_response",
+        ProviderFailureClass::ProviderRejected => "provider_rejected",
+        ProviderFailureClass::UnsupportedParameter => "unsupported_parameter",
+        ProviderFailureClass::UnsupportedCapability => "unsupported_capability",
+        ProviderFailureClass::UnsupportedImageInput => "unsupported_image_input",
+        ProviderFailureClass::UnsupportedToolCalling => "unsupported_tool_calling",
+        ProviderFailureClass::UnsupportedStreaming => "unsupported_streaming",
+        ProviderFailureClass::MalformedProviderRequest => "malformed_provider_request",
+        ProviderFailureClass::InvalidRequest => "invalid_request",
+        ProviderFailureClass::PermissionDenied => "permission_denied",
+        ProviderFailureClass::Unknown => "unknown",
     }
 }
 
@@ -2231,6 +2632,28 @@ fn terminal_policy_error_message(job: &RecoveryJobRecord) -> String {
     {
         Some(reason) => format!("{BASE}: {reason}"),
         None => BASE.to_owned(),
+    }
+}
+
+fn block_resumable_policy_message(job: &RecoveryJobRecord) -> String {
+    let base = match job.error_class {
+        Some(class) => format!(
+            "recovery is blocked and requires user/operator action: {}",
+            provider_failure_class_name(class)
+        ),
+        None => format!(
+            "recovery is blocked and requires user/operator action: {}",
+            recovery_trigger_name(job.trigger)
+        ),
+    };
+    match job
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+    {
+        Some(reason) => format!("{base}: {reason}"),
+        None => base,
     }
 }
 
@@ -2297,13 +2720,14 @@ mod tests {
     };
     use migration::{Migrator, MigratorTrait};
     use pioneer_agent::{
-        AgentManager, SkillsDependenciesLoopConfig, SkillsLoopConfig, SkillsRuntimeLoopConfig,
-        SkillsSecurityLoopConfig, SkillsValidationLoopConfig, ToolLoopConfig,
+        AgentManager, AgentTurnHookRuntimeContext, ResolvedArtifactInput,
+        SkillsDependenciesLoopConfig, SkillsLoopConfig, SkillsRuntimeLoopConfig,
+        SkillsSecurityLoopConfig, SkillsValidationLoopConfig, ToolLoopConfig, WorkspaceSkillPolicy,
     };
     use pioneer_crud::{
         ClaimedRecoveryActivation, CrudStore, NewTurnExecutionCheckpointRecord,
-        NewTurnExecutionWindowRecord, TimeoutCandidate, TurnExecutionCheckpointKind,
-        TurnExecutionWindowStatsRecord,
+        NewTurnExecutionWindowRecord, NewTurnRuntimeSnapshot, RecoveryJobRecord, TimeoutCandidate,
+        TurnExecutionCheckpointKind, TurnExecutionWindowStatsRecord,
     };
     use pioneer_protocol::{
         ExecutionWindowExhaustionReason, ExecutionWindowStatus, ItemStartedNotification,
@@ -2311,17 +2735,20 @@ mod tests {
         RecoveryAction, RecoveryAttemptContext, RecoveryJobStatus, RecoveryTrigger, SandboxMode,
         Thread, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus,
         ToolCallStatus, ToolDisplayPayload, ToolOutputPolicySnapshot, ToolRecoveryIdempotencyMode,
-        ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass, ToolStoragePayload,
-        TurnCompletedNotification, TurnItem, TurnItemTimeoutReason, TurnItemType, TurnStatus,
-        UserInput, build_execution_checkpoint_payload,
+        ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass, ToolStoragePayload, TurnCapability,
+        TurnCapabilityKind, TurnCompletedNotification, TurnItem, TurnItemTimeoutReason,
+        TurnItemType, TurnStatus, UserInput, build_execution_checkpoint_payload,
     };
-    use pioneer_provider::{ProviderRegistry, providers::EchoProvider};
-    use pioneer_skills::SkillTrustLevel;
+    use pioneer_provider::{
+        ChatMessage, InputContentType, MessageAttachment, ProviderRegistry, providers::EchoProvider,
+    };
+    use pioneer_skills::{SkillPolicyKey, SkillTrustLevel};
     use pioneer_tools::{
         ComputerUseToolsConfig, ExecutionWindowsConfig, ToolLoopBudgetConfig,
         ToolRetryBudgetConfig, WebToolsConfig,
     };
     use sea_orm::Database;
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     fn test_tool_loop_config() -> ToolLoopConfig {
@@ -2448,6 +2875,34 @@ mod tests {
         }
     }
 
+    fn provider_plan_job(class: ProviderFailureClass, transport: &str) -> RecoveryJobRecord {
+        RecoveryJobRecord {
+            id: format!("job_plan_{}", super::provider_failure_class_name(class)),
+            turn_id: "turn_plan".to_owned(),
+            item_id: "reasoning_plan".to_owned(),
+            item_type: TurnItemType::Reasoning,
+            source_attempt_id: None,
+            status: RecoveryJobStatus::Pending,
+            trigger: RecoveryTrigger::ProviderError,
+            action: RecoveryAction::RetryWithBackoff,
+            reason: None,
+            error_class: Some(class),
+            transport_stage: Some(ProviderFailureStage::Finalize),
+            retry_after_ms: None,
+            provider_attempt_number: 1,
+            policy_json: serde_json::json!({}),
+            policy_snapshot: serde_json::json!({ "transport": transport }),
+            last_error: None,
+            run_count: 0,
+            max_attempts: 2,
+            scheduled_at_unix: 1_700_000_000,
+            updated_at_unix: 1_700_000_000,
+            claim_token: None,
+            active_attempt_id: None,
+            active_attempt_started_at_unix: None,
+        }
+    }
+
     fn tool_snapshot(
         retry_class: ToolRecoveryRetryClass,
         idempotency_mode: ToolRecoveryIdempotencyMode,
@@ -2556,6 +3011,394 @@ mod tests {
             )
             .await
             .expect("tool item should persist");
+    }
+
+    async fn persist_test_runtime_snapshot(
+        crud_store: &CrudStore,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+    ) {
+        let mut workspace_skill_policies = HashMap::new();
+        workspace_skill_policies.insert(
+            SkillPolicyKey::new("writer", "user"),
+            WorkspaceSkillPolicy {
+                enabled: Some(true),
+                allow_implicit_invocation: Some(false),
+            },
+        );
+        let capabilities = vec![TurnCapability {
+            id: "cap_writer".to_owned(),
+            kind: TurnCapabilityKind::Skill {
+                slug: "writer".to_owned(),
+                source_kind: "user".to_owned(),
+            },
+            label: Some("Writer".to_owned()),
+        }];
+        let resolved_artifacts = vec![ResolvedArtifactInput {
+            artifact_id: "artifact_snapshot".to_owned(),
+            version_id: Some("version_snapshot".to_owned()),
+            content_type: InputContentType::File,
+            attachment: MessageAttachment::from_path("/tmp/snapshot.txt", "text/plain"),
+        }];
+        let runtime_environment = HashMap::from([(
+            "PIONEER_ARTIFACT_OUTPUT_DIR".to_owned(),
+            "/tmp/pioneer-snapshot-output".to_owned(),
+        )]);
+        let history = vec![
+            ChatMessage::user("previous user message"),
+            ChatMessage::assistant("previous assistant message"),
+        ];
+        let input = vec![UserInput::Text {
+            text: "run tool".to_owned(),
+            text_elements: Vec::new(),
+        }];
+        let hook_runtime_context = AgentTurnHookRuntimeContext::task("task_snapshot");
+
+        let snapshot = crate::turn_runtime_snapshot::new_turn_runtime_snapshot(
+            thread_id,
+            workspace_id,
+            turn_id,
+            ThreadMode::Agent,
+            &hook_runtime_context,
+            "test-model",
+            "echo",
+            &workspace_skill_policies,
+            input.as_slice(),
+            capabilities.as_slice(),
+            resolved_artifacts.as_slice(),
+            &runtime_environment,
+            history.as_slice(),
+        )
+        .expect("runtime snapshot should serialize");
+        crud_store
+            .upsert_turn_runtime_snapshot(snapshot)
+            .await
+            .expect("runtime snapshot should persist");
+    }
+
+    #[tokio::test]
+    async fn restored_recovery_turn_request_uses_runtime_snapshot() {
+        let (crud_store, coordinator) = setup_coordinator().await;
+        let workspace_id = "ws_restore_snapshot";
+        let thread_id = "thr_restore_snapshot";
+        let turn_id = "turn_restore_snapshot";
+        materialize_turn_with_tool_item(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            "tool_restore_snapshot",
+            None,
+        )
+        .await;
+        persist_test_runtime_snapshot(crud_store.as_ref(), workspace_id, thread_id, turn_id).await;
+
+        let restored = coordinator
+            .restored_recovery_turn_request(thread_id, turn_id, 1_700_000_000)
+            .await
+            .expect("restored request should load")
+            .into_available()
+            .expect("runtime snapshot should be restorable");
+
+        assert_eq!(restored.turn_id, turn_id);
+        assert_eq!(restored.execution_window_index, 1);
+        assert_eq!(restored.provider_name, "echo");
+        assert_eq!(
+            restored.hook_runtime_context.task_id.as_deref(),
+            Some("task_snapshot")
+        );
+        assert_eq!(restored.workspace_skill_policies.len(), 1);
+        assert_eq!(restored.capabilities.len(), 1);
+        assert_eq!(restored.resolved_artifacts.len(), 1);
+        assert_eq!(
+            restored
+                .runtime_environment
+                .get("PIONEER_ARTIFACT_OUTPUT_DIR")
+                .map(String::as_str),
+            Some("/tmp/pioneer-snapshot-output")
+        );
+        assert_eq!(restored.history.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn restored_recovery_turn_request_closes_stale_running_window_and_advances_index() {
+        let (crud_store, coordinator) = setup_coordinator().await;
+        let workspace_id = "ws_restore_running_window";
+        let thread_id = "thr_restore_running_window";
+        let turn_id = "turn_restore_running_window";
+        materialize_turn_with_tool_item(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            "tool_restore_running_window",
+            None,
+        )
+        .await;
+        persist_test_runtime_snapshot(crud_store.as_ref(), workspace_id, thread_id, turn_id).await;
+
+        let timestamp = chrono::Utc::now().fixed_offset();
+        let window = crud_store
+            .create_turn_execution_window(
+                NewTurnExecutionWindowRecord {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    window_index: 1,
+                    status: ExecutionWindowStatus::Running,
+                    exhaustion_reason: None,
+                    agent_round_count: 1,
+                    tool_call_count: 1,
+                    provider_token_count: 0,
+                    metadata_json: serde_json::json!({"runtimeWindowId": "stale_window_1"}),
+                    started_at: timestamp,
+                },
+                timestamp,
+                timestamp,
+            )
+            .await
+            .expect("running window should persist");
+
+        let restored = coordinator
+            .restored_recovery_turn_request(thread_id, turn_id, 1_700_000_010)
+            .await
+            .expect("restored request should load")
+            .into_available()
+            .expect("runtime snapshot should be restorable");
+        assert_eq!(restored.execution_window_index, 2);
+
+        let interrupted = crud_store
+            .get_turn_execution_window(window.id.as_str())
+            .await
+            .expect("window read should succeed")
+            .expect("window should exist");
+        assert_eq!(interrupted.status, ExecutionWindowStatus::Interrupted);
+        assert_eq!(
+            interrupted
+                .metadata_json
+                .get("interruptedBy")
+                .and_then(serde_json::Value::as_str),
+            Some("startup_recovery")
+        );
+    }
+
+    #[tokio::test]
+    async fn restored_recovery_turn_request_does_not_close_stale_window_for_invalid_snapshot() {
+        let (crud_store, coordinator) = setup_coordinator().await;
+        let workspace_id = "ws_restore_invalid_snapshot";
+        let thread_id = "thr_restore_invalid_snapshot";
+        let turn_id = "turn_restore_invalid_snapshot";
+        materialize_turn_with_tool_item(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            "tool_restore_invalid_snapshot",
+            None,
+        )
+        .await;
+
+        let timestamp = chrono::Utc::now().fixed_offset();
+        crud_store
+            .upsert_turn_runtime_snapshot(NewTurnRuntimeSnapshot {
+                turn_id: turn_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                workspace_id: workspace_id.to_owned(),
+                mode_json: "{invalid".to_owned(),
+                model: "test-model".to_owned(),
+                provider_name: "echo".to_owned(),
+                hook_runtime_context_json: "{}".to_owned(),
+                workspace_skill_policies_json: "[]".to_owned(),
+                input_json: "[]".to_owned(),
+                capabilities_json: "[]".to_owned(),
+                resolved_artifacts_json: "[]".to_owned(),
+                runtime_environment_json: "{}".to_owned(),
+                history_json: "[]".to_owned(),
+                created_at: timestamp,
+                updated_at: timestamp,
+            })
+            .await
+            .expect("invalid runtime snapshot should persist");
+        let window = crud_store
+            .create_turn_execution_window(
+                NewTurnExecutionWindowRecord {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    window_index: 1,
+                    status: ExecutionWindowStatus::Running,
+                    exhaustion_reason: None,
+                    agent_round_count: 1,
+                    tool_call_count: 1,
+                    provider_token_count: 0,
+                    metadata_json: serde_json::json!({"runtimeWindowId": "stale_window_1"}),
+                    started_at: timestamp,
+                },
+                timestamp,
+                timestamp,
+            )
+            .await
+            .expect("running window should persist");
+
+        let lookup = coordinator
+            .restored_recovery_turn_request(thread_id, turn_id, 1_700_000_010)
+            .await
+            .expect("restored request lookup should evaluate");
+        assert!(matches!(
+            lookup,
+            super::RestoredRecoveryTurnRequestLookup::Unavailable(
+                super::RestoredRecoveryTurnUnavailable::SnapshotInvalid { .. }
+            )
+        ));
+
+        let still_running = crud_store
+            .get_turn_execution_window(window.id.as_str())
+            .await
+            .expect("window read should succeed")
+            .expect("window should exist");
+        assert_eq!(still_running.status, ExecutionWindowStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn tool_item_recovery_restores_turn_from_runtime_snapshot_when_loop_missing() {
+        let (crud_store, _agent_manager, coordinator) = setup_coordinator_with_agent().await;
+        let workspace_id = "ws_tool_restore";
+        let thread_id = "thr_tool_restore";
+        let turn_id = "turn_tool_restore";
+        let item_id = "tool_restore";
+        materialize_turn_with_tool_item(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            item_id,
+            None,
+        )
+        .await;
+        persist_test_runtime_snapshot(crud_store.as_ref(), workspace_id, thread_id, turn_id).await;
+        let job = crud_store
+            .enqueue_recovery_job(
+                turn_id.to_owned(),
+                item_id.to_owned(),
+                TurnItemType::WebFetch,
+                None,
+                RecoveryTrigger::Timeout,
+                RecoveryAction::RetryAttempt,
+                Some("tool idle timeout".to_owned()),
+                None,
+                None,
+                None,
+                0,
+                2,
+                serde_json::json!({}),
+                serde_json::json!({
+                    "base_backoff_secs": 0,
+                    "max_wall_clock_secs": 60,
+                    "no_progress_limit": 3,
+                }),
+                1_700_000_010,
+            )
+            .await
+            .expect("tool recovery job should enqueue");
+
+        let events = coordinator
+            .run_ready_jobs(1_700_000_011, 1)
+            .await
+            .expect("tool recovery should run");
+
+        assert!(matches!(
+            events.as_slice(),
+            [RecoveryCoordinatorEvent::RetryAttemptStarted {
+                job_id,
+                turn_id: event_turn_id,
+                item_id: event_item_id,
+                item_type,
+                attempt_number,
+            }] if job_id == &job.id
+                && event_turn_id == turn_id
+                && event_item_id == item_id
+                && *item_type == TurnItemType::WebFetch
+                && *attempt_number == 1
+        ));
+        let reloaded = crud_store
+            .get_recovery_job(job.id.as_str())
+            .await
+            .expect("job should reload")
+            .expect("job should exist");
+        assert_eq!(reloaded.status, RecoveryJobStatus::Active);
+    }
+
+    #[tokio::test]
+    async fn tool_item_recovery_blocks_when_loop_missing_and_runtime_snapshot_missing() {
+        let (crud_store, _agent_manager, coordinator) = setup_coordinator_with_agent().await;
+        let workspace_id = "ws_tool_missing_snapshot";
+        let thread_id = "thr_tool_missing_snapshot";
+        let turn_id = "turn_tool_missing_snapshot";
+        let item_id = "tool_missing_snapshot";
+        materialize_turn_with_tool_item(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            item_id,
+            None,
+        )
+        .await;
+        let job = crud_store
+            .enqueue_recovery_job(
+                turn_id.to_owned(),
+                item_id.to_owned(),
+                TurnItemType::WebFetch,
+                None,
+                RecoveryTrigger::Timeout,
+                RecoveryAction::RetryAttempt,
+                Some("tool idle timeout".to_owned()),
+                None,
+                None,
+                None,
+                0,
+                2,
+                serde_json::json!({}),
+                serde_json::json!({
+                    "base_backoff_secs": 0,
+                    "max_wall_clock_secs": 60,
+                    "no_progress_limit": 3,
+                }),
+                1_700_000_010,
+            )
+            .await
+            .expect("tool recovery job should enqueue");
+
+        let events = coordinator
+            .run_ready_jobs(1_700_000_011, 1)
+            .await
+            .expect("tool recovery should block without a restorable snapshot");
+
+        assert!(matches!(
+            events.as_slice(),
+            [RecoveryCoordinatorEvent::RecoveryBlocked {
+                job_id,
+                turn_id: event_turn_id,
+                reason,
+            }] if job_id == &job.id
+                && event_turn_id == turn_id
+                && reason.contains("runtime snapshot is missing")
+        ));
+        let reloaded = crud_store
+            .get_recovery_job(job.id.as_str())
+            .await
+            .expect("job should reload")
+            .expect("job should exist");
+        assert_eq!(reloaded.status, RecoveryJobStatus::Blocked);
+        assert!(reloaded.active_attempt_id.is_none());
+        assert!(
+            reloaded
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("runtime snapshot is missing")
+        );
     }
 
     #[tokio::test]
@@ -3254,8 +4097,8 @@ mod tests {
             .expect("timeout should enqueue conservative recovery")
             .into_job();
 
-        assert_eq!(job.action, RecoveryAction::MarkFailed);
-        assert_eq!(job.max_attempts, 1);
+        assert_eq!(job.action, RecoveryAction::BlockResumable);
+        assert_eq!(job.max_attempts, 0);
         assert_eq!(
             job.policy_snapshot
                 .get("policy_source")
@@ -3273,7 +4116,7 @@ mod tests {
             job.policy_snapshot
                 .get("no_progress_limit")
                 .and_then(|value| value.as_i64()),
-            Some(1)
+            Some(0)
         );
     }
 
@@ -4024,12 +4867,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mark_failed_provider_policy_fails_without_recovery_attempt() {
+    async fn invalid_request_provider_policy_retries_instead_of_marking_failed() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let job = coordinator
             .enqueue_provider_failure_job(
                 &ProviderFailureCandidate {
-                    turn_id: "turn_mark_failed_recovery_job".to_owned(),
+                    turn_id: "turn_invalid_request_recovery_job".to_owned(),
                     item_id: "reasoning_1".to_owned(),
                     item_type: TurnItemType::Reasoning,
                     failure: provider_failure(ProviderFailureClass::InvalidRequest, "bad request"),
@@ -4039,24 +4882,26 @@ mod tests {
             .await
             .expect("initial provider failure should enqueue")
             .into_job();
+        assert_eq!(job.action, RecoveryAction::RetryWithBackoff);
+        assert_eq!(job.max_attempts, 2);
 
         let events = coordinator
             .run_ready_jobs(1_700_000_001, 1)
             .await
-            .expect("mark-failed recovery job should run");
+            .expect("invalid-request recovery job should run");
 
         assert!(matches!(
             events.as_slice(),
-            [RecoveryCoordinatorEvent::RecoveryExhausted(outcome)]
-                if outcome.job_id == job.id && outcome.status == RecoveryJobStatus::Failed
+            [RecoveryCoordinatorEvent::RetryScheduled { job_id, .. }]
+                if job_id == &job.id
         ));
         let reloaded = crud_store
             .get_recovery_job(job.id.as_str())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(reloaded.status, RecoveryJobStatus::Failed);
-        assert_eq!(reloaded.run_count, 0);
+        assert_eq!(reloaded.status, RecoveryJobStatus::Pending);
+        assert_eq!(reloaded.run_count, 1);
     }
 
     #[tokio::test]
@@ -4082,6 +4927,238 @@ mod tests {
         assert_eq!(job.action, RecoveryAction::RetryWithBackoff);
         assert_eq!(job.max_attempts, 2);
         assert_eq!(job.status, RecoveryJobStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn unsupported_tool_calling_plan_disables_tools_without_terminal_reason() {
+        let (_crud_store, coordinator) = setup_coordinator().await;
+        let job = provider_plan_job(ProviderFailureClass::UnsupportedToolCalling, "stream");
+
+        let plan = coordinator
+            .build_attempt_plan(&job, 1)
+            .await
+            .expect("unsupported tool-calling plan should build");
+
+        assert!(plan.disable_tool_calling);
+        assert!(plan.force_non_stream);
+        assert!(!plan.disable_image_input);
+        assert!(plan.terminal_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn unsupported_image_input_plan_removes_images_without_terminal_reason() {
+        let (_crud_store, coordinator) = setup_coordinator().await;
+        let job = provider_plan_job(ProviderFailureClass::UnsupportedImageInput, "non_stream");
+
+        let plan = coordinator
+            .build_attempt_plan(&job, 1)
+            .await
+            .expect("unsupported image-input plan should build");
+
+        assert!(plan.disable_image_input);
+        assert!(!plan.disable_tool_calling);
+        assert!(!plan.force_non_stream);
+        assert!(plan.terminal_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn model_not_found_without_explicit_fallback_blocks_recovery_instead_of_failing() {
+        let (crud_store, coordinator) = setup_coordinator().await;
+        let job = coordinator
+            .enqueue_provider_failure_job(
+                &ProviderFailureCandidate {
+                    turn_id: "turn_model_not_found_blocks".to_owned(),
+                    item_id: "reasoning_model_missing".to_owned(),
+                    item_type: TurnItemType::Reasoning,
+                    failure: provider_failure(ProviderFailureClass::ModelNotFound, "missing"),
+                },
+                1_700_000_000,
+            )
+            .await
+            .expect("model-not-found should enqueue blocked recovery")
+            .into_job();
+
+        assert_eq!(job.action, RecoveryAction::BlockResumable);
+
+        let events = coordinator
+            .run_ready_jobs(1_700_000_001, 1)
+            .await
+            .expect("model-not-found recovery job should block");
+
+        assert!(matches!(
+            events.as_slice(),
+            [RecoveryCoordinatorEvent::RecoveryBlocked { job_id, reason, .. }]
+                if job_id == &job.id && reason.contains("model_not_found")
+        ));
+        let reloaded = crud_store
+            .get_recovery_job(job.id.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.status, RecoveryJobStatus::Blocked);
+        assert!(
+            reloaded
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("model_not_found")
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_resume_requeues_blocked_turn_recovery_for_same_turn() {
+        let (crud_store, coordinator) = setup_coordinator().await;
+        let workspace_id = "ws_resume_blocked";
+        let thread_id = "thr_resume_blocked";
+        let turn_id = "turn_resume_blocked";
+        materialize_turn_with_tool_item(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            "tool_resume_blocked",
+            None,
+        )
+        .await;
+        crud_store
+            .update_turn_status(
+                thread_id,
+                turn_id,
+                TurnStatus::Blocked,
+                Some("model unavailable"),
+                1_700_000_010,
+            )
+            .await
+            .expect("turn should be marked blocked");
+        let job = crud_store
+            .enqueue_recovery_job(
+                turn_id.to_owned(),
+                "reasoning_resume_blocked".to_owned(),
+                TurnItemType::Reasoning,
+                None,
+                RecoveryTrigger::ProviderError,
+                RecoveryAction::BlockResumable,
+                Some("model_not_found recovery has no fallback model".to_owned()),
+                Some(ProviderFailureClass::ModelNotFound),
+                Some(ProviderFailureStage::Finalize),
+                None,
+                1,
+                0,
+                serde_json::json!({}),
+                serde_json::json!({
+                    "base_backoff_secs": 0,
+                    "max_wall_clock_secs": 10,
+                    "no_progress_limit": 0,
+                }),
+                1_700_000_011,
+            )
+            .await
+            .expect("blocked recovery job should enqueue");
+        crud_store
+            .mark_recovery_job_terminal(
+                job.id.as_str(),
+                RecoveryJobStatus::Blocked,
+                Some("waiting for model config".to_owned()),
+                1_700_000_012,
+            )
+            .await
+            .expect("recovery job should be marked blocked");
+
+        let resumed = coordinator
+            .resume_blocked_turn(thread_id, turn_id, Some(job.id.as_str()), 1_700_000_020)
+            .await
+            .expect("blocked turn resume should succeed")
+            .expect("blocked recovery job should resume");
+
+        assert_eq!(resumed.id, job.id);
+        assert_eq!(resumed.status, RecoveryJobStatus::Pending);
+        assert_eq!(resumed.action, RecoveryAction::RestartTurn);
+        assert!(resumed.max_attempts >= 1);
+        let (_, turn) = crud_store
+            .get_turn(thread_id, turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(turn.status, TurnStatus::InProgress);
+        assert_eq!(turn.error, None);
+    }
+
+    #[tokio::test]
+    async fn explicit_resume_requeues_blocked_tool_recovery_with_runtime_snapshot() {
+        let (crud_store, coordinator) = setup_coordinator().await;
+        let workspace_id = "ws_resume_blocked_tool";
+        let thread_id = "thr_resume_blocked_tool";
+        let turn_id = "turn_resume_blocked_tool";
+        let item_id = "tool_resume_blocked";
+        materialize_turn_with_tool_item(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            item_id,
+            None,
+        )
+        .await;
+        persist_test_runtime_snapshot(crud_store.as_ref(), workspace_id, thread_id, turn_id).await;
+        crud_store
+            .update_turn_status(
+                thread_id,
+                turn_id,
+                TurnStatus::Blocked,
+                Some("tool recovery requires resume"),
+                1_700_000_010,
+            )
+            .await
+            .expect("turn should be marked blocked");
+        let job = crud_store
+            .enqueue_recovery_job(
+                turn_id.to_owned(),
+                item_id.to_owned(),
+                TurnItemType::WebFetch,
+                None,
+                RecoveryTrigger::Timeout,
+                RecoveryAction::BlockResumable,
+                Some("tool recovery blocked".to_owned()),
+                None,
+                None,
+                None,
+                0,
+                0,
+                serde_json::json!({}),
+                serde_json::json!({
+                    "base_backoff_secs": 0,
+                    "max_wall_clock_secs": 60,
+                    "no_progress_limit": 3,
+                }),
+                1_700_000_011,
+            )
+            .await
+            .expect("blocked tool recovery job should enqueue");
+        crud_store
+            .mark_recovery_job_terminal(
+                job.id.as_str(),
+                RecoveryJobStatus::Blocked,
+                Some("waiting for operator resume".to_owned()),
+                1_700_000_012,
+            )
+            .await
+            .expect("recovery job should be marked blocked");
+
+        let resumed = coordinator
+            .resume_blocked_turn(thread_id, turn_id, Some(job.id.as_str()), 1_700_000_020)
+            .await
+            .expect("blocked tool turn resume should succeed")
+            .expect("blocked tool recovery job should resume");
+
+        assert_eq!(resumed.id, job.id);
+        assert_eq!(resumed.status, RecoveryJobStatus::Pending);
+        assert_eq!(resumed.action, RecoveryAction::RestartTurn);
+        let (_, turn) = crud_store
+            .get_turn(thread_id, turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(turn.status, TurnStatus::InProgress);
     }
 
     #[tokio::test]
@@ -4114,19 +5191,13 @@ mod tests {
             .await
             .expect("terminal repair should run");
 
-        assert!(matches!(
-            events.as_slice(),
-            [RecoveryCoordinatorEvent::RecoveryExhausted(outcome)]
-                if outcome.job_id == job.id
-                    && outcome.status == RecoveryJobStatus::Failed
-                    && outcome.error_message.contains("bad request")
-        ));
+        assert!(events.is_empty());
         let reloaded = crud_store
             .get_recovery_job(job.id.as_str())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(reloaded.status, RecoveryJobStatus::Failed);
+        assert_eq!(reloaded.status, RecoveryJobStatus::Pending);
         assert_eq!(reloaded.run_count, 0);
         assert!(reloaded.claim_token.is_none());
     }

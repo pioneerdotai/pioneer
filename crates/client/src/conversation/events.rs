@@ -1,10 +1,10 @@
 use pioneer_protocol::{
     ItemDeltaStream, MarkdownDocument, ToolLoopBudgetAction, ToolLoopBudgetLimitKind,
     ToolRetryBudgetUsage, ToolRetryErrorClass, ToolRetryExhaustionKind, ToolRetryResolution, Turn,
-    TurnExecutionWindowBlockedNotification, TurnExecutionWindowCheckpointedNotification,
-    TurnExecutionWindowContinuedNotification, TurnExecutionWindowExhaustedNotification,
-    TurnExecutionWindowStartedNotification, TurnItem, TurnItemTimeoutReason, TurnItemType,
-    TurnStatus, UserMessageAttachment,
+    TurnBlockedResumeMetadata, TurnExecutionWindowBlockedNotification,
+    TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
+    TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification, TurnItem,
+    TurnItemTimeoutReason, TurnItemType, TurnStatus, UserMessageAttachment,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
@@ -89,6 +89,8 @@ pub enum ConversationEvent {
     TurnBlocked {
         thread_id: String,
         turn: Turn,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resume: Option<TurnBlockedResumeMetadata>,
     },
     ItemStarted {
         thread_id: String,

@@ -1,5 +1,6 @@
 use super::{ActiveTurnRequest, RecoveryAttemptRequest};
-use pioneer_provider::{ChatMessage, Role};
+use pioneer_protocol::{TurnCapabilityKind, UserInput};
+use pioneer_provider::{ChatMessage, InputContentType, Role};
 
 pub(super) fn apply_recovery_adjustments(
     turn_request: &mut ActiveTurnRequest,
@@ -14,7 +15,27 @@ pub(super) fn apply_recovery_adjustments(
         turn_request.history =
             compact_history_for_recovery(std::mem::take(&mut turn_request.history));
     }
+    if request.disable_tool_calling {
+        turn_request.capabilities.retain(|capability| {
+            !matches!(
+                capability.kind,
+                TurnCapabilityKind::McpServer { .. } | TurnCapabilityKind::McpTool { .. }
+            )
+        });
+    }
+    if request.disable_image_input {
+        turn_request.input.retain(|input| {
+            !matches!(
+                input,
+                UserInput::Image { .. } | UserInput::LocalImage { .. }
+            )
+        });
+        turn_request
+            .resolved_artifacts
+            .retain(|artifact| artifact.content_type != InputContentType::Image);
+    }
     turn_request.execution_options.force_non_stream = request.force_non_stream;
+    turn_request.execution_options.disable_tool_calling = request.disable_tool_calling;
     turn_request.execution_options.continue_generation_hint = request.continue_generation;
     turn_request.retained_llm_context = request.retained_llm_context.clone();
     turn_request.execution_checkpoint_context = request.execution_checkpoint_context.clone();
@@ -61,9 +82,11 @@ mod tests {
     };
     use pioneer_protocol::{
         ExecutionCheckpointOriginalRequestSummary, ExecutionCheckpointProviderBudgetSummary,
-        ExecutionCheckpointToolSummary, ExecutionCheckpointWindowSummary, ThreadMode, TurnItemType,
-        UserInput, build_execution_checkpoint_payload,
+        ExecutionCheckpointToolSummary, ExecutionCheckpointWindowSummary, McpScopeKind, ThreadMode,
+        TurnCapability, TurnCapabilityKind, TurnItemType, UserInput,
+        build_execution_checkpoint_payload,
     };
+    use pioneer_provider::MessageAttachment;
     use serde_json::json;
     use std::collections::HashMap;
 
@@ -98,6 +121,8 @@ mod tests {
             item_id: "item_agents_md".to_owned(),
             item_type: TurnItemType::AgentMessage,
             force_non_stream: true,
+            disable_tool_calling: false,
+            disable_image_input: false,
             refresh_provider_auth: false,
             compact_history: true,
             continue_generation: true,
@@ -211,6 +236,8 @@ mod tests {
             item_id: "item_checkpoint".to_owned(),
             item_type: TurnItemType::AgentMessage,
             force_non_stream: false,
+            disable_tool_calling: false,
+            disable_image_input: false,
             refresh_provider_auth: false,
             compact_history: false,
             continue_generation: true,
@@ -240,6 +267,116 @@ mod tests {
                 .as_ref()
                 .map(|context| context.checkpoint_id.as_str()),
             Some("checkpoint_4")
+        );
+    }
+
+    #[test]
+    fn recovery_adjustments_downgrade_unsupported_tools_and_images() {
+        let mut turn_request = ActiveTurnRequest {
+            turn_id: "turn_downgrade".to_owned(),
+            execution_window_index: 1,
+            mode: ThreadMode::Agent,
+            hook_runtime_context: crate::AgentTurnHookRuntimeContext::default(),
+            model: "test-model".to_owned(),
+            provider_name: "test-provider".to_owned(),
+            workspace_skill_policies:
+                HashMap::<pioneer_skills::SkillPolicyKey, WorkspaceSkillPolicy>::new(),
+            input: vec![
+                UserInput::Text {
+                    text: "describe this".to_owned(),
+                    text_elements: Vec::new(),
+                },
+                UserInput::Image {
+                    url: "https://example.test/image.png".to_owned(),
+                },
+                UserInput::LocalImage {
+                    path: "/tmp/image.png".to_owned(),
+                },
+            ],
+            capabilities: vec![
+                TurnCapability {
+                    id: "skill:workspace:docs".to_owned(),
+                    kind: TurnCapabilityKind::Skill {
+                        slug: "docs".to_owned(),
+                        source_kind: "workspace".to_owned(),
+                    },
+                    label: None,
+                },
+                TurnCapability {
+                    id: "mcp-server:workspace:browser".to_owned(),
+                    kind: TurnCapabilityKind::McpServer {
+                        name: "browser".to_owned(),
+                        scope_kind: McpScopeKind::Workspace,
+                    },
+                    label: None,
+                },
+                TurnCapability {
+                    id: "mcp-tool:workspace:browser:open".to_owned(),
+                    kind: TurnCapabilityKind::McpTool {
+                        server_name: "browser".to_owned(),
+                        raw_tool_name: "open".to_owned(),
+                        scope_kind: McpScopeKind::Workspace,
+                    },
+                    label: None,
+                },
+            ],
+            resolved_artifacts: vec![
+                ResolvedArtifactInput {
+                    artifact_id: "art_image".to_owned(),
+                    version_id: None,
+                    content_type: InputContentType::Image,
+                    attachment: MessageAttachment::from_url(
+                        "https://example.test/image.png",
+                        "image/png",
+                    ),
+                },
+                ResolvedArtifactInput {
+                    artifact_id: "art_file".to_owned(),
+                    version_id: None,
+                    content_type: InputContentType::File,
+                    attachment: MessageAttachment::from_url(
+                        "https://example.test/file.txt",
+                        "text/plain",
+                    ),
+                },
+            ],
+            runtime_environment: HashMap::new(),
+            history: vec![ChatMessage::user("describe this")],
+            retained_llm_context: Vec::new(),
+            execution_checkpoint_context: None,
+            execution_usage: TurnExecutionUsageCounters::default(),
+            execution_options: TurnExecutionOptions::default(),
+        };
+        let request = RecoveryAttemptRequest {
+            recovery_job_id: "job_downgrade".to_owned(),
+            recovery_attempt_id: "attempt_downgrade".to_owned(),
+            turn_id: turn_request.turn_id.clone(),
+            item_id: "item_downgrade".to_owned(),
+            item_type: TurnItemType::AgentMessage,
+            force_non_stream: false,
+            disable_tool_calling: true,
+            disable_image_input: true,
+            refresh_provider_auth: false,
+            compact_history: false,
+            continue_generation: false,
+            model_override: None,
+            retained_llm_context: Vec::new(),
+            execution_checkpoint_context: None,
+        };
+
+        apply_recovery_adjustments(&mut turn_request, &request);
+
+        assert!(turn_request.execution_options.disable_tool_calling);
+        assert_eq!(turn_request.input.len(), 1);
+        assert_eq!(turn_request.capabilities.len(), 1);
+        assert!(matches!(
+            turn_request.capabilities[0].kind,
+            TurnCapabilityKind::Skill { .. }
+        ));
+        assert_eq!(turn_request.resolved_artifacts.len(), 1);
+        assert_eq!(
+            turn_request.resolved_artifacts[0].content_type,
+            InputContentType::File
         );
     }
 }

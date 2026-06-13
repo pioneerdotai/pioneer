@@ -106,6 +106,44 @@ use tokio::sync::{Notify, mpsc};
 use tokio::time::{Duration, sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
 
+#[test]
+fn terminal_failure_paths_stay_behind_recovery_gate() {
+    let leaf_sources = [
+        ("turn_handlers.rs", include_str!("turn_handlers.rs")),
+        ("artifact_tools.rs", include_str!("artifact_tools.rs")),
+        (
+            "task_agent_executor.rs",
+            include_str!("task_agent_executor.rs"),
+        ),
+        ("mod.rs", include_str!("mod.rs")),
+    ];
+
+    for (name, source) in leaf_sources {
+        assert!(
+            !source.contains("mark_turn_failed_terminal("),
+            "{name} must not bypass recovery with mark_turn_failed_terminal"
+        );
+        assert!(
+            !source.contains("mark_turn_failed_with_recovery("),
+            "{name} must not bypass recovery with mark_turn_failed_with_recovery"
+        );
+    }
+
+    let runtime = include_str!("agent_runtime.rs");
+    assert_eq!(
+        runtime.matches(".mark_turn_failed_terminal(").count(),
+        1,
+        "terminal failure transition should only be requested from recovery exhaustion handling"
+    );
+    assert_eq!(
+        runtime
+            .matches("pub(super) async fn mark_turn_failed_terminal(")
+            .count(),
+        1,
+        "terminal failure transition should have one centralized implementation"
+    );
+}
+
 struct CompletingSystemExecutor;
 
 #[async_trait]
@@ -5618,8 +5656,26 @@ async fn task_revise_rpc_rejects_candidate_and_dispatches_same_thread_revision()
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn task_revise_dispatch_failure_marks_revision_turn_and_run_failed() {
+#[test]
+fn task_revise_dispatch_failure_blocks_revision_turn_and_run() {
+    std::thread::Builder::new()
+        .name("task_revision_dispatch_blocked_test".to_owned())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_stack_size(16 * 1024 * 1024)
+                .enable_all()
+                .build()
+                .expect("test runtime should build");
+            runtime.block_on(task_revise_dispatch_failure_blocks_revision_turn_and_run_impl());
+        })
+        .expect("test thread should spawn")
+        .join()
+        .expect("test thread should complete");
+}
+
+async fn task_revise_dispatch_failure_blocks_revision_turn_and_run_impl() {
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         Arc::new(DelayedProvider {
@@ -5697,33 +5753,33 @@ async fn task_revise_dispatch_failure_marks_revision_turn_and_run_failed() {
         .task_agent_executor
         .dispatch_revision_turn(revised.clone())
         .await
-        .expect("dispatch failure should be converted into task failure");
+        .expect("dispatch failure should be converted into blocked task recovery");
 
     assert_eq!(
         wait_for_task_status(
             crud_store.clone(),
             response.task.id.as_str(),
-            pioneer_protocol::TaskStatus::Failed,
+            pioneer_protocol::TaskStatus::Blocked,
         )
         .await,
-        pioneer_protocol::TaskStatus::Failed
+        pioneer_protocol::TaskStatus::Blocked
     );
     assert_eq!(
-        wait_for_run_status(crud_store.clone(), run.id.as_str(), TaskRunStatus::Failed).await,
-        TaskRunStatus::Failed
+        wait_for_run_status(crud_store.clone(), run.id.as_str(), TaskRunStatus::Blocked).await,
+        TaskRunStatus::Blocked
     );
-    let failed_turn = crud_store
+    let blocked_turn = crud_store
         .get_task_run_turn(revised.task_run_turn.id.as_str())
         .await
         .expect("task run turn lookup should succeed")
         .expect("revision turn should exist");
-    assert_eq!(failed_turn.status, TaskRunTurnStatus::Failed);
+    assert_eq!(blocked_turn.status, TaskRunTurnStatus::Blocked);
     assert_eq!(
-        failed_turn.requested_by_candidate_id.as_deref(),
+        blocked_turn.requested_by_candidate_id.as_deref(),
         Some(first_candidate.id.as_str())
     );
     assert_eq!(
-        failed_turn.requested_by_review_event_id.as_deref(),
+        blocked_turn.requested_by_review_event_id.as_deref(),
         Some(revised.review_event.id.as_str())
     );
     let rejected = crud_store
@@ -5737,17 +5793,17 @@ async fn task_revise_dispatch_failure_marks_revision_turn_and_run_failed() {
         Some(revised.review_event.id.as_str())
     );
 
-    let failed_response = crud_store
+    let blocked_response = crud_store
         .get_task(response.task.id.as_str())
         .await
         .expect("task lookup should succeed")
         .expect("task should exist");
-    let failed_run = failed_response
+    let blocked_run = blocked_response
         .runs
         .iter()
         .find(|run| run.id == revised.run.id)
-        .expect("failed run should exist");
-    let error = failed_run.error.as_ref().expect("run should store failure");
+        .expect("blocked run should exist");
+    let error = blocked_run.error.as_ref().expect("run should store block");
     assert_eq!(error.code, "child_thread_missing");
     let details = error
         .details
@@ -6734,7 +6790,7 @@ async fn failed_child_task_run_marks_target_turn_failed_without_candidate() {
     );
 
     processor
-        .mark_turn_failed(
+        .report_legacy_turn_failure(
             lineage.child_thread_id.clone(),
             lineage.child_turn_id.clone(),
             "synthetic child failure".to_owned(),
@@ -10189,7 +10245,7 @@ async fn terminal_turn_completion_closes_running_execution_window() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn terminal_turn_failure_closes_running_execution_window() {
+async fn agent_turn_failed_without_recovery_opens_runtime_recovery() {
     let thread_id = "thr_window_terminal_fail";
     let turn_id = "turn_window_terminal_fail";
     let (processor, crud_store, workspace_id) =
@@ -10218,20 +10274,33 @@ async fn terminal_turn_failure_closes_running_execution_window() {
         .await
         .expect("latest window should load")
         .expect("window should exist");
-    assert_eq!(window.status, ExecutionWindowStatus::Failed);
-    assert!(window.completed_at.is_some());
-    assert_eq!(window.metadata_json["terminalStatus"], "failed");
-    assert_eq!(window.metadata_json["terminalReason"], "provider failed");
+    assert_eq!(window.status, ExecutionWindowStatus::Running);
+    assert!(window.completed_at.is_none());
     let (_workspace_id, turn) = crud_store
         .get_turn(thread_id, turn_id)
         .await
         .expect("turn should load")
         .expect("turn should exist");
-    assert_eq!(turn.status, TurnStatus::Failed);
+    assert_eq!(turn.status, TurnStatus::InProgress);
+
+    let pending_jobs = crud_store
+        .find_recovery_jobs_by_turn_and_status(turn_id, RecoveryJobStatus::Pending)
+        .await
+        .expect("pending recovery jobs should load");
+    assert_eq!(pending_jobs.len(), 1);
+    assert_eq!(pending_jobs[0].trigger, RecoveryTrigger::RuntimeFailure);
+    assert_eq!(pending_jobs[0].action, RecoveryAction::RestartTurn);
+    assert!(
+        pending_jobs[0]
+            .reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("provider failed")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mark_failed_provider_failure_closes_turn_without_polling() {
+async fn invalid_request_provider_failure_opens_retry_recovery_without_polling() {
     let thread_id = "thr_provider_terminal_sync";
     let turn_id = "turn_provider_terminal_sync";
     let item_id = "reasoning_provider_terminal_sync";
@@ -10269,15 +10338,20 @@ async fn mark_failed_provider_failure_closes_turn_without_polling() {
         )
         .await;
 
-    let failed_jobs = crud_store
-        .find_recovery_jobs_by_turn_and_status(turn_id, RecoveryJobStatus::Failed)
+    let pending_jobs = crud_store
+        .find_recovery_jobs_by_turn_and_status(turn_id, RecoveryJobStatus::Pending)
         .await
-        .expect("failed recovery jobs should load");
-    assert_eq!(failed_jobs.len(), 1);
-    assert_eq!(failed_jobs[0].action, RecoveryAction::MarkFailed);
+        .expect("pending recovery jobs should load");
+    assert_eq!(pending_jobs.len(), 1);
+    assert_eq!(pending_jobs[0].trigger, RecoveryTrigger::ProviderError);
+    assert_eq!(pending_jobs[0].action, RecoveryAction::RetryWithBackoff);
+    assert_eq!(
+        pending_jobs[0].error_class,
+        Some(ProviderFailureClass::InvalidRequest)
+    );
     assert!(
-        failed_jobs[0]
-            .last_error
+        pending_jobs[0]
+            .reason
             .as_deref()
             .unwrap_or("")
             .contains("bad request")
@@ -10288,15 +10362,15 @@ async fn mark_failed_provider_failure_closes_turn_without_polling() {
         .await
         .expect("latest window should load")
         .expect("window should exist");
-    assert_eq!(window.status, ExecutionWindowStatus::Failed);
+    assert_eq!(window.status, ExecutionWindowStatus::Running);
 
     let (_workspace_id, turn) = crud_store
         .get_turn(thread_id, turn_id)
         .await
         .expect("turn should load")
         .expect("turn should exist");
-    assert_eq!(turn.status, TurnStatus::Failed);
-    assert!(turn.error.as_deref().unwrap_or("").contains("bad request"));
+    assert_eq!(turn.status, TurnStatus::InProgress);
+    assert!(turn.error.is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -13866,6 +13940,113 @@ async fn recovery_lifecycle_notification_is_persisted_for_history_replay() {
             && *trigger == RecoveryTrigger::ProviderError
             && *action == RecoveryAction::RetryWithBackoff
             && *attempt_number == 1
+    )));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_blocked_event_marks_turn_blocked_and_closes_active_window() {
+    let thread_id = "thr_recovery_blocked_missing_snapshot";
+    let turn_id = "turn_recovery_blocked_missing_snapshot";
+    let (processor, crud_store, workspace_id) =
+        setup_execution_window_terminal_turn(thread_id, turn_id).await;
+
+    start_terminal_test_execution_window(
+        &processor,
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+        "runtime_win_recovery_blocked_missing_snapshot",
+    )
+    .await;
+
+    let block_reason = "cannot restore recovery after agent loop loss because durable turn runtime snapshot is missing";
+    let job = crud_store
+        .enqueue_recovery_job(
+            turn_id.to_owned(),
+            "tool_missing_snapshot".to_owned(),
+            TurnItemType::WebFetch,
+            None,
+            RecoveryTrigger::Timeout,
+            RecoveryAction::RetryAttempt,
+            Some("tool idle timeout".to_owned()),
+            None,
+            None,
+            None,
+            0,
+            2,
+            json!({}),
+            json!({
+                "base_backoff_secs": 0,
+                "max_wall_clock_secs": 60,
+                "no_progress_limit": 3,
+            }),
+            1_700_000_010,
+        )
+        .await
+        .expect("recovery job should enqueue");
+    crud_store
+        .mark_recovery_job_terminal(
+            job.id.as_str(),
+            RecoveryJobStatus::Blocked,
+            Some(block_reason.to_owned()),
+            1_700_000_011,
+        )
+        .await
+        .expect("recovery job should be blocked before event dispatch");
+
+    processor
+        .handle_recovery_event(
+            crate::resilience::RecoveryCoordinatorEvent::RecoveryBlocked {
+                job_id: job.id.clone(),
+                turn_id: turn_id.to_owned(),
+                reason: block_reason.to_owned(),
+            },
+            1_700_000_012,
+        )
+        .await;
+
+    let (_workspace_id, turn) = crud_store
+        .get_turn(thread_id, turn_id)
+        .await
+        .expect("turn should load")
+        .expect("turn should exist");
+    assert_eq!(turn.status, TurnStatus::Blocked);
+    assert!(
+        turn.error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("runtime snapshot is missing")
+    );
+
+    let window = crud_store
+        .latest_turn_execution_window(turn_id)
+        .await
+        .expect("latest window should load")
+        .expect("window should exist");
+    assert_eq!(window.status, ExecutionWindowStatus::Blocked);
+    assert_eq!(window.metadata_json["terminalStatus"], "blocked");
+    assert_eq!(
+        window.metadata_json["terminalSource"],
+        "turn_terminal_event"
+    );
+
+    let history = crud_store
+        .get_thread_history(thread_id, Some(16))
+        .await
+        .expect("thread history should load")
+        .expect("thread history should exist");
+    assert!(history.events.iter().any(|event| matches!(
+        &event.payload,
+        ThreadHistoryEventPayload::TurnBlocked {
+            turn,
+            resume: Some(resume),
+            ..
+        } if turn.status == TurnStatus::Blocked
+            && resume.blocked_recovery_job_id.as_deref() == Some(job.id.as_str())
+            && !resume.can_resume_same_turn
+            && resume.resume_requirements.iter().any(|requirement| {
+                requirement.contains("no durable turn runtime snapshot")
+            })
     )));
 }
 

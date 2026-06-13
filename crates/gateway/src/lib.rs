@@ -23,6 +23,7 @@ mod task_tools;
 mod thread;
 mod tokenizer;
 mod transport;
+mod turn_runtime_snapshot;
 mod workspace;
 
 use anyhow::{Context, Result};

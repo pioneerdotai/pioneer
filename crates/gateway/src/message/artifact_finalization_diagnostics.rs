@@ -61,7 +61,7 @@ pub(super) fn artifact_finalization_terminal_error(
     diagnostics: &[ArtifactFinalizationDiagnostic],
 ) -> String {
     let mut message =
-        String::from("artifact finalization failed after one artifact_register retry");
+        String::from("artifact finalization repair still required after artifact_register retry");
     if diagnostics.is_empty() {
         return message;
     }
