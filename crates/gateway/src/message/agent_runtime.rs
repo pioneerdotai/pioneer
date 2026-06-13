@@ -1875,7 +1875,7 @@ impl MessageProcessor {
                 turn_id,
                 recovery,
             } => {
-                if !self.complete_turn(thread_id, turn_id, recovery).await {
+                if !message_future(self.complete_turn(thread_id, turn_id, recovery)).await {
                     return false;
                 }
             }
@@ -1887,9 +1887,9 @@ impl MessageProcessor {
                 failure,
                 recovery,
             } => {
-                self.handle_provider_failure_detected(
+                message_future(self.handle_provider_failure_detected(
                     thread_id, turn_id, item_id, item_type, failure, recovery,
-                )
+                ))
                 .await;
             }
             AgentDurableEvent::RecoveryAttemptSucceeded {
@@ -1897,8 +1897,10 @@ impl MessageProcessor {
                 turn_id,
                 recovery,
             } => {
-                self.handle_recovery_attempt_succeeded(thread_id, turn_id, recovery)
-                    .await;
+                message_future(
+                    self.handle_recovery_attempt_succeeded(thread_id, turn_id, recovery),
+                )
+                .await;
             }
             AgentDurableEvent::TurnFailed {
                 thread_id,
@@ -1907,20 +1909,20 @@ impl MessageProcessor {
                 recovery,
             } => {
                 if recovery.is_some() {
-                    if !self
-                        .mark_turn_failed_with_recovery(thread_id, turn_id, error, recovery)
-                        .await
+                    if !message_future(
+                        self.mark_turn_failed_with_recovery(thread_id, turn_id, error, recovery),
+                    )
+                    .await
                     {
                         return false;
                     }
-                } else if !self
-                    .report_turn_failure(
-                        thread_id,
-                        turn_id,
-                        TurnFailureRecoveryKind::RuntimeFailure,
-                        error,
-                    )
-                    .await
+                } else if !message_future(self.report_turn_failure(
+                    thread_id,
+                    turn_id,
+                    TurnFailureRecoveryKind::RuntimeFailure,
+                    error,
+                ))
+                .await
                 {
                     return false;
                 }
@@ -1934,20 +1936,20 @@ impl MessageProcessor {
                 if recovery.is_none()
                     && reason.contains("execution window continuation could not resume")
                 {
-                    if !self
-                        .report_turn_failure(
-                            thread_id,
-                            turn_id,
-                            TurnFailureRecoveryKind::ExecutionWindowContinuation,
-                            reason,
-                        )
-                        .await
+                    if !message_future(self.report_turn_failure(
+                        thread_id,
+                        turn_id,
+                        TurnFailureRecoveryKind::ExecutionWindowContinuation,
+                        reason,
+                    ))
+                    .await
                     {
                         return false;
                     }
-                } else if !self
-                    .mark_turn_blocked_with_recovery(thread_id, turn_id, reason, recovery)
-                    .await
+                } else if !message_future(
+                    self.mark_turn_blocked_with_recovery(thread_id, turn_id, reason, recovery),
+                )
+                .await
                 {
                     return false;
                 }
@@ -1958,9 +1960,10 @@ impl MessageProcessor {
                 reason,
                 recovery,
             } => {
-                if !self
-                    .mark_turn_interrupted_with_recovery(thread_id, turn_id, reason, recovery)
-                    .await
+                if !message_future(
+                    self.mark_turn_interrupted_with_recovery(thread_id, turn_id, reason, recovery),
+                )
+                .await
                 {
                     return false;
                 }
@@ -2213,7 +2216,7 @@ impl MessageProcessor {
                 next_attempt_number,
             }
         };
-        self.handle_recovery_event(event, now_unix).await;
+        message_future(self.handle_recovery_event(event, now_unix)).await;
         true
     }
 
@@ -2633,28 +2636,17 @@ impl MessageProcessor {
                 action,
                 attempt_number,
             } => {
-                let Some((thread_id, workspace_id)) = self
-                    .crud_store
-                    .get_turn_location(turn_id.as_str())
-                    .await
-                    .ok()
-                    .flatten()
-                else {
-                    return;
-                };
-                let notification = pioneer_protocol::ItemRecoveryOpenedNotification {
-                    workspace_id,
-                    thread_id: thread_id.clone(),
+                message_future(self.handle_recovery_opened_event(
+                    job_id,
                     turn_id,
                     item_id,
                     item_type,
-                    recovery_job_id: job_id,
                     trigger,
                     action,
                     attempt_number,
-                };
-                self.persist_and_send_item_recovery_opened(notification, event_timestamp)
-                    .await;
+                    event_timestamp,
+                ))
+                .await;
             }
             crate::resilience::RecoveryCoordinatorEvent::RecoveryAttached {
                 job_id,
@@ -2668,31 +2660,20 @@ impl MessageProcessor {
                 existing_status,
                 next_attempt_number,
             } => {
-                let Some((thread_id, workspace_id)) = self
-                    .crud_store
-                    .get_turn_location(turn_id.as_str())
-                    .await
-                    .ok()
-                    .flatten()
-                else {
-                    return;
-                };
-                let notification = pioneer_protocol::ItemRecoveryAttachedNotification {
-                    workspace_id,
-                    thread_id: thread_id.clone(),
+                message_future(self.handle_recovery_attached_event(
+                    job_id,
                     turn_id,
                     item_id,
                     item_type,
-                    recovery_job_id: job_id,
                     recovery_item_id,
                     recovery_item_type,
                     trigger,
                     action,
                     existing_status,
                     next_attempt_number,
-                };
-                self.persist_and_send_item_recovery_attached(notification, event_timestamp)
-                    .await;
+                    event_timestamp,
+                ))
+                .await;
             }
             crate::resilience::RecoveryCoordinatorEvent::RetryScheduled {
                 job_id,
@@ -2703,28 +2684,17 @@ impl MessageProcessor {
                 next_run_at_unix,
                 reason,
             } => {
-                let Some((thread_id, workspace_id)) = self
-                    .crud_store
-                    .get_turn_location(turn_id.as_str())
-                    .await
-                    .ok()
-                    .flatten()
-                else {
-                    return;
-                };
-                let notification = pioneer_protocol::ItemRetryScheduledNotification {
-                    workspace_id,
-                    thread_id: thread_id.clone(),
+                message_future(self.handle_retry_scheduled_event(
+                    job_id,
                     turn_id,
                     item_id,
                     item_type,
-                    recovery_job_id: job_id,
                     attempt_number,
                     next_run_at_unix,
                     reason,
-                };
-                self.persist_and_send_item_retry_scheduled(notification, event_timestamp)
-                    .await;
+                    event_timestamp,
+                ))
+                .await;
             }
             crate::resilience::RecoveryCoordinatorEvent::RetryAttemptStarted {
                 job_id,
@@ -2733,26 +2703,15 @@ impl MessageProcessor {
                 item_type,
                 attempt_number,
             } => {
-                let Some((thread_id, workspace_id)) = self
-                    .crud_store
-                    .get_turn_location(turn_id.as_str())
-                    .await
-                    .ok()
-                    .flatten()
-                else {
-                    return;
-                };
-                let notification = pioneer_protocol::ItemRetryAttemptStartedNotification {
-                    workspace_id,
-                    thread_id: thread_id.clone(),
+                message_future(self.handle_retry_attempt_started_event(
+                    job_id,
                     turn_id,
                     item_id,
                     item_type,
-                    recovery_job_id: job_id,
                     attempt_number,
-                };
-                self.persist_and_send_item_retry_attempt_started(notification, event_timestamp)
-                    .await;
+                    event_timestamp,
+                ))
+                .await;
             }
             crate::resilience::RecoveryCoordinatorEvent::RecoverySucceeded {
                 job_id,
@@ -2761,72 +2720,245 @@ impl MessageProcessor {
                 item_type,
                 attempt_number,
             } => {
-                let Some((thread_id, workspace_id)) = self
-                    .crud_store
-                    .get_turn_location(turn_id.as_str())
-                    .await
-                    .ok()
-                    .flatten()
-                else {
-                    return;
-                };
-                let notification = pioneer_protocol::ItemRecoverySucceededNotification {
-                    workspace_id,
-                    thread_id: thread_id.clone(),
+                message_future(self.handle_recovery_succeeded_event(
+                    job_id,
                     turn_id,
                     item_id,
                     item_type,
-                    recovery_job_id: job_id,
                     attempt_number,
-                };
-                self.persist_and_send_item_recovery_succeeded(notification, event_timestamp)
-                    .await;
+                    event_timestamp,
+                ))
+                .await;
             }
             crate::resilience::RecoveryCoordinatorEvent::RecoveryBlocked {
                 job_id,
                 turn_id,
                 reason,
             } => {
-                let Some((thread_id, _workspace_id)) = self
-                    .crud_store
-                    .get_turn_location(turn_id.as_str())
-                    .await
-                    .ok()
-                    .flatten()
-                else {
-                    return;
-                };
-                let resume = self
-                    .build_recovery_blocked_resume_metadata(
-                        turn_id.as_str(),
-                        job_id.as_str(),
-                        reason.as_str(),
-                    )
-                    .await;
-                if !self
-                    .mark_turn_blocked_with_resume_metadata(
-                        thread_id,
-                        turn_id,
-                        format!("{reason} (recovery job {job_id})"),
-                        None,
-                        Some(resume),
-                    )
-                    .await
-                {
-                    warn!(
-                        recovery_job_id = %job_id,
-                        error = %reason,
-                        "failed to mark turn blocked for blocked recovery job"
-                    );
-                }
+                message_future(self.handle_recovery_blocked_event(job_id, turn_id, reason)).await;
             }
             crate::resilience::RecoveryCoordinatorEvent::RecoveryExhausted(outcome) => {
-                self.send_recovery_exhausted_notification(&outcome, event_timestamp)
-                    .await;
-                self.handle_recovery_terminal_outcome(outcome, event_timestamp)
+                message_future(self.handle_recovery_exhausted_event(outcome, event_timestamp))
                     .await;
             }
         }
+    }
+
+    async fn handle_recovery_opened_event(
+        &self,
+        job_id: String,
+        turn_id: String,
+        item_id: String,
+        item_type: pioneer_protocol::TurnItemType,
+        trigger: pioneer_protocol::RecoveryTrigger,
+        action: pioneer_protocol::RecoveryAction,
+        attempt_number: u32,
+        event_timestamp: i64,
+    ) {
+        let Some((thread_id, workspace_id)) = self
+            .crud_store
+            .get_turn_location(turn_id.as_str())
+            .await
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+        let notification = pioneer_protocol::ItemRecoveryOpenedNotification {
+            workspace_id,
+            thread_id: thread_id.clone(),
+            turn_id,
+            item_id,
+            item_type,
+            recovery_job_id: job_id,
+            trigger,
+            action,
+            attempt_number,
+        };
+        self.persist_and_send_item_recovery_opened(notification, event_timestamp)
+            .await;
+    }
+
+    async fn handle_recovery_attached_event(
+        &self,
+        job_id: String,
+        turn_id: String,
+        item_id: String,
+        item_type: pioneer_protocol::TurnItemType,
+        recovery_item_id: String,
+        recovery_item_type: pioneer_protocol::TurnItemType,
+        trigger: pioneer_protocol::RecoveryTrigger,
+        action: pioneer_protocol::RecoveryAction,
+        existing_status: pioneer_protocol::RecoveryJobStatus,
+        next_attempt_number: u32,
+        event_timestamp: i64,
+    ) {
+        let Some((thread_id, workspace_id)) = self
+            .crud_store
+            .get_turn_location(turn_id.as_str())
+            .await
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+        let notification = pioneer_protocol::ItemRecoveryAttachedNotification {
+            workspace_id,
+            thread_id: thread_id.clone(),
+            turn_id,
+            item_id,
+            item_type,
+            recovery_job_id: job_id,
+            recovery_item_id,
+            recovery_item_type,
+            trigger,
+            action,
+            existing_status,
+            next_attempt_number,
+        };
+        self.persist_and_send_item_recovery_attached(notification, event_timestamp)
+            .await;
+    }
+
+    async fn handle_retry_scheduled_event(
+        &self,
+        job_id: String,
+        turn_id: String,
+        item_id: String,
+        item_type: pioneer_protocol::TurnItemType,
+        attempt_number: u32,
+        next_run_at_unix: i64,
+        reason: Option<String>,
+        event_timestamp: i64,
+    ) {
+        let Some((thread_id, workspace_id)) = self
+            .crud_store
+            .get_turn_location(turn_id.as_str())
+            .await
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+        let notification = pioneer_protocol::ItemRetryScheduledNotification {
+            workspace_id,
+            thread_id: thread_id.clone(),
+            turn_id,
+            item_id,
+            item_type,
+            recovery_job_id: job_id,
+            attempt_number,
+            next_run_at_unix,
+            reason,
+        };
+        self.persist_and_send_item_retry_scheduled(notification, event_timestamp)
+            .await;
+    }
+
+    async fn handle_retry_attempt_started_event(
+        &self,
+        job_id: String,
+        turn_id: String,
+        item_id: String,
+        item_type: pioneer_protocol::TurnItemType,
+        attempt_number: u32,
+        event_timestamp: i64,
+    ) {
+        let Some((thread_id, workspace_id)) = self
+            .crud_store
+            .get_turn_location(turn_id.as_str())
+            .await
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+        let notification = pioneer_protocol::ItemRetryAttemptStartedNotification {
+            workspace_id,
+            thread_id: thread_id.clone(),
+            turn_id,
+            item_id,
+            item_type,
+            recovery_job_id: job_id,
+            attempt_number,
+        };
+        self.persist_and_send_item_retry_attempt_started(notification, event_timestamp)
+            .await;
+    }
+
+    async fn handle_recovery_succeeded_event(
+        &self,
+        job_id: String,
+        turn_id: String,
+        item_id: String,
+        item_type: pioneer_protocol::TurnItemType,
+        attempt_number: u32,
+        event_timestamp: i64,
+    ) {
+        let Some((thread_id, workspace_id)) = self
+            .crud_store
+            .get_turn_location(turn_id.as_str())
+            .await
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+        let notification = pioneer_protocol::ItemRecoverySucceededNotification {
+            workspace_id,
+            thread_id: thread_id.clone(),
+            turn_id,
+            item_id,
+            item_type,
+            recovery_job_id: job_id,
+            attempt_number,
+        };
+        self.persist_and_send_item_recovery_succeeded(notification, event_timestamp)
+            .await;
+    }
+
+    async fn handle_recovery_blocked_event(&self, job_id: String, turn_id: String, reason: String) {
+        let Some((thread_id, _workspace_id)) = self
+            .crud_store
+            .get_turn_location(turn_id.as_str())
+            .await
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+        let resume = self
+            .build_recovery_blocked_resume_metadata(
+                turn_id.as_str(),
+                job_id.as_str(),
+                reason.as_str(),
+            )
+            .await;
+        if !self
+            .mark_turn_blocked_with_resume_metadata(
+                thread_id,
+                turn_id,
+                format!("{reason} (recovery job {job_id})"),
+                None,
+                Some(resume),
+            )
+            .await
+        {
+            warn!(
+                recovery_job_id = %job_id,
+                error = %reason,
+                "failed to mark turn blocked for blocked recovery job"
+            );
+        }
+    }
+
+    async fn handle_recovery_exhausted_event(
+        &self,
+        outcome: RecoveryTerminalOutcome,
+        event_timestamp: i64,
+    ) {
+        message_future(self.send_recovery_exhausted_notification(&outcome, event_timestamp)).await;
+        message_future(self.handle_recovery_terminal_outcome(outcome, event_timestamp)).await;
     }
 
     pub(super) async fn send_recovery_exhausted_notification(
