@@ -415,11 +415,10 @@ impl TaskAgentExecutor {
         response: TaskReviseResponse,
     ) -> Result<TaskReviseResponse> {
         let processor = self.processor()?;
-        let task_response = processor
-            .crud_store
-            .get_task(response.task.id.as_str())
-            .await?
-            .ok_or_else(|| anyhow!("task `{}` not found", response.task.id))?;
+        let task_response =
+            message_future(processor.crud_store.get_task(response.task.id.as_str()))
+                .await?
+                .ok_or_else(|| anyhow!("task `{}` not found", response.task.id))?;
         let run = task_response
             .runs
             .iter()
@@ -428,33 +427,32 @@ impl TaskAgentExecutor {
             .ok_or_else(|| anyhow!("task run `{}` not found", response.run.id))?;
         let agent_spec = select_agent_spec(&task_response, run.id.as_str())
             .ok_or_else(|| anyhow!("agent task `{}` has no agent spec", task_response.task.id))?;
-        let execution = match processor
-            .crud_store
-            .load_execution_for_run(run.id.as_str())
-            .await?
-        {
-            Some(execution) => execution,
-            None => {
-                processor
-                    .crud_store
-                    .reserve_execution_for_run(
+        let execution =
+            match message_future(processor.crud_store.load_execution_for_run(run.id.as_str()))
+                .await?
+            {
+                Some(execution) => execution,
+                None => {
+                    message_future(processor.crud_store.reserve_execution_for_run(
                         run.id.as_str(),
                         TaskExecutorKind::Agent,
                         now_timestamp_secs(),
-                    )
+                    ))
                     .await?
-            }
-        };
-        let child_runtime =
-            load_child_runtime_from_task_run_turn(&processor, response.task_run_turn.clone())
-                .await?;
+                }
+            };
+        let child_runtime = message_future(load_child_runtime_from_task_run_turn(
+            &processor,
+            response.task_run_turn.clone(),
+        ))
+        .await?;
         let handle = TaskExecutionHandle::new(
             processor.crud_store.clone(),
             processor.task_runtime.event_bus(),
             run.task_id.clone(),
             run.id.clone(),
         );
-        self.dispatch_existing_revision_turn(
+        message_future(self.dispatch_existing_revision_turn(
             &processor,
             &task_response,
             &run,
@@ -462,9 +460,9 @@ impl TaskAgentExecutor {
             &execution,
             child_runtime,
             handle,
-        )
+        ))
         .await?;
-        task_revise_response_from_store(&processor, response).await
+        message_future(task_revise_response_from_store(&processor, response)).await
     }
 
     async fn dispatch_existing_revision_turn(
@@ -480,9 +478,7 @@ impl TaskAgentExecutor {
         let task = &task_response.task;
         let child_thread_id = child_runtime.task_run_turn.thread_id.clone();
         let child_turn_id = child_runtime.task_run_turn.turn_id.clone();
-        match self
-            .acquire_write_locks(processor, task, run, handle.clone())
-            .await?
+        match message_future(self.acquire_write_locks(processor, task, run, handle.clone())).await?
         {
             TaskExecutorStartOutcome::Started => {}
             TaskExecutorStartOutcome::Queued => return Ok(()),

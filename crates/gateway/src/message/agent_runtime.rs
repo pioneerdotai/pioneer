@@ -2164,12 +2164,12 @@ impl MessageProcessor {
             max_attempts: 3,
             max_wall_clock_secs: 180,
             no_progress_limit: 3,
-            metadata: serde_json::json!({
+            metadata: pioneer_protocol::ToolMetadata::from_json(serde_json::json!({
                 "thread_id": thread_id,
                 "turn_id": turn_id,
                 "failure_kind": kind.label(),
                 "error": error_message,
-            }),
+            })),
         };
 
         let outcome = match self

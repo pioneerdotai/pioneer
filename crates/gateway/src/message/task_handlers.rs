@@ -203,18 +203,19 @@ impl MessageProcessor {
     ) {
         let context =
             pioneer_tasks::TaskMutationContext::user(format!("connection:{connection_id}"));
-        match message_future(async {
-            let revised = self
-                .task_runtime
+        let response_payload = match message_future(
+            self.task_runtime
                 .service()
-                .revise_task_result_candidate(context, params)
-                .await?;
-            self.task_agent_executor
-                .dispatch_revision_turn(revised)
-                .await
-        })
+                .revise_task_result_candidate(context, params),
+        )
         .await
         {
+            Ok(revised) => {
+                message_future(self.task_agent_executor.dispatch_revision_turn(revised)).await
+            }
+            Err(error) => Err(error),
+        };
+        match response_payload {
             Ok(response_payload) => {
                 self.send_task_response(connection_id, request_id, &response_payload)
                     .await

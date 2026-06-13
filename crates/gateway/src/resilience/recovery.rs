@@ -10,7 +10,7 @@ use pioneer_crud::{
 use pioneer_protocol::{
     ExecutionCheckpointPayload, ExecutionWindowStatus, ProviderFailureClass,
     ProviderFailureDetails, RecoveryAction, RecoveryAttemptContext, RecoveryJobStatus,
-    RecoveryTrigger, ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot,
+    RecoveryTrigger, ToolMetadata, ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot,
     ToolRecoveryRetryClass, TurnItem, TurnItemType, TurnStatus, generate_id,
 };
 use pioneer_provider::ProviderRegistry;
@@ -458,7 +458,7 @@ pub struct RuntimeFailureCandidate {
     pub max_attempts: i64,
     pub max_wall_clock_secs: u64,
     pub no_progress_limit: i64,
-    pub metadata: serde_json::Value,
+    pub metadata: ToolMetadata,
 }
 
 #[derive(Clone)]
@@ -789,7 +789,7 @@ impl RecoveryCoordinator {
         });
 
         if let serde_json::Value::Object(snapshot_object) = &mut snapshot {
-            snapshot_object.insert("metadata".to_owned(), candidate.metadata.clone());
+            snapshot_object.insert("metadata".to_owned(), candidate.metadata.to_json());
         }
 
         let record = self
@@ -3606,6 +3606,7 @@ mod tests {
             None,
         )
         .await;
+        persist_test_runtime_snapshot(crud_store.as_ref(), workspace_id, thread_id, turn_id).await;
 
         let timestamp = chrono::Utc::now().fixed_offset();
         let window = crud_store

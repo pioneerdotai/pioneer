@@ -6739,7 +6739,7 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn failed_child_task_run_marks_target_turn_failed_without_candidate() {
+async fn failed_child_task_run_opens_recovery_without_candidate() {
     let provider = Arc::new(HangingChildProvider::new());
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
@@ -6797,12 +6797,17 @@ async fn failed_child_task_run_marks_target_turn_failed_without_candidate() {
         )
         .await;
 
-    wait_for_task_status(
-        crud_store.clone(),
-        response.task.id.as_str(),
-        pioneer_protocol::TaskStatus::Failed,
-    )
-    .await;
+    let recovery_jobs = crud_store
+        .find_recovery_jobs_by_turn_and_status(
+            lineage.child_turn_id.as_str(),
+            RecoveryJobStatus::Pending,
+        )
+        .await
+        .expect("recovery job lookup should succeed");
+    assert_eq!(recovery_jobs.len(), 1);
+    assert_eq!(recovery_jobs[0].trigger, RecoveryTrigger::RuntimeFailure);
+    assert_eq!(recovery_jobs[0].action, RecoveryAction::RestartTurn);
+
     let task_run_turn = crud_store
         .get_task_run_turn_by_turn(
             lineage.child_thread_id.as_str(),
@@ -6811,14 +6816,14 @@ async fn failed_child_task_run_marks_target_turn_failed_without_candidate() {
         .await
         .expect("task run turn lookup should succeed")
         .expect("target task_run_turn should exist");
-    assert_eq!(task_run_turn.status, TaskRunTurnStatus::Failed);
+    assert_eq!(task_run_turn.status, TaskRunTurnStatus::InProgress);
     assert!(
         crud_store
             .get_accepted_task_result_candidate(run.id.as_str())
             .await
             .expect("accepted candidate lookup should succeed")
             .is_none(),
-        "failed child turn must not create an accepted candidate"
+        "recovering child turn must not create an accepted candidate"
     );
 }
 
