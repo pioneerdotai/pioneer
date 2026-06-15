@@ -18,6 +18,7 @@ use gpui_component::{
     theme::ActiveTheme,
     *,
 };
+use pioneer_client::settings::gateway::ThreadEpisodicSettingToggle;
 use pioneer_client::settings::memory as settings_memory;
 use pioneer_protocol::{GatewayMemoryModelSelection, GatewayMemorySettings};
 use std::rc::Rc;
@@ -127,9 +128,12 @@ impl PioneerDesktop {
     fn render_settings_memory(&self, cx: &mut Context<Self>) -> AnyElement {
         let desktop_entity = cx.entity().clone();
         let memory_settings_panel = match &self.gateway.settings {
-            Some(settings) => {
-                Self::render_memory_settings(settings.memory.clone(), desktop_entity, cx)
-            }
+            Some(settings) => Self::render_memory_settings(
+                settings.memory.clone(),
+                settings.thread_episodic.enabled,
+                desktop_entity,
+                cx,
+            ),
             None => {
                 Self::render_gateway_settings_status(self.gateway_settings_status_message(), cx)
             }
@@ -252,6 +256,7 @@ impl PioneerDesktop {
 
     fn render_memory_settings(
         memory: GatewayMemorySettings,
+        thread_context_enabled: bool,
         desktop_entity: Entity<Self>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -282,6 +287,18 @@ impl PioneerDesktop {
                     memory.active_recall_enabled,
                     t!("settings.memory.active_recall.label").to_string(),
                     t!("settings.memory.active_recall.description").to_string(),
+                    desktop_entity.clone(),
+                    cx,
+                ),
+            );
+
+            settings = settings.child(Self::render_settings_divider(cx)).child(
+                Self::render_thread_episodic_toggle_row(
+                    "settings-memory-thread-context",
+                    ThreadEpisodicSettingToggle::Enabled,
+                    thread_context_enabled,
+                    t!("settings.memory.thread_context.label").to_string(),
+                    t!("settings.memory.thread_context.description").to_string(),
                     desktop_entity.clone(),
                     cx,
                 ),
@@ -585,6 +602,41 @@ impl PioneerDesktop {
             .into_any_element()
     }
 
+    fn render_thread_episodic_toggle_row(
+        id: &'static str,
+        toggle: ThreadEpisodicSettingToggle,
+        selected: bool,
+        label: String,
+        description: String,
+        desktop_entity: Entity<Self>,
+        _cx: &mut Context<Self>,
+    ) -> AnyElement {
+        h_flex()
+            .w_full()
+            .gap_6()
+            .py_3()
+            .justify_between()
+            .items_center()
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .flex_1()
+                    .child(div().text_sm().font_semibold().child(label))
+                    .child(div().text_xs().opacity(0.6).child(description)),
+            )
+            .child(
+                Switch::new(id)
+                    .checked(selected)
+                    .on_click(move |enabled, _, cx| {
+                        let _ = desktop_entity.update(cx, |view, cx| {
+                            view.apply_thread_episodic_setting(toggle, *enabled, cx);
+                            cx.notify();
+                        });
+                    }),
+            )
+            .into_any_element()
+    }
+
     fn render_memory_model_row(
         id: &'static str,
         setting: MemoryModelSetting,
@@ -828,6 +880,8 @@ mod tests {
 
         assert!(general_view.contains("render_preflight_model_setting"));
         assert!(general_view.contains("settings.general.preflight_model"));
+        assert!(!general_view.contains("\"settings-general-thread-context\""));
+        assert!(!general_view.contains("settings.general.thread_context"));
         assert!(source.contains("\"settings-preflight-model\""));
     }
 
@@ -846,6 +900,11 @@ mod tests {
         assert!(memory_view.contains("settings.memory.active_recall"));
         assert!(memory_view.contains("\"settings-memory-post-turn-extractor-model\""));
         assert!(memory_view.contains("MemoryModelSetting::PostTurnExtractor"));
+        assert!(memory_view.contains("\"settings-memory-thread-context\""));
+        assert!(memory_view.contains("settings.memory.thread_context"));
+        assert!(memory_view.contains("ThreadEpisodicSettingToggle::Enabled"));
+        assert!(!memory_view.contains("ThreadEpisodicSettingToggle::Indexing"));
+        assert!(!memory_view.contains("ThreadEpisodicSettingToggle::Recall"));
         assert!(!memory_view.contains("render_preflight_model_setting"));
         assert!(!memory_view.contains("settings.general.preflight_model"));
         assert!(!memory_view.contains("settings.memory.active_recall_model"));
@@ -862,6 +921,7 @@ mod tests {
                 "[settings.general.preflight_model]",
                 "select_model",
                 "dialog_title",
+                "[settings.memory.thread_context]",
                 "[settings.memory.active_recall]",
                 "[settings.memory.proactive_writes_model]",
             ] {

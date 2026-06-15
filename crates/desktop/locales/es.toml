@@ -646,6 +646,10 @@ default = "Predeterminado"
 select_model = "Seleccionar modelo"
 dialog_title = "Seleccionar modelo de preflight"
 
+[settings.memory.thread_context]
+label = "Contexto del hilo"
+description = "Permitir que Pioneer indexe y recupere contexto útil del hilo actual."
+
 [settings.memory]
 title = "Memoria"
 description = "Controla cómo Pioneer usa la memoria duradera."

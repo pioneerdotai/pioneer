@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnResumeParams",
+  "type": "object",
+  "properties": {
+    "recovery_job_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "thread_id": {
+      "type": "string"
+    },
+    "turn_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "thread_id",
+    "turn_id"
+  ]
+}

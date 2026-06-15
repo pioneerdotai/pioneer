@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadEpisodicSourceContext",
+  "type": "string",
+  "enum": [
+    "user_visible_thread_item",
+    "user_visible_tool_summary",
+    "user_visible_task_summary",
+    "thread_compaction_summary",
+    "hidden_prompt",
+    "reasoning_trace",
+    "raw_tool_output",
+    "raw_task_runtime",
+    "internal_hook_runtime",
+    "system_prompt",
+    "developer_prompt",
+    "unknown"
+  ]
+}

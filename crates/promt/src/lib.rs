@@ -40,6 +40,7 @@ pub use render::{
     memory_recall::{
         MemoryRecallPromptContextBlock, MemoryRecallPromptInput, MemoryRecallPromptItem,
         MemoryRecallPromptPolicy, render_memory_recall_context_block, render_memory_recall_prompt,
+        render_thread_context_prompt,
     },
     memory_turn_policy::{
         MemoryTurnPolicyClassifierPromptInput, render_memory_turn_policy_classifier_prompt,

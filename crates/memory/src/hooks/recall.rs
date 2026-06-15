@@ -91,6 +91,7 @@ pub(super) fn resolve_active_memory_decision_without_preflight_plan(
     config: &MemoryActiveRecallConfig,
     deterministic: &DeterministicRecallContextSummary,
     episodic_capabilities: MemoryEpisodicRecallCapabilities,
+    thread_episodic: MemoryActiveRecallThreadEpisodicSummary,
 ) -> ActiveMemoryDecision {
     let local = active_recall_local_planning_parts(
         context,
@@ -99,6 +100,7 @@ pub(super) fn resolve_active_memory_decision_without_preflight_plan(
         config,
         deterministic,
         episodic_capabilities,
+        thread_episodic,
     );
 
     if local.local_final {
@@ -115,6 +117,7 @@ pub(super) fn active_memory_decision_from_preflight_plan(
     config: &MemoryActiveRecallConfig,
     deterministic: &DeterministicRecallContextSummary,
     episodic_capabilities: MemoryEpisodicRecallCapabilities,
+    thread_episodic: MemoryActiveRecallThreadEpisodicSummary,
     plan: ActiveRecallPlan,
 ) -> ActiveMemoryDecision {
     let local = active_recall_local_planning_parts(
@@ -124,6 +127,7 @@ pub(super) fn active_memory_decision_from_preflight_plan(
         config,
         deterministic,
         episodic_capabilities,
+        thread_episodic,
     );
     if matches!(
         local.local_plan.reason_code,
@@ -160,6 +164,28 @@ pub fn build_active_recall_local_preflight_plan(
     episodic_capabilities: MemoryEpisodicRecallCapabilities,
     provider_available: bool,
 ) -> MemoryActiveRecallLocalPlan {
+    build_active_recall_local_preflight_plan_with_thread_summary(
+        context,
+        input,
+        policy,
+        config,
+        deterministic,
+        episodic_capabilities,
+        MemoryActiveRecallThreadEpisodicSummary::default(),
+        provider_available,
+    )
+}
+
+pub fn build_active_recall_local_preflight_plan_with_thread_summary(
+    context: &MemoryTurnContext,
+    input: &TurnPrePromptContextHookInput,
+    policy: &MemoryTurnPolicy,
+    config: &MemoryActiveRecallConfig,
+    deterministic: &DeterministicRecallContextSummary,
+    episodic_capabilities: MemoryEpisodicRecallCapabilities,
+    thread_episodic: MemoryActiveRecallThreadEpisodicSummary,
+    provider_available: bool,
+) -> MemoryActiveRecallLocalPlan {
     let local = active_recall_local_planning_parts(
         context,
         input,
@@ -167,6 +193,7 @@ pub fn build_active_recall_local_preflight_plan(
         config,
         deterministic,
         episodic_capabilities,
+        thread_episodic,
     );
     let provider_planning_needed =
         !local.local_final && config.planner.enabled && provider_available;
@@ -242,6 +269,7 @@ fn active_recall_local_planning_parts(
     config: &MemoryActiveRecallConfig,
     deterministic: &DeterministicRecallContextSummary,
     episodic_capabilities: MemoryEpisodicRecallCapabilities,
+    thread_episodic: MemoryActiveRecallThreadEpisodicSummary,
 ) -> ActiveRecallLocalPlanningParts {
     let planner_input = active_recall_planner_input(
         context,
@@ -250,6 +278,7 @@ fn active_recall_local_planning_parts(
         config,
         deterministic,
         episodic_capabilities,
+        thread_episodic,
     );
     let local_plan = local_active_memory_decision(&planner_input, "");
     let local_final = active_recall_local_plan_is_final(&local_plan);
@@ -270,6 +299,7 @@ fn active_recall_local_planning_parts(
         available_modes: active_recall_available_mode_names(&planner_input),
         available_scoped_contexts: active_recall_available_scoped_contexts(&planner_input),
         episodic_capabilities: planner_input.episodic_capabilities.clone(),
+        thread_episodic: planner_input.thread_episodic.clone(),
         max_queries: config.max_queries,
         top_k_per_query: config.top_k_per_query,
         max_prompt_chars: config.max_prompt_chars,
@@ -634,6 +664,7 @@ mod active_recall_local_preflight_tests {
             &config,
             &deterministic,
             episodic_capabilities,
+            MemoryActiveRecallThreadEpisodicSummary::default(),
         );
 
         assert!(!plan.provider_planning_needed);
@@ -676,6 +707,7 @@ mod active_recall_local_preflight_tests {
             &config,
             &deterministic,
             episodic_capabilities,
+            MemoryActiveRecallThreadEpisodicSummary::default(),
         );
 
         assert!(!plan.provider_planning_needed);

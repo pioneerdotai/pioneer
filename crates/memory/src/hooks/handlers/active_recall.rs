@@ -49,6 +49,11 @@ impl HookHandler for ActiveMemoryRecallHook {
         let context = memory_turn_context_from_prompt_context_request(&request, &prompt_input)?;
         let episodic_capabilities =
             resolve_episodic_recall_capabilities(self.episodic_provider.as_ref(), &context).await;
+        let thread_episodic = active_recall_thread_episodic_summary(
+            &request.prompt_context_set,
+            &context,
+            &episodic_capabilities,
+        );
         let mut response = HookHandlerResponse::default();
         let decision = match &input.active_memory_recall_plan {
             Some(plan) => match serde_json::from_value::<ActiveRecallPlan>(plan.clone()) {
@@ -60,22 +65,43 @@ impl HookHandler for ActiveMemoryRecallHook {
                         &config,
                         &deterministic,
                         episodic_capabilities.clone(),
+                        thread_episodic.clone(),
                         plan,
                     ),
                     Err(error) => {
                         response.diagnostics.push(memory_safe_warning_diagnostic(
                             "memory.active_recall.preflight_plan_invalid",
-                            format!("memory active recall skipped: invalid preflight plan {error}"),
+                            format!(
+                                "memory active recall planner output invalid; using local fallback: {error}"
+                            ),
                         ));
-                        return Ok(response);
+                        resolve_active_memory_decision_without_preflight_plan(
+                            &context,
+                            &prompt_input,
+                            &policy,
+                            &config,
+                            &deterministic,
+                            episodic_capabilities.clone(),
+                            thread_episodic.clone(),
+                        )
                     }
                 },
                 Err(error) => {
                     response.diagnostics.push(memory_safe_warning_diagnostic(
                         "memory.active_recall.preflight_plan_invalid",
-                        format!("memory active recall skipped: invalid preflight plan {error}"),
+                        format!(
+                            "memory active recall planner output invalid; using local fallback: {error}"
+                        ),
                     ));
-                    return Ok(response);
+                    resolve_active_memory_decision_without_preflight_plan(
+                        &context,
+                        &prompt_input,
+                        &policy,
+                        &config,
+                        &deterministic,
+                        episodic_capabilities.clone(),
+                        thread_episodic.clone(),
+                    )
                 }
             },
             None => resolve_active_memory_decision_without_preflight_plan(
@@ -85,6 +111,7 @@ impl HookHandler for ActiveMemoryRecallHook {
                 &config,
                 &deterministic,
                 episodic_capabilities.clone(),
+                thread_episodic.clone(),
             ),
         };
         response.diagnostics.extend(hook_diagnostics_from_strings(
@@ -184,19 +211,21 @@ impl HookHandler for ActiveMemoryRecallHook {
                 &active_dedup,
             ));
 
+        let episodic_items = execution.episodic_items.clone();
+
         let mut contributed = false;
         let mut active_synthesis = None;
         if !active_dedup.items.is_empty() {
-            let synthesis_result = memory_active_recall_prompt_context_contribution_with_synthesis(
-                active_dedup.items.clone(),
-                execution.truncated,
-                deterministic.memory_ids.clone(),
-                deterministic.rendered_line_fingerprints.clone(),
-                &config,
-            );
+            let synthesis_result =
+                memory_active_recall_multi_source_prompt_context_contribution_with_synthesis(
+                    active_dedup.items.clone(),
+                    Vec::new(),
+                    execution.truncated,
+                    &config,
+                );
             response
                 .diagnostics
-                .push(memory_recall_synthesis_observability_diagnostic(
+                .push(memory_active_synthesis_observability_diagnostic(
                     &synthesis_result.synthesis,
                 ));
             response.diagnostics.extend(hook_diagnostics_from_strings(
@@ -216,7 +245,7 @@ impl HookHandler for ActiveMemoryRecallHook {
         }
 
         let episodic_contributions = memory_episodic_recall_prompt_context_contributions(
-            execution.episodic_items.clone(),
+            episodic_items,
             execution.truncated,
             &config,
         );

@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WorkspaceBootstrapSuccessReduction",
+  "type": "object",
+  "properties": {
+    "clear_workspaces_error": {
+      "type": "boolean"
+    },
+    "selected": {
+      "$ref": "#/$defs/WorkspaceSelectionReduction"
+    },
+    "workspaces": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Workspace"
+      }
+    }
+  },
+  "required": [
+    "workspaces",
+    "selected",
+    "clear_workspaces_error"
+  ],
+  "$defs": {
+    "Workspace": {
+      "type": "object",
+      "properties": {
+        "created_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "id": {
+          "type": "string"
+        },
+        "is_active": {
+          "type": "boolean"
+        },
+        "is_current": {
+          "type": "boolean"
+        },
+        "name": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "is_active",
+        "is_current",
+        "created_at",
+        "updated_at"
+      ]
+    },
+    "WorkspaceSelectionReduction": {
+      "type": "object",
+      "properties": {
+        "persist_active_gateway_workspace_id": {
+          "type": "string"
+        },
+        "refresh_thread_list": {
+          "type": "boolean"
+        },
+        "set_preferred_workspace_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "persist_active_gateway_workspace_id",
+        "set_preferred_workspace_id",
+        "refresh_thread_list"
+      ]
+    }
+  }
+}

@@ -129,10 +129,158 @@
         },
         "memory": {
           "$ref": "#/$defs/GatewayMemorySettings"
+        },
+        "thread_episodic": {
+          "$ref": "#/$defs/GatewayThreadEpisodicSettings",
+          "default": {
+            "chunk_max_chars": 1600,
+            "chunk_target_max_chars": 1200,
+            "chunk_target_min_chars": 700,
+            "default_max_candidates": 32,
+            "default_prompt_chars": 2400,
+            "enabled": true,
+            "index_batch_limit": 16,
+            "indexing_enabled": true,
+            "max_attempts": 5,
+            "max_candidate_work": 128,
+            "max_chunks_per_item": 64,
+            "max_hit_chars": 1200,
+            "max_prompt_chars": 12000,
+            "max_segments": 16,
+            "min_relevancy": 0.25,
+            "min_results": 1,
+            "near_capacity_percent": 90.0,
+            "recall_enabled": true,
+            "retry_base_delay_secs": 30,
+            "retry_max_delay_secs": 900,
+            "snippet_chars": 360
+          }
         }
       },
       "required": [
         "memory"
+      ]
+    },
+    "GatewayThreadEpisodicSettings": {
+      "type": "object",
+      "properties": {
+        "chunk_max_chars": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "chunk_target_max_chars": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "chunk_target_min_chars": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "default_max_candidates": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "default_prompt_chars": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "index_batch_limit": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "indexing_enabled": {
+          "type": "boolean"
+        },
+        "max_attempts": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "max_candidate_work": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_chunks_per_item": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_hit_chars": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_prompt_chars": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_segments": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "min_relevancy": {
+          "type": "number",
+          "format": "float"
+        },
+        "min_results": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "near_capacity_percent": {
+          "type": "number",
+          "format": "double"
+        },
+        "recall_enabled": {
+          "type": "boolean"
+        },
+        "retry_base_delay_secs": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "retry_max_delay_secs": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "snippet_chars": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "enabled",
+        "indexing_enabled",
+        "recall_enabled",
+        "default_prompt_chars",
+        "max_prompt_chars",
+        "max_hit_chars",
+        "default_max_candidates",
+        "max_candidate_work",
+        "max_segments",
+        "min_relevancy",
+        "min_results",
+        "snippet_chars",
+        "chunk_target_min_chars",
+        "chunk_target_max_chars",
+        "chunk_max_chars",
+        "max_chunks_per_item",
+        "index_batch_limit",
+        "retry_base_delay_secs",
+        "retry_max_delay_secs",
+        "max_attempts",
+        "near_capacity_percent"
       ]
     }
   }

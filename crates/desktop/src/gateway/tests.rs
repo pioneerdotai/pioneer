@@ -347,6 +347,7 @@ pub(crate) fn test_config() -> AppConfig {
             tasks: Default::default(),
             skills: GatewaySkillsConfig::default(),
             memory: GatewayMemoryConfig::default(),
+            thread_episodic: Default::default(),
             hooks: Default::default(),
             artifacts: GatewayArtifactsConfig::default(),
             provider: GatewayProviderConfig::default(),

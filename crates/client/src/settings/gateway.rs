@@ -4,10 +4,11 @@ use pioneer_protocol::{
     GatewayGeneralSettingsUpdate, GatewayMemoryModelSelection, GatewaySettingsGetParams,
     GatewaySettingsGetResponse, GatewaySettingsSnapshot, GatewaySettingsUpdate,
     GatewaySettingsUpdateParams, GatewaySettingsUpdateResponse,
+    GatewayThreadEpisodicSettingsUpdate,
 };
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct GatewaySettingsState {
     pub settings: Option<GatewaySettingsSnapshot>,
     pub loading: bool,
@@ -40,6 +41,12 @@ pub enum GatewaySettingsRefreshPlan {
     Send(GatewaySettingsActionScope),
     SkipAlreadyLoading,
     Unavailable(GatewaySettingsRefreshUnavailable),
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum ThreadEpisodicSettingToggle {
+    Enabled,
 }
 
 pub fn gateway_settings_get_params() -> GatewaySettingsGetParams {
@@ -182,6 +189,7 @@ pub fn keepawake_update_plan(
                 preflight_model: None,
             }),
             memory: None,
+            thread_episodic: None,
         },
     })
 }
@@ -201,6 +209,24 @@ pub fn preflight_model_update_plan(
                 preflight_model: Some(model_selection),
             }),
             memory: None,
+            thread_episodic: None,
+        },
+    })
+}
+
+pub fn thread_episodic_enabled_update_plan(
+    current: Option<&GatewaySettingsSnapshot>,
+    enabled: bool,
+) -> Option<GatewaySettingsUpdatePlan> {
+    let mut snapshot = current.cloned()?;
+    snapshot.thread_episodic.enabled = enabled;
+
+    Some(GatewaySettingsUpdatePlan {
+        snapshot,
+        update: GatewaySettingsUpdate {
+            general: None,
+            memory: None,
+            thread_episodic: Some(GatewayThreadEpisodicSettingsUpdate::enabled(enabled)),
         },
     })
 }
@@ -217,6 +243,7 @@ mod tests {
                 ..Default::default()
             },
             memory: GatewayMemorySettings::default(),
+            thread_episodic: Default::default(),
         }
     }
 
@@ -304,6 +331,7 @@ mod tests {
         let params = gateway_settings_update_params(update);
         assert!(params.update.general.is_none());
         assert!(params.update.memory.is_none());
+        assert!(params.update.thread_episodic.is_none());
         let _params: GatewaySettingsGetParams = gateway_settings_get_params();
 
         assert!(settings_action_matches_connection(7, 3, Some(7), 3));
@@ -360,6 +388,7 @@ mod tests {
         assert_eq!(general.keepawake, Some(true));
         assert!(general.preflight_model.is_none());
         assert!(plan.update.memory.is_none());
+        assert!(plan.update.thread_episodic.is_none());
         assert!(keepawake_update_plan(None, true).is_none());
     }
 
@@ -375,6 +404,26 @@ mod tests {
         assert!(general.keepawake.is_none());
         assert_eq!(general.preflight_model, Some(model_selection));
         assert!(plan.update.memory.is_none());
+        assert!(plan.update.thread_episodic.is_none());
         assert!(preflight_model_update_plan(None, GatewayMemoryModelSelection::thread()).is_none());
+    }
+
+    #[test]
+    fn thread_episodic_enabled_update_plan_does_not_touch_hidden_fields() {
+        let mut current = snapshot(true);
+        current.thread_episodic.indexing_enabled = false;
+        current.thread_episodic.recall_enabled = false;
+
+        let plan =
+            thread_episodic_enabled_update_plan(Some(&current), false).expect("enabled plan");
+
+        assert!(!plan.snapshot.thread_episodic.enabled);
+        assert!(!plan.snapshot.thread_episodic.indexing_enabled);
+        assert!(!plan.snapshot.thread_episodic.recall_enabled);
+        assert_eq!(
+            plan.update.thread_episodic,
+            Some(GatewayThreadEpisodicSettingsUpdate::enabled(false))
+        );
+        assert!(thread_episodic_enabled_update_plan(None, true).is_none());
     }
 }

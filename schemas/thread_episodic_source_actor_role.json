@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadEpisodicSourceActorRole",
+  "type": "string",
+  "enum": [
+    "user",
+    "assistant",
+    "tool_summary",
+    "task_summary",
+    "generated_summary"
+  ]
+}

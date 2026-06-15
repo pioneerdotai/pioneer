@@ -1,0 +1,219 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ProviderListModelsResponse",
+  "type": "object",
+  "properties": {
+    "models": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ProviderModelInfo"
+      }
+    },
+    "provider": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "provider",
+    "models"
+  ],
+  "$defs": {
+    "ProviderModelCapabilities": {
+      "type": "object",
+      "properties": {
+        "fine_tuning": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "input_modalities": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "json_output": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "output_modalities": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "streaming": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "thinking": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "tool_calling": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "vision": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "ProviderModelInfo": {
+      "type": "object",
+      "properties": {
+        "active": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "capabilities": {
+          "$ref": "#/$defs/ProviderModelCapabilities"
+        },
+        "created": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "family": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "lifecycle_status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limits": {
+          "$ref": "#/$defs/ProviderModelLimits"
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "owned_by": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pricing": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderModelPricing"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "provider": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "provider",
+        "limits",
+        "capabilities"
+      ]
+    },
+    "ProviderModelLimits": {
+      "type": "object",
+      "properties": {
+        "context_window": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_input_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_output_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      }
+    },
+    "ProviderModelPricing": {
+      "type": "object",
+      "properties": {
+        "image": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "input_token": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "output_token": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "request": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      }
+    }
+  }
+}

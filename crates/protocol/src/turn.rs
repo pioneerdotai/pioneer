@@ -862,6 +862,7 @@ pub struct PromptManifestHookSource {
 #[serde(rename_all = "snake_case")]
 pub enum PromptManifestHookContributionKind {
     PromptContext,
+    ThreadContext,
     PromptSection,
     PromptManifestDiagnostic,
     RuntimeFailure,

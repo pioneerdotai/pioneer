@@ -1,0 +1,260 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadEpisodicHit",
+  "type": "object",
+  "properties": {
+    "adaptive_diagnostics": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ThreadEpisodicAdaptiveDiagnostics"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "created_at": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "provenance": {
+      "$ref": "#/$defs/ThreadEpisodicSourceProvenance"
+    },
+    "score": {
+      "type": "number",
+      "format": "float"
+    },
+    "score_breakdown": {
+      "$ref": "#/$defs/ThreadEpisodicScoreBreakdown"
+    },
+    "text": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "provenance",
+    "text",
+    "score",
+    "score_breakdown"
+  ],
+  "$defs": {
+    "ThreadEpisodicAdaptiveDiagnostics": {
+      "type": "object",
+      "properties": {
+        "cutoff_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cutoff_score": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "max_candidates": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "min_relevancy": {
+          "type": "number",
+          "format": "float"
+        },
+        "native_memvid_adaptive_used": {
+          "type": "boolean",
+          "default": false
+        },
+        "results_returned": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "search_mode": {
+          "$ref": "#/$defs/ThreadEpisodicSearchMode"
+        },
+        "strategy": {
+          "$ref": "#/$defs/ThreadEpisodicAdaptiveStrategy"
+        },
+        "total_candidates": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "search_mode",
+        "strategy",
+        "min_relevancy",
+        "max_candidates",
+        "total_candidates",
+        "results_returned"
+      ]
+    },
+    "ThreadEpisodicAdaptiveStrategy": {
+      "type": "string",
+      "enum": [
+        "combined",
+        "relative",
+        "absolute",
+        "cliff",
+        "elbow"
+      ]
+    },
+    "ThreadEpisodicScoreBreakdown": {
+      "type": "object",
+      "properties": {
+        "exact_source_boost": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "final_score": {
+          "type": "number",
+          "format": "float"
+        },
+        "lexical_score": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "memvid_score": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "recency_boost": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "semantic_score": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "source_role_boost": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "temporal_score": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        }
+      },
+      "required": [
+        "final_score"
+      ]
+    },
+    "ThreadEpisodicSearchMode": {
+      "type": "string",
+      "enum": [
+        "auto",
+        "semantic",
+        "lexical",
+        "temporal"
+      ]
+    },
+    "ThreadEpisodicSourceActorRole": {
+      "type": "string",
+      "enum": [
+        "user",
+        "assistant",
+        "tool_summary",
+        "task_summary",
+        "generated_summary"
+      ]
+    },
+    "ThreadEpisodicSourceContext": {
+      "type": "string",
+      "enum": [
+        "user_visible_thread_item",
+        "user_visible_tool_summary",
+        "user_visible_task_summary",
+        "thread_compaction_summary",
+        "hidden_prompt",
+        "reasoning_trace",
+        "raw_tool_output",
+        "raw_task_runtime",
+        "internal_hook_runtime",
+        "system_prompt",
+        "developer_prompt",
+        "unknown"
+      ]
+    },
+    "ThreadEpisodicSourceProvenance": {
+      "description": "Evidence pointer for a thread episodic chunk.\n\nThis is not a durable-memory identity. It points to where recalled\nconversation context came from so later layers can filter, debug, rebuild,\nand cite the exact source chunk without reusing durable memory record ids.",
+      "type": "object",
+      "properties": {
+        "chunk_id": {
+          "type": "string"
+        },
+        "chunk_index": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "created_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "item_id": {
+          "type": "string"
+        },
+        "source_actor_role": {
+          "$ref": "#/$defs/ThreadEpisodicSourceActorRole"
+        },
+        "source_context": {
+          "$ref": "#/$defs/ThreadEpisodicSourceContext"
+        },
+        "source_id": {
+          "type": "string"
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "turn_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_id",
+        "workspace_id",
+        "thread_id",
+        "turn_id",
+        "item_id",
+        "chunk_id",
+        "chunk_index",
+        "source_actor_role",
+        "source_context"
+      ]
+    }
+  }
+}

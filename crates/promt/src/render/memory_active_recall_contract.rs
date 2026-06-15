@@ -41,7 +41,7 @@ pub fn render_memory_active_recall_provider_output_contract(
             "- `targets`: array of advisory target objects; use [] when no exact target fields are structurally clear.\n",
             "- `diagnostics`: array of short strings.\n\n",
             "Allowed active recall modes:\n",
-            "- `profile`, `project`, `durable`, `current_thread`, `related_thread`, `current_task`, `completed_task`, `thread_episodic`, `task_context`, `exact_canonical`.\n\n",
+            "- `profile`, `project`, `durable`, `current_thread`, `related_thread`, `workspace_thread`, `current_task`, `completed_task`, `thread_episodic`, `task_context`, `exact_canonical`.\n\n",
             "Allowed active recall target fields:\n",
             "- `scopeKind`: `user`, `workspace`, `thread`, `agent`, or `task`.\n",
             "- `factClass`: `user_identity`, `user_biography`, `user_relationship`, `stable_user_preference`, `communication_preference`, `recurring_user_instruction`, `project_policy`, `project_decision`, `project_procedure`, `project_constraint`, `task_lifecycle_state`, `operational_observation`, `thread_local_state`, `tool_result_fact`, `assistant_self_description`, `generated_summary_fact`, `domain_owned_state`, `secret_or_credential`, or `regulated_sensitive_fact`.\n",
@@ -62,8 +62,9 @@ pub fn render_memory_active_recall_provider_output_contract(
             "- Do not include `exact_canonical` unless an exact canonical target is present.\n",
             "- Do not include `current_task` or `task_context` unless current task context capability is available.\n",
             "- Do not include `completed_task` unless completed task summary capability is available.\n",
-            "- Do not include `current_thread` or `thread_episodic` unless current thread episodic capability is available.\n",
+            "- Do not include `current_thread` or `thread_episodic` unless structured input `threadEpisodic.currentThreadRecallAvailable` is true.\n",
             "- Do not include `related_thread` unless related thread search capability is available.\n",
+            "- Do not include `workspace_thread` unless workspace thread search capability is available and workspace context is present.\n",
             "- Keep diagnostics short and operational.",
         ),
         output_path = output_path
@@ -117,6 +118,7 @@ mod tests {
 
         assert!(contract.contains("Active recall output contract for memory.activeRecall"));
         assert!(contract.contains("Return recall strategy only"));
+        assert!(contract.contains("`workspace_thread`"));
         assert!(contract.contains("`factClass`: `user_identity`"));
         assert!(contract.contains("`subject`: `current_user`"));
         assert!(contract.contains("`attribute`: `name`"));
@@ -124,6 +126,9 @@ mod tests {
         assert!(contract.contains("never output free-form strings for enum fields"));
         assert!(contract.contains("For `run`, `modes` must contain at least one allowed mode."));
         assert!(contract.contains("For `skip` or `uncertain`, `modes` must be []"));
+        assert!(contract.contains(
+            "Do not include `workspace_thread` unless workspace thread search capability is available"
+        ));
         assert!(!contract.contains(" | string"));
         assert!(!contract.contains("optional string"));
     }

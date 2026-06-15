@@ -684,6 +684,17 @@
         "retry_attempt",
         "retry_with_backoff",
         "restart_turn",
+        "replay_durable_event",
+        "rehydrate_turn_state",
+        "open_next_execution_window",
+        "adapt_provider_request",
+        "refresh_provider_auth",
+        "compact_history",
+        "disable_streaming",
+        "disable_unsupported_capability",
+        "repair_artifact_finalization",
+        "requeue_task_dispatch",
+        "block_resumable",
         "fallback",
         "mark_failed"
       ]
@@ -771,6 +782,41 @@
           "description": "Any provider/model/transport failure in LLM interaction path.",
           "type": "string",
           "const": "provider_error"
+        },
+        {
+          "description": "Turn runtime could not be prepared after the turn was persisted.",
+          "type": "string",
+          "const": "turn_start"
+        },
+        {
+          "description": "Turn could not be dispatched to the agent runtime.",
+          "type": "string",
+          "const": "turn_dispatch"
+        },
+        {
+          "description": "A durable event could not be projected/materialized.",
+          "type": "string",
+          "const": "projection_failure"
+        },
+        {
+          "description": "A same-turn execution window continuation could not be opened directly.",
+          "type": "string",
+          "const": "execution_window_continuation"
+        },
+        {
+          "description": "Final artifact validation/registration failed after model output.",
+          "type": "string",
+          "const": "artifact_finalization"
+        },
+        {
+          "description": "Child/reviewer/revision task turn dispatch failed.",
+          "type": "string",
+          "const": "task_dispatch"
+        },
+        {
+          "description": "Generic runtime failure routed through the central terminal decision gate.",
+          "type": "string",
+          "const": "runtime_failure"
         },
         {
           "description": "Forward-compatibility fallback for unknown persisted values.",

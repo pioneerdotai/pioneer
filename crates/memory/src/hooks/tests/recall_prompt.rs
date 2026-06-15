@@ -638,8 +638,13 @@ async fn active_memory_hook_rejects_invalid_preflight_plan_without_legacy_provid
         .await
         .expect("invalid preflight plan is best-effort");
 
-    assert_eq!(provider.recall_call_count(), 0);
-    assert_no_prompt_context_contributions(&response);
+    assert!(provider.recall_call_count() >= 1);
+    assert!(
+        response
+            .contributions
+            .iter()
+            .any(|contribution| matches!(contribution, HookContribution::PromptContext(_)))
+    );
     assert!(response.diagnostics.iter().any(|diagnostic| {
         diagnostic.code.as_str() == "memory.active_recall.preflight_plan_invalid"
     }));
@@ -1048,6 +1053,7 @@ fn active_recall_planner_input_is_structured_from_hook_context() {
         &config,
         &deterministic,
         MemoryEpisodicRecallCapabilities::default(),
+        MemoryActiveRecallThreadEpisodicSummary::default(),
     );
 
     assert_eq!(planner_input.workspace_id, "ws");
@@ -1067,6 +1073,11 @@ fn active_recall_planner_input_is_structured_from_hook_context() {
     );
     assert!(planner_input.deterministic_sufficient);
     assert!(!planner_input.has_task_context);
+    assert!(
+        !planner_input
+            .thread_episodic
+            .current_thread_recall_available
+    );
 }
 
 #[test]
@@ -1097,6 +1108,16 @@ fn active_recall_decision_request_renders_sanitized_preflight_input() {
         available_modes: vec!["profile".to_owned(), "project".to_owned()],
         available_scoped_contexts: vec!["workspace".to_owned(), "thread".to_owned()],
         episodic_capabilities: MemoryEpisodicRecallCapabilities::default(),
+        thread_episodic: MemoryActiveRecallThreadEpisodicSummary {
+            current_thread_id_present: true,
+            current_thread_recall_available: true,
+            related_thread_recall_available: false,
+            workspace_thread_recall_available: false,
+            prompt_context_source_count: 1,
+            prompt_context_chars: 128,
+            source_ids: vec!["thread:turn_41/item_1/chunk_0".to_owned()],
+            diagnostics: vec!["current_thread_recall_available".to_owned()],
+        },
         max_queries: 3,
         top_k_per_query: 5,
         max_prompt_chars: 1_500,
@@ -1108,11 +1129,70 @@ fn active_recall_decision_request_renders_sanitized_preflight_input() {
     let json = request.sanitized_input_json(&context);
     assert!(json.contains(r#""workspaceIdPresent": true"#));
     assert!(json.contains(r#""inputTextPreview": "current bounded input""#));
+    assert!(json.contains(r#""threadEpisodic""#));
+    assert!(json.contains(r#""currentThreadRecallAvailable": true"#));
+    assert!(json.contains(r#""thread:turn_41/item_1/chunk_0""#));
     assert!(!json.contains("workspace-secret-id"));
     assert!(!json.contains("thread-secret-id"));
     assert!(!json.contains("turn-secret-id"));
     assert!(!json.contains("tool schema"));
     assert!(!json.contains("hidden system prompt content"));
+}
+
+#[test]
+fn active_recall_thread_episodic_summary_is_bounded_and_metadata_only() {
+    let context = MemoryTurnContext {
+        workspace_id: "ws".to_owned(),
+        thread_id: "thr".to_owned(),
+        turn_id: "turn".to_owned(),
+        mode: ThreadMode::Agent,
+        input_text: "continue".to_owned(),
+        task_id: None,
+        agent_id: None,
+    };
+    let long_content = (0..12)
+        .map(|index| {
+            format!("- [thread:turn_{index}/item_1/chunk_0, role=user] Raw chunk text {index}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let prompt_context = PromptContextContribution {
+        contribution_id: HookContributionId::new(MEMORY_THREAD_CONTEXT_CONTRIBUTION_ID)
+            .expect("valid contribution id"),
+        domain: HookDomain::new("thread_context").expect("valid domain"),
+        priority: 480,
+        content: HookPromptContent::new(long_content).expect("valid prompt content"),
+        max_chars: Some(4_000),
+        source_refs: Vec::new(),
+        diagnostics: Vec::new(),
+        truncated: false,
+    };
+    let prompt_context_set = HookPromptContextSet::aggregate_contributions(
+        [prompt_context],
+        HookPromptContextLimits::default(),
+    );
+    let summary = active_recall_thread_episodic_summary(
+        &prompt_context_set,
+        &context,
+        &MemoryEpisodicRecallCapabilities {
+            current_thread_search: true,
+            related_thread_search: true,
+            workspace_thread_search: false,
+            current_task_context: false,
+            completed_task_summary: false,
+        },
+    );
+
+    assert!(summary.current_thread_id_present);
+    assert!(summary.current_thread_recall_available);
+    assert!(summary.related_thread_recall_available);
+    assert_eq!(summary.source_ids.len(), 8);
+    assert!(
+        summary
+            .diagnostics
+            .contains(&"thread_source_ids_truncated".to_owned())
+    );
+    assert!(!format!("{summary:?}").contains("Raw chunk text"));
 }
 
 #[test]
@@ -1256,6 +1336,70 @@ async fn memory_prompt_contract_consumes_active_context_allowlist() {
     assert!(content.contains("Additional active memory context for this turn:"));
     assert!(content.contains("Use hooks for memory domains."));
     assert!(!content.contains("Unrelated memory-domain context"));
+}
+
+#[tokio::test]
+async fn memory_prompt_contract_deduplicates_thread_context_consumed_by_active_synthesis() {
+    let hook = MemoryPromptContractHook;
+    let active_context = PromptContextContribution {
+        contribution_id: HookContributionId::new(MEMORY_ACTIVE_RECALL_CONTRIBUTION_ID)
+            .expect("valid contribution id"),
+        domain: memory_policy_domain(),
+        priority: 480,
+        content: HookPromptContent::new(
+            "- active synthesis: Continue with the hook-based prompt contract. Sources: thread:turn_41/item_1/chunk_0",
+        )
+        .expect("valid prompt content"),
+        max_chars: Some(500),
+        source_refs: Vec::new(),
+        diagnostics: Vec::new(),
+        truncated: false,
+    };
+    let thread_context = PromptContextContribution {
+        contribution_id: HookContributionId::new(MEMORY_THREAD_CONTEXT_CONTRIBUTION_ID)
+            .expect("valid contribution id"),
+        domain: HookDomain::new("thread_context").expect("valid domain"),
+        priority: 480,
+        content: HookPromptContent::new(
+            "- [thread:turn_41/item_1/chunk_0, role=user, context=message, score=0.91] Duplicate direct context.\n- [thread:turn_42/item_1/chunk_0, role=assistant, context=message, score=0.83] Retained direct context.",
+        )
+        .expect("valid prompt content"),
+        max_chars: Some(1_000),
+        source_refs: Vec::new(),
+        diagnostics: Vec::new(),
+        truncated: false,
+    };
+    let prompt_context_set = HookPromptContextSet::aggregate_contributions(
+        [active_context, thread_context],
+        HookPromptContextLimits::default(),
+    );
+
+    let response = hook
+        .execute(test_prompt_compile_hook_request(
+            memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+            true,
+            &[MEMORY_SEARCH_TOOL],
+            prompt_context_set,
+        ))
+        .await
+        .expect("prompt contract hook executes");
+
+    let sections = prompt_section_contents(response);
+    let combined = sections
+        .iter()
+        .map(|(_, content)| content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let thread_content = sections
+        .iter()
+        .find(|(section_id, _)| section_id == "thread_context")
+        .map(|(_, content)| content.as_str())
+        .expect("thread context section renders with retained non-duplicate hit");
+
+    assert_eq!(combined.matches("thread:turn_41/item_1/chunk_0").count(), 1);
+    assert!(!thread_content.contains("Duplicate direct context."));
+    assert!(thread_content.contains("thread:turn_42/item_1/chunk_0"));
+    assert!(thread_content.contains("Retained direct context."));
 }
 
 #[tokio::test]
@@ -1571,5 +1715,6 @@ fn active_recall_planner_input_for_test() -> ActiveRecallPlannerInput {
         has_workspace_context: true,
         has_task_context: false,
         episodic_capabilities: MemoryEpisodicRecallCapabilities::default(),
+        thread_episodic: MemoryActiveRecallThreadEpisodicSummary::default(),
     }
 }

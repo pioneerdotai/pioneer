@@ -1826,9 +1826,13 @@ mod tests {
                         episodic_capabilities: MemoryEpisodicRecallCapabilities {
                             current_thread_search: true,
                             related_thread_search: false,
+                            workspace_thread_search: false,
                             current_task_context: false,
                             completed_task_summary: false,
                         },
+                        thread_episodic:
+                            pioneer_memory::hooks::MemoryActiveRecallThreadEpisodicSummary::default(
+                            ),
                         max_queries: 3,
                         top_k_per_query: 5,
                         max_prompt_chars: 1_500,

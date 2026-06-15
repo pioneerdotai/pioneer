@@ -812,11 +812,64 @@ impl MessageProcessor {
     pub(super) async fn handle_durable_agent_event(&self, event: AgentDurableEvent) {
         let thread_id = durable_event_thread_id(&event).map(str::to_owned);
         let committed = message_future(self.persist_durable_agent_event(event.clone())).await;
-        if committed && let Some(thread_id) = thread_id {
-            self.agent_manager
-                .publish_committed(thread_id.as_str(), event)
-                .await;
+        if committed {
+            self.ingest_committed_thread_item(&event).await;
+            if let Some(thread_id) = thread_id {
+                self.agent_manager
+                    .publish_committed(thread_id.as_str(), event)
+                    .await;
+            }
         }
+    }
+
+    async fn ingest_committed_thread_item(&self, event: &AgentDurableEvent) {
+        let AgentDurableEvent::ItemCompleted { notification } = event else {
+            return;
+        };
+        let Some(input) = crate::thread_episodic::committed_item_ingestion_input(notification)
+        else {
+            debug!(
+                workspace_id = notification.workspace_id,
+                thread_id = notification.thread_id,
+                turn_id = notification.turn_id,
+                item_id = notification.item.item_id(),
+                "skipping thread episodic ingestion for committed item with missing required ids"
+            );
+            return;
+        };
+
+        let ingestor = self.thread_episodic_ingestor.read().await.clone();
+        match ingestor.ingest_committed_item(input).await {
+            Ok(crate::thread_episodic::ThreadEpisodicIngestionOutcome::Accepted) => {
+                debug!("thread episodic ingestion accepted committed item");
+                self.spawn_thread_episodic_index_run();
+            }
+            Ok(crate::thread_episodic::ThreadEpisodicIngestionOutcome::Skipped { reason }) => {
+                debug!(
+                    reason = reason.as_str(),
+                    "thread episodic ingestion skipped committed item"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    error = %format!("{error:#}"),
+                    "thread episodic ingestion failed after committed item persistence"
+                );
+            }
+        }
+    }
+
+    fn spawn_thread_episodic_index_run(&self) {
+        let executor = self.thread_episodic_index_executor.clone();
+        tokio::spawn(async move {
+            let now_unix = chrono::Utc::now().timestamp();
+            if let Err(error) = executor.run_once(now_unix).await {
+                warn!(
+                    error = %format!("{error:#}"),
+                    "thread episodic index run failed"
+                );
+            }
+        });
     }
 
     async fn persist_durable_agent_event(&self, event: AgentDurableEvent) -> bool {
@@ -3945,6 +3998,14 @@ impl MessageProcessor {
         {
             Ok(outcome) => outcome,
             Err(error) => {
+                if let Some((_workspace_id, current_turn)) = self
+                    .thread_manager
+                    .turn_get(thread_id.as_str(), turn_id.as_str())
+                    .await
+                    && current_turn.status == TurnStatus::Interrupted
+                {
+                    return true;
+                }
                 warn!(
                     thread_id,
                     turn_id,

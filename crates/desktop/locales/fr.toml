@@ -646,6 +646,10 @@ default = "Par défaut"
 select_model = "Sélectionner un modèle"
 dialog_title = "Sélectionner le modèle de preflight"
 
+[settings.memory.thread_context]
+label = "Contexte du fil"
+description = "Autoriser Pioneer à indexer et rappeler le contexte utile du fil actuel."
+
 [settings.memory]
 title = "Mémoire"
 description = "Contrôlez la façon dont Pioneer utilise la mémoire durable."

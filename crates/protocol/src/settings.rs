@@ -15,6 +15,8 @@ pub struct GatewaySettingsUpdate {
     pub general: Option<GatewayGeneralSettingsUpdate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<GatewayMemorySettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_episodic: Option<GatewayThreadEpisodicSettingsUpdate>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -35,11 +37,13 @@ pub struct GatewaySettingsUpdateResponse {
     pub settings: GatewaySettingsSnapshot,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct GatewaySettingsSnapshot {
     #[serde(default)]
     pub general: GatewayGeneralSettings,
     pub memory: GatewayMemorySettings,
+    #[serde(default)]
+    pub thread_episodic: GatewayThreadEpisodicSettings,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -76,6 +80,114 @@ impl Default for GatewayMemorySettings {
             proactive_writes_model: GatewayMemoryModelSelection::thread(),
             debug_trace_enabled: false,
             strict_diagnostics_enabled: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct GatewayThreadEpisodicSettings {
+    pub enabled: bool,
+    pub indexing_enabled: bool,
+    pub recall_enabled: bool,
+    pub default_prompt_chars: u32,
+    pub max_prompt_chars: u32,
+    pub max_hit_chars: u32,
+    pub default_max_candidates: u32,
+    pub max_candidate_work: u32,
+    pub max_segments: u32,
+    pub min_relevancy: f32,
+    pub min_results: u32,
+    pub snippet_chars: u32,
+    pub chunk_target_min_chars: u32,
+    pub chunk_target_max_chars: u32,
+    pub chunk_max_chars: u32,
+    pub max_chunks_per_item: u32,
+    pub index_batch_limit: u32,
+    pub retry_base_delay_secs: i64,
+    pub retry_max_delay_secs: i64,
+    pub max_attempts: i64,
+    pub near_capacity_percent: f64,
+}
+
+impl Default for GatewayThreadEpisodicSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            indexing_enabled: true,
+            recall_enabled: true,
+            default_prompt_chars: 2_400,
+            max_prompt_chars: 12_000,
+            max_hit_chars: 1_200,
+            default_max_candidates: 32,
+            max_candidate_work: 128,
+            max_segments: 16,
+            min_relevancy: 0.25,
+            min_results: 1,
+            snippet_chars: 360,
+            chunk_target_min_chars: 700,
+            chunk_target_max_chars: 1_200,
+            chunk_max_chars: 1_600,
+            max_chunks_per_item: 64,
+            index_batch_limit: 16,
+            retry_base_delay_secs: 30,
+            retry_max_delay_secs: 900,
+            max_attempts: 5,
+            near_capacity_percent: 90.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct GatewayThreadEpisodicSettingsUpdate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indexing_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recall_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_prompt_chars: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_prompt_chars: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_hit_chars: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_max_candidates: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_candidate_work: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_segments: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_relevancy: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_results: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet_chars: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_target_min_chars: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_target_max_chars: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_max_chars: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_chunks_per_item: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_batch_limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_base_delay_secs: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_max_delay_secs: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub near_capacity_percent: Option<f64>,
+}
+
+impl GatewayThreadEpisodicSettingsUpdate {
+    pub fn enabled(enabled: bool) -> Self {
+        Self {
+            enabled: Some(enabled),
+            ..Self::default()
         }
     }
 }
@@ -164,6 +276,8 @@ fn normalized_optional_model_selection_text(value: Option<&str>, max_len: usize)
 mod tests {
     use super::{
         GatewayGeneralSettings, GatewayGeneralSettingsUpdate, GatewayMemoryModelSelection,
+        GatewaySettingsSnapshot, GatewaySettingsUpdate, GatewayThreadEpisodicSettings,
+        GatewayThreadEpisodicSettingsUpdate,
     };
 
     #[test]
@@ -192,5 +306,63 @@ mod tests {
         let roundtrip: GatewayGeneralSettingsUpdate =
             serde_json::from_str(serialized.as_str()).expect("settings update should deserialize");
         assert_eq!(roundtrip, update);
+    }
+
+    #[test]
+    fn settings_snapshot_roundtrips_thread_episodic_settings() {
+        let snapshot = GatewaySettingsSnapshot {
+            general: GatewayGeneralSettings::default(),
+            memory: Default::default(),
+            thread_episodic: GatewayThreadEpisodicSettings {
+                enabled: true,
+                indexing_enabled: false,
+                recall_enabled: true,
+                default_prompt_chars: 1_000,
+                max_prompt_chars: 8_000,
+                max_hit_chars: 800,
+                default_max_candidates: 24,
+                max_candidate_work: 96,
+                max_segments: 8,
+                min_relevancy: 0.3,
+                min_results: 2,
+                snippet_chars: 280,
+                chunk_target_min_chars: 500,
+                chunk_target_max_chars: 900,
+                chunk_max_chars: 1_200,
+                max_chunks_per_item: 32,
+                index_batch_limit: 8,
+                retry_base_delay_secs: 10,
+                retry_max_delay_secs: 300,
+                max_attempts: 3,
+                near_capacity_percent: 85.0,
+            },
+        };
+
+        let serialized = serde_json::to_string(&snapshot).expect("snapshot should serialize");
+        assert!(serialized.contains("thread_episodic"));
+        assert!(serialized.contains("indexing_enabled"));
+
+        let roundtrip: GatewaySettingsSnapshot =
+            serde_json::from_str(serialized.as_str()).expect("snapshot should deserialize");
+        assert_eq!(roundtrip, snapshot);
+    }
+
+    #[test]
+    fn settings_update_roundtrips_partial_thread_episodic_settings() {
+        let update = GatewaySettingsUpdate {
+            thread_episodic: Some(GatewayThreadEpisodicSettingsUpdate {
+                enabled: Some(false),
+                recall_enabled: Some(false),
+                ..GatewayThreadEpisodicSettingsUpdate::default()
+            }),
+            ..GatewaySettingsUpdate::default()
+        };
+
+        let serialized = serde_json::to_string(&update).expect("settings update should serialize");
+        assert!(serialized.contains("thread_episodic"));
+
+        let roundtrip: GatewaySettingsUpdate =
+            serde_json::from_str(serialized.as_str()).expect("settings update should deserialize");
+        assert_eq!(roundtrip.thread_episodic, update.thread_episodic);
     }
 }

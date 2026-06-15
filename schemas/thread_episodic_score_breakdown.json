@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadEpisodicScoreBreakdown",
+  "type": "object",
+  "properties": {
+    "exact_source_boost": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "float"
+    },
+    "final_score": {
+      "type": "number",
+      "format": "float"
+    },
+    "lexical_score": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "float"
+    },
+    "memvid_score": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "float"
+    },
+    "recency_boost": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "float"
+    },
+    "semantic_score": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "float"
+    },
+    "source_role_boost": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "float"
+    },
+    "temporal_score": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "float"
+    }
+  },
+  "required": [
+    "final_score"
+  ]
+}

@@ -651,6 +651,17 @@
         "retry_attempt",
         "retry_with_backoff",
         "restart_turn",
+        "replay_durable_event",
+        "rehydrate_turn_state",
+        "open_next_execution_window",
+        "adapt_provider_request",
+        "refresh_provider_auth",
+        "compact_history",
+        "disable_streaming",
+        "disable_unsupported_capability",
+        "repair_artifact_finalization",
+        "requeue_task_dispatch",
+        "block_resumable",
         "fallback",
         "mark_failed"
       ]

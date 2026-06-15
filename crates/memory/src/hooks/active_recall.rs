@@ -7,6 +7,8 @@ const ACTIVE_RECALL_MAX_TARGETS: usize = 6;
 const ACTIVE_RECALL_MAX_DIAGNOSTICS: usize = 6;
 const ACTIVE_RECALL_MAX_DIAGNOSTIC_CHARS: usize = 160;
 const ACTIVE_RECALL_MAX_CANONICAL_KEY_CHARS: usize = 240;
+const ACTIVE_RECALL_THREAD_SUMMARY_MAX_SOURCE_IDS: usize = 8;
+const ACTIVE_RECALL_THREAD_SUMMARY_MAX_DIAGNOSTICS: usize = 8;
 pub(super) const ACTIVE_RECALL_INPUT_PREVIEW_MAX_CHARS: usize = 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,8 +69,15 @@ pub enum ActiveRecallMode {
     Profile,
     Project,
     Durable,
+    #[serde(alias = "current_threads")]
+    #[serde(alias = "current_thread_context")]
+    #[serde(alias = "thread_context")]
     CurrentThread,
+    #[serde(alias = "related_threads")]
     RelatedThread,
+    #[serde(alias = "workspace_threads")]
+    #[serde(alias = "workspace_thread_context")]
+    WorkspaceThread,
     CurrentTask,
     CompletedTask,
     ThreadEpisodic,
@@ -84,6 +93,7 @@ impl ActiveRecallMode {
             Self::Durable => "durable",
             Self::CurrentThread => "current_thread",
             Self::RelatedThread => "related_thread",
+            Self::WorkspaceThread => "workspace_thread",
             Self::CurrentTask => "current_task",
             Self::CompletedTask => "completed_task",
             Self::ThreadEpisodic => "thread_episodic",
@@ -102,8 +112,9 @@ impl ActiveRecallMode {
             Self::CurrentThread => 5,
             Self::ThreadEpisodic => 6,
             Self::RelatedThread => 7,
-            Self::CompletedTask => 8,
-            Self::Durable => 9,
+            Self::WorkspaceThread => 8,
+            Self::CompletedTask => 9,
+            Self::Durable => 10,
         }
     }
 
@@ -115,6 +126,7 @@ impl ActiveRecallMode {
             Self::ExactCanonical => Some(MemoryRecallMode::ExactCanonical),
             Self::CurrentThread
             | Self::RelatedThread
+            | Self::WorkspaceThread
             | Self::CurrentTask
             | Self::CompletedTask
             | Self::ThreadEpisodic
@@ -128,6 +140,7 @@ impl ActiveRecallMode {
                 Some(MemoryEpisodicRecallSourceKind::CurrentThread)
             }
             Self::RelatedThread => Some(MemoryEpisodicRecallSourceKind::RelatedThread),
+            Self::WorkspaceThread => Some(MemoryEpisodicRecallSourceKind::WorkspaceThread),
             Self::CurrentTask | Self::TaskContext => {
                 Some(MemoryEpisodicRecallSourceKind::CurrentTask)
             }
@@ -527,6 +540,7 @@ async fn execute_episodic_active_recall_mode(
                 provider.recall_current_thread(MemoryCurrentThreadRecallRequest {
                     workspace_id: context.workspace_id.clone(),
                     thread_id: context.thread_id.clone(),
+                    turn_id: context.turn_id.clone(),
                     query: query.to_owned(),
                     targets,
                     top_k: request.budget.top_k,
@@ -539,6 +553,20 @@ async fn execute_episodic_active_recall_mode(
             tokio::time::timeout(
                 timeout,
                 provider.recall_related_threads(MemoryRelatedThreadRecallRequest {
+                    workspace_id: context.workspace_id.clone(),
+                    current_thread_id: context.thread_id.clone(),
+                    query: query.to_owned(),
+                    targets,
+                    top_k: request.budget.top_k,
+                    max_chars: request.budget.max_chars,
+                }),
+            )
+            .await
+        }
+        MemoryEpisodicRecallSourceKind::WorkspaceThread => {
+            tokio::time::timeout(
+                timeout,
+                provider.recall_workspace_threads(MemoryWorkspaceThreadRecallRequest {
                     workspace_id: context.workspace_id.clone(),
                     current_thread_id: context.thread_id.clone(),
                     query: query.to_owned(),
@@ -822,7 +850,7 @@ pub(super) fn active_recall_debug_audit_contribution(
     deterministic: &DeterministicRecallContextSummary,
     execution: &ActiveRecallExecutionResult,
     dedup: Option<&ActiveRecallDedupResult>,
-    synthesis: Option<&MemoryRecallSynthesis>,
+    synthesis: Option<&MemoryActiveSynthesisOutput>,
 ) -> HookContribution {
     let mut details = BTreeMap::new();
     details.insert(
@@ -1034,6 +1062,7 @@ fn active_recall_mode_skip_reason(
         ActiveRecallMode::ThreadEpisodic
         | ActiveRecallMode::CurrentThread
         | ActiveRecallMode::RelatedThread
+        | ActiveRecallMode::WorkspaceThread
             if context.thread_id.trim().is_empty() =>
         {
             Some("missing_thread_context".to_owned())
@@ -1230,6 +1259,7 @@ fn episodic_rank_score(
         ActiveRecallMode::CurrentTask | ActiveRecallMode::TaskContext => 0.08,
         ActiveRecallMode::CurrentThread | ActiveRecallMode::ThreadEpisodic => 0.07,
         ActiveRecallMode::RelatedThread => 0.03,
+        ActiveRecallMode::WorkspaceThread => 0.01,
         ActiveRecallMode::CompletedTask => 0.02,
         _ => 0.0,
     };
@@ -1283,6 +1313,7 @@ pub(super) struct ActiveRecallPlannerInput {
     pub(super) has_workspace_context: bool,
     pub(super) has_task_context: bool,
     pub(super) episodic_capabilities: MemoryEpisodicRecallCapabilities,
+    pub(super) thread_episodic: MemoryActiveRecallThreadEpisodicSummary,
 }
 
 pub(super) fn active_recall_planner_input(
@@ -1292,6 +1323,7 @@ pub(super) fn active_recall_planner_input(
     config: &MemoryActiveRecallConfig,
     deterministic: &DeterministicRecallContextSummary,
     episodic_capabilities: MemoryEpisodicRecallCapabilities,
+    thread_episodic: MemoryActiveRecallThreadEpisodicSummary,
 ) -> ActiveRecallPlannerInput {
     let input_text_char_count = input.input_text.chars().count();
     let deterministic_memory_ids = deterministic.memory_ids.iter().cloned().collect::<Vec<_>>();
@@ -1329,6 +1361,74 @@ pub(super) fn active_recall_planner_input(
             .as_ref()
             .is_some_and(|task_id| !task_id.trim().is_empty()),
         episodic_capabilities,
+        thread_episodic,
+    }
+}
+
+pub fn active_recall_thread_episodic_summary(
+    prompt_context_set: &pioneer_hooks::HookPromptContextSet,
+    context: &MemoryTurnContext,
+    capabilities: &MemoryEpisodicRecallCapabilities,
+) -> MemoryActiveRecallThreadEpisodicSummary {
+    let current_thread_id_present = !context.thread_id.trim().is_empty();
+    let mut source_ids = BTreeSet::new();
+    let mut prompt_context_source_count = 0usize;
+    let mut prompt_context_chars = 0usize;
+    for entry in prompt_context_set.entries() {
+        if entry.contribution_id.as_str() != MEMORY_THREAD_CONTEXT_CONTRIBUTION_ID {
+            continue;
+        }
+        prompt_context_chars += entry.content.as_str().chars().count();
+        for source_ref in &entry.source_refs {
+            prompt_context_source_count += 1;
+            if source_ref.id.as_str().starts_with("thread:") {
+                source_ids.insert(source_ref.id.as_str().to_owned());
+            }
+        }
+        source_ids.extend(rendered_thread_source_ids(entry.content.as_str()));
+    }
+    if prompt_context_source_count == 0 {
+        prompt_context_source_count = source_ids.len();
+    }
+
+    let mut diagnostics = Vec::new();
+    if current_thread_id_present && capabilities.current_thread_search {
+        diagnostics.push("current_thread_recall_available".to_owned());
+    }
+    if capabilities.related_thread_search {
+        diagnostics.push("related_thread_recall_available".to_owned());
+    }
+    if capabilities.workspace_thread_search {
+        diagnostics.push("workspace_thread_recall_available".to_owned());
+    }
+    if prompt_context_source_count > 0 || !source_ids.is_empty() {
+        diagnostics.push("thread_prompt_context_present".to_owned());
+    }
+    if !current_thread_id_present {
+        diagnostics.push("thread_id_missing".to_owned());
+    }
+    if source_ids.len() > ACTIVE_RECALL_THREAD_SUMMARY_MAX_SOURCE_IDS {
+        diagnostics.push("thread_source_ids_truncated".to_owned());
+    }
+
+    MemoryActiveRecallThreadEpisodicSummary {
+        current_thread_id_present,
+        current_thread_recall_available: current_thread_id_present
+            && capabilities.current_thread_search,
+        related_thread_recall_available: capabilities.related_thread_search,
+        workspace_thread_recall_available: capabilities.workspace_thread_search,
+        prompt_context_source_count,
+        prompt_context_chars,
+        source_ids: source_ids
+            .into_iter()
+            .take(ACTIVE_RECALL_THREAD_SUMMARY_MAX_SOURCE_IDS)
+            .collect(),
+        diagnostics: normalize_active_recall_diagnostics(
+            diagnostics
+                .into_iter()
+                .take(ACTIVE_RECALL_THREAD_SUMMARY_MAX_DIAGNOSTICS)
+                .collect(),
+        ),
     }
 }
 
@@ -1401,6 +1501,10 @@ pub(super) fn deterministic_active_recall_plan(
         modes.push(ActiveRecallMode::CurrentTask);
         modes.push(ActiveRecallMode::TaskContext);
         diagnostics.push("structured_task_context_available".to_owned());
+    }
+    if input.thread_episodic.current_thread_recall_available && input.deterministic_recall_empty {
+        modes.push(ActiveRecallMode::CurrentThread);
+        diagnostics.push("structured_thread_context_available".to_owned());
     }
     if input.has_workspace_context && input.deterministic_recall_empty {
         modes.push(ActiveRecallMode::Project);
@@ -1483,6 +1587,7 @@ pub(super) fn normalize_active_recall_plan_for_input(
             ActiveRecallMode::ThreadEpisodic
             | ActiveRecallMode::CurrentThread
             | ActiveRecallMode::RelatedThread
+            | ActiveRecallMode::WorkspaceThread
                 if input.thread_id.trim().is_empty() =>
             {
                 Some("dropped_mode=thread_episodic:no_thread_context")
@@ -1500,6 +1605,16 @@ pub(super) fn normalize_active_recall_plan_for_input(
                     .supports_source(MemoryEpisodicRecallSourceKind::RelatedThread) =>
             {
                 Some("dropped_mode=related_thread:capability_unavailable")
+            }
+            ActiveRecallMode::WorkspaceThread if !input.has_workspace_context => {
+                Some("dropped_mode=workspace_thread:no_workspace_context")
+            }
+            ActiveRecallMode::WorkspaceThread
+                if !input
+                    .episodic_capabilities
+                    .supports_source(MemoryEpisodicRecallSourceKind::WorkspaceThread) =>
+            {
+                Some("dropped_mode=workspace_thread:capability_unavailable")
             }
             ActiveRecallMode::CompletedTask
                 if !input
@@ -1583,6 +1698,9 @@ pub(super) fn active_recall_available_mode_names(input: &ActiveRecallPlannerInpu
     }
     if input.episodic_capabilities.related_thread_search {
         modes.push(ActiveRecallMode::RelatedThread);
+    }
+    if input.episodic_capabilities.workspace_thread_search {
+        modes.push(ActiveRecallMode::WorkspaceThread);
     }
     if input.has_task_context && input.episodic_capabilities.current_task_context {
         modes.push(ActiveRecallMode::CurrentTask);
@@ -1972,6 +2090,7 @@ fn hook_value_source_boundary_counts(result: &ActiveRecallExecutionResult) -> Ho
     let mut durable = 0usize;
     let mut current_thread = 0usize;
     let mut related_thread = 0usize;
+    let mut workspace_thread = 0usize;
     let mut current_task = 0usize;
     let mut completed_task = 0usize;
     for mode_result in &result.mode_results {
@@ -1981,6 +2100,7 @@ fn hook_value_source_boundary_counts(result: &ActiveRecallExecutionResult) -> Ho
                 MemoryEpisodicRecallSourceKind::CurrentThread
                 | MemoryEpisodicRecallSourceKind::TranscriptSummary => current_thread += 1,
                 MemoryEpisodicRecallSourceKind::RelatedThread => related_thread += 1,
+                MemoryEpisodicRecallSourceKind::WorkspaceThread => workspace_thread += 1,
                 MemoryEpisodicRecallSourceKind::CurrentTask => current_task += 1,
                 MemoryEpisodicRecallSourceKind::CompletedTask => completed_task += 1,
             }
@@ -1990,6 +2110,7 @@ fn hook_value_source_boundary_counts(result: &ActiveRecallExecutionResult) -> Ho
         ("durable_memory", durable),
         ("current_thread", current_thread),
         ("related_thread", related_thread),
+        ("workspace_thread", workspace_thread),
         ("current_task", current_task),
         ("completed_task", completed_task),
     ])
@@ -2195,16 +2316,53 @@ pub(super) fn active_memory_context_lines(content: &str) -> Vec<&str> {
 
 pub(super) fn rendered_memory_line_id(line: &str) -> Option<String> {
     let line = line.trim();
-    let metadata = line.strip_prefix("- [")?;
-    let end = metadata
-        .char_indices()
-        .find_map(|(index, ch)| (ch == ',' || ch == ']').then_some(index))?;
-    let memory_id = metadata[..end].trim();
-    if memory_id.is_empty() {
-        None
-    } else {
-        Some(memory_id.to_owned())
+    if let Some(metadata) = line.strip_prefix("- [") {
+        let end = metadata
+            .char_indices()
+            .find_map(|(index, ch)| (ch == ',' || ch == ']').then_some(index))?;
+        let memory_id = metadata[..end].trim();
+        if !memory_id.is_empty() {
+            return Some(
+                memory_id
+                    .strip_prefix("memory:")
+                    .unwrap_or(memory_id)
+                    .to_owned(),
+            );
+        }
     }
+
+    let mut remaining = line;
+    while let Some(index) = remaining.find("memory:") {
+        let candidate = &remaining[index + "memory:".len()..];
+        let memory_id = candidate
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(*ch, '_' | '-' | '.'))
+            .collect::<String>();
+        if !memory_id.is_empty() {
+            return Some(memory_id);
+        }
+        remaining = candidate;
+    }
+    None
+}
+
+fn rendered_thread_source_ids(content: &str) -> BTreeSet<String> {
+    let mut ids = BTreeSet::new();
+    for line in content.lines() {
+        let mut remaining = line;
+        while let Some(index) = remaining.find("thread:") {
+            let candidate = &remaining[index..];
+            let source_id = candidate
+                .chars()
+                .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(*ch, ':' | '_' | '-' | '/'))
+                .collect::<String>();
+            if source_id.len() > "thread:".len() && source_id.matches('/').count() >= 2 {
+                ids.insert(source_id.clone());
+            }
+            remaining = &candidate[source_id.len()..];
+        }
+    }
+    ids
 }
 
 pub(super) fn rendered_line_fingerprint(line: &str) -> Option<String> {
@@ -2235,9 +2393,10 @@ pub(super) fn memory_active_recall_prompt_context_contribution(
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct ActiveMemoryRecallPromptContextContributionResult {
     pub(super) contribution: Option<PromptContextContribution>,
-    pub(super) synthesis: MemoryRecallSynthesis,
+    pub(super) synthesis: MemoryActiveSynthesisOutput,
 }
 
+#[cfg(test)]
 pub(super) fn memory_active_recall_prompt_context_contribution_with_synthesis(
     items: Vec<MemoryRecallItem>,
     snapshot_truncated: bool,
@@ -2245,10 +2404,29 @@ pub(super) fn memory_active_recall_prompt_context_contribution_with_synthesis(
     deterministic_line_fingerprints: BTreeSet<String>,
     config: &MemoryActiveRecallConfig,
 ) -> ActiveMemoryRecallPromptContextContributionResult {
-    let synthesis = MemoryRecallSynthesizer::synthesize(MemoryRecallSynthesisInput::active(
+    let active_dedup = dedup_active_recall_items_with_lines(
         items,
-        deterministic_memory_ids,
-        deterministic_line_fingerprints,
+        &deterministic_memory_ids,
+        &deterministic_line_fingerprints,
+    );
+    memory_active_recall_multi_source_prompt_context_contribution_with_synthesis(
+        active_dedup.items,
+        Vec::new(),
+        snapshot_truncated,
+        config,
+    )
+}
+
+pub(super) fn memory_active_recall_multi_source_prompt_context_contribution_with_synthesis(
+    items: Vec<MemoryRecallItem>,
+    thread_items: Vec<MemoryEpisodicRecallItem>,
+    snapshot_truncated: bool,
+    config: &MemoryActiveRecallConfig,
+) -> ActiveMemoryRecallPromptContextContributionResult {
+    let synthesis = synthesize_active_memory_context(ordered_active_synthesis_input(
+        items,
+        thread_items,
+        Vec::new(),
         MemoryRecallSynthesisBudget::for_active_config(config),
     ));
     let content = synthesis.rendered_text();
@@ -2265,7 +2443,7 @@ pub(super) fn memory_active_recall_prompt_context_contribution_with_synthesis(
         priority: 490,
         content,
         max_chars: Some(config.max_prompt_chars),
-        source_refs: synthesis.source_refs.clone(),
+        source_refs: active_synthesis_source_refs(&synthesis),
         diagnostics: hook_diagnostics_from_strings(synthesis.diagnostics.as_slice()),
         truncated: snapshot_truncated || synthesis.truncated,
     };
@@ -2280,24 +2458,48 @@ pub(super) fn memory_episodic_recall_prompt_context_contributions(
     snapshot_truncated: bool,
     config: &MemoryActiveRecallConfig,
 ) -> Vec<PromptContextContribution> {
-    let (thread_items, task_items): (Vec<_>, Vec<_>) = items.into_iter().partition(|item| {
-        matches!(
-            item.provenance.source,
+    let mut current_thread_items = Vec::new();
+    let mut related_thread_items = Vec::new();
+    let mut workspace_thread_items = Vec::new();
+    let mut task_items = Vec::new();
+    for item in items {
+        match item.provenance.source {
             MemoryEpisodicRecallSourceKind::CurrentThread
-                | MemoryEpisodicRecallSourceKind::RelatedThread
-                | MemoryEpisodicRecallSourceKind::TranscriptSummary
-        )
-    });
+            | MemoryEpisodicRecallSourceKind::TranscriptSummary => current_thread_items.push(item),
+            MemoryEpisodicRecallSourceKind::RelatedThread => related_thread_items.push(item),
+            MemoryEpisodicRecallSourceKind::WorkspaceThread => workspace_thread_items.push(item),
+            MemoryEpisodicRecallSourceKind::CurrentTask
+            | MemoryEpisodicRecallSourceKind::CompletedTask => task_items.push(item),
+        }
+    }
     [
         episodic_prompt_context_contribution(
             MEMORY_THREAD_CONTEXT_CONTRIBUTION_ID,
+            "current_thread_context",
             480,
-            thread_items,
+            current_thread_items,
+            snapshot_truncated,
+            config.max_prompt_chars,
+        ),
+        episodic_prompt_context_contribution(
+            MEMORY_RELATED_THREAD_CONTEXT_CONTRIBUTION_ID,
+            "related_thread_context",
+            475,
+            related_thread_items,
+            snapshot_truncated,
+            config.max_prompt_chars,
+        ),
+        episodic_prompt_context_contribution(
+            MEMORY_WORKSPACE_THREAD_CONTEXT_CONTRIBUTION_ID,
+            "workspace_thread_context",
+            470,
+            workspace_thread_items,
             snapshot_truncated,
             config.max_prompt_chars,
         ),
         episodic_prompt_context_contribution(
             MEMORY_TASK_CONTEXT_CONTRIBUTION_ID,
+            "task_context",
             470,
             task_items,
             snapshot_truncated,
@@ -2311,6 +2513,7 @@ pub(super) fn memory_episodic_recall_prompt_context_contributions(
 
 fn episodic_prompt_context_contribution(
     contribution_id: &'static str,
+    domain: &'static str,
     priority: i32,
     items: Vec<MemoryEpisodicRecallItem>,
     snapshot_truncated: bool,
@@ -2352,7 +2555,7 @@ fn episodic_prompt_context_contribution(
     Some(PromptContextContribution {
         contribution_id: HookContributionId::new(contribution_id)
             .expect("static contribution id is valid"),
-        domain: memory_policy_domain(),
+        domain: HookDomain::new(domain).expect("static contribution domain is valid"),
         priority,
         content,
         max_chars: Some(max_chars),
@@ -2367,11 +2570,26 @@ fn episodic_prompt_line(item: &MemoryEpisodicRecallItem, max_chars: usize) -> Op
     let source = match item.provenance.source {
         MemoryEpisodicRecallSourceKind::CurrentThread => "current thread",
         MemoryEpisodicRecallSourceKind::RelatedThread => "related thread",
+        MemoryEpisodicRecallSourceKind::WorkspaceThread => "workspace thread",
         MemoryEpisodicRecallSourceKind::TranscriptSummary => "thread summary",
         MemoryEpisodicRecallSourceKind::CurrentTask => "current task",
         MemoryEpisodicRecallSourceKind::CompletedTask => "completed task",
     };
     let boundary = item.provenance.boundary.as_str().replace('_', " ");
+    let id = item.id.trim();
+    if id.starts_with("thread:")
+        && matches!(
+            item.provenance.source,
+            MemoryEpisodicRecallSourceKind::CurrentThread
+                | MemoryEpisodicRecallSourceKind::RelatedThread
+                | MemoryEpisodicRecallSourceKind::WorkspaceThread
+                | MemoryEpisodicRecallSourceKind::TranscriptSummary
+        )
+    {
+        return Some(format!(
+            "- [{id}, source={source}, boundary={boundary}]: {content}"
+        ));
+    }
     Some(format!("- {source} {boundary}: {content}"))
 }
 
@@ -2382,8 +2600,9 @@ fn episodic_source_ref(item: &MemoryEpisodicRecallItem) -> Option<HookSourceRef>
     }
     let kind = match item.provenance.source {
         MemoryEpisodicRecallSourceKind::CurrentThread
-        | MemoryEpisodicRecallSourceKind::RelatedThread
-        | MemoryEpisodicRecallSourceKind::TranscriptSummary => "thread_context",
+        | MemoryEpisodicRecallSourceKind::TranscriptSummary => "current_thread_context",
+        MemoryEpisodicRecallSourceKind::RelatedThread => "related_thread_context",
+        MemoryEpisodicRecallSourceKind::WorkspaceThread => "workspace_thread_context",
         MemoryEpisodicRecallSourceKind::CurrentTask
         | MemoryEpisodicRecallSourceKind::CompletedTask => "task_context",
     };

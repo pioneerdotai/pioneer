@@ -646,6 +646,10 @@ default = "डिफ़ॉल्ट"
 select_model = "मॉडल चुनें"
 dialog_title = "Preflight मॉडल चुनें"
 
+[settings.memory.thread_context]
+label = "थ्रेड संदर्भ"
+description = "Pioneer को वर्तमान थ्रेड से उपयोगी संदर्भ इंडेक्स और स्मरण करने दें."
+
 [settings.memory]
 title = "मेमोरी"
 description = "Pioneer टिकाऊ मेमोरी का उपयोग कैसे करता है, इसे नियंत्रित करें."

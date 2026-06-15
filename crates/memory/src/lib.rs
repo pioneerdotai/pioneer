@@ -16,6 +16,7 @@ mod ranking;
 mod recall;
 mod recall_visibility;
 mod service;
+mod thread_episodic;
 mod write;
 
 pub use backend::{
@@ -62,4 +63,20 @@ pub use recall::{
     MemoryRecallParams, MemoryRecallResponse, MemoryRecallTarget,
 };
 pub use service::MemoryService;
+pub use thread_episodic::{
+    MemvidThreadEpisodicBackend, PioneerAdaptiveCutoff, PioneerAdaptiveCutoffConfig,
+    PioneerAdaptiveCutoffDiagnostics, PioneerAdaptiveCutoffReason,
+    ThreadEpisodicAdaptiveRetrievalImplementation, ThreadEpisodicCandidateSuppression,
+    ThreadEpisodicCandidateSuppressionReason, ThreadEpisodicExactSourceTarget,
+    ThreadEpisodicFilteredSearchCandidates, ThreadEpisodicMemvidBackend,
+    ThreadEpisodicMemvidBackendCapabilities, ThreadEpisodicMemvidCapabilityState,
+    ThreadEpisodicMemvidError, ThreadEpisodicMemvidFailureKind, ThreadEpisodicMemvidFeatureAudit,
+    ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidIndexRequest,
+    ThreadEpisodicMemvidSearchHit, ThreadEpisodicMemvidSearchOutput,
+    ThreadEpisodicMemvidSearchRequest, ThreadEpisodicMemvidSearchSegment,
+    ThreadEpisodicMemvidStats, ThreadEpisodicRankedSearchHit, ThreadEpisodicRankingContext,
+    ThreadEpisodicSearchDiagnostics, ThreadEpisodicSearchProfile, ThreadEpisodicSearchProfileKind,
+    filter_thread_episodic_search_candidates, rank_thread_episodic_search_hits,
+    thread_episodic_memvid_metadata, thread_episodic_storage_uri_from_path,
+};
 pub use write::{build_memory_canonical_key, semantic_memory_fingerprint};

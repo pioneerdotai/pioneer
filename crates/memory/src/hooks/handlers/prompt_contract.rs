@@ -60,15 +60,7 @@ impl HookHandler for MemoryPromptContractHook {
         }
 
         let available_tool_names = memory_tool_names_from_prompt_compile_input(input);
-        if available_tool_names.is_empty() {
-            let mut response = HookHandlerResponse::default();
-            response.diagnostics.push(memory_safe_info_diagnostic(
-                "memory.prompt_omitted",
-                "memory prompt contract skipped: no visible memory tools",
-            ));
-            return Ok(response);
-        }
-
+        let no_available_memory_tools = available_tool_names.is_empty();
         let Some(prompt_policy) = policy.recall_prompt_policy() else {
             return Ok(HookHandlerResponse::default());
         };
@@ -77,12 +69,13 @@ impl HookHandler for MemoryPromptContractHook {
             prompt_policy,
         );
         let mut response = HookHandlerResponse::default();
-        if let Some(contribution) = memory_recall_prompt_section_contribution_from_context(
+        let contributions = memory_prompt_section_contributions_from_context(
             available_tool_names,
             prompt_policy,
             recall_context.clone(),
             recall_context.truncated,
-        ) {
+        );
+        if !contributions.is_empty() {
             response.diagnostics.push(memory_safe_info_diagnostic(
                 "memory.prompt_rendered",
                 format!(
@@ -95,7 +88,12 @@ impl HookHandler for MemoryPromptContractHook {
             response
                 .diagnostics
                 .push(memory_prompt_recall_dedup_diagnostic(&recall_context));
-            response.contributions.push(contribution);
+            response.contributions.extend(contributions);
+        } else if no_available_memory_tools {
+            response.diagnostics.push(memory_safe_info_diagnostic(
+                "memory.prompt_omitted",
+                "memory prompt contract skipped: no visible memory tools",
+            ));
         }
         Ok(response)
     }

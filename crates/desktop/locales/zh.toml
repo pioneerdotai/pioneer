@@ -646,6 +646,10 @@ default = "默认"
 select_model = "选择模型"
 dialog_title = "选择 Preflight 模型"
 
+[settings.memory.thread_context]
+label = "线程上下文"
+description = "允许 Pioneer 索引并回忆当前线程中的有用上下文。"
+
 [settings.memory]
 title = "记忆"
 description = "控制 Pioneer 如何使用持久记忆。"

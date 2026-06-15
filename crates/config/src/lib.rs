@@ -55,6 +55,8 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub memory: GatewayMemoryConfig,
     #[serde(default)]
+    pub thread_episodic: GatewayThreadEpisodicConfig,
+    #[serde(default)]
     pub hooks: GatewayHooksConfig,
     #[serde(default)]
     pub artifacts: GatewayArtifactsConfig,
@@ -353,6 +355,101 @@ impl GatewayMemoryConfig {
         let capsules_dir =
             normalize_runtime_dir_path(self.capsules_dir.as_str(), "gateway.memory.capsules_dir")?;
         Ok(runtime_home.join(capsules_dir))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct GatewayThreadEpisodicConfig {
+    /// Enables the thread-local episodic context subsystem.
+    #[serde(default = "default_gateway_thread_episodic_enabled")]
+    pub enabled: bool,
+    /// Enables indexing of committed visible thread items.
+    #[serde(default = "default_gateway_thread_episodic_indexing_enabled")]
+    pub indexing_enabled: bool,
+    /// Enables pre-prompt current-thread recall hook contributions.
+    #[serde(default = "default_gateway_thread_episodic_recall_enabled")]
+    pub recall_enabled: bool,
+    /// Default prompt budget used by current-thread recall.
+    #[serde(default = "default_gateway_thread_episodic_prompt_chars")]
+    pub default_prompt_chars: u32,
+    /// Hard cap for per-turn thread context prompt budget.
+    #[serde(default = "default_gateway_thread_episodic_max_prompt_chars")]
+    pub max_prompt_chars: u32,
+    /// Maximum chars per hydrated hit.
+    #[serde(default = "default_gateway_thread_episodic_max_hit_chars")]
+    pub max_hit_chars: usize,
+    /// Default candidate count requested from the search backend.
+    #[serde(default = "default_gateway_thread_episodic_max_candidates")]
+    pub default_max_candidates: u32,
+    /// Hard cap for backend candidate work.
+    #[serde(default = "default_gateway_thread_episodic_max_candidate_work")]
+    pub max_candidate_work: u32,
+    /// Maximum current-thread segments searched per recall.
+    #[serde(default = "default_gateway_thread_episodic_max_segments")]
+    pub max_segments: u64,
+    /// Adaptive retrieval minimum relevancy cutoff.
+    #[serde(default = "default_gateway_thread_episodic_min_relevancy")]
+    pub min_relevancy: f32,
+    /// Adaptive retrieval minimum result count.
+    #[serde(default = "default_gateway_thread_episodic_min_results")]
+    pub min_results: u32,
+    /// Snippet chars requested from memvid search.
+    #[serde(default = "default_gateway_thread_episodic_snippet_chars")]
+    pub snippet_chars: u32,
+    /// Chunking lower target.
+    #[serde(default = "default_gateway_thread_episodic_chunk_target_min_chars")]
+    pub chunk_target_min_chars: usize,
+    /// Chunking upper target.
+    #[serde(default = "default_gateway_thread_episodic_chunk_target_max_chars")]
+    pub chunk_target_max_chars: usize,
+    /// Hard chunk size cap.
+    #[serde(default = "default_gateway_thread_episodic_chunk_max_chars")]
+    pub chunk_max_chars: usize,
+    /// Maximum chunks emitted for one source item.
+    #[serde(default = "default_gateway_thread_episodic_max_chunks_per_item")]
+    pub max_chunks_per_item: usize,
+    /// Index worker batch limit.
+    #[serde(default = "default_gateway_thread_episodic_index_batch_limit")]
+    pub index_batch_limit: u64,
+    /// Base retry delay for retryable index failures.
+    #[serde(default = "default_gateway_thread_episodic_retry_base_delay_secs")]
+    pub retry_base_delay_secs: i64,
+    /// Max retry delay for retryable index failures.
+    #[serde(default = "default_gateway_thread_episodic_retry_max_delay_secs")]
+    pub retry_max_delay_secs: i64,
+    /// Max retry attempts before terminal failure.
+    #[serde(default = "default_gateway_thread_episodic_max_attempts")]
+    pub max_attempts: i64,
+    /// Segment rotation threshold based on memvid utilization stats.
+    #[serde(default = "default_gateway_thread_episodic_near_capacity_percent")]
+    pub near_capacity_percent: f64,
+}
+
+impl Default for GatewayThreadEpisodicConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_gateway_thread_episodic_enabled(),
+            indexing_enabled: default_gateway_thread_episodic_indexing_enabled(),
+            recall_enabled: default_gateway_thread_episodic_recall_enabled(),
+            default_prompt_chars: default_gateway_thread_episodic_prompt_chars(),
+            max_prompt_chars: default_gateway_thread_episodic_max_prompt_chars(),
+            max_hit_chars: default_gateway_thread_episodic_max_hit_chars(),
+            default_max_candidates: default_gateway_thread_episodic_max_candidates(),
+            max_candidate_work: default_gateway_thread_episodic_max_candidate_work(),
+            max_segments: default_gateway_thread_episodic_max_segments(),
+            min_relevancy: default_gateway_thread_episodic_min_relevancy(),
+            min_results: default_gateway_thread_episodic_min_results(),
+            snippet_chars: default_gateway_thread_episodic_snippet_chars(),
+            chunk_target_min_chars: default_gateway_thread_episodic_chunk_target_min_chars(),
+            chunk_target_max_chars: default_gateway_thread_episodic_chunk_target_max_chars(),
+            chunk_max_chars: default_gateway_thread_episodic_chunk_max_chars(),
+            max_chunks_per_item: default_gateway_thread_episodic_max_chunks_per_item(),
+            index_batch_limit: default_gateway_thread_episodic_index_batch_limit(),
+            retry_base_delay_secs: default_gateway_thread_episodic_retry_base_delay_secs(),
+            retry_max_delay_secs: default_gateway_thread_episodic_retry_max_delay_secs(),
+            max_attempts: default_gateway_thread_episodic_max_attempts(),
+            near_capacity_percent: default_gateway_thread_episodic_near_capacity_percent(),
+        }
     }
 }
 
@@ -1147,6 +1244,90 @@ const fn default_gateway_memory_proactive_writes_enabled() -> bool {
 
 const fn default_gateway_memory_background_extraction_enabled() -> bool {
     true
+}
+
+const fn default_gateway_thread_episodic_enabled() -> bool {
+    true
+}
+
+const fn default_gateway_thread_episodic_indexing_enabled() -> bool {
+    true
+}
+
+const fn default_gateway_thread_episodic_recall_enabled() -> bool {
+    true
+}
+
+const fn default_gateway_thread_episodic_prompt_chars() -> u32 {
+    2_400
+}
+
+const fn default_gateway_thread_episodic_max_prompt_chars() -> u32 {
+    12_000
+}
+
+const fn default_gateway_thread_episodic_max_hit_chars() -> usize {
+    1_200
+}
+
+const fn default_gateway_thread_episodic_max_candidates() -> u32 {
+    32
+}
+
+const fn default_gateway_thread_episodic_max_candidate_work() -> u32 {
+    128
+}
+
+const fn default_gateway_thread_episodic_max_segments() -> u64 {
+    16
+}
+
+const fn default_gateway_thread_episodic_min_relevancy() -> f32 {
+    0.25
+}
+
+const fn default_gateway_thread_episodic_min_results() -> u32 {
+    1
+}
+
+const fn default_gateway_thread_episodic_snippet_chars() -> u32 {
+    360
+}
+
+const fn default_gateway_thread_episodic_chunk_target_min_chars() -> usize {
+    700
+}
+
+const fn default_gateway_thread_episodic_chunk_target_max_chars() -> usize {
+    1_200
+}
+
+const fn default_gateway_thread_episodic_chunk_max_chars() -> usize {
+    1_600
+}
+
+const fn default_gateway_thread_episodic_max_chunks_per_item() -> usize {
+    64
+}
+
+const fn default_gateway_thread_episodic_index_batch_limit() -> u64 {
+    16
+}
+
+const fn default_gateway_thread_episodic_retry_base_delay_secs() -> i64 {
+    30
+}
+
+const fn default_gateway_thread_episodic_retry_max_delay_secs() -> i64 {
+    15 * 60
+}
+
+const fn default_gateway_thread_episodic_max_attempts() -> i64 {
+    5
+}
+
+const fn default_gateway_thread_episodic_near_capacity_percent() -> f64 {
+    90.0
 }
 
 fn normalized_optional_model_selection_text(
@@ -2520,6 +2701,27 @@ active_recall_model = { source = "custom", model_provider = "legacy-provider", m
                 .expect("memory capsules root should resolve"),
             PathBuf::from("/tmp/pioneer-runtime/memory/capsules")
         );
+        assert!(config.gateway.thread_episodic.enabled);
+        assert!(config.gateway.thread_episodic.indexing_enabled);
+        assert!(config.gateway.thread_episodic.recall_enabled);
+        assert_eq!(config.gateway.thread_episodic.default_prompt_chars, 2_400);
+        assert_eq!(config.gateway.thread_episodic.max_prompt_chars, 12_000);
+        assert_eq!(config.gateway.thread_episodic.max_hit_chars, 1_200);
+        assert_eq!(config.gateway.thread_episodic.default_max_candidates, 32);
+        assert_eq!(config.gateway.thread_episodic.max_candidate_work, 128);
+        assert_eq!(config.gateway.thread_episodic.max_segments, 16);
+        assert_eq!(config.gateway.thread_episodic.min_relevancy, 0.25);
+        assert_eq!(config.gateway.thread_episodic.min_results, 1);
+        assert_eq!(config.gateway.thread_episodic.snippet_chars, 360);
+        assert_eq!(config.gateway.thread_episodic.chunk_target_min_chars, 700);
+        assert_eq!(config.gateway.thread_episodic.chunk_target_max_chars, 1_200);
+        assert_eq!(config.gateway.thread_episodic.chunk_max_chars, 1_600);
+        assert_eq!(config.gateway.thread_episodic.max_chunks_per_item, 64);
+        assert_eq!(config.gateway.thread_episodic.index_batch_limit, 16);
+        assert_eq!(config.gateway.thread_episodic.retry_base_delay_secs, 30);
+        assert_eq!(config.gateway.thread_episodic.retry_max_delay_secs, 900);
+        assert_eq!(config.gateway.thread_episodic.max_attempts, 5);
+        assert_eq!(config.gateway.thread_episodic.near_capacity_percent, 90.0);
     }
 
     #[test]
@@ -2555,6 +2757,52 @@ active_recall_model = { source = "custom", model_provider = "legacy-provider", m
         assert!(config.proactive_writes_model.is_thread_model());
         assert!(!config.debug_trace_enabled);
         assert!(!config.strict_diagnostics_enabled);
+    }
+
+    #[test]
+    fn gateway_thread_episodic_config_defaults_match_runtime_contract() {
+        let config = super::GatewayThreadEpisodicConfig::default();
+
+        assert!(config.enabled);
+        assert!(config.indexing_enabled);
+        assert!(config.recall_enabled);
+        assert_eq!(config.default_prompt_chars, 2_400);
+        assert_eq!(config.max_prompt_chars, 12_000);
+        assert_eq!(config.max_hit_chars, 1_200);
+        assert_eq!(config.default_max_candidates, 32);
+        assert_eq!(config.max_candidate_work, 128);
+        assert_eq!(config.max_segments, 16);
+        assert_eq!(config.min_relevancy, 0.25);
+        assert_eq!(config.min_results, 1);
+        assert_eq!(config.snippet_chars, 360);
+        assert_eq!(config.chunk_target_min_chars, 700);
+        assert_eq!(config.chunk_target_max_chars, 1_200);
+        assert_eq!(config.chunk_max_chars, 1_600);
+        assert_eq!(config.max_chunks_per_item, 64);
+        assert_eq!(config.index_batch_limit, 16);
+        assert_eq!(config.retry_base_delay_secs, 30);
+        assert_eq!(config.retry_max_delay_secs, 900);
+        assert_eq!(config.max_attempts, 5);
+        assert_eq!(config.near_capacity_percent, 90.0);
+    }
+
+    #[test]
+    fn gateway_thread_episodic_config_deserializes_missing_fields_with_defaults() {
+        let config = toml::from_str::<super::GatewayThreadEpisodicConfig>(
+            r#"
+enabled = false
+default_prompt_chars = 1000
+"#,
+        )
+        .expect("gateway thread episodic config should deserialize with defaults");
+
+        assert!(!config.enabled);
+        assert!(config.indexing_enabled);
+        assert!(config.recall_enabled);
+        assert_eq!(config.default_prompt_chars, 1_000);
+        assert_eq!(config.max_prompt_chars, 12_000);
+        assert_eq!(config.index_batch_limit, 16);
+        assert_eq!(config.near_capacity_percent, 90.0);
     }
 
     #[test]

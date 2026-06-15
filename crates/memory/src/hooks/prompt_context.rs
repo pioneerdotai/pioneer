@@ -67,8 +67,10 @@ pub(super) fn memory_recall_context_from_prompt_context_set(
     let mut deterministic_ids = BTreeSet::new();
     let mut seen_line_fingerprints = BTreeSet::new();
     let mut active_ids = BTreeSet::new();
+    let mut consumed_thread_source_ids = BTreeSet::new();
+    let mut thread_line_fingerprints = BTreeSet::new();
     for entry in prompt_context_set.entries() {
-        if entry.domain.as_str() != MEMORY_POLICY_DOMAIN {
+        if !is_memory_prompt_context_entry(entry) {
             continue;
         }
         match entry.contribution_id.as_str() {
@@ -122,12 +124,20 @@ pub(super) fn memory_recall_context_from_prompt_context_set(
                         active_content.push('\n');
                     }
                     active_content.push_str(line);
+                    consumed_thread_source_ids.extend(rendered_thread_source_ids(line));
                     context.active_rendered_count += 1;
                     context.active_synthesis_rendered |= parsed_id.is_none();
                 }
             }
-            MEMORY_THREAD_CONTEXT_CONTRIBUTION_ID => {
-                append_prompt_context_entry(&mut thread_content, entry.content.as_str());
+            MEMORY_THREAD_CONTEXT_CONTRIBUTION_ID
+            | MEMORY_RELATED_THREAD_CONTEXT_CONTRIBUTION_ID
+            | MEMORY_WORKSPACE_THREAD_CONTEXT_CONTRIBUTION_ID => {
+                append_thread_prompt_context_entry(
+                    &mut thread_content,
+                    entry.content.as_str(),
+                    &mut consumed_thread_source_ids,
+                    &mut thread_line_fingerprints,
+                );
                 context.count += 1;
                 context.truncated |= entry.truncated;
             }
@@ -162,6 +172,17 @@ pub(super) fn memory_recall_context_from_prompt_context_set(
     context
 }
 
+fn is_memory_prompt_context_entry(entry: &pioneer_hooks::HookPromptContextEntry) -> bool {
+    entry.domain.as_str() == MEMORY_POLICY_DOMAIN
+        || matches!(
+            entry.contribution_id.as_str(),
+            MEMORY_THREAD_CONTEXT_CONTRIBUTION_ID
+                | MEMORY_RELATED_THREAD_CONTEXT_CONTRIBUTION_ID
+                | MEMORY_WORKSPACE_THREAD_CONTEXT_CONTRIBUTION_ID
+                | MEMORY_TASK_CONTEXT_CONTRIBUTION_ID
+        )
+}
+
 fn append_prompt_context_entry(output: &mut String, content: &str) {
     let content = content.trim();
     if content.is_empty() {
@@ -171,6 +192,56 @@ fn append_prompt_context_entry(output: &mut String, content: &str) {
         output.push('\n');
     }
     output.push_str(content);
+}
+
+fn append_thread_prompt_context_entry(
+    output: &mut String,
+    content: &str,
+    consumed_thread_source_ids: &mut BTreeSet<String>,
+    seen_line_fingerprints: &mut BTreeSet<String>,
+) {
+    for line in content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let source_ids = rendered_thread_source_ids(line);
+        if !source_ids.is_empty()
+            && source_ids
+                .iter()
+                .any(|source_id| consumed_thread_source_ids.contains(source_id))
+        {
+            continue;
+        }
+        let Some(fingerprint) = rendered_line_fingerprint(line) else {
+            continue;
+        };
+        if !seen_line_fingerprints.insert(fingerprint) {
+            continue;
+        }
+        consumed_thread_source_ids.extend(source_ids);
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(line);
+    }
+}
+
+fn rendered_thread_source_ids(line: &str) -> BTreeSet<String> {
+    let mut ids = BTreeSet::new();
+    let mut remaining = line;
+    while let Some(index) = remaining.find("thread:") {
+        let candidate = &remaining[index..];
+        let source_id = candidate
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(*ch, ':' | '_' | '-' | '/'))
+            .collect::<String>();
+        if source_id.len() > "thread:".len() && source_id.matches('/').count() >= 2 {
+            ids.insert(source_id.clone());
+        }
+        remaining = &candidate[source_id.len()..];
+    }
+    ids
 }
 
 pub(super) fn render_memory_manifest(manifest: &MemoryManifest) -> String {
@@ -235,39 +306,45 @@ pub(crate) fn memory_recall_prompt_input(
     }
 }
 
-pub(super) fn memory_recall_prompt_section_contribution_from_context(
+pub(super) fn memory_prompt_section_contributions_from_context(
     available_tool_names: Vec<String>,
     policy: MemoryRecallPromptPolicy,
     recall_context: MemoryRecallPromptContext,
     truncated: bool,
-) -> Option<HookContribution> {
-    memory_recall_prompt_section_contribution_from_input(MemoryRecallPromptInput {
-        available_tool_names,
-        policy,
-        recalled_items: Vec::new(),
-        recalled_context: recall_context
-            .deterministic_content
-            .as_deref()
-            .and_then(|content| {
+) -> Vec<HookContribution> {
+    let mut contributions = Vec::new();
+    if let Some(contribution) =
+        memory_recall_prompt_section_contribution_from_input(MemoryRecallPromptInput {
+            available_tool_names,
+            policy,
+            recalled_items: Vec::new(),
+            recalled_context: recall_context
+                .deterministic_content
+                .as_deref()
+                .and_then(|content| {
+                    MemoryRecallPromptContextBlock::from_text(content, recall_context.truncated)
+                }),
+            active_context: recall_context
+                .active_content
+                .as_deref()
+                .and_then(|content| {
+                    MemoryRecallPromptContextBlock::from_text(content, recall_context.truncated)
+                }),
+            thread_context: None,
+            task_context: recall_context.task_content.as_deref().and_then(|content| {
                 MemoryRecallPromptContextBlock::from_text(content, recall_context.truncated)
             }),
-        active_context: recall_context
-            .active_content
-            .as_deref()
-            .and_then(|content| {
-                MemoryRecallPromptContextBlock::from_text(content, recall_context.truncated)
-            }),
-        thread_context: recall_context
-            .thread_content
-            .as_deref()
-            .and_then(|content| {
-                MemoryRecallPromptContextBlock::from_text(content, recall_context.truncated)
-            }),
-        task_context: recall_context.task_content.as_deref().and_then(|content| {
-            MemoryRecallPromptContextBlock::from_text(content, recall_context.truncated)
-        }),
-        truncated: truncated || recall_context.truncated,
-    })
+            truncated: truncated || recall_context.truncated,
+        })
+    {
+        contributions.push(contribution);
+    }
+    if let Some(contribution) =
+        thread_context_prompt_section_contribution_from_context(&recall_context, truncated)
+    {
+        contributions.push(contribution);
+    }
+    contributions
 }
 
 pub(super) fn memory_recall_prompt_section_contribution_from_input(
@@ -287,6 +364,37 @@ pub(super) fn memory_recall_prompt_section_contribution_from_input(
         source_refs: Vec::new(),
         diagnostics: Vec::new(),
         truncated: false,
+    }))
+}
+
+fn thread_context_prompt_section_contribution_from_context(
+    recall_context: &MemoryRecallPromptContext,
+    truncated: bool,
+) -> Option<HookContribution> {
+    let context = recall_context
+        .thread_content
+        .as_deref()
+        .and_then(|content| {
+            MemoryRecallPromptContextBlock::from_text(content, recall_context.truncated)
+        })?;
+    let (prompt, section_truncated) =
+        render_thread_context_prompt(&context, truncated || recall_context.truncated)?;
+    Some(HookContribution::PromptSection(PromptSectionContribution {
+        contribution_id: HookContributionId::new(MEMORY_THREAD_CONTEXT_PROMPT_CONTRIBUTION_ID)
+            .expect("static contribution id is valid"),
+        section_id: HookSectionId::new(MEMORY_THREAD_CONTEXT_PROMPT_SECTION_ID)
+            .expect("static section id is valid"),
+        title: Some(
+            HookPromptSectionTitle::new(MEMORY_THREAD_CONTEXT_PROMPT_SECTION_TITLE)
+                .expect("static section title is valid"),
+        ),
+        domain: HookDomain::new("thread_context").expect("static domain is valid"),
+        priority: 490,
+        content: HookPromptContent::new(prompt).ok()?,
+        max_chars: None,
+        source_refs: Vec::new(),
+        diagnostics: Vec::new(),
+        truncated: section_truncated,
     }))
 }
 

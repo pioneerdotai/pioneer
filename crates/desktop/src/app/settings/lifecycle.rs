@@ -140,6 +140,27 @@ impl PioneerDesktop {
         self.apply_gateway_settings_update(plan.snapshot, plan.update, cx);
     }
 
+    pub(super) fn apply_thread_episodic_setting(
+        &mut self,
+        toggle: gateway_settings::ThreadEpisodicSettingToggle,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(current) = self.gateway.settings.as_ref() else {
+            self.refresh_gateway_settings(cx);
+            return;
+        };
+        let _ = toggle;
+        let Some(plan) =
+            gateway_settings::thread_episodic_enabled_update_plan(Some(current), enabled)
+        else {
+            self.refresh_gateway_settings(cx);
+            return;
+        };
+
+        self.apply_gateway_settings_update(plan.snapshot, plan.update, cx);
+    }
+
     pub(in crate::app) fn refresh_gateway_settings(&mut self, cx: &mut Context<Self>) {
         let plan = gateway_settings::plan_gateway_settings_refresh(
             self.gateway.settings_loading,
@@ -353,5 +374,24 @@ mod tests {
         assert!(memory_model_fn.contains("self.apply_gateway_memory_settings"));
         assert!(!memory_model_fn.contains("preflight_model"));
         assert!(!memory_model_fn.contains("ActiveRecall"));
+    }
+
+    #[test]
+    fn settings_thread_episodic_update_writes_thread_episodic_settings_only() {
+        let source = production_lifecycle_source();
+        let thread_episodic_fn = source
+            .split("pub(super) fn apply_thread_episodic_setting")
+            .nth(1)
+            .expect("thread episodic setting function exists")
+            .split("pub(in crate::app) fn refresh_gateway_settings")
+            .next()
+            .expect("thread episodic setting function body exists");
+
+        assert!(thread_episodic_fn.contains("thread_episodic_enabled_update_plan"));
+        assert!(thread_episodic_fn.contains("self.apply_gateway_settings_update"));
+        assert!(
+            !thread_episodic_fn.contains("settings_memory::gateway_settings_update_for_memory")
+        );
+        assert!(!thread_episodic_fn.contains("desktop-settings.toml"));
     }
 }

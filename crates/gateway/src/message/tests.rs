@@ -4,6 +4,10 @@ use crate::memory_runtime::GatewayMemoryRuntime;
 use crate::secrets::GatewaySecrets;
 use crate::session::SessionManager;
 use crate::thread::ThreadManager;
+use crate::thread_episodic::{
+    StoreThreadEpisodicIngestor, ThreadEpisodicCommittedItem, ThreadEpisodicIngestionOutcome,
+    ThreadEpisodicIngestor,
+};
 use crate::workspace::WorkspaceManager;
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -64,16 +68,17 @@ use pioneer_protocol::{
     TaskResultReviewResolutionStrategy, TaskResultReviewerKind, TaskResumeResponse,
     TaskRetryBackoffKind, TaskRetryPolicy, TaskReviseParams, TaskReviseResponse, TaskRun,
     TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind,
-    TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskThreadLineage, TaskTriggerInput,
-    TaskTriggerSpec, TaskTriggerStatus, TaskValue, TaskWaitParams, TaskWriteLockStatus, Thread,
-    ThreadAgentsDocArchiveResponse, ThreadAgentsDocGetResponse,
-    ThreadAgentsDocResolveForThreadResponse, ThreadAgentsDocSaveResponse, ThreadAgentsDocStatus,
-    ThreadClosedNotification, ThreadFolderCreateResponse, ThreadFolderDeleteResponse,
-    ThreadFolderMoveResponse, ThreadHistoryEventPayload, ThreadHistoryResponse, ThreadMode,
-    ThreadMoveResponse, ThreadOriginKind, ThreadSidebarVisibility, ThreadStartParams,
-    ThreadStartResponse, ThreadStatus, ThreadTreeResponse, ThreadUnsubscribeResponse,
-    ThreadUnsubscribeStatus, TimelineOriginKind, ToolCallStatus, ToolDisplayPayload, ToolMetadata,
-    ToolOutputPolicySnapshot, ToolResultView, ToolStoragePayload, Turn, TurnAcceptedCapability,
+    TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskStatus, TaskThreadLineage,
+    TaskTriggerInput, TaskTriggerKind, TaskTriggerSpec, TaskTriggerStatus, TaskTurnItem, TaskValue,
+    TaskWaitParams, TaskWriteLockStatus, Thread, ThreadAgentsDocArchiveResponse,
+    ThreadAgentsDocGetResponse, ThreadAgentsDocResolveForThreadResponse,
+    ThreadAgentsDocSaveResponse, ThreadAgentsDocStatus, ThreadClosedNotification,
+    ThreadFolderCreateResponse, ThreadFolderDeleteResponse, ThreadFolderMoveResponse,
+    ThreadHistoryEventPayload, ThreadHistoryResponse, ThreadMode, ThreadMoveResponse,
+    ThreadOriginKind, ThreadSidebarVisibility, ThreadStartParams, ThreadStartResponse,
+    ThreadStatus, ThreadTreeResponse, ThreadUnsubscribeResponse, ThreadUnsubscribeStatus,
+    TimelineOriginKind, ToolCallStatus, ToolDisplayPayload, ToolMetadata, ToolOutputPolicySnapshot,
+    ToolOutputSummary, ToolResultView, ToolStoragePayload, Turn, TurnAcceptedCapability,
     TurnCancelResponse, TurnCapabilityAcceptedReason, TurnCapabilityKind,
     TurnCapabilityRejectedReason, TurnCompletedNotification, TurnFailedNotification,
     TurnGetResponse, TurnItem, TurnItemEventPayload, TurnItemType, TurnKind, TurnOrigin,
@@ -102,9 +107,47 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Mutex as TokioMutex, Notify, mpsc};
 use tokio::time::{Duration, sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
+
+#[derive(Default)]
+struct RecordingThreadEpisodicIngestor {
+    calls: TokioMutex<Vec<ThreadEpisodicCommittedItem>>,
+    fail: bool,
+}
+
+#[async_trait]
+impl ThreadEpisodicIngestor for RecordingThreadEpisodicIngestor {
+    async fn ingest_committed_item(
+        &self,
+        item: ThreadEpisodicCommittedItem,
+    ) -> anyhow::Result<ThreadEpisodicIngestionOutcome> {
+        self.calls.lock().await.push(item);
+        if self.fail {
+            anyhow::bail!("forced thread episodic ingestion failure");
+        }
+        Ok(ThreadEpisodicIngestionOutcome::Accepted)
+    }
+}
+
+fn thread_episodic_committed_item(
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    item: TurnItem,
+) -> ThreadEpisodicCommittedItem {
+    ThreadEpisodicCommittedItem {
+        workspace_id: workspace_id.to_owned(),
+        thread_id: thread_id.to_owned(),
+        turn_id: turn_id.to_owned(),
+        item_id: item.item_id().to_owned(),
+        item_type: item.item_type(),
+        source_actor_role: crate::thread_episodic::committed_item_source_actor_role(&item),
+        source_context: crate::thread_episodic::committed_item_source_context(&item),
+        item,
+    }
+}
 
 #[test]
 fn terminal_failure_paths_stay_behind_recovery_gate() {
@@ -1905,6 +1948,7 @@ fn review_enabled_processor(
         std::env::temp_dir().join("pioneer-message-review-tests"),
         pioneer_config::GatewayArtifactsConfig::default(),
         review_enabled_task_runtime_config(),
+        crate::thread_episodic::ThreadEpisodicRuntimeConfig::default(),
     ))
 }
 
@@ -9398,6 +9442,10 @@ async fn direct_durable_item_completed_persists_before_committed_notification() 
         workspace_manager,
         crud_store.clone(),
     );
+    let ingestor = Arc::new(RecordingThreadEpisodicIngestor::default());
+    processor
+        .set_thread_episodic_ingestor_for_test(ingestor.clone())
+        .await;
 
     let thread_id = "thr_direct_durable_01";
     let turn_id = "turn_direct_durable_01";
@@ -9494,6 +9542,329 @@ async fn direct_durable_item_completed_persists_before_committed_notification() 
         )),
         "committed durable event must already be persisted in the read model"
     );
+
+    let calls = ingestor.calls.lock().await;
+    assert_eq!(calls.len(), 1);
+    let call = &calls[0];
+    assert_eq!(call.workspace_id, item_events.workspace_id);
+    assert_eq!(call.thread_id, thread_id);
+    assert_eq!(call.turn_id, turn_id);
+    assert_eq!(call.item_id, item_id);
+    assert_eq!(call.item_type, TurnItemType::AgentMessage);
+    assert_eq!(
+        call.source_context,
+        pioneer_protocol::ThreadEpisodicSourceContext::UserVisibleThreadItem
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_durable_item_completed_ingestion_failure_does_not_block_commit() {
+    let session_manager = Arc::new(SessionManager::new());
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let agent_manager = Arc::new(AgentManager::new(test_provider(), test_tool_loop_config()));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = MessageProcessor::with_agent_manager(
+        thread_manager.clone(),
+        agent_manager.clone(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+    );
+    let ingestor = Arc::new(RecordingThreadEpisodicIngestor {
+        calls: TokioMutex::new(Vec::new()),
+        fail: true,
+    });
+    processor
+        .set_thread_episodic_ingestor_for_test(ingestor.clone())
+        .await;
+
+    let thread_id = "thr_direct_durable_ingest_fail";
+    let turn_id = "turn_direct_durable_ingest_fail";
+    let item_id = "item_direct_durable_ingest_fail";
+
+    let thread_start = thread_manager
+        .system_thread_start_seeded(
+            workspace_id.clone(),
+            pioneer_protocol::ThreadStartParams {
+                thread_id: thread_id.to_owned(),
+                workspace_id: workspace_id.clone(),
+                name: None,
+                model: None,
+                model_provider: None,
+                sandbox: Some(SandboxMode::FullAccess),
+                mode: None,
+                origin_kind: None,
+                sidebar_visibility: None,
+                agent_nickname: None,
+                agent_role: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("thread should start");
+
+    crud_store
+        .materialize_turn_start(
+            &thread_start.started_notification.thread,
+            SandboxMode::FullAccess,
+            &Turn {
+                id: turn_id.to_owned(),
+                status: TurnStatus::InProgress,
+                turn_kind: Default::default(),
+                origin: Default::default(),
+                error: None,
+                prompt_manifest: None,
+            },
+            &[],
+        )
+        .await
+        .expect("turn start should persist");
+    agent_manager
+        .ensure_thread(thread_id, workspace_id.as_str())
+        .await
+        .expect("agent thread should be registered for committed subscription");
+    let mut committed_rx = agent_manager
+        .subscribe_committed(thread_id)
+        .await
+        .expect("committed subscription should exist");
+
+    processor
+        .handle_durable_agent_event(AgentDurableEvent::ItemCompleted {
+            notification: ItemCompletedNotification {
+                workspace_id,
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                item: TurnItem::UserMessage {
+                    id: item_id.to_owned(),
+                    text: "committed despite ingestion failure".to_owned(),
+                    attachments: Vec::new(),
+                },
+            },
+        })
+        .await;
+
+    let committed = timeout(Duration::from_secs(1), committed_rx.recv())
+        .await
+        .expect("committed notification should arrive")
+        .expect("committed lane should stay open");
+    assert!(matches!(
+        committed,
+        AgentDurableEvent::ItemCompleted { notification: committed_notification }
+            if committed_notification.turn_id == turn_id
+                && committed_notification.item.item_id() == item_id
+    ));
+
+    let item_events = crud_store
+        .get_turn_item_events(thread_id, turn_id)
+        .await
+        .expect("turn item events should be readable")
+        .expect("turn item events should exist");
+    assert!(
+        item_events.events.iter().any(|event| matches!(
+            &event.payload,
+            TurnItemEventPayload::ItemCompleted {
+                item: TurnItem::UserMessage { id, text, .. },
+                ..
+            } if id == item_id && text == "committed despite ingestion failure"
+        )),
+        "ingestion failure must not roll back durable item persistence"
+    );
+    assert_eq!(ingestor.calls.lock().await.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_episodic_store_ingestor_creates_chunks_and_jobs_idempotently() {
+    let (_workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let ingestor = StoreThreadEpisodicIngestor::new(crud_store.clone());
+    let thread_id = "thr_thread_episodic_ingest";
+    let turn_id = "turn_thread_episodic_ingest";
+
+    for item in [
+        TurnItem::UserMessage {
+            id: "user_item".to_owned(),
+            text: "  Remember this thread context.  ".to_owned(),
+            attachments: Vec::new(),
+        },
+        TurnItem::AgentMessage {
+            id: "assistant_item".to_owned(),
+            text: "Thread context was captured.".to_owned(),
+            markdown: None,
+            markdown_version: None,
+        },
+    ] {
+        let committed =
+            thread_episodic_committed_item(workspace_id.as_str(), thread_id, turn_id, item.clone());
+        assert_eq!(
+            ingestor
+                .ingest_committed_item(committed.clone())
+                .await
+                .expect("thread episodic ingestion should succeed"),
+            ThreadEpisodicIngestionOutcome::Accepted
+        );
+        assert_eq!(
+            ingestor
+                .ingest_committed_item(committed)
+                .await
+                .expect("repeated thread episodic ingestion should succeed"),
+            ThreadEpisodicIngestionOutcome::Accepted
+        );
+    }
+
+    let chunks = crud_store
+        .list_thread_episodic_chunks_for_thread(workspace_id.as_str(), thread_id, 10)
+        .await
+        .expect("chunks should be readable");
+    assert_eq!(chunks.len(), 2);
+    assert!(chunks.iter().all(|chunk| {
+        chunk.status == pioneer_crud::ThreadEpisodicChunkStatus::PendingIndex
+            && chunk.visibility == pioneer_crud::ThreadEpisodicChunkVisibility::UserVisible
+            && chunk.chunk_index == 0
+            && chunk.chunk_count == 1
+            && chunk.text_hash.len() == 64
+            && chunk.source_text_hash.len() == 64
+    }));
+
+    let jobs = crud_store
+        .list_thread_episodic_index_jobs_for_thread(workspace_id.as_str(), thread_id, 10)
+        .await
+        .expect("index jobs should be readable");
+    assert_eq!(jobs.len(), 2);
+    assert!(jobs.iter().all(|job| {
+        job.status == pioneer_crud::ThreadEpisodicIndexJobStatus::Queued
+            && job.graph_enrichment_state
+                == pioneer_crud::ThreadEpisodicGraphEnrichmentState::NotSupported
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_episodic_store_ingestor_indexes_visible_tool_and_task_summaries_only() {
+    let (_workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let ingestor = StoreThreadEpisodicIngestor::new(crud_store.clone());
+    let thread_id = "thr_thread_episodic_summaries";
+    let turn_id = "turn_thread_episodic_summaries";
+
+    let visible_tool = thread_episodic_committed_item(
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+        TurnItem::DynamicToolCall {
+            id: "tool_summary_item".to_owned(),
+            tool_name: "read_file".to_owned(),
+            arguments: serde_json::json!({"path":"README.md"}),
+            status: ToolCallStatus::Completed,
+            recovery_policy: None,
+            output_policy: ToolOutputPolicySnapshot::for_tool_name("read_file"),
+            display: ToolDisplayPayload::Summary(ToolOutputSummary {
+                title: "Read README.md".to_owned(),
+                lines: vec!["Read 42 lines".to_owned()],
+                metadata: ToolMetadata::empty(),
+                truncated: false,
+            }),
+            storage: ToolStoragePayload::None,
+            recovery: None,
+            success: Some(true),
+            outcome: None,
+            observation: None,
+        },
+    );
+    let visible_task = thread_episodic_committed_item(
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+        TurnItem::Task {
+            item: TaskTurnItem {
+                id: "task_summary_item".to_owned(),
+                task_id: "task_1".to_owned(),
+                run_id: Some("run_1".to_owned()),
+                parent_task_id: None,
+                root_task_id: None,
+                title: "Summarize proposal".to_owned(),
+                status: TaskStatus::Completed,
+                trigger_kind: TaskTriggerKind::Immediate,
+                executor_kind: TaskExecutorKind::Agent,
+                child_thread_id: None,
+                child_turn_id: None,
+                agent_role: None,
+                depth: 0,
+                max_depth: 3,
+                next_fire_at: None,
+                result_preview: Some("Proposal summary is ready".to_owned()),
+                error_preview: None,
+                created_at: 1,
+                updated_at: 2,
+            },
+        },
+    );
+    let raw_tool = thread_episodic_committed_item(
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+        TurnItem::CommandExecution {
+            id: "raw_tool_item".to_owned(),
+            tool_name: "exec_command".to_owned(),
+            arguments: serde_json::json!({"cmd":"cat secret.txt"}),
+            status: ToolCallStatus::Completed,
+            recovery_policy: None,
+            output_policy: ToolOutputPolicySnapshot::for_tool_name("exec_command"),
+            display: ToolDisplayPayload::Shell {
+                stdout: Some("secret".to_owned()),
+                stderr: None,
+                aggregated_output: Some("secret".to_owned()),
+                exit_code: Some(0),
+                duration_ms: Some(1),
+                timed_out: Some(false),
+                truncated: false,
+            },
+            storage: ToolStoragePayload::None,
+            recovery: None,
+            command: vec!["cat".to_owned(), "secret.txt".to_owned()],
+            cwd: None,
+            success: Some(true),
+            outcome: None,
+            observation: None,
+        },
+    );
+
+    assert_eq!(
+        ingestor
+            .ingest_committed_item(visible_tool)
+            .await
+            .expect("visible tool summary should ingest"),
+        ThreadEpisodicIngestionOutcome::Accepted
+    );
+    assert_eq!(
+        ingestor
+            .ingest_committed_item(visible_task)
+            .await
+            .expect("visible task summary should ingest"),
+        ThreadEpisodicIngestionOutcome::Accepted
+    );
+    assert_eq!(
+        ingestor
+            .ingest_committed_item(raw_tool)
+            .await
+            .expect("raw tool output should skip without failing"),
+        ThreadEpisodicIngestionOutcome::Skipped {
+            reason: crate::thread_episodic::ThreadEpisodicIngestionSkipReason::RawToolOutput
+        }
+    );
+
+    let chunks = crud_store
+        .list_thread_episodic_chunks_for_thread(workspace_id.as_str(), thread_id, 10)
+        .await
+        .expect("chunks should be readable");
+    assert_eq!(chunks.len(), 2);
+    assert!(chunks.iter().any(|chunk| {
+        chunk.source_actor_role == pioneer_crud::ThreadEpisodicSourceActorRole::Tool
+            && chunk.source_runtime_kind
+                == pioneer_crud::ThreadEpisodicSourceRuntimeKind::ToolSummary
+    }));
+    assert!(chunks.iter().any(|chunk| {
+        chunk.source_actor_role == pioneer_crud::ThreadEpisodicSourceActorRole::Task
+            && chunk.source_runtime_kind
+                == pioneer_crud::ThreadEpisodicSourceRuntimeKind::TaskResult
+    }));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

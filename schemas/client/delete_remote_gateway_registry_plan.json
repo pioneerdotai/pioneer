@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DeleteRemoteGatewayRegistryPlan",
+  "type": "object",
+  "properties": {
+    "deleted_active": {
+      "type": "boolean"
+    },
+    "deleted_token_ref": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "endpoint": {
+      "$ref": "#/$defs/GatewayEndpoint"
+    },
+    "fallback_endpoint": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GatewayEndpoint"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "previous_active_gateway_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "registry": {
+      "$ref": "#/$defs/GatewayRegistry"
+    }
+  },
+  "required": [
+    "registry",
+    "endpoint",
+    "deleted_active"
+  ],
+  "$defs": {
+    "GatewayEndpoint": {
+      "type": "object",
+      "properties": {
+        "address": {
+          "type": "string"
+        },
+        "auth_token_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/GatewayEndpointKind"
+        },
+        "name": {
+          "type": "string"
+        },
+        "service_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "address",
+        "kind"
+      ]
+    },
+    "GatewayEndpointKind": {
+      "type": "string",
+      "enum": [
+        "local",
+        "remote"
+      ]
+    },
+    "GatewayRegistry": {
+      "type": "object",
+      "properties": {
+        "active_gateway_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "local": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayEndpoint"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "remotes": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/GatewayEndpoint"
+          }
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "version"
+      ]
+    }
+  }
+}

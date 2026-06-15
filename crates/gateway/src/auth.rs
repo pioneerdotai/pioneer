@@ -427,6 +427,7 @@ mod tests {
                     run_migrations_on_startup: true,
                 },
                 memory: GatewayMemoryConfig::default(),
+                thread_episodic: Default::default(),
                 hooks: Default::default(),
                 artifacts: GatewayArtifactsConfig::default(),
                 auth: GatewayAuthConfig {

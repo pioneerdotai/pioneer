@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadEpisodicRecallInput",
+  "type": "object",
+  "properties": {
+    "max_candidates": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0
+    },
+    "max_prompt_chars": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0
+    },
+    "policy_context": {
+      "$ref": "#/$defs/ThreadEpisodicRecallPolicyContext",
+      "default": {
+        "context_recall_allowed": true,
+        "include_sensitive_context": false
+      }
+    },
+    "query_text": {
+      "type": "string"
+    },
+    "recent_context_summary": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "thread_id": {
+      "type": "string"
+    },
+    "turn_id": {
+      "type": "string"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_id",
+    "thread_id",
+    "turn_id",
+    "query_text"
+  ],
+  "$defs": {
+    "ThreadEpisodicRecallPolicyContext": {
+      "type": "object",
+      "properties": {
+        "context_recall_allowed": {
+          "type": "boolean"
+        },
+        "include_sensitive_context": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [
+        "context_recall_allowed"
+      ]
+    }
+  }
+}

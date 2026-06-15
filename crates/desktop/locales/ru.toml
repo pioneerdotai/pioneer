@@ -925,6 +925,10 @@ default = "По умолчанию"
 select_model = "Выбрать модель"
 dialog_title = "Выбор модели preflight"
 
+[settings.memory.thread_context]
+label = "Контекст треда"
+description = "Разрешить Pioneer индексировать и вспоминать полезный контекст из текущего треда."
+
 [settings.memory]
 title = "Память"
 description = "Управляйте тем, как Pioneer использует долговременную память."

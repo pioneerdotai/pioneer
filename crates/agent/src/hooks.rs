@@ -24,6 +24,7 @@ const HOOK_MANIFEST_MESSAGE_MAX_CHARS: usize = 512;
 const REDACTED_HOOK_DIAGNOSTIC_MESSAGE: &str = "Hook diagnostic redacted.";
 const HOOK_BEST_EFFORT_FAILED_MESSAGE: &str = "Best-effort hook failed before prompt compilation.";
 const TOOL_BUNDLE_MISSING_ARTIFACT_DIAGNOSTIC_CODE: &str = "tool_bundle.missing_artifact";
+const MEMORY_THREAD_CONTEXT_CONTRIBUTION_ID: &str = "memory.active_recall.thread_context";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentTurnHookRuntimeContext {
@@ -393,6 +394,7 @@ pub(super) struct EffectiveTurnPromptManifestHookSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum EffectiveTurnPromptManifestHookContributionKind {
     PromptContext,
+    ThreadContext,
     PromptSection,
 }
 
@@ -862,8 +864,9 @@ fn prompt_context_manifest_hook_metadata_from_phase_response(
                     .push(EffectiveTurnPromptManifestHookSourceEntry {
                         source: run_source.clone(),
                         section_id: None,
-                        contribution_kind:
-                            EffectiveTurnPromptManifestHookContributionKind::PromptContext,
+                        contribution_kind: prompt_context_manifest_contribution_kind(
+                            &context.contribution_id,
+                        ),
                         contribution_id: Some(context.contribution_id.clone()),
                         priority: Some(context.priority),
                         source_count: Some(context.source_refs.len()),
@@ -1189,7 +1192,18 @@ fn prompt_manifest_hook_contribution_kind_order(
 ) -> u8 {
     match kind {
         EffectiveTurnPromptManifestHookContributionKind::PromptContext => 0,
-        EffectiveTurnPromptManifestHookContributionKind::PromptSection => 1,
+        EffectiveTurnPromptManifestHookContributionKind::ThreadContext => 1,
+        EffectiveTurnPromptManifestHookContributionKind::PromptSection => 2,
+    }
+}
+
+fn prompt_context_manifest_contribution_kind(
+    contribution_id: &HookContributionId,
+) -> EffectiveTurnPromptManifestHookContributionKind {
+    if contribution_id.as_str() == MEMORY_THREAD_CONTEXT_CONTRIBUTION_ID {
+        EffectiveTurnPromptManifestHookContributionKind::ThreadContext
+    } else {
+        EffectiveTurnPromptManifestHookContributionKind::PromptContext
     }
 }
 
@@ -2045,6 +2059,23 @@ mod tests {
         HookSubscription, HookSubscriptionRegistry,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn thread_context_prompt_contribution_has_distinct_manifest_kind() {
+        let thread_context_id = HookContributionId::new(MEMORY_THREAD_CONTEXT_CONTRIBUTION_ID)
+            .expect("valid thread context contribution id");
+        let durable_context_id = HookContributionId::new("memory.recall.context")
+            .expect("valid durable memory contribution id");
+
+        assert_eq!(
+            prompt_context_manifest_contribution_kind(&thread_context_id),
+            EffectiveTurnPromptManifestHookContributionKind::ThreadContext
+        );
+        assert_eq!(
+            prompt_context_manifest_contribution_kind(&durable_context_id),
+            EffectiveTurnPromptManifestHookContributionKind::PromptContext
+        );
+    }
 
     struct TestPostTurnBackgroundHook {
         calls: Arc<AtomicUsize>,

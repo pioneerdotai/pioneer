@@ -219,6 +219,29 @@ proactive_writes_model = "thread"
 debug_trace_enabled = false
 strict_diagnostics_enabled = false
 
+[gateway.thread_episodic]
+enabled = true
+indexing_enabled = true
+recall_enabled = true
+default_prompt_chars = 2400
+max_prompt_chars = 12000
+max_hit_chars = 1200
+default_max_candidates = 32
+max_candidate_work = 128
+max_segments = 16
+min_relevancy = 0.25
+min_results = 1
+snippet_chars = 360
+chunk_target_min_chars = 700
+chunk_target_max_chars = 1200
+chunk_max_chars = 1600
+max_chunks_per_item = 64
+index_batch_limit = 16
+retry_base_delay_secs = 30
+retry_max_delay_secs = 900
+max_attempts = 5
+near_capacity_percent = 90.0
+
 [gateway.auth]
 jwt_issuer = "pioneer"
 jwt_audience = "pioneer-clients"

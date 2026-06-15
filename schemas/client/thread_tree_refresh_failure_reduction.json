@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadTreeRefreshFailureReduction",
+  "type": "object",
+  "properties": {
+    "drive_thread_start_queue": {
+      "type": "boolean"
+    },
+    "request_thread_start_if_needed": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "request_thread_start_if_needed",
+    "drive_thread_start_queue"
+  ]
+}

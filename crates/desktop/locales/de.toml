@@ -646,6 +646,10 @@ default = "Standard"
 select_model = "Modell auswählen"
 dialog_title = "Preflight-Modell auswählen"
 
+[settings.memory.thread_context]
+label = "Thread-Kontext"
+description = "Pioneer darf nützlichen Kontext aus dem aktuellen Thread indexieren und abrufen."
+
 [settings.memory]
 title = "Speicher"
 description = "Steuere, wie Pioneer dauerhaften Speicher verwendet."

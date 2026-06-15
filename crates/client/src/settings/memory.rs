@@ -112,6 +112,7 @@ pub fn gateway_settings_snapshot_with_memory(
     let mut snapshot = current.cloned().unwrap_or_else(|| GatewaySettingsSnapshot {
         general: GatewayGeneralSettings::default(),
         memory: GatewayMemorySettings::default(),
+        thread_episodic: Default::default(),
     });
     snapshot.memory = memory;
     snapshot
@@ -121,6 +122,7 @@ pub fn gateway_settings_update_for_memory(memory: GatewayMemorySettings) -> Gate
     GatewaySettingsUpdate {
         general: None,
         memory: Some(memory),
+        thread_episodic: None,
     }
 }
 
@@ -135,6 +137,7 @@ mod tests {
                 ..Default::default()
             },
             memory: GatewayMemorySettings::default(),
+            thread_episodic: Default::default(),
         }
     }
 

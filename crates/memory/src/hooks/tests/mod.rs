@@ -489,6 +489,22 @@ fn prompt_section_content(response: HookHandlerResponse) -> Option<String> {
     })
 }
 
+fn prompt_section_contents(response: HookHandlerResponse) -> Vec<(String, String)> {
+    response
+        .contributions
+        .into_iter()
+        .filter_map(|contribution| {
+            let HookContribution::PromptSection(section) = contribution else {
+                return None;
+            };
+            Some((
+                section.section_id.as_str().to_owned(),
+                section.content.as_str().to_owned(),
+            ))
+        })
+        .collect()
+}
+
 fn test_memory_turn_context() -> MemoryTurnContext {
     MemoryTurnContext {
         workspace_id: "ws".to_owned(),

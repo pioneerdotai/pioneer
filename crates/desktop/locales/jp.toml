@@ -646,6 +646,10 @@ default = "デフォルト"
 select_model = "モデルを選択"
 dialog_title = "Preflight モデルを選択"
 
+[settings.memory.thread_context]
+label = "スレッド文脈"
+description = "現在のスレッドから有用な文脈をインデックス化して呼び出すことを Pioneer に許可します。"
+
 [settings.memory]
 title = "メモリ"
 description = "Pioneer が永続メモリをどのように使うかを制御します。"

@@ -32,11 +32,19 @@ pub const MEMORY_ACTIVE_RECALL_SUBSCRIPTION_ID: &str = "memory.active_recall.def
 pub(super) const MEMORY_ACTIVE_RECALL_CONTRIBUTION_ID: &str = "memory.active_recall.context";
 pub(super) const MEMORY_THREAD_CONTEXT_CONTRIBUTION_ID: &str =
     "memory.active_recall.thread_context";
+pub(super) const MEMORY_RELATED_THREAD_CONTEXT_CONTRIBUTION_ID: &str =
+    "memory.active_recall.related_thread_context";
+pub(super) const MEMORY_WORKSPACE_THREAD_CONTEXT_CONTRIBUTION_ID: &str =
+    "memory.active_recall.workspace_thread_context";
 pub(super) const MEMORY_TASK_CONTEXT_CONTRIBUTION_ID: &str = "memory.active_recall.task_context";
 pub(super) const MEMORY_PROMPT_CONTRACT_HOOK_ID: &str = "memory.prompt_contract";
 pub(super) const MEMORY_PROMPT_CONTRACT_SUBSCRIPTION_ID: &str = "memory.prompt_contract.default";
 pub(super) const MEMORY_PROMPT_CONTRACT_CONTRIBUTION_ID: &str = "memory.prompt_contract.section";
 pub(super) const MEMORY_PROMPT_CONTRACT_SECTION_ID: &str = "memory_recall";
+pub(super) const MEMORY_THREAD_CONTEXT_PROMPT_CONTRIBUTION_ID: &str =
+    "memory.prompt_contract.thread_context_section";
+pub(super) const MEMORY_THREAD_CONTEXT_PROMPT_SECTION_ID: &str = "thread_context";
+pub(super) const MEMORY_THREAD_CONTEXT_PROMPT_SECTION_TITLE: &str = "Thread Context";
 pub(super) const MEMORY_POST_TURN_EXTRACTOR_HOOK_ID: &str = "memory.post_turn_extractor";
 pub(super) const MEMORY_POST_TURN_EXTRACTOR_SUBSCRIPTION_ID: &str =
     "memory.post_turn_extractor.default";

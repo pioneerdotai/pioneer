@@ -30,6 +30,15 @@ pub use summary::SummaryConfig;
 use crate::hook_runtime::GatewayHookRuntimeBuilder;
 use crate::keep_awake::GatewayKeepAwake;
 use crate::prompt_hooks::agents_doc_prompt_hook_package;
+use crate::thread_episodic::{
+    StoreThreadEpisodicIndexPayloadProvider, StoreThreadEpisodicIngestor,
+    ThreadEpisodicIndexExecutor, ThreadEpisodicIngestor, ThreadEpisodicRecallService,
+    ThreadEpisodicRuntimeConfig, WorkspaceEpisodicRecallService,
+};
+use crate::thread_episodic_hooks::{
+    ThreadContextRecallHookConfig, ThreadEpisodicMemoryRecallProvider,
+    thread_context_recall_hook_package,
+};
 use crate::tokenizer::count_tokens;
 use anyhow::Context as AnyhowContext;
 use pioneer_agent::MemoryLoopConfig;
@@ -42,6 +51,9 @@ use pioneer_artifacts::{
 use pioneer_config::{GatewayArtifactsConfig, GatewayHookRecoveryConfig};
 use pioneer_crud::{ConversationEntry, CrudStore, TimeoutCandidate};
 use pioneer_hooks::{HookRecoveryOptions, HookRuntime};
+use pioneer_memory::{
+    MemvidThreadEpisodicBackend, ThreadEpisodicMemvidBackend, thread_episodic_storage_uri_from_path,
+};
 use pioneer_protocol::{
     AgentDurableEvent, AgentProgressEvent, ArtifactBindingDirection, ArtifactBindingKind,
     ArtifactCreatedByKind, ArtifactCreatedNotification, ArtifactKind, ArtifactRole,
@@ -183,6 +195,7 @@ pub struct MessageProcessor {
     skills_watcher_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     tool_loop_config: ToolLoopConfig,
     memory_loop_config: Arc<StdRwLock<MemoryLoopConfig>>,
+    thread_episodic_runtime_config: Arc<StdRwLock<ThreadEpisodicRuntimeConfig>>,
     skills_snapshot_version: Arc<AtomicU64>,
     mcp_snapshot_version: Arc<AtomicU64>,
     mcp_service: Arc<McpService>,
@@ -199,6 +212,10 @@ pub struct MessageProcessor {
     pub(crate) artifact_service: Arc<ArtifactService>,
     artifact_uploads: Arc<artifacts::upload::ArtifactUploadSessionManager>,
     artifact_downloads: Arc<artifacts::download::ArtifactDownloadSessionManager>,
+    thread_episodic_ingestor: Arc<RwLock<Arc<dyn ThreadEpisodicIngestor>>>,
+    thread_episodic_index_executor: Arc<ThreadEpisodicIndexExecutor>,
+    thread_episodic_recall_service: Arc<ThreadEpisodicRecallService>,
+    workspace_episodic_recall_service: Arc<WorkspaceEpisodicRecallService>,
 }
 
 #[derive(Clone)]
@@ -237,6 +254,7 @@ impl MessageProcessor {
             runtime_home,
             artifacts_config,
             TaskRuntimeConfig::default(),
+            ThreadEpisodicRuntimeConfig::default(),
         )
     }
 
@@ -254,6 +272,7 @@ impl MessageProcessor {
         runtime_home: PathBuf,
         artifacts_config: GatewayArtifactsConfig,
         task_runtime_config: TaskRuntimeConfig,
+        thread_episodic_runtime_config: ThreadEpisodicRuntimeConfig,
     ) -> Self {
         let now_snapshot = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         {
@@ -306,6 +325,27 @@ impl MessageProcessor {
         ));
         let artifact_downloads =
             Arc::new(artifacts::download::ArtifactDownloadSessionManager::new());
+        let thread_episodic_storage_root = runtime_home.join("memory").join("capsules");
+        let thread_episodic_backend: Arc<dyn ThreadEpisodicMemvidBackend> =
+            Arc::new(MemvidThreadEpisodicBackend::new());
+        let thread_episodic_index_executor = Arc::new(ThreadEpisodicIndexExecutor::new(
+            crud_store.clone(),
+            thread_episodic_backend.clone(),
+            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                crud_store.clone(),
+                thread_episodic_storage_uri_from_path(thread_episodic_storage_root.as_path()),
+            )),
+        ));
+        thread_episodic_index_executor.apply_config(thread_episodic_runtime_config.index_executor);
+        let thread_episodic_recall_service = Arc::new(ThreadEpisodicRecallService::new(
+            crud_store.clone(),
+            thread_episodic_backend,
+        ));
+        thread_episodic_recall_service.apply_config(thread_episodic_runtime_config.recall_service);
+        let workspace_episodic_recall_service = Arc::new(WorkspaceEpisodicRecallService::new(
+            crud_store.clone(),
+            thread_episodic_recall_service.clone(),
+        ));
 
         Self {
             thread_manager,
@@ -334,6 +374,9 @@ impl MessageProcessor {
             skills_watcher_worker: Arc::new(Mutex::new(None)),
             tool_loop_config: normalized_tool_loop_config,
             memory_loop_config,
+            thread_episodic_runtime_config: Arc::new(StdRwLock::new(
+                thread_episodic_runtime_config,
+            )),
             skills_snapshot_version: Arc::new(AtomicU64::new(now_snapshot)),
             mcp_snapshot_version,
             mcp_service,
@@ -350,11 +393,30 @@ impl MessageProcessor {
             artifact_service,
             artifact_uploads,
             artifact_downloads,
+            thread_episodic_ingestor: Arc::new(RwLock::new(Arc::new(
+                StoreThreadEpisodicIngestor::with_config(
+                    crud_store,
+                    thread_episodic_runtime_config.enabled
+                        && thread_episodic_runtime_config.indexing_enabled,
+                    thread_episodic_runtime_config.chunker,
+                ),
+            ))),
+            thread_episodic_index_executor,
+            thread_episodic_recall_service,
+            workspace_episodic_recall_service,
         }
     }
 
     pub async fn set_hook_recovery_config(&self, config: GatewayHookRecoveryConfig) {
         *self.hook_recovery_config.write().await = config;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn set_thread_episodic_ingestor_for_test(
+        &self,
+        ingestor: Arc<dyn ThreadEpisodicIngestor>,
+    ) {
+        *self.thread_episodic_ingestor.write().await = ingestor;
     }
 
     pub async fn ensure_hook_runtime_with_run_store(&self) {
@@ -446,10 +508,31 @@ impl MessageProcessor {
                 Some(bridge.memory_provider.clone()),
                 Some(bridge.memory_provider.clone()),
                 Some(bridge.memory_policy_provider),
-                None,
+                Some(Arc::new(
+                    ThreadEpisodicMemoryRecallProvider::with_workspace_service(
+                        self.thread_episodic_recall_service.clone(),
+                        self.workspace_episodic_recall_service.clone(),
+                    ),
+                )),
                 self.agent_manager.memory_tool_bundle_artifact_store(),
                 self.memory_loop_config(),
             ))
+            .and_then(|builder| {
+                let thread_config = self
+                    .thread_episodic_runtime_config
+                    .read()
+                    .map(|config| *config)
+                    .unwrap_or_default();
+                builder.install(thread_context_recall_hook_package(
+                    self.thread_episodic_recall_service.clone(),
+                    self.memory_loop_config(),
+                    ThreadContextRecallHookConfig {
+                        enabled: thread_config.enabled && thread_config.recall_enabled,
+                        max_prompt_chars: thread_config.hook_max_prompt_chars,
+                        max_candidates: thread_config.hook_max_candidates,
+                    },
+                ))
+            })
             .and_then(|builder| {
                 builder.install(agents_doc_prompt_hook_package(self.crud_store.clone()))
             }) {
@@ -498,6 +581,25 @@ impl MessageProcessor {
         if let Ok(mut current) = self.memory_loop_config.write() {
             *current = config.normalized();
         }
+    }
+
+    pub(crate) async fn apply_thread_episodic_runtime_config(
+        &self,
+        config: ThreadEpisodicRuntimeConfig,
+    ) {
+        if let Ok(mut current) = self.thread_episodic_runtime_config.write() {
+            *current = config;
+        }
+        self.thread_episodic_index_executor
+            .apply_config(config.index_executor);
+        self.thread_episodic_recall_service
+            .apply_config(config.recall_service);
+        *self.thread_episodic_ingestor.write().await =
+            Arc::new(StoreThreadEpisodicIngestor::with_config(
+                self.crud_store.clone(),
+                config.enabled && config.indexing_enabled,
+                config.chunker,
+            ));
     }
 
     pub(crate) fn apply_keepawake_setting(&self, enabled: bool) -> anyhow::Result<()> {
@@ -1381,13 +1483,36 @@ impl MessageProcessor {
         .normalized();
         let memory_loop_config =
             Arc::new(StdRwLock::new(normalized_tool_loop_config.memory.clone()));
+        let thread_episodic_backend: Arc<dyn ThreadEpisodicMemvidBackend> =
+            Arc::new(MemvidThreadEpisodicBackend::new());
+        let thread_episodic_index_executor = Arc::new(ThreadEpisodicIndexExecutor::new(
+            crud_store.clone(),
+            thread_episodic_backend.clone(),
+            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                crud_store.clone(),
+                thread_episodic_storage_uri_from_path(
+                    artifact_runtime_home
+                        .join("memory")
+                        .join("capsules")
+                        .as_path(),
+                ),
+            )),
+        ));
+        let thread_episodic_recall_service = Arc::new(ThreadEpisodicRecallService::new(
+            crud_store.clone(),
+            thread_episodic_backend,
+        ));
+        let workspace_episodic_recall_service = Arc::new(WorkspaceEpisodicRecallService::new(
+            crud_store.clone(),
+            thread_episodic_recall_service.clone(),
+        ));
         Self {
             thread_manager,
             agent_manager,
             provider_registry,
             session_manager,
             workspace_manager,
-            crud_store,
+            crud_store: crud_store.clone(),
             gateway_secrets,
             summary_config: Arc::new(summary::SummaryConfig {
                 summary_model: Some("test-model".to_owned()),
@@ -1416,6 +1541,9 @@ impl MessageProcessor {
             skills_watcher_worker: Arc::new(Mutex::new(None)),
             tool_loop_config: normalized_tool_loop_config,
             memory_loop_config,
+            thread_episodic_runtime_config: Arc::new(StdRwLock::new(
+                ThreadEpisodicRuntimeConfig::default(),
+            )),
             skills_snapshot_version: Arc::new(AtomicU64::new(now_snapshot)),
             mcp_snapshot_version,
             mcp_service,
@@ -1432,6 +1560,12 @@ impl MessageProcessor {
             artifact_service,
             artifact_uploads,
             artifact_downloads,
+            thread_episodic_ingestor: Arc::new(RwLock::new(Arc::new(
+                StoreThreadEpisodicIngestor::new(crud_store),
+            ))),
+            thread_episodic_index_executor,
+            thread_episodic_recall_service,
+            workspace_episodic_recall_service,
         }
     }
 }

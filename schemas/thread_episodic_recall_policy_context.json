@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadEpisodicRecallPolicyContext",
+  "type": "object",
+  "properties": {
+    "context_recall_allowed": {
+      "type": "boolean"
+    },
+    "include_sensitive_context": {
+      "type": "boolean",
+      "default": false
+    }
+  },
+  "required": [
+    "context_recall_allowed"
+  ]
+}

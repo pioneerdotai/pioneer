@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadEpisodicChunkStatus",
+  "type": "string",
+  "enum": [
+    "pending_index",
+    "indexed",
+    "active",
+    "index_failed",
+    "deleted",
+    "excluded",
+    "unknown"
+  ]
+}

@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadEpisodicAdaptiveDiagnostics",
+  "type": "object",
+  "properties": {
+    "cutoff_reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "cutoff_score": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "float"
+    },
+    "max_candidates": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "min_relevancy": {
+      "type": "number",
+      "format": "float"
+    },
+    "native_memvid_adaptive_used": {
+      "type": "boolean",
+      "default": false
+    },
+    "results_returned": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "search_mode": {
+      "$ref": "#/$defs/ThreadEpisodicSearchMode"
+    },
+    "strategy": {
+      "$ref": "#/$defs/ThreadEpisodicAdaptiveStrategy"
+    },
+    "total_candidates": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "search_mode",
+    "strategy",
+    "min_relevancy",
+    "max_candidates",
+    "total_candidates",
+    "results_returned"
+  ],
+  "$defs": {
+    "ThreadEpisodicAdaptiveStrategy": {
+      "type": "string",
+      "enum": [
+        "combined",
+        "relative",
+        "absolute",
+        "cliff",
+        "elbow"
+      ]
+    },
+    "ThreadEpisodicSearchMode": {
+      "type": "string",
+      "enum": [
+        "auto",
+        "semantic",
+        "lexical",
+        "temporal"
+      ]
+    }
+  }
+}

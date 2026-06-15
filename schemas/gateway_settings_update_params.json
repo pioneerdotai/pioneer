@@ -127,6 +127,178 @@
               "type": "null"
             }
           ]
+        },
+        "thread_episodic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayThreadEpisodicSettingsUpdate"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "GatewayThreadEpisodicSettingsUpdate": {
+      "type": "object",
+      "properties": {
+        "chunk_max_chars": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "chunk_target_max_chars": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "chunk_target_min_chars": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "default_max_candidates": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "default_prompt_chars": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "index_batch_limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "indexing_enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "max_attempts": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "max_candidate_work": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_chunks_per_item": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_hit_chars": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_prompt_chars": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_segments": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "min_relevancy": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "min_results": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "near_capacity_percent": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "recall_enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "retry_base_delay_secs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "retry_max_delay_secs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "snippet_chars": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
         }
       }
     }

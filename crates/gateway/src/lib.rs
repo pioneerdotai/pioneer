@@ -21,6 +21,8 @@ mod settings;
 mod system_skills;
 mod task_tools;
 mod thread;
+mod thread_episodic;
+mod thread_episodic_hooks;
 mod tokenizer;
 mod transport;
 mod turn_runtime_snapshot;
@@ -31,7 +33,7 @@ use attachment::CrudArtifactExternalRefCacheBackend;
 use pioneer_agent::ToolLoopConfig;
 use pioneer_config::{
     AppConfig, GatewayExecutionWindowsConfig, GatewayMemoryConfig, GatewayTasksConfig,
-    GatewayToolLoopBudgetConfig, GatewayToolsConfig,
+    GatewayThreadEpisodicConfig, GatewayToolLoopBudgetConfig, GatewayToolsConfig,
 };
 use pioneer_crud::CrudStore;
 use pioneer_hooks::HookAwaitPolicy;
@@ -64,6 +66,10 @@ use crate::message::{ContextBudget, SummaryConfig};
 use crate::secrets::GatewaySecrets;
 use crate::session::SessionManager;
 use crate::thread::ThreadManager;
+use crate::thread_episodic::{
+    ThreadEpisodicChunkerConfig, ThreadEpisodicIndexExecutorConfig,
+    ThreadEpisodicRecallServiceConfig, ThreadEpisodicRuntimeConfig,
+};
 use crate::transport::spawn_server;
 use crate::workspace::WorkspaceManager;
 
@@ -75,8 +81,8 @@ pub use crate::operations::{
     secrets_garbage_collection, secrets_status,
 };
 pub use crate::settings::{
-    GatewayMemorySettings, GatewaySettings, load_or_create_gateway_settings,
-    normalize_settings_file_name, save_gateway_settings,
+    GatewayMemorySettings, GatewaySettings, GatewayThreadEpisodicSettings,
+    load_or_create_gateway_settings, normalize_settings_file_name, save_gateway_settings,
 };
 
 const HOME_DIRECTORY_TOKEN: &str = "{homeDirectory}";
@@ -427,6 +433,7 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         runtime_home.clone(),
         config.gateway.artifacts.clone(),
         task_runtime_config,
+        thread_episodic_runtime_config_from_gateway_config(&config.gateway.thread_episodic),
     ));
 
     message_processor
@@ -652,6 +659,80 @@ pub(crate) fn memory_loop_config_from_gateway_memory_settings(
     memory
 }
 
+fn thread_episodic_runtime_config_from_gateway_config(
+    config: &GatewayThreadEpisodicConfig,
+) -> ThreadEpisodicRuntimeConfig {
+    ThreadEpisodicRuntimeConfig {
+        enabled: config.enabled,
+        indexing_enabled: config.indexing_enabled,
+        recall_enabled: config.recall_enabled,
+        hook_max_prompt_chars: config.default_prompt_chars,
+        hook_max_candidates: config.default_max_candidates,
+        chunker: ThreadEpisodicChunkerConfig {
+            target_min_chars: config.chunk_target_min_chars,
+            target_max_chars: config.chunk_target_max_chars,
+            max_chunk_chars: config.chunk_max_chars,
+            max_chunks_per_item: config.max_chunks_per_item,
+        },
+        index_executor: ThreadEpisodicIndexExecutorConfig {
+            batch_limit: config.index_batch_limit,
+            retry_base_delay_secs: config.retry_base_delay_secs,
+            retry_max_delay_secs: config.retry_max_delay_secs,
+            max_attempts: config.max_attempts,
+            near_capacity_percent: config.near_capacity_percent,
+        },
+        recall_service: ThreadEpisodicRecallServiceConfig {
+            enabled: config.enabled && config.recall_enabled,
+            default_prompt_chars: config.default_prompt_chars,
+            max_prompt_chars: config.max_prompt_chars,
+            max_hit_chars: config.max_hit_chars,
+            default_max_candidates: config.default_max_candidates,
+            max_candidate_work: config.max_candidate_work,
+            max_segments: config.max_segments,
+            min_relevancy: config.min_relevancy,
+            min_results: config.min_results,
+            snippet_chars: config.snippet_chars,
+        },
+    }
+}
+
+pub(crate) fn thread_episodic_runtime_config_from_gateway_settings(
+    settings: &GatewayThreadEpisodicSettings,
+) -> ThreadEpisodicRuntimeConfig {
+    ThreadEpisodicRuntimeConfig {
+        enabled: settings.enabled,
+        indexing_enabled: settings.indexing_enabled,
+        recall_enabled: settings.recall_enabled,
+        hook_max_prompt_chars: settings.default_prompt_chars,
+        hook_max_candidates: settings.default_max_candidates,
+        chunker: ThreadEpisodicChunkerConfig {
+            target_min_chars: settings.chunk_target_min_chars as usize,
+            target_max_chars: settings.chunk_target_max_chars as usize,
+            max_chunk_chars: settings.chunk_max_chars as usize,
+            max_chunks_per_item: settings.max_chunks_per_item as usize,
+        },
+        index_executor: ThreadEpisodicIndexExecutorConfig {
+            batch_limit: settings.index_batch_limit as u64,
+            retry_base_delay_secs: settings.retry_base_delay_secs,
+            retry_max_delay_secs: settings.retry_max_delay_secs,
+            max_attempts: settings.max_attempts,
+            near_capacity_percent: settings.near_capacity_percent,
+        },
+        recall_service: ThreadEpisodicRecallServiceConfig {
+            enabled: settings.enabled && settings.recall_enabled,
+            default_prompt_chars: settings.default_prompt_chars,
+            max_prompt_chars: settings.max_prompt_chars,
+            max_hit_chars: settings.max_hit_chars as usize,
+            default_max_candidates: settings.default_max_candidates,
+            max_candidate_work: settings.max_candidate_work,
+            max_segments: settings.max_segments as u64,
+            min_relevancy: settings.min_relevancy,
+            min_results: settings.min_results,
+            snippet_chars: settings.snippet_chars,
+        },
+    }
+}
+
 fn parse_skill_trust_level(raw: &str, field_name: &str) -> Result<SkillTrustLevel> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "internal" => Ok(SkillTrustLevel::Internal),
@@ -720,8 +801,10 @@ mod tests {
         execution_windows_config_from_gateway_tools_config, expand_home_directory_templates,
         memory_loop_config_from_gateway_memory_config, parse_skill_trust_level,
         task_runtime_config_from_gateway_tasks_config,
+        thread_episodic_runtime_config_from_gateway_settings,
     };
     use crate::secrets::GatewaySecrets;
+    use crate::settings::GatewayThreadEpisodicSettings;
     use pioneer_config::{
         GatewayExecutionWindowBudgetConfig, GatewayExecutionWindowTotalBudgetConfig,
         GatewayExecutionWindowsConfig, GatewayMemoryConfig, GatewayMemoryModelSelectionConfig,
@@ -966,6 +1049,60 @@ mod tests {
         );
         assert_eq!(runtime_config.review.default_max_revision_rounds, 5);
         assert_eq!(runtime_config.review.auto_accept_after_seconds, 300);
+    }
+
+    #[test]
+    fn gateway_thread_episodic_settings_map_to_runtime_config() {
+        let settings = GatewayThreadEpisodicSettings {
+            enabled: false,
+            indexing_enabled: true,
+            recall_enabled: true,
+            default_prompt_chars: 1_500,
+            max_prompt_chars: 6_000,
+            max_hit_chars: 700,
+            default_max_candidates: 9,
+            max_candidate_work: 33,
+            max_segments: 5,
+            min_relevancy: 0.4,
+            min_results: 2,
+            snippet_chars: 220,
+            chunk_target_min_chars: 400,
+            chunk_target_max_chars: 800,
+            chunk_max_chars: 1_000,
+            max_chunks_per_item: 12,
+            index_batch_limit: 7,
+            retry_base_delay_secs: 11,
+            retry_max_delay_secs: 121,
+            max_attempts: 4,
+            near_capacity_percent: 81.0,
+        };
+
+        let runtime = thread_episodic_runtime_config_from_gateway_settings(&settings);
+
+        assert!(!runtime.enabled);
+        assert!(runtime.indexing_enabled);
+        assert!(runtime.recall_enabled);
+        assert_eq!(runtime.hook_max_prompt_chars, 1_500);
+        assert_eq!(runtime.hook_max_candidates, 9);
+        assert_eq!(runtime.chunker.target_min_chars, 400);
+        assert_eq!(runtime.chunker.target_max_chars, 800);
+        assert_eq!(runtime.chunker.max_chunk_chars, 1_000);
+        assert_eq!(runtime.chunker.max_chunks_per_item, 12);
+        assert_eq!(runtime.index_executor.batch_limit, 7);
+        assert_eq!(runtime.index_executor.retry_base_delay_secs, 11);
+        assert_eq!(runtime.index_executor.retry_max_delay_secs, 121);
+        assert_eq!(runtime.index_executor.max_attempts, 4);
+        assert_eq!(runtime.index_executor.near_capacity_percent, 81.0);
+        assert!(!runtime.recall_service.enabled);
+        assert_eq!(runtime.recall_service.default_prompt_chars, 1_500);
+        assert_eq!(runtime.recall_service.max_prompt_chars, 6_000);
+        assert_eq!(runtime.recall_service.max_hit_chars, 700);
+        assert_eq!(runtime.recall_service.default_max_candidates, 9);
+        assert_eq!(runtime.recall_service.max_candidate_work, 33);
+        assert_eq!(runtime.recall_service.max_segments, 5);
+        assert_eq!(runtime.recall_service.min_relevancy, 0.4);
+        assert_eq!(runtime.recall_service.min_results, 2);
+        assert_eq!(runtime.recall_service.snippet_chars, 220);
     }
 
     #[test]

@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use pioneer_config::{
     AppConfig, GatewayConfig, GatewayMemoryConfig, GatewayMemoryModelSelectionConfig,
     GatewayMemoryModelSelectionSource as ConfigGatewayMemoryModelSelectionSource,
+    GatewayThreadEpisodicConfig,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -18,6 +19,8 @@ pub struct GatewaySettings {
     secrets: GatewaySecretsSettings,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     memory: Option<GatewayMemorySettingsOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thread_episodic: Option<GatewayThreadEpisodicSettingsOverride>,
     #[serde(skip)]
     migrated: bool,
 }
@@ -31,6 +34,8 @@ struct GatewaySettingsWire {
     secrets: GatewaySecretsSettings,
     #[serde(default)]
     memory: Option<GatewayMemorySettingsOverride>,
+    #[serde(default)]
+    thread_episodic: Option<GatewayThreadEpisodicSettingsOverride>,
 }
 
 impl<'de> Deserialize<'de> for GatewaySettings {
@@ -44,6 +49,7 @@ impl<'de> Deserialize<'de> for GatewaySettings {
             general: wire.general,
             secrets: wire.secrets,
             memory: wire.memory,
+            thread_episodic: wire.thread_episodic,
             migrated: false,
         };
         settings.migrate_legacy_active_recall_model();
@@ -151,6 +157,84 @@ struct GatewayMemorySettingsOverride {
     strict_diagnostics_enabled: Option<bool>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GatewayThreadEpisodicSettings {
+    pub enabled: bool,
+    pub indexing_enabled: bool,
+    pub recall_enabled: bool,
+    pub default_prompt_chars: u32,
+    pub max_prompt_chars: u32,
+    pub max_hit_chars: u32,
+    pub default_max_candidates: u32,
+    pub max_candidate_work: u32,
+    pub max_segments: u32,
+    pub min_relevancy: f32,
+    pub min_results: u32,
+    pub snippet_chars: u32,
+    pub chunk_target_min_chars: u32,
+    pub chunk_target_max_chars: u32,
+    pub chunk_max_chars: u32,
+    pub max_chunks_per_item: u32,
+    pub index_batch_limit: u32,
+    pub retry_base_delay_secs: i64,
+    pub retry_max_delay_secs: i64,
+    pub max_attempts: i64,
+    pub near_capacity_percent: f64,
+}
+
+impl Default for GatewayThreadEpisodicSettings {
+    fn default() -> Self {
+        Self::from_gateway_thread_episodic_config(&GatewayThreadEpisodicConfig::default())
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct GatewayThreadEpisodicSettingsOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    indexing_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recall_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    default_prompt_chars: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_prompt_chars: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_hit_chars: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    default_max_candidates: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_candidate_work: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_segments: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    min_relevancy: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    min_results: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snippet_chars: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chunk_target_min_chars: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chunk_target_max_chars: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chunk_max_chars: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_chunks_per_item: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    index_batch_limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry_base_delay_secs: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry_max_delay_secs: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_attempts: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    near_capacity_percent: Option<f64>,
+}
+
 impl Default for GatewaySecretsSettings {
     fn default() -> Self {
         Self {
@@ -184,8 +268,26 @@ impl GatewaySettings {
         }
     }
 
+    pub fn effective_thread_episodic_settings(
+        &self,
+        config: &GatewayThreadEpisodicConfig,
+    ) -> GatewayThreadEpisodicSettings {
+        let settings = GatewayThreadEpisodicSettings::from_gateway_thread_episodic_config(config);
+        if let Some(thread_episodic) = &self.thread_episodic {
+            thread_episodic.apply_to_thread_episodic_settings(settings)
+        } else {
+            settings
+        }
+    }
+
     pub fn set_memory_settings(&mut self, memory: GatewayMemorySettings) {
         self.memory = Some(GatewayMemorySettingsOverride::from_memory_settings(memory));
+    }
+
+    pub fn set_thread_episodic_settings(&mut self, thread_episodic: GatewayThreadEpisodicSettings) {
+        self.thread_episodic = Some(
+            GatewayThreadEpisodicSettingsOverride::from_thread_episodic_settings(thread_episodic),
+        );
     }
 
     pub fn snapshot(&self, config: &GatewayConfig) -> pioneer_protocol::GatewaySettingsSnapshot {
@@ -193,6 +295,9 @@ impl GatewaySettings {
         pioneer_protocol::GatewaySettingsSnapshot {
             general,
             memory: self.effective_memory_settings(&config.memory).to_protocol(),
+            thread_episodic: self
+                .effective_thread_episodic_settings(&config.thread_episodic)
+                .to_protocol(),
         }
     }
 
@@ -209,7 +314,20 @@ impl GatewaySettings {
             self.set_memory_settings(memory);
             changes.memory = true;
         }
+        if let Some(thread_episodic) = update.thread_episodic {
+            self.apply_thread_episodic_settings_update(thread_episodic);
+            changes.thread_episodic = true;
+        }
         changes
+    }
+
+    fn apply_thread_episodic_settings_update(
+        &mut self,
+        update: pioneer_protocol::GatewayThreadEpisodicSettingsUpdate,
+    ) {
+        self.thread_episodic
+            .get_or_insert_with(GatewayThreadEpisodicSettingsOverride::default)
+            .apply_protocol_update(update);
     }
 
     pub fn apply_to_gateway_memory_config(
@@ -223,11 +341,24 @@ impl GatewaySettings {
         }
     }
 
+    pub fn apply_to_gateway_thread_episodic_config(
+        &self,
+        config: GatewayThreadEpisodicConfig,
+    ) -> GatewayThreadEpisodicConfig {
+        if let Some(thread_episodic) = &self.thread_episodic {
+            thread_episodic.apply_to_gateway_thread_episodic_config(config)
+        } else {
+            config
+        }
+    }
+
     pub fn apply_to_gateway_config(&self, mut config: GatewayConfig) -> GatewayConfig {
         let general = self.effective_general_settings(&config);
         config.keepawake = general.keepawake;
         config.preflight_model = model_selection_from_protocol(general.preflight_model);
         config.memory = self.apply_to_gateway_memory_config(config.memory);
+        config.thread_episodic =
+            self.apply_to_gateway_thread_episodic_config(config.thread_episodic);
         config
     }
 
@@ -294,10 +425,91 @@ impl GatewayMemorySettings {
     }
 }
 
+impl GatewayThreadEpisodicSettings {
+    pub fn from_gateway_thread_episodic_config(config: &GatewayThreadEpisodicConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            indexing_enabled: config.indexing_enabled,
+            recall_enabled: config.recall_enabled,
+            default_prompt_chars: config.default_prompt_chars,
+            max_prompt_chars: config.max_prompt_chars,
+            max_hit_chars: config.max_hit_chars.min(u32::MAX as usize) as u32,
+            default_max_candidates: config.default_max_candidates,
+            max_candidate_work: config.max_candidate_work,
+            max_segments: config.max_segments.min(u32::MAX as u64) as u32,
+            min_relevancy: config.min_relevancy,
+            min_results: config.min_results,
+            snippet_chars: config.snippet_chars,
+            chunk_target_min_chars: config.chunk_target_min_chars.min(u32::MAX as usize) as u32,
+            chunk_target_max_chars: config.chunk_target_max_chars.min(u32::MAX as usize) as u32,
+            chunk_max_chars: config.chunk_max_chars.min(u32::MAX as usize) as u32,
+            max_chunks_per_item: config.max_chunks_per_item.min(u32::MAX as usize) as u32,
+            index_batch_limit: config.index_batch_limit.min(u32::MAX as u64) as u32,
+            retry_base_delay_secs: config.retry_base_delay_secs,
+            retry_max_delay_secs: config.retry_max_delay_secs,
+            max_attempts: config.max_attempts,
+            near_capacity_percent: config.near_capacity_percent,
+        }
+    }
+
+    pub fn from_protocol(settings: pioneer_protocol::GatewayThreadEpisodicSettings) -> Self {
+        Self {
+            enabled: settings.enabled,
+            indexing_enabled: settings.indexing_enabled,
+            recall_enabled: settings.recall_enabled,
+            default_prompt_chars: settings.default_prompt_chars,
+            max_prompt_chars: settings.max_prompt_chars,
+            max_hit_chars: settings.max_hit_chars,
+            default_max_candidates: settings.default_max_candidates,
+            max_candidate_work: settings.max_candidate_work,
+            max_segments: settings.max_segments,
+            min_relevancy: settings.min_relevancy,
+            min_results: settings.min_results,
+            snippet_chars: settings.snippet_chars,
+            chunk_target_min_chars: settings.chunk_target_min_chars,
+            chunk_target_max_chars: settings.chunk_target_max_chars,
+            chunk_max_chars: settings.chunk_max_chars,
+            max_chunks_per_item: settings.max_chunks_per_item,
+            index_batch_limit: settings.index_batch_limit,
+            retry_base_delay_secs: settings.retry_base_delay_secs,
+            retry_max_delay_secs: settings.retry_max_delay_secs,
+            max_attempts: settings.max_attempts,
+            near_capacity_percent: settings.near_capacity_percent,
+        }
+    }
+
+    pub fn to_protocol(&self) -> pioneer_protocol::GatewayThreadEpisodicSettings {
+        pioneer_protocol::GatewayThreadEpisodicSettings {
+            enabled: self.enabled,
+            indexing_enabled: self.indexing_enabled,
+            recall_enabled: self.recall_enabled,
+            default_prompt_chars: self.default_prompt_chars,
+            max_prompt_chars: self.max_prompt_chars,
+            max_hit_chars: self.max_hit_chars,
+            default_max_candidates: self.default_max_candidates,
+            max_candidate_work: self.max_candidate_work,
+            max_segments: self.max_segments,
+            min_relevancy: self.min_relevancy,
+            min_results: self.min_results,
+            snippet_chars: self.snippet_chars,
+            chunk_target_min_chars: self.chunk_target_min_chars,
+            chunk_target_max_chars: self.chunk_target_max_chars,
+            chunk_max_chars: self.chunk_max_chars,
+            max_chunks_per_item: self.max_chunks_per_item,
+            index_batch_limit: self.index_batch_limit,
+            retry_base_delay_secs: self.retry_base_delay_secs,
+            retry_max_delay_secs: self.retry_max_delay_secs,
+            max_attempts: self.max_attempts,
+            near_capacity_percent: self.near_capacity_percent,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GatewaySettingsChangeSet {
     pub general: GatewayGeneralSettingsChangeSet,
     pub memory: bool,
+    pub thread_episodic: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -391,6 +603,204 @@ impl GatewayMemorySettingsOverride {
     }
 }
 
+impl GatewayThreadEpisodicSettingsOverride {
+    fn from_thread_episodic_settings(settings: GatewayThreadEpisodicSettings) -> Self {
+        Self {
+            enabled: Some(settings.enabled),
+            indexing_enabled: Some(settings.indexing_enabled),
+            recall_enabled: Some(settings.recall_enabled),
+            default_prompt_chars: Some(settings.default_prompt_chars),
+            max_prompt_chars: Some(settings.max_prompt_chars),
+            max_hit_chars: Some(settings.max_hit_chars),
+            default_max_candidates: Some(settings.default_max_candidates),
+            max_candidate_work: Some(settings.max_candidate_work),
+            max_segments: Some(settings.max_segments),
+            min_relevancy: Some(settings.min_relevancy),
+            min_results: Some(settings.min_results),
+            snippet_chars: Some(settings.snippet_chars),
+            chunk_target_min_chars: Some(settings.chunk_target_min_chars),
+            chunk_target_max_chars: Some(settings.chunk_target_max_chars),
+            chunk_max_chars: Some(settings.chunk_max_chars),
+            max_chunks_per_item: Some(settings.max_chunks_per_item),
+            index_batch_limit: Some(settings.index_batch_limit),
+            retry_base_delay_secs: Some(settings.retry_base_delay_secs),
+            retry_max_delay_secs: Some(settings.retry_max_delay_secs),
+            max_attempts: Some(settings.max_attempts),
+            near_capacity_percent: Some(settings.near_capacity_percent),
+        }
+    }
+
+    fn apply_to_thread_episodic_settings(
+        &self,
+        mut settings: GatewayThreadEpisodicSettings,
+    ) -> GatewayThreadEpisodicSettings {
+        if let Some(enabled) = self.enabled {
+            settings.enabled = enabled;
+        }
+        if let Some(indexing_enabled) = self.indexing_enabled {
+            settings.indexing_enabled = indexing_enabled;
+        }
+        if let Some(recall_enabled) = self.recall_enabled {
+            settings.recall_enabled = recall_enabled;
+        }
+        if let Some(default_prompt_chars) = self.default_prompt_chars {
+            settings.default_prompt_chars = default_prompt_chars;
+        }
+        if let Some(max_prompt_chars) = self.max_prompt_chars {
+            settings.max_prompt_chars = max_prompt_chars;
+        }
+        if let Some(max_hit_chars) = self.max_hit_chars {
+            settings.max_hit_chars = max_hit_chars;
+        }
+        if let Some(default_max_candidates) = self.default_max_candidates {
+            settings.default_max_candidates = default_max_candidates;
+        }
+        if let Some(max_candidate_work) = self.max_candidate_work {
+            settings.max_candidate_work = max_candidate_work;
+        }
+        if let Some(max_segments) = self.max_segments {
+            settings.max_segments = max_segments;
+        }
+        if let Some(min_relevancy) = self.min_relevancy {
+            settings.min_relevancy = min_relevancy;
+        }
+        if let Some(min_results) = self.min_results {
+            settings.min_results = min_results;
+        }
+        if let Some(snippet_chars) = self.snippet_chars {
+            settings.snippet_chars = snippet_chars;
+        }
+        if let Some(chunk_target_min_chars) = self.chunk_target_min_chars {
+            settings.chunk_target_min_chars = chunk_target_min_chars;
+        }
+        if let Some(chunk_target_max_chars) = self.chunk_target_max_chars {
+            settings.chunk_target_max_chars = chunk_target_max_chars;
+        }
+        if let Some(chunk_max_chars) = self.chunk_max_chars {
+            settings.chunk_max_chars = chunk_max_chars;
+        }
+        if let Some(max_chunks_per_item) = self.max_chunks_per_item {
+            settings.max_chunks_per_item = max_chunks_per_item;
+        }
+        if let Some(index_batch_limit) = self.index_batch_limit {
+            settings.index_batch_limit = index_batch_limit;
+        }
+        if let Some(retry_base_delay_secs) = self.retry_base_delay_secs {
+            settings.retry_base_delay_secs = retry_base_delay_secs;
+        }
+        if let Some(retry_max_delay_secs) = self.retry_max_delay_secs {
+            settings.retry_max_delay_secs = retry_max_delay_secs;
+        }
+        if let Some(max_attempts) = self.max_attempts {
+            settings.max_attempts = max_attempts;
+        }
+        if let Some(near_capacity_percent) = self.near_capacity_percent {
+            settings.near_capacity_percent = near_capacity_percent;
+        }
+        settings
+    }
+
+    fn apply_protocol_update(
+        &mut self,
+        update: pioneer_protocol::GatewayThreadEpisodicSettingsUpdate,
+    ) {
+        if let Some(enabled) = update.enabled {
+            self.enabled = Some(enabled);
+        }
+        if let Some(indexing_enabled) = update.indexing_enabled {
+            self.indexing_enabled = Some(indexing_enabled);
+        }
+        if let Some(recall_enabled) = update.recall_enabled {
+            self.recall_enabled = Some(recall_enabled);
+        }
+        if let Some(default_prompt_chars) = update.default_prompt_chars {
+            self.default_prompt_chars = Some(default_prompt_chars);
+        }
+        if let Some(max_prompt_chars) = update.max_prompt_chars {
+            self.max_prompt_chars = Some(max_prompt_chars);
+        }
+        if let Some(max_hit_chars) = update.max_hit_chars {
+            self.max_hit_chars = Some(max_hit_chars);
+        }
+        if let Some(default_max_candidates) = update.default_max_candidates {
+            self.default_max_candidates = Some(default_max_candidates);
+        }
+        if let Some(max_candidate_work) = update.max_candidate_work {
+            self.max_candidate_work = Some(max_candidate_work);
+        }
+        if let Some(max_segments) = update.max_segments {
+            self.max_segments = Some(max_segments);
+        }
+        if let Some(min_relevancy) = update.min_relevancy {
+            self.min_relevancy = Some(min_relevancy);
+        }
+        if let Some(min_results) = update.min_results {
+            self.min_results = Some(min_results);
+        }
+        if let Some(snippet_chars) = update.snippet_chars {
+            self.snippet_chars = Some(snippet_chars);
+        }
+        if let Some(chunk_target_min_chars) = update.chunk_target_min_chars {
+            self.chunk_target_min_chars = Some(chunk_target_min_chars);
+        }
+        if let Some(chunk_target_max_chars) = update.chunk_target_max_chars {
+            self.chunk_target_max_chars = Some(chunk_target_max_chars);
+        }
+        if let Some(chunk_max_chars) = update.chunk_max_chars {
+            self.chunk_max_chars = Some(chunk_max_chars);
+        }
+        if let Some(max_chunks_per_item) = update.max_chunks_per_item {
+            self.max_chunks_per_item = Some(max_chunks_per_item);
+        }
+        if let Some(index_batch_limit) = update.index_batch_limit {
+            self.index_batch_limit = Some(index_batch_limit);
+        }
+        if let Some(retry_base_delay_secs) = update.retry_base_delay_secs {
+            self.retry_base_delay_secs = Some(retry_base_delay_secs);
+        }
+        if let Some(retry_max_delay_secs) = update.retry_max_delay_secs {
+            self.retry_max_delay_secs = Some(retry_max_delay_secs);
+        }
+        if let Some(max_attempts) = update.max_attempts {
+            self.max_attempts = Some(max_attempts);
+        }
+        if let Some(near_capacity_percent) = update.near_capacity_percent {
+            self.near_capacity_percent = Some(near_capacity_percent);
+        }
+    }
+
+    fn apply_to_gateway_thread_episodic_config(
+        &self,
+        mut config: GatewayThreadEpisodicConfig,
+    ) -> GatewayThreadEpisodicConfig {
+        let settings = self.apply_to_thread_episodic_settings(
+            GatewayThreadEpisodicSettings::from_gateway_thread_episodic_config(&config),
+        );
+        config.enabled = settings.enabled;
+        config.indexing_enabled = settings.indexing_enabled;
+        config.recall_enabled = settings.recall_enabled;
+        config.default_prompt_chars = settings.default_prompt_chars;
+        config.max_prompt_chars = settings.max_prompt_chars;
+        config.max_hit_chars = settings.max_hit_chars as usize;
+        config.default_max_candidates = settings.default_max_candidates;
+        config.max_candidate_work = settings.max_candidate_work;
+        config.max_segments = settings.max_segments as u64;
+        config.min_relevancy = settings.min_relevancy;
+        config.min_results = settings.min_results;
+        config.snippet_chars = settings.snippet_chars;
+        config.chunk_target_min_chars = settings.chunk_target_min_chars as usize;
+        config.chunk_target_max_chars = settings.chunk_target_max_chars as usize;
+        config.chunk_max_chars = settings.chunk_max_chars as usize;
+        config.max_chunks_per_item = settings.max_chunks_per_item as usize;
+        config.index_batch_limit = settings.index_batch_limit as u64;
+        config.retry_base_delay_secs = settings.retry_base_delay_secs;
+        config.retry_max_delay_secs = settings.retry_max_delay_secs;
+        config.max_attempts = settings.max_attempts;
+        config.near_capacity_percent = settings.near_capacity_percent;
+        config
+    }
+}
+
 fn model_selection_from_protocol(
     selection: pioneer_protocol::GatewayMemoryModelSelection,
 ) -> GatewayMemoryModelSelectionConfig {
@@ -456,6 +866,7 @@ pub fn load_or_create_gateway_settings(
         general: GatewayGeneralSettings::default(),
         secrets: GatewaySecretsSettings::default(),
         memory: None,
+        thread_episodic: None,
         migrated: false,
     };
 
@@ -567,8 +978,8 @@ mod tests {
         GatewayArtifactsConfig, GatewayAuthConfig, GatewayComputerUseToolsConfig, GatewayConfig,
         GatewayDatabaseConfig, GatewayExecutionWindowsConfig, GatewayMemoryConfig,
         GatewayMemoryModelSelectionConfig, GatewayProviderConfig, GatewaySkillsConfig,
-        GatewayThreadConfig, GatewayToolLoopBudgetConfig, GatewayToolRetryBudgetConfig,
-        GatewayToolsConfig, GatewayWebToolsConfig,
+        GatewayThreadConfig, GatewayThreadEpisodicConfig, GatewayToolLoopBudgetConfig,
+        GatewayToolRetryBudgetConfig, GatewayToolsConfig, GatewayWebToolsConfig,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -595,6 +1006,7 @@ mod tests {
         assert!(!content.contains("[mcp]"));
         assert!(!content.contains("[mcp.secrets]"));
         assert!(!content.contains("[memory]"));
+        assert!(!content.contains("[thread_episodic]"));
 
         let _ = fs::remove_dir_all(temp_dir);
     }
@@ -763,6 +1175,7 @@ backend = "keystore"
                 )),
             }),
             memory: None,
+            thread_episodic: None,
         });
         save_gateway_settings(&path, &settings).expect("settings should save");
 
@@ -815,6 +1228,161 @@ backend = "keystore"
         assert!(!content.contains("capsules_dir"));
         assert!(!content.contains("allow_global_user_by_default"));
         assert!(!content.contains("allow_global_agent_by_default"));
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn gateway_settings_thread_episodic_overrides_gateway_config_without_storage_fields() {
+        let settings = toml::from_str::<super::GatewaySettings>(
+            r#"
+version = 1
+
+[secrets]
+backend = "keystore"
+
+[thread_episodic]
+enabled = true
+indexing_enabled = false
+recall_enabled = false
+default_prompt_chars = 1200
+max_prompt_chars = 4800
+max_hit_chars = 600
+default_max_candidates = 12
+max_candidate_work = 24
+max_segments = 4
+min_relevancy = 0.45
+min_results = 2
+snippet_chars = 240
+chunk_target_min_chars = 500
+chunk_target_max_chars = 900
+chunk_max_chars = 1100
+max_chunks_per_item = 16
+index_batch_limit = 4
+retry_base_delay_secs = 12
+retry_max_delay_secs = 120
+max_attempts = 3
+near_capacity_percent = 75.0
+"#,
+        )
+        .expect("gateway settings should parse");
+
+        let base = GatewayThreadEpisodicConfig {
+            enabled: false,
+            indexing_enabled: true,
+            recall_enabled: true,
+            default_prompt_chars: 2400,
+            max_prompt_chars: 12_000,
+            max_hit_chars: 1_200,
+            default_max_candidates: 32,
+            max_candidate_work: 128,
+            max_segments: 16,
+            min_relevancy: 0.25,
+            min_results: 1,
+            snippet_chars: 360,
+            chunk_target_min_chars: 700,
+            chunk_target_max_chars: 1_200,
+            chunk_max_chars: 1_600,
+            max_chunks_per_item: 64,
+            index_batch_limit: 16,
+            retry_base_delay_secs: 30,
+            retry_max_delay_secs: 900,
+            max_attempts: 5,
+            near_capacity_percent: 90.0,
+        };
+
+        let mapped = settings.apply_to_gateway_thread_episodic_config(base);
+
+        assert!(mapped.enabled);
+        assert!(!mapped.indexing_enabled);
+        assert!(!mapped.recall_enabled);
+        assert_eq!(mapped.default_prompt_chars, 1200);
+        assert_eq!(mapped.max_prompt_chars, 4800);
+        assert_eq!(mapped.max_hit_chars, 600);
+        assert_eq!(mapped.default_max_candidates, 12);
+        assert_eq!(mapped.max_candidate_work, 24);
+        assert_eq!(mapped.max_segments, 4);
+        assert_eq!(mapped.min_relevancy, 0.45);
+        assert_eq!(mapped.min_results, 2);
+        assert_eq!(mapped.snippet_chars, 240);
+        assert_eq!(mapped.chunk_target_min_chars, 500);
+        assert_eq!(mapped.chunk_target_max_chars, 900);
+        assert_eq!(mapped.chunk_max_chars, 1100);
+        assert_eq!(mapped.max_chunks_per_item, 16);
+        assert_eq!(mapped.index_batch_limit, 4);
+        assert_eq!(mapped.retry_base_delay_secs, 12);
+        assert_eq!(mapped.retry_max_delay_secs, 120);
+        assert_eq!(mapped.max_attempts, 3);
+        assert_eq!(mapped.near_capacity_percent, 75.0);
+    }
+
+    #[test]
+    fn saves_gateway_thread_episodic_settings_in_gateway_settings_file() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let path = temp_dir.join("gateway-settings.toml");
+        let mut settings = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
+            .expect("settings should be created");
+
+        settings.set_thread_episodic_settings(super::GatewayThreadEpisodicSettings {
+            enabled: true,
+            indexing_enabled: false,
+            recall_enabled: false,
+            default_prompt_chars: 1200,
+            max_prompt_chars: 4800,
+            max_hit_chars: 600,
+            default_max_candidates: 12,
+            max_candidate_work: 24,
+            max_segments: 4,
+            min_relevancy: 0.45,
+            min_results: 2,
+            snippet_chars: 240,
+            chunk_target_min_chars: 500,
+            chunk_target_max_chars: 900,
+            chunk_max_chars: 1100,
+            max_chunks_per_item: 16,
+            index_batch_limit: 4,
+            retry_base_delay_secs: 12,
+            retry_max_delay_secs: 120,
+            max_attempts: 3,
+            near_capacity_percent: 75.0,
+        });
+        save_gateway_settings(&path, &settings).expect("settings should save");
+
+        let content = fs::read_to_string(&path).expect("read settings");
+        assert!(content.contains("[thread_episodic]"));
+        assert!(content.contains("indexing_enabled = false"));
+        assert!(content.contains("recall_enabled = false"));
+        assert!(content.contains("default_prompt_chars = 1200"));
+        assert!(content.contains("min_relevancy = 0.45"));
+        assert!(!content.contains("capsules_dir"));
+        assert!(!content.contains("thread_episodic/"));
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn partial_gateway_thread_episodic_update_saves_enabled_without_hidden_fields() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let path = temp_dir.join("gateway-settings.toml");
+        let mut settings = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
+            .expect("settings should be created");
+
+        let changes = settings.apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+            thread_episodic: Some(
+                pioneer_protocol::GatewayThreadEpisodicSettingsUpdate::enabled(false),
+            ),
+            ..pioneer_protocol::GatewaySettingsUpdate::default()
+        });
+        assert!(changes.thread_episodic);
+        save_gateway_settings(&path, &settings).expect("settings should save");
+
+        let content = fs::read_to_string(&path).expect("read settings");
+        assert!(content.contains("[thread_episodic]"));
+        assert!(content.contains("enabled = false"));
+        assert!(!content.contains("indexing_enabled"));
+        assert!(!content.contains("recall_enabled"));
 
         let _ = fs::remove_dir_all(temp_dir);
     }
@@ -1152,6 +1720,7 @@ model = "legacy-model"
                 run_migrations_on_startup: true,
             },
             memory: GatewayMemoryConfig::default(),
+            thread_episodic: GatewayThreadEpisodicConfig::default(),
             hooks: Default::default(),
             artifacts: GatewayArtifactsConfig::default(),
             auth: GatewayAuthConfig {

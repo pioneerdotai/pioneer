@@ -4,6 +4,7 @@
   "type": "string",
   "enum": [
     "prompt_context",
+    "thread_context",
     "prompt_section",
     "prompt_manifest_diagnostic",
     "runtime_failure"

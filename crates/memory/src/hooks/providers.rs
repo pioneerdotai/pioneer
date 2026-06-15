@@ -33,6 +33,7 @@ pub enum MemoryEpisodicRecallSourceKind {
     #[default]
     CurrentThread,
     RelatedThread,
+    WorkspaceThread,
     CurrentTask,
     CompletedTask,
     TranscriptSummary,
@@ -43,6 +44,7 @@ impl MemoryEpisodicRecallSourceKind {
         match self {
             Self::CurrentThread => "current_thread",
             Self::RelatedThread => "related_thread",
+            Self::WorkspaceThread => "workspace_thread",
             Self::CurrentTask => "current_task",
             Self::CompletedTask => "completed_task",
             Self::TranscriptSummary => "transcript_summary",
@@ -97,6 +99,8 @@ impl MemoryEpisodicRecallVisibility {
 pub struct MemoryEpisodicRecallCapabilities {
     pub current_thread_search: bool,
     pub related_thread_search: bool,
+    #[serde(default)]
+    pub workspace_thread_search: bool,
     pub current_task_context: bool,
     pub completed_task_summary: bool,
 }
@@ -105,6 +109,7 @@ impl MemoryEpisodicRecallCapabilities {
     pub fn any(&self) -> bool {
         self.current_thread_search
             || self.related_thread_search
+            || self.workspace_thread_search
             || self.current_task_context
             || self.completed_task_summary
     }
@@ -114,6 +119,7 @@ impl MemoryEpisodicRecallCapabilities {
             MemoryEpisodicRecallSourceKind::CurrentThread
             | MemoryEpisodicRecallSourceKind::TranscriptSummary => self.current_thread_search,
             MemoryEpisodicRecallSourceKind::RelatedThread => self.related_thread_search,
+            MemoryEpisodicRecallSourceKind::WorkspaceThread => self.workspace_thread_search,
             MemoryEpisodicRecallSourceKind::CurrentTask => self.current_task_context,
             MemoryEpisodicRecallSourceKind::CompletedTask => self.completed_task_summary,
         }
@@ -126,6 +132,9 @@ impl MemoryEpisodicRecallCapabilities {
         }
         if self.related_thread_search {
             names.push("related_threads".to_owned());
+        }
+        if self.workspace_thread_search {
+            names.push("workspace_threads".to_owned());
         }
         if self.current_task_context {
             names.push("current_task".to_owned());
@@ -186,6 +195,7 @@ pub struct MemoryEpisodicRecallResponse {
 pub struct MemoryCurrentThreadRecallRequest {
     pub workspace_id: String,
     pub thread_id: String,
+    pub turn_id: String,
     pub query: String,
     #[serde(default)]
     pub targets: Vec<MemoryRecallTarget>,
@@ -196,6 +206,18 @@ pub struct MemoryCurrentThreadRecallRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryRelatedThreadRecallRequest {
+    pub workspace_id: String,
+    pub current_thread_id: String,
+    pub query: String,
+    #[serde(default)]
+    pub targets: Vec<MemoryRecallTarget>,
+    pub top_k: u32,
+    pub max_chars: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryWorkspaceThreadRecallRequest {
     pub workspace_id: String,
     pub current_thread_id: String,
     pub query: String,
@@ -257,6 +279,16 @@ pub trait AgentEpisodicRecallProvider: Send + Sync {
     ) -> Result<MemoryEpisodicRecallResponse, String> {
         Ok(MemoryEpisodicRecallResponse {
             diagnostics: vec!["memory.episodic_recall.related_threads_unavailable".to_owned()],
+            ..MemoryEpisodicRecallResponse::default()
+        })
+    }
+
+    async fn recall_workspace_threads(
+        &self,
+        _request: MemoryWorkspaceThreadRecallRequest,
+    ) -> Result<MemoryEpisodicRecallResponse, String> {
+        Ok(MemoryEpisodicRecallResponse {
+            diagnostics: vec!["memory.episodic_recall.workspace_threads_unavailable".to_owned()],
             ..MemoryEpisodicRecallResponse::default()
         })
     }
@@ -415,6 +447,7 @@ pub struct MemoryActiveRecallDecisionRequest {
     pub available_modes: Vec<String>,
     pub available_scoped_contexts: Vec<String>,
     pub episodic_capabilities: MemoryEpisodicRecallCapabilities,
+    pub thread_episodic: MemoryActiveRecallThreadEpisodicSummary,
     pub max_queries: usize,
     pub top_k_per_query: u32,
     pub max_prompt_chars: usize,
@@ -458,6 +491,7 @@ impl MemoryActiveRecallDecisionRequest {
             available_modes: self.available_modes.clone(),
             available_scoped_contexts: self.available_scoped_contexts.clone(),
             episodic_capabilities: self.episodic_capabilities.clone(),
+            thread_episodic: self.thread_episodic.clone(),
             budgets: MemoryActiveRecallPlannerBudgetInput {
                 max_queries: self.max_queries,
                 top_k_per_query: self.top_k_per_query,
@@ -469,6 +503,22 @@ impl MemoryActiveRecallDecisionRequest {
         };
         serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_owned())
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryActiveRecallThreadEpisodicSummary {
+    pub current_thread_id_present: bool,
+    pub current_thread_recall_available: bool,
+    pub related_thread_recall_available: bool,
+    #[serde(default)]
+    pub workspace_thread_recall_available: bool,
+    pub prompt_context_source_count: usize,
+    pub prompt_context_chars: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -497,6 +547,7 @@ struct MemoryActiveRecallPlannerSanitizedInput {
     available_modes: Vec<String>,
     available_scoped_contexts: Vec<String>,
     episodic_capabilities: MemoryEpisodicRecallCapabilities,
+    thread_episodic: MemoryActiveRecallThreadEpisodicSummary,
     budgets: MemoryActiveRecallPlannerBudgetInput,
     fallback_policy: String,
 }

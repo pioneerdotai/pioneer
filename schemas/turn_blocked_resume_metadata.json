@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnBlockedResumeMetadata",
+  "type": "object",
+  "properties": {
+    "blocked_recovery_job_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "can_resume_same_turn": {
+      "type": "boolean"
+    },
+    "human_message": {
+      "type": "string"
+    },
+    "latest_checkpoint_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "reason_class": {
+      "type": "string"
+    },
+    "resume_command": {
+      "type": "string"
+    },
+    "resume_requirements": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "reason_class",
+    "human_message",
+    "resume_requirements",
+    "resume_command",
+    "can_resume_same_turn"
+  ]
+}

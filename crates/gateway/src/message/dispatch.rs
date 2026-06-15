@@ -2238,6 +2238,18 @@ impl MessageProcessor {
             self.apply_memory_loop_config(loop_config);
             self.reinstall_memory_hook_runtime_if_bound().await;
         }
+        if changes.thread_episodic {
+            let thread_episodic_settings =
+                crate::settings::GatewayThreadEpisodicSettings::from_protocol(
+                    snapshot.thread_episodic.clone(),
+                );
+            let runtime_config = crate::thread_episodic_runtime_config_from_gateway_settings(
+                &thread_episodic_settings,
+            );
+            self.apply_thread_episodic_runtime_config(runtime_config)
+                .await;
+            self.reinstall_memory_hook_runtime_if_bound().await;
+        }
 
         Ok(snapshot)
     }

@@ -15,6 +15,7 @@ mod skills;
 mod task;
 mod thread;
 mod thread_agents_doc;
+mod thread_episodic;
 mod turn;
 mod workspace;
 
@@ -104,7 +105,8 @@ pub use settings::{
     GatewayGeneralSettings, GatewayGeneralSettingsUpdate, GatewayMemoryModelSelection,
     GatewayMemoryModelSelectionSource, GatewayMemorySettings, GatewaySettingsGetParams,
     GatewaySettingsGetResponse, GatewaySettingsSnapshot, GatewaySettingsUpdate,
-    GatewaySettingsUpdateParams, GatewaySettingsUpdateResponse,
+    GatewaySettingsUpdateParams, GatewaySettingsUpdateResponse, GatewayThreadEpisodicSettings,
+    GatewayThreadEpisodicSettingsUpdate,
 };
 pub use skills::{
     SkillArchiveFormat, SkillAuditTimelineItem, SkillChangedItem, SkillDependencyDiagnostic,
@@ -177,6 +179,15 @@ pub use thread_agents_doc::{
     ThreadAgentsDocResolveForThreadResponse, ThreadAgentsDocResolvedPayload,
     ThreadAgentsDocSaveParams, ThreadAgentsDocSaveReason, ThreadAgentsDocSaveResponse,
     ThreadAgentsDocStatus, ThreadAgentsDocSummary,
+};
+pub use thread_episodic::{
+    ThreadEpisodicAdaptiveDiagnostics, ThreadEpisodicAdaptiveStrategy, ThreadEpisodicChunk,
+    ThreadEpisodicChunkId, ThreadEpisodicChunkStatus, ThreadEpisodicHit, ThreadEpisodicItemId,
+    ThreadEpisodicRecallDiagnostic, ThreadEpisodicRecallDiagnosticCode, ThreadEpisodicRecallInput,
+    ThreadEpisodicRecallOutput, ThreadEpisodicRecallPolicyContext, ThreadEpisodicScoreBreakdown,
+    ThreadEpisodicSearchMode, ThreadEpisodicSourceActorRole, ThreadEpisodicSourceContext,
+    ThreadEpisodicSourceProvenance, ThreadEpisodicThreadId, ThreadEpisodicTurnId,
+    ThreadEpisodicVisibility, ThreadEpisodicWorkspaceId,
 };
 pub use turn::{
     ByteRange, ContextCompressedNotification, ContextCompressingNotification, DeltaOutputPolicy,

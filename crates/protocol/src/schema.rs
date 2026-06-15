@@ -35,22 +35,22 @@ use crate::{
     GatewayMemoryModelSelectionSource, GatewayMemorySettings, GatewayNotification,
     GatewaySettingsGetParams, GatewaySettingsGetResponse, GatewaySettingsSnapshot,
     GatewaySettingsUpdate, GatewaySettingsUpdateParams, GatewaySettingsUpdateResponse,
-    ItemCompletedNotification, ItemDeltaNotification, ItemRecoveryAttachedNotification,
-    ItemRecoveryExhaustedNotification, ItemRecoveryOpenedNotification,
-    ItemRecoverySucceededNotification, ItemRetryAttemptStartedNotification,
-    ItemRetryScheduledNotification, ItemStartedNotification, ItemTimeoutDetectedNotification,
-    ItemToolRetryExhaustedNotification, ItemToolRetryResolvedNotification,
-    ItemToolRetryScheduledNotification, ItemUpdatedNotification, MarkdownBlock, MarkdownDocument,
-    MarkdownInline, MarkdownList, MarkdownListItem, MarkdownMark, MarkdownMarkKind,
-    McpAuditEventSummary, McpChangedAction, McpChangedItem, McpChangedNotification,
-    McpDiagnosticLevel, McpInstallParams, McpInstallResponse, McpInstallResult,
-    McpInstallResultStatus, McpInstallStatus, McpLifecycleAuditSummary, McpListItem, McpListParams,
-    McpListResponse, McpPolicySetParams, McpPolicySetResponse, McpPolicyState,
-    McpPromptCatalogItem, McpResourceCatalogItem, McpResourceTemplateCatalogItem, McpRuntimeState,
-    McpRuntimeStatus, McpScopeKind, McpServerCatalogChangedNotification, McpServerCatalogDetails,
-    McpServerDetailsParams, McpServerDetailsResponse, McpServerHealthDetails, McpServerPolicy,
-    McpServerRestartParams, McpServerRestartResponse, McpServerStatus,
-    McpServerStatusChangedNotification, McpServerStatusItem, McpSourceKind,
+    GatewayThreadEpisodicSettings, GatewayThreadEpisodicSettingsUpdate, ItemCompletedNotification,
+    ItemDeltaNotification, ItemRecoveryAttachedNotification, ItemRecoveryExhaustedNotification,
+    ItemRecoveryOpenedNotification, ItemRecoverySucceededNotification,
+    ItemRetryAttemptStartedNotification, ItemRetryScheduledNotification, ItemStartedNotification,
+    ItemTimeoutDetectedNotification, ItemToolRetryExhaustedNotification,
+    ItemToolRetryResolvedNotification, ItemToolRetryScheduledNotification, ItemUpdatedNotification,
+    MarkdownBlock, MarkdownDocument, MarkdownInline, MarkdownList, MarkdownListItem, MarkdownMark,
+    MarkdownMarkKind, McpAuditEventSummary, McpChangedAction, McpChangedItem,
+    McpChangedNotification, McpDiagnosticLevel, McpInstallParams, McpInstallResponse,
+    McpInstallResult, McpInstallResultStatus, McpInstallStatus, McpLifecycleAuditSummary,
+    McpListItem, McpListParams, McpListResponse, McpPolicySetParams, McpPolicySetResponse,
+    McpPolicyState, McpPromptCatalogItem, McpResourceCatalogItem, McpResourceTemplateCatalogItem,
+    McpRuntimeState, McpRuntimeStatus, McpScopeKind, McpServerCatalogChangedNotification,
+    McpServerCatalogDetails, McpServerDetailsParams, McpServerDetailsResponse,
+    McpServerHealthDetails, McpServerPolicy, McpServerRestartParams, McpServerRestartResponse,
+    McpServerStatus, McpServerStatusChangedNotification, McpServerStatusItem, McpSourceKind,
     McpToolAnnotationSummary, McpToolCatalogItem, McpTransportSummary, McpTurnBindingSummary,
     McpUninstallParams, McpUninstallResponse, McpValidationDiagnostic, MemoryActor,
     MemoryActorKind, MemoryAttribute, MemoryAttributeCardinality, MemoryCandidate,
@@ -131,14 +131,21 @@ use crate::{
     ThreadAgentsDocPayload, ThreadAgentsDocResolveForThreadParams,
     ThreadAgentsDocResolveForThreadResponse, ThreadAgentsDocResolvedPayload,
     ThreadAgentsDocSaveParams, ThreadAgentsDocSaveReason, ThreadAgentsDocSaveResponse,
-    ThreadAgentsDocStatus, ThreadAgentsDocSummary, ThreadClosedNotification, ThreadFolder,
-    ThreadFolderCreateParams, ThreadFolderCreateResponse, ThreadFolderDeleteParams,
-    ThreadFolderDeleteResponse, ThreadFolderMoveParams, ThreadFolderMoveResponse, ThreadGetParams,
-    ThreadGetResponse, ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadHistoryParams,
-    ThreadHistoryResponse, ThreadLineage, ThreadMode, ThreadMoveParams, ThreadMoveResponse,
-    ThreadOriginKind, ThreadPlacement, ThreadSidebarVisibility, ThreadStartParams,
-    ThreadStartResponse, ThreadStartedNotification, ThreadStatus, ThreadTreeChangedNotification,
-    ThreadTreeParams, ThreadTreeResponse, ThreadUnsubscribeParams, ThreadUnsubscribeResponse,
+    ThreadAgentsDocStatus, ThreadAgentsDocSummary, ThreadClosedNotification,
+    ThreadEpisodicAdaptiveDiagnostics, ThreadEpisodicAdaptiveStrategy, ThreadEpisodicChunk,
+    ThreadEpisodicChunkId, ThreadEpisodicChunkStatus, ThreadEpisodicHit, ThreadEpisodicItemId,
+    ThreadEpisodicRecallDiagnostic, ThreadEpisodicRecallDiagnosticCode, ThreadEpisodicRecallInput,
+    ThreadEpisodicRecallOutput, ThreadEpisodicRecallPolicyContext, ThreadEpisodicScoreBreakdown,
+    ThreadEpisodicSearchMode, ThreadEpisodicSourceActorRole, ThreadEpisodicSourceContext,
+    ThreadEpisodicSourceProvenance, ThreadEpisodicThreadId, ThreadEpisodicTurnId,
+    ThreadEpisodicVisibility, ThreadEpisodicWorkspaceId, ThreadFolder, ThreadFolderCreateParams,
+    ThreadFolderCreateResponse, ThreadFolderDeleteParams, ThreadFolderDeleteResponse,
+    ThreadFolderMoveParams, ThreadFolderMoveResponse, ThreadGetParams, ThreadGetResponse,
+    ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadHistoryParams, ThreadHistoryResponse,
+    ThreadLineage, ThreadMode, ThreadMoveParams, ThreadMoveResponse, ThreadOriginKind,
+    ThreadPlacement, ThreadSidebarVisibility, ThreadStartParams, ThreadStartResponse,
+    ThreadStartedNotification, ThreadStatus, ThreadTreeChangedNotification, ThreadTreeParams,
+    ThreadTreeResponse, ThreadUnsubscribeParams, ThreadUnsubscribeResponse,
     ThreadUnsubscribeStatus, ThreadUpdateParams, ThreadUpdateResponse, ThreadUpdatedNotification,
     ToolDisplayPayload, ToolLoopBudgetAction, ToolLoopBudgetLimitKind, ToolMetadata,
     ToolMetadataRawKind, ToolMetadataValue, ToolOutputPolicySnapshot, ToolOutputSummary,
@@ -519,6 +526,66 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "memory_forgotten_notification.json",
             MemoryForgottenNotification
+        ),
+        schema_doc!(
+            "thread_episodic_workspace_id.json",
+            ThreadEpisodicWorkspaceId
+        ),
+        schema_doc!("thread_episodic_thread_id.json", ThreadEpisodicThreadId),
+        schema_doc!("thread_episodic_turn_id.json", ThreadEpisodicTurnId),
+        schema_doc!("thread_episodic_item_id.json", ThreadEpisodicItemId),
+        schema_doc!("thread_episodic_chunk_id.json", ThreadEpisodicChunkId),
+        schema_doc!(
+            "thread_episodic_source_actor_role.json",
+            ThreadEpisodicSourceActorRole
+        ),
+        schema_doc!(
+            "thread_episodic_source_context.json",
+            ThreadEpisodicSourceContext
+        ),
+        schema_doc!(
+            "thread_episodic_chunk_status.json",
+            ThreadEpisodicChunkStatus
+        ),
+        schema_doc!("thread_episodic_visibility.json", ThreadEpisodicVisibility),
+        schema_doc!(
+            "thread_episodic_source_provenance.json",
+            ThreadEpisodicSourceProvenance
+        ),
+        schema_doc!("thread_episodic_chunk.json", ThreadEpisodicChunk),
+        schema_doc!("thread_episodic_search_mode.json", ThreadEpisodicSearchMode),
+        schema_doc!(
+            "thread_episodic_adaptive_strategy.json",
+            ThreadEpisodicAdaptiveStrategy
+        ),
+        schema_doc!(
+            "thread_episodic_score_breakdown.json",
+            ThreadEpisodicScoreBreakdown
+        ),
+        schema_doc!(
+            "thread_episodic_adaptive_diagnostics.json",
+            ThreadEpisodicAdaptiveDiagnostics
+        ),
+        schema_doc!("thread_episodic_hit.json", ThreadEpisodicHit),
+        schema_doc!(
+            "thread_episodic_recall_policy_context.json",
+            ThreadEpisodicRecallPolicyContext
+        ),
+        schema_doc!(
+            "thread_episodic_recall_input.json",
+            ThreadEpisodicRecallInput
+        ),
+        schema_doc!(
+            "thread_episodic_recall_diagnostic_code.json",
+            ThreadEpisodicRecallDiagnosticCode
+        ),
+        schema_doc!(
+            "thread_episodic_recall_diagnostic.json",
+            ThreadEpisodicRecallDiagnostic
+        ),
+        schema_doc!(
+            "thread_episodic_recall_output.json",
+            ThreadEpisodicRecallOutput
         ),
         schema_doc!("thread.json", Thread),
         schema_doc!("thread_status.json", ThreadStatus),
@@ -1061,6 +1128,14 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
             GatewayMemoryModelSelection
         ),
         schema_doc!("gateway_memory_settings.json", GatewayMemorySettings),
+        schema_doc!(
+            "gateway_thread_episodic_settings.json",
+            GatewayThreadEpisodicSettings
+        ),
+        schema_doc!(
+            "gateway_thread_episodic_settings_update.json",
+            GatewayThreadEpisodicSettingsUpdate
+        ),
         schema_doc!("gateway_general_settings.json", GatewayGeneralSettings),
         schema_doc!(
             "gateway_general_settings_update.json",

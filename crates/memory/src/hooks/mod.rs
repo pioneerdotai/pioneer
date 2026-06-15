@@ -31,20 +31,21 @@ use pioneer_hooks::{
     HookDiagnostic, HookDiagnosticCode, HookDiagnosticMessage, HookDiagnosticSeverity, HookDomain,
     HookError, HookExecutionPolicy, HookFailurePolicy, HookHandlerRequest, HookHandlerResponse,
     HookId, HookInputPayload, HookKind, HookMetadata, HookMetadataKey, HookPackage, HookPhase,
-    HookPolicyKey, HookPolicySet, HookPromptContent, HookRegistryError, HookResult,
-    HookRetryBackoff, HookRetryPolicy, HookSectionId, HookSourceId, HookSourceKind, HookSourceRef,
-    HookSubscription, HookSubscriptionDependencies, HookSubscriptionId, HookSubscriptionVisibility,
-    HookToolBundleId, HookToolName, HookValue, PolicyContribution, PromptContextContribution,
-    PromptSectionContribution, ToolBundleContribution, TurnPostPreflightPromptContextHookInput,
-    TurnPostTurnDomain, TurnPostTurnHookInput, TurnPostTurnStatus, TurnPrePolicyHookInput,
-    TurnPrePromptCompileHookInput, TurnPrePromptContextHookInput,
+    HookPolicyKey, HookPolicySet, HookPromptContent, HookPromptSectionTitle, HookRegistryError,
+    HookResult, HookRetryBackoff, HookRetryPolicy, HookSectionId, HookSourceId, HookSourceKind,
+    HookSourceRef, HookSubscription, HookSubscriptionDependencies, HookSubscriptionId,
+    HookSubscriptionVisibility, HookToolBundleId, HookToolName, HookValue, PolicyContribution,
+    PromptContextContribution, PromptSectionContribution, ToolBundleContribution,
+    TurnPostPreflightPromptContextHookInput, TurnPostTurnDomain, TurnPostTurnHookInput,
+    TurnPostTurnStatus, TurnPrePolicyHookInput, TurnPrePromptCompileHookInput,
+    TurnPrePromptContextHookInput,
 };
 #[cfg(test)]
 use pioneer_promt::MemoryRecallPromptItem;
 use pioneer_promt::{
     MemoryPostTurnExtractorPromptInput, MemoryRecallPromptContextBlock, MemoryRecallPromptInput,
     MemoryRecallPromptPolicy, render_memory_post_turn_extractor_prompt,
-    render_memory_recall_prompt,
+    render_memory_recall_prompt, render_thread_context_prompt,
 };
 use pioneer_protocol::{
     MemoryActor, MemoryActorKind, MemoryAttribute, MemoryCandidateStatus, MemoryCategory,
@@ -65,7 +66,8 @@ pub use active_recall::{
     ActiveMemoryDecision, ActiveMemoryDecisionReasonCode, ActiveMemoryDecisionReasonCodeJson,
     ActiveMemoryDecisionStatus, ActiveRecallMode, ActiveRecallPlan, ActiveRecallPlanJson,
     ActiveRecallPlanJsonStatus, ActiveRecallTarget, active_recall_planned_query_count,
-    normalize_active_recall_plan, parse_active_memory_decision_json,
+    active_recall_thread_episodic_summary, normalize_active_recall_plan,
+    parse_active_memory_decision_json,
 };
 pub use artifact_store::*;
 use capabilities::*;
@@ -89,6 +91,7 @@ pub use recall::{
     DeterministicRecallContextSummary, MemoryActiveRecallLocalPlan,
     MemoryActiveRecallProviderFallbackContext, active_recall_preflight_provider_fallback,
     active_recall_preflight_provider_success, build_active_recall_local_preflight_plan,
+    build_active_recall_local_preflight_plan_with_thread_summary,
     deterministic_recall_context_summary,
 };
 use state::*;

@@ -925,6 +925,10 @@ default = "Default"
 select_model = "Select model"
 dialog_title = "Select Preflight Model"
 
+[settings.memory.thread_context]
+label = "Thread context"
+description = "Allow Pioneer to index and recall useful context from the current thread."
+
 [settings.memory]
 title = "Memory"
 description = "Control how Pioneer uses durable memory."

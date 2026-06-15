@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadEpisodicRecallDiagnostic",
+  "type": "object",
+  "properties": {
+    "code": {
+      "$ref": "#/$defs/ThreadEpisodicRecallDiagnosticCode"
+    },
+    "message": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "code",
+    "message"
+  ],
+  "$defs": {
+    "ThreadEpisodicRecallDiagnosticCode": {
+      "type": "string",
+      "enum": [
+        "completed",
+        "skipped_by_policy",
+        "backend_unavailable",
+        "invalid_input",
+        "prompt_budget_exceeded",
+        "suppressed_by_boundary",
+        "unknown"
+      ]
+    }
+  }
+}

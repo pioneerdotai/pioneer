@@ -48,8 +48,9 @@ use pioneer_hooks::{
 };
 use pioneer_memory::hooks::{
     MemoryEpisodicRecallCapabilities, MemoryTurnContext, MemoryTurnPolicy,
-    build_active_recall_local_preflight_plan, deterministic_recall_context_summary,
-    memory_turn_policy_from_hook_policy_set,
+    active_recall_thread_episodic_summary,
+    build_active_recall_local_preflight_plan_with_thread_summary,
+    deterministic_recall_context_summary, memory_turn_policy_from_hook_policy_set,
 };
 use pioneer_promt::{
     CompiledPromptBundle, ExecutionContinuationRuntimeFactsInput, PromptCompileInput,
@@ -1517,13 +1518,29 @@ async fn run_agent_turn_preflight_stage(
         task_id: hook_runtime_context.task_id.clone(),
         agent_id: hook_runtime_context.agent_id.clone(),
     };
-    let active_recall = build_active_recall_local_preflight_plan(
+    let episodic_capabilities = MemoryEpisodicRecallCapabilities {
+        current_thread_search: !thread_id.trim().is_empty(),
+        related_thread_search: false,
+        workspace_thread_search: false,
+        current_task_context: hook_runtime_context
+            .task_id
+            .as_ref()
+            .is_some_and(|task_id| !task_id.trim().is_empty()),
+        completed_task_summary: false,
+    };
+    let thread_episodic_summary = active_recall_thread_episodic_summary(
+        &hook_prompt_context_set,
+        &memory_context,
+        &episodic_capabilities,
+    );
+    let active_recall = build_active_recall_local_preflight_plan_with_thread_summary(
         &memory_context,
         &prompt_context_input,
         &memory_policy,
         &memory_config,
         &deterministic_summary,
-        MemoryEpisodicRecallCapabilities::default(),
+        episodic_capabilities,
+        thread_episodic_summary,
         true,
     );
     let input_text_char_count = input_text.chars().count();
@@ -1952,6 +1969,9 @@ fn prompt_manifest_hook_contribution_kind(
     match kind {
         EffectiveTurnPromptManifestHookContributionKind::PromptContext => {
             PromptManifestHookContributionKind::PromptContext
+        }
+        EffectiveTurnPromptManifestHookContributionKind::ThreadContext => {
+            PromptManifestHookContributionKind::ThreadContext
         }
         EffectiveTurnPromptManifestHookContributionKind::PromptSection => {
             PromptManifestHookContributionKind::PromptSection
