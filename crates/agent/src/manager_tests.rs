@@ -7535,18 +7535,26 @@ async fn memory_identity_flow_preflight_provider_owned_active_recall_contributes
         },
         "memory": {
             "activeRecall": {
-                "status": "run",
-                "reasonCode": "provider_run",
-                "confidence": 0.92,
-                "modes": ["profile"],
-                "targets": [{
-                    "scopeKind": "user",
-                    "factClass": "user_identity",
-                    "category": "identity",
-                    "subject": "current_user",
-                    "attribute": "name"
-                }],
-                "diagnostics": ["preflight provider ok"]
+                "durable": {
+                    "status": "run",
+                    "reasonCode": "provider_run",
+                    "confidence": 0.92,
+                    "modes": ["profile"],
+                    "targets": [{
+                        "scopeKind": "user",
+                        "factClass": "user_identity",
+                        "category": "identity",
+                        "subject": "current_user",
+                        "attribute": "name"
+                    }],
+                    "diagnostics": ["preflight provider ok"]
+                },
+                "episodic": {
+                    "status": "skip",
+                    "reasonCode": "provider_skip",
+                    "confidence": 1.0,
+                    "queries": []
+                }
             }
         }
     });
@@ -7654,18 +7662,26 @@ async fn preflight_memory_active_recall_disabled_suppresses_provider_plan() {
         },
         "memory": {
             "activeRecall": {
-                "status": "run",
-                "reasonCode": "provider_run",
-                "confidence": 0.92,
-                "modes": ["profile"],
-                "targets": [{
-                    "scopeKind": "user",
-                    "factClass": "user_identity",
-                    "category": "identity",
-                    "subject": "current_user",
-                    "attribute": "name"
-                }],
-                "diagnostics": ["must be ignored"]
+                "durable": {
+                    "status": "run",
+                    "reasonCode": "provider_run",
+                    "confidence": 0.92,
+                    "modes": ["profile"],
+                    "targets": [{
+                        "scopeKind": "user",
+                        "factClass": "user_identity",
+                        "category": "identity",
+                        "subject": "current_user",
+                        "attribute": "name"
+                    }],
+                    "diagnostics": ["must be ignored"]
+                },
+                "episodic": {
+                    "status": "skip",
+                    "reasonCode": "provider_skip",
+                    "confidence": 1.0,
+                    "queries": []
+                }
             }
         }
     });

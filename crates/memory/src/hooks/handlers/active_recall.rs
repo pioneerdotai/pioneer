@@ -114,9 +114,9 @@ impl HookHandler for ActiveMemoryRecallHook {
                 thread_episodic.clone(),
             ),
         };
-        response.diagnostics.extend(hook_diagnostics_from_strings(
-            decision.diagnostics.as_slice(),
-        ));
+        response
+            .diagnostics
+            .extend(hook_diagnostics_from_strings(&decision.all_diagnostics()));
         response
             .diagnostics
             .push(active_memory_decision_observability_diagnostic(
@@ -124,12 +124,13 @@ impl HookHandler for ActiveMemoryRecallHook {
                 &deterministic,
             ));
 
-        if decision.status != ActiveMemoryDecisionStatus::Run {
+        if decision.effective_status() != ActiveMemoryDecisionStatus::Run {
             response.diagnostics.push(memory_safe_info_diagnostic(
-                decision.reason_code.diagnostic_code(),
+                decision.effective_reason_code().diagnostic_code(),
                 format!(
                     "memory active recall skipped: reason={:?} confidence={:.2}",
-                    decision.reason_code, decision.confidence
+                    decision.effective_reason_code(),
+                    decision.effective_confidence()
                 ),
             ));
             response
@@ -283,14 +284,19 @@ impl HookHandler for ActiveMemoryRecallHook {
 fn validate_active_recall_preflight_plan_shape(
     plan: &ActiveRecallPlan,
 ) -> Result<(), &'static str> {
-    if plan.status == ActiveMemoryDecisionStatus::Run
-        && plan.modes.is_empty()
+    if plan.effective_status() == ActiveMemoryDecisionStatus::Run
+        && plan.durable.modes.is_empty()
+        && plan.episodic.queries.is_empty()
         && !plan.debug_fallback
     {
-        return Err("run plan requires at least one mode");
+        return Err("run plan requires at least one durable mode or episodic query");
     }
-    if plan.status != ActiveMemoryDecisionStatus::Run && !plan.modes.is_empty() {
-        return Err("non-run plan must not include modes");
+    if plan.durable.status != ActiveMemoryDecisionStatus::Run && !plan.durable.modes.is_empty() {
+        return Err("non-run durable plan must not include modes");
+    }
+    if plan.episodic.status != ActiveMemoryDecisionStatus::Run && !plan.episodic.queries.is_empty()
+    {
+        return Err("non-run episodic plan must not include queries");
     }
     Ok(())
 }

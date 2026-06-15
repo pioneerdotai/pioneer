@@ -224,7 +224,7 @@ async fn active_memory_hook_uses_valid_preflight_json_plan() {
         },
     };
     let plan = parse_active_memory_decision_json(
-        r#"{"status":"run","reasonCode":"provider_run","confidence":0.92,"modes":["profile"],"targets":[{"scopeKind":"user","factClass":"user_identity","category":"identity","subject":"current_user","attribute":"name"}],"diagnostics":["preflight provider ok"]}"#,
+        r#"{"durable":{"status":"run","reasonCode":"provider_run","confidence":0.92,"modes":["profile"],"targets":[{"scopeKind":"user","factClass":"user_identity","category":"identity","subject":"current_user","attribute":"name"}],"diagnostics":["preflight provider ok"]},"episodic":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"queries":[]}}"#,
     )
     .expect("provider-owned preflight plan uses memory parser");
     let input = TurnPostPreflightPromptContextHookInput::from_parts(
@@ -291,7 +291,7 @@ async fn active_recall_hook_executes_preflight_plan_without_legacy_provider() {
         },
     };
     let plan = parse_active_memory_decision_json(
-        r#"{"status":"run","reasonCode":"provider_run","confidence":0.92,"modes":["profile"],"targets":[{"scopeKind":"user","factClass":"user_identity","category":"identity","subject":"current_user","attribute":"name"}],"diagnostics":["preflight provider ok"]}"#,
+        r#"{"durable":{"status":"run","reasonCode":"provider_run","confidence":0.92,"modes":["profile"],"targets":[{"scopeKind":"user","factClass":"user_identity","category":"identity","subject":"current_user","attribute":"name"}],"diagnostics":["preflight provider ok"]},"episodic":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"queries":[]}}"#,
     )
     .expect("provider-owned preflight plan uses memory parser");
     let input = TurnPostPreflightPromptContextHookInput::from_parts(
@@ -669,13 +669,21 @@ async fn active_memory_hook_executes_preflight_provider_error_fallback_plan() {
         Some("test-provider"),
     )
     .with_active_memory_recall_preflight_plan(json!({
-        "status": "run",
-        "reasonCode": "memory_likely",
-        "confidence": 0.65,
-        "modes": ["project"],
-        "targets": [],
-        "providerFallbackUsed": true,
-        "diagnostics": ["memory.active_recall.provider_failed"]
+        "durable": {
+            "status": "run",
+            "reasonCode": "memory_likely",
+            "confidence": 0.65,
+            "modes": ["project"],
+            "targets": [],
+            "providerFallbackUsed": true,
+            "diagnostics": ["memory.active_recall.provider_failed"]
+        },
+        "episodic": {
+            "status": "skip",
+            "reasonCode": "provider_skip",
+            "confidence": 1.0,
+            "queries": []
+        }
     }));
     let mut request = test_active_prompt_context_hook_request(
         memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
@@ -729,13 +737,21 @@ async fn active_memory_hook_executes_preflight_timeout_fallback_plan() {
         Some("test-provider"),
     )
     .with_active_memory_recall_preflight_plan(json!({
-        "status": "run",
-        "reasonCode": "memory_likely",
-        "confidence": 0.65,
-        "modes": ["project"],
-        "targets": [],
-        "providerFallbackUsed": true,
-        "diagnostics": ["memory.active_recall.provider_timeout"]
+        "durable": {
+            "status": "run",
+            "reasonCode": "memory_likely",
+            "confidence": 0.65,
+            "modes": ["project"],
+            "targets": [],
+            "providerFallbackUsed": true,
+            "diagnostics": ["memory.active_recall.provider_timeout"]
+        },
+        "episodic": {
+            "status": "skip",
+            "reasonCode": "provider_skip",
+            "confidence": 1.0,
+            "queries": []
+        }
     }));
     let mut request = test_active_prompt_context_hook_request(
         memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
@@ -924,13 +940,13 @@ fn active_recall_plan_normalizes_modes_targets_and_diagnostics() {
         ]
     );
     assert_eq!(plan.targets.len(), 6);
-    assert_eq!(plan.diagnostics.len(), 6);
+    assert_eq!(plan.all_diagnostics().len(), 6);
 }
 
 #[test]
 fn active_recall_provider_plan_parses_typed_modes_and_targets() {
     let plan = parse_active_memory_decision_json(
-        r#"{"status":"run","reasonCode":"provider_run","confidence":0.91,"modes":["exact_canonical","profile"],"targets":[{"scopeKind":"user","factClass":"user_identity","category":"identity","subject":"current_user","attribute":"name","canonicalKey":"user/global:identity:self:name"}],"diagnostics":["provider ok"],"ignoredExtraKey":true}"#,
+        r#"{"durable":{"status":"run","reasonCode":"provider_run","confidence":0.91,"modes":["exact_canonical","profile"],"targets":[{"scopeKind":"user","factClass":"user_identity","category":"identity","subject":"current_user","attribute":"name","canonicalKey":"user/global:identity:self:name"}],"diagnostics":["provider ok"]},"episodic":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"queries":[]}}"#,
     )
     .expect("typed provider plan parses");
 
@@ -949,19 +965,80 @@ fn active_recall_provider_plan_parses_typed_modes_and_targets() {
         plan.targets[0].canonical_key.as_deref(),
         Some("user/global:identity:self:name")
     );
+    assert!(
+        parse_active_memory_decision_json(
+            r#"{"durable":{"status":"run","reasonCode":"provider_run","confidence":0.91,"modes":["profile"],"targets":[],"ignoredExtraKey":true},"episodic":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"queries":[]}}"#,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn active_recall_provider_plan_parses_envelope_with_durable_and_episodic_plans() {
+    let plan = parse_active_memory_decision_json(
+        r#"{
+            "durable": {
+                "status": "run",
+                "reasonCode": "provider_run",
+                "confidence": 0.91,
+                "modes": ["profile"],
+                "targets": [
+                    {
+                        "scopeKind": "user",
+                        "factClass": "user_identity",
+                        "category": "identity",
+                        "subject": "current_user",
+                        "attribute": "name",
+                        "canonicalKey": "user/global:identity:self:name"
+                    }
+                ]
+            },
+            "episodic": {
+                "status": "run",
+                "reasonCode": "provider_run",
+                "confidence": 0.84,
+                "queries": [
+                    {
+                        "mode": "current_thread",
+                        "query": "weather forecast Moscow tomorrow",
+                        "targets": [],
+                        "topK": 3,
+                        "maxChars": 700
+                    }
+                ]
+            },
+            "diagnostics": ["envelope_ok"]
+        }"#,
+    )
+    .expect("envelope provider plan parses");
+
+    assert_eq!(plan.durable.status, ActiveMemoryDecisionStatus::Run);
+    assert_eq!(plan.durable.modes, vec![ActiveRecallMode::Profile]);
+    assert_eq!(plan.durable.targets.len(), 1);
+    assert_eq!(plan.episodic.status, ActiveMemoryDecisionStatus::Run);
+    assert_eq!(plan.episodic.queries.len(), 1);
+    assert_eq!(
+        plan.episodic.queries[0].mode,
+        ActiveRecallMode::CurrentThread
+    );
+    assert_eq!(
+        plan.episodic.queries[0].query.as_str(),
+        "weather forecast Moscow tomorrow"
+    );
+    assert_eq!(plan.diagnostics, vec!["envelope_ok".to_owned()]);
 }
 
 #[test]
 fn active_recall_provider_plan_rejects_invalid_enum_values() {
     assert!(
         parse_active_memory_decision_json(
-            r#"{"status":"run","confidence":0.7,"modes":["anything"],"targets":[]}"#,
+            r#"{"durable":{"status":"run","reasonCode":"provider_run","confidence":0.7,"modes":["anything"],"targets":[]},"episodic":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"queries":[]}}"#,
         )
         .is_err()
     );
     assert!(
         parse_active_memory_decision_json(
-            r#"{"status":"run","confidence":0.7,"modes":["profile"],"targets":[{"factClass":"future_fact"}]}"#,
+            r#"{"durable":{"status":"run","reasonCode":"provider_run","confidence":0.7,"modes":["profile"],"targets":[{"factClass":"future_fact"}]},"episodic":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"queries":[]}}"#,
         )
         .is_err()
     );
@@ -971,19 +1048,19 @@ fn active_recall_provider_plan_rejects_invalid_enum_values() {
 fn active_recall_provider_plan_requires_reason_and_run_modes() {
     assert!(
         parse_active_memory_decision_json(
-            r#"{"status":"run","confidence":0.7,"modes":["profile"],"targets":[]}"#,
+            r#"{"durable":{"status":"run","confidence":0.7,"modes":["profile"],"targets":[]},"episodic":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"queries":[]}}"#,
         )
         .is_err()
     );
     assert!(
         parse_active_memory_decision_json(
-            r#"{"status":"run","reasonCode":"provider_run","confidence":0.7,"modes":[],"targets":[]}"#,
+            r#"{"durable":{"status":"run","reasonCode":"provider_run","confidence":0.7,"modes":[],"targets":[]},"episodic":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"queries":[]}}"#,
         )
         .is_err()
     );
     assert!(
         parse_active_memory_decision_json(
-            r#"{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"modes":["profile"],"targets":[]}"#,
+            r#"{"durable":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"modes":["profile"],"targets":[]},"episodic":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"queries":[]}}"#,
         )
         .is_err()
     );
@@ -992,7 +1069,7 @@ fn active_recall_provider_plan_requires_reason_and_run_modes() {
 #[test]
 fn active_recall_provider_plan_ignores_debug_fallback_and_drops_impossible_modes() {
     let plan = parse_active_memory_decision_json(
-        r#"{"status":"run","reasonCode":"provider_run","confidence":0.8,"modes":["exact_canonical","task_context","thread_episodic","profile"],"targets":[],"debugFallback":true}"#,
+        r#"{"durable":{"status":"run","reasonCode":"provider_run","confidence":0.8,"modes":["exact_canonical","task_context","thread_episodic","profile"],"targets":[],"debugFallback":true},"episodic":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"queries":[]}}"#,
     )
     .expect("provider plan parses");
     assert!(!plan.debug_fallback);
@@ -1004,19 +1081,19 @@ fn active_recall_provider_plan_ignores_debug_fallback_and_drops_impossible_modes
     assert_eq!(normalized.modes, vec![ActiveRecallMode::Profile]);
     assert!(
         normalized
-            .diagnostics
+            .all_diagnostics()
             .iter()
             .any(|diagnostic| { diagnostic == "dropped_mode=exact_canonical:no_canonical_target" })
     );
     assert!(
         normalized
-            .diagnostics
+            .all_diagnostics()
             .iter()
             .any(|diagnostic| { diagnostic == "dropped_mode=task_context:no_task_context" })
     );
     assert!(
         normalized
-            .diagnostics
+            .all_diagnostics()
             .iter()
             .any(|diagnostic| { diagnostic == "dropped_mode=thread_episodic:no_thread_context" })
     );
@@ -1106,6 +1183,8 @@ fn active_recall_decision_request_renders_sanitized_preflight_input() {
         explicit_no_memory: false,
         input_text_char_count: 21,
         available_modes: vec!["profile".to_owned(), "project".to_owned()],
+        available_durable_modes: vec!["profile".to_owned(), "project".to_owned()],
+        available_episodic_modes: vec!["current_thread".to_owned()],
         available_scoped_contexts: vec!["workspace".to_owned(), "thread".to_owned()],
         episodic_capabilities: MemoryEpisodicRecallCapabilities::default(),
         thread_episodic: MemoryActiveRecallThreadEpisodicSummary {
@@ -1130,6 +1209,8 @@ fn active_recall_decision_request_renders_sanitized_preflight_input() {
     assert!(json.contains(r#""workspaceIdPresent": true"#));
     assert!(json.contains(r#""inputTextPreview": "current bounded input""#));
     assert!(json.contains(r#""threadEpisodic""#));
+    assert!(json.contains(r#""availableDurableModes""#));
+    assert!(json.contains(r#""availableEpisodicModes""#));
     assert!(json.contains(r#""currentThreadRecallAvailable": true"#));
     assert!(json.contains(r#""thread:turn_41/item_1/chunk_0""#));
     assert!(!json.contains("workspace-secret-id"));
@@ -1241,9 +1322,13 @@ fn deterministic_active_recall_plan_uses_only_structural_context() {
     input.has_task_context = true;
     input.episodic_capabilities.current_task_context = true;
     let task_plan = deterministic_active_recall_plan(&input);
-    assert_eq!(task_plan.status, ActiveMemoryDecisionStatus::Run);
     assert_eq!(
-        task_plan.modes,
+        task_plan.effective_status(),
+        ActiveMemoryDecisionStatus::Run
+    );
+    assert_eq!(task_plan.durable.modes, Vec::<ActiveRecallMode>::new());
+    assert_eq!(
+        task_plan.selected_modes(),
         vec![ActiveRecallMode::CurrentTask, ActiveRecallMode::TaskContext]
     );
 

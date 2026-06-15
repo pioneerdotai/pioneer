@@ -297,6 +297,8 @@ fn active_recall_local_planning_parts(
         explicit_no_memory: planner_input.explicit_no_memory,
         input_text_char_count: planner_input.input_text_char_count,
         available_modes: active_recall_available_mode_names(&planner_input),
+        available_durable_modes: active_recall_available_durable_mode_names(&planner_input),
+        available_episodic_modes: active_recall_available_episodic_mode_names(&planner_input),
         available_scoped_contexts: active_recall_available_scoped_contexts(&planner_input),
         episodic_capabilities: planner_input.episodic_capabilities.clone(),
         thread_episodic: planner_input.thread_episodic.clone(),
@@ -328,7 +330,7 @@ fn active_recall_local_planning_parts(
 
 fn active_recall_local_plan_is_final(local_plan: &ActiveMemoryDecision) -> bool {
     if matches!(
-        local_plan.reason_code,
+        local_plan.effective_reason_code(),
         ActiveMemoryDecisionReasonCode::PolicyDisabled
             | ActiveMemoryDecisionReasonCode::ConfigDisabled
             | ActiveMemoryDecisionReasonCode::DeterministicOnly
@@ -338,7 +340,8 @@ fn active_recall_local_plan_is_final(local_plan: &ActiveMemoryDecision) -> bool 
         return true;
     }
 
-    local_plan.status == ActiveMemoryDecisionStatus::Run && local_plan.confidence >= 0.7
+    local_plan.effective_status() == ActiveMemoryDecisionStatus::Run
+        && local_plan.effective_confidence() >= 0.7
 }
 
 fn active_recall_no_provider_local_decision(
@@ -611,12 +614,20 @@ mod active_recall_local_preflight_tests {
     fn active_recall_preflight_provider_success_preserves_provider_metadata() {
         let parsed = parse_active_memory_decision_json(
             r#"{
-                "status": "run",
-                "reasonCode": "provider_run",
-                "confidence": 0.82,
-                "modes": ["profile"],
-                "targets": [],
-                "diagnostics": ["memory.active_recall.identity_lookup"]
+                "durable": {
+                    "status": "run",
+                    "reasonCode": "provider_run",
+                    "confidence": 0.82,
+                    "modes": ["profile"],
+                    "targets": [],
+                    "diagnostics": ["memory.active_recall.identity_lookup"]
+                },
+                "episodic": {
+                    "status": "skip",
+                    "reasonCode": "provider_skip",
+                    "confidence": 1.0,
+                    "queries": []
+                }
             }"#,
         )
         .expect("provider active recall parses through memory contract");
@@ -628,12 +639,12 @@ mod active_recall_local_preflight_tests {
         assert_eq!(decision.provider_input_chars, Some(123));
         assert_eq!(decision.provider_output_chars, Some(45));
         assert_eq!(
-            decision.diagnostics[0],
+            decision.all_diagnostics()[0],
             "memory.active_recall.provider_called"
         );
         assert!(
             decision
-                .diagnostics
+                .all_diagnostics()
                 .iter()
                 .any(|diagnostic| diagnostic == "memory.active_recall.identity_lookup")
         );
@@ -675,7 +686,7 @@ mod active_recall_local_preflight_tests {
         );
         assert!(
             plan.local_decision
-                .diagnostics
+                .all_diagnostics()
                 .iter()
                 .any(|diagnostic| diagnostic == "memory.active_recall.provider_unavailable")
         );
@@ -714,7 +725,7 @@ mod active_recall_local_preflight_tests {
         assert_eq!(plan.local_decision, resolved);
         assert!(
             plan.local_decision
-                .diagnostics
+                .all_diagnostics()
                 .iter()
                 .any(|diagnostic| diagnostic == "memory.active_recall.provider_disabled")
         );

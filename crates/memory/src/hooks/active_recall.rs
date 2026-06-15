@@ -61,6 +61,17 @@ impl ActiveMemoryDecisionReasonCode {
             Self::ProviderUncertain => "memory.active_recall.uncertain",
         }
     }
+
+    fn is_provider_allowed(self) -> bool {
+        matches!(
+            self,
+            Self::MemoryLikely
+                | Self::DeterministicSufficient
+                | Self::ProviderRun
+                | Self::ProviderSkip
+                | Self::ProviderUncertain
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -199,7 +210,7 @@ impl ActiveRecallTarget {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ActiveRecallPlan {
+pub struct DurableMemoryRecallPlan {
     pub status: ActiveMemoryDecisionStatus,
     pub reason_code: ActiveMemoryDecisionReasonCode,
     pub confidence: f32,
@@ -221,8 +232,8 @@ pub struct ActiveRecallPlan {
     pub diagnostics: Vec<String>,
 }
 
-impl ActiveRecallPlan {
-    pub(super) fn skip(
+impl DurableMemoryRecallPlan {
+    pub fn skip(
         reason_code: ActiveMemoryDecisionReasonCode,
         confidence: f32,
         diagnostics: Vec<String>,
@@ -242,14 +253,14 @@ impl ActiveRecallPlan {
         }
     }
 
-    pub(super) fn run(
+    pub fn run(
         reason_code: ActiveMemoryDecisionReasonCode,
         confidence: f32,
         modes: Vec<ActiveRecallMode>,
         targets: Vec<ActiveRecallTarget>,
         diagnostics: Vec<String>,
     ) -> Self {
-        normalize_active_recall_plan(Self {
+        normalize_durable_memory_recall_plan(Self {
             status: ActiveMemoryDecisionStatus::Run,
             reason_code,
             confidence: confidence.clamp(0.0, 1.0),
@@ -264,7 +275,7 @@ impl ActiveRecallPlan {
         })
     }
 
-    pub(super) fn uncertain(
+    pub fn uncertain(
         reason_code: ActiveMemoryDecisionReasonCode,
         confidence: f32,
         diagnostics: Vec<String>,
@@ -290,7 +301,235 @@ impl ActiveRecallPlan {
     }
 }
 
-pub type ActiveMemoryDecision = ActiveRecallPlan;
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EpisodicMemoryRecallQuery {
+    pub mode: ActiveRecallMode,
+    pub query: String,
+    #[serde(default)]
+    pub targets: Vec<ActiveRecallTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_chars: Option<usize>,
+}
+
+impl EpisodicMemoryRecallQuery {
+    fn normalized(mut self) -> Option<Self> {
+        self.query = bounded_nonempty_text(self.query.as_str(), 500)?;
+        self.targets = self
+            .targets
+            .into_iter()
+            .filter_map(ActiveRecallTarget::normalized)
+            .take(ACTIVE_RECALL_MAX_TARGETS)
+            .collect();
+        if self.mode.episodic_source_kind().is_none() {
+            return None;
+        }
+        Some(self)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EpisodicMemoryRecallPlan {
+    pub status: ActiveMemoryDecisionStatus,
+    pub reason_code: ActiveMemoryDecisionReasonCode,
+    pub confidence: f32,
+    #[serde(default)]
+    pub queries: Vec<EpisodicMemoryRecallQuery>,
+    #[serde(default)]
+    pub diagnostics: Vec<String>,
+}
+
+impl Default for EpisodicMemoryRecallPlan {
+    fn default() -> Self {
+        Self::skip(
+            ActiveMemoryDecisionReasonCode::ProviderSkip,
+            1.0,
+            Vec::new(),
+        )
+    }
+}
+
+impl EpisodicMemoryRecallPlan {
+    pub fn skip(
+        reason_code: ActiveMemoryDecisionReasonCode,
+        confidence: f32,
+        diagnostics: Vec<String>,
+    ) -> Self {
+        Self {
+            status: ActiveMemoryDecisionStatus::Skip,
+            reason_code,
+            confidence: confidence.clamp(0.0, 1.0),
+            queries: Vec::new(),
+            diagnostics: normalize_active_recall_diagnostics(diagnostics),
+        }
+    }
+
+    pub fn run(
+        reason_code: ActiveMemoryDecisionReasonCode,
+        confidence: f32,
+        queries: Vec<EpisodicMemoryRecallQuery>,
+        diagnostics: Vec<String>,
+    ) -> Self {
+        normalize_episodic_memory_recall_plan(Self {
+            status: ActiveMemoryDecisionStatus::Run,
+            reason_code,
+            confidence: confidence.clamp(0.0, 1.0),
+            queries,
+            diagnostics,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ActiveMemoryRecallPlan {
+    pub durable: DurableMemoryRecallPlan,
+    pub episodic: EpisodicMemoryRecallPlan,
+    #[serde(default)]
+    pub diagnostics: Vec<String>,
+}
+
+impl std::ops::Deref for ActiveMemoryRecallPlan {
+    type Target = DurableMemoryRecallPlan;
+
+    fn deref(&self) -> &Self::Target {
+        &self.durable
+    }
+}
+
+impl std::ops::DerefMut for ActiveMemoryRecallPlan {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.durable
+    }
+}
+
+impl ActiveMemoryRecallPlan {
+    pub(super) fn from_durable(durable: DurableMemoryRecallPlan) -> Self {
+        Self {
+            durable,
+            episodic: EpisodicMemoryRecallPlan::default(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    pub fn skip(
+        reason_code: ActiveMemoryDecisionReasonCode,
+        confidence: f32,
+        diagnostics: Vec<String>,
+    ) -> Self {
+        Self::from_durable(DurableMemoryRecallPlan::skip(
+            reason_code,
+            confidence,
+            diagnostics,
+        ))
+    }
+
+    pub fn run(
+        reason_code: ActiveMemoryDecisionReasonCode,
+        confidence: f32,
+        modes: Vec<ActiveRecallMode>,
+        targets: Vec<ActiveRecallTarget>,
+        diagnostics: Vec<String>,
+    ) -> Self {
+        Self::from_durable(DurableMemoryRecallPlan::run(
+            reason_code,
+            confidence,
+            modes,
+            targets,
+            diagnostics,
+        ))
+    }
+
+    pub fn uncertain(
+        reason_code: ActiveMemoryDecisionReasonCode,
+        confidence: f32,
+        diagnostics: Vec<String>,
+    ) -> Self {
+        Self::from_durable(DurableMemoryRecallPlan::uncertain(
+            reason_code,
+            confidence,
+            diagnostics,
+        ))
+    }
+
+    pub(super) fn with_debug_fallback(mut self) -> Self {
+        self.durable = self.durable.with_debug_fallback();
+        self
+    }
+
+    pub fn effective_status(&self) -> ActiveMemoryDecisionStatus {
+        if self.durable.status == ActiveMemoryDecisionStatus::Run
+            || self.episodic.status == ActiveMemoryDecisionStatus::Run
+        {
+            ActiveMemoryDecisionStatus::Run
+        } else if self.durable.status == ActiveMemoryDecisionStatus::Uncertain
+            || self.episodic.status == ActiveMemoryDecisionStatus::Uncertain
+        {
+            ActiveMemoryDecisionStatus::Uncertain
+        } else {
+            ActiveMemoryDecisionStatus::Skip
+        }
+    }
+
+    pub fn effective_reason_code(&self) -> ActiveMemoryDecisionReasonCode {
+        if self.durable.status == ActiveMemoryDecisionStatus::Run {
+            self.durable.reason_code
+        } else if self.episodic.status == ActiveMemoryDecisionStatus::Run {
+            self.episodic.reason_code
+        } else if self.durable.status == ActiveMemoryDecisionStatus::Uncertain {
+            self.durable.reason_code
+        } else if self.episodic.status == ActiveMemoryDecisionStatus::Uncertain {
+            self.episodic.reason_code
+        } else {
+            self.durable.reason_code
+        }
+    }
+
+    pub fn effective_confidence(&self) -> f32 {
+        if self.durable.status == ActiveMemoryDecisionStatus::Run
+            && self.episodic.status == ActiveMemoryDecisionStatus::Run
+        {
+            self.durable.confidence.max(self.episodic.confidence)
+        } else if self.durable.status == ActiveMemoryDecisionStatus::Run {
+            self.durable.confidence
+        } else if self.episodic.status == ActiveMemoryDecisionStatus::Run {
+            self.episodic.confidence
+        } else if self.durable.status == ActiveMemoryDecisionStatus::Uncertain
+            && self.episodic.status == ActiveMemoryDecisionStatus::Uncertain
+        {
+            self.durable.confidence.max(self.episodic.confidence)
+        } else if self.durable.status == ActiveMemoryDecisionStatus::Uncertain {
+            self.durable.confidence
+        } else if self.episodic.status == ActiveMemoryDecisionStatus::Uncertain {
+            self.episodic.confidence
+        } else {
+            self.durable.confidence
+        }
+    }
+
+    pub fn selected_modes(&self) -> Vec<ActiveRecallMode> {
+        let mut modes = self.durable.modes.clone();
+        modes.extend(self.episodic.queries.iter().map(|query| query.mode));
+        normalize_active_recall_modes(modes)
+    }
+
+    pub fn all_diagnostics(&self) -> Vec<String> {
+        normalize_active_recall_diagnostics(
+            self.diagnostics
+                .iter()
+                .chain(self.durable.diagnostics.iter())
+                .chain(self.episodic.diagnostics.iter())
+                .cloned()
+                .collect(),
+        )
+    }
+}
+
+pub type ActiveRecallPlan = ActiveMemoryRecallPlan;
+pub type ActiveMemoryDecision = ActiveMemoryRecallPlan;
 
 impl From<&ActiveRecallTarget> for MemoryRecallTarget {
     fn from(target: &ActiveRecallTarget) -> Self {
@@ -324,6 +563,7 @@ pub(super) struct ActiveRecallModeBudget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ActiveRecallModeRequest {
     pub(super) mode: ActiveRecallMode,
+    pub(super) query: Option<String>,
     pub(super) targets: Vec<ActiveRecallTarget>,
     pub(super) budget: ActiveRecallModeBudget,
 }
@@ -389,12 +629,16 @@ pub(super) async fn execute_active_recall_plan(
         }
         let mode = request.mode;
         if let Some(source) = mode.episodic_source_kind() {
+            let query = request
+                .query
+                .as_deref()
+                .unwrap_or(input.context.input_text.as_str());
             mode_results.push(
                 execute_episodic_active_recall_mode(
                     input.episodic_provider.as_deref(),
                     &input.episodic_capabilities,
                     &input.context,
-                    input.context.input_text.as_str(),
+                    query,
                     &request,
                     source,
                     input.config.timeout_ms,
@@ -859,7 +1103,7 @@ pub(super) fn active_recall_debug_audit_contribution(
             "provider".to_owned()
         } else if decision.provider_fallback_used {
             "fallback".to_owned()
-        } else if decision.status == ActiveMemoryDecisionStatus::Skip {
+        } else if decision.effective_status() == ActiveMemoryDecisionStatus::Skip {
             "skipped".to_owned()
         } else {
             "deterministic".to_owned()
@@ -867,11 +1111,11 @@ pub(super) fn active_recall_debug_audit_contribution(
     );
     details.insert(
         metadata_key("planner_status"),
-        HookValue::Text(active_memory_decision_status_name(decision.status).to_owned()),
+        HookValue::Text(active_memory_decision_status_name(decision.effective_status()).to_owned()),
     );
     details.insert(
         metadata_key("planner_reason"),
-        HookValue::Text(decision.reason_code.as_str().to_owned()),
+        HookValue::Text(decision.effective_reason_code().as_str().to_owned()),
     );
     details.insert(
         metadata_key("provider_used"),
@@ -889,7 +1133,7 @@ pub(super) fn active_recall_debug_audit_contribution(
         metadata_key("selected_modes"),
         hook_value_string_list(
             decision
-                .modes
+                .selected_modes()
                 .iter()
                 .map(|mode| mode.as_str().to_owned())
                 .collect(),
@@ -1010,23 +1254,45 @@ pub(super) fn active_recall_debug_audit_contribution(
 
 fn active_recall_mode_requests(input: &ActiveRecallExecutionInput) -> Vec<ActiveRecallModeRequest> {
     let max_modes = input.config.max_queries.max(1);
-    let mode_count = input.plan.modes.len().min(max_modes).max(1);
+    let mode_count = (input.plan.durable.modes.len() + input.plan.episodic.queries.len())
+        .min(max_modes)
+        .max(1);
     let max_chars_per_mode = (input.config.max_prompt_chars / mode_count).max(1);
-    input
+    let mut requests = input
         .plan
+        .durable
         .modes
         .iter()
         .copied()
         .take(max_modes)
         .map(|mode| ActiveRecallModeRequest {
             mode,
-            targets: active_recall_targets_for_mode(mode, input.plan.targets.as_slice()),
+            query: None,
+            targets: active_recall_targets_for_mode(mode, input.plan.durable.targets.as_slice()),
             budget: ActiveRecallModeBudget {
                 top_k: input.config.top_k_per_query,
                 max_chars: max_chars_per_mode,
             },
         })
-        .collect()
+        .collect::<Vec<_>>();
+    for query in input
+        .plan
+        .episodic
+        .queries
+        .iter()
+        .take(max_modes.saturating_sub(requests.len()))
+    {
+        requests.push(ActiveRecallModeRequest {
+            mode: query.mode,
+            query: Some(query.query.clone()),
+            targets: query.targets.clone(),
+            budget: ActiveRecallModeBudget {
+                top_k: query.top_k.unwrap_or(input.config.top_k_per_query),
+                max_chars: query.max_chars.unwrap_or(max_chars_per_mode),
+            },
+        });
+    }
+    requests
 }
 
 fn active_recall_targets_for_mode(
@@ -1459,13 +1725,13 @@ pub(super) fn deterministic_active_recall_plan(
             );
         }
         MemoryActiveRecallMode::StrictDebug => {
-            return ActiveRecallPlan::run(
+            return ActiveRecallPlan::from_durable(DurableMemoryRecallPlan::run(
                 ActiveMemoryDecisionReasonCode::StrictDebug,
                 1.0,
                 Vec::new(),
                 Vec::new(),
                 vec!["strict_debug".to_owned()],
-            )
+            ))
             .with_debug_fallback();
         }
         MemoryActiveRecallMode::Hybrid => {}
@@ -1495,24 +1761,47 @@ pub(super) fn deterministic_active_recall_plan(
         );
     }
 
-    let mut modes = Vec::new();
+    let mut durable_modes = Vec::new();
+    let mut episodic_queries = Vec::new();
     let mut diagnostics = Vec::new();
     if input.has_task_context && input.episodic_capabilities.current_task_context {
-        modes.push(ActiveRecallMode::CurrentTask);
-        modes.push(ActiveRecallMode::TaskContext);
+        if let Some(query) = bounded_nonempty_text(input.input_text_preview.as_str(), 500) {
+            episodic_queries.push(EpisodicMemoryRecallQuery {
+                mode: ActiveRecallMode::CurrentTask,
+                query: query.clone(),
+                targets: Vec::new(),
+                top_k: None,
+                max_chars: None,
+            });
+            episodic_queries.push(EpisodicMemoryRecallQuery {
+                mode: ActiveRecallMode::TaskContext,
+                query,
+                targets: Vec::new(),
+                top_k: None,
+                max_chars: None,
+            });
+        }
         diagnostics.push("structured_task_context_available".to_owned());
     }
     if input.thread_episodic.current_thread_recall_available && input.deterministic_recall_empty {
-        modes.push(ActiveRecallMode::CurrentThread);
+        if let Some(query) = bounded_nonempty_text(input.input_text_preview.as_str(), 500) {
+            episodic_queries.push(EpisodicMemoryRecallQuery {
+                mode: ActiveRecallMode::CurrentThread,
+                query,
+                targets: Vec::new(),
+                top_k: None,
+                max_chars: None,
+            });
+        }
         diagnostics.push("structured_thread_context_available".to_owned());
     }
     if input.has_workspace_context && input.deterministic_recall_empty {
-        modes.push(ActiveRecallMode::Project);
-        modes.push(ActiveRecallMode::Durable);
+        durable_modes.push(ActiveRecallMode::Project);
+        durable_modes.push(ActiveRecallMode::Durable);
         diagnostics.push("structured_workspace_context_available".to_owned());
     }
 
-    if modes.is_empty() {
+    if durable_modes.is_empty() && episodic_queries.is_empty() {
         return ActiveRecallPlan::uncertain(
             ActiveMemoryDecisionReasonCode::ProviderUncertain,
             0.35,
@@ -1520,13 +1809,38 @@ pub(super) fn deterministic_active_recall_plan(
         );
     }
 
-    ActiveRecallPlan::run(
-        ActiveMemoryDecisionReasonCode::MemoryLikely,
-        0.65,
-        modes,
-        Vec::new(),
+    normalize_active_recall_plan(ActiveRecallPlan {
+        durable: if durable_modes.is_empty() {
+            DurableMemoryRecallPlan::skip(
+                ActiveMemoryDecisionReasonCode::MemoryLikely,
+                0.65,
+                vec![],
+            )
+        } else {
+            DurableMemoryRecallPlan::run(
+                ActiveMemoryDecisionReasonCode::MemoryLikely,
+                0.65,
+                durable_modes,
+                Vec::new(),
+                Vec::new(),
+            )
+        },
+        episodic: if episodic_queries.is_empty() {
+            EpisodicMemoryRecallPlan::skip(
+                ActiveMemoryDecisionReasonCode::ProviderSkip,
+                1.0,
+                Vec::new(),
+            )
+        } else {
+            EpisodicMemoryRecallPlan::run(
+                ActiveMemoryDecisionReasonCode::MemoryLikely,
+                0.65,
+                episodic_queries,
+                Vec::new(),
+            )
+        },
         diagnostics,
-    )
+    })
 }
 
 fn active_recall_input_length_bucket(char_count: usize) -> ActiveRecallInputLengthBucket {
@@ -1538,7 +1852,9 @@ fn active_recall_input_length_bucket(char_count: usize) -> ActiveRecallInputLeng
     }
 }
 
-pub fn normalize_active_recall_plan(mut plan: ActiveRecallPlan) -> ActiveRecallPlan {
+fn normalize_durable_memory_recall_plan(
+    mut plan: DurableMemoryRecallPlan,
+) -> DurableMemoryRecallPlan {
     plan.confidence = plan.confidence.clamp(0.0, 1.0);
     plan.modes = normalize_active_recall_modes(plan.modes);
     plan.targets = plan
@@ -1551,25 +1867,61 @@ pub fn normalize_active_recall_plan(mut plan: ActiveRecallPlan) -> ActiveRecallP
     plan
 }
 
+fn normalize_episodic_memory_recall_plan(
+    mut plan: EpisodicMemoryRecallPlan,
+) -> EpisodicMemoryRecallPlan {
+    plan.confidence = plan.confidence.clamp(0.0, 1.0);
+    plan.queries = plan
+        .queries
+        .into_iter()
+        .filter_map(EpisodicMemoryRecallQuery::normalized)
+        .take(ACTIVE_RECALL_MAX_MODES)
+        .collect();
+    plan.diagnostics = normalize_active_recall_diagnostics(plan.diagnostics);
+    if plan.status == ActiveMemoryDecisionStatus::Run && plan.queries.is_empty() {
+        plan.status = ActiveMemoryDecisionStatus::Uncertain;
+        plan.reason_code = ActiveMemoryDecisionReasonCode::ProviderUncertain;
+        plan.diagnostics
+            .push("episodic_recall_run_without_queries".to_owned());
+        plan.diagnostics = normalize_active_recall_diagnostics(plan.diagnostics);
+    }
+    if plan.status != ActiveMemoryDecisionStatus::Run {
+        plan.queries.clear();
+    }
+    plan
+}
+
+pub fn normalize_active_recall_plan(mut plan: ActiveRecallPlan) -> ActiveRecallPlan {
+    plan.durable = normalize_durable_memory_recall_plan(plan.durable);
+    plan.episodic = normalize_episodic_memory_recall_plan(plan.episodic);
+    plan.diagnostics = normalize_active_recall_diagnostics(plan.diagnostics);
+    plan
+}
+
 pub fn active_recall_planned_query_count(decision: &ActiveRecallPlan) -> usize {
-    if decision.status != ActiveMemoryDecisionStatus::Run {
+    if decision.effective_status() != ActiveMemoryDecisionStatus::Run {
         return 0;
     }
 
     if decision.debug_fallback {
-        return decision.modes.len().max(1);
+        return decision.durable.modes.len().max(1);
     }
 
-    decision.modes.len()
+    decision.durable.modes.len() + decision.episodic.queries.len()
 }
 
 pub(super) fn normalize_active_recall_plan_for_input(
     mut plan: ActiveRecallPlan,
     input: &ActiveRecallPlannerInput,
 ) -> ActiveRecallPlan {
-    let mut diagnostics = std::mem::take(&mut plan.diagnostics);
-    let original_modes = std::mem::take(&mut plan.modes);
-    let mut modes = Vec::new();
+    let mut diagnostics = plan.all_diagnostics();
+    let source_status = plan.durable.status;
+    let source_reason_code = plan.durable.reason_code;
+    let source_confidence = plan.durable.confidence;
+    let original_modes = std::mem::take(&mut plan.durable.modes);
+    let original_queries = std::mem::take(&mut plan.episodic.queries);
+    let mut durable_modes = Vec::new();
+    let mut episodic_queries = Vec::new();
     for mode in original_modes {
         let drop_reason = match mode {
             ActiveRecallMode::TaskContext | ActiveRecallMode::CurrentTask
@@ -1625,6 +1977,7 @@ pub(super) fn normalize_active_recall_plan_for_input(
             }
             ActiveRecallMode::ExactCanonical
                 if !plan
+                    .durable
                     .targets
                     .iter()
                     .any(|target| target.canonical_key.is_some()) =>
@@ -1635,12 +1988,112 @@ pub(super) fn normalize_active_recall_plan_for_input(
         };
         if let Some(reason) = drop_reason {
             diagnostics.push(reason.to_owned());
+        } else if mode.episodic_source_kind().is_some() {
+            if let Some(query) = bounded_nonempty_text(input.input_text_preview.as_str(), 500) {
+                episodic_queries.push(EpisodicMemoryRecallQuery {
+                    mode,
+                    query,
+                    targets: plan.durable.targets.clone(),
+                    top_k: None,
+                    max_chars: None,
+                });
+            } else {
+                diagnostics.push(format!(
+                    "dropped_mode={}:empty_episodic_query",
+                    mode.as_str()
+                ));
+            }
         } else {
-            modes.push(mode);
+            durable_modes.push(mode);
         }
     }
-    plan.modes = modes;
-    plan.diagnostics = diagnostics;
+    for query in original_queries {
+        let mode = query.mode;
+        let drop_reason = match mode {
+            ActiveRecallMode::TaskContext | ActiveRecallMode::CurrentTask
+                if !input.has_task_context =>
+            {
+                Some("dropped_query=task_context:no_task_context")
+            }
+            ActiveRecallMode::TaskContext | ActiveRecallMode::CurrentTask
+                if !input
+                    .episodic_capabilities
+                    .supports_source(MemoryEpisodicRecallSourceKind::CurrentTask) =>
+            {
+                Some("dropped_query=task_context:capability_unavailable")
+            }
+            ActiveRecallMode::ThreadEpisodic
+            | ActiveRecallMode::CurrentThread
+            | ActiveRecallMode::RelatedThread
+            | ActiveRecallMode::WorkspaceThread
+                if input.thread_id.trim().is_empty() =>
+            {
+                Some("dropped_query=thread_episodic:no_thread_context")
+            }
+            ActiveRecallMode::ThreadEpisodic | ActiveRecallMode::CurrentThread
+                if !input
+                    .episodic_capabilities
+                    .supports_source(MemoryEpisodicRecallSourceKind::CurrentThread) =>
+            {
+                Some("dropped_query=thread_episodic:capability_unavailable")
+            }
+            ActiveRecallMode::RelatedThread
+                if !input
+                    .episodic_capabilities
+                    .supports_source(MemoryEpisodicRecallSourceKind::RelatedThread) =>
+            {
+                Some("dropped_query=related_thread:capability_unavailable")
+            }
+            ActiveRecallMode::WorkspaceThread if !input.has_workspace_context => {
+                Some("dropped_query=workspace_thread:no_workspace_context")
+            }
+            ActiveRecallMode::WorkspaceThread
+                if !input
+                    .episodic_capabilities
+                    .supports_source(MemoryEpisodicRecallSourceKind::WorkspaceThread) =>
+            {
+                Some("dropped_query=workspace_thread:capability_unavailable")
+            }
+            ActiveRecallMode::CompletedTask
+                if !input
+                    .episodic_capabilities
+                    .supports_source(MemoryEpisodicRecallSourceKind::CompletedTask) =>
+            {
+                Some("dropped_query=completed_task:capability_unavailable")
+            }
+            _ if mode.episodic_source_kind().is_none() => {
+                Some("dropped_query=episodic_query:non_episodic_mode")
+            }
+            _ => None,
+        };
+        if let Some(reason) = drop_reason {
+            diagnostics.push(reason.to_owned());
+        } else {
+            episodic_queries.push(query);
+        }
+    }
+    plan.durable.modes = durable_modes;
+    plan.episodic.queries = episodic_queries;
+    if source_status == ActiveMemoryDecisionStatus::Run
+        && plan.episodic.status != ActiveMemoryDecisionStatus::Run
+        && !plan.episodic.queries.is_empty()
+    {
+        plan.episodic.status = ActiveMemoryDecisionStatus::Run;
+        plan.episodic.reason_code = source_reason_code;
+        plan.episodic.confidence = source_confidence;
+    }
+    if plan.durable.status == ActiveMemoryDecisionStatus::Run
+        && plan.durable.modes.is_empty()
+        && !plan.durable.debug_fallback
+    {
+        plan.durable.status = ActiveMemoryDecisionStatus::Skip;
+    }
+    if plan.episodic.status == ActiveMemoryDecisionStatus::Run && plan.episodic.queries.is_empty() {
+        plan.episodic.status = ActiveMemoryDecisionStatus::Skip;
+    }
+    plan.durable.diagnostics = diagnostics;
+    plan.diagnostics = Vec::new();
+    plan.episodic.diagnostics = normalize_active_recall_diagnostics(plan.episodic.diagnostics);
     normalize_active_recall_plan(plan)
 }
 
@@ -1729,6 +2182,40 @@ pub(super) fn active_recall_available_mode_names(input: &ActiveRecallPlannerInpu
         .collect()
 }
 
+pub(super) fn active_recall_available_durable_mode_names(
+    input: &ActiveRecallPlannerInput,
+) -> Vec<String> {
+    active_recall_available_mode_names(input)
+        .into_iter()
+        .filter(|mode| {
+            matches!(
+                mode.as_str(),
+                "profile" | "project" | "durable" | "exact_canonical"
+            )
+        })
+        .collect()
+}
+
+pub(super) fn active_recall_available_episodic_mode_names(
+    input: &ActiveRecallPlannerInput,
+) -> Vec<String> {
+    active_recall_available_mode_names(input)
+        .into_iter()
+        .filter(|mode| {
+            matches!(
+                mode.as_str(),
+                "current_thread"
+                    | "related_thread"
+                    | "workspace_thread"
+                    | "current_task"
+                    | "completed_task"
+                    | "thread_episodic"
+                    | "task_context"
+            )
+        })
+        .collect()
+}
+
 pub(super) fn active_recall_available_scoped_contexts(
     input: &ActiveRecallPlannerInput,
 ) -> Vec<String> {
@@ -1769,19 +2256,19 @@ pub(super) fn active_memory_decision_observability_diagnostic(
     decision: &ActiveMemoryDecision,
     deterministic: &DeterministicRecallContextSummary,
 ) -> HookDiagnostic {
-    let selected_modes = active_recall_mode_names(decision.modes.as_slice());
+    let selected_modes = active_recall_mode_names(decision.selected_modes().as_slice());
     let mut diagnostic = memory_safe_info_diagnostic(
         "memory.active_recall.decision",
         format!(
             "memory active recall decision: status={} reason={} confidence={:.2} deterministic_sufficient={} deterministic_contexts={} deterministic_chars={} modes={} targets={} provider_used={} provider_fallback_used={} debug_fallback={}",
-            active_memory_decision_status_name(decision.status),
-            decision.reason_code.as_str(),
-            decision.confidence,
+            active_memory_decision_status_name(decision.effective_status()),
+            decision.effective_reason_code().as_str(),
+            decision.effective_confidence(),
             deterministic.sufficient,
             deterministic.context_count,
             deterministic.context_chars,
             selected_modes,
-            decision.targets.len(),
+            decision.durable.targets.len(),
             decision.provider_used,
             decision.provider_fallback_used,
             decision.debug_fallback
@@ -1789,11 +2276,11 @@ pub(super) fn active_memory_decision_observability_diagnostic(
     );
     diagnostic.metadata.insert(
         hook_metadata_key("planner_status"),
-        HookValue::Text(active_memory_decision_status_name(decision.status).to_owned()),
+        HookValue::Text(active_memory_decision_status_name(decision.effective_status()).to_owned()),
     );
     diagnostic.metadata.insert(
         hook_metadata_key("planner_reason"),
-        HookValue::Text(decision.reason_code.as_str().to_owned()),
+        HookValue::Text(decision.effective_reason_code().as_str().to_owned()),
     );
     diagnostic.metadata.insert(
         hook_metadata_key("selected_modes"),
@@ -1802,7 +2289,7 @@ pub(super) fn active_memory_decision_observability_diagnostic(
     insert_usize_metadata(
         &mut diagnostic.metadata,
         "target_count",
-        decision.targets.len(),
+        decision.durable.targets.len(),
     );
     diagnostic.metadata.insert(
         hook_metadata_key("provider_used"),
@@ -1825,118 +2312,54 @@ pub(super) fn active_memory_decision_observability_diagnostic(
     diagnostic
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ActiveRecallPlanJson {
-    pub status: ActiveRecallPlanJsonStatus,
-    pub reason_code: ActiveMemoryDecisionReasonCodeJson,
-    pub confidence: f32,
-    #[serde(default)]
-    pub modes: Vec<ActiveRecallMode>,
-    #[serde(default)]
-    pub targets: Vec<ActiveRecallTarget>,
-    #[serde(default)]
-    pub diagnostics: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ActiveRecallPlanJsonStatus {
-    Skip,
-    Run,
-    Uncertain,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ActiveMemoryDecisionReasonCodeJson {
-    PolicyDisabled,
-    ConfigDisabled,
-    DeterministicOnly,
-    DeterministicSufficient,
-    MemoryLikely,
-    StrictDebug,
-    ProviderRun,
-    ProviderSkip,
-    ProviderUncertain,
-}
-
-impl ActiveMemoryDecisionReasonCodeJson {
-    fn is_provider_allowed(&self) -> bool {
-        matches!(
-            self,
-            Self::MemoryLikely
-                | Self::DeterministicSufficient
-                | Self::ProviderRun
-                | Self::ProviderSkip
-                | Self::ProviderUncertain
-        )
-    }
-
-    fn into_reason_code(self) -> ActiveMemoryDecisionReasonCode {
-        match self {
-            Self::PolicyDisabled => ActiveMemoryDecisionReasonCode::PolicyDisabled,
-            Self::ConfigDisabled => ActiveMemoryDecisionReasonCode::ConfigDisabled,
-            Self::DeterministicOnly => ActiveMemoryDecisionReasonCode::DeterministicOnly,
-            Self::DeterministicSufficient => {
-                ActiveMemoryDecisionReasonCode::DeterministicSufficient
-            }
-            Self::MemoryLikely => ActiveMemoryDecisionReasonCode::MemoryLikely,
-            Self::StrictDebug => ActiveMemoryDecisionReasonCode::StrictDebug,
-            Self::ProviderRun => ActiveMemoryDecisionReasonCode::ProviderRun,
-            Self::ProviderSkip => ActiveMemoryDecisionReasonCode::ProviderSkip,
-            Self::ProviderUncertain => ActiveMemoryDecisionReasonCode::ProviderUncertain,
-        }
-    }
-}
-
 pub fn parse_active_memory_decision_json(
     raw: &str,
 ) -> Result<ActiveMemoryDecision, serde_json::Error> {
-    let parsed = serde_json::from_str::<ActiveRecallPlanJson>(raw.trim())?;
-    if parsed
+    let mut plan = serde_json::from_str::<ActiveMemoryRecallPlan>(raw.trim())?;
+    validate_active_memory_recall_plan(&plan).map_err(serde_json::Error::custom)?;
+    plan.durable.debug_fallback = false;
+    plan.durable.provider_used = true;
+    plan.durable.provider_fallback_used = false;
+    plan.durable.provider_input_chars = None;
+    plan.durable.provider_output_chars = None;
+    Ok(normalize_active_recall_plan(plan))
+}
+
+fn validate_active_memory_recall_plan(plan: &ActiveMemoryRecallPlan) -> Result<(), String> {
+    if plan
+        .durable
         .targets
         .iter()
         .any(ActiveRecallTarget::has_unknown_fact_class)
+        || plan.episodic.queries.iter().any(|query| {
+            query
+                .targets
+                .iter()
+                .any(ActiveRecallTarget::has_unknown_fact_class)
+        })
     {
-        return Err(serde_json::Error::custom(
-            "unknown active recall fact_class",
-        ));
+        return Err("unknown active recall fact_class".to_owned());
     }
-    let status = match parsed.status {
-        ActiveRecallPlanJsonStatus::Skip => ActiveMemoryDecisionStatus::Skip,
-        ActiveRecallPlanJsonStatus::Run => ActiveMemoryDecisionStatus::Run,
-        ActiveRecallPlanJsonStatus::Uncertain => ActiveMemoryDecisionStatus::Uncertain,
-    };
-    if !parsed.reason_code.is_provider_allowed() {
-        return Err(serde_json::Error::custom(
-            "active recall provider reasonCode is not allowed",
-        ));
+    if !plan.durable.reason_code.is_provider_allowed() {
+        return Err("active recall provider reasonCode is not allowed".to_owned());
     }
-    if status == ActiveMemoryDecisionStatus::Run && parsed.modes.is_empty() {
-        return Err(serde_json::Error::custom(
-            "active recall run plan requires at least one mode",
-        ));
+    if !plan.episodic.reason_code.is_provider_allowed() {
+        return Err("episodic recall provider reasonCode is not allowed".to_owned());
     }
-    if status != ActiveMemoryDecisionStatus::Run && !parsed.modes.is_empty() {
-        return Err(serde_json::Error::custom(
-            "active recall non-run plan must not include modes",
-        ));
+    if plan.durable.status == ActiveMemoryDecisionStatus::Run && plan.durable.modes.is_empty() {
+        return Err("active recall durable run plan requires at least one mode".to_owned());
     }
-    let plan = normalize_active_recall_plan(ActiveRecallPlan {
-        status,
-        reason_code: parsed.reason_code.into_reason_code(),
-        confidence: parsed.confidence.clamp(0.0, 1.0),
-        modes: parsed.modes,
-        targets: parsed.targets,
-        debug_fallback: false,
-        provider_used: true,
-        provider_fallback_used: false,
-        provider_input_chars: None,
-        provider_output_chars: None,
-        diagnostics: parsed.diagnostics,
-    });
-    Ok(plan)
+    if plan.durable.status != ActiveMemoryDecisionStatus::Run && !plan.durable.modes.is_empty() {
+        return Err("active recall durable non-run plan must not include modes".to_owned());
+    }
+    if plan.episodic.status == ActiveMemoryDecisionStatus::Run && plan.episodic.queries.is_empty() {
+        return Err("episodic recall run plan requires at least one query".to_owned());
+    }
+    if plan.episodic.status != ActiveMemoryDecisionStatus::Run && !plan.episodic.queries.is_empty()
+    {
+        return Err("episodic recall non-run plan must not include queries".to_owned());
+    }
+    Ok(())
 }
 
 pub(super) fn active_memory_dedup_observability_diagnostic(

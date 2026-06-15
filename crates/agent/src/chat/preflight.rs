@@ -1,12 +1,11 @@
 #![allow(dead_code)]
 
 use pioneer_memory::hooks::{
-    ActiveRecallPlan, ActiveRecallPlanJson, DeterministicRecallContextSummary,
-    MemoryActiveRecallDecisionContext, MemoryActiveRecallDecisionRequest,
-    MemoryActiveRecallLocalPlan, MemoryActiveRecallProviderFallbackContext,
-    active_recall_planned_query_count, active_recall_preflight_provider_fallback,
-    active_recall_preflight_provider_success, normalize_active_recall_plan,
-    parse_active_memory_decision_json,
+    ActiveRecallPlan, DeterministicRecallContextSummary, MemoryActiveRecallDecisionContext,
+    MemoryActiveRecallDecisionRequest, MemoryActiveRecallLocalPlan,
+    MemoryActiveRecallProviderFallbackContext, active_recall_planned_query_count,
+    active_recall_preflight_provider_fallback, active_recall_preflight_provider_success,
+    normalize_active_recall_plan, parse_active_memory_decision_json,
 };
 use pioneer_promt::{
     TurnPreflightMemoryActiveRecallPromptInput, TurnPreflightPromptInput,
@@ -721,7 +720,7 @@ pub(crate) struct ProviderTurnPreflightToolsPlan {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ProviderTurnPreflightMemoryPlan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_recall: Option<ActiveRecallPlanJson>,
+    pub active_recall: Option<ActiveRecallPlan>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -945,7 +944,7 @@ pub(crate) fn normalize_module_diagnostics(
 }
 
 pub(crate) fn parse_provider_memory_active_recall_plan(
-    plan: &ActiveRecallPlanJson,
+    plan: &ActiveRecallPlan,
 ) -> Result<ActiveRecallPlan, serde_json::Error> {
     let raw = serde_json::to_string(plan)?;
     parse_active_memory_decision_json(raw.as_str())
@@ -1117,18 +1116,18 @@ fn memory_diagnostics_snapshot(
         active_recall: TurnPreflightMemoryActiveRecallDiagnosticsSnapshot {
             source: active_recall.source,
             fallback_reason: active_recall.fallback_reason,
-            status: decision.status,
-            reason_code: decision.reason_code,
-            confidence: decision.confidence,
+            status: decision.effective_status(),
+            reason_code: decision.effective_reason_code(),
+            confidence: decision.effective_confidence(),
             planned_query_count: active_recall_planned_query_count(decision),
-            selected_modes: decision.modes.clone(),
-            target_count: decision.targets.len(),
+            selected_modes: decision.selected_modes(),
+            target_count: decision.durable.targets.len(),
             provider_used: decision.provider_used,
             provider_fallback_used: decision.provider_fallback_used,
             debug_fallback: decision.debug_fallback,
             provider_input_chars: decision.provider_input_chars,
             provider_output_chars: decision.provider_output_chars,
-            diagnostics: decision.diagnostics.clone(),
+            diagnostics: decision.all_diagnostics(),
         },
     }
 }
@@ -1586,8 +1585,7 @@ mod tests {
     use super::*;
     use pioneer_hooks::TurnPrePromptContextHookInput;
     use pioneer_memory::hooks::{
-        ActiveMemoryDecisionReasonCode, ActiveMemoryDecisionReasonCodeJson,
-        ActiveMemoryDecisionStatus, ActiveRecallMode, ActiveRecallPlanJsonStatus,
+        ActiveMemoryDecisionReasonCode, ActiveMemoryDecisionStatus, ActiveRecallMode,
         ActiveRecallTarget, MemoryActiveRecallConfig, MemoryActiveRecallMode,
         MemoryActiveRecallPlannerFallbackPolicy, MemoryEpisodicRecallCapabilities,
         MemoryTurnContext, MemoryTurnPolicy, build_active_recall_local_preflight_plan,
@@ -1822,6 +1820,12 @@ mod tests {
                             "project".to_owned(),
                             "exact_canonical".to_owned(),
                         ],
+                        available_durable_modes: vec![
+                            "profile".to_owned(),
+                            "project".to_owned(),
+                            "exact_canonical".to_owned(),
+                        ],
+                        available_episodic_modes: vec!["current_thread".to_owned()],
                         available_scoped_contexts: vec!["thread".to_owned()],
                         episodic_capabilities: MemoryEpisodicRecallCapabilities {
                             current_thread_search: true,
@@ -1852,23 +1856,31 @@ mod tests {
             },
             "memory": {
                 "activeRecall": {
-                    "status": "run",
-                    "reasonCode": "memory_likely",
-                    "confidence": 0.92,
-                    "modes": ["profile", "exact_canonical"],
-                    "targets": [
-                        {
-                            "scopeKind": "user",
-                            "factClass": "user_identity",
-                            "category": "identity",
-                            "subject": "current_user",
-                            "attribute": "name",
-                            "canonicalKey": "identity.current_user.name"
-                        }
-                    ],
-                    "diagnostics": [
-                        "memory.active_recall.identity_lookup"
-                    ]
+                    "durable": {
+                        "status": "run",
+                        "reasonCode": "memory_likely",
+                        "confidence": 0.92,
+                        "modes": ["exact_canonical", "profile"],
+                        "targets": [
+                            {
+                                "scopeKind": "user",
+                                "factClass": "user_identity",
+                                "category": "identity",
+                                "subject": "current_user",
+                                "attribute": "name",
+                                "canonicalKey": "identity.current_user.name"
+                            }
+                        ],
+                        "diagnostics": [
+                            "memory.active_recall.identity_lookup"
+                        ]
+                    },
+                    "episodic": {
+                        "status": "skip",
+                        "reasonCode": "provider_skip",
+                        "confidence": 1.0,
+                        "queries": []
+                    }
                 }
             },
             "diagnostics": [
@@ -2125,35 +2137,21 @@ mod tests {
     }
 
     fn sample_skip_decision(reason_code: ActiveMemoryDecisionReasonCode) -> ActiveRecallPlan {
-        ActiveRecallPlan {
-            status: ActiveMemoryDecisionStatus::Skip,
+        ActiveRecallPlan::skip(
             reason_code,
-            confidence: 1.0,
-            modes: Vec::new(),
-            targets: Vec::new(),
-            debug_fallback: false,
-            provider_used: false,
-            provider_fallback_used: false,
-            provider_input_chars: None,
-            provider_output_chars: None,
-            diagnostics: vec!["memory.active_recall.host_local".to_owned()],
-        }
+            1.0,
+            vec!["memory.active_recall.host_local".to_owned()],
+        )
     }
 
     fn sample_low_confidence_run_decision() -> ActiveRecallPlan {
-        ActiveRecallPlan {
-            status: ActiveMemoryDecisionStatus::Run,
-            reason_code: ActiveMemoryDecisionReasonCode::MemoryLikely,
-            confidence: 0.65,
-            modes: vec![ActiveRecallMode::Profile],
-            targets: Vec::new(),
-            debug_fallback: false,
-            provider_used: false,
-            provider_fallback_used: false,
-            provider_input_chars: None,
-            provider_output_chars: None,
-            diagnostics: vec!["memory.active_recall.local_candidate".to_owned()],
-        }
+        ActiveRecallPlan::run(
+            ActiveMemoryDecisionReasonCode::MemoryLikely,
+            0.65,
+            vec![ActiveRecallMode::Profile],
+            Vec::new(),
+            vec!["memory.active_recall.local_candidate".to_owned()],
+        )
     }
 
     fn sample_provider_needed_modules() -> TurnPreflightLocalModulePlans {
@@ -2404,19 +2402,13 @@ mod tests {
         );
         let high_confidence_local_run = sample_memory_local_plan(
             false,
-            ActiveRecallPlan {
-                status: ActiveMemoryDecisionStatus::Run,
-                reason_code: ActiveMemoryDecisionReasonCode::MemoryLikely,
-                confidence: 0.70,
-                modes: vec![ActiveRecallMode::Profile],
-                targets: Vec::new(),
-                debug_fallback: false,
-                provider_used: false,
-                provider_fallback_used: false,
-                provider_input_chars: None,
-                provider_output_chars: None,
-                diagnostics: vec!["memory.active_recall.local_candidate".to_owned()],
-            },
+            ActiveRecallPlan::run(
+                ActiveMemoryDecisionReasonCode::MemoryLikely,
+                0.70,
+                vec![ActiveRecallMode::Profile],
+                Vec::new(),
+                vec!["memory.active_recall.local_candidate".to_owned()],
+            ),
         );
 
         for (label, local_plan, reason_code, status) in [
@@ -2513,14 +2505,14 @@ mod tests {
             .expect("memory plan")
             .active_recall
             .expect("active recall plan");
-        assert_eq!(active_recall.status, ActiveRecallPlanJsonStatus::Run);
+        assert_eq!(active_recall.status, ActiveMemoryDecisionStatus::Run);
         assert_eq!(
             active_recall.reason_code,
-            ActiveMemoryDecisionReasonCodeJson::MemoryLikely
+            ActiveMemoryDecisionReasonCode::MemoryLikely
         );
         assert_eq!(
             active_recall.modes,
-            vec![ActiveRecallMode::Profile, ActiveRecallMode::ExactCanonical]
+            vec![ActiveRecallMode::ExactCanonical, ActiveRecallMode::Profile]
         );
         assert_eq!(
             active_recall.targets[0].canonical_key.as_deref(),
@@ -2536,15 +2528,23 @@ mod tests {
             },
             "memory": {
                 "activeRecall": {
-                    "status": "run",
-                    "reasonCode": "memory_likely",
-                    "confidence": 0.92,
-                    "modes": ["exact_canonical"],
-                    "targets": [
-                        {
-                            "canonicalKey": "identity.current_user.name"
-                        }
-                    ]
+                    "durable": {
+                        "status": "run",
+                        "reasonCode": "memory_likely",
+                        "confidence": 0.92,
+                        "modes": ["exact_canonical"],
+                        "targets": [
+                            {
+                                "canonicalKey": "identity.current_user.name"
+                            }
+                        ]
+                    },
+                    "episodic": {
+                        "status": "skip",
+                        "reasonCode": "provider_skip",
+                        "confidence": 1.0,
+                        "queries": []
+                    }
                 }
             }
         })
@@ -2670,25 +2670,15 @@ mod tests {
     }
 
     #[test]
-    fn provider_memory_active_recall_uses_existing_memory_boundary() {
+    fn provider_memory_active_recall_rejects_host_owned_memory_fields() {
         let mut value = sample_provider_plan_json();
         value["memory"]["activeRecall"]["debugFallback"] = json!(true);
         value["memory"]["activeRecall"]["providerUsed"] = json!(true);
         value["memory"]["activeRecall"]["source"] = json!("provider");
 
-        let parsed: ProviderTurnPreflightPlan =
-            serde_json::from_value(value).expect("provider plan uses memory active recall parser");
-        let active_recall = parsed
-            .memory
-            .expect("memory plan")
-            .active_recall
-            .expect("active recall plan");
-
-        assert_eq!(active_recall.status, ActiveRecallPlanJsonStatus::Run);
-        let serialized = serde_json::to_value(active_recall).expect("active recall serializes");
-        assert!(serialized.get("debugFallback").is_none());
-        assert!(serialized.get("providerUsed").is_none());
-        assert!(serialized.get("source").is_none());
+        let error = serde_json::from_value::<ProviderTurnPreflightPlan>(value)
+            .expect_err("provider active recall must use the envelope only");
+        assert!(error.to_string().contains("unknown field"));
     }
 
     #[tokio::test]
@@ -3012,7 +3002,7 @@ mod tests {
             Some(240)
         );
         assert_eq!(
-            plan.memory.active_recall.decision.diagnostics[0],
+            plan.memory.active_recall.decision.all_diagnostics()[0],
             "memory.active_recall.provider_called"
         );
     }
@@ -3037,7 +3027,7 @@ mod tests {
             Some(240)
         );
         assert_eq!(
-            plan.memory.active_recall.decision.diagnostics,
+            plan.memory.active_recall.decision.all_diagnostics(),
             vec![
                 "memory.active_recall.provider_called".to_owned(),
                 "memory.active_recall.identity_lookup".to_owned()
@@ -3358,7 +3348,7 @@ mod tests {
             plan.memory
                 .active_recall
                 .decision
-                .diagnostics
+                .all_diagnostics()
                 .iter()
                 .any(|diagnostic| diagnostic == "memory.active_recall.invalid_json")
         );
@@ -3412,7 +3402,7 @@ mod tests {
             plan.memory
                 .active_recall
                 .decision
-                .diagnostics
+                .all_diagnostics()
                 .iter()
                 .any(|diagnostic| diagnostic == "memory.active_recall.invalid_json")
         );
@@ -3452,7 +3442,7 @@ mod tests {
             plan.memory
                 .active_recall
                 .decision
-                .diagnostics
+                .all_diagnostics()
                 .iter()
                 .any(|diagnostic| diagnostic == "memory.active_recall.invalid_json")
         );
@@ -3488,7 +3478,7 @@ mod tests {
             plan.memory
                 .active_recall
                 .decision
-                .diagnostics
+                .all_diagnostics()
                 .iter()
                 .any(|diagnostic| diagnostic == "planner_fallback_skip")
         );
@@ -3528,7 +3518,7 @@ mod tests {
             plan.memory
                 .active_recall
                 .decision
-                .diagnostics
+                .all_diagnostics()
                 .iter()
                 .any(|diagnostic| diagnostic == "planner_fallback_skip")
         );
@@ -3553,7 +3543,7 @@ mod tests {
     #[test]
     fn provider_memory_active_recall_validation_uses_existing_memory_parser() {
         let mut value = sample_provider_plan_json();
-        value["memory"]["activeRecall"]["modes"] = json!([]);
+        value["memory"]["activeRecall"]["durable"]["modes"] = json!([]);
 
         let parsed: ProviderTurnPreflightPlan =
             serde_json::from_value(value.clone()).expect("provider plan shape parses");
@@ -3584,40 +3574,34 @@ mod tests {
         let active_recall = wrap_memory_active_recall_plan(
             TurnPreflightPlanSource::HostLocal,
             None,
-            ActiveRecallPlan {
-                status: ActiveMemoryDecisionStatus::Run,
-                reason_code: ActiveMemoryDecisionReasonCode::MemoryLikely,
-                confidence: 4.0,
-                modes: vec![
+            ActiveRecallPlan::run(
+                ActiveMemoryDecisionReasonCode::MemoryLikely,
+                4.0,
+                vec![
                     ActiveRecallMode::Project,
                     ActiveRecallMode::Profile,
                     ActiveRecallMode::Profile,
                 ],
-                targets: Vec::new(),
-                debug_fallback: false,
-                provider_used: false,
-                provider_fallback_used: false,
-                provider_input_chars: None,
-                provider_output_chars: None,
-                diagnostics: vec![String::new(), "host_local".to_owned()],
-            },
+                Vec::new(),
+                vec![String::new(), "host_local".to_owned()],
+            ),
         );
 
         assert_eq!(active_recall.decision.confidence, 1.0);
-        assert_eq!(active_recall.decision.modes.len(), 2);
+        assert_eq!(active_recall.decision.selected_modes().len(), 2);
         assert!(
             active_recall
                 .decision
-                .modes
+                .selected_modes()
                 .contains(&ActiveRecallMode::Profile)
         );
         assert!(
             active_recall
                 .decision
-                .modes
+                .selected_modes()
                 .contains(&ActiveRecallMode::Project)
         );
-        assert_eq!(active_recall.decision.diagnostics, vec!["host_local"]);
+        assert_eq!(active_recall.decision.all_diagnostics(), vec!["host_local"]);
     }
 
     #[test]
@@ -3625,12 +3609,11 @@ mod tests {
         let active_recall = wrap_memory_active_recall_plan(
             TurnPreflightPlanSource::HostLocal,
             None,
-            ActiveRecallPlan {
-                status: ActiveMemoryDecisionStatus::Run,
-                reason_code: ActiveMemoryDecisionReasonCode::MemoryLikely,
-                confidence: 1.0,
-                modes: vec![ActiveRecallMode::ExactCanonical],
-                targets: vec![ActiveRecallTarget {
+            ActiveRecallPlan::run(
+                ActiveMemoryDecisionReasonCode::MemoryLikely,
+                1.0,
+                vec![ActiveRecallMode::ExactCanonical],
+                vec![ActiveRecallTarget {
                     scope_kind: Some(MemoryScopeKind::User),
                     fact_class: Some(MemoryFactClass::UserIdentity),
                     category: Some(MemoryCategory::Identity),
@@ -3638,13 +3621,8 @@ mod tests {
                     attribute: Some(MemoryAttribute::Name),
                     canonical_key: Some("identity.current_user.name".to_owned()),
                 }],
-                debug_fallback: false,
-                provider_used: false,
-                provider_fallback_used: false,
-                provider_input_chars: None,
-                provider_output_chars: None,
-                diagnostics: vec!["memory.active_recall.host_local".to_owned()],
-            },
+                vec!["memory.active_recall.host_local".to_owned()],
+            ),
         );
         let plan = fallback_turn_preflight_plan(
             TurnPreflightFallbackReason::Timeout,
@@ -3682,7 +3660,7 @@ mod tests {
             JsonValue::String("host_local".to_owned())
         );
         assert_eq!(
-            value["memory"]["activeRecall"]["decision"]["reasonCode"],
+            value["memory"]["activeRecall"]["decision"]["durable"]["reasonCode"],
             JsonValue::String("memory_likely".to_owned())
         );
 
@@ -3756,17 +3734,25 @@ mod tests {
                     "source": "fallback",
                     "fallbackReason": "validation_error",
                     "decision": {
-                        "status": "skip",
-                        "reasonCode": "provider_skip",
-                        "confidence": 0.0,
-                        "modes": [],
-                        "targets": [],
-                        "debugFallback": false,
-                        "providerUsed": false,
-                        "providerFallbackUsed": true,
-                        "diagnostics": [
-                            "memory.active_recall.fallback"
-                        ]
+                        "durable": {
+                            "status": "skip",
+                            "reasonCode": "provider_skip",
+                            "confidence": 0.0,
+                            "modes": [],
+                            "targets": [],
+                            "debugFallback": false,
+                            "providerUsed": false,
+                            "providerFallbackUsed": true,
+                            "diagnostics": [
+                                "memory.active_recall.fallback"
+                            ]
+                        },
+                        "episodic": {
+                            "status": "skip",
+                            "reasonCode": "provider_skip",
+                            "confidence": 1.0,
+                            "queries": []
+                        }
                     }
                 }
             },

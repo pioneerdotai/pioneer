@@ -63,11 +63,11 @@ use std::sync::{Arc, Mutex};
 
 use active_recall::*;
 pub use active_recall::{
-    ActiveMemoryDecision, ActiveMemoryDecisionReasonCode, ActiveMemoryDecisionReasonCodeJson,
-    ActiveMemoryDecisionStatus, ActiveRecallMode, ActiveRecallPlan, ActiveRecallPlanJson,
-    ActiveRecallPlanJsonStatus, ActiveRecallTarget, active_recall_planned_query_count,
-    active_recall_thread_episodic_summary, normalize_active_recall_plan,
-    parse_active_memory_decision_json,
+    ActiveMemoryDecision, ActiveMemoryDecisionReasonCode, ActiveMemoryDecisionStatus,
+    ActiveMemoryRecallPlan, ActiveRecallMode, ActiveRecallPlan, ActiveRecallTarget,
+    DurableMemoryRecallPlan, EpisodicMemoryRecallPlan, EpisodicMemoryRecallQuery,
+    active_recall_planned_query_count, active_recall_thread_episodic_summary,
+    normalize_active_recall_plan, parse_active_memory_decision_json,
 };
 pub use artifact_store::*;
 use capabilities::*;

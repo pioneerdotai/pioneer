@@ -59,6 +59,7 @@ pub fn render_turn_preflight_prompt(input: &TurnPreflightPromptInput) -> String 
 
     if memory_active_recall_requested {
         prompt.push_str("- `memory.activeRecall` is required and must contain an active recall strategy object, not remembered facts.\n");
+        prompt.push_str("- `memory.activeRecall` must use the durable/episodic envelope from the contract below.\n");
         prompt.push_str("- `memory.activeRecall.diagnostics` is an array of short strings; do not use the top-level diagnostics object shape inside it.\n");
     }
 
@@ -113,20 +114,28 @@ fn render_turn_preflight_output_example(memory_active_recall_requested: bool) ->
             "  },\n",
             "  \"memory\": {\n",
             "    \"activeRecall\": {\n",
-            "      \"status\": \"run\",\n",
-            "      \"reasonCode\": \"memory_likely\",\n",
-            "      \"confidence\": 0.86,\n",
-            "      \"modes\": [\"profile\"],\n",
-            "      \"targets\": [\n",
-            "        {\n",
-            "          \"scopeKind\": \"user\",\n",
-            "          \"factClass\": \"user_identity\",\n",
-            "          \"category\": \"identity\",\n",
-            "          \"subject\": \"current_user\",\n",
-            "          \"attribute\": \"name\",\n",
-            "          \"canonicalKey\": null\n",
-            "        }\n",
-            "      ],\n",
+            "      \"durable\": {\n",
+            "        \"status\": \"run\",\n",
+            "        \"reasonCode\": \"memory_likely\",\n",
+            "        \"confidence\": 0.86,\n",
+            "        \"modes\": [\"profile\"],\n",
+            "        \"targets\": [\n",
+            "          {\n",
+            "            \"scopeKind\": \"user\",\n",
+            "            \"factClass\": \"user_identity\",\n",
+            "            \"category\": \"identity\",\n",
+            "            \"subject\": \"current_user\",\n",
+            "            \"attribute\": \"name\",\n",
+            "            \"canonicalKey\": null\n",
+            "          }\n",
+            "        ]\n",
+            "      },\n",
+            "      \"episodic\": {\n",
+            "        \"status\": \"skip\",\n",
+            "        \"reasonCode\": \"provider_skip\",\n",
+            "        \"confidence\": 1.0,\n",
+            "        \"queries\": []\n",
+            "      },\n",
             "      \"diagnostics\": [\"identity_lookup\"]\n",
             "    }\n",
             "  },\n",
@@ -163,7 +172,7 @@ mod tests {
 
     fn sample_prompt_with_active_recall() -> String {
         render_turn_preflight_prompt(&TurnPreflightPromptInput {
-            structured_input_json: r#"{"turn":{"inputTextPreview":"как меня зовут?"},"tools":{"coreTools":["exec_command","request_tools"],"candidateTools":[{"name":"memory_search","domain":"memory","summary":"Search memory.","mutation":false},{"name":"memory_get","domain":"memory","summary":"Read memory.","mutation":false}]},"memory":{"activeRecall":{"providerPlanningNeeded":true,"decisionRequest":{"availableModes":["profile","project","durable"],"availableScopedContexts":["workspace","thread"],"deterministicSufficient":false,"deterministicRecallEmpty":true,"inputTextCharCount":15}}}}"#.to_owned(),
+            structured_input_json: r#"{"turn":{"inputTextPreview":"как меня зовут?"},"tools":{"coreTools":["exec_command","request_tools"],"candidateTools":[{"name":"memory_search","domain":"memory","summary":"Search memory.","mutation":false},{"name":"memory_get","domain":"memory","summary":"Read memory.","mutation":false}]},"memory":{"activeRecall":{"providerPlanningNeeded":true,"decisionRequest":{"availableModes":["profile","project","durable","current_thread"],"availableDurableModes":["profile","project","durable"],"availableEpisodicModes":["current_thread"],"availableScopedContexts":["workspace","thread"],"deterministicSufficient":false,"deterministicRecallEmpty":true,"inputTextCharCount":15}}}}"#.to_owned(),
             memory_active_recall: TurnPreflightMemoryActiveRecallPromptInput {
                 provider_planning_needed: true,
             },
@@ -274,14 +283,15 @@ mod tests {
         assert!(with_memory.contains(r#""status": "run""#));
         assert!(with_memory.contains(r#""reasonCode": "memory_likely""#));
         assert!(with_memory.contains(r#""confidence": 0.86"#));
+        assert!(with_memory.contains(r#""durable": {"#));
         assert!(with_memory.contains(r#""modes": ["profile"]"#));
+        assert!(with_memory.contains(r#""episodic": {"#));
+        assert!(with_memory.contains(r#""queries": []"#));
         assert!(with_memory.contains(r#""targets": ["#));
         assert!(with_memory.contains(r#""diagnostics": ["identity_lookup"]"#));
-        assert!(
-            with_memory
-                .contains("array containing only values from structured input `availableModes`")
-        );
-        assert!(with_memory.contains(r#""availableModes":["profile","project","durable"]"#));
+        assert!(with_memory.contains("array containing only durable modes"));
+        assert!(with_memory.contains(r#""availableDurableModes":["profile","project","durable"]"#));
+        assert!(with_memory.contains(r#""availableEpisodicModes":["current_thread"]"#));
     }
 
     #[test]

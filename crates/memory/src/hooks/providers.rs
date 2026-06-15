@@ -445,6 +445,10 @@ pub struct MemoryActiveRecallDecisionRequest {
     pub explicit_no_memory: bool,
     pub input_text_char_count: usize,
     pub available_modes: Vec<String>,
+    #[serde(default)]
+    pub available_durable_modes: Vec<String>,
+    #[serde(default)]
+    pub available_episodic_modes: Vec<String>,
     pub available_scoped_contexts: Vec<String>,
     pub episodic_capabilities: MemoryEpisodicRecallCapabilities,
     pub thread_episodic: MemoryActiveRecallThreadEpisodicSummary,
@@ -489,6 +493,8 @@ impl MemoryActiveRecallDecisionRequest {
             active_memory_allowed: self.active_memory_allowed,
             explicit_no_memory: self.explicit_no_memory,
             available_modes: self.available_modes.clone(),
+            available_durable_modes: self.available_durable_modes.clone(),
+            available_episodic_modes: self.available_episodic_modes.clone(),
             available_scoped_contexts: self.available_scoped_contexts.clone(),
             episodic_capabilities: self.episodic_capabilities.clone(),
             thread_episodic: self.thread_episodic.clone(),
@@ -545,6 +551,8 @@ struct MemoryActiveRecallPlannerSanitizedInput {
     active_memory_allowed: bool,
     explicit_no_memory: bool,
     available_modes: Vec<String>,
+    available_durable_modes: Vec<String>,
+    available_episodic_modes: Vec<String>,
     available_scoped_contexts: Vec<String>,
     episodic_capabilities: MemoryEpisodicRecallCapabilities,
     thread_episodic: MemoryActiveRecallThreadEpisodicSummary,

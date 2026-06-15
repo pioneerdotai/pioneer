@@ -9,6 +9,7 @@ struct FakeEpisodicRecallProvider {
     current_task: MemoryEpisodicRecallResponse,
     completed_tasks: MemoryEpisodicRecallResponse,
     calls: Arc<Mutex<Vec<&'static str>>>,
+    queries: Arc<Mutex<Vec<String>>>,
 }
 
 struct SlowEpisodicRecallProvider;
@@ -45,6 +46,10 @@ impl FakeEpisodicRecallProvider {
     fn calls(&self) -> Vec<&'static str> {
         self.calls.lock().expect("calls lock poisoned").clone()
     }
+
+    fn queries(&self) -> Vec<String> {
+        self.queries.lock().expect("queries lock poisoned").clone()
+    }
 }
 
 #[async_trait::async_trait]
@@ -58,56 +63,76 @@ impl AgentEpisodicRecallProvider for FakeEpisodicRecallProvider {
 
     async fn recall_current_thread(
         &self,
-        _request: MemoryCurrentThreadRecallRequest,
+        request: MemoryCurrentThreadRecallRequest,
     ) -> Result<MemoryEpisodicRecallResponse, String> {
         self.calls
             .lock()
             .expect("calls lock poisoned")
             .push("current_thread");
+        self.queries
+            .lock()
+            .expect("queries lock poisoned")
+            .push(request.query);
         Ok(self.current_thread.clone())
     }
 
     async fn recall_related_threads(
         &self,
-        _request: MemoryRelatedThreadRecallRequest,
+        request: MemoryRelatedThreadRecallRequest,
     ) -> Result<MemoryEpisodicRecallResponse, String> {
         self.calls
             .lock()
             .expect("calls lock poisoned")
             .push("related_threads");
+        self.queries
+            .lock()
+            .expect("queries lock poisoned")
+            .push(request.query);
         Ok(self.related_threads.clone())
     }
 
     async fn recall_workspace_threads(
         &self,
-        _request: MemoryWorkspaceThreadRecallRequest,
+        request: MemoryWorkspaceThreadRecallRequest,
     ) -> Result<MemoryEpisodicRecallResponse, String> {
         self.calls
             .lock()
             .expect("calls lock poisoned")
             .push("workspace_threads");
+        self.queries
+            .lock()
+            .expect("queries lock poisoned")
+            .push(request.query);
         Ok(self.workspace_threads.clone())
     }
 
     async fn recall_current_task(
         &self,
-        _request: MemoryCurrentTaskRecallRequest,
+        request: MemoryCurrentTaskRecallRequest,
     ) -> Result<MemoryEpisodicRecallResponse, String> {
         self.calls
             .lock()
             .expect("calls lock poisoned")
             .push("current_task");
+        self.queries
+            .lock()
+            .expect("queries lock poisoned")
+            .push(request.query);
         Ok(self.current_task.clone())
     }
 
     async fn recall_completed_tasks(
         &self,
-        _request: MemoryCompletedTaskRecallRequest,
+        request: MemoryCompletedTaskRecallRequest,
     ) -> Result<MemoryEpisodicRecallResponse, String> {
         self.calls
             .lock()
             .expect("calls lock poisoned")
             .push("completed_tasks");
+        self.queries
+            .lock()
+            .expect("queries lock poisoned")
+            .push(request.query);
         Ok(self.completed_tasks.clone())
     }
 }
@@ -217,7 +242,7 @@ async fn missing_episodic_capability_drops_provider_selected_mode() {
         config: MemoryActiveRecallConfig::default(),
     };
     let plan = parse_active_memory_decision_json(
-        r#"{"status":"run","reasonCode":"provider_run","confidence":0.9,"modes":["current_thread"],"targets":[]}"#,
+        r#"{"durable":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"modes":[],"targets":[]},"episodic":{"status":"run","reasonCode":"provider_run","confidence":0.9,"queries":[{"mode":"current_thread","query":"continue what we discussed earlier","targets":[]}]}}"#,
     )
     .expect("provider-owned preflight plan parses");
     let input = TurnPostPreflightPromptContextHookInput::from_parts(
@@ -246,18 +271,18 @@ async fn missing_episodic_capability_drops_provider_selected_mode() {
         diagnostic
             .message
             .as_str()
-            .contains("dropped_mode=thread_episodic:capability_unavailable")
+            .contains("dropped_query=thread_episodic:capability_unavailable")
     }));
 }
 
 #[test]
 fn active_recall_planner_parses_new_episodic_modes_and_validates_capabilities() {
     let plan = parse_active_memory_decision_json(
-        r#"{"status":"run","reasonCode":"provider_run","confidence":0.9,"modes":["current_thread","related_threads","workspace_threads","current_task"],"targets":[]}"#,
+        r#"{"durable":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"modes":[],"targets":[]},"episodic":{"status":"run","reasonCode":"provider_run","confidence":0.9,"queries":[{"mode":"current_thread","query":"current thread context","targets":[]},{"mode":"related_threads","query":"related thread context","targets":[]},{"mode":"workspace_threads","query":"workspace thread context","targets":[]},{"mode":"current_task","query":"current task context","targets":[]}]}}"#,
     )
     .expect("provider plan parses");
     assert_eq!(
-        plan.modes,
+        plan.selected_modes(),
         vec![
             ActiveRecallMode::CurrentTask,
             ActiveRecallMode::CurrentThread,
@@ -266,11 +291,11 @@ fn active_recall_planner_parses_new_episodic_modes_and_validates_capabilities() 
         ]
     );
     let completed_task_plan = parse_active_memory_decision_json(
-        r#"{"status":"run","reasonCode":"provider_run","confidence":0.9,"modes":["completed_task"],"targets":[]}"#,
+        r#"{"durable":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"modes":[],"targets":[]},"episodic":{"status":"run","reasonCode":"provider_run","confidence":0.9,"queries":[{"mode":"completed_task","query":"completed task context","targets":[]}]}}"#,
     )
     .expect("completed task mode parses");
     assert_eq!(
-        completed_task_plan.modes,
+        completed_task_plan.selected_modes(),
         vec![ActiveRecallMode::CompletedTask]
     );
 
@@ -281,20 +306,22 @@ fn active_recall_planner_parses_new_episodic_modes_and_validates_capabilities() 
     input.episodic_capabilities.current_task_context = true;
     let normalized = normalize_active_recall_plan_for_input(plan, &input);
 
+    assert_eq!(normalized.durable.modes, Vec::<ActiveRecallMode>::new());
     assert_eq!(
-        normalized.modes,
+        normalized.selected_modes(),
         vec![
             ActiveRecallMode::CurrentTask,
             ActiveRecallMode::CurrentThread
         ]
     );
+    assert_eq!(normalized.episodic.queries.len(), 2);
     assert!(
-        normalized.diagnostics.iter().any(|diagnostic| {
-            diagnostic == "dropped_mode=related_thread:capability_unavailable"
+        normalized.all_diagnostics().iter().any(|diagnostic| {
+            diagnostic == "dropped_query=related_thread:capability_unavailable"
         })
     );
-    assert!(normalized.diagnostics.iter().any(|diagnostic| {
-        diagnostic == "dropped_mode=workspace_thread:capability_unavailable"
+    assert!(normalized.all_diagnostics().iter().any(|diagnostic| {
+        diagnostic == "dropped_query=workspace_thread:capability_unavailable"
     }));
 }
 
@@ -323,7 +350,7 @@ async fn current_thread_recall_uses_native_provider_and_separate_prompt_context(
         config: MemoryActiveRecallConfig::default(),
     };
     let plan = parse_active_memory_decision_json(
-        r#"{"status":"run","reasonCode":"provider_run","confidence":0.9,"modes":["current_thread"],"targets":[]}"#,
+        r#"{"durable":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"modes":[],"targets":[]},"episodic":{"status":"run","reasonCode":"provider_run","confidence":0.9,"queries":[{"mode":"current_thread","query":"continue what we discussed earlier","targets":[]}]}}"#,
     )
     .expect("provider-owned preflight plan parses");
     let input = TurnPostPreflightPromptContextHookInput::from_parts(
@@ -374,6 +401,83 @@ async fn current_thread_recall_uses_native_provider_and_separate_prompt_context(
 }
 
 #[tokio::test]
+async fn current_thread_recall_uses_envelope_planned_query_instead_of_raw_turn_text() {
+    let durable_provider = Arc::new(TestRecallMemoryProvider::with_recall(
+        MemoryRecallSnapshot::empty(),
+    ));
+    let mut episodic =
+        FakeEpisodicRecallProvider::with_capabilities(MemoryEpisodicRecallCapabilities {
+            current_thread_search: true,
+            ..MemoryEpisodicRecallCapabilities::default()
+        });
+    episodic.current_thread = MemoryEpisodicRecallResponse {
+        items: vec![episodic_item(
+            "thread:turn_1/item_1/chunk_0",
+            MemoryEpisodicRecallSourceKind::CurrentThread,
+            "Earlier in this thread, the user asked for tomorrow weather in Moscow.",
+        )],
+        ..MemoryEpisodicRecallResponse::default()
+    };
+    let episodic = Arc::new(episodic);
+    let hook = ActiveMemoryRecallHook {
+        memory_provider: durable_provider.clone(),
+        episodic_provider: Some(episodic.clone()),
+        config: MemoryActiveRecallConfig::default(),
+    };
+    let plan = parse_active_memory_decision_json(
+        r#"{
+            "durable": {
+                "status": "skip",
+                "reasonCode": "provider_skip",
+                "confidence": 1.0,
+                "modes": [],
+                "targets": []
+            },
+            "episodic": {
+                "status": "run",
+                "reasonCode": "provider_run",
+                "confidence": 0.92,
+                "queries": [
+                    {
+                        "mode": "current_thread",
+                        "query": "прогноз погоды в Москве завтра",
+                        "targets": [],
+                        "topK": 3,
+                        "maxChars": 700
+                    }
+                ]
+            },
+            "diagnostics": ["continuation_query_planned"]
+        }"#,
+    )
+    .expect("provider-owned envelope plan parses");
+    let input = TurnPostPreflightPromptContextHookInput::from_parts(
+        "а завтра какая?",
+        Some("test-model"),
+        Some("test-provider"),
+    )
+    .with_active_memory_recall_preflight_plan(
+        serde_json::to_value(plan).expect("active recall plan serializes"),
+    );
+    let mut request = test_active_prompt_context_hook_request(
+        memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+        HookPromptContextSet::default(),
+        "а завтра какая?",
+    );
+    request.input = HookInput::turn_post_preflight_prompt_context(input);
+
+    let response = hook
+        .execute(request)
+        .await
+        .expect("active recall hook executes");
+
+    assert_eq!(durable_provider.recall_call_count(), 0);
+    assert_eq!(episodic.calls(), vec!["current_thread"]);
+    assert_eq!(episodic.queries(), vec!["прогноз погоды в Москве завтра"]);
+    assert!(!prompt_context_contributions(&response).is_empty());
+}
+
+#[tokio::test]
 async fn active_recall_hook_keeps_cross_thread_prompt_domains_separate() {
     let durable_provider = Arc::new(TestRecallMemoryProvider::with_recall(
         MemoryRecallSnapshot::empty(),
@@ -416,7 +520,7 @@ async fn active_recall_hook_keeps_cross_thread_prompt_domains_separate() {
         config: MemoryActiveRecallConfig::default(),
     };
     let plan = parse_active_memory_decision_json(
-        r#"{"status":"run","reasonCode":"provider_run","confidence":0.9,"modes":["current_thread","related_thread","workspace_thread"],"targets":[]}"#,
+        r#"{"durable":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"modes":[],"targets":[]},"episodic":{"status":"run","reasonCode":"provider_run","confidence":0.9,"queries":[{"mode":"current_thread","query":"current thread context","targets":[]},{"mode":"related_thread","query":"related thread context","targets":[]},{"mode":"workspace_thread","query":"workspace thread context","targets":[]}]}}"#,
     )
     .expect("provider-owned cross-thread plan parses");
     let input = TurnPostPreflightPromptContextHookInput::from_parts(
@@ -503,11 +607,19 @@ async fn invalid_preflight_plan_falls_back_to_current_thread_recall_when_availab
         Some("test-provider"),
     )
     .with_active_memory_recall_preflight_plan(json!({
-        "status": "run",
-        "reasonCode": "provider_run",
-        "confidence": 0.9,
-        "modes": [],
-        "targets": []
+        "durable": {
+            "status": "skip",
+            "reasonCode": "provider_skip",
+            "confidence": 1.0,
+            "modes": [],
+            "targets": []
+        },
+        "episodic": {
+            "status": "run",
+            "reasonCode": "provider_run",
+            "confidence": 0.9,
+            "queries": []
+        }
     }));
     let mut request = test_active_prompt_context_hook_request(
         memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
