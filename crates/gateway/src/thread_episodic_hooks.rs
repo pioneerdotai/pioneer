@@ -3,6 +3,9 @@ use crate::thread_episodic::{
     WorkspaceEpisodicRecallRequest, WorkspaceEpisodicRecallService,
 };
 use async_trait::async_trait;
+use pioneer_crud::{
+    ConversationArtifactRef, ConversationArtifactRefLimits, ConversationTurnArtifactRefs, CrudStore,
+};
 use pioneer_hooks::{
     HookAwaitPolicy, HookCapabilities, HookCapability, HookContribution, HookContributionId,
     HookDefinition, HookDiagnostic, HookDiagnosticCode, HookDiagnosticMessage,
@@ -22,8 +25,10 @@ use pioneer_memory::hooks::{
 use pioneer_protocol::{
     ThreadEpisodicHit, ThreadEpisodicRecallDiagnostic, ThreadEpisodicRecallDiagnosticCode,
     ThreadEpisodicRecallInput, ThreadEpisodicRecallOutput, ThreadEpisodicRecallPolicyContext,
-    ThreadEpisodicThreadId, ThreadEpisodicTurnId, ThreadEpisodicWorkspaceId,
+    ThreadEpisodicSourceActorRole, ThreadEpisodicThreadId, ThreadEpisodicTurnId,
+    ThreadEpisodicWorkspaceId,
 };
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 const THREAD_CONTEXT_RECALL_PACKAGE_ID: &str = "pioneer.thread_episodic";
@@ -73,24 +78,31 @@ impl ThreadContextRecallProvider for ThreadEpisodicRecallService {
 pub(crate) struct ThreadEpisodicMemoryRecallProvider {
     service: Arc<ThreadEpisodicRecallService>,
     workspace_service: Option<Arc<WorkspaceEpisodicRecallService>>,
+    crud_store: Arc<CrudStore>,
 }
 
 impl ThreadEpisodicMemoryRecallProvider {
     #[allow(dead_code)]
-    pub(crate) fn new(service: Arc<ThreadEpisodicRecallService>) -> Self {
+    pub(crate) fn new(
+        service: Arc<ThreadEpisodicRecallService>,
+        crud_store: Arc<CrudStore>,
+    ) -> Self {
         Self {
             service,
             workspace_service: None,
+            crud_store,
         }
     }
 
     pub(crate) fn with_workspace_service(
         service: Arc<ThreadEpisodicRecallService>,
         workspace_service: Arc<WorkspaceEpisodicRecallService>,
+        crud_store: Arc<CrudStore>,
     ) -> Self {
         Self {
             service,
             workspace_service: Some(workspace_service),
+            crud_store,
         }
     }
 }
@@ -136,9 +148,9 @@ impl AgentEpisodicRecallProvider for ThreadEpisodicMemoryRecallProvider {
         let truncated = output.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == ThreadEpisodicRecallDiagnosticCode::PromptBudgetExceeded
         });
+        let hits = enrich_thread_hits_with_artifact_refs(&self.crud_store, output.hits).await;
         Ok(MemoryEpisodicRecallResponse {
-            items: output
-                .hits
+            items: hits
                 .into_iter()
                 .map(|hit| {
                     thread_hit_to_memory_episodic_item(
@@ -187,9 +199,9 @@ impl AgentEpisodicRecallProvider for ThreadEpisodicMemoryRecallProvider {
                 },
             })
             .await;
+        let hits = enrich_thread_hits_with_artifact_refs(&self.crud_store, output.hits).await;
         Ok(MemoryEpisodicRecallResponse {
-            items: output
-                .hits
+            items: hits
                 .into_iter()
                 .map(|hit| {
                     thread_hit_to_memory_episodic_item(
@@ -236,9 +248,9 @@ impl AgentEpisodicRecallProvider for ThreadEpisodicMemoryRecallProvider {
                 },
             })
             .await;
+        let hits = enrich_thread_hits_with_artifact_refs(&self.crud_store, output.hits).await;
         Ok(MemoryEpisodicRecallResponse {
-            items: output
-                .hits
+            items: hits
                 .into_iter()
                 .map(|hit| {
                     thread_hit_to_memory_episodic_item(
@@ -277,13 +289,129 @@ fn thread_hit_to_memory_episodic_item(
     }
 }
 
+async fn enrich_thread_hits_with_artifact_refs(
+    crud_store: &CrudStore,
+    hits: Vec<ThreadEpisodicHit>,
+) -> Vec<ThreadEpisodicHit> {
+    if hits.is_empty() {
+        return hits;
+    }
+    let refs_by_source_id = conversation_artifact_refs_by_source_id(crud_store, &hits).await;
+    if refs_by_source_id.is_empty() {
+        return hits;
+    }
+
+    hits.into_iter()
+        .map(|mut hit| {
+            if let Some(refs) = refs_by_source_id.get(hit.provenance.source_id.as_str()) {
+                hit.text = crate::artifact_prompt_refs::append_episodic_artifact_refs(
+                    hit.text.as_str(),
+                    hit.provenance.source_id.as_str(),
+                    refs,
+                );
+            }
+            hit
+        })
+        .collect()
+}
+
+async fn conversation_artifact_refs_by_source_id(
+    crud_store: &CrudStore,
+    hits: &[ThreadEpisodicHit],
+) -> BTreeMap<String, Vec<ConversationArtifactRef>> {
+    let mut turn_ids_by_thread: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+    for hit in hits {
+        turn_ids_by_thread
+            .entry((
+                hit.provenance.workspace_id.0.clone(),
+                hit.provenance.thread_id.0.clone(),
+            ))
+            .or_default()
+            .insert(hit.provenance.turn_id.0.clone());
+    }
+
+    let mut refs_by_turn: BTreeMap<(String, String, String), ConversationTurnArtifactRefs> =
+        BTreeMap::new();
+    for ((workspace_id, thread_id), turn_ids) in turn_ids_by_thread {
+        let turn_ids = turn_ids.into_iter().collect::<Vec<_>>();
+        let Ok(grouped) = crud_store
+            .list_conversation_artifact_refs(
+                workspace_id.as_str(),
+                thread_id.as_str(),
+                &turn_ids,
+                ConversationArtifactRefLimits::default(),
+            )
+            .await
+        else {
+            continue;
+        };
+        for (turn_id, refs) in grouped {
+            refs_by_turn.insert((workspace_id.clone(), thread_id.clone(), turn_id), refs);
+        }
+    }
+
+    let mut refs_by_source_id = BTreeMap::new();
+    for hit in hits {
+        let key = (
+            hit.provenance.workspace_id.0.clone(),
+            hit.provenance.thread_id.0.clone(),
+            hit.provenance.turn_id.0.clone(),
+        );
+        let Some(turn_refs) = refs_by_turn.get(&key) else {
+            continue;
+        };
+        let refs = refs_for_thread_hit(hit, turn_refs);
+        if !refs.is_empty() {
+            refs_by_source_id.insert(hit.provenance.source_id.clone(), refs);
+        }
+    }
+    refs_by_source_id
+}
+
+fn refs_for_thread_hit(
+    hit: &ThreadEpisodicHit,
+    turn_refs: &ConversationTurnArtifactRefs,
+) -> Vec<ConversationArtifactRef> {
+    let (bucket, allow_bucket_fallback) = match hit.provenance.source_actor_role {
+        ThreadEpisodicSourceActorRole::User => (&turn_refs.user, true),
+        ThreadEpisodicSourceActorRole::Assistant => (&turn_refs.assistant, true),
+        ThreadEpisodicSourceActorRole::ToolSummary
+        | ThreadEpisodicSourceActorRole::TaskSummary
+        | ThreadEpisodicSourceActorRole::GeneratedSummary => (&turn_refs.assistant, false),
+    };
+    if bucket.is_empty() {
+        return Vec::new();
+    }
+
+    let item_id = hit.provenance.item_id.0.as_str();
+    let exact = bucket
+        .iter()
+        .filter(|artifact_ref| {
+            artifact_ref.turn_item_id.as_deref() == Some(item_id)
+                || artifact_ref.message_id.as_deref() == Some(item_id)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if exact.is_empty() {
+        if allow_bucket_fallback {
+            bucket.clone()
+        } else {
+            Vec::new()
+        }
+    } else {
+        exact
+    }
+}
+
 pub(crate) fn thread_context_recall_hook_package(
     recall_provider: Arc<dyn ThreadContextRecallProvider>,
+    artifact_store: Option<Arc<CrudStore>>,
     memory_config: MemoryLoopConfig,
     thread_context_config: ThreadContextRecallHookConfig,
 ) -> ThreadContextRecallHookPackage {
     ThreadContextRecallHookPackage {
         recall_provider,
+        artifact_store,
         config: ThreadContextRecallHookConfig {
             enabled: memory_config.normalized().deterministic_recall_enabled
                 && thread_context_config.enabled,
@@ -294,6 +422,7 @@ pub(crate) fn thread_context_recall_hook_package(
 
 pub(crate) struct ThreadContextRecallHookPackage {
     recall_provider: Arc<dyn ThreadContextRecallProvider>,
+    artifact_store: Option<Arc<CrudStore>>,
     config: ThreadContextRecallHookConfig,
 }
 
@@ -305,6 +434,7 @@ impl HookPackage for ThreadContextRecallHookPackage {
     fn definitions(&self) -> Result<Vec<HookDefinition>, HookRegistryError> {
         let hook = Arc::new(ThreadContextRecallHook {
             recall_provider: self.recall_provider.clone(),
+            artifact_store: self.artifact_store.clone(),
             config: self.config,
         });
         let hook_id = hook.id();
@@ -330,6 +460,7 @@ impl HookPackage for ThreadContextRecallHookPackage {
 
 pub(crate) struct ThreadContextRecallHook {
     recall_provider: Arc<dyn ThreadContextRecallProvider>,
+    artifact_store: Option<Arc<CrudStore>>,
     config: ThreadContextRecallHookConfig,
 }
 
@@ -445,6 +576,16 @@ impl HookHandler for ThreadContextRecallHook {
             .await;
         let recall_diagnostics = hook_diagnostics_from_recall(&recall_output.diagnostics);
         response.diagnostics.extend(recall_diagnostics.clone());
+
+        let recall_output = if let Some(artifact_store) = self.artifact_store.as_ref() {
+            ThreadEpisodicRecallOutput {
+                hits: enrich_thread_hits_with_artifact_refs(artifact_store, recall_output.hits)
+                    .await,
+                ..recall_output
+            }
+        } else {
+            recall_output
+        };
 
         if let Some(contribution) = thread_context_prompt_contribution(
             &recall_output,
@@ -685,6 +826,7 @@ mod tests {
         MemoryTurnPolicy,
     };
     use pioneer_protocol::{
+        ArtifactBindingDirection, ArtifactBindingKind, ArtifactKind, ArtifactRole,
         ThreadEpisodicItemId, ThreadEpisodicScoreBreakdown, ThreadEpisodicSourceActorRole,
         ThreadEpisodicSourceContext, ThreadEpisodicSourceProvenance,
     };
@@ -736,6 +878,7 @@ mod tests {
         };
         let hook = ThreadContextRecallHook {
             recall_provider: provider.clone(),
+            artifact_store: None,
             config: ThreadContextRecallHookConfig::default(),
         };
 
@@ -813,6 +956,7 @@ mod tests {
         let runtime = HookRuntimeBuilder::new()
             .install(thread_context_recall_hook_package(
                 provider,
+                None,
                 MemoryLoopConfig::default(),
                 ThreadContextRecallHookConfig::default(),
             ))
@@ -844,6 +988,7 @@ mod tests {
         let provider = Arc::new(FakeThreadContextRecallProvider::default());
         let hook = ThreadContextRecallHook {
             recall_provider: provider.clone(),
+            artifact_store: None,
             config: ThreadContextRecallHookConfig::default(),
         };
 
@@ -867,6 +1012,7 @@ mod tests {
         let provider = Arc::new(FakeThreadContextRecallProvider::default());
         let hook = ThreadContextRecallHook {
             recall_provider: provider.clone(),
+            artifact_store: None,
             config: ThreadContextRecallHookConfig {
                 enabled: false,
                 ..ThreadContextRecallHookConfig::default()
@@ -893,6 +1039,7 @@ mod tests {
         let provider = Arc::new(FakeThreadContextRecallProvider::default());
         let package = thread_context_recall_hook_package(
             provider,
+            None,
             MemoryLoopConfig::default(),
             ThreadContextRecallHookConfig::default(),
         );
@@ -1048,6 +1195,93 @@ mod tests {
             adaptive_diagnostics: None,
             created_at: Some(1_700_000_000),
         }
+    }
+
+    fn test_user_conversation_artifact_ref(turn_item_id: Option<&str>) -> ConversationArtifactRef {
+        ConversationArtifactRef {
+            artifact_id: "art_car".to_owned(),
+            version_id: Some("ver_car".to_owned()),
+            display_name: "car.jpg".to_owned(),
+            kind: ArtifactKind::Image,
+            mime_type: Some("image/jpeg".to_owned()),
+            size_bytes: Some(862_208),
+            sha256: Some("sha".to_owned()),
+            binding_kind: ArtifactBindingKind::UserInput,
+            direction: ArtifactBindingDirection::Input,
+            role: Some(ArtifactRole::User),
+            turn_id: Some("turn_1".to_owned()),
+            message_id: turn_item_id.map(ToOwned::to_owned),
+            turn_item_id: turn_item_id.map(ToOwned::to_owned),
+            item_index: Some(0),
+        }
+    }
+
+    fn test_assistant_conversation_artifact_ref(
+        turn_item_id: Option<&str>,
+    ) -> ConversationArtifactRef {
+        ConversationArtifactRef {
+            artifact_id: "art_report".to_owned(),
+            version_id: Some("ver_report".to_owned()),
+            display_name: "report.pdf".to_owned(),
+            kind: ArtifactKind::File,
+            mime_type: Some("application/pdf".to_owned()),
+            size_bytes: Some(24_000),
+            sha256: Some("sha".to_owned()),
+            binding_kind: ArtifactBindingKind::AgentOutput,
+            direction: ArtifactBindingDirection::Output,
+            role: Some(ArtifactRole::Assistant),
+            turn_id: Some("turn_1".to_owned()),
+            message_id: turn_item_id.map(ToOwned::to_owned),
+            turn_item_id: turn_item_id.map(ToOwned::to_owned),
+            item_index: Some(0),
+        }
+    }
+
+    #[test]
+    fn episodic_user_and_assistant_hits_get_matching_artifact_refs() {
+        let turn_refs = ConversationTurnArtifactRefs {
+            user: vec![test_user_conversation_artifact_ref(Some("item_1"))],
+            assistant: vec![test_assistant_conversation_artifact_ref(Some(
+                "assistant_item",
+            ))],
+        };
+
+        let user_refs = refs_for_thread_hit(
+            &test_hit("thread:turn_1/item_1/chunk_1", "user"),
+            &turn_refs,
+        );
+        assert_eq!(user_refs.len(), 1);
+        assert_eq!(user_refs[0].artifact_id, "art_car");
+        assert_eq!(user_refs[0].role, Some(ArtifactRole::User));
+
+        let mut assistant_hit = test_hit("thread:turn_1/assistant_item/chunk_1", "assistant");
+        assistant_hit.provenance.source_actor_role = ThreadEpisodicSourceActorRole::Assistant;
+        assistant_hit.provenance.item_id = ThreadEpisodicItemId("assistant_item".to_owned());
+        let assistant_refs = refs_for_thread_hit(&assistant_hit, &turn_refs);
+        assert_eq!(assistant_refs.len(), 1);
+        assert_eq!(assistant_refs[0].artifact_id, "art_report");
+        assert_eq!(assistant_refs[0].role, Some(ArtifactRole::Assistant));
+    }
+
+    #[test]
+    fn episodic_summary_hits_do_not_inherit_assistant_artifacts_without_exact_provenance() {
+        let turn_refs = ConversationTurnArtifactRefs {
+            user: Vec::new(),
+            assistant: vec![test_assistant_conversation_artifact_ref(Some(
+                "assistant_item",
+            ))],
+        };
+        let mut summary_hit = test_hit("thread:turn_1/summary_item/chunk_1", "summary");
+        summary_hit.provenance.source_actor_role = ThreadEpisodicSourceActorRole::GeneratedSummary;
+        summary_hit.provenance.item_id = ThreadEpisodicItemId("summary_item".to_owned());
+
+        assert!(refs_for_thread_hit(&summary_hit, &turn_refs).is_empty());
+
+        let mut exact_summary_hit = summary_hit;
+        exact_summary_hit.provenance.item_id = ThreadEpisodicItemId("assistant_item".to_owned());
+        let refs = refs_for_thread_hit(&exact_summary_hit, &turn_refs);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].artifact_id, "art_report");
     }
 
     fn prompt_context_contribution(

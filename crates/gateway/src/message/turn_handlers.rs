@@ -132,7 +132,8 @@ impl MessageProcessor {
         self.ensure_agent_listener_task(outcome.started_notification.thread_id.as_str())
             .await;
         let history = self
-            .load_conversation_history(
+            .load_conversation_history_for_workspace(
+                outcome.started_notification.workspace_id.as_str(),
                 outcome.started_notification.thread_id.as_str(),
                 outcome.started_notification.turn.id.as_str(),
             )

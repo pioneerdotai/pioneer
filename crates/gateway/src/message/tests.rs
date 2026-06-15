@@ -3441,6 +3441,48 @@ async fn ingest_bound_test_artifact(
         .artifact
 }
 
+async fn ingest_bound_assistant_test_artifact(
+    processor: &MessageProcessor,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    item_id: &str,
+    display_name: &str,
+    bytes: Vec<u8>,
+) -> pioneer_protocol::ArtifactRef {
+    processor
+        .artifact_service
+        .ingest_bytes(pioneer_artifacts::IngestArtifactBytesRequest {
+            workspace_id: workspace_id.to_owned(),
+            primary_thread_id: Some(thread_id.to_owned()),
+            bytes,
+            display_name: display_name.to_owned(),
+            kind: pioneer_protocol::ArtifactKind::File,
+            mime_type: Some(
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".to_owned(),
+            ),
+            created_by_kind: pioneer_protocol::ArtifactCreatedByKind::Agent,
+            created_by_actor_id: Some("test-agent".to_owned()),
+            binding: Some(pioneer_artifacts::ArtifactBindingTarget {
+                thread_id: Some(thread_id.to_owned()),
+                turn_id: Some(turn_id.to_owned()),
+                message_id: Some(item_id.to_owned()),
+                turn_item_id: Some(item_id.to_owned()),
+                tool_call_id: None,
+                task_id: None,
+                task_run_id: None,
+                binding_kind: pioneer_protocol::ArtifactBindingKind::AgentOutput,
+                direction: pioneer_protocol::ArtifactBindingDirection::Output,
+                role: Some(pioneer_protocol::ArtifactRole::Assistant),
+                item_index: Some(0),
+            }),
+            metadata: Default::default(),
+        })
+        .await
+        .expect("bound assistant artifact ingest should succeed")
+        .artifact
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turn_start_with_artifact_input_materializes_user_message_attachment_and_binding() {
     let (tx, mut rx) = mpsc::channel(16);
@@ -3559,6 +3601,308 @@ async fn turn_start_with_artifact_input_materializes_user_message_attachment_and
                 && file.size_bytes == Some(14)
                 && matches!(file.source, pioneer_provider::AttachmentDataSource::Path { .. })
     ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn followup_turn_history_includes_inline_artifact_ref_without_reattaching_content() {
+    let (tx, mut rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let capture_provider = Arc::new(CaptureSummaryProvider::new("artifact answer"));
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        capture_provider.clone(),
+    ));
+    let processor = MessageProcessor::new(
+        thread_manager,
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+    let artifact = ingest_user_test_artifact(&processor, workspace_id.as_str(), "car.jpg").await;
+    let thread = start_thread_for_artifact_test(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        "thr_artifact_followup_history",
+    )
+    .await;
+
+    let first_turn_id = "turn_artifact_followup_01";
+    let first_request_id = generate_test_request_id("turnartifact", "followup1");
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": first_request_id.clone(),
+                "method": "turn/start",
+                "params": {
+                    "thread_id": thread.thread.id,
+                    "turn_id": first_turn_id,
+                    "input": [
+                        { "type": "text", "text": "Что за машина?" },
+                        {
+                            "type": "artifact",
+                            "artifactId": artifact.artifact_id.clone(),
+                            "versionId": artifact.version_id.clone()
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let _first_response = recv_response_by_id(&mut rx, first_request_id.as_str()).await;
+    let _first_completed = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
+
+    let second_turn_id = "turn_artifact_followup_02";
+    let second_request_id = generate_test_request_id("turnartifact", "followup2");
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": second_request_id.clone(),
+                "method": "turn/start",
+                "params": {
+                    "thread_id": thread.thread.id,
+                    "turn_id": second_turn_id,
+                    "input": [{ "type": "text", "text": "Нет, разве это не Nissan?" }]
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let _second_response = recv_response_by_id(&mut rx, second_request_id.as_str()).await;
+    let _second_completed = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
+
+    let requests = capture_provider.snapshot_requests();
+    assert_eq!(requests.len(), 2);
+    let second_request = &requests[1];
+    let artifact_history_message = second_request
+        .messages
+        .iter()
+        .find(|message| {
+            message
+                .content
+                .contains("Available artifacts from this user message:")
+        })
+        .expect("second provider request should include previous user artifact ref");
+    assert!(
+        artifact_history_message
+            .content
+            .starts_with("Что за машина?")
+    );
+    assert!(
+        artifact_history_message
+            .content
+            .contains(format!("artifactId={}", artifact.artifact_id).as_str())
+    );
+    let artifact_version_id = artifact
+        .version_id
+        .as_deref()
+        .expect("test artifact version id");
+    assert!(
+        artifact_history_message
+            .content
+            .contains(format!("versionId={artifact_version_id}").as_str())
+    );
+    assert!(
+        artifact_history_message
+            .content
+            .contains("name=\"car.jpg\"")
+    );
+    assert!(artifact_history_message.content.contains("mime=text/plain"));
+    assert!(!artifact_history_message.content.contains("hello artifact"));
+    assert!(!artifact_history_message.content.contains("artifact_read"));
+    assert!(artifact_history_message.content_parts.is_empty());
+
+    processor
+        .artifact_service
+        .delete_artifact(workspace_id.as_str(), artifact.artifact_id.as_str())
+        .await
+        .expect("test artifact delete should succeed");
+
+    let third_turn_id = "turn_artifact_followup_03";
+    let third_request_id = generate_test_request_id("turnartifact", "followup3");
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": third_request_id.clone(),
+                "method": "turn/start",
+                "params": {
+                    "thread_id": thread.thread.id,
+                    "turn_id": third_turn_id,
+                    "input": [{ "type": "text", "text": "А теперь без файла?" }]
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let _third_response = recv_response_by_id(&mut rx, third_request_id.as_str()).await;
+    let _third_completed = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
+
+    let requests = capture_provider.snapshot_requests();
+    assert_eq!(requests.len(), 3);
+    let third_request = &requests[2];
+    assert!(
+        third_request.messages.iter().all(|message| !message
+            .content
+            .contains("Available artifacts from this user message:")),
+        "deleted artifacts must not be rendered back into retained history"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn followup_turn_history_includes_inline_assistant_artifact_ref() {
+    let (tx, mut rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let capture_provider = Arc::new(CaptureSummaryProvider::new("Я подготовил файл."));
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        capture_provider.clone(),
+    ));
+    let processor = MessageProcessor::new(
+        thread_manager,
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+    let thread = start_thread_for_artifact_test(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        "thr_artifact_assistant_followup_history",
+    )
+    .await;
+
+    let first_turn_id = "turn_artifact_assistant_followup_01";
+    let first_request_id = generate_test_request_id("turnartifact", "assistant1");
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": first_request_id.clone(),
+                "method": "turn/start",
+                "params": {
+                    "thread_id": thread.thread.id,
+                    "turn_id": first_turn_id,
+                    "input": [{ "type": "text", "text": "Сделай файл" }]
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let _first_response = recv_response_by_id(&mut rx, first_request_id.as_str()).await;
+    let _first_completed = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
+    let item_events = crud_store
+        .get_turn_item_events(&thread.thread.id, first_turn_id)
+        .await
+        .expect("turn item events should be readable")
+        .expect("turn item events should exist");
+    let assistant_item_id = item_events
+        .events
+        .iter()
+        .find_map(|event| {
+            if let TurnItemEventPayload::ItemCompleted {
+                item: TurnItem::AgentMessage { id, text, .. },
+                ..
+            } = &event.payload
+            {
+                assert_eq!(text, "Я подготовил файл.");
+                Some(id.clone())
+            } else {
+                None
+            }
+        })
+        .expect("assistant message item should be persisted");
+    let artifact = ingest_bound_assistant_test_artifact(
+        &processor,
+        workspace_id.as_str(),
+        thread.thread.id.as_str(),
+        first_turn_id,
+        assistant_item_id.as_str(),
+        "analysis.xlsx",
+        b"assistant artifact bytes".to_vec(),
+    )
+    .await;
+
+    let second_turn_id = "turn_artifact_assistant_followup_02";
+    let second_request_id = generate_test_request_id("turnartifact", "assistant2");
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": second_request_id.clone(),
+                "method": "turn/start",
+                "params": {
+                    "thread_id": thread.thread.id,
+                    "turn_id": second_turn_id,
+                    "input": [{ "type": "text", "text": "Покажи файл еще раз" }]
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let _second_response = recv_response_by_id(&mut rx, second_request_id.as_str()).await;
+    let _second_completed = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
+
+    let requests = capture_provider.snapshot_requests();
+    assert_eq!(requests.len(), 2);
+    let assistant_history_message = requests[1]
+        .messages
+        .iter()
+        .find(|message| {
+            message
+                .content
+                .contains("Available artifacts from this assistant message:")
+        })
+        .expect("second provider request should include previous assistant artifact ref");
+    assert!(
+        assistant_history_message
+            .content
+            .starts_with("Я подготовил файл.")
+    );
+    assert!(
+        assistant_history_message
+            .content
+            .contains(format!("artifactId={}", artifact.artifact_id).as_str())
+    );
+    assert!(
+        assistant_history_message
+            .content
+            .contains("name=\"analysis.xlsx\"")
+    );
+    assert!(assistant_history_message.content.contains("role=assistant"));
+    assert!(
+        !assistant_history_message
+            .content
+            .contains("assistant artifact bytes")
+    );
+    assert!(!assistant_history_message.content.contains("artifact_read"));
+    assert!(assistant_history_message.content_parts.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

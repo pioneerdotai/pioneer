@@ -512,6 +512,7 @@ impl MessageProcessor {
                     ThreadEpisodicMemoryRecallProvider::with_workspace_service(
                         self.thread_episodic_recall_service.clone(),
                         self.workspace_episodic_recall_service.clone(),
+                        self.crud_store.clone(),
                     ),
                 )),
                 self.agent_manager.memory_tool_bundle_artifact_store(),
@@ -525,6 +526,7 @@ impl MessageProcessor {
                     .unwrap_or_default();
                 builder.install(thread_context_recall_hook_package(
                     self.thread_episodic_recall_service.clone(),
+                    Some(self.crud_store.clone()),
                     self.memory_loop_config(),
                     ThreadContextRecallHookConfig {
                         enabled: thread_config.enabled && thread_config.recall_enabled,

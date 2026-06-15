@@ -3,14 +3,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{Duration, Utc};
 use pioneer_protocol::{
     ArtifactBindingDirection, ArtifactBindingKind, ArtifactCreatedByKind,
     ArtifactCreatedNotification, ArtifactKind, ArtifactPrepareKind, ArtifactPrepareParams,
-    ArtifactPrepareResponse, ArtifactProjectionUpdatedNotification, ArtifactRegisterParams,
-    ArtifactRegisterResponse, ArtifactRole, ArtifactSummary, ThreadArtifactsChangedNotification,
-    constants::events,
+    ArtifactPrepareResponse, ArtifactProjectionKind, ArtifactProjectionUpdatedNotification,
+    ArtifactReadParams, ArtifactRegisterParams, ArtifactRegisterResponse, ArtifactRole,
+    ArtifactSummary, ThreadArtifactsChangedNotification, constants::events,
 };
+use pioneer_provider::AttachmentDataSource;
 use pioneer_tools::{
     ConfiguredToolSpec, ExecutionClass, FunctionToolOutput, PayloadKind, ToolError, ToolHandler,
     ToolIdempotencyMode, ToolInvocation, ToolOutput, ToolOutputProjectionKind, ToolPayload,
@@ -18,6 +20,7 @@ use pioneer_tools::{
     normalize_tool_arguments_from_schema,
 };
 use schemars::{JsonSchema, schema_for};
+use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
 
@@ -29,10 +32,12 @@ use crate::{
 
 pub const ARTIFACT_PREPARE_TOOL: &str = "artifact_prepare";
 pub const ARTIFACT_REGISTER_TOOL: &str = "artifact_register";
+pub const ARTIFACT_READ_TOOL: &str = "artifact_read";
 pub const ARTIFACT_OUTPUT_DIR_ENV: &str = PIONEER_ARTIFACT_OUTPUT_DIR_ENV;
 
 const PREPARED_OUTPUT_TTL_HOURS: i64 = 24;
 const MAX_FILENAME_CHARS: usize = 120;
+const ARTIFACT_READ_MAX_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreparedArtifactOutputStatus {
@@ -180,6 +185,20 @@ pub struct ArtifactToolContext {
     pub turn_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ArtifactReadToolParams {
+    pub artifact_id: String,
+    #[serde(default)]
+    pub version_id: Option<String>,
+    #[serde(default)]
+    pub projection_kind: Option<ArtifactProjectionKind>,
+    #[serde(default)]
+    pub offset: Option<u64>,
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 pub enum ArtifactToolNotification {
     ArtifactCreated(ArtifactCreatedNotification),
@@ -315,6 +334,94 @@ impl ArtifactToolHandler {
             })
     }
 
+    async fn handle_read(
+        &self,
+        invocation: ToolInvocation,
+    ) -> Result<Box<dyn ToolOutput>, ToolError> {
+        let input = decode_artifact_tool_args::<ArtifactReadToolParams>(invocation)?;
+        let max_bytes = input
+            .max_bytes
+            .map(|value| value.clamp(1, ARTIFACT_READ_MAX_BYTES))
+            .unwrap_or(ARTIFACT_READ_MAX_BYTES);
+        let projection_kind = input.projection_kind;
+        let response = self
+            .artifact_service
+            .read_artifact(
+                ArtifactReadParams {
+                    workspace_id: self.context.workspace_id.clone(),
+                    artifact_id: input.artifact_id,
+                    version_id: input.version_id,
+                    projection_kind,
+                    offset: input.offset,
+                    max_bytes: Some(max_bytes),
+                },
+                ARTIFACT_READ_MAX_BYTES,
+            )
+            .await
+            .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
+
+        let bytes = BASE64
+            .decode(response.content_base64.as_bytes())
+            .map_err(|error| {
+                ToolError::internal(format!("failed to decode artifact bytes: {error}"))
+            })?;
+        let text = artifact_read_text(
+            response.artifact.kind,
+            response.artifact.mime_type.as_deref(),
+            projection_kind,
+            bytes.as_slice(),
+        );
+        let attachment = if text.is_none() {
+            Some(
+                self.artifact_service
+                    .resolve_provider_attachment(
+                        self.context.workspace_id.as_str(),
+                        response.artifact.artifact_id.as_str(),
+                        response.artifact.version_id.as_deref(),
+                    )
+                    .await
+                    .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?,
+            )
+        } else {
+            None
+        };
+
+        let mut payload = json!({
+            "artifact": response.artifact,
+            "offset": response.offset,
+            "len": response.len,
+            "totalSizeBytes": response.total_size_bytes,
+            "sha256": response.sha256,
+            "truncated": response.truncated,
+            "nextOffset": if response.truncated {
+                Some(response.offset.saturating_add(response.len))
+            } else {
+                None
+            },
+        });
+        if let Some(text) = text {
+            payload["text"] = JsonValue::String(text);
+        }
+        if let Some(resolved) = attachment
+            && let AttachmentDataSource::Path { path } = resolved.attachment.source
+        {
+            payload["llm_context"] = json!({
+                "attachment": {
+                    "path": path,
+                    "mime_type": resolved.attachment.mime_type,
+                    "name": resolved.attachment.name,
+                    "size_bytes": resolved.attachment.size_bytes,
+                    "sha256": resolved.attachment.sha256,
+                }
+            });
+        }
+
+        let rendered = artifact_read_rendered_text(&payload);
+        Ok(Box::new(FunctionToolOutput::with_payload(
+            rendered, true, payload,
+        )))
+    }
+
     async fn emit_artifact_register_notifications(&self, summary: &ArtifactSummary) {
         self.notification_sink
             .send(
@@ -376,6 +483,7 @@ impl ToolHandler for ArtifactToolHandler {
         match invocation.tool_name.as_str() {
             ARTIFACT_PREPARE_TOOL => self.handle_prepare(invocation).await,
             ARTIFACT_REGISTER_TOOL => self.handle_register(invocation).await,
+            ARTIFACT_READ_TOOL => self.handle_read(invocation).await,
             other => Err(ToolError::NotFound(other.to_owned())),
         }
     }
@@ -399,6 +507,18 @@ pub fn artifact_tool_specs() -> Vec<ConfiguredToolSpec> {
             ARTIFACT_REGISTER_TOOL,
             "Register a file you created into the artifact store. Path must be inside the current workspace or the artifact output dir returned by artifact_prepare. If path is a copy or moved version of a prepared output, pass preparedOutputPath with the original outputPath. Do not register arbitrary system files.",
             artifact_register_schema(),
+            ToolRecoveryMetadata {
+                retry_class: ToolRetryClass::Arguments,
+                idempotency_mode: ToolIdempotencyMode::Safe,
+                max_attempts: 1,
+                can_resume: false,
+                max_wall_clock_secs: None,
+            },
+        ),
+        artifact_tool_spec(
+            ARTIFACT_READ_TOOL,
+            "Read a referenced artifact from the current workspace. Use this only when a prior message or recalled thread snippet includes an artifactId and the artifact content is needed for the current answer. Text artifacts return text; binary artifacts return a provider attachment.",
+            artifact_read_schema(),
             ToolRecoveryMetadata {
                 retry_class: ToolRetryClass::Arguments,
                 idempotency_mode: ToolIdempotencyMode::Safe,
@@ -432,10 +552,15 @@ fn artifact_register_schema() -> JsonValue {
     tool_input_schema::<ArtifactRegisterParams>()
 }
 
+fn artifact_read_schema() -> JsonValue {
+    tool_input_schema::<ArtifactReadToolParams>()
+}
+
 fn artifact_tool_schema_for_name(tool_name: &str) -> JsonValue {
     match tool_name {
         ARTIFACT_PREPARE_TOOL => artifact_prepare_schema(),
         ARTIFACT_REGISTER_TOOL => artifact_register_schema(),
+        ARTIFACT_READ_TOOL => artifact_read_schema(),
         _ => json!({ "type": "object" }),
     }
 }
@@ -485,6 +610,9 @@ fn artifact_tool_argument_hint(tool_name: &str) -> &'static str {
         }
         ARTIFACT_REGISTER_TOOL => {
             "Expected field: path, with optional displayName, kind, mimeType, description, and preparedOutputPath. The path must be inside the current workspace or PIONEER_ARTIFACT_OUTPUT_DIR."
+        }
+        ARTIFACT_READ_TOOL => {
+            "Expected field: artifactId, with optional versionId, projectionKind, offset, and maxBytes. Do not pass workspaceId; the current workspace is used automatically."
         }
         _ => "Check the tool schema and use the documented camelCase fields.",
     }
@@ -873,6 +1001,77 @@ fn artifact_prepare_kind_to_artifact_kind(kind: ArtifactPrepareKind) -> Artifact
 fn function_output(payload: JsonValue) -> Box<dyn ToolOutput> {
     let text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
     Box::new(FunctionToolOutput::with_payload(text, true, payload))
+}
+
+fn artifact_read_text(
+    kind: ArtifactKind,
+    mime_type: Option<&str>,
+    projection_kind: Option<ArtifactProjectionKind>,
+    bytes: &[u8],
+) -> Option<String> {
+    if !artifact_read_is_textual(kind, mime_type, projection_kind) {
+        return None;
+    }
+    std::str::from_utf8(bytes).ok().map(ToOwned::to_owned)
+}
+
+fn artifact_read_is_textual(
+    kind: ArtifactKind,
+    mime_type: Option<&str>,
+    projection_kind: Option<ArtifactProjectionKind>,
+) -> bool {
+    if matches!(
+        projection_kind,
+        Some(ArtifactProjectionKind::PlainText)
+            | Some(ArtifactProjectionKind::JsonSummary)
+            | Some(ArtifactProjectionKind::PdfText)
+    ) {
+        return true;
+    }
+    if matches!(
+        kind,
+        ArtifactKind::Text
+            | ArtifactKind::Json
+            | ArtifactKind::WorkspaceFile
+            | ArtifactKind::DirectoryManifest
+    ) {
+        return true;
+    }
+    let Some(mime_type) = mime_type.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    mime_type.starts_with("text/")
+        || matches!(
+            mime_type,
+            "application/json"
+                | "application/x-ndjson"
+                | "application/xml"
+                | "application/yaml"
+                | "application/toml"
+        )
+}
+
+fn artifact_read_rendered_text(payload: &JsonValue) -> String {
+    let artifact = payload.get("artifact").unwrap_or(&JsonValue::Null);
+    let artifact_id = artifact
+        .get("artifactId")
+        .or_else(|| artifact.get("artifact_id"))
+        .and_then(JsonValue::as_str)
+        .unwrap_or("unknown");
+    let name = artifact
+        .get("displayName")
+        .or_else(|| artifact.get("display_name"))
+        .and_then(JsonValue::as_str)
+        .unwrap_or("artifact");
+    if let Some(text) = payload.get("text").and_then(JsonValue::as_str) {
+        return format!("Read artifact `{name}` ({artifact_id}).\n\n{text}");
+    }
+    if payload.pointer("/llm_context/attachment").is_some() {
+        return format!(
+            "Read artifact `{name}` ({artifact_id}) as an attachment for model inspection."
+        );
+    }
+    serde_json::to_string_pretty(payload).unwrap_or_else(|_| payload.to_string())
 }
 
 fn required_tool_string(value: Option<&str>, field: &str) -> Result<String, ToolError> {
@@ -1708,6 +1907,33 @@ mod tests {
                 &format!("{} validation hint", configured.spec.name),
             );
         }
+    }
+
+    #[test]
+    fn artifact_read_text_returns_utf8_for_textual_artifacts() {
+        assert_eq!(
+            artifact_read_text(
+                ArtifactKind::Text,
+                Some("text/plain"),
+                None,
+                "привет".as_bytes(),
+            ),
+            Some("привет".to_owned())
+        );
+        assert_eq!(
+            artifact_read_text(ArtifactKind::Image, Some("image/jpeg"), None, b"jpeg"),
+            None
+        );
+    }
+
+    #[test]
+    fn artifact_tool_specs_include_artifact_read() {
+        let tool_names = artifact_tool_specs()
+            .into_iter()
+            .map(|configured| configured.spec.name)
+            .collect::<Vec<_>>();
+
+        assert!(tool_names.contains(&ARTIFACT_READ_TOOL.to_owned()));
     }
 
     fn assert_schema_descriptions_have_no_json_object_examples(value: &JsonValue, label: &str) {

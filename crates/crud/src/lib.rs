@@ -196,7 +196,8 @@ pub use crate::repositories::artifact::{
     ArtifactExternalRefRecord, ArtifactGcBlobCandidateRecord, ArtifactGcPlanRecord,
     ArtifactListFilterRecord, ArtifactListPageRecord, ArtifactProjectionBlobRecord,
     ArtifactProjectionRecord, ArtifactRecord, ArtifactVersionBlobRecord, ArtifactVersionRecord,
-    ArtifactWorkspaceUsageRecord, IngestArtifactMetadataRecord, IngestedArtifactRecord,
+    ArtifactWorkspaceUsageRecord, ConversationArtifactRef, ConversationArtifactRefLimits,
+    ConversationTurnArtifactRefs, IngestArtifactMetadataRecord, IngestedArtifactRecord,
     NewArtifactBlobRecord, UpsertArtifactExternalRefRequest,
 };
 pub use crate::repositories::thread_agents_doc::{
@@ -355,8 +356,11 @@ async fn reserve_execution_for_run_in_connection<C: ConnectionTrait>(
 /// A single turn's conversation content: user input + assistant reply.
 #[derive(Debug, Clone)]
 pub struct ConversationEntry {
+    pub turn_id: String,
     pub user_text: Option<String>,
     pub assistant_text: Option<String>,
+    pub user_artifacts: Vec<ConversationArtifactRef>,
+    pub assistant_artifacts: Vec<ConversationArtifactRef>,
 }
 
 #[derive(Debug, Clone)]
@@ -1149,6 +1153,25 @@ impl CrudStore {
     ) -> Result<ArtifactListPageRecord> {
         artifact_repository::ArtifactRepository::new()
             .list_artifacts(&self.connection, workspace_id, filter)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn list_conversation_artifact_refs(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_ids: &[String],
+        limits: ConversationArtifactRefLimits,
+    ) -> Result<BTreeMap<String, ConversationTurnArtifactRefs>> {
+        artifact_repository::ArtifactRepository::new()
+            .list_conversation_artifact_refs(
+                &self.connection,
+                workspace_id,
+                thread_id,
+                turn_ids,
+                limits,
+            )
             .await
             .map_err(Into::into)
     }
@@ -5984,9 +6007,45 @@ impl CrudStore {
         thread_id: &str,
         max_turns: usize,
     ) -> Result<Vec<ConversationEntry>> {
+        self.get_thread_conversation_history_inner(None, thread_id, max_turns)
+            .await
+    }
+
+    pub async fn get_thread_conversation_history_with_artifacts(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        max_turns: usize,
+    ) -> Result<Vec<ConversationEntry>> {
+        self.get_thread_conversation_history_inner(Some(workspace_id), thread_id, max_turns)
+            .await
+    }
+
+    async fn get_thread_conversation_history_inner(
+        &self,
+        workspace_id: Option<&str>,
+        thread_id: &str,
+        max_turns: usize,
+    ) -> Result<Vec<ConversationEntry>> {
         let turns =
             turn::find_terminal_turns_for_thread(&self.connection, thread_id, max_turns as u64)
                 .await?;
+        let artifact_refs = if let Some(workspace_id) = workspace_id {
+            let turn_ids = turns
+                .iter()
+                .map(|turn_model| turn_model.id.clone())
+                .collect::<Vec<_>>();
+            self.list_conversation_artifact_refs(
+                workspace_id,
+                thread_id,
+                &turn_ids,
+                ConversationArtifactRefLimits::default(),
+            )
+            .await
+            .unwrap_or_default()
+        } else {
+            BTreeMap::new()
+        };
 
         let mut entries = Vec::with_capacity(turns.len());
 
@@ -6011,8 +6070,13 @@ impl CrudStore {
                 })
                 .collect::<Vec<_>>()
                 .join("");
+            let refs = artifact_refs
+                .get(&turn_model.id)
+                .cloned()
+                .unwrap_or_default();
 
             entries.push(ConversationEntry {
+                turn_id: turn_model.id.clone(),
                 user_text: if user_text.is_empty() {
                     None
                 } else {
@@ -6023,6 +6087,8 @@ impl CrudStore {
                 } else {
                     Some(assistant_text)
                 },
+                user_artifacts: refs.user,
+                assistant_artifacts: refs.assistant,
             });
         }
 
@@ -7333,6 +7399,7 @@ impl CrudStore {
                 .join("");
 
             entries.push(ConversationEntry {
+                turn_id: turn_model.id.clone(),
                 user_text: if user_text.is_empty() {
                     None
                 } else {
@@ -7343,6 +7410,8 @@ impl CrudStore {
                 } else {
                     Some(assistant_text)
                 },
+                user_artifacts: Vec::new(),
+                assistant_artifacts: Vec::new(),
             });
         }
 

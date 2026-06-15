@@ -451,8 +451,41 @@ impl MessageProcessor {
     /// 3. If < 80% of budget — return everything as-is (maximum context fidelity)
     /// 4. If >= 80% — compress ALL turns into a ~10% summary via LLM, notify UI,
     ///    then return the compressed summary (conversation continues growing from there)
+    #[cfg(test)]
     pub(super) async fn load_conversation_history(
         &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Vec<ChatMessage> {
+        let workspace_id = match self.crud_store.get_thread_by_id(thread_id).await {
+            Ok(Some(thread)) => Some(thread.workspace_id),
+            Ok(None) => None,
+            Err(error) => {
+                warn!(
+                    thread_id,
+                    error = %format!("{error:#}"),
+                    "failed to load thread workspace for conversation artifact refs"
+                );
+                None
+            }
+        };
+        self.load_conversation_history_inner(workspace_id.as_deref(), thread_id, turn_id)
+            .await
+    }
+
+    pub(super) async fn load_conversation_history_for_workspace(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Vec<ChatMessage> {
+        self.load_conversation_history_inner(Some(workspace_id), thread_id, turn_id)
+            .await
+    }
+
+    async fn load_conversation_history_inner(
+        &self,
+        workspace_id: Option<&str>,
         thread_id: &str,
         turn_id: &str,
     ) -> Vec<ChatMessage> {
@@ -480,11 +513,17 @@ impl MessageProcessor {
                 }
             };
 
-        let entries = match self
-            .crud_store
-            .get_thread_conversation_history(thread_id, MAX_TURNS)
-            .await
-        {
+        let entries_result = if let Some(workspace_id) = workspace_id {
+            self.crud_store
+                .get_thread_conversation_history_with_artifacts(workspace_id, thread_id, MAX_TURNS)
+                .await
+        } else {
+            self.crud_store
+                .get_thread_conversation_history(thread_id, MAX_TURNS)
+                .await
+        };
+
+        let entries = match entries_result {
             Ok(entries) => entries,
             Err(error) => {
                 warn!(
@@ -507,15 +546,13 @@ impl MessageProcessor {
         let entry_tokens: Vec<usize> = entries
             .iter()
             .map(|entry| {
-                let user_t = entry
-                    .user_text
+                let user_t = rendered_user_history_text(entry)
                     .as_deref()
-                    .map(|t| count_tokens(t) + MESSAGE_OVERHEAD)
+                    .map(|text| count_tokens(text) + MESSAGE_OVERHEAD)
                     .unwrap_or(0);
-                let assistant_t = entry
-                    .assistant_text
+                let assistant_t = rendered_assistant_history_text(entry)
                     .as_deref()
-                    .map(|t| count_tokens(t) + MESSAGE_OVERHEAD)
+                    .map(|text| count_tokens(text) + MESSAGE_OVERHEAD)
                     .unwrap_or(0);
                 user_t + assistant_t
             })
@@ -719,11 +756,11 @@ impl MessageProcessor {
         }
 
         for entry in entries {
-            if let Some(user_text) = &entry.user_text {
-                messages.push(ChatMessage::user(user_text.clone()));
+            if let Some(user_text) = rendered_user_history_text(entry) {
+                messages.push(ChatMessage::user(user_text));
             }
-            if let Some(assistant_text) = &entry.assistant_text {
-                messages.push(ChatMessage::assistant(assistant_text.clone()));
+            if let Some(assistant_text) = rendered_assistant_history_text(entry) {
+                messages.push(ChatMessage::assistant(assistant_text));
             }
         }
 
@@ -771,11 +808,11 @@ impl MessageProcessor {
             messages.push(summary);
         }
         for i in selected_indices {
-            if let Some(user_text) = &entries[i].user_text {
-                messages.push(ChatMessage::user(user_text.clone()));
+            if let Some(user_text) = rendered_user_history_text(&entries[i]) {
+                messages.push(ChatMessage::user(user_text));
             }
-            if let Some(assistant_text) = &entries[i].assistant_text {
-                messages.push(ChatMessage::assistant(assistant_text.clone()));
+            if let Some(assistant_text) = rendered_assistant_history_text(&entries[i]) {
+                messages.push(ChatMessage::assistant(assistant_text));
             }
         }
 
@@ -813,5 +850,72 @@ impl MessageProcessor {
             .set_connection_workspace(connection_id, Some(workspace_id.clone()))
             .await;
         Some(workspace_id)
+    }
+}
+
+pub(super) fn rendered_user_history_text(entry: &ConversationEntry) -> Option<String> {
+    crate::artifact_prompt_refs::append_history_artifact_refs(
+        entry.user_text.as_deref(),
+        &entry.user_artifacts,
+        crate::artifact_prompt_refs::HistoryArtifactRefRole::User,
+    )
+}
+
+pub(super) fn rendered_assistant_history_text(entry: &ConversationEntry) -> Option<String> {
+    crate::artifact_prompt_refs::append_history_artifact_refs(
+        entry.assistant_text.as_deref(),
+        &entry.assistant_artifacts,
+        crate::artifact_prompt_refs::HistoryArtifactRefRole::Assistant,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pioneer_crud::ConversationArtifactRef;
+    use pioneer_protocol::{
+        ArtifactBindingDirection, ArtifactBindingKind, ArtifactKind, ArtifactRole,
+    };
+
+    fn history_artifact_ref(role: ArtifactRole) -> ConversationArtifactRef {
+        ConversationArtifactRef {
+            artifact_id: "art_car".to_owned(),
+            version_id: Some("ver_car_1".to_owned()),
+            display_name: "car.jpg".to_owned(),
+            kind: ArtifactKind::Image,
+            mime_type: Some("image/jpeg".to_owned()),
+            size_bytes: Some(862_208),
+            sha256: Some("sha".to_owned()),
+            binding_kind: ArtifactBindingKind::UserInput,
+            direction: ArtifactBindingDirection::Input,
+            role: Some(role),
+            turn_id: Some("turn_1".to_owned()),
+            message_id: Some("msg_1".to_owned()),
+            turn_item_id: Some("item_1".to_owned()),
+            item_index: Some(0),
+        }
+    }
+
+    #[test]
+    fn history_rendering_appends_artifact_refs_to_matching_message_text() {
+        let entry = ConversationEntry {
+            turn_id: "turn_1".to_owned(),
+            user_text: Some("Что за машина?".to_owned()),
+            assistant_text: Some("Похоже на седан.".to_owned()),
+            user_artifacts: vec![history_artifact_ref(ArtifactRole::User)],
+            assistant_artifacts: vec![history_artifact_ref(ArtifactRole::Assistant)],
+        };
+
+        let user_text = rendered_user_history_text(&entry).expect("user text");
+        assert!(user_text.starts_with("Что за машина?"));
+        assert!(user_text.contains("Available artifacts from this user message:"));
+        assert!(user_text.contains("artifactId=art_car"));
+        assert!(!user_text.contains("Artifact References"));
+
+        let assistant_text = rendered_assistant_history_text(&entry).expect("assistant text");
+        assert!(assistant_text.starts_with("Похоже на седан."));
+        assert!(assistant_text.contains("Available artifacts from this assistant message:"));
+        assert!(assistant_text.contains("artifactId=art_car"));
+        assert!(!assistant_text.contains("Artifact References"));
     }
 }

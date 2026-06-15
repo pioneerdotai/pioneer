@@ -3525,18 +3525,39 @@ async fn render_parent_history(
     }
 
     let max_turns = max_turns.unwrap_or(6).max(1);
-    let entries = processor
+    let parent_workspace_id = processor
         .crud_store
-        .get_thread_conversation_history(parent.parent_thread_id.as_str(), max_turns)
+        .get_thread_by_id(parent.parent_thread_id.as_str())
         .await
-        .unwrap_or_default();
+        .ok()
+        .flatten()
+        .map(|thread| thread.workspace_id);
+    let entries = if let Some(workspace_id) = parent_workspace_id.as_deref() {
+        processor
+            .crud_store
+            .get_thread_conversation_history_with_artifacts(
+                workspace_id,
+                parent.parent_thread_id.as_str(),
+                max_turns,
+            )
+            .await
+            .unwrap_or_default()
+    } else {
+        processor
+            .crud_store
+            .get_thread_conversation_history(parent.parent_thread_id.as_str(), max_turns)
+            .await
+            .unwrap_or_default()
+    };
     if !entries.is_empty() {
         let mut lines = Vec::new();
         for entry in entries {
-            if let Some(user_text) = entry.user_text {
+            if let Some(user_text) = super::provider_handlers::rendered_user_history_text(&entry) {
                 lines.push(format!("User: {user_text}"));
             }
-            if let Some(assistant_text) = entry.assistant_text {
+            if let Some(assistant_text) =
+                super::provider_handlers::rendered_assistant_history_text(&entry)
+            {
                 lines.push(format!("Assistant: {assistant_text}"));
             }
         }

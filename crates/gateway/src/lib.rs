@@ -1,3 +1,4 @@
+mod artifact_prompt_refs;
 mod attachment;
 mod auth;
 mod bootstrap;

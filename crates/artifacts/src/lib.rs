@@ -43,8 +43,8 @@ pub use security::{ArtifactLocalPathPolicy, ValidatedLocalFile};
 pub use service::{ArtifactDownloadSnapshot, ArtifactService};
 pub use source::{ArtifactSource, IngestArtifactSourceRequest};
 pub use tools::{
-    ARTIFACT_OUTPUT_DIR_ENV, ARTIFACT_PREPARE_TOOL, ARTIFACT_REGISTER_TOOL, ArtifactToolContext,
-    ArtifactToolHandler, ArtifactToolNotification, ArtifactToolNotificationSink, ArtifactToolState,
-    NoopArtifactToolNotificationSink, PreparedArtifactOutput, PreparedArtifactOutputStatus,
-    artifact_tool_specs,
+    ARTIFACT_OUTPUT_DIR_ENV, ARTIFACT_PREPARE_TOOL, ARTIFACT_READ_TOOL, ARTIFACT_REGISTER_TOOL,
+    ArtifactToolContext, ArtifactToolHandler, ArtifactToolNotification,
+    ArtifactToolNotificationSink, ArtifactToolState, NoopArtifactToolNotificationSink,
+    PreparedArtifactOutput, PreparedArtifactOutputStatus, artifact_tool_specs,
 };

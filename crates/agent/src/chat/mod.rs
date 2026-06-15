@@ -1445,6 +1445,74 @@ fn runtime_sections_with_execution_continuation_context(
     sections
 }
 
+fn runtime_sections_with_artifact_reference_policy(
+    runtime_sections: Vec<PromptRuntimeSectionInput>,
+    include_policy: bool,
+) -> Result<Vec<PromptRuntimeSectionInput>, ChatTurnError> {
+    if runtime_sections.iter().any(|section| {
+        matches!(
+            &section.id,
+            PromptRuntimeSectionId::Dynamic(id) if id.as_str() == "artifact_references"
+        )
+    }) {
+        return Ok(runtime_sections);
+    }
+    if !include_policy {
+        return Ok(runtime_sections);
+    }
+
+    let mut sections = runtime_sections;
+    sections.push(PromptRuntimeSectionInput {
+        id: PromptRuntimeSectionId::Dynamic(
+            PromptDynamicSectionId::new("artifact_references").map_err(|error| {
+                ChatTurnError::Terminal(format!(
+                    "failed to create artifact reference prompt section id: {error}"
+                ))
+            })?,
+        ),
+        title: Some("Artifact References".to_owned()),
+        content: render_artifact_reference_policy_prompt(),
+        max_chars: None,
+        truncated: false,
+    });
+    Ok(sections)
+}
+
+fn history_or_prompt_context_has_artifact_refs(
+    history: &[ChatMessage],
+    effective_prompt_context_set: &EffectiveTurnPromptContextSet,
+) -> bool {
+    history.iter().any(|message| {
+        prompt_text_has_inline_artifact_refs(message.content.as_str())
+            || message
+                .content_parts
+                .iter()
+                .filter_map(|part| part.text_value())
+                .any(prompt_text_has_inline_artifact_refs)
+    }) || effective_prompt_context_set
+        .clone_hook_prompt_context_set()
+        .entries()
+        .any(|entry| prompt_text_has_inline_artifact_refs(entry.content.as_str()))
+}
+
+fn prompt_text_has_inline_artifact_refs(text: &str) -> bool {
+    text.contains("Available artifacts from this user message:")
+        || text.contains("Available artifacts from this assistant message:")
+        || text.contains("Available artifacts for thread:")
+}
+
+fn render_artifact_reference_policy_prompt() -> String {
+    [
+        "Some prior messages or recalled thread snippets may include compact artifact references.",
+        "Artifact references are metadata only; they do not contain the file, image, or binary content.",
+        "If an artifact's content is needed to answer correctly, reveal the artifact tool domain when needed and call artifact_read with the referenced artifactId, and versionId when present.",
+        "artifact_read may return text content for readable artifacts or an attachment for binary artifacts such as images, audio, video, PDFs, or other files.",
+        "Do not call artifact_read for artifacts that are irrelevant to the current task.",
+        "Do not guess unseen artifact content from names, mime types, or surrounding text.",
+    ]
+    .join("\n")
+}
+
 fn prior_visible_assistant_text_for_execution_continuation(
     history: &[ChatMessage],
 ) -> Option<String> {
@@ -2989,6 +3057,13 @@ async fn execute_agent_provider_response(
             execution_checkpoint_context.as_ref(),
             prior_visible_assistant_text.as_deref(),
         );
+        let prompt_runtime_sections = runtime_sections_with_artifact_reference_policy(
+            prompt_runtime_sections,
+            history_or_prompt_context_has_artifact_refs(
+                history.as_slice(),
+                &effective_prompt_context_set,
+            ),
+        )?;
 
         let initial_prompt_bundle = compile_agent_prompt_bundle(
             skills_prompt.clone(),
@@ -3346,6 +3421,13 @@ async fn execute_agent_provider_response(
         execution_checkpoint_context.as_ref(),
         prior_visible_assistant_text.as_deref(),
     );
+    let prompt_runtime_sections = runtime_sections_with_artifact_reference_policy(
+        prompt_runtime_sections,
+        history_or_prompt_context_has_artifact_refs(
+            history.as_slice(),
+            &effective_prompt_context_set,
+        ),
+    )?;
 
     let initial_prompt_bundle = compile_agent_prompt_bundle(
         skills_prompt.clone(),
@@ -3422,6 +3504,11 @@ async fn execute_agent_provider_response(
             }
         }
     });
+
+    let include_artifact_reference_policy = history_or_prompt_context_has_artifact_refs(
+        history.as_slice(),
+        &effective_prompt_context_set,
+    );
 
     let mut messages = history
         .into_iter()
@@ -3712,6 +3799,11 @@ async fn execute_agent_provider_response(
                         execution_checkpoint_context.as_ref(),
                         prior_visible_assistant_text.as_deref(),
                     );
+                let no_tool_runtime_sections = runtime_sections_with_artifact_reference_policy(
+                    no_tool_runtime_sections,
+                    include_artifact_reference_policy,
+                )
+                .map_err(|error| (error, current_thinking_id.clone()))?;
                 let prompt_without_tools = compile_agent_prompt_bundle(
                     skills_prompt.clone(),
                     applied_retry_instruction.clone(),
@@ -5239,6 +5331,7 @@ mod tests {
         resolve_skill_capability_summary, retain_agent_attachment_messages,
         retain_agent_attachment_messages_with_budget, retain_chat_mode_attachment_messages,
         review_required_observation_payload, review_required_observation_signature,
+        runtime_sections_with_artifact_reference_policy,
         runtime_sections_with_execution_continuation_context,
         sync_review_action_tools_to_observations,
     };
@@ -5399,6 +5492,28 @@ mod tests {
                 .content
                 .contains("Prior visible assistant text: partial assistant text")
         );
+    }
+
+    #[test]
+    fn artifact_reference_policy_section_is_added_only_when_refs_exist() {
+        let sections = runtime_sections_with_artifact_reference_policy(Vec::new(), true)
+            .expect("section renders");
+
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].title.as_deref(), Some("Artifact References"));
+        assert!(sections[0].content.contains("artifact_read"));
+        assert!(matches!(
+            &sections[0].id,
+            PromptRuntimeSectionId::Dynamic(id) if id.as_str() == "artifact_references"
+        ));
+    }
+
+    #[test]
+    fn artifact_reference_policy_section_is_not_added_without_refs() {
+        let sections = runtime_sections_with_artifact_reference_policy(Vec::new(), false)
+            .expect("section skipped");
+
+        assert!(sections.is_empty());
     }
 
     #[test]
@@ -6005,11 +6120,10 @@ mod tests {
 
     #[tokio::test]
     async fn request_tools_visibility_expansion_exposes_artifact_next_round() {
-        let built = build_tools_with_extension_names(&[
-            "artifact_prepare",
-            "artifact_register",
-            "skill.test.dynamic",
-        ]);
+        let artifact_tools = BuiltinToolDomain::Artifact.tool_names();
+        let mut extension_names = artifact_tools.to_vec();
+        extension_names.push("skill.test.dynamic");
+        let built = build_tools_with_extension_names(&extension_names);
         let mut visible_tool_names = vec![
             "request_tools".to_owned(),
             "read_file".to_owned(),
@@ -6018,9 +6132,7 @@ mod tests {
         let before = visible_tool_names.clone();
         let result = request_tools_result_for_added(
             "artifact",
-            ["artifact_prepare", "artifact_register"]
-                .into_iter()
-                .map(str::to_owned),
+            artifact_tools.iter().map(|name| (*name).to_owned()),
         );
 
         let added = apply_request_tools_visibility_expansion(
@@ -6040,7 +6152,10 @@ mod tests {
             .map(|spec| spec.name)
             .collect::<Vec<_>>();
 
-        assert_eq!(added, vec!["artifact_prepare", "artifact_register"]);
+        assert_eq!(
+            added,
+            vec!["artifact_prepare", "artifact_register", "artifact_read"]
+        );
         for name in before {
             assert!(
                 visible.contains(&name),
@@ -6049,6 +6164,7 @@ mod tests {
         }
         assert!(visible.contains(&"artifact_prepare".to_owned()));
         assert!(visible.contains(&"artifact_register".to_owned()));
+        assert!(visible.contains(&"artifact_read".to_owned()));
         assert!(!visible.contains(&"web_search".to_owned()));
     }
 

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
 use chrono::{TimeZone, Utc};
@@ -635,6 +635,211 @@ impl ArtifactRepository {
         })
     }
 
+    pub async fn list_conversation_artifact_refs<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_ids: &[String],
+        limits: ConversationArtifactRefLimits,
+    ) -> ArtifactCrudResult<BTreeMap<String, ConversationTurnArtifactRefs>> {
+        let mut turn_order = BTreeMap::<String, usize>::new();
+        let mut normalized_turn_ids = Vec::new();
+        for turn_id in turn_ids
+            .iter()
+            .map(|turn_id| turn_id.trim())
+            .filter(|turn_id| !turn_id.is_empty())
+        {
+            if turn_order.contains_key(turn_id) {
+                continue;
+            }
+            let index = normalized_turn_ids.len();
+            turn_order.insert(turn_id.to_owned(), index);
+            normalized_turn_ids.push(turn_id.to_owned());
+        }
+        if workspace_id.trim().is_empty()
+            || thread_id.trim().is_empty()
+            || normalized_turn_ids.is_empty()
+        {
+            return Ok(BTreeMap::new());
+        }
+
+        let limits = limits.normalized();
+        let mut bindings = artifact_binding::Entity::find()
+            .filter(artifact_binding::Column::WorkspaceId.eq(workspace_id.to_owned()))
+            .filter(artifact_binding::Column::ThreadId.eq(thread_id.to_owned()))
+            .filter(artifact_binding::Column::TurnId.is_in(normalized_turn_ids.clone()))
+            .order_by_asc(artifact_binding::Column::ItemIndex)
+            .order_by_asc(artifact_binding::Column::CreatedAt)
+            .order_by_asc(artifact_binding::Column::ArtifactId)
+            .all(db)
+            .await
+            .map_err(|source| ArtifactCrudError::Database {
+                message: "failed to list conversation artifact bindings".to_owned(),
+                source,
+            })?;
+        if bindings.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        bindings.sort_by(|left, right| {
+            let left_turn_order = left
+                .turn_id
+                .as_ref()
+                .and_then(|turn_id| turn_order.get(turn_id))
+                .copied()
+                .unwrap_or(usize::MAX);
+            let right_turn_order = right
+                .turn_id
+                .as_ref()
+                .and_then(|turn_id| turn_order.get(turn_id))
+                .copied()
+                .unwrap_or(usize::MAX);
+            (
+                left_turn_order,
+                left.item_index.unwrap_or(i64::MAX),
+                &left.created_at,
+                &left.artifact_id,
+            )
+                .cmp(&(
+                    right_turn_order,
+                    right.item_index.unwrap_or(i64::MAX),
+                    &right.created_at,
+                    &right.artifact_id,
+                ))
+        });
+
+        let artifact_ids = bindings
+            .iter()
+            .map(|binding| binding.artifact_id.clone())
+            .collect::<HashSet<_>>();
+        let artifacts = artifact::Entity::find()
+            .filter(artifact::Column::WorkspaceId.eq(workspace_id.to_owned()))
+            .filter(artifact::Column::Id.is_in(artifact_ids.into_iter().collect::<Vec<_>>()))
+            .all(db)
+            .await
+            .map_err(|source| ArtifactCrudError::Database {
+                message: "failed to load conversation artifacts".to_owned(),
+                source,
+            })?
+            .into_iter()
+            .map(|artifact| (artifact.id.clone(), artifact))
+            .collect::<HashMap<_, _>>();
+
+        let version_ids = bindings
+            .iter()
+            .filter_map(|binding| {
+                binding.artifact_version_id.clone().or_else(|| {
+                    artifacts
+                        .get(&binding.artifact_id)
+                        .and_then(|artifact| artifact.current_version_id.clone())
+                })
+            })
+            .collect::<HashSet<_>>();
+        let versions = if version_ids.is_empty() {
+            HashMap::new()
+        } else {
+            artifact_version::Entity::find()
+                .filter(artifact_version::Column::WorkspaceId.eq(workspace_id.to_owned()))
+                .filter(
+                    artifact_version::Column::Id.is_in(version_ids.into_iter().collect::<Vec<_>>()),
+                )
+                .all(db)
+                .await
+                .map_err(|source| ArtifactCrudError::Database {
+                    message: "failed to load conversation artifact versions".to_owned(),
+                    source,
+                })?
+                .into_iter()
+                .map(|version| (version.id.clone(), version))
+                .collect::<HashMap<_, _>>()
+        };
+
+        let blob_ids = versions
+            .values()
+            .map(|version| version.blob_id.clone())
+            .collect::<HashSet<_>>();
+        let blobs = if blob_ids.is_empty() {
+            HashMap::new()
+        } else {
+            artifact_blob::Entity::find()
+                .filter(artifact_blob::Column::WorkspaceId.eq(workspace_id.to_owned()))
+                .filter(artifact_blob::Column::Id.is_in(blob_ids.into_iter().collect::<Vec<_>>()))
+                .all(db)
+                .await
+                .map_err(|source| ArtifactCrudError::Database {
+                    message: "failed to load conversation artifact blobs".to_owned(),
+                    source,
+                })?
+                .into_iter()
+                .map(|blob| (blob.id.clone(), blob))
+                .collect::<HashMap<_, _>>()
+        };
+
+        let mut grouped = BTreeMap::<String, ConversationTurnArtifactRefs>::new();
+        let mut total_rendered = 0usize;
+        for binding in bindings {
+            if total_rendered >= limits.max_total {
+                break;
+            }
+            let Some(turn_id) = binding.turn_id.clone() else {
+                continue;
+            };
+            let Some(artifact) = artifacts.get(&binding.artifact_id) else {
+                continue;
+            };
+            if status_from_db(artifact.status.as_str())? == ArtifactStatus::Deleted {
+                continue;
+            }
+            let resolved_version_id = binding
+                .artifact_version_id
+                .clone()
+                .or_else(|| artifact.current_version_id.clone());
+            let version = resolved_version_id
+                .as_ref()
+                .and_then(|version_id| versions.get(version_id));
+            let blob = version.and_then(|version| blobs.get(&version.blob_id));
+            let binding_kind = binding_kind_from_db(binding.binding_kind.as_str())?;
+            let direction = binding_direction_from_db(binding.direction.as_str())?;
+            let role = binding.role.as_deref().map(role_from_db).transpose()?;
+            let Some(bucket) = conversation_artifact_ref_bucket(binding_kind, direction, role)
+            else {
+                continue;
+            };
+            let artifact_ref = ConversationArtifactRef {
+                artifact_id: artifact.id.clone(),
+                version_id: resolved_version_id,
+                display_name: artifact.display_name.clone(),
+                kind: kind_from_db(artifact.kind.as_str())?,
+                mime_type: artifact.mime_type.clone(),
+                size_bytes: blob.map(|blob| blob.size_bytes.max(0) as u64),
+                sha256: blob.map(|blob| blob.sha256.clone()),
+                binding_kind,
+                direction,
+                role,
+                turn_id: binding.turn_id.clone(),
+                message_id: binding.message_id.clone(),
+                turn_item_id: binding.turn_item_id.clone(),
+                item_index: binding.item_index,
+            };
+            let entry = grouped.entry(turn_id).or_default();
+            let turn_count = entry.user.len() + entry.assistant.len();
+            if turn_count >= limits.max_per_turn {
+                continue;
+            }
+            let target = match bucket {
+                ConversationArtifactRefBucket::User => &mut entry.user,
+                ConversationArtifactRefBucket::Assistant => &mut entry.assistant,
+            };
+            if target.len() >= limits.max_per_message {
+                continue;
+            }
+            target.push(artifact_ref);
+            total_rendered += 1;
+        }
+
+        Ok(grouped)
+    }
+
     pub async fn update_artifact_status<C: ConnectionTrait>(
         &self,
         db: &C,
@@ -737,6 +942,80 @@ pub struct ArtifactListFilterRecord {
 pub struct ArtifactListPageRecord {
     pub items: Vec<ArtifactSummary>,
     pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConversationArtifactRefLimits {
+    pub max_per_message: usize,
+    pub max_per_turn: usize,
+    pub max_total: usize,
+}
+
+impl Default for ConversationArtifactRefLimits {
+    fn default() -> Self {
+        Self {
+            max_per_message: 5,
+            max_per_turn: 8,
+            max_total: 80,
+        }
+    }
+}
+
+impl ConversationArtifactRefLimits {
+    fn normalized(self) -> Self {
+        Self {
+            max_per_message: self.max_per_message.max(1),
+            max_per_turn: self.max_per_turn.max(1),
+            max_total: self.max_total.max(1),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationArtifactRef {
+    pub artifact_id: String,
+    pub version_id: Option<String>,
+    pub display_name: String,
+    pub kind: ArtifactKind,
+    pub mime_type: Option<String>,
+    pub size_bytes: Option<u64>,
+    pub sha256: Option<String>,
+    pub binding_kind: ArtifactBindingKind,
+    pub direction: ArtifactBindingDirection,
+    pub role: Option<ArtifactRole>,
+    pub turn_id: Option<String>,
+    pub message_id: Option<String>,
+    pub turn_item_id: Option<String>,
+    pub item_index: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ConversationTurnArtifactRefs {
+    pub user: Vec<ConversationArtifactRef>,
+    pub assistant: Vec<ConversationArtifactRef>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConversationArtifactRefBucket {
+    User,
+    Assistant,
+}
+
+fn conversation_artifact_ref_bucket(
+    binding_kind: ArtifactBindingKind,
+    direction: ArtifactBindingDirection,
+    role: Option<ArtifactRole>,
+) -> Option<ConversationArtifactRefBucket> {
+    if role == Some(ArtifactRole::User)
+        || binding_kind == ArtifactBindingKind::UserInput
+        || direction == ArtifactBindingDirection::Input
+    {
+        return Some(ConversationArtifactRefBucket::User);
+    }
+    if role == Some(ArtifactRole::Assistant) || binding_kind == ArtifactBindingKind::AgentOutput {
+        return Some(ConversationArtifactRefBucket::Assistant);
+    }
+    None
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

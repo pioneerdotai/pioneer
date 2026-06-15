@@ -21,7 +21,8 @@ pub const TASK_DOMAIN_TOOL_NAMES: &[&str] = &[
     "task_pause",
     "task_resume",
 ];
-pub const ARTIFACT_DOMAIN_TOOL_NAMES: &[&str] = &["artifact_prepare", "artifact_register"];
+pub const ARTIFACT_DOMAIN_TOOL_NAMES: &[&str] =
+    &["artifact_prepare", "artifact_register", "artifact_read"];
 pub const COMPUTER_USE_DOMAIN_TOOL_NAMES: &[&str] = &["computer_use"];
 pub const REQUEST_TOOLS_REASON_MAX_CHARS: usize = 512;
 
