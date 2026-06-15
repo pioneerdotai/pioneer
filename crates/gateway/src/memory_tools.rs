@@ -1137,6 +1137,8 @@ fn category_values() -> Vec<&'static str> {
         "preference",
         "biography",
         "relationship",
+        "recurring_instruction",
+        "project_policy",
         "project_fact",
         "project_decision",
         "procedure",

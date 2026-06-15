@@ -30,6 +30,18 @@ pub fn render_memory_post_turn_extractor_prompt(
             "Return no facts when evidence is weak, evidence.quote_or_span is missing, source actor is unclear, ownership is unclear, the fact is only an assistant inference about the user, or the content has no future-useful memory value.\n",
             "Do not decide whether a fact becomes active, pending, routed elsewhere, or rejected. Final write state is owned by the memory service.\n",
             "Set semantic fields carefully. The memory service computes final confidence and importance from semantic fields; numeric confidence and importance are non-authoritative and may be null.\n",
+            "Extraction decision rubric:\n",
+            "- Extract a candidate only when all gates pass: durable beyond the current turn, directly evidenced, future-useful, policy-safe, non-secret, and ownership-clear.\n",
+            "- If any gate fails, omit that candidate. A correct empty facts array is better than a speculative or low-value memory.\n",
+            "- Highest priority: direct user corrections about prior assistant behavior, remembered preferences, standing instructions, and project conventions that should affect future turns.\n",
+            "- For direct user corrections, store the stable future rule, not the complaint, emotion, current mistake, or transient frustration.\n",
+            "- If a user correction conflicts with the memory manifest, extract the corrected rule with direct user evidence; the memory service will handle merge/supersession.\n",
+            "- Use semantic.category=recurring_instruction and ontology.fact_class=recurring_user_instruction for durable instructions about how the agent should behave in future sessions.\n",
+            "- Use semantic.category=communication_style and ontology.fact_class=communication_preference for tone, language, verbosity, formatting, review style, or response-structure expectations.\n",
+            "- Use semantic.category=preference and ontology.fact_class=stable_user_preference for stable user or workflow preferences that are not direct behavior instructions.\n",
+            "- Use semantic.category=project_policy and ontology.fact_class=project_policy for durable workspace rules, architectural constraints, repo conventions, acceptance criteria, or decisions that govern future work.\n",
+            "- Treat direct user corrections and explicit remember requests as explicit_store when they pass all gates; use implicit_candidate only for clearly future-useful facts with strong evidence.\n",
+            "- Do not extract session progress, completed one-off tasks, local command outputs, incidental assistant summaries, current frustration, or current bugs unless the turn states durable project/user knowledge.\n",
             "Return strict JSON only. No markdown. No prose outside JSON.\n",
             "Return at most {max_facts} facts.\n\n",
             "Allowed semantic.intent values for facts: explicit_store, implicit_candidate.\n",
@@ -102,6 +114,19 @@ mod tests {
         assert!(prompt.contains("primary language of the source user text"));
         assert!(prompt.contains("Keep evidence.quote_or_span as an exact source quote"));
         assert!(prompt.contains("numeric confidence and importance are non-authoritative"));
+        assert!(prompt.contains("Extraction decision rubric"));
+        assert!(prompt.contains("all gates pass"));
+        assert!(prompt.contains("A correct empty facts array is better"));
+        assert!(prompt.contains("direct user corrections about prior assistant behavior"));
+        assert!(prompt.contains("store the stable future rule"));
+        assert!(prompt.contains("conflicts with the memory manifest"));
+        assert!(prompt.contains("recurring_instruction"));
+        assert!(prompt.contains("recurring_user_instruction"));
+        assert!(prompt.contains("communication_style"));
+        assert!(prompt.contains("communication_preference"));
+        assert!(prompt.contains("stable_user_preference"));
+        assert!(prompt.contains("project_policy"));
+        assert!(prompt.contains("Do not extract session progress"));
         assert!(prompt.contains("ontology.fact_class"));
         assert!(prompt.contains("ontology.lifetime_class"));
         assert!(prompt.contains("ontology.evidence_class"));

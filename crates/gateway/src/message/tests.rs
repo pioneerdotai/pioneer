@@ -19945,6 +19945,63 @@ async fn memory_provider_materializes_five_memory_tools_when_runtime_enabled() {
         pioneer_tools::ToolIdempotencyMode::RequiresKey
     );
     assert_eq!(remember.spec.recovery.max_attempts, 1);
+    let remember_categories = remember
+        .spec
+        .parameters
+        .pointer("/properties/category/enum")
+        .and_then(serde_json::Value::as_array)
+        .expect("remember category enum should be present")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        remember_categories.contains("recurring_instruction"),
+        "memory_remember category enum must expose recurring_instruction"
+    );
+    assert!(
+        remember_categories.contains("project_policy"),
+        "memory_remember category enum should stay aligned with MemoryCategory"
+    );
+
+    let _ = std::fs::remove_dir_all(harness.runtime_home);
+}
+
+#[tokio::test]
+async fn memory_remember_tool_accepts_recurring_instruction_category() {
+    let harness = setup_memory_gateway_harness("tool_recurring_instruction", true).await;
+    let tools = built_memory_tools(&harness, "tool_recurring_instruction").await;
+
+    let result = execute_memory_tool_payload(
+        &tools,
+        "memory_remember",
+        "call_memory_recurring_instruction",
+        json!({
+            "content": "The user wants concise direct answers by default.",
+            "category": "recurring_instruction",
+            "key": "recurring_instruction.concise_direct_answers",
+            "source_context": "direct_user_conversation",
+            "confidence": 0.95,
+            "importance": 0.9
+        }),
+    )
+    .await;
+
+    assert_eq!(result.get("created"), Some(&serde_json::Value::Bool(true)));
+    assert_eq!(
+        result.get("category").and_then(serde_json::Value::as_str),
+        Some("recurring_instruction")
+    );
+    assert_eq!(
+        result
+            .pointer("/scope/kind")
+            .and_then(serde_json::Value::as_str),
+        Some("user"),
+        "recurring instructions should route to user scope by default"
+    );
+    assert_eq!(
+        result.get("key").and_then(serde_json::Value::as_str),
+        Some("recurring_instruction.concise_direct_answers")
+    );
 
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }

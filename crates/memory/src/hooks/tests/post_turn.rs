@@ -98,6 +98,172 @@ fn post_turn_parser_accepts_typed_ontology_proposal() {
 }
 
 #[test]
+fn post_turn_parser_accepts_prompt_rubric_memory_classes() {
+    let raw = serde_json::json!({
+        "facts": [
+            {
+                "semantic": {
+                    "intent": "explicit_store",
+                    "explicitness": "explicit",
+                    "category": "recurring_instruction",
+                    "subject": "current_user",
+                    "attribute": "custom",
+                    "custom_attribute": "future_agent_behavior",
+                    "scope_hint": "user_global",
+                    "durability": "long_lived",
+                    "sensitivity": "low",
+                    "certainty": "high"
+                },
+                "ontology": {
+                    "fact_class": "recurring_user_instruction",
+                    "lifetime_class": "long_lived",
+                    "evidence_class": "user_correction",
+                    "proposed_ownership_class": "durable_user_memory"
+                },
+                "content": "The user wants future answers to preserve important project context instead of restarting from scratch.",
+                "value": "preserve important project context",
+                "evidence": {
+                    "source_ref": "turn.post_turn:user",
+                    "quote_or_span": "do not restart from scratch on this project",
+                    "extractor_reason": "The user corrected future assistant behavior."
+                }
+            },
+            {
+                "semantic": {
+                    "intent": "explicit_store",
+                    "explicitness": "explicit",
+                    "category": "communication_style",
+                    "subject": "current_user",
+                    "attribute": "communication_style",
+                    "scope_hint": "user_global",
+                    "durability": "long_lived",
+                    "sensitivity": "low",
+                    "certainty": "high"
+                },
+                "ontology": {
+                    "fact_class": "communication_preference",
+                    "lifetime_class": "long_lived",
+                    "evidence_class": "direct_user_assertion",
+                    "proposed_ownership_class": "durable_user_memory"
+                },
+                "content": "The user prefers concise direct summaries for memory-related status updates.",
+                "value": "concise direct summaries",
+                "evidence": {
+                    "source_ref": "turn.post_turn:user",
+                    "quote_or_span": "кратко",
+                    "extractor_reason": "The user stated a communication-style expectation."
+                }
+            },
+            {
+                "semantic": {
+                    "intent": "implicit_candidate",
+                    "explicitness": "implicit",
+                    "category": "preference",
+                    "subject": "current_user",
+                    "attribute": "custom",
+                    "custom_attribute": "workflow_preference",
+                    "scope_hint": "user_workspace",
+                    "durability": "long_lived",
+                    "sensitivity": "low",
+                    "certainty": "high"
+                },
+                "ontology": {
+                    "fact_class": "stable_user_preference",
+                    "lifetime_class": "long_lived",
+                    "evidence_class": "direct_user_assertion",
+                    "proposed_ownership_class": "durable_user_memory"
+                },
+                "content": "The user prefers implementation guidance to be grounded in the existing project architecture.",
+                "value": "ground implementation guidance in existing architecture",
+                "evidence": {
+                    "source_ref": "turn.post_turn:user",
+                    "quote_or_span": "изучи проект",
+                    "extractor_reason": "The user expressed a stable workflow preference."
+                }
+            },
+            {
+                "semantic": {
+                    "intent": "implicit_candidate",
+                    "explicitness": "implicit",
+                    "category": "project_policy",
+                    "subject": "project",
+                    "attribute": "custom",
+                    "subject_key": "pioneer",
+                    "custom_attribute": "memory_extraction_policy",
+                    "scope_hint": "project_workspace",
+                    "durability": "project_lifetime",
+                    "sensitivity": "none",
+                    "certainty": "high"
+                },
+                "ontology": {
+                    "fact_class": "project_policy",
+                    "lifetime_class": "project_lifetime",
+                    "evidence_class": "direct_user_assertion",
+                    "proposed_ownership_class": "durable_workspace_memory"
+                },
+                "content": "Pioneer memory extraction guidance belongs in the post-turn extractor prompt, not in expanded memory tool schema descriptions.",
+                "value": "put memory extraction guidance in post-turn extractor prompt",
+                "evidence": {
+                    "source_ref": "turn.post_turn:user",
+                    "quote_or_span": "у нас же есть post turn memory extraction запрос в llm",
+                    "extractor_reason": "The user stated a durable project implementation policy."
+                }
+            }
+        ]
+    });
+
+    let parsed = parse_memory_post_turn_extractor_json(
+        raw.to_string().as_str(),
+        &MemoryPostTurnExtractorConfig::default(),
+    )
+    .expect("prompt rubric payload should parse");
+
+    assert_eq!(parsed.raw_fact_count, 4);
+    assert_eq!(parsed.validation_rejected_count, 0);
+    assert_eq!(parsed.facts.len(), 4);
+    let cases = [
+        (
+            MemoryCategory::RecurringInstruction,
+            MemoryFactClass::RecurringUserInstruction,
+            MemoryEvidenceClass::UserCorrection,
+            MemoryOwnershipClass::DurableUserMemory,
+        ),
+        (
+            MemoryCategory::CommunicationStyle,
+            MemoryFactClass::CommunicationPreference,
+            MemoryEvidenceClass::DirectUserAssertion,
+            MemoryOwnershipClass::DurableUserMemory,
+        ),
+        (
+            MemoryCategory::Preference,
+            MemoryFactClass::StableUserPreference,
+            MemoryEvidenceClass::DirectUserAssertion,
+            MemoryOwnershipClass::DurableUserMemory,
+        ),
+        (
+            MemoryCategory::ProjectPolicy,
+            MemoryFactClass::ProjectPolicy,
+            MemoryEvidenceClass::DirectUserAssertion,
+            MemoryOwnershipClass::DurableWorkspaceMemory,
+        ),
+    ];
+
+    for (fact, (category, fact_class, evidence_class, ownership_class)) in
+        parsed.facts.iter().zip(cases)
+    {
+        assert_eq!(fact.semantic.category, category);
+        let proposal = fact
+            .ontology_proposal
+            .expect("rubric fact should keep ontology proposal");
+        assert_eq!(proposal.fact_class, fact_class);
+        assert_eq!(proposal.evidence_class, evidence_class);
+        assert_eq!(proposal.proposed_ownership_class, ownership_class);
+        assert!(fact.confidence.expect("computed confidence") > 0.0);
+        assert!(fact.importance.expect("computed importance") > 0.0);
+    }
+}
+
+#[test]
 fn post_turn_parser_accepts_class_based_valid_ontology_proposals() {
     let cases = [
         (
