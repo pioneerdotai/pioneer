@@ -44,8 +44,7 @@ impl HookHandler for ActiveMemoryRecallHook {
             None => return Ok(memory_missing_policy_response(MEMORY_ACTIVE_RECALL_HOOK_ID)),
         };
         let config = self.config.normalized();
-        let deterministic =
-            deterministic_recall_context_summary(&request.prompt_context_set, &config);
+        let deterministic = deterministic_recall_context_summary(&request.prompt_context_set);
         let context = memory_turn_context_from_prompt_context_request(&request, &prompt_input)?;
         let episodic_capabilities =
             resolve_episodic_recall_capabilities(self.episodic_provider.as_ref(), &context).await;
@@ -137,7 +136,6 @@ impl HookHandler for ActiveMemoryRecallHook {
                 .contributions
                 .push(active_recall_debug_audit_contribution(
                     &decision,
-                    &deterministic,
                     &ActiveRecallExecutionResult::default(),
                     None,
                     None,
@@ -191,11 +189,7 @@ impl HookHandler for ActiveMemoryRecallHook {
             response
                 .contributions
                 .push(active_recall_debug_audit_contribution(
-                    &decision,
-                    &deterministic,
-                    &execution,
-                    None,
-                    None,
+                    &decision, &execution, None, None,
                 ));
             return Ok(response);
         }
@@ -272,7 +266,6 @@ impl HookHandler for ActiveMemoryRecallHook {
             .contributions
             .push(active_recall_debug_audit_contribution(
                 &decision,
-                &deterministic,
                 &execution,
                 Some(&active_dedup),
                 active_synthesis.as_ref(),

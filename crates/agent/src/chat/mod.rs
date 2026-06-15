@@ -47,9 +47,8 @@ use pioneer_hooks::{
     TurnPrePolicyHookInput, TurnPrePromptCompileHookInput, TurnPrePromptContextHookInput,
 };
 use pioneer_memory::hooks::{
-    MemoryActiveRecallRecentMessage, MemoryActiveRecallRecentMessageRole,
-    MemoryActiveRecallRecentThreadContext, MemoryEpisodicRecallCapabilities, MemoryTurnContext,
-    MemoryTurnPolicy, active_recall_thread_episodic_summary,
+    MemoryEpisodicRecallCapabilities, MemoryTurnContext, MemoryTurnPolicy,
+    active_recall_thread_episodic_summary,
     build_active_recall_local_preflight_plan_with_thread_summary,
     deterministic_recall_context_summary, memory_turn_policy_from_hook_policy_set,
 };
@@ -81,7 +80,7 @@ use pioneer_protocol::{
 use pioneer_provider::{
     AttachmentDataSource, ChatMessage, ChatRequest, CompiledPromptPayload, InputContentType,
     MessageAttachment, MessageContentPart, ModelInputItem, Provider, ProviderRegistry,
-    ProviderTimeoutPolicy, ProviderToolCall, Role, ToolDefinition, infer_mime_from_reference,
+    ProviderTimeoutPolicy, ProviderToolCall, ToolDefinition, infer_mime_from_reference,
 };
 use pioneer_skills::{
     ExcludedSkill, ResolvedSkill, SkillExcludedReason, SkillExplicitRef, SkillPolicyKey,
@@ -112,9 +111,6 @@ const TURN_TOOL_BUNDLE_PRIORITY: i32 = 250;
 const TASK_TOOL_BUNDLE_PRIORITY: i32 = 200;
 const MAX_CONSECUTIVE_REJECTED_NO_TOOL_ROUNDS: usize = 3;
 const TOOL_EVENT_FORWARDER_DRAIN_TIMEOUT_MS: u64 = 250;
-const ACTIVE_RECALL_RECENT_CONTEXT_MAX_MESSAGES: usize = 6;
-const ACTIVE_RECALL_RECENT_CONTEXT_MAX_MESSAGE_CHARS: usize = 240;
-const ACTIVE_RECALL_RECENT_CONTEXT_MAX_TOTAL_CHARS: usize = 1_000;
 
 async fn finish_tool_event_forwarder(mut forwarder: JoinHandle<()>) {
     match timeout(
@@ -1464,54 +1460,6 @@ fn prior_visible_assistant_text_for_execution_continuation(
     normalize_optional_prompt(Some(text))
 }
 
-fn active_recall_recent_thread_context(
-    history: &[ChatMessage],
-) -> MemoryActiveRecallRecentThreadContext {
-    let mut messages = Vec::new();
-    let mut total_chars = 0usize;
-    let mut truncated = false;
-
-    for message in history.iter().rev() {
-        let role = match message.role {
-            Role::User => MemoryActiveRecallRecentMessageRole::User,
-            Role::Assistant => MemoryActiveRecallRecentMessageRole::Assistant,
-            Role::System | Role::Tool => continue,
-        };
-        let text = message.text_content_lossy();
-        let text = text.trim();
-        if text.is_empty() {
-            continue;
-        }
-        let remaining_total =
-            ACTIVE_RECALL_RECENT_CONTEXT_MAX_TOTAL_CHARS.saturating_sub(total_chars);
-        if remaining_total == 0 {
-            truncated = true;
-            break;
-        }
-        let max_chars = remaining_total.min(ACTIVE_RECALL_RECENT_CONTEXT_MAX_MESSAGE_CHARS);
-        let (text_preview, text_truncated) = truncate_text_preview(text, max_chars);
-        total_chars += text_preview.chars().count();
-        truncated |= text_truncated;
-        messages.push(MemoryActiveRecallRecentMessage { role, text_preview });
-        if messages.len() >= ACTIVE_RECALL_RECENT_CONTEXT_MAX_MESSAGES {
-            truncated = true;
-            break;
-        }
-    }
-
-    messages.reverse();
-    MemoryActiveRecallRecentThreadContext {
-        messages,
-        truncated,
-    }
-}
-
-fn truncate_text_preview(text: &str, max_chars: usize) -> (String, bool) {
-    let mut chars = text.chars();
-    let preview = chars.by_ref().take(max_chars).collect::<String>();
-    (preview, chars.next().is_some())
-}
-
 fn hook_tool_names_from_strings(names: &[String]) -> Vec<HookToolName> {
     let mut names = names
         .iter()
@@ -1537,7 +1485,6 @@ async fn run_agent_turn_preflight_stage(
     turn_id: &str,
     hook_runtime_context: &AgentTurnHookRuntimeContext,
     input_text: &str,
-    recent_thread_context: MemoryActiveRecallRecentThreadContext,
 ) -> TurnPreflightOrchestratorResult {
     let memory_config = tool_loop_config.memory.active_recall.normalized();
     let hook_policy_set = effective_policy_set.clone_hook_policy_set();
@@ -1555,8 +1502,7 @@ async fn run_agent_turn_preflight_stage(
         None => MemoryTurnPolicy::no_use(),
     };
     let hook_prompt_context_set = effective_prompt_context_set.clone_hook_prompt_context_set();
-    let deterministic_summary =
-        deterministic_recall_context_summary(&hook_prompt_context_set, &memory_config);
+    let deterministic_summary = deterministic_recall_context_summary(&hook_prompt_context_set);
     let prompt_context_input = TurnPrePromptContextHookInput::from_parts(
         input_text,
         Some(model.to_owned()),
@@ -1594,7 +1540,6 @@ async fn run_agent_turn_preflight_stage(
         &deterministic_summary,
         episodic_capabilities,
         thread_episodic_summary,
-        recent_thread_context,
         true,
     );
     let input_text_char_count = input_text.chars().count();
@@ -2995,7 +2940,6 @@ async fn execute_agent_provider_response(
             turn_id,
             &hook_runtime_context,
             user_input_text.as_str(),
-            active_recall_recent_thread_context(history.as_slice()),
         )
         .await;
 
@@ -3336,7 +3280,6 @@ async fn execute_agent_provider_response(
         turn_id,
         &hook_runtime_context,
         user_input_text.as_str(),
-        active_recall_recent_thread_context(history.as_slice()),
     )
     .await;
 

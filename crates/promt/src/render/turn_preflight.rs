@@ -71,7 +71,6 @@ pub fn render_turn_preflight_prompt(input: &TurnPreflightPromptInput) -> String 
             "- Include mutation tools only when the current user request already asks to mutate that domain.\n",
             "- If the main model can request a domain later with `request_tools` and the need is not clear now, leave that tool out.\n",
             "- For durable remembered personal facts, durable project decisions, stable preferences, or exact memory records, include available memory read tools.\n",
-            "- Do not include durable memory read tools solely for current-thread continuation, recent transcript context, or episodic lookup; use `memory.activeRecall.episodic` when active recall planning is requested.\n",
             "- For explicit durable memory changes, include available memory mutation tools.\n",
             "- For creating, waiting on, updating, scheduling, or managing subtasks, include available task tools.\n",
             "- For creating or registering user-visible files, include available artifact tools.\n",
@@ -165,7 +164,7 @@ mod tests {
 
     fn sample_prompt() -> String {
         render_turn_preflight_prompt(&TurnPreflightPromptInput {
-            structured_input_json: r#"{"turn":{"inputTextPreview":"как меня зовут?"},"tools":{"coreTools":["exec_command","request_tools"],"candidateTools":[{"name":"memory_search","domain":"memory","summary":"Search memory.","mutation":false},{"name":"memory_get","domain":"memory","summary":"Read memory.","mutation":false}]},"memory":{"deterministicSummary":{"contextCount":0,"contextChars":0,"sufficient":false}}}"#.to_owned(),
+            structured_input_json: r#"{"turn":{"inputTextPreview":"как меня зовут?"},"tools":{"coreTools":["exec_command","request_tools"],"candidateTools":[{"name":"memory_search","domain":"memory","summary":"Search memory.","mutation":false},{"name":"memory_get","domain":"memory","summary":"Read memory.","mutation":false}]},"memory":{"deterministicSummary":{"contextCount":0,"contextChars":0}}}"#.to_owned(),
             memory_active_recall: TurnPreflightMemoryActiveRecallPromptInput::disabled(),
             max_output_chars: 1_200,
         })
@@ -173,7 +172,7 @@ mod tests {
 
     fn sample_prompt_with_active_recall() -> String {
         render_turn_preflight_prompt(&TurnPreflightPromptInput {
-            structured_input_json: r#"{"turn":{"inputTextPreview":"как меня зовут?"},"tools":{"coreTools":["exec_command","request_tools"],"candidateTools":[{"name":"memory_search","domain":"memory","summary":"Search memory.","mutation":false},{"name":"memory_get","domain":"memory","summary":"Read memory.","mutation":false}]},"memory":{"activeRecall":{"providerPlanningNeeded":true,"decisionRequest":{"availableModes":["profile","project","durable","current_thread"],"availableDurableModes":["profile","project","durable"],"availableEpisodicModes":["current_thread"],"availableScopedContexts":["workspace","thread"],"deterministicSufficient":false,"deterministicRecallEmpty":true,"inputTextCharCount":15}}}}"#.to_owned(),
+            structured_input_json: r#"{"turn":{"inputTextPreview":"как меня зовут?"},"tools":{"coreTools":["exec_command","request_tools"],"candidateTools":[{"name":"memory_search","domain":"memory","summary":"Search memory.","mutation":false},{"name":"memory_get","domain":"memory","summary":"Read memory.","mutation":false}]},"memory":{"activeRecall":{"providerPlanningNeeded":true,"decisionRequest":{"availableModes":["profile","project","durable","current_thread"],"availableDurableModes":["profile","project","durable"],"availableEpisodicModes":["current_thread"],"availableScopedContexts":["workspace","thread"],"deterministicRecallEmpty":true,"inputTextCharCount":15}}}}"#.to_owned(),
             memory_active_recall: TurnPreflightMemoryActiveRecallPromptInput {
                 provider_planning_needed: true,
             },
@@ -207,7 +206,6 @@ mod tests {
         assert!(prompt.contains("Do not include `tools.coreTools`"));
         assert!(prompt.contains("Use [] when no hidden candidate tool is clearly needed"));
         assert!(prompt.contains("For durable remembered personal facts"));
-        assert!(prompt.contains("Do not include durable memory read tools solely for current-thread continuation"));
         assert!(prompt.contains("For creating or registering user-visible files"));
         assert!(prompt.contains("Valid output example"));
         assert!(prompt.contains(r#""visibleTools": []"#));
@@ -337,16 +335,8 @@ mod tests {
                 r#"{"memory":{"activeRecall":{"providerPlanningNeeded":false,"localDecision":{"reasonCode":"deterministic_only","status":"skip","confidence":1.0}}}}"#,
             ),
             (
-                "deterministic_sufficient",
-                r#"{"memory":{"activeRecall":{"providerPlanningNeeded":false,"localDecision":{"reasonCode":"deterministic_sufficient","status":"skip","confidence":0.9}}}}"#,
-            ),
-            (
                 "strict_debug",
                 r#"{"memory":{"activeRecall":{"providerPlanningNeeded":false,"localDecision":{"reasonCode":"strict_debug","status":"run","confidence":1.0}}}}"#,
-            ),
-            (
-                "local_run_high_confidence",
-                r#"{"memory":{"activeRecall":{"providerPlanningNeeded":false,"localDecision":{"reasonCode":"memory_likely","status":"run","confidence":0.7}}}}"#,
             ),
         ] {
             let prompt = render_turn_preflight_prompt(&TurnPreflightPromptInput {

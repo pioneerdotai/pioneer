@@ -333,7 +333,6 @@ pub struct MemoryDebugRecallTrace {
     pub planner_reason: Option<String>,
     pub provider_used: Option<bool>,
     pub provider_fallback_used: Option<bool>,
-    pub deterministic_sufficient: Option<bool>,
     pub selected_modes: Vec<String>,
     pub dropped_modes: Vec<String>,
     pub mode_traces: Vec<MemoryDebugRecallModeTrace>,
@@ -352,7 +351,6 @@ impl Default for MemoryDebugRecallTrace {
             planner_reason: None,
             provider_used: None,
             provider_fallback_used: None,
-            deterministic_sufficient: None,
             selected_modes: Vec::new(),
             dropped_modes: Vec::new(),
             mode_traces: Vec::new(),
@@ -706,8 +704,6 @@ pub(crate) fn memory_debug_recall_trace_from_hook_run(
     };
     trace.selected_modes = diagnostic_value_list(&trace.diagnostics, "executed_modes");
     trace.dropped_modes = diagnostic_value_list(&trace.diagnostics, "skipped_modes");
-    trace.deterministic_sufficient =
-        diagnostic_bool(&trace.diagnostics, "deterministic_sufficient");
     for event in audit_events {
         apply_recall_audit_event(&mut trace, event);
     }
@@ -992,19 +988,6 @@ fn diagnostic_value_list(diagnostics: &[MemoryDebugDiagnosticPreview], key: &str
         .unwrap_or_default()
 }
 
-fn diagnostic_bool(diagnostics: &[MemoryDebugDiagnosticPreview], key: &str) -> Option<bool> {
-    diagnostics.iter().find_map(|diagnostic| {
-        diagnostic.message.split_whitespace().find_map(|token| {
-            let value = token.strip_prefix(format!("{key}=").as_str())?;
-            match value {
-                "true" => Some(true),
-                "false" => Some(false),
-                _ => None,
-            }
-        })
-    })
-}
-
 fn apply_recall_audit_event(
     trace: &mut MemoryDebugRecallTrace,
     event: &pioneer_crud::HookAuditEventRecord,
@@ -1040,10 +1023,6 @@ fn apply_recall_audit_event(
         .get("provider_fallback_used")
         .and_then(Value::as_bool)
         .or(trace.provider_fallback_used);
-    trace.deterministic_sufficient = details
-        .get("deterministic_sufficient")
-        .and_then(Value::as_bool)
-        .or(trace.deterministic_sufficient);
     append_string_array(&mut trace.selected_modes, details.get("selected_modes"));
     append_string_array(&mut trace.dropped_modes, details.get("dropped_modes"));
     append_string_array(&mut trace.suppressed_ids, details.get("suppressed_ids"));

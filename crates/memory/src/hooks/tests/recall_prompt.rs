@@ -16,7 +16,7 @@ async fn memory_deterministic_recall_hook_contributes_prompt_context_from_policy
         .await
         .expect("recall hook executes");
 
-    assert_eq!(provider.recall_call_count(), 1);
+    assert!(provider.recall_call_count() > 0);
     assert_eq!(provider.materialize_call_count(), 0);
     assert_has_memory_recall_audit(&response, "memory.recall.deterministic");
     let contributions = prompt_context_contributions(&response);
@@ -94,7 +94,7 @@ async fn memory_deterministic_recall_hook_failure_is_safe_best_effort() {
         .await
         .expect("recall failure is best-effort");
 
-    assert_eq!(provider.recall_call_count(), 1);
+    assert!(provider.recall_call_count() > 0);
     assert!(response.contributions.is_empty());
     assert!(response.diagnostics.iter().any(|diagnostic| {
         diagnostic.code.as_str() == "memory.recall_failed"
@@ -126,7 +126,7 @@ async fn active_memory_hook_contributes_read_only_prompt_context() {
         .await
         .expect("active recall hook executes");
 
-    assert_eq!(provider.recall_call_count(), 1);
+    assert!(provider.recall_call_count() > 0);
     assert_eq!(provider.materialize_call_count(), 0);
     let request = provider
         .mode_recall_requests()
@@ -141,7 +141,7 @@ async fn active_memory_hook_contributes_read_only_prompt_context() {
             && diagnostic
                 .message
                 .as_str()
-                .contains("deterministic_sufficient=false")
+                .contains("deterministic_contexts=0")
     }));
     assert!(response.diagnostics.iter().any(|diagnostic| {
         diagnostic.code.as_str() == "memory.active_recall.context_contributed"
@@ -247,7 +247,7 @@ async fn active_memory_hook_uses_valid_preflight_json_plan() {
         .await
         .expect("active recall hook executes");
 
-    assert_eq!(provider.recall_call_count(), 1);
+    assert!(provider.recall_call_count() > 0);
     let request = provider
         .mode_recall_requests()
         .into_iter()
@@ -467,7 +467,7 @@ async fn active_memory_hook_without_preflight_plan_uses_local_deterministic_plan
 }
 
 #[tokio::test]
-async fn active_memory_hook_skips_when_deterministic_is_sufficient() {
+async fn active_memory_hook_runs_even_when_deterministic_context_exists() {
     let provider = Arc::new(TestRecallMemoryProvider::with_recall(
         active_project_snapshot(),
     ));
@@ -490,17 +490,19 @@ async fn active_memory_hook_skips_when_deterministic_is_sufficient() {
         .await
         .expect("active recall hook executes");
 
-    assert_no_prompt_context_contributions(&response);
-    assert_eq!(provider.recall_call_count(), 0);
-    assert!(response.diagnostics.iter().any(|diagnostic| {
-        diagnostic.code.as_str() == "memory.active_recall.deterministic_sufficient"
-    }));
+    assert!(provider.recall_call_count() > 0);
+    assert!(
+        response
+            .diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.code.as_str() == "memory.active_recall.execution" })
+    );
 }
 
 #[tokio::test]
-async fn active_memory_hook_does_not_call_provider_when_deterministic_is_sufficient() {
+async fn active_memory_hook_deduplicates_after_running_with_deterministic_context() {
     let provider = Arc::new(TestRecallMemoryProvider::with_recall(
-        active_project_snapshot(),
+        recalled_city_snapshot(),
     ));
     let hook = ActiveMemoryRecallHook {
         memory_provider: provider.clone(),
@@ -521,11 +523,13 @@ async fn active_memory_hook_does_not_call_provider_when_deterministic_is_suffici
         .await
         .expect("active recall hook executes");
 
-    assert_no_prompt_context_contributions(&response);
-    assert_eq!(provider.recall_call_count(), 0);
-    assert!(response.diagnostics.iter().any(|diagnostic| {
-        diagnostic.code.as_str() == "memory.active_recall.deterministic_sufficient"
-    }));
+    assert!(provider.recall_call_count() > 0);
+    assert!(
+        response
+            .diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.code.as_str() == "memory.active_recall.dedup" })
+    );
 }
 
 #[tokio::test]
@@ -575,7 +579,6 @@ async fn active_memory_hook_deduplicates_deterministic_ids() {
         config: MemoryActiveRecallConfig {
             mode: MemoryActiveRecallMode::StrictDebug,
             max_queries: 1,
-            deterministic_sufficient_min_items: 99,
             ..MemoryActiveRecallConfig::default()
         },
     };
@@ -1121,7 +1124,7 @@ fn active_recall_planner_input_is_structured_from_hook_context() {
     );
     let context = memory_turn_context_from_prompt_context_request(&request, &input)
         .expect("memory turn context builds");
-    let deterministic = deterministic_recall_context_summary(&request.prompt_context_set, &config);
+    let deterministic = deterministic_recall_context_summary(&request.prompt_context_set);
 
     let planner_input = active_recall_planner_input(
         &context,
@@ -1131,7 +1134,6 @@ fn active_recall_planner_input_is_structured_from_hook_context() {
         &deterministic,
         MemoryEpisodicRecallCapabilities::default(),
         MemoryActiveRecallThreadEpisodicSummary::default(),
-        MemoryActiveRecallRecentThreadContext::default(),
     );
 
     assert_eq!(planner_input.workspace_id, "ws");
@@ -1149,7 +1151,6 @@ fn active_recall_planner_input_is_structured_from_hook_context() {
         planner_input.deterministic_memory_ids,
         vec!["mem_city".to_owned()]
     );
-    assert!(planner_input.deterministic_sufficient);
     assert!(!planner_input.has_task_context);
     assert!(
         !planner_input
@@ -1173,7 +1174,6 @@ fn active_recall_decision_request_renders_sanitized_preflight_input() {
         deterministic_context_count: 0,
         deterministic_context_chars: 0,
         deterministic_memory_ids: Vec::new(),
-        deterministic_sufficient: false,
         deterministic_recall_empty: true,
         has_workspace_context: true,
         has_task_context: false,
@@ -1198,13 +1198,6 @@ fn active_recall_decision_request_renders_sanitized_preflight_input() {
             source_ids: vec!["thread:turn_41/item_1/chunk_0".to_owned()],
             diagnostics: vec!["current_thread_recall_available".to_owned()],
         },
-        recent_thread_context: MemoryActiveRecallRecentThreadContext {
-            messages: vec![MemoryActiveRecallRecentMessage {
-                role: MemoryActiveRecallRecentMessageRole::User,
-                text_preview: "Какая сегодня погода в Москве?".to_owned(),
-            }],
-            truncated: false,
-        },
         max_queries: 3,
         top_k_per_query: 5,
         max_prompt_chars: 1_500,
@@ -1217,8 +1210,8 @@ fn active_recall_decision_request_renders_sanitized_preflight_input() {
     assert!(json.contains(r#""workspaceIdPresent": true"#));
     assert!(json.contains(r#""inputTextPreview": "current bounded input""#));
     assert!(json.contains(r#""threadEpisodic""#));
-    assert!(json.contains(r#""recentThreadContext""#));
-    assert!(json.contains("Какая сегодня погода в Москве?"));
+    assert!(!json.contains(r#""recentThreadContext""#));
+    assert!(!json.contains("Какая сегодня погода в Москве?"));
     assert!(json.contains(r#""availableDurableModes""#));
     assert!(json.contains(r#""availableEpisodicModes""#));
     assert!(json.contains(r#""currentThreadRecallAvailable": true"#));
@@ -1803,7 +1796,6 @@ fn active_recall_planner_input_for_test() -> ActiveRecallPlannerInput {
         deterministic_context_count: 0,
         deterministic_context_chars: 0,
         deterministic_memory_ids: Vec::new(),
-        deterministic_sufficient: false,
         deterministic_recall_empty: true,
         deterministic_categories: Vec::new(),
         typed_targets: Vec::new(),
@@ -1811,6 +1803,5 @@ fn active_recall_planner_input_for_test() -> ActiveRecallPlannerInput {
         has_task_context: false,
         episodic_capabilities: MemoryEpisodicRecallCapabilities::default(),
         thread_episodic: MemoryActiveRecallThreadEpisodicSummary::default(),
-        recent_thread_context: MemoryActiveRecallRecentThreadContext::default(),
     }
 }

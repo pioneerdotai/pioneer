@@ -24,8 +24,6 @@ fn memory_active_recall_config_defaults_to_bounded_hybrid() {
         max_queries: 0,
         top_k_per_query: 0,
         max_prompt_chars: 0,
-        deterministic_sufficient_min_items: 0,
-        deterministic_sufficient_min_chars: 0,
         ..MemoryActiveRecallConfig::default()
     }
     .normalized();

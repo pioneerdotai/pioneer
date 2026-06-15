@@ -53,12 +53,10 @@ pub struct DeterministicRecallContextSummary {
     pub rendered_line_fingerprints: BTreeSet<String>,
     pub context_count: usize,
     pub context_chars: usize,
-    pub sufficient: bool,
 }
 
 pub fn deterministic_recall_context_summary(
     prompt_context_set: &pioneer_hooks::HookPromptContextSet,
-    config: &MemoryActiveRecallConfig,
 ) -> DeterministicRecallContextSummary {
     let mut summary = DeterministicRecallContextSummary::default();
     for entry in prompt_context_set.entries() {
@@ -78,9 +76,6 @@ pub fn deterministic_recall_context_summary(
             }
         }
     }
-    summary.sufficient = !summary.memory_ids.is_empty()
-        && (summary.memory_ids.len() >= config.deterministic_sufficient_min_items
-            || summary.context_chars >= config.deterministic_sufficient_min_chars);
     summary
 }
 
@@ -101,7 +96,6 @@ pub(super) fn resolve_active_memory_decision_without_preflight_plan(
         deterministic,
         episodic_capabilities,
         thread_episodic,
-        MemoryActiveRecallRecentThreadContext::default(),
     );
 
     if local.local_final {
@@ -129,7 +123,6 @@ pub(super) fn active_memory_decision_from_preflight_plan(
         deterministic,
         episodic_capabilities,
         thread_episodic,
-        MemoryActiveRecallRecentThreadContext::default(),
     );
     if matches!(
         local.local_plan.reason_code,
@@ -174,7 +167,6 @@ pub fn build_active_recall_local_preflight_plan(
         deterministic,
         episodic_capabilities,
         MemoryActiveRecallThreadEpisodicSummary::default(),
-        MemoryActiveRecallRecentThreadContext::default(),
         provider_available,
     )
 }
@@ -187,7 +179,6 @@ pub fn build_active_recall_local_preflight_plan_with_thread_summary(
     deterministic: &DeterministicRecallContextSummary,
     episodic_capabilities: MemoryEpisodicRecallCapabilities,
     thread_episodic: MemoryActiveRecallThreadEpisodicSummary,
-    recent_thread_context: MemoryActiveRecallRecentThreadContext,
     provider_available: bool,
 ) -> MemoryActiveRecallLocalPlan {
     let local = active_recall_local_planning_parts(
@@ -198,7 +189,6 @@ pub fn build_active_recall_local_preflight_plan_with_thread_summary(
         deterministic,
         episodic_capabilities,
         thread_episodic,
-        recent_thread_context,
     );
     let provider_planning_needed =
         !local.local_final && config.planner.enabled && provider_available;
@@ -275,7 +265,6 @@ fn active_recall_local_planning_parts(
     deterministic: &DeterministicRecallContextSummary,
     episodic_capabilities: MemoryEpisodicRecallCapabilities,
     thread_episodic: MemoryActiveRecallThreadEpisodicSummary,
-    recent_thread_context: MemoryActiveRecallRecentThreadContext,
 ) -> ActiveRecallLocalPlanningParts {
     let planner_input = active_recall_planner_input(
         context,
@@ -285,7 +274,6 @@ fn active_recall_local_planning_parts(
         deterministic,
         episodic_capabilities,
         thread_episodic,
-        recent_thread_context,
     );
     let local_plan = local_active_memory_decision(&planner_input, "");
     let local_final = active_recall_local_plan_is_final(&local_plan);
@@ -293,7 +281,6 @@ fn active_recall_local_planning_parts(
         deterministic_context_count: planner_input.deterministic_context_count,
         deterministic_context_chars: planner_input.deterministic_context_chars,
         deterministic_memory_ids: planner_input.deterministic_memory_ids.clone(),
-        deterministic_sufficient: planner_input.deterministic_sufficient,
         deterministic_recall_empty: planner_input.deterministic_recall_empty,
         has_workspace_context: planner_input.has_workspace_context,
         has_task_context: planner_input.has_task_context,
@@ -309,7 +296,6 @@ fn active_recall_local_planning_parts(
         available_scoped_contexts: active_recall_available_scoped_contexts(&planner_input),
         episodic_capabilities: planner_input.episodic_capabilities.clone(),
         thread_episodic: planner_input.thread_episodic.clone(),
-        recent_thread_context: planner_input.recent_thread_context.clone(),
         max_queries: config.max_queries,
         top_k_per_query: config.top_k_per_query,
         max_prompt_chars: config.max_prompt_chars,
@@ -337,19 +323,13 @@ fn active_recall_local_planning_parts(
 }
 
 fn active_recall_local_plan_is_final(local_plan: &ActiveMemoryDecision) -> bool {
-    if matches!(
+    matches!(
         local_plan.effective_reason_code(),
         ActiveMemoryDecisionReasonCode::PolicyDisabled
             | ActiveMemoryDecisionReasonCode::ConfigDisabled
             | ActiveMemoryDecisionReasonCode::DeterministicOnly
-            | ActiveMemoryDecisionReasonCode::DeterministicSufficient
             | ActiveMemoryDecisionReasonCode::StrictDebug
-    ) {
-        return true;
-    }
-
-    local_plan.effective_status() == ActiveMemoryDecisionStatus::Run
-        && local_plan.effective_confidence() >= 0.7
+    )
 }
 
 fn active_recall_no_provider_local_decision(
@@ -428,13 +408,12 @@ mod active_recall_local_preflight_tests {
         DeterministicRecallContextSummary::default()
     }
 
-    fn sufficient_deterministic() -> DeterministicRecallContextSummary {
+    fn nonempty_deterministic() -> DeterministicRecallContextSummary {
         DeterministicRecallContextSummary {
             memory_ids: BTreeSet::from(["memory_1".to_owned()]),
             rendered_line_fingerprints: BTreeSet::new(),
             context_count: 1,
             context_chars: 128,
-            sufficient: true,
         }
     }
 
@@ -458,22 +437,6 @@ mod active_recall_local_preflight_tests {
             prompt_context_chars: 0,
             source_ids: Vec::new(),
             diagnostics: vec!["current_thread_recall_available".to_owned()],
-        }
-    }
-
-    fn weather_followup_recent_context() -> MemoryActiveRecallRecentThreadContext {
-        MemoryActiveRecallRecentThreadContext {
-            messages: vec![
-                MemoryActiveRecallRecentMessage {
-                    role: MemoryActiveRecallRecentMessageRole::User,
-                    text_preview: "Какая сегодня погода в Москве?".to_owned(),
-                },
-                MemoryActiveRecallRecentMessage {
-                    role: MemoryActiveRecallRecentMessageRole::Assistant,
-                    text_preview: "В Москве сегодня прохладно.".to_owned(),
-                },
-            ],
-            truncated: false,
         }
     }
 
@@ -523,32 +486,28 @@ mod active_recall_local_preflight_tests {
     }
 
     #[test]
-    fn active_recall_local_preflight_marks_deterministic_sufficient_as_host_local_final() {
+    fn active_recall_local_preflight_does_not_gate_on_nonempty_deterministic_recall() {
         let plan = build_active_recall_local_preflight_plan(
             &test_context(None),
             &test_input(),
             &MemoryTurnPolicy::normal_default_allow(),
             &MemoryActiveRecallConfig::default(),
-            &sufficient_deterministic(),
+            &nonempty_deterministic(),
             MemoryEpisodicRecallCapabilities::default(),
             true,
         );
 
-        assert!(!plan.provider_planning_needed);
-        assert_eq!(
-            plan.local_decision.reason_code,
-            ActiveMemoryDecisionReasonCode::DeterministicSufficient
-        );
-        assert_eq!(plan.local_decision.status, ActiveMemoryDecisionStatus::Skip);
+        assert!(plan.provider_planning_needed);
+        assert_eq!(plan.local_decision.status, ActiveMemoryDecisionStatus::Run);
         assert_eq!(
             plan.decision_request.deterministic_memory_ids,
             vec!["memory_1".to_owned()]
         );
-        assert!(plan.decision_request.deterministic_sufficient);
     }
 
     #[test]
-    fn active_recall_local_preflight_allows_thread_episodic_when_deterministic_is_sufficient() {
+    fn active_recall_local_preflight_keeps_provider_needed_with_deterministic_and_episodic_context()
+    {
         let plan = build_active_recall_local_preflight_plan_with_thread_summary(
             &test_context(None),
             &TurnPrePromptContextHookInput::from_parts(
@@ -558,30 +517,18 @@ mod active_recall_local_preflight_tests {
             ),
             &MemoryTurnPolicy::normal_default_allow(),
             &MemoryActiveRecallConfig::default(),
-            &sufficient_deterministic(),
+            &nonempty_deterministic(),
             current_thread_capabilities(),
             current_thread_summary(),
-            weather_followup_recent_context(),
             true,
         );
 
         assert!(plan.provider_planning_needed);
-        assert!(plan.decision_request.deterministic_sufficient);
         assert_eq!(
-            plan.local_decision.effective_reason_code(),
-            ActiveMemoryDecisionReasonCode::MemoryLikely
+            plan.local_decision.durable.status,
+            ActiveMemoryDecisionStatus::Run
         );
-        assert_eq!(
-            plan.local_decision.episodic.queries[0].mode,
-            ActiveRecallMode::CurrentThread
-        );
-        let query = plan.local_decision.episodic.queries[0].query.as_str();
-        assert!(query.contains("Какая сегодня погода в Москве?"));
-        assert!(query.contains("а завтра какая?"));
-        assert_eq!(
-            plan.decision_request.recent_thread_context.messages.len(),
-            2
-        );
+        assert!(!plan.local_decision.episodic.queries.is_empty());
     }
 
     #[test]
@@ -636,7 +583,7 @@ mod active_recall_local_preflight_tests {
     }
 
     #[test]
-    fn active_recall_local_preflight_marks_high_confidence_run_as_host_local_final() {
+    fn active_recall_local_preflight_does_not_treat_high_confidence_run_as_host_local_final() {
         let plan = ActiveRecallPlan::run(
             ActiveMemoryDecisionReasonCode::MemoryLikely,
             0.70,
@@ -644,7 +591,7 @@ mod active_recall_local_preflight_tests {
             Vec::new(),
             vec!["memory.active_recall.local_candidate".to_owned()],
         );
-        assert!(active_recall_local_plan_is_final(&plan));
+        assert!(!active_recall_local_plan_is_final(&plan));
 
         let plan = ActiveRecallPlan::run(
             ActiveMemoryDecisionReasonCode::MemoryLikely,

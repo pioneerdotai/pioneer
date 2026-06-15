@@ -7427,10 +7427,6 @@ async fn phase_15_active_memory_recall_contributes_prompt_context_and_manifest()
     let mut config = test_tool_loop_config();
     config.memory.active_recall.mode = super::MemoryActiveRecallMode::StrictDebug;
     config.memory.active_recall.max_queries = 1;
-    config
-        .memory
-        .active_recall
-        .deterministic_sufficient_min_items = 99;
     let manager = AgentManager::new(registry, config);
     let memory_provider = Arc::new(RecordingMemoryProvider::with_recall_sequence(
         vec![
@@ -7564,10 +7560,6 @@ async fn memory_identity_flow_preflight_provider_owned_active_recall_contributes
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
     let mut config = test_tool_loop_config();
     config.memory.active_recall.mode = super::MemoryActiveRecallMode::Hybrid;
-    config
-        .memory
-        .active_recall
-        .deterministic_sufficient_min_items = 99;
     config.memory.active_recall.max_queries = 1;
     let manager = AgentManager::new(registry, config);
     let memory_provider = Arc::new(RecordingMemoryProvider::with_recall_sequence(
@@ -7742,10 +7734,6 @@ async fn phase_16_active_memory_duplicate_suppression_is_manifest_observable() {
     let mut config = test_tool_loop_config();
     config.memory.active_recall.mode = super::MemoryActiveRecallMode::StrictDebug;
     config.memory.active_recall.max_queries = 1;
-    config
-        .memory
-        .active_recall
-        .deterministic_sufficient_min_items = 99;
     let manager = AgentManager::new(registry, config);
     let duplicate_memory = memory_recall_item(
         "mem_phase16_duplicate",

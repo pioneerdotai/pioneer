@@ -779,7 +779,6 @@ pub(crate) struct TurnPreflightProviderDiagnosticsSnapshot {
 pub(crate) struct TurnPreflightMemoryDiagnosticsSnapshot {
     pub deterministic_context_count: usize,
     pub deterministic_context_chars: usize,
-    pub deterministic_sufficient: bool,
     pub active_recall: TurnPreflightMemoryActiveRecallDiagnosticsSnapshot,
 }
 
@@ -1112,7 +1111,6 @@ fn memory_diagnostics_snapshot(
     TurnPreflightMemoryDiagnosticsSnapshot {
         deterministic_context_count: deterministic.context_count,
         deterministic_context_chars: deterministic.context_chars,
-        deterministic_sufficient: deterministic.sufficient,
         active_recall: TurnPreflightMemoryActiveRecallDiagnosticsSnapshot {
             source: active_recall.source,
             fallback_reason: active_recall.fallback_reason,
@@ -1587,8 +1585,10 @@ mod tests {
     use pioneer_memory::hooks::{
         ActiveMemoryDecisionReasonCode, ActiveMemoryDecisionStatus, ActiveRecallMode,
         ActiveRecallTarget, MemoryActiveRecallConfig, MemoryActiveRecallMode,
-        MemoryActiveRecallPlannerFallbackPolicy, MemoryEpisodicRecallCapabilities,
-        MemoryTurnContext, MemoryTurnPolicy, build_active_recall_local_preflight_plan,
+        MemoryActiveRecallPlannerFallbackPolicy, MemoryActiveRecallThreadEpisodicSummary,
+        MemoryEpisodicRecallCapabilities, MemoryTurnContext, MemoryTurnPolicy,
+        build_active_recall_local_preflight_plan,
+        build_active_recall_local_preflight_plan_with_thread_summary,
         parse_active_memory_decision_json,
     };
     use pioneer_protocol::{
@@ -1789,7 +1789,6 @@ mod tests {
                     rendered_line_fingerprints: BTreeSet::new(),
                     context_count: 0,
                     context_chars: 0,
-                    sufficient: false,
                 },
                 active_recall: Some(TurnPreflightMemoryActiveRecallInput {
                     decision_context: MemoryActiveRecallDecisionContext {
@@ -1805,7 +1804,6 @@ mod tests {
                         deterministic_context_count: 0,
                         deterministic_context_chars: 0,
                         deterministic_memory_ids: Vec::new(),
-                        deterministic_sufficient: false,
                         deterministic_recall_empty: true,
                         has_workspace_context: true,
                         has_task_context: false,
@@ -1837,8 +1835,6 @@ mod tests {
                         thread_episodic:
                             pioneer_memory::hooks::MemoryActiveRecallThreadEpisodicSummary::default(
                             ),
-                        recent_thread_context:
-                            pioneer_memory::hooks::MemoryActiveRecallRecentThreadContext::default(),
                         max_queries: 3,
                         top_k_per_query: 5,
                         max_prompt_chars: 1_500,
@@ -1947,8 +1943,7 @@ mod tests {
             value["memory"]["deterministicSummary"],
             json!({
                 "contextCount": 0,
-                "contextChars": 0,
-                "sufficient": false
+                "contextChars": 0
             })
         );
         let mut deterministic_with_internal_fields = sample_input();
@@ -2059,12 +2054,11 @@ mod tests {
         sample_input().memory.deterministic_summary
     }
 
-    fn sample_sufficient_deterministic_summary() -> DeterministicRecallContextSummary {
+    fn sample_nonempty_deterministic_summary() -> DeterministicRecallContextSummary {
         let mut summary = sample_deterministic_summary();
         summary.context_count = 1;
         summary.context_chars = 128;
         summary.memory_ids.insert("memory_identity_name".to_owned());
-        summary.sufficient = true;
         summary
     }
 
@@ -2135,6 +2129,48 @@ mod tests {
             &deterministic,
             MemoryEpisodicRecallCapabilities::default(),
             provider_available,
+        )
+    }
+
+    fn sample_memory_local_plan_with_current_thread_episodic(
+        deterministic: DeterministicRecallContextSummary,
+    ) -> MemoryActiveRecallLocalPlan {
+        build_active_recall_local_preflight_plan_with_thread_summary(
+            &MemoryTurnContext {
+                workspace_id: "ws_1".to_owned(),
+                thread_id: "thr_1".to_owned(),
+                turn_id: "turn_1".to_owned(),
+                mode: ThreadMode::Agent,
+                input_text: "а завтра какая?".to_owned(),
+                task_id: None,
+                agent_id: None,
+            },
+            &TurnPrePromptContextHookInput::from_parts(
+                "а завтра какая?",
+                Some("thread-model"),
+                Some("thread-provider"),
+            ),
+            &MemoryTurnPolicy::normal_default_allow(),
+            &MemoryActiveRecallConfig::default(),
+            &deterministic,
+            MemoryEpisodicRecallCapabilities {
+                current_thread_search: true,
+                related_thread_search: false,
+                workspace_thread_search: false,
+                current_task_context: false,
+                completed_task_summary: false,
+            },
+            MemoryActiveRecallThreadEpisodicSummary {
+                current_thread_id_present: true,
+                current_thread_recall_available: true,
+                related_thread_recall_available: false,
+                workspace_thread_recall_available: false,
+                prompt_context_source_count: 0,
+                prompt_context_chars: 0,
+                source_ids: Vec::new(),
+                diagnostics: vec!["current_thread_recall_available".to_owned()],
+            },
+            true,
         )
     }
 
@@ -2335,7 +2371,7 @@ mod tests {
             sample_deterministic_summary(),
             sample_memory_local_plan(
                 false,
-                sample_skip_decision(ActiveMemoryDecisionReasonCode::DeterministicSufficient),
+                sample_skip_decision(ActiveMemoryDecisionReasonCode::DeterministicOnly),
             ),
         );
 
@@ -2350,7 +2386,7 @@ mod tests {
         assert_eq!(host_local.fallback_reason, None);
         assert_eq!(
             host_local.decision.reason_code,
-            ActiveMemoryDecisionReasonCode::DeterministicSufficient
+            ActiveMemoryDecisionReasonCode::DeterministicOnly
         );
     }
 
@@ -2388,12 +2424,31 @@ mod tests {
     }
 
     #[test]
-    fn memory_identity_flow_local_final_active_recall_variants_omit_provider_owned_input() {
-        let deterministic_sufficient = sample_memory_local_plan_from_memory_config(
-            MemoryActiveRecallConfig::default(),
-            sample_sufficient_deterministic_summary(),
-            true,
+    fn preflight_keeps_provider_input_when_deterministic_recall_is_nonempty() {
+        let modules = build_local_preflight_module_plans(
+            sample_tool_index(),
+            sample_nonempty_deterministic_summary(),
+            sample_memory_local_plan_with_current_thread_episodic(
+                sample_nonempty_deterministic_summary(),
+            ),
         );
+
+        let provider_input = modules.provider_input(sample_turn_input());
+        let active_recall = provider_input
+            .memory
+            .active_recall
+            .expect("episodic provider planning remains visible");
+
+        assert!(modules.active_recall_provider_planning_needed());
+        assert!(modules.host_local_active_recall_plan().is_none());
+        assert_eq!(
+            active_recall.decision_request.available_episodic_modes,
+            vec!["current_thread".to_owned(), "thread_episodic".to_owned()]
+        );
+    }
+
+    #[test]
+    fn memory_identity_flow_local_final_active_recall_variants_omit_provider_owned_input() {
         let deterministic_only = sample_memory_local_plan_from_memory_config(
             MemoryActiveRecallConfig {
                 mode: MemoryActiveRecallMode::DeterministicOnly,
@@ -2402,37 +2457,13 @@ mod tests {
             sample_deterministic_summary(),
             true,
         );
-        let high_confidence_local_run = sample_memory_local_plan(
-            false,
-            ActiveRecallPlan::run(
-                ActiveMemoryDecisionReasonCode::MemoryLikely,
-                0.70,
-                vec![ActiveRecallMode::Profile],
-                Vec::new(),
-                vec!["memory.active_recall.local_candidate".to_owned()],
-            ),
-        );
 
-        for (label, local_plan, reason_code, status) in [
-            (
-                "deterministic_sufficient",
-                deterministic_sufficient,
-                ActiveMemoryDecisionReasonCode::DeterministicSufficient,
-                ActiveMemoryDecisionStatus::Skip,
-            ),
-            (
-                "deterministic_only",
-                deterministic_only,
-                ActiveMemoryDecisionReasonCode::DeterministicOnly,
-                ActiveMemoryDecisionStatus::Skip,
-            ),
-            (
-                "high_confidence_local_run",
-                high_confidence_local_run,
-                ActiveMemoryDecisionReasonCode::MemoryLikely,
-                ActiveMemoryDecisionStatus::Run,
-            ),
-        ] {
+        for (label, local_plan, reason_code, status) in [(
+            "deterministic_only",
+            deterministic_only,
+            ActiveMemoryDecisionReasonCode::DeterministicOnly,
+            ActiveMemoryDecisionStatus::Skip,
+        )] {
             let modules = build_local_preflight_module_plans(
                 sample_tool_index(),
                 sample_deterministic_summary(),
@@ -2462,7 +2493,7 @@ mod tests {
             sample_deterministic_summary(),
             sample_memory_local_plan(
                 false,
-                sample_skip_decision(ActiveMemoryDecisionReasonCode::DeterministicSufficient),
+                sample_skip_decision(ActiveMemoryDecisionReasonCode::DeterministicOnly),
             ),
         );
 
@@ -3044,7 +3075,7 @@ mod tests {
             sample_deterministic_summary(),
             sample_memory_local_plan(
                 false,
-                sample_skip_decision(ActiveMemoryDecisionReasonCode::DeterministicSufficient),
+                sample_skip_decision(ActiveMemoryDecisionReasonCode::DeterministicOnly),
             ),
         );
 
@@ -3057,7 +3088,7 @@ mod tests {
         );
         assert_eq!(
             plan.memory.active_recall.decision.reason_code,
-            ActiveMemoryDecisionReasonCode::DeterministicSufficient
+            ActiveMemoryDecisionReasonCode::DeterministicOnly
         );
     }
 

@@ -25,7 +25,6 @@ pub enum ActiveMemoryDecisionReasonCode {
     PolicyDisabled,
     ConfigDisabled,
     DeterministicOnly,
-    DeterministicSufficient,
     MemoryLikely,
     StrictDebug,
     ProviderRun,
@@ -39,7 +38,6 @@ impl ActiveMemoryDecisionReasonCode {
             Self::PolicyDisabled => "policy_disabled",
             Self::ConfigDisabled => "config_disabled",
             Self::DeterministicOnly => "deterministic_only",
-            Self::DeterministicSufficient => "deterministic_sufficient",
             Self::MemoryLikely => "memory_likely",
             Self::StrictDebug => "strict_debug",
             Self::ProviderRun => "provider_run",
@@ -53,7 +51,6 @@ impl ActiveMemoryDecisionReasonCode {
             Self::PolicyDisabled => "memory.active_recall.policy_disabled",
             Self::ConfigDisabled => "memory.active_recall.config_disabled",
             Self::DeterministicOnly => "memory.active_recall.deterministic_only",
-            Self::DeterministicSufficient => "memory.active_recall.deterministic_sufficient",
             Self::MemoryLikely | Self::StrictDebug | Self::ProviderRun => {
                 "memory.active_recall.started"
             }
@@ -65,11 +62,7 @@ impl ActiveMemoryDecisionReasonCode {
     fn is_provider_allowed(self) -> bool {
         matches!(
             self,
-            Self::MemoryLikely
-                | Self::DeterministicSufficient
-                | Self::ProviderRun
-                | Self::ProviderSkip
-                | Self::ProviderUncertain
+            Self::MemoryLikely | Self::ProviderRun | Self::ProviderSkip | Self::ProviderUncertain
         )
     }
 }
@@ -380,6 +373,20 @@ impl EpisodicMemoryRecallPlan {
             queries,
             diagnostics,
         })
+    }
+
+    pub fn uncertain(
+        reason_code: ActiveMemoryDecisionReasonCode,
+        confidence: f32,
+        diagnostics: Vec<String>,
+    ) -> Self {
+        Self {
+            status: ActiveMemoryDecisionStatus::Uncertain,
+            reason_code,
+            confidence: confidence.clamp(0.0, 1.0),
+            queries: Vec::new(),
+            diagnostics: normalize_active_recall_diagnostics(diagnostics),
+        }
     }
 }
 
@@ -1043,10 +1050,6 @@ pub(super) fn deterministic_recall_debug_audit_contribution(
         HookValue::Text("deterministic_recall".to_owned()),
     );
     details.insert(
-        metadata_key("deterministic_sufficient"),
-        HookValue::Bool(!synthesis.items.is_empty()),
-    );
-    details.insert(
         metadata_key("selected_modes"),
         hook_value_string_list(vec!["deterministic".to_owned()]),
     );
@@ -1091,7 +1094,6 @@ pub(super) fn deterministic_recall_debug_audit_contribution(
 
 pub(super) fn active_recall_debug_audit_contribution(
     decision: &ActiveMemoryDecision,
-    deterministic: &DeterministicRecallContextSummary,
     execution: &ActiveRecallExecutionResult,
     dedup: Option<&ActiveRecallDedupResult>,
     synthesis: Option<&MemoryActiveSynthesisOutput>,
@@ -1124,10 +1126,6 @@ pub(super) fn active_recall_debug_audit_contribution(
     details.insert(
         metadata_key("provider_fallback_used"),
         HookValue::Bool(decision.provider_fallback_used),
-    );
-    details.insert(
-        metadata_key("deterministic_sufficient"),
-        HookValue::Bool(deterministic.sufficient),
     );
     details.insert(
         metadata_key("selected_modes"),
@@ -1572,7 +1570,6 @@ pub(super) struct ActiveRecallPlannerInput {
     pub(super) deterministic_context_count: usize,
     pub(super) deterministic_context_chars: usize,
     pub(super) deterministic_memory_ids: Vec<String>,
-    pub(super) deterministic_sufficient: bool,
     pub(super) deterministic_recall_empty: bool,
     pub(super) deterministic_categories: Vec<MemoryCategory>,
     pub(super) typed_targets: Vec<ActiveRecallTarget>,
@@ -1580,14 +1577,6 @@ pub(super) struct ActiveRecallPlannerInput {
     pub(super) has_task_context: bool,
     pub(super) episodic_capabilities: MemoryEpisodicRecallCapabilities,
     pub(super) thread_episodic: MemoryActiveRecallThreadEpisodicSummary,
-    pub(super) recent_thread_context: MemoryActiveRecallRecentThreadContext,
-}
-
-impl ActiveRecallPlannerInput {
-    fn has_recent_thread_episodic_context(&self) -> bool {
-        self.thread_episodic.current_thread_recall_available
-            && !self.recent_thread_context.messages.is_empty()
-    }
 }
 
 pub(super) fn active_recall_planner_input(
@@ -1598,7 +1587,6 @@ pub(super) fn active_recall_planner_input(
     deterministic: &DeterministicRecallContextSummary,
     episodic_capabilities: MemoryEpisodicRecallCapabilities,
     thread_episodic: MemoryActiveRecallThreadEpisodicSummary,
-    recent_thread_context: MemoryActiveRecallRecentThreadContext,
 ) -> ActiveRecallPlannerInput {
     let input_text_char_count = input.input_text.chars().count();
     let deterministic_memory_ids = deterministic.memory_ids.iter().cloned().collect::<Vec<_>>();
@@ -1626,7 +1614,6 @@ pub(super) fn active_recall_planner_input(
         deterministic_context_count: deterministic.context_count,
         deterministic_context_chars: deterministic.context_chars,
         deterministic_memory_ids,
-        deterministic_sufficient: deterministic.sufficient,
         deterministic_recall_empty: deterministic.memory_ids.is_empty(),
         deterministic_categories: Vec::new(),
         typed_targets: Vec::new(),
@@ -1637,26 +1624,7 @@ pub(super) fn active_recall_planner_input(
             .is_some_and(|task_id| !task_id.trim().is_empty()),
         episodic_capabilities,
         thread_episodic,
-        recent_thread_context,
     }
-}
-
-fn current_thread_episodic_query(input: &ActiveRecallPlannerInput) -> Option<String> {
-    let mut parts = Vec::new();
-    for message in &input.recent_thread_context.messages {
-        let text = message.text_preview.trim();
-        if text.is_empty() {
-            continue;
-        }
-        parts.push(format!("{}: {text}", message.role.as_str()));
-    }
-
-    let current = input.input_text_preview.trim();
-    if !current.is_empty() {
-        parts.push(format!("current_user: {current}"));
-    }
-
-    bounded_nonempty_text(parts.join("\n").as_str(), 500)
 }
 
 pub fn active_recall_thread_episodic_summary(
@@ -1765,14 +1733,6 @@ pub(super) fn deterministic_active_recall_plan(
         MemoryActiveRecallMode::Hybrid => {}
     }
 
-    if input.deterministic_sufficient && !input.has_recent_thread_episodic_context() {
-        return ActiveRecallPlan::skip(
-            ActiveMemoryDecisionReasonCode::DeterministicSufficient,
-            0.9,
-            vec!["deterministic_sufficient".to_owned()],
-        );
-    }
-
     let exact_targets = input
         .typed_targets
         .iter()
@@ -1811,10 +1771,8 @@ pub(super) fn deterministic_active_recall_plan(
         }
         diagnostics.push("structured_task_context_available".to_owned());
     }
-    if input.thread_episodic.current_thread_recall_available
-        && (input.deterministic_recall_empty || input.has_recent_thread_episodic_context())
-    {
-        if let Some(query) = current_thread_episodic_query(input) {
+    if input.thread_episodic.current_thread_recall_available {
+        if let Some(query) = bounded_nonempty_text(input.input_text_preview.as_str(), 500) {
             episodic_queries.push(EpisodicMemoryRecallQuery {
                 mode: ActiveRecallMode::CurrentThread,
                 query,
@@ -1825,7 +1783,7 @@ pub(super) fn deterministic_active_recall_plan(
         }
         diagnostics.push("structured_thread_context_available".to_owned());
     }
-    if input.has_workspace_context && input.deterministic_recall_empty {
+    if input.has_workspace_context {
         durable_modes.push(ActiveRecallMode::Project);
         durable_modes.push(ActiveRecallMode::Durable);
         diagnostics.push("structured_workspace_context_available".to_owned());
@@ -2290,11 +2248,10 @@ pub(super) fn active_memory_decision_observability_diagnostic(
     let mut diagnostic = memory_safe_info_diagnostic(
         "memory.active_recall.decision",
         format!(
-            "memory active recall decision: status={} reason={} confidence={:.2} deterministic_sufficient={} deterministic_contexts={} deterministic_chars={} modes={} targets={} provider_used={} provider_fallback_used={} debug_fallback={}",
+            "memory active recall decision: status={} reason={} confidence={:.2} deterministic_contexts={} deterministic_chars={} modes={} targets={} provider_used={} provider_fallback_used={} debug_fallback={}",
             active_memory_decision_status_name(decision.effective_status()),
             decision.effective_reason_code().as_str(),
             decision.effective_confidence(),
-            deterministic.sufficient,
             deterministic.context_count,
             deterministic.context_chars,
             selected_modes,

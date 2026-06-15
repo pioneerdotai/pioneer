@@ -434,7 +434,6 @@ pub struct MemoryActiveRecallDecisionRequest {
     pub deterministic_context_count: usize,
     pub deterministic_context_chars: usize,
     pub deterministic_memory_ids: Vec<String>,
-    pub deterministic_sufficient: bool,
     pub deterministic_recall_empty: bool,
     pub has_workspace_context: bool,
     pub has_task_context: bool,
@@ -452,11 +451,6 @@ pub struct MemoryActiveRecallDecisionRequest {
     pub available_scoped_contexts: Vec<String>,
     pub episodic_capabilities: MemoryEpisodicRecallCapabilities,
     pub thread_episodic: MemoryActiveRecallThreadEpisodicSummary,
-    #[serde(
-        default,
-        skip_serializing_if = "MemoryActiveRecallRecentThreadContext::is_empty"
-    )]
-    pub recent_thread_context: MemoryActiveRecallRecentThreadContext,
     pub max_queries: usize,
     pub top_k_per_query: u32,
     pub max_prompt_chars: usize,
@@ -488,7 +482,6 @@ impl MemoryActiveRecallDecisionRequest {
             deterministic_context_count: self.deterministic_context_count,
             deterministic_context_chars: self.deterministic_context_chars,
             deterministic_memory_ids: self.deterministic_memory_ids.clone(),
-            deterministic_sufficient: self.deterministic_sufficient,
             deterministic_recall_empty: self.deterministic_recall_empty,
             has_workspace_context: self.has_workspace_context,
             has_task_context: self.has_task_context,
@@ -503,7 +496,6 @@ impl MemoryActiveRecallDecisionRequest {
             available_scoped_contexts: self.available_scoped_contexts.clone(),
             episodic_capabilities: self.episodic_capabilities.clone(),
             thread_episodic: self.thread_episodic.clone(),
-            recent_thread_context: self.recent_thread_context.clone(),
             budgets: MemoryActiveRecallPlannerBudgetInput {
                 max_queries: self.max_queries,
                 top_k_per_query: self.top_k_per_query,
@@ -514,44 +506,6 @@ impl MemoryActiveRecallDecisionRequest {
             fallback_policy: self.fallback_policy.as_str().to_owned(),
         };
         serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_owned())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MemoryActiveRecallRecentMessageRole {
-    User,
-    Assistant,
-}
-
-impl MemoryActiveRecallRecentMessageRole {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::User => "user",
-            Self::Assistant => "assistant",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct MemoryActiveRecallRecentMessage {
-    pub role: MemoryActiveRecallRecentMessageRole,
-    pub text_preview: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct MemoryActiveRecallRecentThreadContext {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub messages: Vec<MemoryActiveRecallRecentMessage>,
-    #[serde(default)]
-    pub truncated: bool,
-}
-
-impl MemoryActiveRecallRecentThreadContext {
-    pub fn is_empty(&self) -> bool {
-        self.messages.is_empty() && !self.truncated
     }
 }
 
@@ -585,7 +539,6 @@ struct MemoryActiveRecallPlannerSanitizedInput {
     deterministic_context_count: usize,
     deterministic_context_chars: usize,
     deterministic_memory_ids: Vec<String>,
-    deterministic_sufficient: bool,
     deterministic_recall_empty: bool,
     has_workspace_context: bool,
     has_task_context: bool,
@@ -600,7 +553,6 @@ struct MemoryActiveRecallPlannerSanitizedInput {
     available_scoped_contexts: Vec<String>,
     episodic_capabilities: MemoryEpisodicRecallCapabilities,
     thread_episodic: MemoryActiveRecallThreadEpisodicSummary,
-    recent_thread_context: MemoryActiveRecallRecentThreadContext,
     budgets: MemoryActiveRecallPlannerBudgetInput,
     fallback_policy: String,
 }

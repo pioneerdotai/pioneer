@@ -199,7 +199,6 @@ fn episodic_planner_input_for_test() -> ActiveRecallPlannerInput {
         deterministic_context_count: 0,
         deterministic_context_chars: 0,
         deterministic_memory_ids: Vec::new(),
-        deterministic_sufficient: false,
         deterministic_recall_empty: true,
         deterministic_categories: Vec::new(),
         typed_targets: Vec::new(),
@@ -207,7 +206,6 @@ fn episodic_planner_input_for_test() -> ActiveRecallPlannerInput {
         has_task_context: false,
         episodic_capabilities: MemoryEpisodicRecallCapabilities::default(),
         thread_episodic: MemoryActiveRecallThreadEpisodicSummary::default(),
-        recent_thread_context: MemoryActiveRecallRecentThreadContext::default(),
     }
 }
 

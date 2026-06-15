@@ -93,8 +93,6 @@ pub struct MemoryActiveRecallConfig {
     pub max_queries: usize,
     pub top_k_per_query: u32,
     pub max_prompt_chars: usize,
-    pub deterministic_sufficient_min_items: usize,
-    pub deterministic_sufficient_min_chars: usize,
     pub planner: MemoryActiveRecallPlannerConfig,
 }
 
@@ -106,8 +104,6 @@ impl Default for MemoryActiveRecallConfig {
             max_queries: 3,
             top_k_per_query: 5,
             max_prompt_chars: 1_500,
-            deterministic_sufficient_min_items: 1,
-            deterministic_sufficient_min_chars: 600,
             planner: MemoryActiveRecallPlannerConfig::default(),
         }
     }
@@ -121,8 +117,6 @@ impl MemoryActiveRecallConfig {
             max_queries: self.max_queries.max(1),
             top_k_per_query: self.top_k_per_query.max(1),
             max_prompt_chars: self.max_prompt_chars.max(1),
-            deterministic_sufficient_min_items: self.deterministic_sufficient_min_items.max(1),
-            deterministic_sufficient_min_chars: self.deterministic_sufficient_min_chars.max(1),
             planner: self.planner.normalized(),
         }
     }
