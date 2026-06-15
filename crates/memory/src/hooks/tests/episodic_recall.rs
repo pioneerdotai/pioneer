@@ -207,6 +207,7 @@ fn episodic_planner_input_for_test() -> ActiveRecallPlannerInput {
         has_task_context: false,
         episodic_capabilities: MemoryEpisodicRecallCapabilities::default(),
         thread_episodic: MemoryActiveRecallThreadEpisodicSummary::default(),
+        recent_thread_context: MemoryActiveRecallRecentThreadContext::default(),
     }
 }
 

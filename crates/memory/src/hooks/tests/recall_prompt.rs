@@ -1131,6 +1131,7 @@ fn active_recall_planner_input_is_structured_from_hook_context() {
         &deterministic,
         MemoryEpisodicRecallCapabilities::default(),
         MemoryActiveRecallThreadEpisodicSummary::default(),
+        MemoryActiveRecallRecentThreadContext::default(),
     );
 
     assert_eq!(planner_input.workspace_id, "ws");
@@ -1197,6 +1198,13 @@ fn active_recall_decision_request_renders_sanitized_preflight_input() {
             source_ids: vec!["thread:turn_41/item_1/chunk_0".to_owned()],
             diagnostics: vec!["current_thread_recall_available".to_owned()],
         },
+        recent_thread_context: MemoryActiveRecallRecentThreadContext {
+            messages: vec![MemoryActiveRecallRecentMessage {
+                role: MemoryActiveRecallRecentMessageRole::User,
+                text_preview: "Какая сегодня погода в Москве?".to_owned(),
+            }],
+            truncated: false,
+        },
         max_queries: 3,
         top_k_per_query: 5,
         max_prompt_chars: 1_500,
@@ -1209,6 +1217,8 @@ fn active_recall_decision_request_renders_sanitized_preflight_input() {
     assert!(json.contains(r#""workspaceIdPresent": true"#));
     assert!(json.contains(r#""inputTextPreview": "current bounded input""#));
     assert!(json.contains(r#""threadEpisodic""#));
+    assert!(json.contains(r#""recentThreadContext""#));
+    assert!(json.contains("Какая сегодня погода в Москве?"));
     assert!(json.contains(r#""availableDurableModes""#));
     assert!(json.contains(r#""availableEpisodicModes""#));
     assert!(json.contains(r#""currentThreadRecallAvailable": true"#));
@@ -1801,5 +1811,6 @@ fn active_recall_planner_input_for_test() -> ActiveRecallPlannerInput {
         has_task_context: false,
         episodic_capabilities: MemoryEpisodicRecallCapabilities::default(),
         thread_episodic: MemoryActiveRecallThreadEpisodicSummary::default(),
+        recent_thread_context: MemoryActiveRecallRecentThreadContext::default(),
     }
 }

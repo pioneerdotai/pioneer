@@ -70,7 +70,8 @@ pub fn render_turn_preflight_prompt(input: &TurnPreflightPromptInput) -> String 
             "- Prefer read-only tools for lookup, recall, inspection, and classification turns.\n",
             "- Include mutation tools only when the current user request already asks to mutate that domain.\n",
             "- If the main model can request a domain later with `request_tools` and the need is not clear now, leave that tool out.\n",
-            "- For remembered personal, project, or prior conversation information, include available memory read tools.\n",
+            "- For durable remembered personal facts, durable project decisions, stable preferences, or exact memory records, include available memory read tools.\n",
+            "- Do not include durable memory read tools solely for current-thread continuation, recent transcript context, or episodic lookup; use `memory.activeRecall.episodic` when active recall planning is requested.\n",
             "- For explicit durable memory changes, include available memory mutation tools.\n",
             "- For creating, waiting on, updating, scheduling, or managing subtasks, include available task tools.\n",
             "- For creating or registering user-visible files, include available artifact tools.\n",
@@ -205,9 +206,8 @@ mod tests {
         assert!(prompt.contains("never domains"));
         assert!(prompt.contains("Do not include `tools.coreTools`"));
         assert!(prompt.contains("Use [] when no hidden candidate tool is clearly needed"));
-        assert!(
-            prompt.contains("For remembered personal, project, or prior conversation information")
-        );
+        assert!(prompt.contains("For durable remembered personal facts"));
+        assert!(prompt.contains("Do not include durable memory read tools solely for current-thread continuation"));
         assert!(prompt.contains("For creating or registering user-visible files"));
         assert!(prompt.contains("Valid output example"));
         assert!(prompt.contains(r#""visibleTools": []"#));

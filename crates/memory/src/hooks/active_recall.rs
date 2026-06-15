@@ -1580,6 +1580,14 @@ pub(super) struct ActiveRecallPlannerInput {
     pub(super) has_task_context: bool,
     pub(super) episodic_capabilities: MemoryEpisodicRecallCapabilities,
     pub(super) thread_episodic: MemoryActiveRecallThreadEpisodicSummary,
+    pub(super) recent_thread_context: MemoryActiveRecallRecentThreadContext,
+}
+
+impl ActiveRecallPlannerInput {
+    fn has_recent_thread_episodic_context(&self) -> bool {
+        self.thread_episodic.current_thread_recall_available
+            && !self.recent_thread_context.messages.is_empty()
+    }
 }
 
 pub(super) fn active_recall_planner_input(
@@ -1590,6 +1598,7 @@ pub(super) fn active_recall_planner_input(
     deterministic: &DeterministicRecallContextSummary,
     episodic_capabilities: MemoryEpisodicRecallCapabilities,
     thread_episodic: MemoryActiveRecallThreadEpisodicSummary,
+    recent_thread_context: MemoryActiveRecallRecentThreadContext,
 ) -> ActiveRecallPlannerInput {
     let input_text_char_count = input.input_text.chars().count();
     let deterministic_memory_ids = deterministic.memory_ids.iter().cloned().collect::<Vec<_>>();
@@ -1628,7 +1637,26 @@ pub(super) fn active_recall_planner_input(
             .is_some_and(|task_id| !task_id.trim().is_empty()),
         episodic_capabilities,
         thread_episodic,
+        recent_thread_context,
     }
+}
+
+fn current_thread_episodic_query(input: &ActiveRecallPlannerInput) -> Option<String> {
+    let mut parts = Vec::new();
+    for message in &input.recent_thread_context.messages {
+        let text = message.text_preview.trim();
+        if text.is_empty() {
+            continue;
+        }
+        parts.push(format!("{}: {text}", message.role.as_str()));
+    }
+
+    let current = input.input_text_preview.trim();
+    if !current.is_empty() {
+        parts.push(format!("current_user: {current}"));
+    }
+
+    bounded_nonempty_text(parts.join("\n").as_str(), 500)
 }
 
 pub fn active_recall_thread_episodic_summary(
@@ -1737,7 +1765,7 @@ pub(super) fn deterministic_active_recall_plan(
         MemoryActiveRecallMode::Hybrid => {}
     }
 
-    if input.deterministic_sufficient {
+    if input.deterministic_sufficient && !input.has_recent_thread_episodic_context() {
         return ActiveRecallPlan::skip(
             ActiveMemoryDecisionReasonCode::DeterministicSufficient,
             0.9,
@@ -1783,8 +1811,10 @@ pub(super) fn deterministic_active_recall_plan(
         }
         diagnostics.push("structured_task_context_available".to_owned());
     }
-    if input.thread_episodic.current_thread_recall_available && input.deterministic_recall_empty {
-        if let Some(query) = bounded_nonempty_text(input.input_text_preview.as_str(), 500) {
+    if input.thread_episodic.current_thread_recall_available
+        && (input.deterministic_recall_empty || input.has_recent_thread_episodic_context())
+    {
+        if let Some(query) = current_thread_episodic_query(input) {
             episodic_queries.push(EpisodicMemoryRecallQuery {
                 mode: ActiveRecallMode::CurrentThread,
                 query,

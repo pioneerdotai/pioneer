@@ -1837,6 +1837,8 @@ mod tests {
                         thread_episodic:
                             pioneer_memory::hooks::MemoryActiveRecallThreadEpisodicSummary::default(
                             ),
+                        recent_thread_context:
+                            pioneer_memory::hooks::MemoryActiveRecallRecentThreadContext::default(),
                         max_queries: 3,
                         top_k_per_query: 5,
                         max_prompt_chars: 1_500,

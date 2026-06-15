@@ -452,6 +452,11 @@ pub struct MemoryActiveRecallDecisionRequest {
     pub available_scoped_contexts: Vec<String>,
     pub episodic_capabilities: MemoryEpisodicRecallCapabilities,
     pub thread_episodic: MemoryActiveRecallThreadEpisodicSummary,
+    #[serde(
+        default,
+        skip_serializing_if = "MemoryActiveRecallRecentThreadContext::is_empty"
+    )]
+    pub recent_thread_context: MemoryActiveRecallRecentThreadContext,
     pub max_queries: usize,
     pub top_k_per_query: u32,
     pub max_prompt_chars: usize,
@@ -498,6 +503,7 @@ impl MemoryActiveRecallDecisionRequest {
             available_scoped_contexts: self.available_scoped_contexts.clone(),
             episodic_capabilities: self.episodic_capabilities.clone(),
             thread_episodic: self.thread_episodic.clone(),
+            recent_thread_context: self.recent_thread_context.clone(),
             budgets: MemoryActiveRecallPlannerBudgetInput {
                 max_queries: self.max_queries,
                 top_k_per_query: self.top_k_per_query,
@@ -508,6 +514,44 @@ impl MemoryActiveRecallDecisionRequest {
             fallback_policy: self.fallback_policy.as_str().to_owned(),
         };
         serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_owned())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryActiveRecallRecentMessageRole {
+    User,
+    Assistant,
+}
+
+impl MemoryActiveRecallRecentMessageRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MemoryActiveRecallRecentMessage {
+    pub role: MemoryActiveRecallRecentMessageRole,
+    pub text_preview: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MemoryActiveRecallRecentThreadContext {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<MemoryActiveRecallRecentMessage>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+impl MemoryActiveRecallRecentThreadContext {
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty() && !self.truncated
     }
 }
 
@@ -556,6 +600,7 @@ struct MemoryActiveRecallPlannerSanitizedInput {
     available_scoped_contexts: Vec<String>,
     episodic_capabilities: MemoryEpisodicRecallCapabilities,
     thread_episodic: MemoryActiveRecallThreadEpisodicSummary,
+    recent_thread_context: MemoryActiveRecallRecentThreadContext,
     budgets: MemoryActiveRecallPlannerBudgetInput,
     fallback_policy: String,
 }

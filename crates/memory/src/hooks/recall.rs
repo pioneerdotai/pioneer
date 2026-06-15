@@ -101,6 +101,7 @@ pub(super) fn resolve_active_memory_decision_without_preflight_plan(
         deterministic,
         episodic_capabilities,
         thread_episodic,
+        MemoryActiveRecallRecentThreadContext::default(),
     );
 
     if local.local_final {
@@ -128,6 +129,7 @@ pub(super) fn active_memory_decision_from_preflight_plan(
         deterministic,
         episodic_capabilities,
         thread_episodic,
+        MemoryActiveRecallRecentThreadContext::default(),
     );
     if matches!(
         local.local_plan.reason_code,
@@ -172,6 +174,7 @@ pub fn build_active_recall_local_preflight_plan(
         deterministic,
         episodic_capabilities,
         MemoryActiveRecallThreadEpisodicSummary::default(),
+        MemoryActiveRecallRecentThreadContext::default(),
         provider_available,
     )
 }
@@ -184,6 +187,7 @@ pub fn build_active_recall_local_preflight_plan_with_thread_summary(
     deterministic: &DeterministicRecallContextSummary,
     episodic_capabilities: MemoryEpisodicRecallCapabilities,
     thread_episodic: MemoryActiveRecallThreadEpisodicSummary,
+    recent_thread_context: MemoryActiveRecallRecentThreadContext,
     provider_available: bool,
 ) -> MemoryActiveRecallLocalPlan {
     let local = active_recall_local_planning_parts(
@@ -194,6 +198,7 @@ pub fn build_active_recall_local_preflight_plan_with_thread_summary(
         deterministic,
         episodic_capabilities,
         thread_episodic,
+        recent_thread_context,
     );
     let provider_planning_needed =
         !local.local_final && config.planner.enabled && provider_available;
@@ -270,6 +275,7 @@ fn active_recall_local_planning_parts(
     deterministic: &DeterministicRecallContextSummary,
     episodic_capabilities: MemoryEpisodicRecallCapabilities,
     thread_episodic: MemoryActiveRecallThreadEpisodicSummary,
+    recent_thread_context: MemoryActiveRecallRecentThreadContext,
 ) -> ActiveRecallLocalPlanningParts {
     let planner_input = active_recall_planner_input(
         context,
@@ -279,6 +285,7 @@ fn active_recall_local_planning_parts(
         deterministic,
         episodic_capabilities,
         thread_episodic,
+        recent_thread_context,
     );
     let local_plan = local_active_memory_decision(&planner_input, "");
     let local_final = active_recall_local_plan_is_final(&local_plan);
@@ -302,6 +309,7 @@ fn active_recall_local_planning_parts(
         available_scoped_contexts: active_recall_available_scoped_contexts(&planner_input),
         episodic_capabilities: planner_input.episodic_capabilities.clone(),
         thread_episodic: planner_input.thread_episodic.clone(),
+        recent_thread_context: planner_input.recent_thread_context.clone(),
         max_queries: config.max_queries,
         top_k_per_query: config.top_k_per_query,
         max_prompt_chars: config.max_prompt_chars,
@@ -430,6 +438,45 @@ mod active_recall_local_preflight_tests {
         }
     }
 
+    fn current_thread_capabilities() -> MemoryEpisodicRecallCapabilities {
+        MemoryEpisodicRecallCapabilities {
+            current_thread_search: true,
+            related_thread_search: false,
+            workspace_thread_search: false,
+            current_task_context: false,
+            completed_task_summary: false,
+        }
+    }
+
+    fn current_thread_summary() -> MemoryActiveRecallThreadEpisodicSummary {
+        MemoryActiveRecallThreadEpisodicSummary {
+            current_thread_id_present: true,
+            current_thread_recall_available: true,
+            related_thread_recall_available: false,
+            workspace_thread_recall_available: false,
+            prompt_context_source_count: 0,
+            prompt_context_chars: 0,
+            source_ids: Vec::new(),
+            diagnostics: vec!["current_thread_recall_available".to_owned()],
+        }
+    }
+
+    fn weather_followup_recent_context() -> MemoryActiveRecallRecentThreadContext {
+        MemoryActiveRecallRecentThreadContext {
+            messages: vec![
+                MemoryActiveRecallRecentMessage {
+                    role: MemoryActiveRecallRecentMessageRole::User,
+                    text_preview: "Какая сегодня погода в Москве?".to_owned(),
+                },
+                MemoryActiveRecallRecentMessage {
+                    role: MemoryActiveRecallRecentMessageRole::Assistant,
+                    text_preview: "В Москве сегодня прохладно.".to_owned(),
+                },
+            ],
+            truncated: false,
+        }
+    }
+
     #[test]
     fn active_recall_local_preflight_marks_policy_disabled_as_host_local_final() {
         let plan = build_active_recall_local_preflight_plan(
@@ -498,6 +545,43 @@ mod active_recall_local_preflight_tests {
             vec!["memory_1".to_owned()]
         );
         assert!(plan.decision_request.deterministic_sufficient);
+    }
+
+    #[test]
+    fn active_recall_local_preflight_allows_thread_episodic_when_deterministic_is_sufficient() {
+        let plan = build_active_recall_local_preflight_plan_with_thread_summary(
+            &test_context(None),
+            &TurnPrePromptContextHookInput::from_parts(
+                "а завтра какая?",
+                Some("thread-model"),
+                Some("thread-provider"),
+            ),
+            &MemoryTurnPolicy::normal_default_allow(),
+            &MemoryActiveRecallConfig::default(),
+            &sufficient_deterministic(),
+            current_thread_capabilities(),
+            current_thread_summary(),
+            weather_followup_recent_context(),
+            true,
+        );
+
+        assert!(plan.provider_planning_needed);
+        assert!(plan.decision_request.deterministic_sufficient);
+        assert_eq!(
+            plan.local_decision.effective_reason_code(),
+            ActiveMemoryDecisionReasonCode::MemoryLikely
+        );
+        assert_eq!(
+            plan.local_decision.episodic.queries[0].mode,
+            ActiveRecallMode::CurrentThread
+        );
+        let query = plan.local_decision.episodic.queries[0].query.as_str();
+        assert!(query.contains("Какая сегодня погода в Москве?"));
+        assert!(query.contains("а завтра какая?"));
+        assert_eq!(
+            plan.decision_request.recent_thread_context.messages.len(),
+            2
+        );
     }
 
     #[test]
