@@ -3223,7 +3223,7 @@ impl ThreadEpisodicIngestor for StoreThreadEpisodicIngestor {
                             status: ThreadEpisodicIndexJobStatus::Queued,
                             graph_enrichment_state:
                                 ThreadEpisodicGraphEnrichmentState::NotSupported,
-                            next_run_at: chrono::Utc::now().fixed_offset(),
+                            next_run_at: fixed_datetime_from_unix(now_unix),
                             last_error: None,
                         },
                         now_unix,
@@ -5079,6 +5079,71 @@ mod tests {
         assert_eq!(metrics.total_capacity_errors, 0);
         assert_eq!(metrics.max_attempt_count, 1);
         assert!(metrics.completed_latency_avg_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn store_ingestor_queues_job_due_at_whole_second() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let thread_id = "thread_ingestor_due_second";
+        let turn_id = "turn_ingestor_due_second";
+        let item = TurnItem::UserMessage {
+            id: "user_ingestor_due_second".to_owned(),
+            text: "this user message should be indexable immediately".to_owned(),
+            attachments: Vec::new(),
+        };
+        let ingestor = StoreThreadEpisodicIngestor::new(crud_store.clone());
+        ingestor
+            .ingest_committed_item(ThreadEpisodicCommittedItem {
+                workspace_id: workspace_id.clone(),
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                item_id: item.item_id().to_owned(),
+                item_type: item.item_type(),
+                source_actor_role: committed_item_source_actor_role(&item),
+                source_context: committed_item_source_context(&item),
+                item,
+            })
+            .await
+            .expect("ingestion should succeed");
+
+        let jobs = crud_store
+            .list_thread_episodic_index_jobs_for_thread(workspace_id.as_str(), thread_id, 10)
+            .await
+            .expect("jobs should be readable");
+        assert_eq!(jobs.len(), 1);
+        let job = &jobs[0];
+        let request = static_index_request(
+            "file:///tmp/thread-ingestor-due-second.mv2".to_owned(),
+            "capsule_due_second",
+            "mv2://pioneer/thread_episodic/test/capsules/capsule_due_second",
+            job.chunk_id.as_str(),
+        );
+        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(vec![Ok(
+            ThreadEpisodicMemvidIndexOutput {
+                frame_id: 7,
+                frame_uri: request.frame_uri.clone(),
+                stats: ThreadEpisodicMemvidStats::default(),
+            },
+        )]));
+        let provider = Arc::new(StaticThreadEpisodicIndexPayloadProvider {
+            request,
+            segment_index: 1,
+        });
+        let executor = ThreadEpisodicIndexExecutor::new(crud_store.clone(), backend, provider);
+
+        let summary = executor
+            .run_once(job.next_run_at.timestamp())
+            .await
+            .expect("executor should claim whole-second due job");
+
+        assert_eq!(summary.claimed, 1);
+        assert_eq!(summary.completed, 1);
+        let stored_job = crud_store
+            .find_thread_episodic_index_job(job.id.as_str())
+            .await
+            .expect("job read")
+            .expect("job exists");
+        assert_eq!(stored_job.status, ThreadEpisodicIndexJobStatus::Completed);
     }
 
     #[tokio::test]

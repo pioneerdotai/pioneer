@@ -9558,6 +9558,125 @@ async fn direct_durable_item_completed_persists_before_committed_notification() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_message_lifecycle_ingests_thread_episodic_source_after_commit() {
+    let session_manager = Arc::new(SessionManager::new());
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let agent_manager = Arc::new(AgentManager::new(test_provider(), test_tool_loop_config()));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = MessageProcessor::with_agent_manager(
+        thread_manager.clone(),
+        agent_manager,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+    );
+    let ingestor = Arc::new(RecordingThreadEpisodicIngestor::default());
+    processor
+        .set_thread_episodic_ingestor_for_test(ingestor.clone())
+        .await;
+
+    let thread_id = "thr_user_message_episodic_ingest";
+    let turn_id = "turn_user_message_episodic_ingest";
+    let thread = Thread {
+        workspace_id: workspace_id.clone(),
+        id: thread_id.to_owned(),
+        name: None,
+        preview: String::new(),
+        mode: ThreadMode::Agent,
+        model: "o4-mini".to_owned(),
+        model_provider: "openai".to_owned(),
+        created_at: 1,
+        updated_at: 1,
+        status: ThreadStatus::Active,
+        origin_kind: ThreadOriginKind::User,
+        sidebar_visibility: ThreadSidebarVisibility::Visible,
+        agent_nickname: None,
+        agent_role: None,
+        turns: Vec::new(),
+    };
+    crud_store
+        .materialize_turn_start(
+            &thread,
+            SandboxMode::FullAccess,
+            &Turn {
+                id: turn_id.to_owned(),
+                status: TurnStatus::InProgress,
+                turn_kind: Default::default(),
+                origin: Default::default(),
+                error: None,
+                prompt_manifest: None,
+            },
+            &[],
+        )
+        .await
+        .expect("turn start should persist");
+
+    processor
+        .emit_user_message_item_lifecycle(
+            workspace_id.as_str(),
+            thread_id,
+            turn_id,
+            &[UserInput::Text {
+                text: "какая сегодня погода в Москве?".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            &[],
+        )
+        .await;
+
+    let item_events = crud_store
+        .get_turn_item_events(thread_id, turn_id)
+        .await
+        .expect("turn item events should be readable")
+        .expect("turn item events should exist");
+    assert!(
+        item_events.events.iter().any(|event| matches!(
+            &event.payload,
+            TurnItemEventPayload::ItemCompleted {
+                item: TurnItem::UserMessage { text, .. },
+                ..
+            } if text == "какая сегодня погода в Москве?"
+        )),
+        "user message must be committed before thread episodic ingestion is observed"
+    );
+
+    let calls = ingestor.calls.lock().await;
+    assert_eq!(calls.len(), 1);
+    let call = &calls[0];
+    assert_eq!(call.workspace_id, workspace_id);
+    assert_eq!(call.thread_id, thread_id);
+    assert_eq!(call.turn_id, turn_id);
+    assert_eq!(call.item_type, TurnItemType::UserMessage);
+    assert_eq!(
+        call.source_actor_role,
+        Some(pioneer_protocol::ThreadEpisodicSourceActorRole::User)
+    );
+    assert_eq!(
+        call.source_context,
+        pioneer_protocol::ThreadEpisodicSourceContext::UserVisibleThreadItem
+    );
+}
+
+#[test]
+fn thread_episodic_index_wakeup_skips_current_user_message() {
+    assert!(
+        !super::agent_runtime::thread_episodic_index_wakeup_after_commit(&TurnItem::UserMessage {
+            id: "user_item".to_owned(),
+            text: "current turn text is already in prompt".to_owned(),
+            attachments: Vec::new(),
+        })
+    );
+    assert!(
+        super::agent_runtime::thread_episodic_index_wakeup_after_commit(&TurnItem::AgentMessage {
+            id: "assistant_item".to_owned(),
+            text: "assistant result can safely wake indexing".to_owned(),
+            markdown: None,
+            markdown_version: None,
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_durable_item_completed_ingestion_failure_does_not_block_commit() {
     let session_manager = Arc::new(SessionManager::new());
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));

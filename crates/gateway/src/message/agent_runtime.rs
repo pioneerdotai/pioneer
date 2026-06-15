@@ -52,6 +52,10 @@ fn tool_display_text(display: &pioneer_protocol::ToolDisplayPayload) -> Option<S
     }
 }
 
+pub(super) fn thread_episodic_index_wakeup_after_commit(item: &pioneer_protocol::TurnItem) -> bool {
+    !matches!(item, pioneer_protocol::TurnItem::UserMessage { .. })
+}
+
 fn now_db_timestamp() -> sea_orm::entity::prelude::DateTimeWithTimeZone {
     chrono::Utc::now().fixed_offset()
 }
@@ -813,7 +817,9 @@ impl MessageProcessor {
         let thread_id = durable_event_thread_id(&event).map(str::to_owned);
         let committed = message_future(self.persist_durable_agent_event(event.clone())).await;
         if committed {
-            self.ingest_committed_thread_item(&event).await;
+            if let AgentDurableEvent::ItemCompleted { notification } = &event {
+                self.ingest_committed_thread_item(notification).await;
+            }
             if let Some(thread_id) = thread_id {
                 self.agent_manager
                     .publish_committed(thread_id.as_str(), event)
@@ -822,10 +828,10 @@ impl MessageProcessor {
         }
     }
 
-    async fn ingest_committed_thread_item(&self, event: &AgentDurableEvent) {
-        let AgentDurableEvent::ItemCompleted { notification } = event else {
-            return;
-        };
+    async fn ingest_committed_thread_item(
+        &self,
+        notification: &pioneer_protocol::ItemCompletedNotification,
+    ) {
         let Some(input) = crate::thread_episodic::committed_item_ingestion_input(notification)
         else {
             debug!(
@@ -838,11 +844,14 @@ impl MessageProcessor {
             return;
         };
 
+        let wake_indexer = thread_episodic_index_wakeup_after_commit(&notification.item);
         let ingestor = self.thread_episodic_ingestor.read().await.clone();
         match ingestor.ingest_committed_item(input).await {
             Ok(crate::thread_episodic::ThreadEpisodicIngestionOutcome::Accepted) => {
                 debug!("thread episodic ingestion accepted committed item");
-                self.spawn_thread_episodic_index_run();
+                if wake_indexer {
+                    self.spawn_thread_episodic_index_run();
+                }
             }
             Ok(crate::thread_episodic::ThreadEpisodicIngestionOutcome::Skipped { reason }) => {
                 debug!(
@@ -4436,6 +4445,7 @@ impl MessageProcessor {
             return;
         }
 
+        self.ingest_committed_thread_item(&completed).await;
         self.send_notification_to_thread_subscribers(thread_id, events::ITEM_COMPLETED, &completed)
             .await;
     }
