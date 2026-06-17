@@ -5,6 +5,7 @@ members = [
   "crates/artifacts",
   "crates/client",
   "crates/client-ffi",
+  "crates/cli-agent-runtime",
   "crates/promt",
   "crates/config",
   "crates/keystore",
@@ -37,6 +38,7 @@ pioneer-agent = { path = "crates/agent" }
 pioneer-artifacts = { path = "crates/artifacts" }
 pioneer-client = { path = "crates/client" }
 pioneer-client-ffi = { path = "crates/client-ffi" }
+pioneer-cli-agent-runtime = { path = "crates/cli-agent-runtime" }
 pioneer-keystore = { path = "crates/keystore" }
 pioneer-gateway = { path = "crates/gateway" }
 pioneer-hooks = { path = "crates/hooks" }

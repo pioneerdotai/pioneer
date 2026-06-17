@@ -7180,6 +7180,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pioneer-cli-agent-runtime"
+version = "0.13.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "process-wrap",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml 1.1.2+spec-1.1.0",
+]
+
+[[package]]
 name = "pioneer-client"
 version = "0.13.0"
 dependencies = [
@@ -7304,6 +7317,7 @@ dependencies = [
  "markdown",
  "pioneer-agent",
  "pioneer-artifacts",
+ "pioneer-cli-agent-runtime",
  "pioneer-config",
  "pioneer-crud",
  "pioneer-entity",
