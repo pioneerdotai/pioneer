@@ -7,6 +7,7 @@ pub mod agent_memory_quality_decision;
 pub mod agent_memory_quarantine;
 pub mod agent_memory_repair_job;
 pub mod artifact;
+pub mod cli_runtime_binding;
 pub mod hook_run;
 pub mod mcp_audit_event;
 pub mod mcp_server_catalog_snapshot;

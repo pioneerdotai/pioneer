@@ -1135,6 +1135,7 @@ pub fn prompt_manifest_profile_to_db(profile: PromptManifestProfile) -> &'static
         PromptManifestProfile::AssistantFull => "assistant_full",
         PromptManifestProfile::AssistantMinimal => "assistant_minimal",
         PromptManifestProfile::AssistantNone => "assistant_none",
+        PromptManifestProfile::CliRuntimeCodex => "cli_runtime_codex",
     }
 }
 

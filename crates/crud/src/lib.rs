@@ -200,6 +200,14 @@ pub use crate::repositories::artifact::{
     ConversationTurnArtifactRefs, IngestArtifactMetadataRecord, IngestedArtifactRecord,
     NewArtifactBlobRecord, UpsertArtifactExternalRefRequest,
 };
+pub use crate::repositories::cli_runtime_binding::{
+    CliRuntimeNativeEventListFilter, CliRuntimeNativeEventRecord,
+    CliRuntimePendingRequestListFilter, CliRuntimePendingRequestRecord,
+    CliRuntimePendingRequestStatus, CliRuntimeThreadBindingRecord, CliRuntimeTurnBindingListFilter,
+    CliRuntimeTurnBindingRecord, NewCliRuntimeNativeEvent, NewCliRuntimePendingRequest,
+    NewCliRuntimeThreadBinding, NewCliRuntimeTurnBinding, ResolveCliRuntimePendingRequest,
+    deserialize_cli_runtime_json, serialize_cli_runtime_json,
+};
 pub use crate::repositories::thread_agents_doc::{
     ResolvedThreadAgentsDocRecord, ThreadAgentsDocError, ThreadAgentsDocRecord,
     ThreadAgentsDocRevisionRecord, ThreadAgentsDocSaveReason, ThreadAgentsDocScope,
@@ -208,15 +216,16 @@ pub use crate::repositories::thread_agents_doc::{
 use crate::repositories::{
     agent_memory, agent_memory_candidate, agent_memory_capsule, agent_memory_event,
     agent_memory_policy_decision, agent_memory_quality_decision, agent_memory_quarantine,
-    agent_memory_repair_job, artifact as artifact_repository, hook_run, mcp_audit_event,
-    mcp_server_catalog_snapshot, mcp_server_installation, policy, recovery_job, skill_audit_event,
-    skill_dependency_snapshot, skill_installation, skill_upload_session, skill_workspace_policy,
-    task as task_repository, task_agent_spec, task_delivery, task_dependency, task_event,
-    task_result_candidate, task_result_review_event, task_run, task_run_execution,
-    task_run_thread_binding, task_run_turn, task_trigger, task_write_lock, thread,
-    thread_agents_doc, thread_episodic as thread_episodic_repository, thread_lineage, thread_tree,
-    turn, turn_event, turn_event_projection_state, turn_execution_window, turn_item_attempt,
-    turn_llm_context, turn_mcp_binding, turn_runtime_snapshot, turn_skill_binding,
+    agent_memory_repair_job, artifact as artifact_repository, cli_runtime_binding, hook_run,
+    mcp_audit_event, mcp_server_catalog_snapshot, mcp_server_installation, policy, recovery_job,
+    skill_audit_event, skill_dependency_snapshot, skill_installation, skill_upload_session,
+    skill_workspace_policy, task as task_repository, task_agent_spec, task_delivery,
+    task_dependency, task_event, task_result_candidate, task_result_review_event, task_run,
+    task_run_execution, task_run_thread_binding, task_run_turn, task_trigger, task_write_lock,
+    thread, thread_agents_doc, thread_episodic as thread_episodic_repository, thread_lineage,
+    thread_tree, turn, turn_event, turn_event_projection_state, turn_execution_window,
+    turn_item_attempt, turn_llm_context, turn_mcp_binding, turn_runtime_snapshot,
+    turn_skill_binding,
 };
 pub use crate::task_events::{AppendedTaskEvent, TaskEventAppendStatus, TaskEventPayload};
 use crate::task_projector::TaskProjector;
@@ -718,6 +727,212 @@ impl CrudStore {
                 .await
         })
         .await
+    }
+
+    pub async fn upsert_cli_runtime_thread_binding(
+        &self,
+        binding: NewCliRuntimeThreadBinding,
+    ) -> Result<CliRuntimeThreadBindingRecord> {
+        self.run_serialized_write(|| async {
+            cli_runtime_binding::upsert_thread_binding(&self.connection, binding.clone()).await
+        })
+        .await
+    }
+
+    pub async fn get_cli_runtime_thread_binding(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<CliRuntimeThreadBindingRecord>> {
+        let thread_id = thread_id.to_owned();
+        cli_runtime_binding::find_thread_binding(&self.connection, thread_id.as_str()).await
+    }
+
+    pub async fn get_cli_runtime_thread_binding_by_native_thread(
+        &self,
+        runtime_id: &str,
+        native_thread_id: &str,
+    ) -> Result<Option<CliRuntimeThreadBindingRecord>> {
+        let runtime_id = runtime_id.to_owned();
+        let native_thread_id = native_thread_id.to_owned();
+        cli_runtime_binding::find_thread_binding_by_native_thread(
+            &self.connection,
+            runtime_id.as_str(),
+            native_thread_id.as_str(),
+        )
+        .await
+    }
+
+    pub async fn list_cli_runtime_thread_bindings_for_runtime(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+    ) -> Result<Vec<CliRuntimeThreadBindingRecord>> {
+        let workspace_id = workspace_id.to_owned();
+        let runtime_id = runtime_id.to_owned();
+        cli_runtime_binding::list_thread_bindings_for_runtime(
+            &self.connection,
+            workspace_id.as_str(),
+            runtime_id.as_str(),
+        )
+        .await
+    }
+
+    pub async fn upsert_cli_runtime_turn_binding(
+        &self,
+        binding: NewCliRuntimeTurnBinding,
+    ) -> Result<CliRuntimeTurnBindingRecord> {
+        self.run_serialized_write(|| async {
+            cli_runtime_binding::upsert_turn_binding(&self.connection, binding.clone()).await
+        })
+        .await
+    }
+
+    pub async fn get_cli_runtime_turn_binding(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<CliRuntimeTurnBindingRecord>> {
+        let turn_id = turn_id.to_owned();
+        cli_runtime_binding::find_turn_binding(&self.connection, turn_id.as_str()).await
+    }
+
+    pub async fn get_cli_runtime_turn_binding_by_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<CliRuntimeTurnBindingRecord>> {
+        let request_id = request_id.to_owned();
+        cli_runtime_binding::find_turn_binding_by_request(&self.connection, request_id.as_str())
+            .await
+    }
+
+    pub async fn get_cli_runtime_turn_binding_by_native_turn(
+        &self,
+        runtime_id: &str,
+        native_turn_id: &str,
+    ) -> Result<Option<CliRuntimeTurnBindingRecord>> {
+        let runtime_id = runtime_id.to_owned();
+        let native_turn_id = native_turn_id.to_owned();
+        cli_runtime_binding::find_turn_binding_by_native_turn(
+            &self.connection,
+            runtime_id.as_str(),
+            native_turn_id.as_str(),
+        )
+        .await
+    }
+
+    pub async fn list_cli_runtime_turn_bindings_for_thread(
+        &self,
+        thread_id: &str,
+    ) -> Result<Vec<CliRuntimeTurnBindingRecord>> {
+        let thread_id = thread_id.to_owned();
+        cli_runtime_binding::list_turn_bindings_for_thread(&self.connection, thread_id.as_str())
+            .await
+    }
+
+    pub async fn list_cli_runtime_turn_bindings(
+        &self,
+        filter: CliRuntimeTurnBindingListFilter,
+    ) -> Result<Vec<CliRuntimeTurnBindingRecord>> {
+        cli_runtime_binding::list_turn_bindings(&self.connection, filter).await
+    }
+
+    pub async fn create_cli_runtime_pending_request(
+        &self,
+        request: NewCliRuntimePendingRequest,
+    ) -> Result<CliRuntimePendingRequestRecord> {
+        self.run_serialized_write(|| async {
+            cli_runtime_binding::create_pending_request(&self.connection, request.clone()).await
+        })
+        .await
+    }
+
+    pub async fn open_cli_runtime_pending_request(
+        &self,
+        request: NewCliRuntimePendingRequest,
+    ) -> Result<CliRuntimePendingRequestRecord> {
+        self.run_serialized_write(|| async {
+            cli_runtime_binding::open_pending_request(&self.connection, request.clone()).await
+        })
+        .await
+    }
+
+    pub async fn get_cli_runtime_pending_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<CliRuntimePendingRequestRecord>> {
+        let request_id = request_id.to_owned();
+        cli_runtime_binding::find_pending_request(&self.connection, request_id.as_str()).await
+    }
+
+    pub async fn list_cli_runtime_pending_requests(
+        &self,
+        filter: CliRuntimePendingRequestListFilter,
+    ) -> Result<Vec<CliRuntimePendingRequestRecord>> {
+        cli_runtime_binding::list_pending_requests(&self.connection, filter).await
+    }
+
+    pub async fn resolve_cli_runtime_pending_request(
+        &self,
+        resolution: ResolveCliRuntimePendingRequest,
+    ) -> Result<Option<CliRuntimePendingRequestRecord>> {
+        self.run_serialized_write(|| async {
+            cli_runtime_binding::resolve_pending_request(&self.connection, resolution.clone()).await
+        })
+        .await
+    }
+
+    pub async fn cancel_cli_runtime_pending_request(
+        &self,
+        request_id: &str,
+        response_json: Option<String>,
+        updated_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+    ) -> Result<Option<CliRuntimePendingRequestRecord>> {
+        let request_id = request_id.to_owned();
+        self.run_serialized_write(|| async {
+            cli_runtime_binding::cancel_pending_request(
+                &self.connection,
+                request_id.clone(),
+                response_json.clone(),
+                updated_at,
+            )
+            .await
+        })
+        .await
+    }
+
+    pub async fn expire_cli_runtime_pending_request(
+        &self,
+        request_id: &str,
+        response_json: Option<String>,
+        updated_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+    ) -> Result<Option<CliRuntimePendingRequestRecord>> {
+        let request_id = request_id.to_owned();
+        self.run_serialized_write(|| async {
+            cli_runtime_binding::expire_pending_request(
+                &self.connection,
+                request_id.clone(),
+                response_json.clone(),
+                updated_at,
+            )
+            .await
+        })
+        .await
+    }
+
+    pub async fn append_cli_runtime_native_event(
+        &self,
+        event: NewCliRuntimeNativeEvent,
+    ) -> Result<CliRuntimeNativeEventRecord> {
+        self.run_serialized_write(|| async {
+            cli_runtime_binding::append_native_event(&self.connection, event.clone()).await
+        })
+        .await
+    }
+
+    pub async fn list_cli_runtime_native_events(
+        &self,
+        filter: CliRuntimeNativeEventListFilter,
+    ) -> Result<Vec<CliRuntimeNativeEventRecord>> {
+        cli_runtime_binding::list_native_events(&self.connection, filter).await
     }
 
     pub async fn create_turn_execution_window(
@@ -6912,6 +7127,19 @@ impl CrudStore {
         Ok(thread_from_db_model(model))
     }
 
+    pub async fn upsert_thread_model(&self, thread_model: &Thread) -> Result<()> {
+        let thread_model = thread_model.clone();
+        let created_at = unix_to_datetime(thread_model.created_at);
+        let updated_at = unix_to_datetime(thread_model.updated_at);
+        self.run_serialized_write(|| {
+            let thread_model = thread_model.clone();
+            async move {
+                thread::upsert_thread(&self.connection, &thread_model, created_at, updated_at).await
+            }
+        })
+        .await
+    }
+
     pub async fn list_threads_for_workspace(
         &self,
         workspace_id: &str,
@@ -10241,18 +10469,22 @@ fn recovery_job_record_from_model(model: pioneer_entity::recovery_job::Model) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockedTurnRecoveryResumeOutcome, ClaimedRecoveryActivation, CrudStore,
+        BlockedTurnRecoveryResumeOutcome, ClaimedRecoveryActivation,
+        CliRuntimeNativeEventListFilter, CliRuntimePendingRequestListFilter,
+        CliRuntimePendingRequestStatus, CliRuntimeTurnBindingListFilter, CrudStore,
         McpAuditEventRecord, McpServerCatalogSnapshotRecord, McpServerInstallationRecord,
-        NewThreadEpisodicChunkRecord, NewTurnExecutionCheckpointRecord,
+        NewCliRuntimeNativeEvent, NewCliRuntimePendingRequest, NewCliRuntimeThreadBinding,
+        NewCliRuntimeTurnBinding, NewThreadEpisodicChunkRecord, NewTurnExecutionCheckpointRecord,
         NewTurnExecutionWindowRecord, NewTurnLlmContextEntry, NewTurnRuntimeSnapshot,
-        SkillAuditEventRecord, SkillInstallationRecord, TaskEventPayload, TaskRunChildAnchor,
-        ThreadAgentsDocError, ThreadAgentsDocSaveReason, ThreadAgentsDocStatus,
-        ThreadEpisodicActiveWriteSegmentRequest, ThreadEpisodicCapsuleCapacityUpdate,
-        ThreadEpisodicCapsuleWriteState, ThreadEpisodicChunkStatus, ThreadEpisodicChunkVisibility,
-        ThreadEpisodicSourceActorRole, ThreadEpisodicSourceRuntimeKind,
-        TurnExecutionCheckpointKind, TurnExecutionWindowStatsRecord,
-        TurnExecutionWindowUsageAggregateRecord, TurnItemAttemptDeadlines, TurnMcpBindingRecord,
-        TurnSkillBindingRecord, WorkspaceSkillPolicyRecord,
+        ResolveCliRuntimePendingRequest, SkillAuditEventRecord, SkillInstallationRecord,
+        TaskEventPayload, TaskRunChildAnchor, ThreadAgentsDocError, ThreadAgentsDocSaveReason,
+        ThreadAgentsDocStatus, ThreadEpisodicActiveWriteSegmentRequest,
+        ThreadEpisodicCapsuleCapacityUpdate, ThreadEpisodicCapsuleWriteState,
+        ThreadEpisodicChunkStatus, ThreadEpisodicChunkVisibility, ThreadEpisodicSourceActorRole,
+        ThreadEpisodicSourceRuntimeKind, TurnExecutionCheckpointKind,
+        TurnExecutionWindowStatsRecord, TurnExecutionWindowUsageAggregateRecord,
+        TurnItemAttemptDeadlines, TurnMcpBindingRecord, TurnSkillBindingRecord,
+        WorkspaceSkillPolicyRecord,
     };
     use crate::util::unix_to_datetime;
     use migration::{Migrator, MigratorTrait};
@@ -10730,6 +10962,387 @@ mod tests {
                 "{turn_id} snapshot should be retained"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn cli_runtime_thread_and_turn_bindings_upsert_idempotently() {
+        let store = test_store_with_workspace("ws_cli_bind").await;
+        let created_at = unix_to_datetime(1_700_010_000);
+        let updated_at = unix_to_datetime(1_700_010_030);
+
+        let thread_binding = NewCliRuntimeThreadBinding {
+            thread_id: "thread_cli_bind".to_owned(),
+            workspace_id: "ws_cli_bind".to_owned(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            native_thread_id: "codex-thread-a".to_owned(),
+            native_session_id: Some("session-a".to_owned()),
+            native_root_thread_id: None,
+            native_cwd: Some("/tmp/project-a".to_owned()),
+            native_model: Some("gpt-5".to_owned()),
+            resume_cursor_json: "{}".to_owned(),
+            status: "active".to_owned(),
+            created_at,
+            updated_at: created_at,
+        };
+        let inserted_thread = store
+            .upsert_cli_runtime_thread_binding(thread_binding.clone())
+            .await
+            .expect("thread binding insert should succeed");
+        assert_eq!(
+            inserted_thread.native_session_id.as_deref(),
+            Some("session-a")
+        );
+
+        let mut replacement_thread = thread_binding;
+        replacement_thread.native_session_id = Some("session-b".to_owned());
+        replacement_thread.native_model = Some("gpt-5.1".to_owned());
+        replacement_thread.resume_cursor_json = r#"{"cursor":"after-turn-1"}"#.to_owned();
+        replacement_thread.created_at = updated_at;
+        replacement_thread.updated_at = updated_at;
+        let updated_thread = store
+            .upsert_cli_runtime_thread_binding(replacement_thread)
+            .await
+            .expect("thread binding update should succeed");
+        assert_eq!(updated_thread.created_at, created_at);
+        assert_eq!(updated_thread.updated_at, updated_at);
+        assert_eq!(
+            updated_thread.native_session_id.as_deref(),
+            Some("session-b")
+        );
+
+        let by_native = store
+            .get_cli_runtime_thread_binding_by_native_thread("codex", "codex-thread-a")
+            .await
+            .expect("native thread lookup should succeed")
+            .expect("native thread binding should exist");
+        assert_eq!(by_native.thread_id, "thread_cli_bind");
+        assert_eq!(
+            store
+                .list_cli_runtime_thread_bindings_for_runtime("ws_cli_bind", "codex")
+                .await
+                .expect("runtime thread list should succeed")
+                .len(),
+            1
+        );
+
+        let turn_binding = NewCliRuntimeTurnBinding {
+            turn_id: "turn_cli_bind".to_owned(),
+            thread_id: "thread_cli_bind".to_owned(),
+            workspace_id: "ws_cli_bind".to_owned(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            native_thread_id: "codex-thread-a".to_owned(),
+            native_turn_id: Some("codex-turn-a".to_owned()),
+            request_id: Some("rpc-request-a".to_owned()),
+            status: "running".to_owned(),
+            model: Some("gpt-5".to_owned()),
+            cwd: Some("/tmp/project-a".to_owned()),
+            sandbox_json: Some(r#"{"mode":"workspace-write"}"#.to_owned()),
+            approval_policy: Some("on-request".to_owned()),
+            input_mapping_json: r#"{"items":1}"#.to_owned(),
+            created_at,
+            updated_at: created_at,
+        };
+        store
+            .upsert_cli_runtime_turn_binding(turn_binding.clone())
+            .await
+            .expect("turn binding insert should succeed");
+
+        let mut replacement_turn = turn_binding;
+        replacement_turn.status = "completed".to_owned();
+        replacement_turn.model = Some("gpt-5.1".to_owned());
+        replacement_turn.created_at = updated_at;
+        replacement_turn.updated_at = updated_at;
+        let updated_turn = store
+            .upsert_cli_runtime_turn_binding(replacement_turn)
+            .await
+            .expect("turn binding update should succeed");
+        assert_eq!(updated_turn.created_at, created_at);
+        assert_eq!(updated_turn.status, "completed");
+
+        let by_request = store
+            .get_cli_runtime_turn_binding_by_request("rpc-request-a")
+            .await
+            .expect("request lookup should succeed")
+            .expect("request turn binding should exist");
+        assert_eq!(by_request.turn_id, "turn_cli_bind");
+        let by_native_turn = store
+            .get_cli_runtime_turn_binding_by_native_turn("codex", "codex-turn-a")
+            .await
+            .expect("native turn lookup should succeed")
+            .expect("native turn binding should exist");
+        assert_eq!(by_native_turn.thread_id, "thread_cli_bind");
+        assert_eq!(
+            store
+                .list_cli_runtime_turn_bindings_for_thread("thread_cli_bind")
+                .await
+                .expect("thread turn list should succeed")
+                .len(),
+            1
+        );
+
+        store
+            .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+                turn_id: "turn_cli_running".to_owned(),
+                thread_id: "thread_cli_bind".to_owned(),
+                workspace_id: "ws_cli_bind".to_owned(),
+                runtime_id: "codex".to_owned(),
+                runtime_kind: "codex".to_owned(),
+                native_thread_id: "codex-thread-a".to_owned(),
+                native_turn_id: None,
+                request_id: Some("rpc-request-running".to_owned()),
+                status: "running".to_owned(),
+                model: Some("gpt-5".to_owned()),
+                cwd: Some("/tmp/project-a".to_owned()),
+                sandbox_json: None,
+                approval_policy: Some("on-request".to_owned()),
+                input_mapping_json: r#"{"items":2}"#.to_owned(),
+                created_at: updated_at,
+                updated_at,
+            })
+            .await
+            .expect("running turn binding insert should succeed");
+        let active_turn_bindings = store
+            .list_cli_runtime_turn_bindings(CliRuntimeTurnBindingListFilter {
+                workspace_id: Some("ws_cli_bind".to_owned()),
+                runtime_id: Some("codex".to_owned()),
+                statuses: vec!["starting".to_owned(), "running".to_owned()],
+                ..Default::default()
+            })
+            .await
+            .expect("active CLI runtime turn bindings should list");
+        assert_eq!(active_turn_bindings.len(), 1);
+        assert_eq!(active_turn_bindings[0].turn_id, "turn_cli_running");
+    }
+
+    #[tokio::test]
+    async fn cli_runtime_pending_request_resolution_rejects_second_answer() {
+        let store = test_store_with_workspace("ws_cli_pending").await;
+        let created_at = unix_to_datetime(1_700_020_000);
+        let updated_at = unix_to_datetime(1_700_020_010);
+        let payload_json = super::serialize_cli_runtime_json(&serde_json::json!({
+            "command": "cargo test",
+            "cwd": "/tmp/project"
+        }))
+        .expect("payload json should serialize");
+
+        let pending = store
+            .create_cli_runtime_pending_request(NewCliRuntimePendingRequest {
+                request_id: "approval-request-a".to_owned(),
+                runtime_id: "codex".to_owned(),
+                runtime_kind: "codex".to_owned(),
+                workspace_id: "ws_cli_pending".to_owned(),
+                thread_id: "thread_cli_pending".to_owned(),
+                turn_id: Some("turn_cli_pending".to_owned()),
+                native_thread_id: Some("codex-thread-pending".to_owned()),
+                native_turn_id: Some("codex-turn-pending".to_owned()),
+                native_item_id: Some("item-1".to_owned()),
+                request_kind: "command_approval".to_owned(),
+                payload_json: payload_json.clone(),
+                created_at,
+                updated_at: created_at,
+            })
+            .await
+            .expect("pending request create should succeed");
+        assert_eq!(pending.status, CliRuntimePendingRequestStatus::Pending);
+
+        let duplicate_pending = store
+            .create_cli_runtime_pending_request(NewCliRuntimePendingRequest {
+                request_id: "approval-request-a".to_owned(),
+                runtime_id: "codex".to_owned(),
+                runtime_kind: "codex".to_owned(),
+                workspace_id: "ws_cli_pending".to_owned(),
+                thread_id: "thread_cli_pending".to_owned(),
+                turn_id: Some("turn_cli_pending".to_owned()),
+                native_thread_id: Some("codex-thread-pending".to_owned()),
+                native_turn_id: Some("codex-turn-pending".to_owned()),
+                native_item_id: Some("item-1".to_owned()),
+                request_kind: "command_approval".to_owned(),
+                payload_json: super::serialize_cli_runtime_json(&serde_json::json!({
+                    "command": "cargo check",
+                    "cwd": "/tmp/project"
+                }))
+                .expect("duplicate payload should serialize"),
+                created_at,
+                updated_at,
+            })
+            .await
+            .expect("duplicate pending request should update metadata");
+        assert_eq!(duplicate_pending.created_at, created_at);
+        assert_eq!(duplicate_pending.updated_at, updated_at);
+        assert!(duplicate_pending.payload_json.contains("cargo check"));
+
+        let response_json = super::serialize_cli_runtime_json(&serde_json::json!({
+            "approved": true,
+            "scope": "once"
+        }))
+        .expect("response json should serialize");
+        let answered = store
+            .resolve_cli_runtime_pending_request(ResolveCliRuntimePendingRequest {
+                request_id: "approval-request-a".to_owned(),
+                status: CliRuntimePendingRequestStatus::Answered,
+                response_json: Some(response_json.clone()),
+                updated_at,
+                resolved_at: updated_at,
+            })
+            .await
+            .expect("pending request answer should succeed")
+            .expect("pending request should exist");
+        assert_eq!(answered.status, CliRuntimePendingRequestStatus::Answered);
+        assert_eq!(
+            answered.response_json.as_deref(),
+            Some(response_json.as_str())
+        );
+
+        let second_answer = store
+            .resolve_cli_runtime_pending_request(ResolveCliRuntimePendingRequest {
+                request_id: "approval-request-a".to_owned(),
+                status: CliRuntimePendingRequestStatus::Answered,
+                response_json: Some(response_json),
+                updated_at,
+                resolved_at: updated_at,
+            })
+            .await;
+        assert!(
+            second_answer.is_err(),
+            "answered pending request must reject a second answer"
+        );
+
+        let answered_rows = store
+            .list_cli_runtime_pending_requests(CliRuntimePendingRequestListFilter {
+                workspace_id: Some("ws_cli_pending".to_owned()),
+                runtime_id: Some("codex".to_owned()),
+                status: Some(CliRuntimePendingRequestStatus::Answered),
+                ..Default::default()
+            })
+            .await
+            .expect("answered request list should succeed");
+        assert_eq!(answered_rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cli_runtime_pending_request_cancel_and_expire_helpers_are_terminal() {
+        let store = test_store_with_workspace("ws_cli_pending_terminal").await;
+        let created_at = unix_to_datetime(1_700_021_000);
+        let updated_at = unix_to_datetime(1_700_021_030);
+        let request_payload = super::serialize_cli_runtime_json(&serde_json::json!({
+            "kind": "user_input",
+            "title": "Need input",
+            "payload": { "prompt": "Continue?" }
+        }))
+        .expect("request payload should serialize");
+
+        for request_id in ["approval-cancel-a", "approval-expire-a"] {
+            store
+                .open_cli_runtime_pending_request(NewCliRuntimePendingRequest {
+                    request_id: request_id.to_owned(),
+                    runtime_id: "codex".to_owned(),
+                    runtime_kind: "codex".to_owned(),
+                    workspace_id: "ws_cli_pending_terminal".to_owned(),
+                    thread_id: "thread_cli_pending_terminal".to_owned(),
+                    turn_id: Some("turn_cli_pending_terminal".to_owned()),
+                    native_thread_id: Some("codex-thread-terminal".to_owned()),
+                    native_turn_id: Some("codex-turn-terminal".to_owned()),
+                    native_item_id: Some("item-terminal".to_owned()),
+                    request_kind: "user_input".to_owned(),
+                    payload_json: request_payload.clone(),
+                    created_at,
+                    updated_at: created_at,
+                })
+                .await
+                .expect("pending request should open");
+        }
+
+        let cancelled = store
+            .cancel_cli_runtime_pending_request(
+                "approval-cancel-a",
+                Some(
+                    super::serialize_cli_runtime_json(&serde_json::json!({
+                        "status": "cancelled"
+                    }))
+                    .expect("cancel payload should serialize"),
+                ),
+                updated_at,
+            )
+            .await
+            .expect("cancel should succeed")
+            .expect("cancelled request should exist");
+        assert_eq!(cancelled.status, CliRuntimePendingRequestStatus::Cancelled);
+        assert_eq!(cancelled.resolved_at, Some(updated_at));
+
+        let second_cancel = store
+            .cancel_cli_runtime_pending_request("approval-cancel-a", None, updated_at)
+            .await;
+        assert!(
+            second_cancel.is_err(),
+            "cancelled request must reject a second terminal transition"
+        );
+
+        let expired = store
+            .expire_cli_runtime_pending_request("approval-expire-a", None, updated_at)
+            .await
+            .expect("expire should succeed")
+            .expect("expired request should exist");
+        assert_eq!(expired.status, CliRuntimePendingRequestStatus::Expired);
+
+        let missing = store
+            .expire_cli_runtime_pending_request("approval-missing-a", None, updated_at)
+            .await
+            .expect("missing expire should not fail");
+        assert!(missing.is_none());
+    }
+
+    #[tokio::test]
+    async fn cli_runtime_json_helpers_and_native_events_round_trip() {
+        let store = test_store_with_workspace("ws_cli_native").await;
+        let created_at = unix_to_datetime(1_700_030_000);
+        let payload = serde_json::json!({
+            "method": "item/completed",
+            "redacted": true
+        });
+        let encoded = super::serialize_cli_runtime_json(&payload)
+            .expect("native event payload should serialize");
+        let decoded: serde_json::Value = super::deserialize_cli_runtime_json(encoded.as_str())
+            .expect("native event payload should deserialize");
+        assert_eq!(decoded, payload);
+
+        for (id, sequence, method) in [
+            ("native-event-1", 1_i64, "thread/start"),
+            ("native-event-2", 2_i64, "item/completed"),
+        ] {
+            store
+                .append_cli_runtime_native_event(NewCliRuntimeNativeEvent {
+                    id: id.to_owned(),
+                    runtime_id: "codex".to_owned(),
+                    runtime_kind: "codex".to_owned(),
+                    workspace_id: Some("ws_cli_native".to_owned()),
+                    thread_id: Some("thread_cli_native".to_owned()),
+                    turn_id: Some("turn_cli_native".to_owned()),
+                    native_thread_id: Some("codex-thread-native".to_owned()),
+                    native_turn_id: Some("codex-turn-native".to_owned()),
+                    native_method: method.to_owned(),
+                    payload_redacted_json: encoded.clone(),
+                    sequence,
+                    created_at,
+                })
+                .await
+                .expect("native event append should succeed");
+        }
+
+        let events = store
+            .list_cli_runtime_native_events(CliRuntimeNativeEventListFilter {
+                runtime_id: Some("codex".to_owned()),
+                thread_id: Some("thread_cli_native".to_owned()),
+                turn_id: Some("turn_cli_native".to_owned()),
+                native_thread_id: Some("codex-thread-native".to_owned()),
+                ..Default::default()
+            })
+            .await
+            .expect("native event list should succeed");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].sequence, 1);
+        assert_eq!(events[1].native_method, "item/completed");
     }
 
     #[tokio::test]
@@ -13037,6 +13650,49 @@ mod tests {
             .expect_err("summary storage should be rejected for metadata-only policy");
         assert!(format!("{error:#}").contains("storage payload must be metadata-only"));
 
+        let external_mcp_summary = pioneer_protocol::ToolOutputSummary {
+            title: "Tool: mcp:Resend/send-email".to_owned(),
+            lines: vec!["Sending email".to_owned()],
+            metadata: ToolMetadata::from_json(serde_json::json!({
+                "server": "Resend",
+                "tool": "send-email",
+                "arguments": {
+                    "to": "alexander.oskin@gmail.com"
+                }
+            })),
+            truncated: false,
+        };
+        let external_mcp_item = TurnItem::DynamicToolCall {
+            id: "item_external_mcp".to_owned(),
+            tool_name: "mcp:Resend/send-email".to_owned(),
+            arguments: serde_json::json!({"to": "alexander.oskin@gmail.com"}),
+            status: ToolCallStatus::Completed,
+            recovery_policy: None,
+            output_policy: ToolOutputPolicySnapshot::for_external_runtime_tool_name(
+                "mcp:Resend/send-email",
+            ),
+            display: ToolDisplayPayload::Summary(external_mcp_summary.clone()),
+            storage: ToolStoragePayload::Metadata {
+                metadata: external_mcp_summary.metadata.clone(),
+            },
+            recovery: None,
+            success: Some(true),
+            outcome: None,
+            observation: None,
+        };
+        store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: external_mcp_item,
+                },
+                timestamp + 3,
+            )
+            .await
+            .expect("external runtime MCP metadata storage should be accepted");
+
         let retained_llm_context_item = TurnItem::DynamicToolCall {
             id: "item_llm_context".to_owned(),
             tool_name: "read_file".to_owned(),
@@ -13066,7 +13722,7 @@ mod tests {
                     turn_id: turn_id.to_owned(),
                     item: retained_llm_context_item,
                 },
-                timestamp + 3,
+                timestamp + 4,
             )
             .await
             .expect_err("retained llm context should be rejected");
