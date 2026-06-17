@@ -2,6 +2,17 @@
 
 Use this reference after a memory tool failure, an empty result that looks suspicious, an incomplete inventory, or a confusing recalled context block.
 
+## Contents
+
+- ToolNotVisible
+- Invalid memory_remember Arguments
+- Search Misses A Known Memory
+- Inventory Seems Incomplete
+- Conflicting Memories
+- User Says You Should Know Something
+- Memory Was Saved But Should Be Changed
+- Recalled Thread Context Looks Relevant But Insufficient
+
 ## ToolNotVisible
 
 Symptoms:

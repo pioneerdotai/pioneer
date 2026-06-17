@@ -2,6 +2,16 @@
 
 Use this reference when writing memory or choosing filters for reads. The goal is to store the right fact in the right place, with a stable shape that future turns can find and update.
 
+## Contents
+
+- Scopes
+- Categories
+- Keys
+- Sensitivity
+- Confidence
+- Importance
+- Durable Memory Versus Thread Context
+
 ## Scopes
 
 Choose the narrowest truthful scope.

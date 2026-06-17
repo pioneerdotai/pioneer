@@ -2,6 +2,15 @@
 
 Use this reference when exact memory tool arguments matter. Memory tools use strict function arguments: pass fields at the top level, use the documented casing, and do not add wrappers or unknown fields.
 
+## Contents
+
+- Tool Visibility
+- memory_search
+- memory_list
+- memory_get
+- memory_remember
+- memory_forget
+
 ## Tool Visibility
 
 Only call tools visible in the current turn. If a needed memory tool is hidden and `request_tools` is visible, request the `memory` domain first:

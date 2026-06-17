@@ -2,7 +2,7 @@
 name: subagents
 slug: subagents
 owner: pioneer
-description: "Task-backed subagent orchestration: when to delegate, how to create attached tasks, wait for them, review result candidates, request revisions, accept results, cancel/detach work, and synthesize the parent answer."
+description: "Use this skill when Pioneer should delegate work to task-backed subagents, create scheduled/interval/cron tasks, wait for or review task results, revise/accept/cancel/detach task work, update task delivery, or decide where task results should appear."
 version: "0.1.0"
 user-invocable: true
 disable-model-invocation: false
@@ -10,274 +10,198 @@ implicit-invocation: required
 catalog-hide: true
 ---
 
-# Subagent Orchestration
+# Pioneer Subagents And Tasks
 
-Use this skill when you are deciding whether to split a user task into subagents, create subagents, coordinate multi-agent work, or review subagent results.
+Tasks are for durable work. Subagents are task-backed child agents that do focused work in hidden child threads. Scheduled tasks are future or recurring runs that may execute long after the creation chat is gone.
 
-The parent agent owns the outcome. Subagents do focused work in hidden child threads, but the parent must decide whether their result is acceptable. Do not treat a child result candidate as final until it has been accepted.
+The parent agent owns the user outcome. A child result is evidence until the parent accepts it, integrates it, or deliberately routes it somewhere else.
 
-## Delegation Stance
+## Product Model
 
-For every non-trivial user task, first look for a useful split into meaningful independent subtasks. Default to attached subagents when independent work can improve speed, coverage, verification, or auditability.
+Think in three surfaces:
 
-Do not create subagents just to create them. If the task is tiny, obvious, tightly coupled, or single-step, do it yourself in the parent turn.
+- **Parent thread**: the user-facing conversation history. Write here when the user expects an answer in this chat.
+- **Task state**: durable run history, candidates, result snapshots, attempts, and diagnostics. Every task result should be recoverable here even when it is not shown as a chat message.
+- **Delivery**: the policy that decides whether a terminal task result becomes a parent/thread message, a user notification, a webhook, or no visible message.
 
-## When To Create Subagents
+Do not confuse "the child agent produced a final answer" with "the main thread received a final answer." Those are separate product events.
 
-Create subagents when at least one of these is true:
+## Quick Start
 
-- The user explicitly asks for subagents, multi-agent work, parallel investigation, or separate workers.
-- The task naturally splits into independent parts that can run concurrently.
-- Parallel subagents can materially speed up the work without reducing quality or making coordination harder.
-- Different subtasks need different scopes, paths, tools, roles, or output contracts.
-- The parent needs independent verification before producing a final answer.
-- The work is large enough that doing every part in one parent context would make the timeline hard to audit.
+Before delegating, decide what kind of work this is.
 
-Prefer doing the work yourself when:
+1. If the user needs one direct answer and the work is small or tightly coupled, do it in the parent turn.
+2. If independent focused work would improve speed, coverage, verification, or auditability, create attached subagents.
+3. If work should run later or repeatedly, create a scheduled, interval, or cron task with self-contained future-run instructions.
+4. If a task result should appear in this chat later, use `deliveryPolicy.mode:"owner_thread"` or `deliveryPolicy.mode:"thread"` with the current thread id.
+5. If the result should only alert the user, use `user_notification`, but remember this may not create durable chat history.
+6. If the result should go outside Pioneer, use `webhook`.
+7. If the task is background state only, use no delivery or `mode:"none"`.
 
-- The task is small or tightly coupled.
-- The next step depends on one specific result.
-- The user asked you not to delegate.
-- Creating subagents would add overhead without improving speed, correctness, coverage, verification, or auditability.
+For attached subagents, create all independent tasks first, wait once, review candidates, accept/revise/cancel, then synthesize the parent answer from accepted results.
 
-## Parent Responsibilities
+For scheduled tasks, do not call `task_wait` after creation unless an active waitable run exists. Confirm the schedule, task id, delivery behavior, and next fire time.
 
-The parent must:
+## Load References When Needed
 
-- create clear, bounded child tasks;
-- start independent child tasks before waiting;
-- wait for active attached tasks;
-- inspect every review-required candidate;
-- accept only results that satisfy the user request and child task goal;
-- request revision with concrete feedback when the result is incomplete, wrong, unsafe, or poorly formatted;
-- synthesize only accepted child results into the final parent answer;
-- never finish while attached tasks are still active or waiting for review.
+Keep this file in context for the normal flow. Load detailed references only for the matching situation:
 
-## Ensure Task Tools Are Visible
+- Read `references/tool-schemas.md` before constructing non-trivial `task_*` payloads, after schema errors, or when exact field names matter.
+- Read `references/delivery-and-scheduled.md` before creating or updating scheduled/interval/cron tasks, changing delivery, or diagnosing why a result did not appear in the main thread.
+- Read `references/workflows-and-examples.md` for concrete examples: parallel research, code review, release-monitor cron tasks, delivery updates, and parent synthesis.
+- Read `references/troubleshooting.md` after task tool failures, missing final answers, hidden child results, review confusion, or stuck/stale tasks.
 
-Before using task orchestration, check whether the needed `task_*` tools are currently visible.
+## Tool Visibility
 
-If `task_create` or other required `task_*` tools are not visible, call `request_tools` for the `task` domain first:
+Only call task tools that are visible in the current turn.
+
+If a needed task tool is hidden and `request_tools` is visible, request the task domain:
 
 ```json
 {
   "domains": ["task"],
-  "reason": "Need task tools to create, wait for, review, revise, accept, cancel, or detach subagent work."
+  "reason": "Need task tools to create, wait for, review, update, cancel, detach, or inspect task-backed work."
 }
 ```
 
-After `request_tools` succeeds, use the newly visible task tools according to the sections below.
+Do not request individual task tool names. Request the `task` domain.
 
-Do not call `request_tools` for individual tool names such as `task_create`; request the whole `task` domain.
+If the task domain cannot be opened, do not pretend the task was created or updated. Continue with visible context and say which task operation is unavailable.
 
-## Create Attached Subagents
+## When To Delegate
 
-Use `task_create` with a structured JSON object. Do not wrap the payload in a raw JSON string.
+Create attached subagents when at least one is true:
 
-For immediate attached subagents, omit `trigger`; immediate is the default.
+- the user explicitly asks for subagents, parallel work, independent workers, or review;
+- the task naturally splits into independent parts;
+- separate agents can inspect different files, systems, tools, or hypotheses in parallel;
+- the parent needs independent verification before committing to an answer;
+- the work is large enough that one parent timeline would be hard to audit.
 
-Basic payload:
+Prefer parent-only work when:
 
-```json
-{
-  "title": "Subagent 1: Inspect task service",
-  "goal": "Find where TaskService is implemented and summarize the retry/cancel logic.",
-  "agentRole": "researcher",
-  "agentNickname": "TaskService researcher",
-  "instructions": [
-    "Inspect /path/to/project.",
-    "Use search/read tools before answering.",
-    "Return exact file:line references for every important claim.",
-    "Do not modify files."
-  ],
-  "inputText": "Focus on TaskService, retry handling, cancellation handling, and task state transitions.",
-  "outputInstructions": "Return Markdown with sections: files inspected, findings, file:line links, and conclusion."
-}
-```
+- the task is small, obvious, or single-step;
+- each next step depends on one previous result;
+- delegation would add coordination overhead without improving quality;
+- the user asks not to delegate.
 
-Task quality rules:
+## Create Good Subagents
 
-- `title` should identify the subtask in the parent timeline.
-- `goal` should be short and concrete.
-- `instructions` should describe behavior and constraints.
-- `inputText` should carry data and scope, not behavior.
-- `outputInstructions` should define the result shape.
-- Include relevant paths, ids, dates, and limits.
-- Ask for file:line references when code claims matter.
-- Ask child agents to register user-visible files with `artifact_register`.
+For immediate attached subagents, omit `trigger`.
+
+Good child tasks are narrow and auditable:
+
+- `title`: short label visible in the parent timeline.
+- `goal`: one concrete outcome.
+- `instructions`: behavior, constraints, and what not to do.
+- `inputText` or `input`: data, paths, ids, dates, examples, and scope.
+- `outputInstructions`: exact result shape, evidence requirements, and language.
+
+Use self-contained wording. Do not rely on hidden parent reasoning, invisible local assumptions, or tool names that might not exist in the child turn.
+
+Ask for file:line references when code claims matter. Ask children to register user-visible files with `artifact_register` when they create files.
 
 Do not pass runtime-owned fields such as `workspaceId`, `ownerKind`, `parentTaskId`, `rootTaskId`, `depth`, `model`, `modelProvider`, or `trigger.spec`.
 
-Omit advanced fields unless needed:
+Read `references/tool-schemas.md` for exact examples.
 
-- `toolPolicy` only when restricting tools, writes, paths, or network.
-- `contextPolicy` only when custom context behavior matters.
-- `resultContract` only when a strict result type/schema is required.
-- `maxDepth` only when nested delegation must be constrained.
-- `lifecyclePolicy`, `deliveryPolicy`, `retryPolicy`, `timeoutPolicy`, and `concurrencyPolicy` only for deliberate advanced workflows.
+## Wait And Review
 
-## Start Tasks Before Waiting
+For independent attached tasks, create them all first, then call `task_wait` once with `taskIds` or `runIds`. Prefer `runIds` when available.
 
-If several subtasks are independent, call `task_create` for all of them first. Then call `task_wait` once for the created set.
+`task_wait` can return terminal results, pending work, or `reviewRequired`. A review-required candidate is not final. Inspect every candidate and accept only when it satisfies:
 
-Use the `taskId` or `runId` values returned by `task_create`. Prefer `runIds` when available.
-
-```json
-{
-  "runIds": [
-    "RUN_ID_1",
-    "RUN_ID_2",
-    "RUN_ID_3"
-  ],
-  "timeoutMs": 120000,
-  "returnCompleted": true,
-  "returnPending": true
-}
-```
-
-`task_wait` defaults to review-aware waiting: it returns when all targets are terminal, or when candidates need parent review. A wait timeout does not cancel child work. If `timedOut` is true and work is still pending, wait again or report progress only when that is useful to the user.
-
-Do not repeatedly call `task_wait` for the same set unless the prior wait timed out or a revision has been requested.
-
-Use `taskIds` and `runIds` arrays. Do not use singular `taskId` or `runId` in `task_wait`.
-
-## Review Result Candidates
-
-When `task_wait` returns `reviewRequired`, inspect every item. A review item contains the task/run, child thread/turn, candidate, review policy, remaining revision rounds, and allowed actions.
-
-Accept a candidate only when it satisfies:
-
-- the user's original request;
+- the original user request;
 - the child task goal;
-- the required output format;
-- the evidence requirements, such as file:line links;
-- safety and scope constraints;
-- artifact registration requirements, if the child created files.
+- the requested output shape;
+- evidence and artifact requirements;
+- safety, scope, and write constraints.
 
-Do not use a `pending_review` candidate as final work until `task_accept` succeeds.
+Use `task_revise` when the result is close but incomplete or incorrectly shaped. Give concrete feedback: what is wrong, what to add/remove/correct, and what the revised output must look like.
 
-## Accept A Candidate
+Use `task_accept` only after the candidate is good enough to use. Use accepted child results in the parent synthesis.
 
-Use `task_accept` only with a candidate id returned by `task_wait.reviewRequired`.
+Do not finish the parent turn while attached tasks are active, waiting for review, or producing unreviewed candidates.
 
-```json
-{
-  "taskId": "TASK_ID",
-  "runId": "RUN_ID",
-  "candidateId": "CANDIDATE_ID",
-  "reason": "The result covers the requested files, includes exact file:line references, and matches the requested Markdown structure."
-}
-```
+## Scheduled And Recurring Tasks
 
-After accepting, use the accepted result in the parent synthesis. If other attached tasks are still active or waiting for review, continue waiting/reviewing before final answer.
-
-## Request A Revision
-
-Use `task_revise` when a candidate is close enough to fix in the same child thread, but not good enough to accept.
-
-```json
-{
-  "taskId": "TASK_ID",
-  "runId": "RUN_ID",
-  "candidateId": "CANDIDATE_ID",
-  "feedback": "The result is missing the Desktop timeline path. Add a section named \"Desktop timeline verification\" with three exact file:line references and a short conclusion.",
-  "additionalInstructions": [
-    "Keep the correct existing findings.",
-    "Do not redo unrelated research.",
-    "Return only the revised final answer."
-  ]
-}
-```
-
-Good revision feedback is specific:
-
-- name what is missing or wrong;
-- say what to add, remove, or correct;
-- preserve useful work when possible;
-- define the expected output shape;
-- avoid vague feedback such as "improve this" or "try harder".
-
-After `task_revise` succeeds, call `task_wait` again for that task or run. Review the new candidate the same way. Continue until the result is accepted, cancelled, or revision is no longer allowed.
-
-If `remainingRevisionRounds` is zero or `allowedActions` does not include `task_revise`, do not request another revision. Accept the candidate, cancel the task, or create a separate follow-up task.
-
-## Cancel Or Detach
-
-Use `task_cancel` when the child result should not be used or the task should stop.
-
-```json
-{
-  "taskId": "TASK_ID",
-  "reason": "The task is no longer relevant after the parent changed direction.",
-  "scope": "attached_subtree"
-}
-```
-
-Use `task_detach` only when the work should continue in the background and should no longer block the parent turn.
-
-```json
-{
-  "taskId": "TASK_ID"
-}
-```
-
-Do not detach a task that is waiting for review. Accept, revise, or cancel the active candidate first.
-
-## Scheduled, Interval, And Cron Tasks
-
-Scheduled future work is different from attached subagent work. If `task_create` returns `waitable=false` or `runId=null`, there is no active run to wait for.
+Scheduled tasks are not attached subagents. They are durable future work.
 
 For scheduled, interval, and cron tasks:
 
 - include self-contained `instructions`;
 - include explicit `outputInstructions`;
-- do not rely on the current chat context being available later;
-- do not call `task_wait` unless there is an active waitable run;
-- after creation, tell the user the task id and schedule/next fire time.
+- choose delivery deliberately;
+- include timezone and exact schedule when relevant;
+- do not call `task_wait` unless the returned run is active and waitable;
+- tell the user task id, schedule, next fire time, and where results will appear.
 
-Example cron trigger:
+Future task runs may not have the tool set, MCP servers, skills, or thread context that existed during task creation. Instruct future agents to choose tools by capability, fail clearly when required data is unavailable, and avoid relying on creation-time chat context.
 
-```json
-{
-  "title": "Daily repository health check",
-  "goal": "Inspect the repository every weekday morning and summarize issues.",
-  "trigger": {
-    "kind": "cron",
-    "cronExpr": "0 9 * * 1-5",
-    "timezone": "Europe/Moscow"
-  },
-  "instructions": [
-    "Run a read-only repository health check.",
-    "Use available search and file-reading tools.",
-    "Fail clearly if the repository path is unavailable."
-  ],
-  "inputText": "Repository: /path/to/project",
-  "outputInstructions": "Return Markdown with findings, evidence links, and recommended next actions."
-}
-```
+Read `references/delivery-and-scheduled.md` before creating recurring tasks that must report to the user.
+
+## Delivery Rules
+
+Use delivery to match the user experience:
+
+- `owner_thread`: write the result to the task owner's thread. Best default for "send the answer back here" when the task is owned by the current thread.
+- `thread`: write the result to a specific `threadId`. Best when updating an existing task or targeting a known thread explicitly.
+- `user_notification`: notify the user without necessarily writing a durable chat message. Good for lightweight alerts, but bad when the user expects the full answer in the main thread.
+- `webhook`: send the result outside Pioneer.
+- `none`: keep the result in task state only.
+
+If the user says "send it here", "post the report in this thread", "make the answer appear in this chat", or "not just a notification", do not use `user_notification`. Use `owner_thread` or `thread`.
+
+Changing delivery affects future runs. It does not retroactively materialize already delivered results in the parent thread.
+
+## Updating Existing Tasks
+
+Use `task_list` or `task_get` to inspect before patching. Patch only fields that should change.
+
+For delivery fixes, preserve schedule, goal, instructions, and output instructions unless the user asked to change them.
+
+After `task_update`, verify the task's current delivery policy with `task_get` or the tool result. Tell the user exactly what changed and what will happen on the next run.
+
+## Before Finalizing
+
+Validate the task state before answering the user.
+
+- For attached subagents: every relevant child is terminal, accepted, revised, cancelled, or deliberately detached.
+- For review-required results: accepted candidates are the only candidates treated as final evidence.
+- For scheduled tasks: schedule, timezone, next fire time, and delivery destination are known or explicitly unavailable.
+- For task updates: the tool result or `task_get` confirms the changed fields.
+- For delivery issues: explain whether the change affects past runs or only future runs.
 
 ## Final Parent Answer
 
-After all attached work is accepted, terminal, cancelled, or detached, synthesize the parent answer.
+For attached subagents, the final user-facing answer comes from the parent. Include only what matters:
 
-Include:
+- which subagents ran, when useful;
+- which results were accepted or revised, when relevant;
+- any failures, cancellations, or detached work;
+- the integrated answer;
+- links or artifacts created by parent or children.
 
-- which subagents ran;
-- which results were accepted on the first candidate;
-- which results required revision;
-- any cancelled, failed, or detached work;
-- the final integrated answer;
-- registered artifacts created by parent or children, when relevant.
+For scheduled tasks, the creation/update answer should not invent a run result. Confirm the schedule and delivery behavior instead.
 
-Do not hide review history when it matters. If a child needed revision, mention that the parent requested changes and accepted the revised candidate.
+## Common Patterns
 
-## Common Mistakes
+If the user asks for parallel investigation, create focused child tasks for independent parts, wait once, review, accept, and synthesize.
 
-- Creating one child, waiting, then creating the next child even though tasks were independent.
-- Using `task_wait` with `taskId` instead of `taskIds`.
-- Calling `task_wait` for scheduled future work with no active run.
-- Treating `reviewRequired` as completion.
-- Quoting a rejected candidate in the final answer as if it were accepted.
-- Calling `task_revise` without actionable feedback.
-- Finishing the parent turn while attached tasks are still active.
-- Forgetting to ask subagents to register user-visible files with `artifact_register`.
+If the user asks to "check every morning and post here", create a cron task with `deliveryPolicy.mode:"owner_thread"` or `mode:"thread"` and `includeResult:true`.
+
+If a scheduled run completed but the answer did not appear in the chat, inspect the task's delivery mode. `user_notification`, `webhook`, and `none` do not guarantee a durable parent-thread message.
+
+For full examples, read `references/workflows-and-examples.md`.
+
+## Gotchas
+
+- `task_wait` uses arrays: `taskIds` or `runIds`, not singular `taskId` or `runId`.
+- Do not call `task_wait` for scheduled future work with `waitable:false` or `runId:null`.
+- A `pending_review` candidate is not accepted work.
+- Do not quote rejected candidates as final results.
+- `user_notification` is not the same as "write the answer in this thread".
+- `includeResult:false` can produce only a generic delivery message.
+- Delivery changes affect future runs, not past runs.
+- Scheduled task instructions must be self-contained.
+- Do not claim a task was created, updated, accepted, cancelled, or delivered unless the relevant tool succeeded.

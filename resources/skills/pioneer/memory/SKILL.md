@@ -169,6 +169,16 @@ If the user asks about "what we discussed yesterday", prefer injected thread con
 
 For full examples, read `references/workflows-and-examples.md`.
 
+## Before Finalizing
+
+Validate memory-dependent work before answering the user.
+
+- If you answered from memory, make sure the fact came from injected context, `memory_search`, `memory_list`, or `memory_get`, not from inference.
+- If exact inventory matters, make sure you used `memory_list`, not only semantic search.
+- If you wrote memory, make sure `memory_remember` succeeded before saying it was saved.
+- If you forgot memory, make sure `memory_forget` succeeded and do not keep using the forgotten fact as active context.
+- If memory tools were unavailable, say that plainly and answer from visible context only.
+
 ## Gotchas
 
 - `memory_search` is not inventory. It can miss records. Use `memory_list` for audits and cleanup.

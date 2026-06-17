@@ -2,6 +2,22 @@
 
 Use this reference for multi-step memory operations, proactive memory use, and common user requests.
 
+## Contents
+
+- Proactive Memory Check For Non-Trivial Turns
+- Proactive User Preference
+- Proactive Project Continuation
+- Proactive Durable Write
+- Answer From Known User Identity
+- List What Is Stored
+- Remember A User Preference
+- Remember A Project Decision
+- Update A Stable Baseline
+- Forget One Memory
+- Broad Cleanup
+- User Asks About Earlier Conversation
+- Artifact References In Thread Context
+
 ## Proactive Memory Check For Non-Trivial Turns
 
 Do not wait for the user to ask "what do you remember?" Before answering a non-trivial request, decide whether durable memory could improve the result.
