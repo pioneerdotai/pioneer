@@ -1202,7 +1202,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_tools_runtime_returns_compact_domain_result() {
-        let extension_specs = ["artifact_prepare", "artifact_register"]
+        let extension_specs = ["artifact_prepare", "artifact_register", "artifact_read"]
             .into_iter()
             .map(|name| {
                 ConfiguredToolSpec::new(
@@ -1228,6 +1228,7 @@ mod tests {
                 handlers: vec![
                     ("artifact_prepare".to_owned(), Arc::new(EchoHandler)),
                     ("artifact_register".to_owned(), Arc::new(EchoHandler)),
+                    ("artifact_read".to_owned(), Arc::new(EchoHandler)),
                 ],
             }],
         )
@@ -1264,7 +1265,8 @@ mod tests {
             output.added.get("artifact"),
             Some(&vec![
                 "artifact_prepare".to_owned(),
-                "artifact_register".to_owned()
+                "artifact_register".to_owned(),
+                "artifact_read".to_owned()
             ])
         );
         assert_eq!(output.unknown_or_unavailable.len(), 1);

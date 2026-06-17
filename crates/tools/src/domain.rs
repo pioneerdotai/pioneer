@@ -234,7 +234,7 @@ mod tests {
         );
         assert_eq!(
             BuiltinToolDomain::Artifact.tool_names(),
-            ["artifact_prepare", "artifact_register"]
+            ["artifact_prepare", "artifact_register", "artifact_read"]
         );
         assert_eq!(
             BuiltinToolDomain::ComputerUse.tool_names(),

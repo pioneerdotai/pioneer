@@ -208,6 +208,7 @@ mod tests {
             [
                 "artifact_prepare".to_owned(),
                 "artifact_register".to_owned(),
+                "artifact_read".to_owned(),
             ],
         );
 
@@ -221,7 +222,10 @@ mod tests {
 
         assert_eq!(
             result.added.get("artifact"),
-            Some(&vec!["artifact_register".to_owned()])
+            Some(&vec![
+                "artifact_register".to_owned(),
+                "artifact_read".to_owned()
+            ])
         );
         assert_eq!(
             result.already_visible.get("artifact"),
@@ -241,6 +245,7 @@ mod tests {
             [
                 "artifact_prepare".to_owned(),
                 "artifact_register".to_owned(),
+                "artifact_read".to_owned(),
             ],
         )
         .with_blocked_tool_names([(
@@ -258,7 +263,10 @@ mod tests {
 
         assert_eq!(
             result.added.get("artifact"),
-            Some(&vec!["artifact_prepare".to_owned()])
+            Some(&vec![
+                "artifact_prepare".to_owned(),
+                "artifact_read".to_owned()
+            ])
         );
         assert_eq!(result.blocked.len(), 1);
         assert_eq!(result.blocked[0].tools, vec!["artifact_register"]);
@@ -267,12 +275,18 @@ mod tests {
 
     #[tokio::test]
     async fn request_tools_result_reports_repeated_visible_domain_as_already_visible() {
-        let visibility = visibility(&["request_tools", "artifact_prepare", "artifact_register"]);
+        let visibility = visibility(&[
+            "request_tools",
+            "artifact_prepare",
+            "artifact_register",
+            "artifact_read",
+        ]);
         visibility
             .set_visible_by_name(&[
                 "request_tools".to_owned(),
                 "artifact_prepare".to_owned(),
                 "artifact_register".to_owned(),
+                "artifact_read".to_owned(),
             ])
             .await;
         let handler = RequestToolsHandler::new(
@@ -280,6 +294,7 @@ mod tests {
             [
                 "artifact_prepare".to_owned(),
                 "artifact_register".to_owned(),
+                "artifact_read".to_owned(),
             ],
         );
 
@@ -296,7 +311,8 @@ mod tests {
             result.already_visible.get("artifact"),
             Some(&vec![
                 "artifact_prepare".to_owned(),
-                "artifact_register".to_owned()
+                "artifact_register".to_owned(),
+                "artifact_read".to_owned()
             ])
         );
         assert!(result.blocked.is_empty());
