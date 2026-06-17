@@ -13,6 +13,7 @@ mod m20260531_000003_task_agent_review_policy;
 mod m20260603_000001_turn_execution_window;
 mod m20260613_000001_turn_event_projection_state;
 mod m20260614_000001_thread_episodic_memory;
+mod m20260616_000001_cli_runtime_bindings;
 
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
@@ -29,6 +30,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260603_000001_turn_execution_window::Migration),
             Box::new(m20260613_000001_turn_event_projection_state::Migration),
             Box::new(m20260614_000001_thread_episodic_memory::Migration),
+            Box::new(m20260616_000001_cli_runtime_bindings::Migration),
         ]
     }
 }
