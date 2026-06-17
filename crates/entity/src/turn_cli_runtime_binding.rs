@@ -29,8 +29,6 @@ pub struct Model {
     pub approval_policy: Option<String>,
     #[sea_orm(column_type = "Text")]
     pub input_mapping_json: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub mcp_config_json: Option<String>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
 }

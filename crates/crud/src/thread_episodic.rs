@@ -498,7 +498,7 @@ pub fn thread_episodic_frame_uri(capsule_ref: &str, chunk_id: &str) -> Result<St
 }
 
 pub(crate) fn thread_episodic_capsule_record_from_model(
-    model: pioneer_entity::thread_episodic_capsule::Model,
+    model: pioneer_entity::thread_episodic_capsules::Model,
 ) -> Result<ThreadEpisodicCapsuleRecord> {
     Ok(ThreadEpisodicCapsuleRecord {
         id: model.id,
@@ -533,7 +533,7 @@ pub(crate) fn thread_episodic_capsule_record_from_model(
 }
 
 pub(crate) fn thread_episodic_chunk_record_from_model(
-    model: pioneer_entity::thread_episodic_chunk::Model,
+    model: pioneer_entity::thread_episodic_chunks::Model,
 ) -> Result<ThreadEpisodicChunkRecord> {
     Ok(ThreadEpisodicChunkRecord {
         id: model.id,
@@ -569,7 +569,7 @@ pub(crate) fn thread_episodic_chunk_record_from_model(
 }
 
 pub(crate) fn thread_episodic_index_job_record_from_model(
-    model: pioneer_entity::thread_episodic_index_job::Model,
+    model: pioneer_entity::thread_episodic_index_jobs::Model,
 ) -> Result<ThreadEpisodicIndexJobRecord> {
     Ok(ThreadEpisodicIndexJobRecord {
         id: model.id,
@@ -596,7 +596,7 @@ pub(crate) fn thread_episodic_index_job_record_from_model(
 }
 
 pub(crate) fn thread_episodic_exclusion_record_from_model(
-    model: pioneer_entity::thread_episodic_exclusion::Model,
+    model: pioneer_entity::thread_episodic_exclusions::Model,
 ) -> Result<ThreadEpisodicExclusionRecord> {
     Ok(ThreadEpisodicExclusionRecord {
         id: model.id,
@@ -610,7 +610,7 @@ pub(crate) fn thread_episodic_exclusion_record_from_model(
 }
 
 pub(crate) fn thread_episodic_recall_event_record_from_model(
-    model: pioneer_entity::thread_episodic_recall_event::Model,
+    model: pioneer_entity::thread_episodic_recall_events::Model,
 ) -> ThreadEpisodicRecallEventRecord {
     ThreadEpisodicRecallEventRecord {
         id: model.id,
@@ -908,7 +908,7 @@ fn ensure_ref_part(field: &str, value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pioneer_entity::thread_episodic_chunk;
+    use pioneer_entity::thread_episodic_chunks;
     use sea_orm::entity::prelude::DateTimeWithTimeZone;
 
     fn timestamp() -> DateTimeWithTimeZone {
@@ -917,7 +917,7 @@ mod tests {
 
     #[test]
     fn chunk_model_conversion_preserves_typed_boundaries_without_text_payload() {
-        let model = thread_episodic_chunk::Model {
+        let model = thread_episodic_chunks::Model {
             id: "chunk_1".to_owned(),
             workspace_id: "workspace_1".to_owned(),
             thread_id: "thread_1".to_owned(),
