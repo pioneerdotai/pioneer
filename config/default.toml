@@ -168,6 +168,15 @@ connect_timeout_secs = 30
 first_chunk_timeout_secs = 180
 inter_chunk_idle_timeout_secs = 180
 
+[gateway.cli_agent_runtime]
+enabled = false
+idle_session_ttl_secs = 1800
+startup_timeout_ms = 30000
+request_timeout_ms = 120000
+event_channel_capacity = 2048
+stderr_ring_lines = 200
+debug_native_events = false
+
 [gateway.provider.attachments]
 max_bytes_per_attachment = 104857600
 max_total_bytes_per_request = 209715200

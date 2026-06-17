@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use config::{Config, ConfigError, File, FileFormat};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 const DEFAULT_CONFIG_TOML: &str = include_str!("../../../config/default.toml");
@@ -50,6 +51,10 @@ pub struct GatewayConfig {
     pub tasks: GatewayTasksConfig,
     #[serde(default)]
     pub skills: GatewaySkillsConfig,
+    #[serde(default)]
+    pub cli_agent_runtime: GatewayCliAgentRuntimeConfig,
+    #[serde(default)]
+    pub cli_agent_runtimes: GatewayCliAgentRuntimeInstancesConfig,
     pub provider: GatewayProviderConfig,
     pub database: GatewayDatabaseConfig,
     #[serde(default)]
@@ -544,6 +549,274 @@ impl Default for GatewayProviderConfig {
             max_stream_duration_secs: None,
             attachments: GatewayProviderAttachmentsConfig::default(),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GatewayCliAgentRuntimeConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub idle_session_ttl_secs: u64,
+    pub startup_timeout_ms: u64,
+    pub request_timeout_ms: u64,
+    pub event_channel_capacity: usize,
+    pub stderr_ring_lines: usize,
+    #[serde(default)]
+    pub debug_native_events: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct GatewayCliAgentRuntimeInstancesConfig {
+    pub instances: BTreeMap<String, GatewayCliAgentRuntimeInstanceConfig>,
+}
+
+impl GatewayCliAgentRuntimeInstancesConfig {
+    pub fn is_empty(&self) -> bool {
+        self.instances.is_empty()
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &GatewayCliAgentRuntimeInstanceConfig> {
+        self.instances.values()
+    }
+}
+
+impl<'de> Deserialize<'de> for GatewayCliAgentRuntimeInstancesConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = BTreeMap::<String, GatewayCliAgentRuntimeInstanceConfigWire>::deserialize(
+            deserializer,
+        )?;
+        let mut instances = BTreeMap::new();
+        for (raw_id, wire) in wire {
+            let id = normalize_cli_agent_runtime_instance_id(raw_id.as_str())
+                .map_err(serde::de::Error::custom)?;
+            if instances.contains_key(id.as_str()) {
+                return Err(serde::de::Error::custom(format!(
+                    "duplicate CLI agent runtime instance id `{id}` after normalization"
+                )));
+            }
+            instances.insert(
+                id.clone(),
+                GatewayCliAgentRuntimeInstanceConfig::from_wire(id, wire),
+            );
+        }
+        Ok(Self { instances })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GatewayCliAgentRuntimeInstanceConfig {
+    pub id: String,
+    pub kind: GatewayCliAgentRuntimeKindConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_home_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub custom_models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub app_server_args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_probe_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_session_ttl_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_channel_capacity: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr_ring_lines: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debug_native_events: Option<bool>,
+}
+
+impl GatewayCliAgentRuntimeInstanceConfig {
+    fn from_wire(id: String, wire: GatewayCliAgentRuntimeInstanceConfigWire) -> Self {
+        Self {
+            id,
+            kind: wire.kind,
+            display_name: normalize_optional_cli_agent_runtime_text(wire.display_name),
+            enabled: wire.enabled,
+            binary_path: normalize_optional_cli_agent_runtime_text(wire.binary_path),
+            home_path: normalize_optional_cli_agent_runtime_text(wire.home_path),
+            shadow_home_path: normalize_optional_cli_agent_runtime_text(wire.shadow_home_path),
+            custom_models: normalize_cli_agent_runtime_string_list(wire.custom_models),
+            app_server_args: wire.app_server_args,
+            startup_probe_timeout_ms: wire.startup_probe_timeout_ms.map(|timeout| {
+                non_zero_or_default(timeout, default_cli_agent_runtime_startup_timeout_ms())
+            }),
+            request_timeout_ms: wire.request_timeout_ms.map(|timeout| {
+                non_zero_or_default(timeout, default_cli_agent_runtime_request_timeout_ms())
+            }),
+            idle_session_ttl_secs: wire.idle_session_ttl_secs.map(|ttl| {
+                non_zero_or_default(ttl, default_cli_agent_runtime_idle_session_ttl_secs())
+            }),
+            event_channel_capacity: wire.event_channel_capacity.map(|capacity| {
+                non_zero_or_default_usize(
+                    capacity,
+                    default_cli_agent_runtime_event_channel_capacity(),
+                )
+            }),
+            stderr_ring_lines: wire.stderr_ring_lines.map(|lines| {
+                non_zero_or_default_usize(lines, default_cli_agent_runtime_stderr_ring_lines())
+            }),
+            debug_native_events: wire.debug_native_events,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GatewayCliAgentRuntimeInstanceConfigWire {
+    #[serde(default)]
+    kind: GatewayCliAgentRuntimeKindConfig,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    binary_path: Option<String>,
+    #[serde(default)]
+    home_path: Option<String>,
+    #[serde(default)]
+    shadow_home_path: Option<String>,
+    #[serde(default)]
+    custom_models: Vec<String>,
+    #[serde(default)]
+    app_server_args: Vec<String>,
+    #[serde(default, alias = "startup_timeout_ms")]
+    startup_probe_timeout_ms: Option<u64>,
+    #[serde(default)]
+    request_timeout_ms: Option<u64>,
+    #[serde(default)]
+    idle_session_ttl_secs: Option<u64>,
+    #[serde(default)]
+    event_channel_capacity: Option<usize>,
+    #[serde(default)]
+    stderr_ring_lines: Option<usize>,
+    #[serde(default)]
+    debug_native_events: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayCliAgentRuntimeKindConfig {
+    #[default]
+    Codex,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EffectiveGatewayCliAgentRuntimeInstanceConfig {
+    pub id: String,
+    pub kind: GatewayCliAgentRuntimeKindConfig,
+    pub display_name: String,
+    pub enabled: bool,
+    pub binary_path: String,
+    pub home_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_home_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub custom_models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub app_server_args: Vec<String>,
+    pub startup_probe_timeout_ms: u64,
+    pub request_timeout_ms: u64,
+    pub idle_session_ttl_secs: u64,
+    pub event_channel_capacity: usize,
+    pub stderr_ring_lines: usize,
+    pub debug_native_events: bool,
+}
+
+impl Default for GatewayCliAgentRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            idle_session_ttl_secs: default_cli_agent_runtime_idle_session_ttl_secs(),
+            startup_timeout_ms: default_cli_agent_runtime_startup_timeout_ms(),
+            request_timeout_ms: default_cli_agent_runtime_request_timeout_ms(),
+            event_channel_capacity: default_cli_agent_runtime_event_channel_capacity(),
+            stderr_ring_lines: default_cli_agent_runtime_stderr_ring_lines(),
+            debug_native_events: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GatewayCliAgentRuntimeConfigWire {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_cli_agent_runtime_idle_session_ttl_secs")]
+    idle_session_ttl_secs: u64,
+    #[serde(default = "default_cli_agent_runtime_startup_timeout_ms")]
+    startup_timeout_ms: u64,
+    #[serde(default = "default_cli_agent_runtime_request_timeout_ms")]
+    request_timeout_ms: u64,
+    #[serde(default = "default_cli_agent_runtime_event_channel_capacity")]
+    event_channel_capacity: usize,
+    #[serde(default = "default_cli_agent_runtime_stderr_ring_lines")]
+    stderr_ring_lines: usize,
+    #[serde(default)]
+    debug_native_events: bool,
+}
+
+impl<'de> Deserialize<'de> for GatewayCliAgentRuntimeConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = GatewayCliAgentRuntimeConfigWire::deserialize(deserializer)?;
+        Ok(Self {
+            enabled: wire.enabled,
+            idle_session_ttl_secs: non_zero_or_default(
+                wire.idle_session_ttl_secs,
+                default_cli_agent_runtime_idle_session_ttl_secs(),
+            ),
+            startup_timeout_ms: non_zero_or_default(
+                wire.startup_timeout_ms,
+                default_cli_agent_runtime_startup_timeout_ms(),
+            ),
+            request_timeout_ms: non_zero_or_default(
+                wire.request_timeout_ms,
+                default_cli_agent_runtime_request_timeout_ms(),
+            ),
+            event_channel_capacity: non_zero_or_default_usize(
+                wire.event_channel_capacity,
+                default_cli_agent_runtime_event_channel_capacity(),
+            ),
+            stderr_ring_lines: non_zero_or_default_usize(
+                wire.stderr_ring_lines,
+                default_cli_agent_runtime_stderr_ring_lines(),
+            ),
+            debug_native_events: wire.debug_native_events,
+        })
+    }
+}
+
+impl GatewayConfig {
+    pub fn effective_cli_agent_runtime_instances(
+        &self,
+    ) -> Vec<EffectiveGatewayCliAgentRuntimeInstanceConfig> {
+        if self.cli_agent_runtimes.is_empty() {
+            if self.cli_agent_runtime.enabled {
+                return vec![default_codex_cli_agent_runtime_instance(
+                    &self.cli_agent_runtime,
+                )];
+            }
+            return Vec::new();
+        }
+
+        self.cli_agent_runtimes
+            .values()
+            .map(|instance| effective_cli_agent_runtime_instance(instance, &self.cli_agent_runtime))
+            .collect()
     }
 }
 
@@ -1453,6 +1726,173 @@ const fn default_provider_inter_chunk_idle_timeout_secs() -> u64 {
     180
 }
 
+const fn default_cli_agent_runtime_idle_session_ttl_secs() -> u64 {
+    1_800
+}
+
+const fn default_cli_agent_runtime_startup_timeout_ms() -> u64 {
+    30_000
+}
+
+const fn default_cli_agent_runtime_request_timeout_ms() -> u64 {
+    120_000
+}
+
+const fn default_cli_agent_runtime_event_channel_capacity() -> usize {
+    2_048
+}
+
+const fn default_cli_agent_runtime_stderr_ring_lines() -> usize {
+    200
+}
+
+const fn non_zero_or_default(value: u64, default_value: u64) -> u64 {
+    if value == 0 { default_value } else { value }
+}
+
+const fn non_zero_or_default_usize(value: usize, default_value: usize) -> usize {
+    if value == 0 { default_value } else { value }
+}
+
+fn default_codex_cli_agent_runtime_instance(
+    defaults: &GatewayCliAgentRuntimeConfig,
+) -> EffectiveGatewayCliAgentRuntimeInstanceConfig {
+    EffectiveGatewayCliAgentRuntimeInstanceConfig {
+        id: "codex".to_owned(),
+        kind: GatewayCliAgentRuntimeKindConfig::Codex,
+        display_name: "Codex".to_owned(),
+        enabled: defaults.enabled,
+        binary_path: "codex".to_owned(),
+        home_path: "~/.codex".to_owned(),
+        shadow_home_path: None,
+        custom_models: Vec::new(),
+        app_server_args: Vec::new(),
+        startup_probe_timeout_ms: defaults.startup_timeout_ms,
+        request_timeout_ms: defaults.request_timeout_ms,
+        idle_session_ttl_secs: defaults.idle_session_ttl_secs,
+        event_channel_capacity: defaults.event_channel_capacity,
+        stderr_ring_lines: defaults.stderr_ring_lines,
+        debug_native_events: defaults.debug_native_events,
+    }
+}
+
+fn effective_cli_agent_runtime_instance(
+    instance: &GatewayCliAgentRuntimeInstanceConfig,
+    defaults: &GatewayCliAgentRuntimeConfig,
+) -> EffectiveGatewayCliAgentRuntimeInstanceConfig {
+    let display_name = instance
+        .display_name
+        .clone()
+        .unwrap_or_else(|| display_name_from_cli_agent_runtime_id(instance.id.as_str()));
+    EffectiveGatewayCliAgentRuntimeInstanceConfig {
+        id: instance.id.clone(),
+        kind: instance.kind,
+        display_name,
+        enabled: instance.enabled.unwrap_or(true),
+        binary_path: instance
+            .binary_path
+            .clone()
+            .unwrap_or_else(|| default_cli_agent_runtime_binary_path(instance.kind)),
+        home_path: instance
+            .home_path
+            .clone()
+            .unwrap_or_else(|| default_cli_agent_runtime_home_path(instance.kind)),
+        shadow_home_path: instance.shadow_home_path.clone(),
+        custom_models: instance.custom_models.clone(),
+        app_server_args: instance.app_server_args.clone(),
+        startup_probe_timeout_ms: instance
+            .startup_probe_timeout_ms
+            .unwrap_or(defaults.startup_timeout_ms),
+        request_timeout_ms: instance
+            .request_timeout_ms
+            .unwrap_or(defaults.request_timeout_ms),
+        idle_session_ttl_secs: instance
+            .idle_session_ttl_secs
+            .unwrap_or(defaults.idle_session_ttl_secs),
+        event_channel_capacity: instance
+            .event_channel_capacity
+            .unwrap_or(defaults.event_channel_capacity),
+        stderr_ring_lines: instance
+            .stderr_ring_lines
+            .unwrap_or(defaults.stderr_ring_lines),
+        debug_native_events: instance
+            .debug_native_events
+            .unwrap_or(defaults.debug_native_events),
+    }
+}
+
+fn default_cli_agent_runtime_binary_path(kind: GatewayCliAgentRuntimeKindConfig) -> String {
+    match kind {
+        GatewayCliAgentRuntimeKindConfig::Codex => "codex".to_owned(),
+    }
+}
+
+fn default_cli_agent_runtime_home_path(kind: GatewayCliAgentRuntimeKindConfig) -> String {
+    match kind {
+        GatewayCliAgentRuntimeKindConfig::Codex => "~/.codex".to_owned(),
+    }
+}
+
+fn normalize_cli_agent_runtime_instance_id(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("CLI agent runtime instance id must not be empty");
+    }
+
+    let mut normalized = String::new();
+    let mut previous_separator = false;
+    for ch in trimmed.chars() {
+        if ch.is_ascii_alphanumeric() {
+            normalized.push(ch.to_ascii_lowercase());
+            previous_separator = false;
+        } else if ch == '_' || ch == '-' || ch == '.' || ch.is_ascii_whitespace() {
+            if !normalized.is_empty() && !previous_separator {
+                normalized.push('_');
+                previous_separator = true;
+            }
+        } else {
+            bail!("CLI agent runtime instance id `{raw}` contains unsupported character `{ch}`");
+        }
+    }
+
+    let normalized = normalized.trim_matches('_').to_owned();
+    if normalized.is_empty() {
+        bail!("CLI agent runtime instance id `{raw}` must contain an ASCII letter or digit");
+    }
+    Ok(normalized)
+}
+
+fn normalize_optional_cli_agent_runtime_text(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    })
+}
+
+fn normalize_cli_agent_runtime_string_list(values: Vec<String>) -> Vec<String> {
+    values
+        .into_iter()
+        .filter_map(|value| normalize_optional_cli_agent_runtime_text(Some(value)))
+        .collect()
+}
+
+fn display_name_from_cli_agent_runtime_id(id: &str) -> String {
+    id.split('_')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            let Some(first) = chars.next() else {
+                return String::new();
+            };
+            let mut word = String::new();
+            word.push(first.to_ascii_uppercase());
+            word.push_str(chars.as_str());
+            word
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 const fn default_provider_attachments_max_bytes_per_attachment() -> usize {
     100 * 1024 * 1024
 }
@@ -2135,9 +2575,9 @@ fn user_config_directory_name() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_CONFIG_TOML, GatewayMemoryConfig, GatewayMemoryModelSelectionConfig,
-        InstallManagedBy, InstallState, load_config_from_sources, load_install_state,
-        save_install_state,
+        DEFAULT_CONFIG_TOML, GatewayCliAgentRuntimeConfig, GatewayCliAgentRuntimeKindConfig,
+        GatewayMemoryConfig, GatewayMemoryModelSelectionConfig, InstallManagedBy, InstallState,
+        load_config_from_sources, load_install_state, save_install_state,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -2295,6 +2735,224 @@ service_name = "com.pioneer.gateway.env"
         );
         assert_eq!(config.gateway.tasks.review.default_max_revision_rounds, 5);
         assert_eq!(config.gateway.tasks.review.auto_accept_after_seconds, 300);
+        assert!(!config.gateway.cli_agent_runtime.enabled);
+        assert_eq!(
+            config.gateway.cli_agent_runtime.idle_session_ttl_secs,
+            1_800
+        );
+        assert_eq!(config.gateway.cli_agent_runtime.startup_timeout_ms, 30_000);
+        assert_eq!(config.gateway.cli_agent_runtime.request_timeout_ms, 120_000);
+        assert_eq!(
+            config.gateway.cli_agent_runtime.event_channel_capacity,
+            2_048
+        );
+        assert_eq!(config.gateway.cli_agent_runtime.stderr_ring_lines, 200);
+        assert!(!config.gateway.cli_agent_runtime.debug_native_events);
+        assert!(config.gateway.cli_agent_runtimes.is_empty());
+        assert!(
+            config
+                .gateway
+                .effective_cli_agent_runtime_instances()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn gateway_cli_agent_runtime_config_defaults_are_disabled_and_bounded() {
+        let config = GatewayCliAgentRuntimeConfig::default();
+
+        assert!(!config.enabled);
+        assert_eq!(config.idle_session_ttl_secs, 1_800);
+        assert_eq!(config.startup_timeout_ms, 30_000);
+        assert_eq!(config.request_timeout_ms, 120_000);
+        assert_eq!(config.event_channel_capacity, 2_048);
+        assert_eq!(config.stderr_ring_lines, 200);
+        assert!(!config.debug_native_events);
+    }
+
+    #[test]
+    fn gateway_cli_agent_runtime_config_accepts_override() {
+        let workspace_override = unique_temp_file_path("gateway-cli-agent-runtime-config");
+        write_file(
+            &workspace_override,
+            r#"
+[gateway.cli_agent_runtime]
+enabled = true
+idle_session_ttl_secs = 60
+startup_timeout_ms = 1000
+request_timeout_ms = 2000
+event_channel_capacity = 64
+stderr_ring_lines = 10
+debug_native_events = true
+"#,
+        );
+
+        let config =
+            load_config_from_sources(DEFAULT_CONFIG_TOML, vec![workspace_override.clone()])
+                .expect("load config with cli agent runtime override");
+
+        assert!(config.gateway.cli_agent_runtime.enabled);
+        assert_eq!(config.gateway.cli_agent_runtime.idle_session_ttl_secs, 60);
+        assert_eq!(config.gateway.cli_agent_runtime.startup_timeout_ms, 1_000);
+        assert_eq!(config.gateway.cli_agent_runtime.request_timeout_ms, 2_000);
+        assert_eq!(config.gateway.cli_agent_runtime.event_channel_capacity, 64);
+        assert_eq!(config.gateway.cli_agent_runtime.stderr_ring_lines, 10);
+        assert!(config.gateway.cli_agent_runtime.debug_native_events);
+
+        let _ = fs::remove_file(workspace_override);
+    }
+
+    #[test]
+    fn gateway_cli_agent_runtime_default_codex_instance_loads_when_feature_enabled() {
+        let workspace_override = unique_temp_file_path("gateway-cli-agent-runtime-default-codex");
+        write_file(
+            &workspace_override,
+            r#"
+[gateway.cli_agent_runtime]
+enabled = true
+startup_timeout_ms = 15000
+request_timeout_ms = 60000
+"#,
+        );
+
+        let config =
+            load_config_from_sources(DEFAULT_CONFIG_TOML, vec![workspace_override.clone()])
+                .expect("load config with default codex runtime enabled");
+        let instances = config.gateway.effective_cli_agent_runtime_instances();
+
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].id, "codex");
+        assert_eq!(instances[0].kind, GatewayCliAgentRuntimeKindConfig::Codex);
+        assert_eq!(instances[0].display_name, "Codex");
+        assert!(instances[0].enabled);
+        assert_eq!(instances[0].binary_path, "codex");
+        assert_eq!(instances[0].home_path, "~/.codex");
+        assert_eq!(instances[0].startup_probe_timeout_ms, 15_000);
+        assert_eq!(instances[0].request_timeout_ms, 60_000);
+
+        let _ = fs::remove_file(workspace_override);
+    }
+
+    #[test]
+    fn gateway_cli_agent_runtime_config_loads_one_codex_instance() {
+        let workspace_override = unique_temp_file_path("gateway-cli-agent-runtime-one-instance");
+        write_file(
+            &workspace_override,
+            r#"
+[gateway.cli_agent_runtime]
+enabled = true
+startup_timeout_ms = 15000
+request_timeout_ms = 60000
+
+[gateway.cli_agent_runtimes.codex_personal]
+kind = "codex"
+display_name = "Codex Personal"
+enabled = true
+binary_path = "codex"
+home_path = "~/.codex"
+shadow_home_path = "~/.pioneer/codex/personal"
+custom_models = ["gpt-5.4-codex"]
+app_server_args = ["--experimental"]
+startup_probe_timeout_ms = 5000
+request_timeout_ms = 45000
+"#,
+        );
+
+        let config =
+            load_config_from_sources(DEFAULT_CONFIG_TOML, vec![workspace_override.clone()])
+                .expect("load config with one codex runtime instance");
+        assert_eq!(config.gateway.cli_agent_runtimes.instances.len(), 1);
+
+        let instances = config.gateway.effective_cli_agent_runtime_instances();
+        assert_eq!(instances.len(), 1);
+        let instance = &instances[0];
+        assert_eq!(instance.id, "codex_personal");
+        assert_eq!(instance.kind, GatewayCliAgentRuntimeKindConfig::Codex);
+        assert_eq!(instance.display_name, "Codex Personal");
+        assert!(instance.enabled);
+        assert_eq!(instance.binary_path, "codex");
+        assert_eq!(instance.home_path, "~/.codex");
+        assert_eq!(
+            instance.shadow_home_path.as_deref(),
+            Some("~/.pioneer/codex/personal")
+        );
+        assert_eq!(instance.custom_models, vec!["gpt-5.4-codex"]);
+        assert_eq!(instance.app_server_args, vec!["--experimental"]);
+        assert_eq!(instance.startup_probe_timeout_ms, 5_000);
+        assert_eq!(instance.request_timeout_ms, 45_000);
+        assert_eq!(instance.idle_session_ttl_secs, 1_800);
+
+        let _ = fs::remove_file(workspace_override);
+    }
+
+    #[test]
+    fn gateway_cli_agent_runtime_config_loads_multiple_instances_and_keeps_disabled_visible() {
+        let workspace_override =
+            unique_temp_file_path("gateway-cli-agent-runtime-multiple-instances");
+        write_file(
+            &workspace_override,
+            r#"
+[gateway.cli_agent_runtime]
+enabled = true
+request_timeout_ms = 90000
+
+[gateway.cli_agent_runtimes."Codex Personal"]
+kind = "codex"
+home_path = "~/.codex"
+shadow_home_path = "~/.pioneer/codex/personal"
+
+[gateway.cli_agent_runtimes.codex-work]
+kind = "codex"
+display_name = "Codex Work"
+enabled = false
+home_path = "~/.codex-work"
+shadow_home_path = "~/.pioneer/codex/work"
+request_timeout_ms = 0
+"#,
+        );
+
+        let config =
+            load_config_from_sources(DEFAULT_CONFIG_TOML, vec![workspace_override.clone()])
+                .expect("load config with multiple codex runtime instances");
+        let instances = config.gateway.effective_cli_agent_runtime_instances();
+
+        assert_eq!(instances.len(), 2);
+        assert_eq!(instances[0].id, "codex_personal");
+        assert_eq!(instances[0].display_name, "Codex Personal");
+        assert!(instances[0].enabled);
+        assert_eq!(instances[0].request_timeout_ms, 90_000);
+
+        assert_eq!(instances[1].id, "codex_work");
+        assert_eq!(instances[1].display_name, "Codex Work");
+        assert!(!instances[1].enabled);
+        assert_eq!(instances[1].home_path, "~/.codex-work");
+        assert_eq!(instances[1].request_timeout_ms, 120_000);
+
+        let _ = fs::remove_file(workspace_override);
+    }
+
+    #[test]
+    fn gateway_cli_agent_runtime_config_normalizes_zero_limits() {
+        let config = toml::from_str::<GatewayCliAgentRuntimeConfig>(
+            r#"
+enabled = true
+idle_session_ttl_secs = 0
+startup_timeout_ms = 0
+request_timeout_ms = 0
+event_channel_capacity = 0
+stderr_ring_lines = 0
+debug_native_events = true
+"#,
+        )
+        .expect("cli agent runtime config should deserialize with normalized limits");
+
+        assert!(config.enabled);
+        assert_eq!(config.idle_session_ttl_secs, 1_800);
+        assert_eq!(config.startup_timeout_ms, 30_000);
+        assert_eq!(config.request_timeout_ms, 120_000);
+        assert_eq!(config.event_channel_capacity, 2_048);
+        assert_eq!(config.stderr_ring_lines, 200);
+        assert!(config.debug_native_events);
     }
 
     #[test]
