@@ -299,6 +299,7 @@ pub(super) async fn stream_provider_response(
                             item: TurnItem::AgentMessage {
                                 id: message_item_id.to_owned(),
                                 text: String::new(),
+                                phase: Default::default(),
                                 markdown: None,
                                 markdown_version: None,
                             },
@@ -415,6 +416,7 @@ pub(super) async fn stream_provider_response(
                     item: TurnItem::AgentMessage {
                         id: message_item_id.to_owned(),
                         text: String::new(),
+                        phase: Default::default(),
                         markdown: None,
                         markdown_version: None,
                     },
@@ -436,6 +438,7 @@ pub(super) async fn stream_provider_response(
                 item: TurnItem::AgentMessage {
                     id: message_item_id.to_owned(),
                     text: assistant_text.clone(),
+                    phase: Default::default(),
                     markdown: None,
                     markdown_version: None,
                 },
@@ -504,6 +507,7 @@ pub(super) async fn non_stream_provider_response(
                 item: TurnItem::AgentMessage {
                     id: message_item_id.to_owned(),
                     text: String::new(),
+                    phase: Default::default(),
                     markdown: None,
                     markdown_version: None,
                 },
@@ -544,6 +548,7 @@ pub(super) async fn non_stream_provider_response(
                 item: TurnItem::AgentMessage {
                     id: message_item_id.to_owned(),
                     text: assistant_text.clone(),
+                    phase: Default::default(),
                     markdown: None,
                     markdown_version: None,
                 },

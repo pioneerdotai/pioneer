@@ -1872,6 +1872,7 @@ fn prompt_manifest_profile(profile: PromptProfile) -> PromptManifestProfile {
         PromptProfile::AssistantFull => PromptManifestProfile::AssistantFull,
         PromptProfile::AssistantMinimal => PromptManifestProfile::AssistantMinimal,
         PromptProfile::AssistantNone => PromptManifestProfile::AssistantNone,
+        PromptProfile::CliRuntimeCodex => PromptManifestProfile::CliRuntimeCodex,
     }
 }
 
@@ -2022,6 +2023,7 @@ fn prompt_manifest_hook_phase(phase: HookPhase) -> Option<PromptManifestHookPhas
             Some(PromptManifestHookPhase::TurnPostPreflightPromptContext)
         }
         HookPhase::TurnPrePromptCompile => Some(PromptManifestHookPhase::TurnPrePromptCompile),
+        HookPhase::RuntimeTurnPreContext => Some(PromptManifestHookPhase::RuntimeTurnPreContext),
         HookPhase::TurnPrePolicy
         | HookPhase::TurnPreToolMaterialization
         | HookPhase::TurnPostPromptCompile
@@ -3896,6 +3898,7 @@ async fn execute_agent_provider_response(
                             item: TurnItem::AgentMessage {
                                 id: message_item_id.to_owned(),
                                 text: String::new(),
+                                phase: Default::default(),
                                 markdown: None,
                                 markdown_version: None,
                             },
@@ -3932,6 +3935,7 @@ async fn execute_agent_provider_response(
                             item: TurnItem::AgentMessage {
                                 id: message_item_id.to_owned(),
                                 text: final_text,
+                                phase: Default::default(),
                                 markdown: None,
                                 markdown_version: None,
                             },
@@ -4381,6 +4385,7 @@ async fn execute_agent_provider_response(
                             item: TurnItem::AgentMessage {
                                 id: message_item_id.to_owned(),
                                 text: String::new(),
+                                phase: Default::default(),
                                 markdown: None,
                                 markdown_version: None,
                             },
@@ -4421,6 +4426,7 @@ async fn execute_agent_provider_response(
                             item: TurnItem::AgentMessage {
                                 id: message_item_id.to_owned(),
                                 text: final_text,
+                                phase: Default::default(),
                                 markdown: None,
                                 markdown_version: None,
                             },

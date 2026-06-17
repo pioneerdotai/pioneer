@@ -1,3 +1,9 @@
+//! API-provider agent loop.
+//!
+//! This crate owns prompt compilation, provider streaming, and Pioneer tool
+//! execution for API-backed providers. CLI-backed agent runtimes bypass this
+//! loop after gateway turn materialization and are selected by the gateway.
+
 mod agent_loop;
 mod chat;
 mod hooks;

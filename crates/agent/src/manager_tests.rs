@@ -942,6 +942,7 @@ fn phase_07_subscription_id(phase: HookPhase) -> HookSubscriptionId {
         HookPhase::TurnPostPromptCompile => "test.phase07.post_prompt_compile",
         HookPhase::TurnPostTurn => "test.phase07.post_turn",
         HookPhase::TurnPreCompaction => "test.phase07.pre_compaction",
+        HookPhase::RuntimeTurnPreContext => "test.phase07.runtime_pre_context",
     };
     HookSubscriptionId::new(value).expect("valid subscription id")
 }
