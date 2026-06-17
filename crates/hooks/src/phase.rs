@@ -11,6 +11,7 @@ pub enum HookPhase {
     TurnPreToolMaterialization,
     TurnPrePromptCompile,
     TurnPostPromptCompile,
+    RuntimeTurnPreContext,
     TurnPostTurn,
     TurnPreCompaction,
 }
@@ -24,6 +25,7 @@ impl HookPhase {
             Self::TurnPreToolMaterialization => "turn.pre_tool_materialization",
             Self::TurnPrePromptCompile => "turn.pre_prompt_compile",
             Self::TurnPostPromptCompile => "turn.post_prompt_compile",
+            Self::RuntimeTurnPreContext => "runtime.turn_pre_context",
             Self::TurnPostTurn => "turn.post_turn",
             Self::TurnPreCompaction => "turn.pre_compaction",
         }
@@ -54,6 +56,7 @@ impl FromStr for HookPhase {
             "turn.pre_tool_materialization" => Ok(Self::TurnPreToolMaterialization),
             "turn.pre_prompt_compile" => Ok(Self::TurnPrePromptCompile),
             "turn.post_prompt_compile" => Ok(Self::TurnPostPromptCompile),
+            "runtime.turn_pre_context" => Ok(Self::RuntimeTurnPreContext),
             "turn.post_turn" => Ok(Self::TurnPostTurn),
             "turn.pre_compaction" => Ok(Self::TurnPreCompaction),
             other => Err(ParseHookPhaseError {
@@ -127,6 +130,10 @@ mod tests {
                 .expect("phase serializes"),
             serde_json::json!("turn.post_preflight_prompt_context")
         );
+        assert_eq!(
+            serde_json::to_value(HookPhase::RuntimeTurnPreContext).expect("phase serializes"),
+            serde_json::json!("runtime.turn_pre_context")
+        );
     }
 
     #[test]
@@ -144,6 +151,11 @@ mod tests {
             serde_json::from_value(serde_json::json!("turn.post_preflight_prompt_context"))
                 .expect("phase deserializes");
         assert_eq!(phase, HookPhase::TurnPostPreflightPromptContext);
+
+        let phase: HookPhase =
+            serde_json::from_value(serde_json::json!("runtime.turn_pre_context"))
+                .expect("phase deserializes");
+        assert_eq!(phase, HookPhase::RuntimeTurnPreContext);
     }
 
     #[test]

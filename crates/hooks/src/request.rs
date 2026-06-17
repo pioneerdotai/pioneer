@@ -15,6 +15,7 @@ pub enum HookInputKind {
     TurnPreToolMaterialization,
     TurnPrePromptCompile,
     TurnPostPromptCompile,
+    RuntimeTurnPreContext,
     TurnPostTurn,
     TurnPreCompaction,
     Custom(String),
@@ -29,6 +30,7 @@ impl HookInputKind {
             Self::TurnPreToolMaterialization => "turn.pre_tool_materialization",
             Self::TurnPrePromptCompile => "turn.pre_prompt_compile",
             Self::TurnPostPromptCompile => "turn.post_prompt_compile",
+            Self::RuntimeTurnPreContext => "runtime.turn_pre_context",
             Self::TurnPostTurn => "turn.post_turn",
             Self::TurnPreCompaction => "turn.pre_compaction",
             Self::Custom(kind) => kind.as_str(),
@@ -45,6 +47,7 @@ impl From<HookPhase> for HookInputKind {
             HookPhase::TurnPreToolMaterialization => Self::TurnPreToolMaterialization,
             HookPhase::TurnPrePromptCompile => Self::TurnPrePromptCompile,
             HookPhase::TurnPostPromptCompile => Self::TurnPostPromptCompile,
+            HookPhase::RuntimeTurnPreContext => Self::RuntimeTurnPreContext,
             HookPhase::TurnPostTurn => Self::TurnPostTurn,
             HookPhase::TurnPreCompaction => Self::TurnPreCompaction,
         }
@@ -60,6 +63,7 @@ impl From<&str> for HookInputKind {
             "turn.pre_tool_materialization" => Self::TurnPreToolMaterialization,
             "turn.pre_prompt_compile" => Self::TurnPrePromptCompile,
             "turn.post_prompt_compile" => Self::TurnPostPromptCompile,
+            "runtime.turn_pre_context" => Self::RuntimeTurnPreContext,
             "turn.post_turn" => Self::TurnPostTurn,
             "turn.pre_compaction" => Self::TurnPreCompaction,
             other => Self::Custom(other.to_owned()),
@@ -76,6 +80,7 @@ impl From<String> for HookInputKind {
             "turn.pre_tool_materialization" => Self::TurnPreToolMaterialization,
             "turn.pre_prompt_compile" => Self::TurnPrePromptCompile,
             "turn.post_prompt_compile" => Self::TurnPostPromptCompile,
+            "runtime.turn_pre_context" => Self::RuntimeTurnPreContext,
             "turn.post_turn" => Self::TurnPostTurn,
             "turn.pre_compaction" => Self::TurnPreCompaction,
             _ => Self::Custom(value),
@@ -179,6 +184,13 @@ impl HookInput {
             payload: HookInputPayload::TurnPreCompaction(payload),
         }
     }
+
+    pub fn runtime_turn_pre_context(payload: RuntimeTurnPreContextHookInput) -> Self {
+        Self {
+            kind: HookInputKind::RuntimeTurnPreContext,
+            payload: HookInputPayload::RuntimeTurnPreContext(payload),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -192,6 +204,7 @@ pub enum HookInputPayload {
     TurnPrePromptCompile(TurnPrePromptCompileHookInput),
     TurnPostTurn(TurnPostTurnHookInput),
     TurnPreCompaction(TurnPreCompactionHookInput),
+    RuntimeTurnPreContext(RuntimeTurnPreContextHookInput),
     Custom(HookValue),
 }
 
@@ -326,6 +339,38 @@ impl TurnPrePromptCompileHookInput {
         Self {
             provider_tool_calling,
             available_tool_names,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeTurnPreContextHookInput {
+    pub runtime_kind: String,
+    pub runtime_id: String,
+    pub input_text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selected_capabilities: Vec<String>,
+}
+
+impl RuntimeTurnPreContextHookInput {
+    pub fn from_parts(
+        runtime_kind: impl Into<String>,
+        runtime_id: impl Into<String>,
+        input_text: impl Into<String>,
+        model: Option<impl Into<String>>,
+        mut selected_capabilities: Vec<String>,
+    ) -> Self {
+        selected_capabilities.sort();
+        selected_capabilities.dedup();
+
+        Self {
+            runtime_kind: runtime_kind.into(),
+            runtime_id: runtime_id.into(),
+            input_text: input_text.into(),
+            model: model.map(Into::into),
+            selected_capabilities,
         }
     }
 }
@@ -935,6 +980,42 @@ mod tests {
             hook_input.payload,
             HookInputPayload::TurnPrePromptCompile(input)
         );
+    }
+
+    #[test]
+    fn runtime_turn_pre_context_input_roundtrips_and_sorts_capabilities() {
+        let input = RuntimeTurnPreContextHookInput::from_parts(
+            "codex",
+            "codex-default",
+            "turn text",
+            Some("gpt-5-codex"),
+            vec![
+                "skill:rust".to_owned(),
+                "skill:rust".to_owned(),
+                "mcp:fs".to_owned(),
+            ],
+        );
+
+        assert_eq!(
+            input.selected_capabilities,
+            vec!["mcp:fs".to_owned(), "skill:rust".to_owned()]
+        );
+
+        let hook_input = HookInput::runtime_turn_pre_context(input.clone());
+        assert_eq!(hook_input.kind, HookInputKind::RuntimeTurnPreContext);
+        assert_eq!(
+            hook_input.payload,
+            HookInputPayload::RuntimeTurnPreContext(input.clone())
+        );
+        assert_eq!(
+            HookInputKind::from(HookPhase::RuntimeTurnPreContext),
+            HookInputKind::RuntimeTurnPreContext
+        );
+
+        let value = serde_json::to_value(&input).expect("runtime context input serializes");
+        let decoded: RuntimeTurnPreContextHookInput =
+            serde_json::from_value(value).expect("runtime context input deserializes");
+        assert_eq!(decoded, input);
     }
 
     #[test]

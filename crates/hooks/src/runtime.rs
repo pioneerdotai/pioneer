@@ -2128,6 +2128,7 @@ fn recoverable_background_input_snapshot(
         | HookInputPayload::TurnPreToolMaterialization(_)
         | HookInputPayload::TurnPrePromptCompile(_)
         | HookInputPayload::TurnPreCompaction(_)
+        | HookInputPayload::RuntimeTurnPreContext(_)
         | HookInputPayload::Custom(_) => None,
     }
 }
