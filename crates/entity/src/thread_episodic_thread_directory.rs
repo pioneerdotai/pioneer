@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: String,
+    #[sea_orm(unique_key = "uidx_thread_episodic_thread_directory_thread")]
     pub workspace_id: String,
+    #[sea_orm(unique_key = "uidx_thread_episodic_thread_directory_thread")]
     pub thread_id: String,
     pub title: Option<String>,
     pub summary_hash: Option<String>,
