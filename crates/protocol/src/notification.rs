@@ -2,14 +2,17 @@ use crate::constants::events;
 use crate::{
     ArtifactCreatedNotification, ArtifactDeletedNotification, ArtifactDownloadProgressNotification,
     ArtifactProjectionUpdatedNotification, ArtifactUpdatedNotification,
-    ArtifactUploadProgressNotification, ContextCompressedNotification,
-    ContextCompressingNotification, ItemCompletedNotification, ItemDeltaNotification,
-    ItemDeltaStream, ItemRecoveryAttachedNotification, ItemRecoveryExhaustedNotification,
-    ItemRecoveryOpenedNotification, ItemRecoverySucceededNotification,
-    ItemRetryAttemptStartedNotification, ItemRetryScheduledNotification, ItemStartedNotification,
-    ItemTimeoutDetectedNotification, ItemToolRetryExhaustedNotification,
-    ItemToolRetryResolvedNotification, ItemToolRetryScheduledNotification, ItemUpdatedNotification,
-    JsonRpcNotification, McpChangedNotification, McpServerCatalogChangedNotification,
+    ArtifactUploadProgressNotification, CLIRuntimeAccountUpdatedNotification,
+    CLIRuntimeAppsChangedNotification, CLIRuntimeRequestOpenedNotification,
+    CLIRuntimeRequestResolvedNotification, CLIRuntimeStatusChangedNotification,
+    ContextCompressedNotification, ContextCompressingNotification, ItemCompletedNotification,
+    ItemDeltaNotification, ItemDeltaStream, ItemRecoveryAttachedNotification,
+    ItemRecoveryExhaustedNotification, ItemRecoveryOpenedNotification,
+    ItemRecoverySucceededNotification, ItemRetryAttemptStartedNotification,
+    ItemRetryScheduledNotification, ItemStartedNotification, ItemTimeoutDetectedNotification,
+    ItemToolRetryExhaustedNotification, ItemToolRetryResolvedNotification,
+    ItemToolRetryScheduledNotification, ItemUpdatedNotification, JsonRpcNotification,
+    McpChangedNotification, McpServerCatalogChangedNotification,
     McpServerStatusChangedNotification, MemoryCandidateCreatedNotification,
     MemoryChangedNotification, MemoryForgottenNotification, SkillsChangedNotification,
     SkillsUploadChunkAckNotification, TaskCancelledNotification, TaskCompletedNotification,
@@ -126,6 +129,11 @@ pub enum GatewayNotification {
     MemoryChanged(MemoryChangedNotification),
     MemoryCandidateCreated(MemoryCandidateCreatedNotification),
     MemoryForgotten(MemoryForgottenNotification),
+    CLIRuntimeStatusChanged(CLIRuntimeStatusChangedNotification),
+    CLIRuntimeAccountUpdated(CLIRuntimeAccountUpdatedNotification),
+    CLIRuntimeRequestOpened(CLIRuntimeRequestOpenedNotification),
+    CLIRuntimeRequestResolved(CLIRuntimeRequestResolvedNotification),
+    CLIRuntimeAppsChanged(CLIRuntimeAppsChangedNotification),
     Unknown(UnknownGatewayNotification),
 }
 
@@ -342,6 +350,33 @@ impl GatewayNotification {
                     .ok()
                     .map(Self::McpServerCatalogChanged)
             }
+            events::CLI_RUNTIME_STATUS_CHANGED => parse_cli_runtime_notification::<
+                CLIRuntimeStatusChangedNotification,
+            >(
+                method, params, Self::CLIRuntimeStatusChanged
+            ),
+            events::CLI_RUNTIME_ACCOUNT_UPDATED => parse_cli_runtime_notification::<
+                CLIRuntimeAccountUpdatedNotification,
+            >(
+                method, params, Self::CLIRuntimeAccountUpdated
+            ),
+            events::CLI_RUNTIME_REQUEST_OPENED => parse_cli_runtime_notification::<
+                CLIRuntimeRequestOpenedNotification,
+            >(
+                method, params, Self::CLIRuntimeRequestOpened
+            ),
+            events::CLI_RUNTIME_REQUEST_RESOLVED => {
+                parse_cli_runtime_notification::<CLIRuntimeRequestResolvedNotification>(
+                    method,
+                    params,
+                    Self::CLIRuntimeRequestResolved,
+                )
+            }
+            events::CLI_RUNTIME_APPS_CHANGED => parse_cli_runtime_notification::<
+                CLIRuntimeAppsChangedNotification,
+            >(
+                method, params, Self::CLIRuntimeAppsChanged
+            ),
             events::ARTIFACT_CREATED => {
                 serde_json::from_value::<ArtifactCreatedNotification>(params)
                     .ok()
@@ -502,6 +537,7 @@ impl GatewayNotification {
                 || method.starts_with("memory/")
                 || method.starts_with("workspace/")
                 || method.starts_with("artifact/")
+                || method.starts_with("cli_runtime/")
                 || method.starts_with("thread/artifacts_") =>
             {
                 Some(Self::Unknown(unknown_notification(method, params)))
@@ -540,6 +576,22 @@ fn unknown_notification(method: String, params: JsonValue) -> UnknownGatewayNoti
         turn_id,
         item_id,
         params,
+    }
+}
+
+fn parse_cli_runtime_notification<T>(
+    method: String,
+    params: JsonValue,
+    wrap: impl FnOnce(T) -> GatewayNotification,
+) -> Option<GatewayNotification>
+where
+    T: DeserializeOwned,
+{
+    match serde_json::from_value::<T>(params.clone()) {
+        Ok(notification) => Some(wrap(notification)),
+        Err(_) => Some(GatewayNotification::Unknown(unknown_notification(
+            method, params,
+        ))),
     }
 }
 
@@ -594,6 +646,7 @@ fn extract_workspace_thread_turn_item(
 #[cfg(test)]
 mod tests {
     use super::GatewayNotification;
+    use crate::constants::events;
     use crate::{
         ExecutionWindowExhaustionReason, ExecutionWindowStatus, ItemDeltaStream,
         JsonRpcNotification, MemoryCandidateCreatedNotification, MemoryChangedNotification,
@@ -602,6 +655,37 @@ mod tests {
         ToolRetryExhaustionKind, ToolRetryResolution, TurnItemType, WorkspaceChangeKind,
     };
     use serde_json::json;
+
+    fn cli_runtime_summary_json() -> serde_json::Value {
+        json!({
+            "runtime_id": "codex_personal",
+            "kind": "codex",
+            "display_name": "Codex Personal",
+            "enabled": true,
+            "status": { "state": "ready" },
+            "capabilities": {
+                "supports_threads": true,
+                "supports_resume": true,
+                "supports_fork": true,
+                "supports_steer": true,
+                "supports_interrupt": true,
+                "supports_approvals": true,
+                "supports_file_change_approvals": true,
+                "supports_command_approvals": true,
+                "supports_user_input_requests": true,
+                "supports_model_list": true,
+                "supports_apps": false,
+                "supports_review": true,
+                "supports_compaction": true,
+                "supports_goal": true,
+                "supports_diff_updates": true,
+                "supports_history_read": true,
+                "supports_thread_archive": true,
+                "supports_auth_management": true,
+                "supports_generated_schema_probe": true
+            }
+        })
+    }
 
     #[test]
     fn maps_known_notification() {
@@ -717,6 +801,117 @@ mod tests {
             mapped,
             GatewayNotification::MemoryForgotten(MemoryForgottenNotification { .. })
         ));
+    }
+
+    #[test]
+    fn maps_cli_runtime_notifications() {
+        let status_changed = JsonRpcNotification::from_params(
+            events::CLI_RUNTIME_STATUS_CHANGED,
+            &json!({
+                "workspace_id": "ws_1",
+                "runtime": cli_runtime_summary_json(),
+                "future_status_field": { "ignored": true }
+            }),
+        )
+        .expect("status notification should encode");
+        match GatewayNotification::from_jsonrpc(status_changed).expect("status should map") {
+            GatewayNotification::CLIRuntimeStatusChanged(notification) => {
+                assert_eq!(notification.workspace_id, "ws_1");
+                assert_eq!(notification.runtime.runtime_id, "codex_personal");
+            }
+            other => panic!("expected cli runtime status notification, got {other:?}"),
+        }
+
+        let account_updated = JsonRpcNotification::from_params(
+            events::CLI_RUNTIME_ACCOUNT_UPDATED,
+            &json!({
+                "workspace_id": "ws_1",
+                "runtime_id": "codex_personal",
+                "kind": "codex",
+                "account": {
+                    "authenticated": true,
+                    "email": "user@example.com"
+                },
+                "status": { "state": "ready" }
+            }),
+        )
+        .expect("account notification should encode");
+        assert!(matches!(
+            GatewayNotification::from_jsonrpc(account_updated).expect("account should map"),
+            GatewayNotification::CLIRuntimeAccountUpdated(_)
+        ));
+
+        let request_opened = JsonRpcNotification::from_params(
+            events::CLI_RUNTIME_REQUEST_OPENED,
+            &json!({
+                "workspace_id": "ws_1",
+                "runtime_id": "codex_personal",
+                "request_id": "req_1",
+                "thread_id": "thread_1",
+                "turn_id": "turn_1",
+                "request": {
+                    "kind": "command_approval",
+                    "title": "Run command",
+                    "payload": { "command": "cargo check" }
+                }
+            }),
+        )
+        .expect("request opened notification should encode");
+        assert!(matches!(
+            GatewayNotification::from_jsonrpc(request_opened).expect("request opened should map"),
+            GatewayNotification::CLIRuntimeRequestOpened(_)
+        ));
+
+        let request_resolved = JsonRpcNotification::from_params(
+            events::CLI_RUNTIME_REQUEST_RESOLVED,
+            &json!({
+                "workspace_id": "ws_1",
+                "runtime_id": "codex_personal",
+                "request_id": "req_1",
+                "resolution": { "status": "approved" }
+            }),
+        )
+        .expect("request resolved notification should encode");
+        assert!(matches!(
+            GatewayNotification::from_jsonrpc(request_resolved)
+                .expect("request resolved should map"),
+            GatewayNotification::CLIRuntimeRequestResolved(_)
+        ));
+
+        let apps_changed = JsonRpcNotification::from_params(
+            events::CLI_RUNTIME_APPS_CHANGED,
+            &json!({
+                "workspace_id": "ws_1",
+                "runtime_id": "codex_personal",
+                "apps": []
+            }),
+        )
+        .expect("apps notification should encode");
+        assert!(matches!(
+            GatewayNotification::from_jsonrpc(apps_changed).expect("apps should map"),
+            GatewayNotification::CLIRuntimeAppsChanged(_)
+        ));
+    }
+
+    #[test]
+    fn maps_future_cli_runtime_notification_to_unknown() {
+        let notification = JsonRpcNotification::from_params(
+            "cli_runtime/generated_schema_probe",
+            &json!({
+                "workspace_id": "ws_1",
+                "runtime_id": "codex_personal",
+                "payload": { "future": true }
+            }),
+        )
+        .expect("future notification should encode");
+
+        match GatewayNotification::from_jsonrpc(notification).expect("future event should map") {
+            GatewayNotification::Unknown(notification) => {
+                assert_eq!(notification.method, "cli_runtime/generated_schema_probe");
+                assert_eq!(notification.workspace_id.as_deref(), Some("ws_1"));
+            }
+            other => panic!("expected unknown cli runtime notification, got {other:?}"),
+        }
     }
 
     #[test]

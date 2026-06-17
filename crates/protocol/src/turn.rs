@@ -332,7 +332,56 @@ pub struct TurnStartParams {
     pub sandbox_policy: Option<SandboxPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<ThreadMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_backend: Option<AgentExecutionBackend>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_runtime_options: Option<TurnCLIRuntimeOptions>,
 }
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "type")]
+pub enum AgentExecutionBackend {
+    #[serde(rename = "apiProvider")]
+    ApiProvider { provider: String },
+    #[serde(rename = "cliAgentRuntime")]
+    CLIAgentRuntime {
+        runtime_id: String,
+        runtime_kind: CLIAgentRuntimeKind,
+    },
+    #[serde(rename = "acpAgentRuntime")]
+    ACPAgentRuntime { runtime_id: String },
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CLIAgentRuntimeKind {
+    Codex,
+    Claude,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+pub struct TurnCLIRuntimeOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_policy: Option<CLIAgentRuntimeApprovalPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<CLIAgentRuntimeSandboxPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub personality: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steer_if_active: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct CLIAgentRuntimeApprovalPolicy(pub String);
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(transparent)]
+pub struct CLIAgentRuntimeSandboxPolicy(pub JsonValue);
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -805,6 +854,7 @@ pub enum PromptManifestProfile {
     AssistantFull,
     AssistantMinimal,
     AssistantNone,
+    CliRuntimeCodex,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
@@ -884,6 +934,7 @@ pub enum PromptManifestHookPhase {
     TurnPrePromptContext,
     TurnPostPreflightPromptContext,
     TurnPrePromptCompile,
+    RuntimeTurnPreContext,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
@@ -1904,6 +1955,21 @@ impl ToolOutputPolicySnapshot {
             _ => dynamic_unknown_output_policy_snapshot(),
         }
     }
+
+    pub fn for_external_runtime_tool_name(tool_name: &str) -> Self {
+        match tool_name {
+            "exec_command" | "write_stdin" => shell_output_policy_snapshot(),
+            "web_fetch" => web_fetch_output_policy_snapshot(),
+            "web_search" => web_search_output_policy_snapshot(),
+            "download_url" | "download" => download_output_policy_snapshot(),
+            "computer_use" => computer_use_output_policy_snapshot(),
+            "artifact_prepare" | "artifact_register" | "read_file" | "list_dir" | "grep_files"
+            | "apply_patch" | "write_file" | "edit_file" | "tool_search" | "tool_suggest" => {
+                model_only_metadata_policy_snapshot()
+            }
+            _ => external_runtime_tool_output_policy_snapshot(),
+        }
+    }
 }
 
 const DEFAULT_LLM_MAX_BYTES: usize = 2 * 1024 * 1024;
@@ -2023,6 +2089,21 @@ fn computer_use_output_policy_snapshot() -> ToolOutputPolicySnapshot {
         },
         storage: StorageOutputPolicy::MetadataOnly,
         recovery: evidence_recovery_policy(DiagnosticExcerptPolicy::Disabled),
+        deltas: DeltaOutputPolicy::ProgressOnly,
+    }
+}
+
+fn external_runtime_tool_output_policy_snapshot() -> ToolOutputPolicySnapshot {
+    ToolOutputPolicySnapshot {
+        llm: LlmOutputPolicy::Structured {
+            max_bytes: DEFAULT_LLM_MAX_BYTES,
+        },
+        llm_retention: retained_llm_policy(),
+        timeline: TimelineOutputPolicy::Summary {
+            max_chars: DEFAULT_SUMMARY_CHARS,
+        },
+        storage: StorageOutputPolicy::MetadataOnly,
+        recovery: RecoveryOutputPolicy::MetadataOnly,
         deltas: DeltaOutputPolicy::ProgressOnly,
     }
 }
@@ -2392,6 +2473,20 @@ pub struct TurnMcpToolCapabilitySummary {
     pub scope_kind: McpScopeKind,
 }
 
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentMessagePhase {
+    #[default]
+    FinalAnswer,
+    Commentary,
+}
+
+impl AgentMessagePhase {
+    pub fn is_final_answer(&self) -> bool {
+        matches!(self, Self::FinalAnswer)
+    }
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum TurnItem {
@@ -2406,6 +2501,8 @@ pub enum TurnItem {
     AgentMessage {
         id: String,
         text: String,
+        #[serde(default, skip_serializing_if = "AgentMessagePhase::is_final_answer")]
+        phase: AgentMessagePhase,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         markdown: Option<MarkdownDocument>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3361,6 +3458,7 @@ mod tests {
             TurnItem::AgentMessage {
                 id: "agent_1".to_owned(),
                 text: "visible".to_owned(),
+                phase: Default::default(),
                 markdown: None,
                 markdown_version: None,
             },
@@ -3497,6 +3595,122 @@ mod tests {
             params.input.first(),
             Some(UserInput::Text { text, .. }) if text == "hello"
         ));
+        assert!(params.execution_backend.is_none());
+        assert!(params.cli_runtime_options.is_none());
+    }
+
+    #[test]
+    fn turn_start_params_round_trips_api_provider_execution_backend() {
+        let params: TurnStartParams = serde_json::from_value(json!({
+            "thread_id": "thr_123",
+            "turn_id": "turn_123",
+            "execution_backend": {
+                "type": "apiProvider",
+                "provider": "openai"
+            }
+        }))
+        .expect("params should decode");
+
+        assert_eq!(
+            params.execution_backend,
+            Some(AgentExecutionBackend::ApiProvider {
+                provider: "openai".to_owned()
+            })
+        );
+
+        let encoded = serde_json::to_value(params).expect("params should encode");
+        assert_eq!(
+            encoded["execution_backend"],
+            json!({
+                "type": "apiProvider",
+                "provider": "openai"
+            })
+        );
+    }
+
+    #[test]
+    fn turn_start_params_round_trips_cli_agent_runtime_execution_backend() {
+        let params: TurnStartParams = serde_json::from_value(json!({
+            "thread_id": "thr_123",
+            "turn_id": "turn_123",
+            "execution_backend": {
+                "type": "cliAgentRuntime",
+                "runtime_id": "codex_personal",
+                "runtime_kind": "codex"
+            },
+            "cli_runtime_options": {
+                "approval_policy": "unlessTrusted",
+                "sandbox": {
+                    "type": "workspaceWrite",
+                    "networkAccess": false
+                },
+                "effort": "medium",
+                "personality": "friendly",
+                "summary": "concise",
+                "steer_if_active": true
+            }
+        }))
+        .expect("params should decode");
+
+        assert_eq!(
+            params.execution_backend,
+            Some(AgentExecutionBackend::CLIAgentRuntime {
+                runtime_id: "codex_personal".to_owned(),
+                runtime_kind: CLIAgentRuntimeKind::Codex
+            })
+        );
+        let options = params
+            .cli_runtime_options
+            .as_ref()
+            .expect("cli options should decode");
+        assert_eq!(
+            options
+                .approval_policy
+                .as_ref()
+                .map(|policy| policy.0.as_str()),
+            Some("unlessTrusted")
+        );
+        assert_eq!(options.effort.as_deref(), Some("medium"));
+        assert_eq!(options.personality.as_deref(), Some("friendly"));
+        assert_eq!(options.summary.as_deref(), Some("concise"));
+        assert_eq!(options.steer_if_active, Some(true));
+
+        let encoded = serde_json::to_value(params).expect("params should encode");
+        assert_eq!(
+            encoded["execution_backend"],
+            json!({
+                "type": "cliAgentRuntime",
+                "runtime_id": "codex_personal",
+                "runtime_kind": "codex"
+            })
+        );
+        assert_eq!(
+            encoded["cli_runtime_options"]["sandbox"],
+            json!({
+                "type": "workspaceWrite",
+                "networkAccess": false
+            })
+        );
+    }
+
+    #[test]
+    fn turn_start_params_round_trips_future_acp_execution_backend() {
+        let params: TurnStartParams = serde_json::from_value(json!({
+            "thread_id": "thr_123",
+            "turn_id": "turn_123",
+            "execution_backend": {
+                "type": "acpAgentRuntime",
+                "runtime_id": "acp_local"
+            }
+        }))
+        .expect("params should decode");
+
+        assert_eq!(
+            params.execution_backend,
+            Some(AgentExecutionBackend::ACPAgentRuntime {
+                runtime_id: "acp_local".to_owned()
+            })
+        );
     }
 
     #[test]
@@ -3512,6 +3726,8 @@ mod tests {
             model_provider: None,
             sandbox_policy: None,
             mode: None,
+            execution_backend: None,
+            cli_runtime_options: None,
         };
 
         let encoded = serde_json::to_value(params).expect("params should encode");
@@ -3592,6 +3808,8 @@ mod tests {
             model_provider: None,
             sandbox_policy: None,
             mode: None,
+            execution_backend: None,
+            cli_runtime_options: None,
         };
 
         let encoded = serde_json::to_value(params).expect("params should encode");
@@ -3879,6 +4097,26 @@ mod tests {
     }
 
     #[test]
+    fn external_runtime_tool_policy_keeps_timeline_summary_without_raw_storage() {
+        let snapshot =
+            ToolOutputPolicySnapshot::for_external_runtime_tool_name("external:custom-action");
+        assert!(matches!(
+            &snapshot.timeline,
+            TimelineOutputPolicy::Summary { .. }
+        ));
+        assert_eq!(snapshot.storage, StorageOutputPolicy::MetadataOnly);
+        assert_eq!(snapshot.recovery, RecoveryOutputPolicy::MetadataOnly);
+        assert_eq!(snapshot.deltas, DeltaOutputPolicy::ProgressOnly);
+
+        let unknown_snapshot = ToolOutputPolicySnapshot::for_tool_name("external:custom-action");
+        assert_eq!(
+            unknown_snapshot.timeline,
+            TimelineOutputPolicy::MetadataOnly
+        );
+        assert_eq!(unknown_snapshot.storage, StorageOutputPolicy::MetadataOnly);
+    }
+
+    #[test]
     fn tool_display_and_storage_payloads_round_trip() {
         let display = ToolDisplayPayload::Summary(ToolOutputSummary {
             title: "Read crates/tools/src/runtime.rs".to_owned(),
@@ -4012,14 +4250,23 @@ mod tests {
         let item = TurnItem::AgentMessage {
             id: "agent_1".to_owned(),
             text: "done".to_owned(),
+            phase: Default::default(),
             markdown: None,
             markdown_version: None,
         };
 
         let value = serde_json::to_value(&item).expect("agent item should serialize");
         assert!(value.get("recoveryPolicy").is_none());
+        assert!(
+            value.get("phase").is_none(),
+            "default final_answer phase should preserve the legacy wire shape"
+        );
         let decoded: TurnItem = serde_json::from_value(value).expect("agent item should decode");
         assert_eq!(decoded.recovery_policy(), None);
+        let TurnItem::AgentMessage { phase, .. } = decoded else {
+            panic!("expected agent message");
+        };
+        assert_eq!(phase, AgentMessagePhase::FinalAnswer);
     }
 
     fn sample_snapshot() -> ToolRecoveryPolicySnapshot {

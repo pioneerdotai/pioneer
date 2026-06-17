@@ -1,0 +1,12 @@
+{
+  "thread_id": "thr_legacy_api",
+  "turn_id": "turn_legacy_api",
+  "input": [
+    {
+      "type": "text",
+      "text": "hello from a legacy api-provider client"
+    }
+  ],
+  "model": "gpt-5.4",
+  "model_provider": "openai"
+}

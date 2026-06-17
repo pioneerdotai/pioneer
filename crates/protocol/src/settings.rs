@@ -1,6 +1,8 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::turn::CLIAgentRuntimeKind;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct GatewaySettingsGetParams {}
 
@@ -17,6 +19,8 @@ pub struct GatewaySettingsUpdate {
     pub memory: Option<GatewayMemorySettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_episodic: Option<GatewayThreadEpisodicSettingsUpdate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_runtimes: Option<GatewayCliRuntimeSettings>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -44,6 +48,8 @@ pub struct GatewaySettingsSnapshot {
     pub memory: GatewayMemorySettings,
     #[serde(default)]
     pub thread_episodic: GatewayThreadEpisodicSettings,
+    #[serde(default)]
+    pub cli_runtimes: GatewayCliRuntimeSettings,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -135,6 +141,24 @@ impl Default for GatewayThreadEpisodicSettings {
             near_capacity_percent: 90.0,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GatewayCliRuntimeSettings {
+    #[serde(default)]
+    pub instances: Vec<GatewayCliRuntimeInstanceSettings>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GatewayCliRuntimeInstanceSettings {
+    pub id: String,
+    pub kind: CLIAgentRuntimeKind,
+    pub display_name: String,
+    pub enabled: bool,
+    pub binary_path: String,
+    pub home_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_home_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -275,10 +299,11 @@ fn normalized_optional_model_selection_text(value: Option<&str>, max_len: usize)
 #[cfg(test)]
 mod tests {
     use super::{
-        GatewayGeneralSettings, GatewayGeneralSettingsUpdate, GatewayMemoryModelSelection,
-        GatewaySettingsSnapshot, GatewaySettingsUpdate, GatewayThreadEpisodicSettings,
-        GatewayThreadEpisodicSettingsUpdate,
+        GatewayCliRuntimeInstanceSettings, GatewayCliRuntimeSettings, GatewayGeneralSettings,
+        GatewayGeneralSettingsUpdate, GatewayMemoryModelSelection, GatewaySettingsSnapshot,
+        GatewaySettingsUpdate, GatewayThreadEpisodicSettings, GatewayThreadEpisodicSettingsUpdate,
     };
+    use crate::turn::CLIAgentRuntimeKind;
 
     #[test]
     fn settings_general_defaults_to_thread_preflight_model() {
@@ -336,11 +361,24 @@ mod tests {
                 max_attempts: 3,
                 near_capacity_percent: 85.0,
             },
+            cli_runtimes: GatewayCliRuntimeSettings {
+                instances: vec![GatewayCliRuntimeInstanceSettings {
+                    id: "codex_work".to_owned(),
+                    kind: CLIAgentRuntimeKind::Codex,
+                    display_name: "Codex Work".to_owned(),
+                    enabled: true,
+                    binary_path: "codex".to_owned(),
+                    home_path: "~/.codex".to_owned(),
+                    shadow_home_path: Some("~/.pioneer/codex-work".to_owned()),
+                }],
+            },
         };
 
         let serialized = serde_json::to_string(&snapshot).expect("snapshot should serialize");
         assert!(serialized.contains("thread_episodic"));
         assert!(serialized.contains("indexing_enabled"));
+        assert!(serialized.contains("cli_runtimes"));
+        assert!(serialized.contains("codex_work"));
 
         let roundtrip: GatewaySettingsSnapshot =
             serde_json::from_str(serialized.as_str()).expect("snapshot should deserialize");
@@ -355,14 +393,27 @@ mod tests {
                 recall_enabled: Some(false),
                 ..GatewayThreadEpisodicSettingsUpdate::default()
             }),
+            cli_runtimes: Some(GatewayCliRuntimeSettings {
+                instances: vec![GatewayCliRuntimeInstanceSettings {
+                    id: "codex_personal".to_owned(),
+                    kind: CLIAgentRuntimeKind::Codex,
+                    display_name: "Codex Personal".to_owned(),
+                    enabled: false,
+                    binary_path: "/opt/homebrew/bin/codex".to_owned(),
+                    home_path: "~/.codex-personal".to_owned(),
+                    shadow_home_path: None,
+                }],
+            }),
             ..GatewaySettingsUpdate::default()
         };
 
         let serialized = serde_json::to_string(&update).expect("settings update should serialize");
         assert!(serialized.contains("thread_episodic"));
+        assert!(serialized.contains("cli_runtimes"));
 
         let roundtrip: GatewaySettingsUpdate =
             serde_json::from_str(serialized.as_str()).expect("settings update should deserialize");
         assert_eq!(roundtrip.thread_episodic, update.thread_episodic);
+        assert_eq!(roundtrip.cli_runtimes, update.cli_runtimes);
     }
 }

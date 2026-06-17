@@ -25,18 +25,34 @@ use crate::artifact::{
 };
 
 use crate::{
-    AgentDurableEvent, AgentProgressEvent, ByteRange, ContextCompressedNotification,
-    ContextCompressingNotification, DurableEventCausalityKey,
+    AgentDurableEvent, AgentExecutionBackend, AgentMessagePhase, AgentProgressEvent, ByteRange,
+    CLIAgentRuntimeApprovalPolicy, CLIAgentRuntimeKind, CLIAgentRuntimeSandboxPolicy,
+    CLIRuntimeAccountUpdatedNotification, CLIRuntimeAppsChangedNotification, CLIRuntimeGetParams,
+    CLIRuntimeGetResponse, CLIRuntimeListModelsParams, CLIRuntimeListModelsResponse,
+    CLIRuntimeListParams, CLIRuntimeListResponse, CLIRuntimeLoginCancelParams,
+    CLIRuntimeLoginCancelResponse, CLIRuntimeLoginStartParams, CLIRuntimeLoginStartResponse,
+    CLIRuntimeLoginStartType, CLIRuntimePendingRequest, CLIRuntimePendingRequestStatus,
+    CLIRuntimeRefreshParams, CLIRuntimeRefreshResponse, CLIRuntimeRequestKind,
+    CLIRuntimeRequestOpenedNotification, CLIRuntimeRequestResolution,
+    CLIRuntimeRequestResolvedNotification, CLIRuntimeRequestRespondParams,
+    CLIRuntimeRequestRespondResponse, CLIRuntimeReviewDelivery, CLIRuntimeReviewStartParams,
+    CLIRuntimeReviewStartResponse, CLIRuntimeReviewTarget, CLIRuntimeStatusChangedNotification,
+    CLIRuntimeStatusParams, CLIRuntimeStatusResponse, CLIRuntimeThreadBinding,
+    CLIRuntimeThreadBindingGetParams, CLIRuntimeThreadBindingGetResponse,
+    CLIRuntimeThreadCompactParams, CLIRuntimeThreadCompactResponse, CLIRuntimeThreadForkParams,
+    CLIRuntimeThreadForkResponse, CLIRuntimeTurnSteerParams, CLIRuntimeTurnSteerResponse,
+    ContextCompressedNotification, ContextCompressingNotification, DurableEventCausalityKey,
     ExecutionCheckpointOriginalRequestSummary, ExecutionCheckpointPayload,
     ExecutionCheckpointProviderBudgetSummary, ExecutionCheckpointStrictObligation,
     ExecutionCheckpointToolCallSummary, ExecutionCheckpointToolSummary,
     ExecutionCheckpointWindowSummary, ExecutionWindowExhaustionReason, ExecutionWindowStatus,
-    GatewayGeneralSettings, GatewayGeneralSettingsUpdate, GatewayMemoryModelSelection,
-    GatewayMemoryModelSelectionSource, GatewayMemorySettings, GatewayNotification,
-    GatewaySettingsGetParams, GatewaySettingsGetResponse, GatewaySettingsSnapshot,
-    GatewaySettingsUpdate, GatewaySettingsUpdateParams, GatewaySettingsUpdateResponse,
-    GatewayThreadEpisodicSettings, GatewayThreadEpisodicSettingsUpdate, ItemCompletedNotification,
-    ItemDeltaNotification, ItemRecoveryAttachedNotification, ItemRecoveryExhaustedNotification,
+    GatewayCliRuntimeInstanceSettings, GatewayCliRuntimeSettings, GatewayGeneralSettings,
+    GatewayGeneralSettingsUpdate, GatewayMemoryModelSelection, GatewayMemoryModelSelectionSource,
+    GatewayMemorySettings, GatewayNotification, GatewaySettingsGetParams,
+    GatewaySettingsGetResponse, GatewaySettingsSnapshot, GatewaySettingsUpdate,
+    GatewaySettingsUpdateParams, GatewaySettingsUpdateResponse, GatewayThreadEpisodicSettings,
+    GatewayThreadEpisodicSettingsUpdate, ItemCompletedNotification, ItemDeltaNotification,
+    ItemRecoveryAttachedNotification, ItemRecoveryExhaustedNotification,
     ItemRecoveryOpenedNotification, ItemRecoverySucceededNotification,
     ItemRetryAttemptStartedNotification, ItemRetryScheduledNotification, ItemStartedNotification,
     ItemTimeoutDetectedNotification, ItemToolRetryExhaustedNotification,
@@ -80,28 +96,30 @@ use crate::{
     ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse, ProviderFailureClass,
     ProviderFailureDetails, ProviderFailureStage, ProviderListModelsParams,
     ProviderListModelsResponse, ProviderListParams, ProviderListResponse, ProviderSetApiKeyParams,
-    ProviderSetApiKeyResponse, ProviderTransportKind, SandboxMode, SandboxPolicy,
-    SkillArchiveFormat, SkillAuditTimelineItem, SkillChangedItem, SkillDependencyDiagnostic,
-    SkillHealthItem, SkillHealthSummary, SkillHealthTarget, SkillInstallState,
-    SkillLifecycleAuditSummary, SkillLifecycleResultSkill, SkillLifecycleSource, SkillListItem,
-    SkillListParams, SkillListResponse, SkillPolicyState, SkillSecurityFinding,
-    SkillTrustGateStatus, SkillWorkspacePolicy, SkillsChangedNotification, SkillsHealthParams,
-    SkillsHealthResponse, SkillsInstallParams, SkillsInstallResponse, SkillsPolicyListParams,
-    SkillsPolicyListResponse, SkillsPolicySetParams, SkillsPolicySetResponse,
-    SkillsUninstallParams, SkillsUninstallResponse, SkillsUpdateParams, SkillsUpdateResponse,
-    SkillsUploadAbortParams, SkillsUploadAbortResponse, SkillsUploadChunkAckNotification,
-    SkillsUploadChunkHeader, SkillsUploadFinishParams, SkillsUploadFinishResponse,
-    SkillsUploadStartParams, SkillsUploadStartResponse, Task, TaskAcceptParams, TaskAcceptResponse,
-    TaskAgendaItem, TaskAgendaParams, TaskAgendaResponse, TaskAgentContext, TaskAgentContextMode,
-    TaskAgentContextPolicy, TaskAgentInput, TaskAgentInputAttachment, TaskAgentInputAttachmentKind,
-    TaskAgentInputReference, TaskAgentInputReferenceKind, TaskAgentInputVariable, TaskAgentPrompt,
-    TaskAgentResultContract, TaskAgentResultFormat, TaskAgentReviewMode, TaskAgentReviewPolicy,
-    TaskAgentSpec, TaskAgentSpecInput, TaskAgentToolPolicy, TaskAgentWriteMode, TaskArtifact,
-    TaskAttachmentMode, TaskCancelParams, TaskCancelResponse, TaskCancelScope,
-    TaskCancelledNotification, TaskCompletedNotification, TaskCompletionBehavior,
-    TaskConcurrencyConflictPolicy, TaskConcurrencyPolicy, TaskCreateParams, TaskCreateResponse,
-    TaskCreatedNotification, TaskDeliveriesParams, TaskDeliveriesResponse, TaskDelivery,
-    TaskDeliveryAttempt, TaskDeliveryAttemptStatus, TaskDeliveryCancelledNotification,
+    ProviderSetApiKeyResponse, ProviderTransportKind, RuntimeAccountSnapshot, RuntimeAppInfo,
+    RuntimeCapabilities, RuntimeDiagnostic, RuntimeDiagnosticLevel, RuntimeModelInfo,
+    RuntimeStatus, RuntimeSummary, SandboxMode, SandboxPolicy, SkillArchiveFormat,
+    SkillAuditTimelineItem, SkillChangedItem, SkillDependencyDiagnostic, SkillHealthItem,
+    SkillHealthSummary, SkillHealthTarget, SkillInstallState, SkillLifecycleAuditSummary,
+    SkillLifecycleResultSkill, SkillLifecycleSource, SkillListItem, SkillListParams,
+    SkillListResponse, SkillPolicyState, SkillSecurityFinding, SkillTrustGateStatus,
+    SkillWorkspacePolicy, SkillsChangedNotification, SkillsHealthParams, SkillsHealthResponse,
+    SkillsInstallParams, SkillsInstallResponse, SkillsPolicyListParams, SkillsPolicyListResponse,
+    SkillsPolicySetParams, SkillsPolicySetResponse, SkillsUninstallParams, SkillsUninstallResponse,
+    SkillsUpdateParams, SkillsUpdateResponse, SkillsUploadAbortParams, SkillsUploadAbortResponse,
+    SkillsUploadChunkAckNotification, SkillsUploadChunkHeader, SkillsUploadFinishParams,
+    SkillsUploadFinishResponse, SkillsUploadStartParams, SkillsUploadStartResponse, Task,
+    TaskAcceptParams, TaskAcceptResponse, TaskAgendaItem, TaskAgendaParams, TaskAgendaResponse,
+    TaskAgentContext, TaskAgentContextMode, TaskAgentContextPolicy, TaskAgentInput,
+    TaskAgentInputAttachment, TaskAgentInputAttachmentKind, TaskAgentInputReference,
+    TaskAgentInputReferenceKind, TaskAgentInputVariable, TaskAgentPrompt, TaskAgentResultContract,
+    TaskAgentResultFormat, TaskAgentReviewMode, TaskAgentReviewPolicy, TaskAgentSpec,
+    TaskAgentSpecInput, TaskAgentToolPolicy, TaskAgentWriteMode, TaskArtifact, TaskAttachmentMode,
+    TaskCancelParams, TaskCancelResponse, TaskCancelScope, TaskCancelledNotification,
+    TaskCompletedNotification, TaskCompletionBehavior, TaskConcurrencyConflictPolicy,
+    TaskConcurrencyPolicy, TaskCreateParams, TaskCreateResponse, TaskCreatedNotification,
+    TaskDeliveriesParams, TaskDeliveriesResponse, TaskDelivery, TaskDeliveryAttempt,
+    TaskDeliveryAttemptStatus, TaskDeliveryCancelledNotification,
     TaskDeliveryDeliveredNotification, TaskDeliveryFailedNotification, TaskDeliveryFormat,
     TaskDeliveryMode, TaskDeliveryPolicy, TaskDeliveryQueuedNotification,
     TaskDeliveryStartedNotification, TaskDeliveryStatus, TaskDependency, TaskDependencyCondition,
@@ -152,20 +170,20 @@ use crate::{
     ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass,
     ToolRecoveryView, ToolRetryBudgetKind, ToolRetryBudgetUsage, ToolRetryErrorClass,
     ToolRetryExhaustionKind, ToolRetryResolution, ToolStoragePayload, Turn, TurnAcceptedCapability,
-    TurnBlockedNotification, TurnBlockedResumeMetadata, TurnCancelParams, TurnCancelResponse,
-    TurnCapability, TurnCapabilityAcceptedReason, TurnCapabilityKind, TurnCapabilityRejectedReason,
-    TurnCompletedNotification, TurnExecutionWindowBlockedNotification,
-    TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
-    TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification,
-    TurnFailedNotification, TurnGetParams, TurnGetResponse, TurnItem, TurnItemAttemptStatus,
-    TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType, TurnItemsParams,
-    TurnItemsResponse, TurnKind, TurnMcpServerCapabilitySummary, TurnMcpToolCapabilitySummary,
-    TurnOrigin, TurnRejectedCapability, TurnResumeParams, TurnResumeResponse,
-    TurnSkillCapabilitySummary, TurnStartParams, TurnStartResponse, TurnStartedNotification,
-    TurnStatus, TurnStatusChangedNotification, TurnTimelineChangedNotification,
-    TurnTimelineChangedReason, TurnTimelineParams, TurnTimelineResponse,
-    TurnToolLoopBudgetExceededNotification, UnknownGatewayNotification, UserInput, Workspace,
-    WorkspaceChangeKind, WorkspaceChangedNotification, WorkspaceCreateParams,
+    TurnBlockedNotification, TurnBlockedResumeMetadata, TurnCLIRuntimeOptions, TurnCancelParams,
+    TurnCancelResponse, TurnCapability, TurnCapabilityAcceptedReason, TurnCapabilityKind,
+    TurnCapabilityRejectedReason, TurnCompletedNotification,
+    TurnExecutionWindowBlockedNotification, TurnExecutionWindowCheckpointedNotification,
+    TurnExecutionWindowContinuedNotification, TurnExecutionWindowExhaustedNotification,
+    TurnExecutionWindowStartedNotification, TurnFailedNotification, TurnGetParams, TurnGetResponse,
+    TurnItem, TurnItemAttemptStatus, TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason,
+    TurnItemType, TurnItemsParams, TurnItemsResponse, TurnKind, TurnMcpServerCapabilitySummary,
+    TurnMcpToolCapabilitySummary, TurnOrigin, TurnRejectedCapability, TurnResumeParams,
+    TurnResumeResponse, TurnSkillCapabilitySummary, TurnStartParams, TurnStartResponse,
+    TurnStartedNotification, TurnStatus, TurnStatusChangedNotification,
+    TurnTimelineChangedNotification, TurnTimelineChangedReason, TurnTimelineParams,
+    TurnTimelineResponse, TurnToolLoopBudgetExceededNotification, UnknownGatewayNotification,
+    UserInput, Workspace, WorkspaceChangeKind, WorkspaceChangedNotification, WorkspaceCreateParams,
     WorkspaceCreateResponse, WorkspaceDefaultParams, WorkspaceDefaultResponse, WorkspaceListParams,
     WorkspaceListResponse, WorkspaceSelectParams, WorkspaceSelectResponse, WorkspaceUpdateParams,
     WorkspaceUpdateResponse,
@@ -924,6 +942,145 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!("prompt_manifest_profile.json", PromptManifestProfile),
         schema_doc!("turn_status.json", TurnStatus),
         schema_doc!("turn_start_params.json", TurnStartParams),
+        schema_doc!("agent_execution_backend.json", AgentExecutionBackend),
+        schema_doc!("cli_agent_runtime_kind.json", CLIAgentRuntimeKind),
+        schema_doc!(
+            "cli_agent_runtime_approval_policy.json",
+            CLIAgentRuntimeApprovalPolicy
+        ),
+        schema_doc!(
+            "cli_agent_runtime_sandbox_policy.json",
+            CLIAgentRuntimeSandboxPolicy
+        ),
+        schema_doc!("turn_cli_runtime_options.json", TurnCLIRuntimeOptions),
+        schema_doc!("runtime_summary.json", RuntimeSummary),
+        schema_doc!("runtime_status.json", RuntimeStatus),
+        schema_doc!("runtime_model_info.json", RuntimeModelInfo),
+        schema_doc!("runtime_app_info.json", RuntimeAppInfo),
+        schema_doc!("runtime_capabilities.json", RuntimeCapabilities),
+        schema_doc!("runtime_account_snapshot.json", RuntimeAccountSnapshot),
+        schema_doc!("runtime_diagnostic.json", RuntimeDiagnostic),
+        schema_doc!("runtime_diagnostic_level.json", RuntimeDiagnosticLevel),
+        schema_doc!("cli_runtime_pending_request.json", CLIRuntimePendingRequest),
+        schema_doc!("cli_runtime_request_kind.json", CLIRuntimeRequestKind),
+        schema_doc!(
+            "cli_runtime_request_resolution.json",
+            CLIRuntimeRequestResolution
+        ),
+        schema_doc!("cli_runtime_list_params.json", CLIRuntimeListParams),
+        schema_doc!("cli_runtime_list_response.json", CLIRuntimeListResponse),
+        schema_doc!("cli_runtime_get_params.json", CLIRuntimeGetParams),
+        schema_doc!("cli_runtime_get_response.json", CLIRuntimeGetResponse),
+        schema_doc!("cli_runtime_status_params.json", CLIRuntimeStatusParams),
+        schema_doc!("cli_runtime_status_response.json", CLIRuntimeStatusResponse),
+        schema_doc!("cli_runtime_refresh_params.json", CLIRuntimeRefreshParams),
+        schema_doc!(
+            "cli_runtime_refresh_response.json",
+            CLIRuntimeRefreshResponse
+        ),
+        schema_doc!(
+            "cli_runtime_list_models_params.json",
+            CLIRuntimeListModelsParams
+        ),
+        schema_doc!(
+            "cli_runtime_list_models_response.json",
+            CLIRuntimeListModelsResponse
+        ),
+        schema_doc!(
+            "cli_runtime_thread_binding_get_params.json",
+            CLIRuntimeThreadBindingGetParams
+        ),
+        schema_doc!(
+            "cli_runtime_thread_binding_get_response.json",
+            CLIRuntimeThreadBindingGetResponse
+        ),
+        schema_doc!("cli_runtime_thread_binding.json", CLIRuntimeThreadBinding),
+        schema_doc!(
+            "cli_runtime_thread_fork_params.json",
+            CLIRuntimeThreadForkParams
+        ),
+        schema_doc!(
+            "cli_runtime_thread_fork_response.json",
+            CLIRuntimeThreadForkResponse
+        ),
+        schema_doc!(
+            "cli_runtime_thread_compact_params.json",
+            CLIRuntimeThreadCompactParams
+        ),
+        schema_doc!(
+            "cli_runtime_thread_compact_response.json",
+            CLIRuntimeThreadCompactResponse
+        ),
+        schema_doc!(
+            "cli_runtime_turn_steer_params.json",
+            CLIRuntimeTurnSteerParams
+        ),
+        schema_doc!(
+            "cli_runtime_turn_steer_response.json",
+            CLIRuntimeTurnSteerResponse
+        ),
+        schema_doc!("cli_runtime_review_delivery.json", CLIRuntimeReviewDelivery),
+        schema_doc!("cli_runtime_review_target.json", CLIRuntimeReviewTarget),
+        schema_doc!(
+            "cli_runtime_review_start_params.json",
+            CLIRuntimeReviewStartParams
+        ),
+        schema_doc!(
+            "cli_runtime_review_start_response.json",
+            CLIRuntimeReviewStartResponse
+        ),
+        schema_doc!(
+            "cli_runtime_login_start_type.json",
+            CLIRuntimeLoginStartType
+        ),
+        schema_doc!(
+            "cli_runtime_login_start_params.json",
+            CLIRuntimeLoginStartParams
+        ),
+        schema_doc!(
+            "cli_runtime_login_start_response.json",
+            CLIRuntimeLoginStartResponse
+        ),
+        schema_doc!(
+            "cli_runtime_login_cancel_params.json",
+            CLIRuntimeLoginCancelParams
+        ),
+        schema_doc!(
+            "cli_runtime_login_cancel_response.json",
+            CLIRuntimeLoginCancelResponse
+        ),
+        schema_doc!(
+            "cli_runtime_request_respond_params.json",
+            CLIRuntimeRequestRespondParams
+        ),
+        schema_doc!(
+            "cli_runtime_request_respond_response.json",
+            CLIRuntimeRequestRespondResponse
+        ),
+        schema_doc!(
+            "cli_runtime_pending_request_status.json",
+            CLIRuntimePendingRequestStatus
+        ),
+        schema_doc!(
+            "cli_runtime_status_changed_notification.json",
+            CLIRuntimeStatusChangedNotification
+        ),
+        schema_doc!(
+            "cli_runtime_account_updated_notification.json",
+            CLIRuntimeAccountUpdatedNotification
+        ),
+        schema_doc!(
+            "cli_runtime_request_opened_notification.json",
+            CLIRuntimeRequestOpenedNotification
+        ),
+        schema_doc!(
+            "cli_runtime_request_resolved_notification.json",
+            CLIRuntimeRequestResolvedNotification
+        ),
+        schema_doc!(
+            "cli_runtime_apps_changed_notification.json",
+            CLIRuntimeAppsChangedNotification
+        ),
         schema_doc!("turn_capability.json", TurnCapability),
         schema_doc!("turn_capability_kind.json", TurnCapabilityKind),
         schema_doc!(
@@ -961,6 +1118,7 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!("turn_timeline_response.json", TurnTimelineResponse),
         schema_doc!("turn_kind.json", TurnKind),
         schema_doc!("turn_origin.json", TurnOrigin),
+        schema_doc!("agent_message_phase.json", AgentMessagePhase),
         schema_doc!("turn_item.json", TurnItem),
         schema_doc!(
             "execution_checkpoint_payload.json",
@@ -1135,6 +1293,14 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "gateway_thread_episodic_settings_update.json",
             GatewayThreadEpisodicSettingsUpdate
+        ),
+        schema_doc!(
+            "gateway_cli_runtime_settings.json",
+            GatewayCliRuntimeSettings
+        ),
+        schema_doc!(
+            "gateway_cli_runtime_instance_settings.json",
+            GatewayCliRuntimeInstanceSettings
         ),
         schema_doc!("gateway_general_settings.json", GatewayGeneralSettings),
         schema_doc!(

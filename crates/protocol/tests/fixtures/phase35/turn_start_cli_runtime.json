@@ -1,0 +1,26 @@
+{
+  "thread_id": "thr_cli_runtime",
+  "turn_id": "turn_cli_runtime",
+  "input": [
+    {
+      "type": "text",
+      "text": "run this through Codex CLI"
+    }
+  ],
+  "execution_backend": {
+    "type": "cliAgentRuntime",
+    "runtime_id": "codex_personal",
+    "runtime_kind": "codex"
+  },
+  "cli_runtime_options": {
+    "approval_policy": "unlessTrusted",
+    "sandbox": {
+      "type": "workspaceWrite",
+      "networkAccess": false
+    },
+    "effort": "medium",
+    "personality": "concise",
+    "summary": "auto",
+    "steer_if_active": true
+  }
+}
