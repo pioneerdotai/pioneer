@@ -1,3 +1,9 @@
+//! API provider transport boundary.
+//!
+//! This crate models remote model API providers only. Local CLI-backed agent
+//! runtimes such as Codex or Claude CLI belong in `pioneer-cli-agent-runtime`
+//! and must not be implemented as `Provider` adapters.
+
 pub mod attachments;
 pub mod factory;
 mod http;
