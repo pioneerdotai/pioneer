@@ -1,5 +1,6 @@
 pub mod boundary;
 pub mod bundle;
+pub mod cli_runtime_context;
 pub mod compile;
 pub mod constants;
 mod content;
@@ -15,6 +16,9 @@ pub mod sources;
 pub use bundle::{
     CompiledPromptBundle, PromptCompileInput, PromptLimits, PromptSourceManifestEntry,
     PromptSourceStatus,
+};
+pub use cli_runtime_context::{
+    CliRuntimeCodexContextInput, CliRuntimeContextText, compile_cli_runtime_codex_context_bundle,
 };
 pub use compile::compile_prompt;
 pub use diagnostics::{PromptDiagnostic, PromptDiagnosticCode};

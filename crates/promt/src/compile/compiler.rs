@@ -314,6 +314,13 @@ fn build_runtime_prompt_section(
 
 fn runtime_section_default_max_chars(id: &PromptRuntimeSectionId) -> usize {
     match id {
+        PromptRuntimeSectionId::BuiltIn(
+            PromptRuntimeBuiltInSectionId::PioneerCliRuntimeContext,
+        )
+        | PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::ThreadContext)
+        | PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::SelectedCapabilities) => {
+            DEFAULT_DYNAMIC_PROMPT_SECTION_MAX_CHARS
+        }
         PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::AgentsMd) => {
             DEFAULT_AGENTS_MD_PROMPT_SECTION_MAX_CHARS
         }
@@ -325,10 +332,15 @@ fn runtime_section_default_max_chars(id: &PromptRuntimeSectionId) -> usize {
 
 fn runtime_section_order(id: &PromptRuntimeSectionId) -> u8 {
     match id {
-        PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::AgentsMd) => 0,
-        PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::MemoryRecall) => 1,
-        PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::ExecutionContinuation) => 2,
-        PromptRuntimeSectionId::Dynamic(_) => 3,
+        PromptRuntimeSectionId::BuiltIn(
+            PromptRuntimeBuiltInSectionId::PioneerCliRuntimeContext,
+        ) => 0,
+        PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::AgentsMd) => 1,
+        PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::MemoryRecall) => 2,
+        PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::ThreadContext) => 3,
+        PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::SelectedCapabilities) => 4,
+        PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::ExecutionContinuation) => 5,
+        PromptRuntimeSectionId::Dynamic(_) => 6,
     }
 }
 

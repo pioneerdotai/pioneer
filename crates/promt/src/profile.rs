@@ -7,4 +7,5 @@ pub enum PromptProfile {
     AssistantFull,
     AssistantMinimal,
     AssistantNone,
+    CliRuntimeCodex,
 }

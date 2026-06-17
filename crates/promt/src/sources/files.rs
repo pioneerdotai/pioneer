@@ -18,7 +18,7 @@ fn is_allowed_by_profile(profile: PromptProfile, kind: BootstrapFileKind) -> boo
             kind,
             BootstrapFileKind::Soul | BootstrapFileKind::Identity | BootstrapFileKind::User
         ),
-        P::AssistantNone => false,
+        P::AssistantNone | P::CliRuntimeCodex => false,
     }
 }
 

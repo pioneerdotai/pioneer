@@ -55,16 +55,22 @@ impl fmt::Display for PromptDynamicSectionId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptRuntimeBuiltInSectionId {
+    PioneerCliRuntimeContext,
     AgentsMd,
     MemoryRecall,
+    ThreadContext,
+    SelectedCapabilities,
     ExecutionContinuation,
 }
 
 impl PromptRuntimeBuiltInSectionId {
     pub fn from_manifest_id(value: &str) -> Option<Self> {
         match value {
+            "pioneer_cli_runtime_context" => Some(Self::PioneerCliRuntimeContext),
             "agents_md" => Some(Self::AgentsMd),
             "memory_recall" => Some(Self::MemoryRecall),
+            "thread_context" => Some(Self::ThreadContext),
+            "selected_capabilities" => Some(Self::SelectedCapabilities),
             "execution_continuation" => Some(Self::ExecutionContinuation),
             _ => None,
         }
@@ -72,24 +78,35 @@ impl PromptRuntimeBuiltInSectionId {
 
     pub fn manifest_id(self) -> &'static str {
         match self {
+            Self::PioneerCliRuntimeContext => "pioneer_cli_runtime_context",
             Self::AgentsMd => "agents_md",
             Self::MemoryRecall => "memory_recall",
+            Self::ThreadContext => "thread_context",
+            Self::SelectedCapabilities => "selected_capabilities",
             Self::ExecutionContinuation => "execution_continuation",
         }
     }
 
     pub fn prompt_section_id(self) -> PromptSectionId {
         match self {
+            Self::PioneerCliRuntimeContext => PromptSectionId::PioneerCliRuntimeContext,
             Self::AgentsMd => PromptSectionId::AgentsMd,
             Self::MemoryRecall => PromptSectionId::MemoryRecall,
+            Self::ThreadContext => PromptSectionId::ThreadContext,
+            Self::SelectedCapabilities => PromptSectionId::SelectedCapabilities,
             Self::ExecutionContinuation => PromptSectionId::ExecutionContinuation,
         }
     }
 
     pub fn default_title(self) -> &'static str {
         match self {
+            Self::PioneerCliRuntimeContext => {
+                crate::content::SECTION_TITLE_PIONEER_CLI_RUNTIME_CONTEXT
+            }
             Self::AgentsMd => crate::content::SECTION_TITLE_AGENTS_MD,
             Self::MemoryRecall => crate::content::SECTION_TITLE_MEMORY_RECALL,
+            Self::ThreadContext => crate::content::SECTION_TITLE_THREAD_CONTEXT,
+            Self::SelectedCapabilities => crate::content::SECTION_TITLE_SELECTED_CAPABILITIES,
             Self::ExecutionContinuation => crate::content::SECTION_TITLE_EXECUTION_CONTINUATION,
         }
     }
@@ -137,8 +154,11 @@ pub enum PromptSectionId {
     UserPersona,
     ToolRecoveryPolicy,
     TaskOrchestrationPolicy,
+    PioneerCliRuntimeContext,
     AgentsMd,
     MemoryRecall,
+    ThreadContext,
+    SelectedCapabilities,
     RecoveryContinuation,
     ExecutionContinuation,
     SkillsRuntimePrompt,
@@ -160,8 +180,11 @@ impl PromptSectionId {
             Self::UserPersona => "user_persona",
             Self::ToolRecoveryPolicy => "tool_recovery_policy",
             Self::TaskOrchestrationPolicy => "task_orchestration_policy",
+            Self::PioneerCliRuntimeContext => "pioneer_cli_runtime_context",
             Self::AgentsMd => "agents_md",
             Self::MemoryRecall => "memory_recall",
+            Self::ThreadContext => "thread_context",
+            Self::SelectedCapabilities => "selected_capabilities",
             Self::RecoveryContinuation => "recovery_continuation",
             Self::ExecutionContinuation => "execution_continuation",
             Self::SkillsRuntimePrompt => "skills_runtime_prompt",
@@ -185,8 +208,11 @@ impl PromptSectionId {
                 | "user_persona"
                 | "tool_recovery_policy"
                 | "task_orchestration_policy"
+                | "pioneer_cli_runtime_context"
                 | "agents_md"
                 | "memory_recall"
+                | "thread_context"
+                | "selected_capabilities"
                 | "recovery_continuation"
                 | "execution_continuation"
                 | "skills_runtime_prompt"

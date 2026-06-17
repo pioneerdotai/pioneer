@@ -110,6 +110,7 @@ fn compile_continuation_prompt(profile: PromptProfile) -> CompiledPromptBundle {
         PromptProfile::AssistantFull => "continuation_full",
         PromptProfile::AssistantMinimal => "continuation_minimal",
         PromptProfile::AssistantNone => "continuation_none",
+        PromptProfile::CliRuntimeCodex => "continuation_cli_runtime_codex",
     });
     write_fixture_files(&root);
 
@@ -323,7 +324,7 @@ Some tool domains and their tools are hidden until requested. If you need a hidd
 Domains:
 - memory: memory_search, memory_list, memory_get, memory_remember, memory_forget.
 - task: task_create, task_wait, task_accept, task_revise, task_cancel, task_update, task_detach, task_list, task_get, task_reschedule, task_pause, task_resume.
-- artifact: artifact_prepare, artifact_register.
+- artifact: artifact_prepare, artifact_register, artifact_read.
 - computer_use: computer_use.
 
 ## Recovery Continuation
@@ -370,7 +371,7 @@ Some tool domains and their tools are hidden until requested. If you need a hidd
 Domains:
 - memory: memory_search, memory_list, memory_get, memory_remember, memory_forget.
 - task: task_create, task_wait, task_accept, task_revise, task_cancel, task_update, task_detach, task_list, task_get, task_reschedule, task_pause, task_resume.
-- artifact: artifact_prepare, artifact_register.
+- artifact: artifact_prepare, artifact_register, artifact_read.
 - computer_use: computer_use.
 
 ## Recovery Continuation
