@@ -1,10 +1,13 @@
 use anyhow::{Context, Result, bail};
 use pioneer_config::{
-    AppConfig, GatewayConfig, GatewayMemoryConfig, GatewayMemoryModelSelectionConfig,
+    AppConfig, GatewayCliAgentRuntimeInstanceConfig, GatewayCliAgentRuntimeInstancesConfig,
+    GatewayCliAgentRuntimeKindConfig, GatewayConfig, GatewayMemoryConfig,
+    GatewayMemoryModelSelectionConfig,
     GatewayMemoryModelSelectionSource as ConfigGatewayMemoryModelSelectionSource,
     GatewayThreadEpisodicConfig,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Component, Path};
 
@@ -21,6 +24,8 @@ pub struct GatewaySettings {
     memory: Option<GatewayMemorySettingsOverride>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     thread_episodic: Option<GatewayThreadEpisodicSettingsOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cli_runtimes: Option<GatewayCliRuntimeSettingsOverride>,
     #[serde(skip)]
     migrated: bool,
 }
@@ -36,6 +41,8 @@ struct GatewaySettingsWire {
     memory: Option<GatewayMemorySettingsOverride>,
     #[serde(default)]
     thread_episodic: Option<GatewayThreadEpisodicSettingsOverride>,
+    #[serde(default)]
+    cli_runtimes: Option<GatewayCliRuntimeSettingsOverride>,
 }
 
 impl<'de> Deserialize<'de> for GatewaySettings {
@@ -50,6 +57,7 @@ impl<'de> Deserialize<'de> for GatewaySettings {
             secrets: wire.secrets,
             memory: wire.memory,
             thread_episodic: wire.thread_episodic,
+            cli_runtimes: wire.cli_runtimes,
             migrated: false,
         };
         settings.migrate_legacy_active_recall_model();
@@ -235,6 +243,26 @@ struct GatewayThreadEpisodicSettingsOverride {
     near_capacity_percent: Option<f64>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct GatewayCliRuntimeSettingsOverride {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    instances: Vec<GatewayCliRuntimeInstanceSettingsOverride>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct GatewayCliRuntimeInstanceSettingsOverride {
+    id: String,
+    kind: GatewayCliAgentRuntimeKindConfig,
+    display_name: String,
+    enabled: bool,
+    binary_path: String,
+    home_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shadow_home_path: Option<String>,
+}
+
 impl Default for GatewaySecretsSettings {
     fn default() -> Self {
         Self {
@@ -280,6 +308,13 @@ impl GatewaySettings {
         }
     }
 
+    pub fn effective_cli_runtime_settings(
+        &self,
+        config: &GatewayConfig,
+    ) -> pioneer_protocol::GatewayCliRuntimeSettings {
+        cli_runtime_settings_from_gateway_config(&self.apply_to_gateway_config(config.clone()))
+    }
+
     pub fn set_memory_settings(&mut self, memory: GatewayMemorySettings) {
         self.memory = Some(GatewayMemorySettingsOverride::from_memory_settings(memory));
     }
@@ -290,6 +325,16 @@ impl GatewaySettings {
         );
     }
 
+    fn set_cli_runtime_settings(
+        &mut self,
+        cli_runtimes: pioneer_protocol::GatewayCliRuntimeSettings,
+    ) -> Result<()> {
+        self.cli_runtimes = Some(GatewayCliRuntimeSettingsOverride::from_protocol(
+            cli_runtimes,
+        )?);
+        Ok(())
+    }
+
     pub fn snapshot(&self, config: &GatewayConfig) -> pioneer_protocol::GatewaySettingsSnapshot {
         let general = self.effective_general_settings(config);
         pioneer_protocol::GatewaySettingsSnapshot {
@@ -298,13 +343,14 @@ impl GatewaySettings {
             thread_episodic: self
                 .effective_thread_episodic_settings(&config.thread_episodic)
                 .to_protocol(),
+            cli_runtimes: self.effective_cli_runtime_settings(config),
         }
     }
 
     pub fn apply_protocol_update(
         &mut self,
         update: pioneer_protocol::GatewaySettingsUpdate,
-    ) -> GatewaySettingsChangeSet {
+    ) -> Result<GatewaySettingsChangeSet> {
         let mut changes = GatewaySettingsChangeSet::default();
         if let Some(general) = update.general {
             changes.general = self.general.apply_protocol_update(general);
@@ -318,7 +364,11 @@ impl GatewaySettings {
             self.apply_thread_episodic_settings_update(thread_episodic);
             changes.thread_episodic = true;
         }
-        changes
+        if let Some(cli_runtimes) = update.cli_runtimes {
+            self.set_cli_runtime_settings(cli_runtimes)?;
+            changes.cli_runtimes = true;
+        }
+        Ok(changes)
     }
 
     fn apply_thread_episodic_settings_update(
@@ -359,6 +409,11 @@ impl GatewaySettings {
         config.memory = self.apply_to_gateway_memory_config(config.memory);
         config.thread_episodic =
             self.apply_to_gateway_thread_episodic_config(config.thread_episodic);
+        if let Some(cli_runtimes) = &self.cli_runtimes {
+            config.cli_agent_runtime.enabled = false;
+            config.cli_agent_runtimes =
+                cli_runtimes.to_gateway_cli_agent_runtime_instances_config();
+        }
         config
     }
 
@@ -510,6 +565,7 @@ pub struct GatewaySettingsChangeSet {
     pub general: GatewayGeneralSettingsChangeSet,
     pub memory: bool,
     pub thread_episodic: bool,
+    pub cli_runtimes: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -801,6 +857,128 @@ impl GatewayThreadEpisodicSettingsOverride {
     }
 }
 
+impl GatewayCliRuntimeSettingsOverride {
+    fn from_protocol(settings: pioneer_protocol::GatewayCliRuntimeSettings) -> Result<Self> {
+        let mut normalized_instances = Vec::with_capacity(settings.instances.len());
+        let mut ids = HashSet::new();
+        let mut display_names = HashSet::new();
+
+        for instance in settings.instances {
+            let id = normalize_cli_runtime_instance_id(instance.id.as_str())?;
+            if !ids.insert(id.clone()) {
+                bail!("duplicate CLI runtime instance id `{id}`");
+            }
+
+            let display_name =
+                normalize_cli_runtime_display_name(instance.display_name.as_str(), id.as_str())?;
+            let display_name_key = display_name.to_ascii_lowercase();
+            if !display_names.insert(display_name_key) {
+                bail!("duplicate CLI runtime display name `{display_name}`");
+            }
+
+            let binary_path =
+                normalize_cli_runtime_required_path("binary_path", instance.binary_path.as_str())?;
+            let home_path =
+                normalize_cli_runtime_required_path("home_path", instance.home_path.as_str())?;
+            let shadow_home_path = normalize_cli_runtime_optional_path(
+                "shadow_home_path",
+                instance.shadow_home_path.as_deref(),
+            )?;
+            if shadow_home_path.as_deref() == Some(home_path.as_str()) {
+                bail!("shadow_home_path must differ from home_path for CLI runtime `{id}`");
+            }
+
+            normalized_instances.push(GatewayCliRuntimeInstanceSettingsOverride {
+                id,
+                kind: cli_runtime_kind_from_protocol(instance.kind)?,
+                display_name,
+                enabled: instance.enabled,
+                binary_path,
+                home_path,
+                shadow_home_path,
+            });
+        }
+
+        normalized_instances.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(Self {
+            instances: normalized_instances,
+        })
+    }
+
+    fn to_gateway_cli_agent_runtime_instances_config(
+        &self,
+    ) -> GatewayCliAgentRuntimeInstancesConfig {
+        let instances = self
+            .instances
+            .iter()
+            .map(|instance| {
+                (
+                    instance.id.clone(),
+                    GatewayCliAgentRuntimeInstanceConfig {
+                        id: instance.id.clone(),
+                        kind: instance.kind,
+                        display_name: Some(instance.display_name.clone()),
+                        enabled: Some(instance.enabled),
+                        binary_path: Some(instance.binary_path.clone()),
+                        home_path: Some(instance.home_path.clone()),
+                        shadow_home_path: instance.shadow_home_path.clone(),
+                        custom_models: Vec::new(),
+                        app_server_args: Vec::new(),
+                        startup_probe_timeout_ms: None,
+                        request_timeout_ms: None,
+                        idle_session_ttl_secs: None,
+                        event_channel_capacity: None,
+                        stderr_ring_lines: None,
+                        debug_native_events: None,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        GatewayCliAgentRuntimeInstancesConfig { instances }
+    }
+}
+
+fn cli_runtime_settings_from_gateway_config(
+    config: &GatewayConfig,
+) -> pioneer_protocol::GatewayCliRuntimeSettings {
+    pioneer_protocol::GatewayCliRuntimeSettings {
+        instances: config
+            .effective_cli_agent_runtime_instances()
+            .into_iter()
+            .map(
+                |instance| pioneer_protocol::GatewayCliRuntimeInstanceSettings {
+                    id: instance.id,
+                    kind: cli_runtime_kind_to_protocol(instance.kind),
+                    display_name: instance.display_name,
+                    enabled: instance.enabled,
+                    binary_path: instance.binary_path,
+                    home_path: instance.home_path,
+                    shadow_home_path: instance.shadow_home_path,
+                },
+            )
+            .collect(),
+    }
+}
+
+fn cli_runtime_kind_to_protocol(
+    kind: GatewayCliAgentRuntimeKindConfig,
+) -> pioneer_protocol::CLIAgentRuntimeKind {
+    match kind {
+        GatewayCliAgentRuntimeKindConfig::Codex => pioneer_protocol::CLIAgentRuntimeKind::Codex,
+    }
+}
+
+fn cli_runtime_kind_from_protocol(
+    kind: pioneer_protocol::CLIAgentRuntimeKind,
+) -> Result<GatewayCliAgentRuntimeKindConfig> {
+    match kind {
+        pioneer_protocol::CLIAgentRuntimeKind::Codex => Ok(GatewayCliAgentRuntimeKindConfig::Codex),
+        pioneer_protocol::CLIAgentRuntimeKind::Claude => {
+            bail!("CLI runtime kind `claude` is not supported by gateway settings yet")
+        }
+    }
+}
+
 fn model_selection_from_protocol(
     selection: pioneer_protocol::GatewayMemoryModelSelection,
 ) -> GatewayMemoryModelSelectionConfig {
@@ -837,6 +1015,99 @@ fn model_selection_to_protocol(
     }
 }
 
+fn normalize_cli_runtime_instance_id(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("CLI runtime instance id must not be empty");
+    }
+
+    let mut normalized = String::new();
+    let mut previous_separator = false;
+    for ch in trimmed.chars() {
+        if ch.is_ascii_alphanumeric() {
+            normalized.push(ch.to_ascii_lowercase());
+            previous_separator = false;
+        } else if ch == '_' || ch == '-' || ch == '.' || ch.is_ascii_whitespace() {
+            if !normalized.is_empty() && !previous_separator {
+                normalized.push('_');
+                previous_separator = true;
+            }
+        } else {
+            bail!("CLI runtime instance id `{raw}` contains unsupported character `{ch}`");
+        }
+    }
+
+    let normalized = normalized.trim_matches('_').to_owned();
+    if normalized.is_empty() {
+        bail!("CLI runtime instance id `{raw}` must contain an ASCII letter or digit");
+    }
+    if normalized.chars().count() > 64 {
+        bail!("CLI runtime instance id `{raw}` must be at most 64 characters");
+    }
+    Ok(normalized)
+}
+
+fn normalize_cli_runtime_display_name(raw: &str, id: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    let display_name = if trimmed.is_empty() {
+        cli_runtime_display_name_from_id(id)
+    } else {
+        trimmed.to_owned()
+    };
+    if display_name.chars().count() > 80 {
+        bail!("CLI runtime display name `{display_name}` must be at most 80 characters");
+    }
+    if display_name.chars().any(is_disallowed_settings_text_char) {
+        bail!("CLI runtime display name `{display_name}` contains unsupported control characters");
+    }
+    Ok(display_name)
+}
+
+fn normalize_cli_runtime_required_path(field: &str, raw: &str) -> Result<String> {
+    let Some(value) = normalize_cli_runtime_optional_path(field, Some(raw))? else {
+        bail!("CLI runtime `{field}` must not be empty");
+    };
+    Ok(value)
+}
+
+fn normalize_cli_runtime_optional_path(field: &str, raw: Option<&str>) -> Result<Option<String>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.chars().count() > 512 {
+        bail!("CLI runtime `{field}` must be at most 512 characters");
+    }
+    if trimmed.chars().any(is_disallowed_settings_text_char) {
+        bail!("CLI runtime `{field}` contains unsupported control characters");
+    }
+    Ok(Some(trimmed.to_owned()))
+}
+
+fn is_disallowed_settings_text_char(ch: char) -> bool {
+    ch == '\0' || ch == '\n' || ch == '\r' || ch.is_control()
+}
+
+fn cli_runtime_display_name_from_id(id: &str) -> String {
+    id.split('_')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            let Some(first) = chars.next() else {
+                return String::new();
+            };
+            let mut word = String::new();
+            word.push(first.to_ascii_uppercase());
+            word.push_str(chars.as_str());
+            word
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub fn normalize_settings_file_name(value: &str) -> Result<String> {
     let trimmed = normalize_non_empty(value, "settings_file_name must not be empty")?;
     let path = Path::new(trimmed.as_str());
@@ -867,6 +1138,7 @@ pub fn load_or_create_gateway_settings(
         secrets: GatewaySecretsSettings::default(),
         memory: None,
         thread_episodic: None,
+        cli_runtimes: None,
         migrated: false,
     };
 
@@ -975,7 +1247,8 @@ fn is_disallowed_component(component: Component<'_>) -> bool {
 mod tests {
     use super::{GatewayMemorySettings, load_or_create_gateway_settings, save_gateway_settings};
     use pioneer_config::{
-        GatewayArtifactsConfig, GatewayAuthConfig, GatewayComputerUseToolsConfig, GatewayConfig,
+        GatewayArtifactsConfig, GatewayAuthConfig, GatewayCliAgentRuntimeConfig,
+        GatewayCliAgentRuntimeInstancesConfig, GatewayComputerUseToolsConfig, GatewayConfig,
         GatewayDatabaseConfig, GatewayExecutionWindowsConfig, GatewayMemoryConfig,
         GatewayMemoryModelSelectionConfig, GatewayProviderConfig, GatewaySkillsConfig,
         GatewayThreadConfig, GatewayThreadEpisodicConfig, GatewayToolLoopBudgetConfig,
@@ -1166,17 +1439,20 @@ backend = "keystore"
         let mut settings = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
             .expect("settings should be created");
 
-        settings.apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
-            general: Some(pioneer_protocol::GatewayGeneralSettingsUpdate {
-                keepawake: Some(true),
-                preflight_model: Some(pioneer_protocol::GatewayMemoryModelSelection::custom(
-                    "planner-provider",
-                    "planner-model",
-                )),
-            }),
-            memory: None,
-            thread_episodic: None,
-        });
+        settings
+            .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+                general: Some(pioneer_protocol::GatewayGeneralSettingsUpdate {
+                    keepawake: Some(true),
+                    preflight_model: Some(pioneer_protocol::GatewayMemoryModelSelection::custom(
+                        "planner-provider",
+                        "planner-model",
+                    )),
+                }),
+                memory: None,
+                thread_episodic: None,
+                cli_runtimes: None,
+            })
+            .expect("settings update should apply");
         save_gateway_settings(&path, &settings).expect("settings should save");
 
         let content = fs::read_to_string(&path).expect("read settings");
@@ -1369,12 +1645,14 @@ near_capacity_percent = 75.0
         let mut settings = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
             .expect("settings should be created");
 
-        let changes = settings.apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
-            thread_episodic: Some(
-                pioneer_protocol::GatewayThreadEpisodicSettingsUpdate::enabled(false),
-            ),
-            ..pioneer_protocol::GatewaySettingsUpdate::default()
-        });
+        let changes = settings
+            .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+                thread_episodic: Some(
+                    pioneer_protocol::GatewayThreadEpisodicSettingsUpdate::enabled(false),
+                ),
+                ..pioneer_protocol::GatewaySettingsUpdate::default()
+            })
+            .expect("settings update should apply");
         assert!(changes.thread_episodic);
         save_gateway_settings(&path, &settings).expect("settings should save");
 
@@ -1385,6 +1663,158 @@ near_capacity_percent = 75.0
         assert!(!content.contains("recall_enabled"));
 
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn gateway_settings_cli_runtimes_override_gateway_config_and_save_cleanly() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let path = temp_dir.join("gateway-settings.toml");
+        let mut settings = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
+            .expect("settings should be created");
+
+        let changes = settings
+            .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+                cli_runtimes: Some(pioneer_protocol::GatewayCliRuntimeSettings {
+                    instances: vec![
+                        pioneer_protocol::GatewayCliRuntimeInstanceSettings {
+                            id: "Codex Personal".to_owned(),
+                            kind: pioneer_protocol::CLIAgentRuntimeKind::Codex,
+                            display_name: "Codex Personal".to_owned(),
+                            enabled: true,
+                            binary_path: "codex".to_owned(),
+                            home_path: "~/.codex".to_owned(),
+                            shadow_home_path: None,
+                        },
+                        pioneer_protocol::GatewayCliRuntimeInstanceSettings {
+                            id: "codex_work".to_owned(),
+                            kind: pioneer_protocol::CLIAgentRuntimeKind::Codex,
+                            display_name: "Codex Work".to_owned(),
+                            enabled: false,
+                            binary_path: "/opt/homebrew/bin/codex".to_owned(),
+                            home_path: "~/.codex-work".to_owned(),
+                            shadow_home_path: Some("~/.pioneer/codex-work".to_owned()),
+                        },
+                    ],
+                }),
+                ..pioneer_protocol::GatewaySettingsUpdate::default()
+            })
+            .expect("CLI runtime settings should apply");
+        assert!(changes.cli_runtimes);
+
+        let applied = settings.apply_to_gateway_config(gateway_config_with_keepawake(false));
+        assert!(!applied.cli_agent_runtime.enabled);
+        let instances = applied.effective_cli_agent_runtime_instances();
+        assert_eq!(instances.len(), 2);
+        assert_eq!(instances[0].id, "codex_personal");
+        assert_eq!(instances[0].display_name, "Codex Personal");
+        assert_eq!(instances[1].id, "codex_work");
+        assert!(!instances[1].enabled);
+
+        let snapshot = settings.snapshot(&gateway_config_with_keepawake(false));
+        assert_eq!(snapshot.cli_runtimes.instances.len(), 2);
+        assert_eq!(snapshot.cli_runtimes.instances[0].id, "codex_personal");
+
+        save_gateway_settings(&path, &settings).expect("settings should save");
+        let content = fs::read_to_string(&path).expect("read settings");
+        assert!(content.contains("[[cli_runtimes.instances]]"));
+        assert!(content.contains("id = \"codex_personal\""));
+        assert!(content.contains("display_name = \"Codex Work\""));
+        assert!(!content.contains("startup_probe_timeout_ms"));
+        assert!(!content.contains("request_timeout_ms"));
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn gateway_settings_cli_runtimes_empty_override_disables_global_fallback() {
+        let mut settings = toml::from_str::<super::GatewaySettings>(
+            r#"
+version = 1
+
+[secrets]
+backend = "keystore"
+
+[cli_runtimes]
+"#,
+        )
+        .expect("gateway settings should parse");
+        let mut config = gateway_config_with_keepawake(false);
+        config.cli_agent_runtime.enabled = true;
+        assert_eq!(config.effective_cli_agent_runtime_instances().len(), 1);
+
+        let snapshot = settings.snapshot(&config);
+        assert!(snapshot.cli_runtimes.instances.is_empty());
+        let applied = settings.apply_to_gateway_config(config);
+        assert!(applied.effective_cli_agent_runtime_instances().is_empty());
+
+        let changes = settings
+            .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+                cli_runtimes: Some(pioneer_protocol::GatewayCliRuntimeSettings::default()),
+                ..pioneer_protocol::GatewaySettingsUpdate::default()
+            })
+            .expect("empty CLI runtime settings should apply");
+        assert!(changes.cli_runtimes);
+    }
+
+    #[test]
+    fn gateway_settings_cli_runtimes_reject_duplicate_names_and_invalid_paths() {
+        let mut settings = toml::from_str::<super::GatewaySettings>(
+            r#"
+version = 1
+
+[secrets]
+backend = "keystore"
+"#,
+        )
+        .expect("gateway settings should parse");
+
+        let duplicate = settings
+            .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+                cli_runtimes: Some(pioneer_protocol::GatewayCliRuntimeSettings {
+                    instances: vec![
+                        pioneer_protocol::GatewayCliRuntimeInstanceSettings {
+                            id: "codex_one".to_owned(),
+                            kind: pioneer_protocol::CLIAgentRuntimeKind::Codex,
+                            display_name: "Codex".to_owned(),
+                            enabled: true,
+                            binary_path: "codex".to_owned(),
+                            home_path: "~/.codex".to_owned(),
+                            shadow_home_path: None,
+                        },
+                        pioneer_protocol::GatewayCliRuntimeInstanceSettings {
+                            id: "codex_two".to_owned(),
+                            kind: pioneer_protocol::CLIAgentRuntimeKind::Codex,
+                            display_name: "codex".to_owned(),
+                            enabled: true,
+                            binary_path: "codex".to_owned(),
+                            home_path: "~/.codex-two".to_owned(),
+                            shadow_home_path: None,
+                        },
+                    ],
+                }),
+                ..pioneer_protocol::GatewaySettingsUpdate::default()
+            })
+            .expect_err("duplicate display names should be rejected");
+        assert!(format!("{duplicate:#}").contains("duplicate CLI runtime display name"));
+
+        let invalid_path = settings
+            .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+                cli_runtimes: Some(pioneer_protocol::GatewayCliRuntimeSettings {
+                    instances: vec![pioneer_protocol::GatewayCliRuntimeInstanceSettings {
+                        id: "codex_bad".to_owned(),
+                        kind: pioneer_protocol::CLIAgentRuntimeKind::Codex,
+                        display_name: "Codex Bad".to_owned(),
+                        enabled: true,
+                        binary_path: "codex\nbad".to_owned(),
+                        home_path: "~/.codex".to_owned(),
+                        shadow_home_path: None,
+                    }],
+                }),
+                ..pioneer_protocol::GatewaySettingsUpdate::default()
+            })
+            .expect_err("invalid path should be rejected");
+        assert!(format!("{invalid_path:#}").contains("binary_path"));
     }
 
     #[test]
@@ -1709,6 +2139,8 @@ model = "legacy-model"
             },
             tasks: Default::default(),
             skills: GatewaySkillsConfig::default(),
+            cli_agent_runtime: GatewayCliAgentRuntimeConfig::default(),
+            cli_agent_runtimes: GatewayCliAgentRuntimeInstancesConfig::default(),
             provider: GatewayProviderConfig::default(),
             database: GatewayDatabaseConfig {
                 file_name: "gateway.db".to_owned(),

@@ -5,10 +5,13 @@ use pioneer_protocol::{
     ArtifactDownloadStartParams, ArtifactGetParams, ArtifactListForMessageParams,
     ArtifactListForThreadParams, ArtifactListForTurnParams, ArtifactListParams, ArtifactReadParams,
     ArtifactRestoreParams, ArtifactUploadAbortParams, ArtifactUploadFinishParams,
-    ArtifactUploadStartParams, GatewaySettingsGetParams, GatewaySettingsUpdateParams,
-    McpInstallParams, McpListParams, McpPolicySetParams, MemoryCandidatesApproveParams,
-    MemoryCandidatesDecideParams, MemoryCandidatesEditAndApproveParams, MemoryCandidatesGetParams,
-    MemoryCandidatesListParams, MemoryCandidatesMergeParams, MemoryCandidatesRejectParams,
+    ArtifactUploadStartParams, CLIRuntimeGetParams, CLIRuntimeListParams, CLIRuntimeRefreshParams,
+    CLIRuntimeStatusParams, CLIRuntimeThreadBindingGetParams, CLIRuntimeThreadCompactParams,
+    CLIRuntimeThreadForkParams, CLIRuntimeTurnSteerParams, GatewaySettingsGetParams,
+    GatewaySettingsUpdateParams, McpInstallParams, McpListParams, McpPolicySetParams,
+    MemoryCandidatesApproveParams, MemoryCandidatesDecideParams,
+    MemoryCandidatesEditAndApproveParams, MemoryCandidatesGetParams, MemoryCandidatesListParams,
+    MemoryCandidatesMergeParams, MemoryCandidatesRejectParams,
     MemoryCandidatesSuppressSimilarParams, MemoryForgetParams, MemoryGetParams, MemoryListParams,
     MemoryRememberParams, MemorySearchParams, SkillListParams, SkillsHealthParams,
     SkillsInstallParams, SkillsPolicyListParams, SkillsPolicySetParams, SkillsUninstallParams,
@@ -774,6 +777,313 @@ impl MessageProcessor {
                                 Some(request.id),
                                 INVALID_PARAMS_CODE,
                                 format!("invalid params for `{}`: {error}", methods::PROVIDER_LIST),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::CLI_RUNTIME_LIST => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<CLIRuntimeListParams>(params_value) {
+                    Ok(params) => {
+                        self.cli_runtime_list(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::CLI_RUNTIME_LIST
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::CLI_RUNTIME_GET => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<CLIRuntimeGetParams>(params_value) {
+                    Ok(params) => {
+                        self.cli_runtime_get(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::CLI_RUNTIME_GET
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::CLI_RUNTIME_STATUS => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<CLIRuntimeStatusParams>(params_value) {
+                    Ok(params) => {
+                        self.cli_runtime_status(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::CLI_RUNTIME_STATUS
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::CLI_RUNTIME_REFRESH => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<CLIRuntimeRefreshParams>(params_value) {
+                    Ok(params) => {
+                        self.cli_runtime_refresh(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::CLI_RUNTIME_REFRESH
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::CLI_RUNTIME_LIST_MODELS => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<CLIRuntimeListModelsParams>(params_value) {
+                    Ok(params) => {
+                        self.cli_runtime_list_models(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::CLI_RUNTIME_LIST_MODELS
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::CLI_RUNTIME_THREAD_BINDING_GET => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<CLIRuntimeThreadBindingGetParams>(params_value) {
+                    Ok(params) => {
+                        self.cli_runtime_thread_binding_get(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::CLI_RUNTIME_THREAD_BINDING_GET
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::CLI_RUNTIME_THREAD_COMPACT => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<CLIRuntimeThreadCompactParams>(params_value) {
+                    Ok(params) => {
+                        self.cli_runtime_thread_compact(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::CLI_RUNTIME_THREAD_COMPACT
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::CLI_RUNTIME_THREAD_FORK => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<CLIRuntimeThreadForkParams>(params_value) {
+                    Ok(params) => {
+                        message_future(self.cli_runtime_thread_fork(
+                            connection_id,
+                            request.id,
+                            params,
+                        ))
+                        .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::CLI_RUNTIME_THREAD_FORK
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::CLI_RUNTIME_TURN_STEER => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<CLIRuntimeTurnSteerParams>(params_value) {
+                    Ok(params) => {
+                        message_future(self.cli_runtime_turn_steer(
+                            connection_id,
+                            request.id,
+                            params,
+                        ))
+                        .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::CLI_RUNTIME_TURN_STEER
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::CLI_RUNTIME_REVIEW_START => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<CLIRuntimeReviewStartParams>(params_value) {
+                    Ok(params) => {
+                        self.cli_runtime_review_start(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::CLI_RUNTIME_REVIEW_START
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::CLI_RUNTIME_LOGIN_START => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<CLIRuntimeLoginStartParams>(params_value) {
+                    Ok(params) => {
+                        self.cli_runtime_login_start(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::CLI_RUNTIME_LOGIN_START
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::CLI_RUNTIME_LOGIN_CANCEL => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<CLIRuntimeLoginCancelParams>(params_value) {
+                    Ok(params) => {
+                        self.cli_runtime_login_cancel(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::CLI_RUNTIME_LOGIN_CANCEL
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+            methods::CLI_RUNTIME_REQUEST_RESPOND => {
+                let params_value = request.params.unwrap_or_else(empty_object_value);
+                match serde_json::from_value::<CLIRuntimeRequestRespondParams>(params_value) {
+                    Ok(params) => {
+                        self.cli_runtime_request_respond(connection_id, request.id, params)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error}",
+                                    methods::CLI_RUNTIME_REQUEST_RESPOND
+                                ),
                             ),
                         )
                         .await;
@@ -2208,7 +2518,7 @@ impl MessageProcessor {
         )?;
 
         let previous_general_settings = settings.effective_general_settings(&config.gateway);
-        let changes = settings.apply_protocol_update(update);
+        let changes = settings.apply_protocol_update(update)?;
         if let Some(keepawake) = changes.general.keepawake {
             self.apply_keepawake_setting(keepawake)
                 .context("failed to apply keepawake setting")?;

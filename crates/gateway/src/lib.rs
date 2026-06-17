@@ -1,7 +1,14 @@
+//! Gateway runtime orchestration.
+//!
+//! The gateway owns the top-level execution-backend decision: existing API
+//! providers continue through `pioneer-agent`, while future `CLIAgentRuntime`
+//! executions are routed through `pioneer-cli-agent-runtime`.
+
 mod artifact_prompt_refs;
 mod attachment;
 mod auth;
 mod bootstrap;
+mod cli_runtime;
 mod database;
 mod helpers;
 mod hook_run_store;
@@ -53,6 +60,7 @@ use pioneer_tools::{
 };
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::auth::initialize as initialize_jwt_auth;
@@ -420,7 +428,8 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
 
     let task_runtime_config = task_runtime_config_from_gateway_tasks_config(&config.gateway.tasks);
 
-    let message_processor = Arc::new(MessageProcessor::new_with_memory_runtime_and_task_config(
+    let cli_runtime_manager = build_cli_runtime_manager(&runtime_home, &config)?;
+    let mut message_processor = MessageProcessor::new_with_memory_runtime_and_task_config(
         thread_manager,
         provider_registry,
         session_manager.clone(),
@@ -435,7 +444,11 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         config.gateway.artifacts.clone(),
         task_runtime_config,
         thread_episodic_runtime_config_from_gateway_config(&config.gateway.thread_episodic),
-    ));
+    );
+    if let Some(cli_runtime_manager) = cli_runtime_manager {
+        message_processor = message_processor.with_cli_runtime_manager(cli_runtime_manager);
+    }
+    let message_processor = Arc::new(message_processor);
 
     message_processor
         .apply_keepawake_setting(config.gateway.keepawake)
@@ -452,7 +465,7 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
     message_processor.start_skills_watcher().await;
     message_processor.start_mcp_workspace_supervisor().await;
 
-    let handle = spawn_server(config, auth, message_processor, session_manager).await?;
+    let handle = spawn_server(config, auth, message_processor.clone(), session_manager).await?;
 
     info!(listen_addr = %handle.local_addr(), "gateway daemon started");
 
@@ -460,6 +473,7 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
 
     info!("gateway daemon stopping with telemetry snapshot");
     handle.shutdown().await?;
+    message_processor.shutdown_cli_runtime_manager().await;
     database
         .close()
         .await
@@ -533,6 +547,17 @@ fn load_gateway_settings(runtime_home: &Path, config: &AppConfig) -> Result<Gate
         config.gateway.settings_version,
         settings_file_name.as_str(),
     )
+}
+
+fn build_cli_runtime_manager(
+    runtime_home: &Path,
+    config: &AppConfig,
+) -> Result<Option<Arc<crate::cli_runtime::manager::CLIAgentRuntimeManager>>> {
+    crate::cli_runtime::codex_session::codex_cli_runtime_manager(
+        runtime_home.to_path_buf(),
+        Duration::from_secs(config.gateway.cli_agent_runtime.idle_session_ttl_secs),
+    )
+    .map(Some)
 }
 
 fn memory_loop_config_from_gateway_memory_config(config: &GatewayMemoryConfig) -> MemoryLoopConfig {

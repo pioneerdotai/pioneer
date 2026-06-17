@@ -5524,6 +5524,7 @@ mod tests {
         let selection = select_committed_item_source(&committed_item(TurnItem::AgentMessage {
             id: "assistant_item".to_owned(),
             text: "Готово".to_owned(),
+            phase: Default::default(),
             markdown: None,
             markdown_version: None,
         }));
@@ -5720,6 +5721,7 @@ mod tests {
             select_committed_item_source(&committed_item(TurnItem::AgentMessage {
                 id: "empty_agent_item".to_owned(),
                 text: "   ".to_owned(),
+                phase: Default::default(),
                 markdown: None,
                 markdown_version: None,
             })),
@@ -5729,6 +5731,7 @@ mod tests {
         let mut item = committed_item(TurnItem::AgentMessage {
             id: "unknown_context_item".to_owned(),
             text: "text".to_owned(),
+            phase: Default::default(),
             markdown: None,
             markdown_version: None,
         });

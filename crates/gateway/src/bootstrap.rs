@@ -418,6 +418,7 @@ mod tests {
                     item: TurnItem::AgentMessage {
                         id: "agent_final_message".to_owned(),
                         text: "done".to_owned(),
+                        phase: Default::default(),
                         markdown: None,
                         markdown_version: None,
                     },

@@ -259,6 +259,8 @@ impl TaskAgentExecutor {
                 model_provider: Some(effective_model.model_provider),
                 sandbox_policy: None,
                 mode: Some(ThreadMode::Agent),
+                execution_backend: None,
+                cli_runtime_options: None,
             })
             .await
             .context("failed to create hidden task turn")?;
@@ -613,6 +615,8 @@ impl TaskAgentExecutor {
                 model_provider: Some(effective_model.model_provider),
                 sandbox_policy: None,
                 mode: Some(ThreadMode::Agent),
+                execution_backend: None,
+                cli_runtime_options: None,
             })
             .await
         {
@@ -1005,6 +1009,8 @@ impl TaskAgentExecutor {
                 model_provider: Some(effective_model.model_provider),
                 sandbox_policy: None,
                 mode: Some(ThreadMode::Agent),
+                execution_backend: None,
+                cli_runtime_options: None,
             })
             .await
         {
@@ -1680,6 +1686,8 @@ impl TaskAgentExecutor {
                 model_provider: Some(effective_model.model_provider),
                 sandbox_policy: None,
                 mode: Some(ThreadMode::Agent),
+                execution_backend: None,
+                cli_runtime_options: None,
             })
             .await
             .context("failed to create hidden reviewer turn")?;

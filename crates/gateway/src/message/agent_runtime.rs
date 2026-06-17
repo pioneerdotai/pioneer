@@ -739,6 +739,7 @@ impl MessageProcessor {
                 text,
                 markdown,
                 markdown_version,
+                ..
             } => {
                 if markdown.is_none() {
                     *markdown = Some(markdown::parse_markdown_document(text.as_str()));
@@ -2989,18 +2990,21 @@ impl MessageProcessor {
         else {
             return;
         };
+        let display_reason = self
+            .recovery_blocked_display_reason(turn_id.as_str(), job_id.as_str(), reason.as_str())
+            .await;
         let resume = self
             .build_recovery_blocked_resume_metadata(
                 turn_id.as_str(),
                 job_id.as_str(),
-                reason.as_str(),
+                display_reason.as_str(),
             )
             .await;
         if !self
             .mark_turn_blocked_with_resume_metadata(
                 thread_id,
                 turn_id,
-                format!("{reason} (recovery job {job_id})"),
+                format!("{display_reason} (recovery job {job_id})"),
                 None,
                 Some(resume),
             )
@@ -3008,10 +3012,44 @@ impl MessageProcessor {
         {
             warn!(
                 recovery_job_id = %job_id,
-                error = %reason,
+                error = %display_reason,
                 "failed to mark turn blocked for blocked recovery job"
             );
         }
+    }
+
+    async fn recovery_blocked_display_reason(
+        &self,
+        turn_id: &str,
+        recovery_job_id: &str,
+        fallback_reason: &str,
+    ) -> String {
+        if !fallback_reason
+            .to_ascii_lowercase()
+            .contains("durable turn runtime snapshot is missing")
+        {
+            return fallback_reason.to_owned();
+        }
+
+        let is_cli_runtime_turn = self
+            .crud_store
+            .get_cli_runtime_turn_binding(turn_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+        if !is_cli_runtime_turn {
+            return fallback_reason.to_owned();
+        }
+
+        self.crud_store
+            .get_recovery_job(recovery_job_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|job| job.reason)
+            .filter(|reason| !reason.trim().is_empty())
+            .unwrap_or_else(|| fallback_reason.to_owned())
     }
 
     async fn handle_recovery_exhausted_event(

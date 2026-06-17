@@ -4,6 +4,8 @@ mod artifact_registration;
 mod artifact_tools;
 mod artifacts;
 mod binary;
+#[path = "../cli_runtime/handlers.rs"]
+mod cli_runtime;
 mod dispatch;
 mod hooks;
 mod markdown;
@@ -49,7 +51,12 @@ use pioneer_artifacts::{
     BindArtifactRequest, LocalArtifactBlobStore,
 };
 use pioneer_config::{GatewayArtifactsConfig, GatewayHookRecoveryConfig};
-use pioneer_crud::{ConversationEntry, CrudStore, TimeoutCandidate};
+use pioneer_crud::{
+    CliRuntimePendingRequestRecord,
+    CliRuntimePendingRequestStatus as StoredCliRuntimePendingRequestStatus, ConversationEntry,
+    CrudStore, NewCliRuntimePendingRequest, NewCliRuntimeThreadBinding,
+    ResolveCliRuntimePendingRequest, TimeoutCandidate,
+};
 use pioneer_hooks::{HookRecoveryOptions, HookRuntime};
 use pioneer_memory::{
     MemvidThreadEpisodicBackend, ThreadEpisodicMemvidBackend, thread_episodic_storage_uri_from_path,
@@ -57,8 +64,21 @@ use pioneer_memory::{
 use pioneer_protocol::{
     AgentDurableEvent, AgentProgressEvent, ArtifactBindingDirection, ArtifactBindingKind,
     ArtifactCreatedByKind, ArtifactCreatedNotification, ArtifactKind, ArtifactRole,
+    CLIAgentRuntimeKind, CLIRuntimeGetParams, CLIRuntimeGetResponse, CLIRuntimeListModelsParams,
+    CLIRuntimeListModelsResponse, CLIRuntimeListParams, CLIRuntimeListResponse,
+    CLIRuntimeLoginCancelParams, CLIRuntimeLoginCancelResponse, CLIRuntimeLoginStartParams,
+    CLIRuntimeLoginStartResponse, CLIRuntimeLoginStartType, CLIRuntimePendingRequest,
+    CLIRuntimePendingRequestStatus, CLIRuntimeRefreshParams, CLIRuntimeRefreshResponse,
+    CLIRuntimeRequestKind, CLIRuntimeRequestOpenedNotification, CLIRuntimeRequestResolution,
+    CLIRuntimeRequestResolvedNotification, CLIRuntimeRequestRespondParams,
+    CLIRuntimeRequestRespondResponse, CLIRuntimeReviewStartParams, CLIRuntimeReviewStartResponse,
+    CLIRuntimeReviewTarget, CLIRuntimeStatusParams, CLIRuntimeStatusResponse,
+    CLIRuntimeThreadBinding, CLIRuntimeThreadBindingGetParams, CLIRuntimeThreadBindingGetResponse,
+    CLIRuntimeThreadCompactParams, CLIRuntimeThreadCompactResponse, CLIRuntimeThreadForkParams,
+    CLIRuntimeThreadForkResponse, CLIRuntimeTurnSteerParams, CLIRuntimeTurnSteerResponse,
     ContextCompressedNotification, ContextCompressingNotification, INVALID_PARAMS_CODE,
-    INVALID_REQUEST_CODE, ItemDeltaStream, ItemTimeoutDetectedNotification, JSONRPC_VERSION,
+    INVALID_REQUEST_CODE, ItemCompletedNotification, ItemDeltaNotification, ItemDeltaStream,
+    ItemStartedNotification, ItemTimeoutDetectedNotification, JSONRPC_VERSION,
     JsonRpcErrorResponse, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
     MARKDOWN_AST_VERSION, METHOD_NOT_FOUND_CODE, McpAuditEventSummary, McpChangedAction,
     McpChangedItem, McpChangedNotification, McpDiagnosticLevel, McpInstallParams,
@@ -74,33 +94,35 @@ use pioneer_protocol::{
     ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
     ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits, ProviderModelPricing,
     ProviderSetApiKeyParams, ProviderSetApiKeyResponse, ProviderSummary, RequestId,
-    SkillsUploadAbortParams, SkillsUploadFinishParams, SkillsUploadStartParams, SystemEventLevel,
-    TaskAcceptParams, TaskAgendaParams, TaskCancelParams, TaskCreateParams, TaskDeliveriesParams,
-    TaskDelivery, TaskDeliveryAttempt, TaskDeliveryMode, TaskDetachParams, TaskEventsParams,
-    TaskGetParams, TaskListParams, TaskPauseParams, TaskRescheduleParams, TaskResumeParams,
-    TaskReviseParams, TaskTreeParams as TaskTreeTaskParams, TaskWaitParams,
-    ThreadAgentsDocArchiveParams, ThreadAgentsDocArchiveResponse,
-    ThreadAgentsDocChangedNotification, ThreadAgentsDocGetParams, ThreadAgentsDocGetResponse,
-    ThreadAgentsDocPayload, ThreadAgentsDocResolveForThreadParams,
+    RuntimeAccountSnapshot, RuntimeCapabilities, RuntimeDiagnostic, RuntimeDiagnosticLevel,
+    RuntimeModelInfo, RuntimeStatus, RuntimeSummary, SkillsUploadAbortParams,
+    SkillsUploadFinishParams, SkillsUploadStartParams, SystemEventLevel, TaskAcceptParams,
+    TaskAgendaParams, TaskCancelParams, TaskCreateParams, TaskDeliveriesParams, TaskDelivery,
+    TaskDeliveryAttempt, TaskDeliveryMode, TaskDetachParams, TaskEventsParams, TaskGetParams,
+    TaskListParams, TaskPauseParams, TaskRescheduleParams, TaskResumeParams, TaskReviseParams,
+    TaskTreeParams as TaskTreeTaskParams, TaskWaitParams, ThreadAgentsDocArchiveParams,
+    ThreadAgentsDocArchiveResponse, ThreadAgentsDocChangedNotification, ThreadAgentsDocGetParams,
+    ThreadAgentsDocGetResponse, ThreadAgentsDocPayload, ThreadAgentsDocResolveForThreadParams,
     ThreadAgentsDocResolveForThreadResponse, ThreadAgentsDocResolvedPayload,
     ThreadAgentsDocSaveParams, ThreadAgentsDocSaveReason, ThreadAgentsDocSaveResponse,
     ThreadAgentsDocStatus, ThreadAgentsDocSummary, ThreadFolderCreateParams,
     ThreadFolderCreateResponse, ThreadFolderDeleteParams, ThreadFolderDeleteResponse,
     ThreadFolderMoveParams, ThreadFolderMoveResponse, ThreadGetParams, ThreadGetResponse,
     ThreadHistoryParams, ThreadHistoryResponse, ThreadMoveParams, ThreadMoveResponse,
-    ThreadStartParams, ThreadTreeChangedNotification, ThreadTreeParams, ThreadTreeResponse,
-    ThreadUnsubscribeParams, ThreadUpdateParams, ThreadUpdateResponse, ThreadUpdatedNotification,
-    TimelineItem, TimelineLane, TimelineOrigin, TimelineOriginKind, TimelinePayload,
-    ToolCallStatus, ToolStoragePayload, TurnBlockedNotification, TurnCancelParams,
-    TurnCancelResponse, TurnCompletedNotification, TurnFailedNotification, TurnGetParams,
-    TurnGetResponse, TurnItem, TurnItemEvent, TurnItemEventPayload, TurnItemType, TurnItemsParams,
-    TurnResumeParams, TurnResumeResponse, TurnStartParams, TurnStatus,
-    TurnTimelineChangedNotification, TurnTimelineChangedReason, TurnTimelineParams,
-    TurnTimelineResponse, Workspace, WorkspaceChangeKind, WorkspaceChangedNotification,
-    WorkspaceCreateParams, WorkspaceCreateResponse, WorkspaceDefaultParams,
-    WorkspaceDefaultResponse, WorkspaceListParams, WorkspaceListResponse, WorkspaceSelectParams,
-    WorkspaceSelectResponse, WorkspaceUpdateParams, WorkspaceUpdateResponse,
+    ThreadOriginKind, ThreadSidebarVisibility, ThreadStartParams, ThreadTreeChangedNotification,
+    ThreadTreeParams, ThreadTreeResponse, ThreadUnsubscribeParams, ThreadUpdateParams,
+    ThreadUpdateResponse, ThreadUpdatedNotification, TimelineItem, TimelineLane, TimelineOrigin,
+    TimelineOriginKind, TimelinePayload, ToolCallStatus, ToolStoragePayload,
+    TurnBlockedNotification, TurnCancelParams, TurnCancelResponse, TurnCompletedNotification,
+    TurnFailedNotification, TurnGetParams, TurnGetResponse, TurnItem, TurnItemEvent,
+    TurnItemEventPayload, TurnItemType, TurnItemsParams, TurnResumeParams, TurnResumeResponse,
+    TurnStartParams, TurnStatus, TurnTimelineChangedNotification, TurnTimelineChangedReason,
+    TurnTimelineParams, TurnTimelineResponse, Workspace, WorkspaceChangeKind,
+    WorkspaceChangedNotification, WorkspaceCreateParams, WorkspaceCreateResponse,
+    WorkspaceDefaultParams, WorkspaceDefaultResponse, WorkspaceListParams, WorkspaceListResponse,
+    WorkspaceSelectParams, WorkspaceSelectResponse, WorkspaceUpdateParams, WorkspaceUpdateResponse,
     constants::{events, methods},
+    generate_id, sanitize_runtime_diagnostic_line, sanitize_runtime_diagnostic_lines,
 };
 use pioneer_provider::{ChatMessage, ProviderRegistry};
 use pioneer_tasks::{TaskRuntime, TaskRuntimeConfig};
@@ -115,9 +137,12 @@ use std::sync::RwLock as StdRwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 use tokio::task::JoinHandle;
+
+use pioneer_cli_agent_runtime::event::RuntimeEvent;
 use tokio::time::{Duration, sleep};
 use tracing::{debug, info, warn};
 
+use crate::cli_runtime::manager::CLIAgentRuntimeManager;
 use crate::mcp_service::McpService;
 use crate::memory_runtime::GatewayMemoryRuntime;
 use crate::resilience::{
@@ -173,6 +198,7 @@ pub struct MessageProcessor {
     agent_manager: Arc<AgentManager>,
     provider_registry: Arc<ProviderRegistry>,
     session_manager: Arc<SessionManager>,
+    cli_runtime_manager: Option<Arc<CLIAgentRuntimeManager>>,
     workspace_manager: Arc<WorkspaceManager>,
     pub(crate) crud_store: Arc<CrudStore>,
     gateway_secrets: Arc<GatewaySecrets>,
@@ -181,6 +207,8 @@ pub struct MessageProcessor {
     agent_listener_tasks: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
     agent_message_buffers: Arc<Mutex<HashMap<String, String>>>,
     parent_timeline_targets: Arc<Mutex<HashMap<String, agent_runtime::ParentTimelineTarget>>>,
+    cli_runtime_pending_turn_events:
+        Arc<Mutex<HashMap<CLIRuntimePendingTurnEventKey, Vec<CLIRuntimePendingTurnEvent>>>>,
     turn_llm_context_sequences: Arc<Mutex<HashMap<String, i64>>>,
     artifact_tool_states: Arc<Mutex<HashMap<String, Arc<ArtifactToolState>>>>,
     artifact_output_dirs: Arc<Mutex<HashMap<String, String>>>,
@@ -222,6 +250,20 @@ pub struct MessageProcessor {
 struct MemoryBridgeProviders {
     memory_provider: Arc<crate::memory_tools::GatewayMemoryProvider>,
     memory_policy_provider: Arc<crate::memory_policy::GatewayMemoryTurnPolicyProvider>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct CLIRuntimePendingTurnEventKey {
+    workspace_id: String,
+    runtime_id: String,
+    thread_id: String,
+    native_turn_id: String,
+}
+
+#[derive(Clone, Debug)]
+struct CLIRuntimePendingTurnEvent {
+    event: RuntimeEvent,
+    received_at_unix_ms: i64,
 }
 
 impl MessageProcessor {
@@ -352,6 +394,7 @@ impl MessageProcessor {
             agent_manager,
             provider_registry,
             session_manager,
+            cli_runtime_manager: None,
             workspace_manager,
             crud_store: crud_store.clone(),
             gateway_secrets,
@@ -360,6 +403,7 @@ impl MessageProcessor {
             agent_listener_tasks: Arc::new(Mutex::new(HashMap::new())),
             agent_message_buffers: Arc::new(Mutex::new(HashMap::new())),
             parent_timeline_targets: Arc::new(Mutex::new(HashMap::new())),
+            cli_runtime_pending_turn_events: Arc::new(Mutex::new(HashMap::new())),
             turn_llm_context_sequences: Arc::new(Mutex::new(HashMap::new())),
             artifact_tool_states: Arc::new(Mutex::new(HashMap::new())),
             artifact_output_dirs: Arc::new(Mutex::new(HashMap::new())),
@@ -409,6 +453,47 @@ impl MessageProcessor {
 
     pub async fn set_hook_recovery_config(&self, config: GatewayHookRecoveryConfig) {
         *self.hook_recovery_config.write().await = config;
+    }
+
+    pub async fn shutdown_cli_runtime_manager(&self) {
+        let Some(manager) = self.cli_runtime_manager.as_ref() else {
+            return;
+        };
+        match manager.close_all().await {
+            Ok(closed) if closed > 0 => {
+                info!(
+                    closed,
+                    "closed CLI runtime sessions during gateway shutdown"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(
+                    error = %format!("{error:#}"),
+                    "failed to close CLI runtime sessions during gateway shutdown"
+                );
+            }
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn cli_runtime_manager_enabled(&self) -> bool {
+        self.cli_runtime_manager.is_some()
+    }
+
+    pub(crate) fn with_cli_runtime_manager(mut self, manager: Arc<CLIAgentRuntimeManager>) -> Self {
+        self.cli_runtime_manager = Some(manager);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_cli_runtime_manager_for_tests(
+        mut self,
+        manager: Arc<CLIAgentRuntimeManager>,
+    ) -> Self {
+        self.cli_runtime_manager = Some(manager);
+        self
     }
 
     #[cfg(test)]
@@ -1513,6 +1598,7 @@ impl MessageProcessor {
             agent_manager,
             provider_registry,
             session_manager,
+            cli_runtime_manager: None,
             workspace_manager,
             crud_store: crud_store.clone(),
             gateway_secrets,
@@ -1529,6 +1615,7 @@ impl MessageProcessor {
             agent_listener_tasks: Arc::new(Mutex::new(HashMap::new())),
             agent_message_buffers: Arc::new(Mutex::new(HashMap::new())),
             parent_timeline_targets: Arc::new(Mutex::new(HashMap::new())),
+            cli_runtime_pending_turn_events: Arc::new(Mutex::new(HashMap::new())),
             turn_llm_context_sequences: Arc::new(Mutex::new(HashMap::new())),
             artifact_tool_states: Arc::new(Mutex::new(HashMap::new())),
             artifact_output_dirs: Arc::new(Mutex::new(HashMap::new())),

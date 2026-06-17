@@ -178,6 +178,7 @@ mod tests {
     use crate::secrets::GatewaySecrets;
     use pioneer_config::{
         AppConfig, DesktopConfig, GatewayArtifactsConfig, GatewayAuthConfig,
+        GatewayCliAgentRuntimeConfig, GatewayCliAgentRuntimeInstancesConfig,
         GatewayComputerUseToolsConfig, GatewayConfig, GatewayDatabaseConfig,
         GatewayExecutionWindowsConfig, GatewayMemoryConfig, GatewayProviderConfig,
         GatewayRuntimeConfig, GatewaySkillsConfig, GatewayThreadConfig,
@@ -416,6 +417,8 @@ mod tests {
                 },
                 tasks: Default::default(),
                 skills: GatewaySkillsConfig::default(),
+                cli_agent_runtime: GatewayCliAgentRuntimeConfig::default(),
+                cli_agent_runtimes: GatewayCliAgentRuntimeInstancesConfig::default(),
                 provider: GatewayProviderConfig::default(),
                 database: GatewayDatabaseConfig {
                     file_name: "gateway.db".to_owned(),

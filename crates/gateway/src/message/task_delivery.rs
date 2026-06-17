@@ -170,6 +170,8 @@ impl MessageProcessor {
                 model_provider: None,
                 sandbox_policy: None,
                 mode: None,
+                execution_backend: None,
+                cli_runtime_options: None,
             })
             .await?;
         if let Err(error) = self
@@ -361,6 +363,7 @@ fn delivery_summary_item(delivery: &TaskDelivery) -> TurnItem {
         .unwrap_or_else(|| "Task completed.".to_owned());
     TurnItem::AgentMessage {
         id: format!("task_delivery_result_{}", delivery.id),
+        phase: Default::default(),
         markdown: Some(super::markdown::parse_markdown_document(text.as_str())),
         markdown_version: Some(MARKDOWN_AST_VERSION),
         text,

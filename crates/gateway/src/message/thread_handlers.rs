@@ -867,6 +867,12 @@ impl MessageProcessor {
             )
             .await;
             self.notify_thread_tree_changed(workspace_id).await;
+            self.best_effort_sync_cli_runtime_thread_name(
+                thread.workspace_id.as_str(),
+                thread.id.as_str(),
+                name,
+            )
+            .await;
         }
     }
 

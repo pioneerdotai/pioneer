@@ -1120,6 +1120,8 @@ mod tests {
                     model_provider: None,
                     sandbox_policy: None,
                     mode: None,
+                    execution_backend: None,
+                    cli_runtime_options: None,
                 },
             )
             .await
@@ -1251,6 +1253,8 @@ mod tests {
                     model_provider: None,
                     sandbox_policy: None,
                     mode: None,
+                    execution_backend: None,
+                    cli_runtime_options: None,
                 },
             )
             .await
@@ -1290,6 +1294,8 @@ mod tests {
                     capabilities: Vec::new(),
                     sandbox_policy: None,
                     mode: None,
+                    execution_backend: None,
+                    cli_runtime_options: None,
                 },
             )
             .await
@@ -1318,6 +1324,8 @@ mod tests {
                     model_provider: None,
                     sandbox_policy: None,
                     mode: None,
+                    execution_backend: None,
+                    cli_runtime_options: None,
                 },
             )
             .await
@@ -1356,6 +1364,8 @@ mod tests {
                     capabilities: Vec::new(),
                     sandbox_policy: None,
                     mode: None,
+                    execution_backend: None,
+                    cli_runtime_options: None,
                 },
             )
             .await
@@ -1386,6 +1396,8 @@ mod tests {
                     model_provider: None,
                     sandbox_policy: None,
                     mode: None,
+                    execution_backend: None,
+                    cli_runtime_options: None,
                 },
             )
             .await
