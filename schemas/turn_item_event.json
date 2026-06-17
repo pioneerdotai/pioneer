@@ -21,6 +21,13 @@
     "payload"
   ],
   "$defs": {
+    "AgentMessagePhase": {
+      "type": "string",
+      "enum": [
+        "final_answer",
+        "commentary"
+      ]
+    },
     "ArtifactKind": {
       "type": "string",
       "enum": [
@@ -2085,6 +2092,9 @@
               "format": "uint16",
               "maximum": 65535,
               "minimum": 0
+            },
+            "phase": {
+              "$ref": "#/$defs/AgentMessagePhase"
             },
             "text": {
               "type": "string"

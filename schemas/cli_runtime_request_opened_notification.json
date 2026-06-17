@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CLIRuntimeRequestOpenedNotification",
+  "type": "object",
+  "properties": {
+    "item_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "request": {
+      "$ref": "#/$defs/CLIRuntimePendingRequest"
+    },
+    "request_id": {
+      "type": "string"
+    },
+    "runtime_id": {
+      "type": "string"
+    },
+    "thread_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "turn_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_id",
+    "runtime_id",
+    "request_id",
+    "request"
+  ],
+  "$defs": {
+    "CLIRuntimePendingRequest": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/CLIRuntimeRequestKind"
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "native_request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "payload": true,
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
+    "CLIRuntimeRequestKind": {
+      "type": "string",
+      "enum": [
+        "command_approval",
+        "file_change_approval",
+        "user_input",
+        "other"
+      ]
+    }
+  }
+}

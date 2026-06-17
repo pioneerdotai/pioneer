@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CLIRuntimeProviderDraftMode",
+  "oneOf": [
+    {
+      "type": "string",
+      "enum": [
+        "Create"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "Edit": {
+          "type": "object",
+          "properties": {
+            "original_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "original_id"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Edit"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "Duplicate": {
+          "type": "object",
+          "properties": {
+            "source_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "source_id"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Duplicate"
+      ]
+    }
+  ]
+}

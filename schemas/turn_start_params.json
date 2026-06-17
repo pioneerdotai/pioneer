@@ -9,6 +9,26 @@
         "$ref": "#/$defs/TurnCapability"
       }
     },
+    "cli_runtime_options": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TurnCLIRuntimeOptions"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "execution_backend": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AgentExecutionBackend"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "input": {
       "type": "array",
       "default": [],
@@ -60,6 +80,62 @@
     "turn_id"
   ],
   "$defs": {
+    "AgentExecutionBackend": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "provider": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "apiProvider"
+            }
+          },
+          "required": [
+            "type",
+            "provider"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "runtime_id": {
+              "type": "string"
+            },
+            "runtime_kind": {
+              "$ref": "#/$defs/CLIAgentRuntimeKind"
+            },
+            "type": {
+              "type": "string",
+              "const": "cliAgentRuntime"
+            }
+          },
+          "required": [
+            "type",
+            "runtime_id",
+            "runtime_kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "runtime_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "acpAgentRuntime"
+            }
+          },
+          "required": [
+            "type",
+            "runtime_id"
+          ]
+        }
+      ]
+    },
     "ByteRange": {
       "type": "object",
       "properties": {
@@ -77,6 +153,13 @@
       "required": [
         "start",
         "end"
+      ]
+    },
+    "CLIAgentRuntimeKind": {
+      "type": "string",
+      "enum": [
+        "codex",
+        "claude"
       ]
     },
     "McpScopeKind": {
@@ -126,6 +209,42 @@
         "Chat",
         "Agent"
       ]
+    },
+    "TurnCLIRuntimeOptions": {
+      "type": "object",
+      "properties": {
+        "approval_policy": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "personality": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sandbox": true,
+        "steer_if_active": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
     },
     "TurnCapability": {
       "type": "object",

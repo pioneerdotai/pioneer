@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CLIRuntimeTurnSteerResponse",
+  "type": "object",
+  "properties": {
+    "native_thread_id": {
+      "type": "string"
+    },
+    "native_turn_id": {
+      "type": "string"
+    },
+    "raw": true,
+    "runtime_id": {
+      "type": "string"
+    },
+    "thread_id": {
+      "type": "string"
+    },
+    "turn_id": {
+      "type": "string"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_id",
+    "runtime_id",
+    "thread_id",
+    "turn_id",
+    "native_thread_id",
+    "native_turn_id"
+  ]
+}

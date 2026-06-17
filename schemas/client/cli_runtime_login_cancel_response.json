@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CLIRuntimeLoginCancelResponse",
+  "type": "object",
+  "properties": {
+    "cancelled": {
+      "type": "boolean"
+    },
+    "login_id": {
+      "type": "string"
+    },
+    "runtime_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "runtime_id",
+    "login_id",
+    "cancelled"
+  ]
+}

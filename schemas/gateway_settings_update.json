@@ -3,6 +3,16 @@
   "title": "GatewaySettingsUpdate",
   "type": "object",
   "properties": {
+    "cli_runtimes": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GatewayCliRuntimeSettings"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "general": {
       "anyOf": [
         {
@@ -35,6 +45,62 @@
     }
   },
   "$defs": {
+    "CLIAgentRuntimeKind": {
+      "type": "string",
+      "enum": [
+        "codex",
+        "claude"
+      ]
+    },
+    "GatewayCliRuntimeInstanceSettings": {
+      "type": "object",
+      "properties": {
+        "binary_path": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "home_path": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/CLIAgentRuntimeKind"
+        },
+        "shadow_home_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "display_name",
+        "enabled",
+        "binary_path",
+        "home_path"
+      ]
+    },
+    "GatewayCliRuntimeSettings": {
+      "type": "object",
+      "properties": {
+        "instances": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/GatewayCliRuntimeInstanceSettings"
+          }
+        }
+      }
+    },
     "GatewayGeneralSettingsUpdate": {
       "type": "object",
       "properties": {

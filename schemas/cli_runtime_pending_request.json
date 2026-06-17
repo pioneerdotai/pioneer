@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CLIRuntimePendingRequest",
+  "type": "object",
+  "properties": {
+    "kind": {
+      "$ref": "#/$defs/CLIRuntimeRequestKind"
+    },
+    "message": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "native_request_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "payload": true,
+    "title": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "kind"
+  ],
+  "$defs": {
+    "CLIRuntimeRequestKind": {
+      "type": "string",
+      "enum": [
+        "command_approval",
+        "file_change_approval",
+        "user_input",
+        "other"
+      ]
+    }
+  }
+}

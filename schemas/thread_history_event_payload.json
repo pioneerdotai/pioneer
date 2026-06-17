@@ -922,6 +922,13 @@
     }
   ],
   "$defs": {
+    "AgentMessagePhase": {
+      "type": "string",
+      "enum": [
+        "final_answer",
+        "commentary"
+      ]
+    },
     "ArtifactKind": {
       "type": "string",
       "enum": [
@@ -1713,7 +1720,8 @@
       "enum": [
         "turn_pre_prompt_context",
         "turn_post_preflight_prompt_context",
-        "turn_pre_prompt_compile"
+        "turn_pre_prompt_compile",
+        "runtime_turn_pre_context"
       ]
     },
     "PromptManifestHookSource": {
@@ -1802,7 +1810,8 @@
       "enum": [
         "assistant_full",
         "assistant_minimal",
-        "assistant_none"
+        "assistant_none",
+        "cli_runtime_codex"
       ]
     },
     "RecoveryAction": {
@@ -3310,6 +3319,9 @@
               "format": "uint16",
               "maximum": 65535,
               "minimum": 0
+            },
+            "phase": {
+              "$ref": "#/$defs/AgentMessagePhase"
             },
             "text": {
               "type": "string"

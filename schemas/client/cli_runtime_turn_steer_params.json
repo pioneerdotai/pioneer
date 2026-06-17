@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CLIRuntimeTurnSteerParams",
+  "type": "object",
+  "properties": {
+    "message": {
+      "type": "string"
+    },
+    "runtime_id": {
+      "type": "string"
+    },
+    "thread_id": {
+      "type": "string"
+    },
+    "turn_id": {
+      "type": "string"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_id",
+    "runtime_id",
+    "thread_id",
+    "turn_id",
+    "message"
+  ]
+}

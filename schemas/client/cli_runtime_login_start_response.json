@@ -1,0 +1,203 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CLIRuntimeLoginStartResponse",
+  "type": "object",
+  "properties": {
+    "auth_url": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "login_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "login_type": {
+      "$ref": "#/$defs/CLIRuntimeLoginStartType"
+    },
+    "message": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "raw": true,
+    "runtime_id": {
+      "type": "string"
+    },
+    "status": {
+      "$ref": "#/$defs/RuntimeStatus"
+    },
+    "user_code": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "verification_url": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "runtime_id",
+    "login_type",
+    "status"
+  ],
+  "$defs": {
+    "CLIRuntimeLoginStartType": {
+      "type": "string",
+      "enum": [
+        "chatgptDeviceCode",
+        "chatgpt"
+      ]
+    },
+    "RuntimeStatus": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "disabled"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "binary_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "state": {
+              "type": "string",
+              "const": "missing_binary"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "state": {
+              "type": "string",
+              "const": "spawn_failed"
+            }
+          },
+          "required": [
+            "state",
+            "message"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "initializing"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "needs_auth"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "ready"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "state": {
+              "type": "string",
+              "const": "degraded"
+            }
+          },
+          "required": [
+            "state",
+            "message"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "minimum_version": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "state": {
+              "type": "string",
+              "const": "unsupported_version"
+            },
+            "version": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "state": {
+              "type": "string",
+              "const": "error"
+            }
+          },
+          "required": [
+            "state",
+            "message"
+          ]
+        }
+      ]
+    }
+  }
+}

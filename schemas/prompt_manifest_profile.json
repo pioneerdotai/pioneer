@@ -5,6 +5,7 @@
   "enum": [
     "assistant_full",
     "assistant_minimal",
-    "assistant_none"
+    "assistant_none",
+    "cli_runtime_codex"
   ]
 }

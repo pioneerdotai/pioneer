@@ -1,0 +1,171 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CLIRuntimeProviderSettingsRejection",
+  "oneOf": [
+    {
+      "type": "string",
+      "enum": [
+        "MissingSettings",
+        "EmptyId",
+        "ShadowHomeMatchesHome"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "MissingRuntime": {
+          "type": "object",
+          "properties": {
+            "runtime_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "runtime_id"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "MissingRuntime"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "InvalidId": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "message"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "InvalidId"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "DuplicateId": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "DuplicateId"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "DuplicateDisplayName": {
+          "type": "object",
+          "properties": {
+            "display_name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "display_name"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "DuplicateDisplayName"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "EmptyPath": {
+          "type": "object",
+          "properties": {
+            "field": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "field"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "EmptyPath"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "InvalidPath": {
+          "type": "object",
+          "properties": {
+            "field": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "field",
+            "message"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "InvalidPath"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "UnsupportedKind": {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "$ref": "#/$defs/CLIAgentRuntimeKind"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "UnsupportedKind"
+      ]
+    }
+  ],
+  "$defs": {
+    "CLIAgentRuntimeKind": {
+      "type": "string",
+      "enum": [
+        "codex",
+        "claude"
+      ]
+    }
+  }
+}

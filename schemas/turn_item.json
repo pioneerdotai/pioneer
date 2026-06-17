@@ -53,6 +53,9 @@
           "maximum": 65535,
           "minimum": 0
         },
+        "phase": {
+          "$ref": "#/$defs/AgentMessagePhase"
+        },
         "text": {
           "type": "string"
         },
@@ -957,6 +960,13 @@
     }
   ],
   "$defs": {
+    "AgentMessagePhase": {
+      "type": "string",
+      "enum": [
+        "final_answer",
+        "commentary"
+      ]
+    },
     "ArtifactKind": {
       "type": "string",
       "enum": [

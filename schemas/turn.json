@@ -154,7 +154,8 @@
       "enum": [
         "turn_pre_prompt_context",
         "turn_post_preflight_prompt_context",
-        "turn_pre_prompt_compile"
+        "turn_pre_prompt_compile",
+        "runtime_turn_pre_context"
       ]
     },
     "PromptManifestHookSource": {
@@ -243,7 +244,8 @@
       "enum": [
         "assistant_full",
         "assistant_minimal",
-        "assistant_none"
+        "assistant_none",
+        "cli_runtime_codex"
       ]
     },
     "TurnKind": {

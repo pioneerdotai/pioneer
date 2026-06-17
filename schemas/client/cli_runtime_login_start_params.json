@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CLIRuntimeLoginStartParams",
+  "type": "object",
+  "properties": {
+    "login_type": {
+      "$ref": "#/$defs/CLIRuntimeLoginStartType",
+      "default": "chatgptDeviceCode"
+    },
+    "runtime_id": {
+      "type": "string"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_id",
+    "runtime_id"
+  ],
+  "$defs": {
+    "CLIRuntimeLoginStartType": {
+      "type": "string",
+      "enum": [
+        "chatgptDeviceCode",
+        "chatgpt"
+      ]
+    }
+  }
+}

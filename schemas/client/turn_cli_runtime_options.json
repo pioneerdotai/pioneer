@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnCLIRuntimeOptions",
+  "type": "object",
+  "properties": {
+    "approval_policy": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "effort": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "personality": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "sandbox": true,
+    "steer_if_active": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "summary": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

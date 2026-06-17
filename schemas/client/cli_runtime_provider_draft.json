@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CLIRuntimeProviderDraft",
+  "type": "object",
+  "properties": {
+    "binary_path": {
+      "type": "string"
+    },
+    "display_name": {
+      "type": "string"
+    },
+    "enabled": {
+      "type": "boolean"
+    },
+    "home_path": {
+      "type": "string"
+    },
+    "id": {
+      "type": "string"
+    },
+    "mode": {
+      "$ref": "#/$defs/CLIRuntimeProviderDraftMode"
+    },
+    "shadow_home_path": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "mode",
+    "id",
+    "display_name",
+    "enabled",
+    "binary_path",
+    "home_path",
+    "shadow_home_path"
+  ],
+  "$defs": {
+    "CLIRuntimeProviderDraftMode": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "Create"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Edit": {
+              "type": "object",
+              "properties": {
+                "original_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "original_id"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Edit"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Duplicate": {
+              "type": "object",
+              "properties": {
+                "source_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "source_id"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Duplicate"
+          ]
+        }
+      ]
+    }
+  }
+}

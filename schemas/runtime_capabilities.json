@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RuntimeCapabilities",
+  "type": "object",
+  "properties": {
+    "supports_approvals": {
+      "type": "boolean"
+    },
+    "supports_apps": {
+      "type": "boolean"
+    },
+    "supports_auth_management": {
+      "type": "boolean"
+    },
+    "supports_command_approvals": {
+      "type": "boolean"
+    },
+    "supports_compaction": {
+      "type": "boolean"
+    },
+    "supports_diff_updates": {
+      "type": "boolean"
+    },
+    "supports_file_change_approvals": {
+      "type": "boolean"
+    },
+    "supports_fork": {
+      "type": "boolean"
+    },
+    "supports_generated_schema_probe": {
+      "type": "boolean"
+    },
+    "supports_goal": {
+      "type": "boolean"
+    },
+    "supports_history_read": {
+      "type": "boolean"
+    },
+    "supports_interrupt": {
+      "type": "boolean"
+    },
+    "supports_model_list": {
+      "type": "boolean"
+    },
+    "supports_resume": {
+      "type": "boolean"
+    },
+    "supports_review": {
+      "type": "boolean"
+    },
+    "supports_steer": {
+      "type": "boolean"
+    },
+    "supports_thread_archive": {
+      "type": "boolean"
+    },
+    "supports_threads": {
+      "type": "boolean"
+    },
+    "supports_user_input_requests": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "supports_threads",
+    "supports_resume",
+    "supports_fork",
+    "supports_steer",
+    "supports_interrupt",
+    "supports_approvals",
+    "supports_file_change_approvals",
+    "supports_command_approvals",
+    "supports_user_input_requests",
+    "supports_model_list",
+    "supports_apps",
+    "supports_review",
+    "supports_compaction",
+    "supports_goal",
+    "supports_diff_updates",
+    "supports_history_read",
+    "supports_thread_archive",
+    "supports_auth_management",
+    "supports_generated_schema_probe"
+  ]
+}

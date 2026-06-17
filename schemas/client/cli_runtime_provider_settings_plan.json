@@ -1,0 +1,753 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CLIRuntimeProviderSettingsPlan",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "Send": {
+          "$ref": "#/$defs/GatewaySettingsUpdatePlan"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Send"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "Reject": {
+          "$ref": "#/$defs/CLIRuntimeProviderSettingsRejection"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Reject"
+      ]
+    }
+  ],
+  "$defs": {
+    "CLIAgentRuntimeKind": {
+      "type": "string",
+      "enum": [
+        "codex",
+        "claude"
+      ]
+    },
+    "CLIRuntimeProviderSettingsRejection": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "MissingSettings",
+            "EmptyId",
+            "ShadowHomeMatchesHome"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "MissingRuntime": {
+              "type": "object",
+              "properties": {
+                "runtime_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "runtime_id"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "MissingRuntime"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "InvalidId": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "message": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "message"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "InvalidId"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "DuplicateId": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "DuplicateId"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "DuplicateDisplayName": {
+              "type": "object",
+              "properties": {
+                "display_name": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "display_name"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "DuplicateDisplayName"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "EmptyPath": {
+              "type": "object",
+              "properties": {
+                "field": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "field"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "EmptyPath"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "InvalidPath": {
+              "type": "object",
+              "properties": {
+                "field": {
+                  "type": "string"
+                },
+                "message": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "field",
+                "message"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "InvalidPath"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "UnsupportedKind": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "$ref": "#/$defs/CLIAgentRuntimeKind"
+                }
+              },
+              "required": [
+                "kind"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "UnsupportedKind"
+          ]
+        }
+      ]
+    },
+    "GatewayCliRuntimeInstanceSettings": {
+      "type": "object",
+      "properties": {
+        "binary_path": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "home_path": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/CLIAgentRuntimeKind"
+        },
+        "shadow_home_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "display_name",
+        "enabled",
+        "binary_path",
+        "home_path"
+      ]
+    },
+    "GatewayCliRuntimeSettings": {
+      "type": "object",
+      "properties": {
+        "instances": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/GatewayCliRuntimeInstanceSettings"
+          }
+        }
+      }
+    },
+    "GatewayGeneralSettings": {
+      "type": "object",
+      "properties": {
+        "keepawake": {
+          "type": "boolean",
+          "default": false
+        },
+        "preflight_model": {
+          "$ref": "#/$defs/GatewayMemoryModelSelection",
+          "default": {
+            "source": "thread"
+          }
+        }
+      }
+    },
+    "GatewayGeneralSettingsUpdate": {
+      "type": "object",
+      "properties": {
+        "keepawake": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "preflight_model": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayMemoryModelSelection"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "GatewayMemoryModelSelection": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model_provider": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "$ref": "#/$defs/GatewayMemoryModelSelectionSource",
+          "default": "thread"
+        }
+      }
+    },
+    "GatewayMemoryModelSelectionSource": {
+      "type": "string",
+      "enum": [
+        "thread",
+        "custom"
+      ]
+    },
+    "GatewayMemorySettings": {
+      "type": "object",
+      "properties": {
+        "active_recall_enabled": {
+          "type": "boolean"
+        },
+        "background_extraction_enabled": {
+          "type": "boolean"
+        },
+        "debug_trace_enabled": {
+          "type": "boolean"
+        },
+        "deterministic_recall_enabled": {
+          "type": "boolean"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "proactive_writes_enabled": {
+          "type": "boolean"
+        },
+        "proactive_writes_model": {
+          "$ref": "#/$defs/GatewayMemoryModelSelection",
+          "default": {
+            "source": "thread"
+          }
+        },
+        "strict_diagnostics_enabled": {
+          "type": "boolean"
+        },
+        "tools_enabled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled",
+        "deterministic_recall_enabled",
+        "active_recall_enabled",
+        "tools_enabled",
+        "proactive_writes_enabled",
+        "background_extraction_enabled",
+        "debug_trace_enabled",
+        "strict_diagnostics_enabled"
+      ]
+    },
+    "GatewaySettingsSnapshot": {
+      "type": "object",
+      "properties": {
+        "cli_runtimes": {
+          "$ref": "#/$defs/GatewayCliRuntimeSettings",
+          "default": {
+            "instances": []
+          }
+        },
+        "general": {
+          "$ref": "#/$defs/GatewayGeneralSettings",
+          "default": {
+            "keepawake": false,
+            "preflight_model": {
+              "source": "thread"
+            }
+          }
+        },
+        "memory": {
+          "$ref": "#/$defs/GatewayMemorySettings"
+        },
+        "thread_episodic": {
+          "$ref": "#/$defs/GatewayThreadEpisodicSettings",
+          "default": {
+            "chunk_max_chars": 1600,
+            "chunk_target_max_chars": 1200,
+            "chunk_target_min_chars": 700,
+            "default_max_candidates": 32,
+            "default_prompt_chars": 2400,
+            "enabled": true,
+            "index_batch_limit": 16,
+            "indexing_enabled": true,
+            "max_attempts": 5,
+            "max_candidate_work": 128,
+            "max_chunks_per_item": 64,
+            "max_hit_chars": 1200,
+            "max_prompt_chars": 12000,
+            "max_segments": 16,
+            "min_relevancy": 0.25,
+            "min_results": 1,
+            "near_capacity_percent": 90.0,
+            "recall_enabled": true,
+            "retry_base_delay_secs": 30,
+            "retry_max_delay_secs": 900,
+            "snippet_chars": 360
+          }
+        }
+      },
+      "required": [
+        "memory"
+      ]
+    },
+    "GatewaySettingsUpdate": {
+      "type": "object",
+      "properties": {
+        "cli_runtimes": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayCliRuntimeSettings"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "general": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayGeneralSettingsUpdate"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "memory": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayMemorySettings"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "thread_episodic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayThreadEpisodicSettingsUpdate"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "GatewaySettingsUpdatePlan": {
+      "type": "object",
+      "properties": {
+        "snapshot": {
+          "$ref": "#/$defs/GatewaySettingsSnapshot"
+        },
+        "update": {
+          "$ref": "#/$defs/GatewaySettingsUpdate"
+        }
+      },
+      "required": [
+        "snapshot",
+        "update"
+      ]
+    },
+    "GatewayThreadEpisodicSettings": {
+      "type": "object",
+      "properties": {
+        "chunk_max_chars": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "chunk_target_max_chars": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "chunk_target_min_chars": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "default_max_candidates": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "default_prompt_chars": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "index_batch_limit": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "indexing_enabled": {
+          "type": "boolean"
+        },
+        "max_attempts": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "max_candidate_work": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_chunks_per_item": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_hit_chars": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_prompt_chars": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_segments": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "min_relevancy": {
+          "type": "number",
+          "format": "float"
+        },
+        "min_results": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "near_capacity_percent": {
+          "type": "number",
+          "format": "double"
+        },
+        "recall_enabled": {
+          "type": "boolean"
+        },
+        "retry_base_delay_secs": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "retry_max_delay_secs": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "snippet_chars": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "enabled",
+        "indexing_enabled",
+        "recall_enabled",
+        "default_prompt_chars",
+        "max_prompt_chars",
+        "max_hit_chars",
+        "default_max_candidates",
+        "max_candidate_work",
+        "max_segments",
+        "min_relevancy",
+        "min_results",
+        "snippet_chars",
+        "chunk_target_min_chars",
+        "chunk_target_max_chars",
+        "chunk_max_chars",
+        "max_chunks_per_item",
+        "index_batch_limit",
+        "retry_base_delay_secs",
+        "retry_max_delay_secs",
+        "max_attempts",
+        "near_capacity_percent"
+      ]
+    },
+    "GatewayThreadEpisodicSettingsUpdate": {
+      "type": "object",
+      "properties": {
+        "chunk_max_chars": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "chunk_target_max_chars": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "chunk_target_min_chars": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "default_max_candidates": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "default_prompt_chars": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "index_batch_limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "indexing_enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "max_attempts": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "max_candidate_work": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_chunks_per_item": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_hit_chars": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_prompt_chars": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_segments": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "min_relevancy": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "min_results": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "near_capacity_percent": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "recall_enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "retry_base_delay_secs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "retry_max_delay_secs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "snippet_chars": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}

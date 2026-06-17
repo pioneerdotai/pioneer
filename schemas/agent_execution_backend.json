@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentExecutionBackend",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "provider": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "apiProvider"
+        }
+      },
+      "required": [
+        "type",
+        "provider"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "runtime_id": {
+          "type": "string"
+        },
+        "runtime_kind": {
+          "$ref": "#/$defs/CLIAgentRuntimeKind"
+        },
+        "type": {
+          "type": "string",
+          "const": "cliAgentRuntime"
+        }
+      },
+      "required": [
+        "type",
+        "runtime_id",
+        "runtime_kind"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "runtime_id": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "acpAgentRuntime"
+        }
+      },
+      "required": [
+        "type",
+        "runtime_id"
+      ]
+    }
+  ],
+  "$defs": {
+    "CLIAgentRuntimeKind": {
+      "type": "string",
+      "enum": [
+        "codex",
+        "claude"
+      ]
+    }
+  }
+}

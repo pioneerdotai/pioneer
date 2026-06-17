@@ -1,0 +1,405 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CLIRuntimeListResponse",
+  "type": "object",
+  "properties": {
+    "runtimes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/RuntimeSummary"
+      }
+    }
+  },
+  "required": [
+    "runtimes"
+  ],
+  "$defs": {
+    "CLIAgentRuntimeKind": {
+      "type": "string",
+      "enum": [
+        "codex",
+        "claude"
+      ]
+    },
+    "RuntimeAccountSnapshot": {
+      "type": "object",
+      "properties": {
+        "account_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "auth_method": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "authenticated": {
+          "type": "boolean"
+        },
+        "display_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "email": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "plan": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "authenticated"
+      ]
+    },
+    "RuntimeCapabilities": {
+      "type": "object",
+      "properties": {
+        "supports_approvals": {
+          "type": "boolean"
+        },
+        "supports_apps": {
+          "type": "boolean"
+        },
+        "supports_auth_management": {
+          "type": "boolean"
+        },
+        "supports_command_approvals": {
+          "type": "boolean"
+        },
+        "supports_compaction": {
+          "type": "boolean"
+        },
+        "supports_diff_updates": {
+          "type": "boolean"
+        },
+        "supports_file_change_approvals": {
+          "type": "boolean"
+        },
+        "supports_fork": {
+          "type": "boolean"
+        },
+        "supports_generated_schema_probe": {
+          "type": "boolean"
+        },
+        "supports_goal": {
+          "type": "boolean"
+        },
+        "supports_history_read": {
+          "type": "boolean"
+        },
+        "supports_interrupt": {
+          "type": "boolean"
+        },
+        "supports_model_list": {
+          "type": "boolean"
+        },
+        "supports_resume": {
+          "type": "boolean"
+        },
+        "supports_review": {
+          "type": "boolean"
+        },
+        "supports_steer": {
+          "type": "boolean"
+        },
+        "supports_thread_archive": {
+          "type": "boolean"
+        },
+        "supports_threads": {
+          "type": "boolean"
+        },
+        "supports_user_input_requests": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "supports_threads",
+        "supports_resume",
+        "supports_fork",
+        "supports_steer",
+        "supports_interrupt",
+        "supports_approvals",
+        "supports_file_change_approvals",
+        "supports_command_approvals",
+        "supports_user_input_requests",
+        "supports_model_list",
+        "supports_apps",
+        "supports_review",
+        "supports_compaction",
+        "supports_goal",
+        "supports_diff_updates",
+        "supports_history_read",
+        "supports_thread_archive",
+        "supports_auth_management",
+        "supports_generated_schema_probe"
+      ]
+    },
+    "RuntimeDiagnostic": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "level": {
+          "$ref": "#/$defs/RuntimeDiagnosticLevel"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "level",
+        "code",
+        "message"
+      ]
+    },
+    "RuntimeDiagnosticLevel": {
+      "type": "string",
+      "enum": [
+        "info",
+        "warning",
+        "error"
+      ]
+    },
+    "RuntimeStatus": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "disabled"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "binary_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "state": {
+              "type": "string",
+              "const": "missing_binary"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "state": {
+              "type": "string",
+              "const": "spawn_failed"
+            }
+          },
+          "required": [
+            "state",
+            "message"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "initializing"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "needs_auth"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "ready"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "state": {
+              "type": "string",
+              "const": "degraded"
+            }
+          },
+          "required": [
+            "state",
+            "message"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "minimum_version": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "state": {
+              "type": "string",
+              "const": "unsupported_version"
+            },
+            "version": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "state": {
+              "type": "string",
+              "const": "error"
+            }
+          },
+          "required": [
+            "state",
+            "message"
+          ]
+        }
+      ]
+    },
+    "RuntimeSummary": {
+      "type": "object",
+      "properties": {
+        "account": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RuntimeAccountSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "binary_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "capabilities": {
+          "$ref": "#/$defs/RuntimeCapabilities"
+        },
+        "debug_native_events_enabled": {
+          "type": "boolean"
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RuntimeDiagnostic"
+          }
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "home_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/CLIAgentRuntimeKind"
+        },
+        "models_refreshed_at_unix_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "recent_stderr": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "runtime_id": {
+          "type": "string"
+        },
+        "shadow_home_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/RuntimeStatus"
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "runtime_id",
+        "kind",
+        "display_name",
+        "enabled",
+        "status",
+        "capabilities"
+      ]
+    }
+  }
+}

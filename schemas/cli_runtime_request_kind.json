@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CLIRuntimeRequestKind",
+  "type": "string",
+  "enum": [
+    "command_approval",
+    "file_change_approval",
+    "user_input",
+    "other"
+  ]
+}

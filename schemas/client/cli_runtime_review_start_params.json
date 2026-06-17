@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CLIRuntimeReviewStartParams",
+  "type": "object",
+  "properties": {
+    "delivery": {
+      "$ref": "#/$defs/CLIRuntimeReviewDelivery",
+      "default": "inline"
+    },
+    "runtime_id": {
+      "type": "string"
+    },
+    "target": {
+      "$ref": "#/$defs/CLIRuntimeReviewTarget"
+    },
+    "thread_id": {
+      "type": "string"
+    },
+    "turn_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_id",
+    "runtime_id",
+    "thread_id",
+    "target"
+  ],
+  "$defs": {
+    "CLIRuntimeReviewDelivery": {
+      "type": "string",
+      "enum": [
+        "inline",
+        "detached"
+      ]
+    },
+    "CLIRuntimeReviewTarget": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "uncommittedChanges"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "branch": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "baseBranch"
+            }
+          },
+          "required": [
+            "type",
+            "branch"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "sha": {
+              "type": "string"
+            },
+            "title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "commit"
+            }
+          },
+          "required": [
+            "type",
+            "sha"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "instructions": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "custom"
+            }
+          },
+          "required": [
+            "type",
+            "instructions"
+          ]
+        }
+      ]
+    }
+  }
+}
