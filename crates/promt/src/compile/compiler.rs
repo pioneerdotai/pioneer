@@ -72,12 +72,22 @@ fn build_tool_recovery_policy_section() -> PromptSection {
     }
 }
 
-fn build_task_orchestration_policy_section() -> PromptSection {
+fn build_subagents_policy_section() -> PromptSection {
     PromptSection {
-        id: PromptSectionId::TaskOrchestrationPolicy,
+        id: PromptSectionId::SubagentsPolicy,
         stability: PromptStability::Dynamic,
-        title: content::SECTION_TITLE_TASK_ORCHESTRATION_POLICY.to_owned(),
-        content: content::TASK_ORCHESTRATION_POLICY_PROMPT.to_owned(),
+        title: content::SECTION_TITLE_SUBAGENTS_POLICY.to_owned(),
+        content: content::SUBAGENTS_POLICY_PROMPT.to_owned(),
+        sources: Vec::new(),
+    }
+}
+
+fn build_tasks_policy_section() -> PromptSection {
+    PromptSection {
+        id: PromptSectionId::TasksPolicy,
+        stability: PromptStability::Dynamic,
+        title: content::SECTION_TITLE_TASKS_POLICY.to_owned(),
+        content: content::TASKS_POLICY_PROMPT.to_owned(),
         sources: Vec::new(),
     }
 }
@@ -570,7 +580,8 @@ pub fn compile_prompt(input: PromptCompileInput) -> anyhow::Result<CompiledPromp
     }
 
     if input.include_task_orchestration_policy {
-        sections.push(build_task_orchestration_policy_section());
+        sections.push(build_subagents_policy_section());
+        sections.push(build_tasks_policy_section());
     }
 
     sections.extend(build_runtime_dynamic_sections(&input, &mut diagnostics));
@@ -790,8 +801,8 @@ mod tests {
     }
 
     #[test]
-    fn task_orchestration_policy_is_dynamic_and_opt_in() {
-        let root = temp_workspace("task_orchestration");
+    fn subagents_and_tasks_policies_are_dynamic_and_opt_in() {
+        let root = temp_workspace("subagents_tasks_policies");
         std::fs::write(root.join("SOUL.md"), "Voice: direct and concise").expect("write SOUL");
         std::fs::write(root.join("IDENTITY.md"), "Name: Pioneer").expect("write IDENTITY");
 
@@ -811,20 +822,26 @@ mod tests {
         })
         .expect("compile");
 
-        let task_section = compiled
+        let subagents_section = compiled
             .sections
             .iter()
-            .find(|section| section.id == PromptSectionId::TaskOrchestrationPolicy)
-            .expect("task orchestration section should be present");
+            .find(|section| section.id == PromptSectionId::SubagentsPolicy)
+            .expect("subagents section should be present");
         assert_eq!(
-            task_section.stability,
+            subagents_section.stability,
             crate::section::PromptStability::Dynamic
         );
-        assert!(
-            compiled
-                .dynamic_system_text
-                .contains("## Task Orchestration")
+        let tasks_section = compiled
+            .sections
+            .iter()
+            .find(|section| section.id == PromptSectionId::TasksPolicy)
+            .expect("tasks section should be present");
+        assert_eq!(
+            tasks_section.stability,
+            crate::section::PromptStability::Dynamic
         );
+        assert!(compiled.dynamic_system_text.contains("## Subagents"));
+        assert!(compiled.dynamic_system_text.contains("## Tasks"));
         assert!(
             compiled
                 .dynamic_system_text
@@ -833,12 +850,22 @@ mod tests {
         assert!(
             compiled
                 .dynamic_system_text
-                .contains("exact tool selection, payloads, waiting, review")
+                .contains("`read_skill` with skill slug `system:pioneer/tasks`")
         );
         assert!(
             compiled
                 .dynamic_system_text
                 .contains("Do not finish the parent turn while attached subagent work")
+        );
+        assert!(
+            compiled
+                .dynamic_system_text
+                .contains("Delivery is separate from execution")
+        );
+        assert!(
+            !compiled
+                .dynamic_system_text
+                .contains("## Task Orchestration")
         );
         assert!(!compiled.dynamic_system_text.contains("task_create"));
         assert!(!compiled.dynamic_system_text.contains("task_accept"));

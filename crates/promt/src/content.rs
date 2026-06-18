@@ -6,7 +6,8 @@ pub const SECTION_TITLE_TOOL_RECOVERY_POLICY: &str = "Tool Recovery Policy";
 pub const SECTION_TITLE_SOUL_CORE: &str = "Soul Core";
 pub const SECTION_TITLE_IDENTITY_CORE: &str = "Identity Core";
 pub const SECTION_TITLE_USER_PERSONA: &str = "User Persona";
-pub const SECTION_TITLE_TASK_ORCHESTRATION_POLICY: &str = "Task Orchestration";
+pub const SECTION_TITLE_SUBAGENTS_POLICY: &str = "Subagents";
+pub const SECTION_TITLE_TASKS_POLICY: &str = "Tasks";
 pub const SECTION_TITLE_PIONEER_CLI_RUNTIME_CONTEXT: &str = "Pioneer Context";
 pub const SECTION_TITLE_MEMORY_RECALL: &str = "Memory Recall";
 pub const SECTION_TITLE_THREAD_CONTEXT: &str = "Thread Context";
@@ -53,7 +54,22 @@ pub const ARTIFACT_OUTPUT_CONTRACT_PROMPT: &str = concat!(
     "- In the final response, refer to registered artifacts only after artifact_register succeeds. Otherwise refer to normal filesystem paths.",
 );
 
-pub const TASK_ORCHESTRATION_POLICY_PROMPT: &str = "Task tools may be available for durable work, scheduling, and attached subagents.\n\nFor every non-trivial user task, first look for a useful split into meaningful independent subtasks. Prefer attached subagents when parallel work can improve speed, coverage, verification, or auditability, and use the parent turn to coordinate, review, and synthesize their accepted results.\n\nDo not over-delegate. Handle tiny, obvious, tightly coupled, or single-step tasks yourself when subagents would add coordination overhead without improving the outcome.\n\nBefore creating subagents, coordinating multi-agent work, or using task tools for scheduled/background work, call `read_skill` with skill slug `system:pioneer/subagents` and follow that skill's instructions. That skill is the authoritative guide for exact tool selection, payloads, waiting, review, revision, cancellation, detaching, scheduling, and final synthesis.\n\nDo not finish the parent turn while attached subagent work created by this turn is still unresolved. Resolve it according to the subagents skill before giving a final answer.";
+pub const SUBAGENTS_POLICY_PROMPT: &str = concat!(
+    "Attached subagents are task-backed child agents for focused work inside the current user turn.\n\n",
+    "Use attached subagents when independent work can improve speed, coverage, verification, or auditability. ",
+    "Do not delegate tiny, obvious, tightly coupled, single-step, or strictly sequential work where coordination would not improve the outcome.\n\n",
+    "The parent agent owns the user outcome. Child results are evidence until the parent reviews, accepts, revises, cancels, detaches, or integrates them.\n\n",
+    "Do not finish the parent turn while attached subagent work created by this turn is pending, running, awaiting review, or producing unreviewed candidates.\n\n",
+    "Before creating attached subagents, waiting for them, reviewing candidates, revising, accepting, cancelling, detaching, or synthesizing child results, call `read_skill` with skill slug `system:pioneer/subagents` and follow that skill."
+);
+
+pub const TASKS_POLICY_PROMPT: &str = concat!(
+    "Durable tasks are for future, recurring, background, or already-existing work. They are product objects with task state, run history, and delivery behavior.\n\n",
+    "Use durable tasks when work should run later, repeat on a schedule, continue in the background, be updated later, or deliver results outside the current parent turn.\n\n",
+    "Scheduled and recurring tasks are not attached subagents. Do not wait for future scheduled runs unless a current active run is explicitly waitable. Confirm the task id, schedule, timezone, delivery destination, and where results will appear.\n\n",
+    "Delivery is separate from execution. A task can finish and store a result without writing a message to this thread unless delivery is configured for a thread surface.\n\n",
+    "Before creating, listing, inspecting, updating, rescheduling, pausing, resuming, or troubleshooting durable tasks, call `read_skill` with skill slug `system:pioneer/tasks` and follow that skill."
+);
 
 pub const RECOVERY_CONTINUATION_PROMPT: &str = "Previous attempt was interrupted by output limits. Continue from where it stopped without repeating prior text.";
 
@@ -186,15 +202,20 @@ mod tests {
     }
 
     #[test]
-    fn task_orchestration_policy_points_to_subagents_skill_and_review_tools() {
-        assert!(TASK_ORCHESTRATION_POLICY_PROMPT.contains("system:pioneer/subagents"));
-        assert!(TASK_ORCHESTRATION_POLICY_PROMPT.contains("read_skill"));
-        assert!(TASK_ORCHESTRATION_POLICY_PROMPT.contains("exact tool selection"));
-        assert!(TASK_ORCHESTRATION_POLICY_PROMPT.contains("payloads"));
+    fn subagents_and_tasks_policies_point_to_separate_system_skills() {
+        assert!(SUBAGENTS_POLICY_PROMPT.contains("system:pioneer/subagents"));
+        assert!(SUBAGENTS_POLICY_PROMPT.contains("read_skill"));
+        assert!(SUBAGENTS_POLICY_PROMPT.contains("attached subagents"));
+        assert!(SUBAGENTS_POLICY_PROMPT.contains("parent agent owns the user outcome"));
         assert!(
-            TASK_ORCHESTRATION_POLICY_PROMPT
+            SUBAGENTS_POLICY_PROMPT
                 .contains("Do not finish the parent turn while attached subagent work")
         );
+
+        assert!(TASKS_POLICY_PROMPT.contains("system:pioneer/tasks"));
+        assert!(TASKS_POLICY_PROMPT.contains("read_skill"));
+        assert!(TASKS_POLICY_PROMPT.contains("future, recurring, background"));
+        assert!(TASKS_POLICY_PROMPT.contains("Delivery is separate from execution"));
     }
 
     #[test]

@@ -8505,10 +8505,12 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
         .as_ref()
         .expect("agent request should include compiled prompt");
     assert!(
-        agent_prompt
-            .full_system_text
-            .contains("## Task Orchestration"),
-        "agent mode should explain task orchestration when task tools are available"
+        agent_prompt.full_system_text.contains("## Subagents"),
+        "agent mode should explain attached subagents when task tools are available"
+    );
+    assert!(
+        agent_prompt.full_system_text.contains("## Tasks"),
+        "agent mode should explain durable tasks when task tools are available"
     );
     let tool_names = first_agent_request
         .tools
@@ -8590,8 +8592,12 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
     );
     if let Some(prompt) = first_chat_request.compiled_prompt.as_ref() {
         assert!(
-            !prompt.full_system_text.contains("## Task Orchestration"),
-            "chat mode without task tools should not advertise task orchestration"
+            !prompt.full_system_text.contains("## Subagents"),
+            "chat mode without task tools should not advertise subagents"
+        );
+        assert!(
+            !prompt.full_system_text.contains("## Tasks"),
+            "chat mode without task tools should not advertise durable tasks"
         );
     }
 }

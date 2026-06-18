@@ -233,7 +233,7 @@ mod tests {
     };
 
     #[test]
-    fn materializes_bundled_browser_and_subagents_skills() {
+    fn materializes_bundled_browser_subagents_tasks_and_memory_skills() {
         let runtime_home = tempfile::tempdir().expect("runtime home");
         let roots = materialize_bundled_system_skill_roots(runtime_home.path())
             .expect("materialize bundled system skills");
@@ -378,6 +378,64 @@ mod tests {
                 .expect("system subagents read_skill entry")
                 .skill_asset_root,
             expected_subagents_asset_root
+        );
+
+        let tasks = catalog
+            .skills
+            .iter()
+            .find(|skill| skill.identity.slug == "tasks")
+            .expect("bundled tasks skill should load");
+        assert!(matches!(
+            tasks.identity.source_kind,
+            SkillSourceKind::System
+        ));
+        assert_eq!(tasks.identity.owner, "pioneer");
+        assert_eq!(
+            tasks.policy_hints.implicit_invocation,
+            SkillImplicitInvocationPolicy::Required
+        );
+        assert!(tasks.policy_hints.catalog_hidden);
+
+        let expected_tasks_asset_root = root_canonical.join("pioneer/tasks").display().to_string();
+        let tasks_active = vec![ResolvedSkill {
+            slug: "pioneer/tasks".to_owned(),
+            reason: SkillResolvedReason::Implicit,
+            definition: tasks.clone(),
+        }];
+        let tasks_prompt = build_skill_prompt(
+            tasks_active.as_slice(),
+            SkillPromptBudget {
+                max_chars: 4_000,
+                compact_mode_threshold: 6,
+                include_read_skill_hint: true,
+            },
+        );
+        assert!(
+            !tasks_prompt.text.contains("system:pioneer/tasks"),
+            "catalog-hidden tasks skill should not appear in the ordinary skills prompt"
+        );
+
+        let tasks_runtime_plan = build_skill_runtime_plan(
+            tasks_active.as_slice(),
+            SkillRuntimeBudget {
+                enable_dynamic_tools: false,
+                max_dynamic_tools_per_skill: 16,
+                allow_shell_tools: false,
+                allow_http_tools: false,
+                allow_function_proxy_tools: false,
+                allow_untrusted_install: false,
+                min_trust_for_shell_tools: SkillTrustLevel::Verified,
+                min_trust_for_http_tools: SkillTrustLevel::Community,
+                min_trust_for_function_proxy_tools: SkillTrustLevel::Community,
+            },
+        );
+        assert_eq!(
+            tasks_runtime_plan
+                .read_skill_index
+                .get("system:pioneer/tasks")
+                .expect("system tasks read_skill entry")
+                .skill_asset_root,
+            expected_tasks_asset_root
         );
 
         let memory = catalog

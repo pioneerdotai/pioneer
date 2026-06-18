@@ -1,13 +1,11 @@
-# Task Workflows And Examples
+# Attached Subagent Workflows And Examples
 
-Use this reference for common multi-step task and subagent workflows.
+Use this reference for common current-turn subagent workflows.
 
 ## Contents
 
 - Parallel Code Investigation
 - Independent Review Subagent
-- Scheduled Release Monitor
-- Fix Delivery From Notification To Thread
 - Parent Synthesis After Subagents
 - Revision Workflow
 - Cancel Or Detach
@@ -17,28 +15,28 @@ Use this reference for common multi-step task and subagent workflows.
 User:
 
 ```text
-Find why scheduled task results are not visible in the parent thread.
+Find why explicit user identity facts are not being extracted into durable memory.
 ```
 
 Good split:
 
-- Subagent A: inspect task delivery service and persistence.
-- Subagent B: inspect desktop/client notification handling.
-- Subagent C: inspect task creation/update schemas and defaults.
+- Subagent A: inspect post-turn extractor prompt and parser.
+- Subagent B: inspect memory quality gate and scoring.
+- Subagent C: inspect write provider calls and diagnostics.
 
 Create all three first, then wait once:
 
 ```json
 {
-  "title": "Delivery service investigation",
-  "goal": "Find how task delivery turns result snapshots into thread items or notifications.",
+  "title": "Memory extraction investigation",
+  "goal": "Find how post-turn extraction turns completed turns into durable memory write candidates.",
   "agentRole": "researcher",
   "instructions": [
     "Inspect the repository read-only.",
     "Return exact file:line references.",
     "Do not modify files."
   ],
-  "inputText": "Focus on task delivery execution, owner_thread, thread, user_notification, webhook, and delivered_turn_id.",
+  "inputText": "Focus on extractor eligibility, provider JSON parsing, quality gate routing, and write diagnostics.",
   "outputInstructions": "Return findings with evidence and a product-level explanation."
 }
 ```
@@ -64,103 +62,20 @@ Child task:
 
 ```json
 {
-  "title": "Review subagents skill update",
-  "goal": "Review the edited Pioneer subagents skill for incorrect task semantics or missing delivery guidance.",
+  "title": "Review memory prompt rewrite",
+  "goal": "Review the edited memory prompt for incorrect semantics or missing safety constraints.",
   "agentRole": "reviewer",
   "instructions": [
-    "Read the changed skill files.",
-    "Look for factual errors, missing warnings, and confusing examples.",
+    "Read the changed prompt files.",
+    "Look for factual errors, missing warnings, and confusing instructions.",
     "Do not edit files."
   ],
-  "inputText": "Changed files: resources/skills/pioneer/subagents/SKILL.md and references.",
+  "inputText": "Changed files: crates/promt/src/render/memory_post_turn_extractor.rs.",
   "outputInstructions": "Return a code-review-style list of findings with file:line references. If no issues, say so and list residual risks."
 }
 ```
 
 Do not pass your intended conclusion. The point is independent validation.
-
-## Scheduled Release Monitor
-
-User:
-
-```text
-Every day at 5 Moscow time, check whether this repo has a new release. If yes, send me a product summary here in the same format.
-```
-
-Good product choices:
-
-- Use cron trigger with `timezone:"Europe/Moscow"`.
-- Make instructions self-contained.
-- Use `owner_thread` or `thread` delivery, not `user_notification`.
-- Define no-op behavior.
-- Include a clear baseline or state comparison rule.
-
-Payload shape:
-
-```json
-{
-  "title": "Repository release monitor",
-  "goal": "Check for new releases and post a product summary when there is a new release.",
-  "trigger": {
-    "kind": "cron",
-    "cronExpr": "0 5 * * *",
-    "timezone": "Europe/Moscow"
-  },
-  "instructions": [
-    "Each run, fetch the latest release for OWNER/REPO using any available web or HTTP tool.",
-    "Compare the latest tag with the configured baseline or available durable state.",
-    "If there is no new release, return a concise no-op result.",
-    "If there is a new release, fetch the release body or page and summarize the changelog from a product perspective.",
-    "Use Russian Markdown.",
-    "Fail clearly if release data is unavailable."
-  ],
-  "inputText": "Repository: https://github.com/OWNER/REPO. Baseline release tag: vX.Y.Z.",
-  "outputInstructions": "If a new release exists, return a Markdown product summary with sections and concise explanations of why each change matters to users. If no new release exists, return 'Новых релизов нет.'",
-  "deliveryPolicy": {
-    "mode": "owner_thread",
-    "includeResult": true,
-    "format": "full_result"
-  }
-}
-```
-
-Confirmation should say the result will be posted in the thread and whether no-op runs will be visible.
-
-## Fix Delivery From Notification To Thread
-
-User:
-
-```text
-Change this task so answers come here. You configured it as a user notification.
-```
-
-Workflow:
-
-1. Use `task_list` or known task id to identify the task.
-2. Use `task_get` to inspect current delivery.
-3. Patch only `deliveryPolicy`.
-4. Verify the update.
-5. Explain that future runs will post to this thread; prior runs are not retroactive.
-
-Patch:
-
-```json
-{
-  "taskId": "TASK_ID",
-  "deliveryPolicy": {
-    "mode": "thread",
-    "threadId": "CURRENT_THREAD_ID",
-    "includeResult": true,
-    "format": "full_result"
-  }
-}
-```
-
-Good final answer:
-
-```text
-Done. The task now delivers full results to this thread instead of user notifications. This applies to future runs; the run that already completed will not be reposted automatically.
-```
 
 ## Parent Synthesis After Subagents
 
@@ -198,9 +113,9 @@ Example feedback:
 
 ```json
 {
-  "feedback": "The answer explains user_notification but does not say whether previous runs are retroactive. Add a section 'Retroactivity' explaining that delivery changes affect future runs only, and include evidence from the task update behavior.",
+  "feedback": "The answer explains parser validation but does not say how weak candidates are rejected. Add a section 'Quality gate' with file:line evidence for rejection and suppression paths.",
   "additionalInstructions": [
-    "Keep the existing correct delivery-mode explanation.",
+    "Keep the existing correct parser explanation.",
     "Return the complete revised answer, not a diff."
   ]
 }

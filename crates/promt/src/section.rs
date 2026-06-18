@@ -154,6 +154,8 @@ pub enum PromptSectionId {
     UserPersona,
     ToolRecoveryPolicy,
     TaskOrchestrationPolicy,
+    SubagentsPolicy,
+    TasksPolicy,
     PioneerCliRuntimeContext,
     AgentsMd,
     MemoryRecall,
@@ -180,6 +182,8 @@ impl PromptSectionId {
             Self::UserPersona => "user_persona",
             Self::ToolRecoveryPolicy => "tool_recovery_policy",
             Self::TaskOrchestrationPolicy => "task_orchestration_policy",
+            Self::SubagentsPolicy => "subagents_policy",
+            Self::TasksPolicy => "tasks_policy",
             Self::PioneerCliRuntimeContext => "pioneer_cli_runtime_context",
             Self::AgentsMd => "agents_md",
             Self::MemoryRecall => "memory_recall",
@@ -208,6 +212,8 @@ impl PromptSectionId {
                 | "user_persona"
                 | "tool_recovery_policy"
                 | "task_orchestration_policy"
+                | "subagents_policy"
+                | "tasks_policy"
                 | "pioneer_cli_runtime_context"
                 | "agents_md"
                 | "memory_recall"

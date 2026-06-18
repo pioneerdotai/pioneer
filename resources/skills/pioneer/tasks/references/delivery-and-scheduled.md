@@ -1,6 +1,6 @@
 # Delivery And Scheduled Tasks
 
-Use this reference when creating future work, recurring tasks, or changing where task results appear.
+Use this reference when creating future work, recurring tasks, interval tasks, cron tasks, or changing where task results appear.
 
 ## Contents
 
@@ -17,7 +17,7 @@ Use this reference when creating future work, recurring tasks, or changing where
 
 Task result production and task result delivery are separate.
 
-The child run can finish successfully, create a result candidate, and store a result snapshot. That does not mean the main thread gets an assistant message. Delivery decides the user-facing surface.
+The task run can finish successfully, create a result candidate, and store a result snapshot. That does not mean the main thread gets an assistant message. Delivery decides the user-facing surface.
 
 Use this mental model:
 
@@ -40,8 +40,6 @@ Every morning, check this and tell me here.
 
 `owner_thread` targets the task owner's thread. It is usually the best default for scheduled tasks created from the current thread.
 
-Payload:
-
 ```json
 {
   "deliveryPolicy": {
@@ -55,8 +53,6 @@ Payload:
 ### thread
 
 Use when you know the exact target thread id or are updating an existing task to point to a specific thread.
-
-Payload:
 
 ```json
 {
@@ -88,13 +84,6 @@ Avoid `user_notification` when the user asks for a report, answer, summary, or "
 ### webhook
 
 Use when the result belongs in an external system.
-
-Examples:
-
-```text
-Send the result to this webhook.
-Post the daily status to our automation endpoint.
-```
 
 ### none
 
