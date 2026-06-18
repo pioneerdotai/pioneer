@@ -409,7 +409,10 @@ mod tests {
             "Available memory tools: memory_search, memory_list, memory_get, memory_remember, memory_forget."
         ));
         assert!(prompt.contains("Treat memory as working context"));
-        assert!(prompt.contains("For every non-trivial turn, actively decide whether memory can improve"));
+        assert!(
+            prompt
+                .contains("For every non-trivial turn, actively decide whether memory can improve")
+        );
         assert!(prompt.contains("Do not wait for the user to ask whether you remember something"));
         assert!(prompt.contains("skill `system:pioneer/memory`"));
         assert!(prompt.contains("call `read_skill` with skill slug `system:pioneer/memory`"));

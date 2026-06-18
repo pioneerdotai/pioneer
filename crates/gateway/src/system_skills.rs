@@ -396,7 +396,8 @@ mod tests {
         );
         assert!(memory.policy_hints.catalog_hidden);
 
-        let expected_memory_asset_root = root_canonical.join("pioneer/memory").display().to_string();
+        let expected_memory_asset_root =
+            root_canonical.join("pioneer/memory").display().to_string();
         let memory_active = vec![ResolvedSkill {
             slug: "pioneer/memory".to_owned(),
             reason: SkillResolvedReason::Implicit,

@@ -23080,7 +23080,7 @@ async fn memory_tool_remember_writes_memory_with_turn_provenance() {
 }
 
 #[tokio::test]
-async fn memory_task_runtime_context_materializes_read_only_tools() {
+async fn memory_task_runtime_context_materializes_all_memory_tools() {
     let harness = setup_memory_gateway_harness("task_runtime_memory_tools", true).await;
     let mut context = memory_tool_context(&harness, "task_runtime_memory_tools");
     context.task_id = Some("task_runtime_memory_tools".to_owned());
@@ -23096,11 +23096,56 @@ async fn memory_task_runtime_context_materializes_read_only_tools() {
     assert!(tool_names.contains(&"memory_search"));
     assert!(tool_names.contains(&"memory_list"));
     assert!(tool_names.contains(&"memory_get"));
-    assert!(!tool_names.contains(&"memory_remember"));
-    assert!(!tool_names.contains(&"memory_forget"));
-    assert!(materialization.diagnostics.iter().any(|diagnostic| {
-        diagnostic.contains("memory mutation tools hidden for task runtime context")
-    }));
+    assert!(tool_names.contains(&"memory_remember"));
+    assert!(tool_names.contains(&"memory_forget"));
+    assert!(materialization.diagnostics.is_empty());
+
+    let tool_loop_config = test_tool_loop_config();
+    let tools = build_tools(
+        harness.runtime_home.clone(),
+        generate_test_request_id("turn", "task_runtime_memory_tools"),
+        tool_loop_config.web,
+        tool_loop_config.computer_use,
+        materialization.bundles,
+    )
+    .expect("task runtime memory tools should build");
+    let remember = execute_memory_tool_payload(
+        &tools,
+        "memory_remember",
+        "call_task_runtime_memory_remember",
+        json!({
+            "content": "task runtime can write a durable user memory",
+            "category": "preference",
+            "scope": "user",
+            "key": "task_runtime_memory_write"
+        }),
+    )
+    .await;
+    let memory_id = remember
+        .get("memoryId")
+        .and_then(serde_json::Value::as_str)
+        .expect("task runtime remember output should include memoryId")
+        .to_owned();
+    let forget = execute_memory_tool_payload(
+        &tools,
+        "memory_forget",
+        "call_task_runtime_memory_forget",
+        json!({
+            "memoryId": memory_id,
+            "reason": "task runtime write tools are allowed"
+        }),
+    )
+    .await;
+    assert_eq!(
+        forget
+            .get("forgottenMemoryIds")
+            .and_then(serde_json::Value::as_array)
+            .expect("forget output ids")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>(),
+        vec![memory_id.as_str()]
+    );
 
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
