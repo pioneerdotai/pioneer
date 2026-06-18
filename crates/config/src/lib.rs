@@ -2126,7 +2126,7 @@ const fn default_skills_runtime_max_dynamic_tools_per_skill() -> usize {
 }
 
 const fn default_skills_runtime_read_skill_max_chars() -> usize {
-    24_000
+    72_000
 }
 
 const fn default_skills_runtime_compact_mode_threshold() -> usize {
@@ -3081,7 +3081,7 @@ active_recall_model = { source = "custom", model_provider = "legacy-provider", m
             config.gateway.skills.runtime.max_dynamic_tools_per_skill,
             64
         );
-        assert_eq!(config.gateway.skills.runtime.read_skill_max_chars, 24_000);
+        assert_eq!(config.gateway.skills.runtime.read_skill_max_chars, 72_000);
         assert_eq!(config.gateway.skills.runtime.compact_mode_threshold, 6);
         assert!(config.gateway.skills.runtime.allow_shell_tools);
         assert!(config.gateway.skills.runtime.allow_http_tools);

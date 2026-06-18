@@ -121,7 +121,7 @@ fn test_tool_loop_config() -> ToolLoopConfig {
                 enable_dynamic_tools: true,
                 enable_read_skill: true,
                 max_dynamic_tools_per_skill: 64,
-                read_skill_max_chars: 24_000,
+                read_skill_max_chars: 72_000,
                 compact_mode_threshold: 6,
                 allow_shell_tools: true,
                 allow_http_tools: true,
