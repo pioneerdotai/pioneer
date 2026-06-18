@@ -34,6 +34,14 @@ impl ClientEffectSink for DesktopClientEffectSink<'_, '_> {
         self.app.refresh_gateway_settings(self.cx);
     }
 
+    fn refresh_provider_lists(&mut self) {
+        if self.app.active_workspace_id().is_none() {
+            return;
+        }
+        self.app.refresh_configured_providers(self.cx);
+        self.app.refresh_cli_providers_auto(self.cx);
+    }
+
     fn queue_skills_refresh(&mut self) {
         self.app.queue_skills_refresh();
     }
@@ -61,6 +69,8 @@ impl ClientEffectSink for GatewayCommandClientEffectSink<'_> {
     fn refresh_workspace_list(&mut self) {}
 
     fn refresh_gateway_settings(&mut self) {}
+
+    fn refresh_provider_lists(&mut self) {}
 
     fn queue_skills_refresh(&mut self) {}
 

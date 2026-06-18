@@ -191,6 +191,7 @@ impl PioneerDesktop {
             MainContentView::Providers => {
                 self.providers.clear_for_workspace_switch();
                 self.refresh_configured_providers(cx);
+                self.refresh_cli_providers_auto(cx);
             }
             _ => {}
         }

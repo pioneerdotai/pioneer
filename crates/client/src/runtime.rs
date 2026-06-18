@@ -803,6 +803,7 @@ mod tests {
             vec![
                 ClientEffect::RefreshWorkspaceList,
                 ClientEffect::RefreshGatewaySettings,
+                ClientEffect::RefreshProviderLists,
                 ClientEffect::QueueSkillsRefresh,
                 ClientEffect::EnqueueInFlightTurnsForResume,
             ]

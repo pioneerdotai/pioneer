@@ -33,6 +33,7 @@ impl PioneerDesktop {
         if plan.clear_gateway_settings {
             self.gateway.settings = None;
         }
+        self.providers.clear_for_gateway_switch();
         self.gateway.settings_loading = plan.gateway_settings_loading;
         self.gateway.settings_error = plan.gateway_settings_error;
         plan.effects

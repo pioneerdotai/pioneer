@@ -555,6 +555,7 @@ pub fn reduce_gateway_connection_event(
             let mut effects = vec![
                 ClientEffect::RefreshWorkspaceList,
                 ClientEffect::RefreshGatewaySettings,
+                ClientEffect::RefreshProviderLists,
             ];
             if queue_skills_refresh {
                 effects.push(ClientEffect::QueueSkillsRefresh);
@@ -695,6 +696,7 @@ pub fn reduce_gateway_operation_finish(
                     vec![
                         ClientEffect::RefreshWorkspaceList,
                         ClientEffect::RefreshGatewaySettings,
+                        ClientEffect::RefreshProviderLists,
                         ClientEffect::EnqueueInFlightTurnsForResume,
                     ]
                 } else {
@@ -1207,6 +1209,7 @@ mod tests {
             vec![
                 ClientEffect::RefreshWorkspaceList,
                 ClientEffect::RefreshGatewaySettings,
+                ClientEffect::RefreshProviderLists,
                 ClientEffect::QueueSkillsRefresh,
                 ClientEffect::EnqueueInFlightTurnsForResume,
             ]
@@ -1254,6 +1257,7 @@ mod tests {
             vec![
                 ClientEffect::RefreshWorkspaceList,
                 ClientEffect::RefreshGatewaySettings,
+                ClientEffect::RefreshProviderLists,
                 ClientEffect::EnqueueInFlightTurnsForResume,
             ]
         );

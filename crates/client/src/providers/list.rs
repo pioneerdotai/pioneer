@@ -290,6 +290,14 @@ impl ProviderListState {
     }
 
     pub fn clear_for_workspace_switch(&mut self) {
+        self.clear_gateway_scoped_state();
+    }
+
+    pub fn clear_for_gateway_switch(&mut self) {
+        self.clear_gateway_scoped_state();
+    }
+
+    fn clear_gateway_scoped_state(&mut self) {
         self.configured_names.clear();
         self.cli_runtimes.clear();
         self.cli_refresh_status = CLIRuntimeRefreshStatus::default();
@@ -929,6 +937,35 @@ mod tests {
         state.apply_refresh_failed("failed".to_owned());
         assert_eq!(state.error(), Some("failed"));
         assert!(!state.loading());
+    }
+
+    #[test]
+    fn provider_list_state_clears_gateway_scoped_cli_runtime_data() {
+        let mut state = ProviderListState::default();
+        state.configured_names.insert("openai".to_owned());
+        state
+            .cli_runtimes
+            .push(runtime_summary("codex", "Codex CLI", RuntimeStatus::Ready));
+        state.cli_refresh_status.mark_success(1_000);
+        state.cli_loading = true;
+        state.cli_error = Some("old cli error".to_owned());
+        state.cli_login_message = Some("old login message".to_owned());
+        state.cli_runtime_draft = Some(CLIRuntimeProviderDraft::create(None));
+        state.expanded_cli_runtime_ids.insert("codex".to_owned());
+
+        state.clear_for_gateway_switch();
+
+        assert!(state.configured_names().is_empty());
+        assert!(state.cli_runtimes().is_empty());
+        assert_eq!(
+            state.cli_refresh_status(),
+            &CLIRuntimeRefreshStatus::default()
+        );
+        assert!(!state.cli_loading());
+        assert!(state.cli_error().is_none());
+        assert!(state.cli_login_message().is_none());
+        assert!(state.cli_runtime_draft().is_none());
+        assert!(state.expanded_cli_runtime_ids().is_empty());
     }
 
     #[test]
