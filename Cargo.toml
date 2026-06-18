@@ -80,6 +80,7 @@ tokio-util = { version = "0.7", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3" }
 sentry = { version = "0.46.2", default-features = false, features = ["anyhow", "backtrace", "contexts", "panic", "transport", "tracing"] }
+dotenvy = "0.15"
 
 # UI
 gpui = "0.2.2"

@@ -7641,6 +7641,7 @@ name = "pioneer-observability"
 version = "0.13.0"
 dependencies = [
  "anyhow",
+ "dotenvy",
  "sentry",
  "tracing",
  "tracing-subscriber",

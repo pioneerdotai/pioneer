@@ -1,10 +1,12 @@
 //! Shared Sentry and tracing setup for Pioneer runtime binaries.
 //!
 //! `PIONEER_SENTRY_DSN` is used by non-desktop binaries. `PIONEER_DESKTOP_SENTRY_DSN`
-//! is used by the desktop app. Runtime environment variables take precedence over
-//! build-time values with the same names.
+//! is used by the desktop app. A local `.env` file is loaded automatically before
+//! reading these values. Runtime environment variables take precedence over `.env`
+//! and build-time values with the same names.
 
 use std::borrow::Cow;
+use std::sync::Once;
 
 use sentry::integrations::tracing::EventFilter;
 use sentry::{ClientInitGuard, ClientOptions};
@@ -21,6 +23,9 @@ pub const SENTRY_ENVIRONMENT_ENV: &str = "PIONEER_SENTRY_ENVIRONMENT";
 
 const BUILD_SENTRY_DSN: Option<&str> = option_env!("PIONEER_SENTRY_DSN");
 const BUILD_DESKTOP_SENTRY_DSN: Option<&str> = option_env!("PIONEER_DESKTOP_SENTRY_DSN");
+const BUILD_SENTRY_ENVIRONMENT: Option<&str> = option_env!("PIONEER_SENTRY_ENVIRONMENT");
+
+static LOAD_DOTENV: Once = Once::new();
 
 #[derive(Clone, Copy, Debug)]
 pub enum SentryTarget {
@@ -53,9 +58,12 @@ impl SentryTarget {
 
 #[must_use]
 pub fn init_sentry(target: SentryTarget) -> Option<ClientInitGuard> {
+    load_local_dotenv();
+
     let dsn = configured_value(target.dsn_env(), target.build_dsn())?;
     let dsn = dsn.parse().ok()?;
-    let environment = configured_value(SENTRY_ENVIRONMENT_ENV, None).map(Cow::Owned);
+    let environment =
+        configured_value(SENTRY_ENVIRONMENT_ENV, BUILD_SENTRY_ENVIRONMENT).map(Cow::Owned);
 
     let guard = sentry::init(ClientOptions {
         dsn: Some(dsn),
@@ -92,6 +100,14 @@ pub fn init_tracing(sentry_enabled: bool) {
 
 pub fn capture_anyhow(error: &anyhow::Error) {
     sentry::integrations::anyhow::capture_anyhow(error);
+}
+
+fn load_local_dotenv() {
+    LOAD_DOTENV.call_once(|| match dotenvy::dotenv() {
+        Ok(_) => {}
+        Err(error) if error.not_found() => {}
+        Err(error) => eprintln!("failed to load .env: {error}"),
+    });
 }
 
 fn sentry_tracing_layer<S>() -> impl tracing_subscriber::Layer<S>
