@@ -1322,7 +1322,10 @@ async fn post_turn_extractor_preserves_manifest_and_observes_auto_approve() {
         .into_iter()
         .next()
         .expect("extractor prompt recorded");
-    assert!(prompt.contains("Memory manifest:"));
+    assert!(prompt.contains("## Memory manifest"));
+    assert!(prompt.contains(
+        "No active or candidate memories in the bounded manifest."
+    ));
     assert!(prompt.contains("Do not generate canonical memory keys"));
     assert!(response.diagnostics.iter().any(|diagnostic| {
         diagnostic.code.as_str() == "memory.post_turn_extractor.completed"

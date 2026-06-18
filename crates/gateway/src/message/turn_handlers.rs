@@ -23,6 +23,10 @@ fn cli_runtime_forbidden_input_kind(input: &UserInput) -> Option<&'static str> {
     }
 }
 
+fn cli_runtime_execution_disabled_message() -> String {
+    "CLI agent runtime execution is disabled or no CLI runtimes are configured".to_owned()
+}
+
 fn cli_runtime_binding_status_for_terminal_turn(status: TurnStatus) -> Option<&'static str> {
     match status {
         TurnStatus::Completed => {
@@ -844,6 +848,19 @@ impl MessageProcessor {
         runtime_id: &str,
         runtime_kind: CLIAgentRuntimeKind,
     ) -> Option<pioneer_config::EffectiveGatewayCliAgentRuntimeInstanceConfig> {
+        if self.cli_runtime_manager.is_none() {
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_REQUEST_CODE,
+                    cli_runtime_execution_disabled_message(),
+                ),
+            )
+            .await;
+            return None;
+        }
+
         let runtimes = match self.load_cli_runtime_instances() {
             Ok(runtimes) => runtimes,
             Err(error) => {
@@ -865,8 +882,7 @@ impl MessageProcessor {
                 JsonRpcErrorResponse::new(
                     Some(request_id),
                     INVALID_REQUEST_CODE,
-                    "CLI agent runtime execution is disabled or no CLI runtimes are configured"
-                        .to_owned(),
+                    cli_runtime_execution_disabled_message(),
                 ),
             )
             .await;
