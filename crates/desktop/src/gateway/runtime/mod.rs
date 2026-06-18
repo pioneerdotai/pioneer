@@ -20,7 +20,7 @@ use pioneer_client::gateway::types::GatewayEndpointKind;
 use pioneer_client::gateway::types::{GatewayEndpoint, GatewayRegistry};
 use pioneer_config::AppConfig;
 use std::path::PathBuf;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use pioneer_client::gateway::runtime::ActiveGatewayState;
 
@@ -243,17 +243,29 @@ impl GatewayRuntime {
                         && let Some(previous_token_ref) =
                             previous_endpoint.auth_token_ref.as_deref()
                     {
-                        let _ = self.secrets.put_gateway_auth_token(
+                        if let Err(rollback_error) = self.secrets.put_gateway_auth_token(
                             previous_token_ref,
                             previous_token,
                             Some(gateway_auth_token_label(
                                 previous_endpoint.name.as_str(),
                                 previous_endpoint.address.as_str(),
                             )),
-                        );
+                        ) {
+                            error!(
+                                token_ref = previous_token_ref,
+                                error = %format!("{rollback_error:#}"),
+                                "failed to restore gateway auth token during registry rollback"
+                            );
+                        }
                     }
                 } else {
-                    let _ = self.secrets.delete_gateway_auth_token(token_ref);
+                    if let Err(rollback_error) = self.secrets.delete_gateway_auth_token(token_ref) {
+                        error!(
+                            token_ref,
+                            error = %format!("{rollback_error:#}"),
+                            "failed to delete gateway auth token during registry rollback"
+                        );
+                    }
                 }
             }
             return Err(error);

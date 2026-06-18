@@ -16,6 +16,7 @@ tracing-subscriber.workspace = true
 pioneer-config.workspace = true
 pioneer-client.workspace = true
 pioneer-keystore.workspace = true
+pioneer-observability.workspace = true
 pioneer-protocol.workspace = true
 pioneer-tools.workspace = true
 serde.workspace = true

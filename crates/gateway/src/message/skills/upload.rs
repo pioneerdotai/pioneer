@@ -590,12 +590,12 @@ impl MessageProcessor {
         if let Some(parent) = payload_path.parent()
             && let Err(error) = fs::create_dir_all(parent)
         {
-            warn!(connection_id, error = %format!("{error:#}"), "failed to create upload payload parent");
+            error!(connection_id, error = %format!("{error:#}"), "failed to create upload payload parent");
             return;
         }
 
         if let Err(error) = append_chunk(payload_path.as_path(), chunk, header.offset) {
-            warn!(connection_id, error = %format!("{error:#}"), "failed to write skill upload chunk");
+            error!(connection_id, error = %format!("{error:#}"), "failed to write skill upload chunk");
             return;
         }
 
@@ -614,7 +614,7 @@ impl MessageProcessor {
                 return;
             }
             Err(error) => {
-                warn!(connection_id, error = %format!("{error:#}"), "failed to update upload received bytes");
+                error!(connection_id, error = %format!("{error:#}"), "failed to update upload received bytes");
                 return;
             }
         };
@@ -632,7 +632,7 @@ impl MessageProcessor {
         ) {
             Ok(notification) => notification,
             Err(error) => {
-                warn!(connection_id, error = %format!("{error:#}"), "failed to encode upload chunk ack");
+                error!(connection_id, error = %format!("{error:#}"), "failed to encode upload chunk ack");
                 return;
             }
         };
@@ -950,7 +950,7 @@ impl MessageProcessor {
         match self.crud_store.find_skill_upload_session(upload_id).await {
             Ok(value) => value,
             Err(error) => {
-                warn!(upload_id, error = %format!("{error:#}"), "failed to load skill upload session");
+                error!(upload_id, error = %format!("{error:#}"), "failed to load skill upload session");
                 None
             }
         }

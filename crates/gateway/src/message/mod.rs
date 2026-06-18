@@ -139,7 +139,7 @@ use tokio::task::JoinHandle;
 
 use pioneer_cli_agent_runtime::event::RuntimeEvent;
 use tokio::time::{Duration, sleep};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::cli_runtime::manager::CLIAgentRuntimeManager;
 use crate::mcp_service::McpService;
@@ -517,7 +517,7 @@ impl MessageProcessor {
                     self.agent_manager.set_hook_runtime(Some(runtime)).await;
                 }
                 Err(error) => {
-                    warn!(error = %error, "failed to install AGENTS.md prompt hook package");
+                    error!(error = %error, "failed to install AGENTS.md prompt hook package");
                 }
             }
             return;
@@ -533,7 +533,7 @@ impl MessageProcessor {
                 self.agent_manager.set_hook_runtime(Some(runtime)).await;
             }
             Err(error) => {
-                warn!(error = %error, "failed to build hook runtime");
+                error!(error = %error, "failed to build hook runtime");
             }
         }
     }
@@ -628,7 +628,7 @@ impl MessageProcessor {
                 self.agent_manager.set_hook_runtime(Some(runtime)).await;
             }
             Err(error) => {
-                warn!(error = %error, "failed to install memory hook package");
+                error!(error = %error, "failed to install memory hook package");
             }
         }
     }
@@ -743,7 +743,7 @@ impl MessageProcessor {
             }
         }
         if let Err(error) = self.task_runtime.start().await {
-            warn!(error = %format!("{error:#}"), "failed to start task runtime");
+            error!(error = %format!("{error:#}"), "failed to start task runtime");
         }
         self.start_task_event_listener().await;
         self.start_hook_recovery_worker().await;
@@ -769,7 +769,7 @@ impl MessageProcessor {
                         }
                     }
                     Err(error) => {
-                        warn!(error = %format!("{error:#}"), "timeout supervisor poll failed");
+                        error!(error = %format!("{error:#}"), "timeout supervisor poll failed");
                     }
                 }
 
@@ -780,7 +780,7 @@ impl MessageProcessor {
                         }
                     }
                     Err(error) => {
-                        warn!(error = %format!("{error:#}"), "recovery coordinator poll failed");
+                        error!(error = %format!("{error:#}"), "recovery coordinator poll failed");
                     }
                 }
 
@@ -827,7 +827,7 @@ impl MessageProcessor {
                         }
                     }
                     Err(error) => {
-                        warn!(
+                        error!(
                             error = %format!("{error:#}"),
                             "turn event projection replay poll failed"
                         );
@@ -835,7 +835,7 @@ impl MessageProcessor {
                 }
 
                 if let Err(error) = this.process_due_task_deliveries(now, 64).await {
-                    warn!(error = %format!("{error:#}"), "task delivery worker poll failed");
+                    error!(error = %format!("{error:#}"), "task delivery worker poll failed");
                 }
 
                 this.fail_stale_cli_runtime_turns(now_timestamp_millis())
@@ -913,7 +913,7 @@ impl MessageProcessor {
                 }
             }
             Err(error) => {
-                warn!(error = %format!("{error:#}"), "hook recovery pass failed");
+                error!(error = %format!("{error:#}"), "hook recovery pass failed");
             }
         }
     }

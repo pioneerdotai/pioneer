@@ -2035,8 +2035,17 @@ impl HookRunPersistence {
                 })
             })
             .collect::<Vec<_>>();
-        if !events.is_empty() {
-            let _ = store.append_audit_events(events).await;
+        if !events.is_empty()
+            && let Err(error) = store.append_audit_events(events).await
+        {
+            tracing::error!(
+                error = %format!("{error:#}"),
+                hook_run_id = run.id.as_str(),
+                subscription_id = subscription.subscription_id.as_str(),
+                hook_id = subscription.hook_id.as_str(),
+                phase = phase.as_str(),
+                "failed to persist hook audit events"
+            );
         }
     }
 }

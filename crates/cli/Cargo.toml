@@ -24,6 +24,7 @@ required-features = ["dev"]
 anyhow.workspace = true
 pioneer-config.workspace = true
 pioneer-gateway.workspace = true
+pioneer-observability.workspace = true
 pioneer-tasks.workspace = true
 tokio.workspace = true
 tracing.workspace = true

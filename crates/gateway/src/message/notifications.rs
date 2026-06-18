@@ -52,7 +52,7 @@ impl MessageProcessor {
         let notification = match JsonRpcNotification::from_params(method, payload) {
             Ok(notification) => notification,
             Err(error) => {
-                warn!(method, error = %error, "failed to encode notification");
+                error!(method, error = %error, "failed to encode notification");
                 return;
             }
         };
@@ -60,7 +60,7 @@ impl MessageProcessor {
         let serialized = match serde_json::to_string(&notification) {
             Ok(payload) => payload,
             Err(error) => {
-                warn!(method, error = %error, "failed to serialize notification");
+                error!(method, error = %error, "failed to serialize notification");
                 return;
             }
         };

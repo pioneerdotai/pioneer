@@ -745,10 +745,18 @@ pub(super) async fn run_agent_loop(
                 if let Some(task) = active_turn_task.take() {
                     sleep(Duration::from_millis(TURN_CANCEL_GRACE_MS)).await;
                     if task.is_finished() {
-                        let _ = task.await;
+                        if let Err(error) = task.await
+                            && !error.is_cancelled()
+                        {
+                            error!(error = %error, "active turn task failed during cancellation");
+                        }
                     } else {
                         task.abort();
-                        let _ = task.await;
+                        if let Err(error) = task.await
+                            && !error.is_cancelled()
+                        {
+                            error!(error = %error, "active turn task failed after abort");
+                        }
                     }
                 }
                 let turn_request_snapshot = active_turn_request.clone();

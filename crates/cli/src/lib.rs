@@ -10,10 +10,14 @@ use std::env;
 use tracing::error;
 
 pub fn main_entry() {
-    init_tracing();
+    let sentry_guard =
+        pioneer_observability::init_sentry(pioneer_observability::SentryTarget::Shared);
+    pioneer_observability::init_tracing(sentry_guard.is_some());
 
     if let Err(error) = run() {
+        pioneer_observability::capture_anyhow(&error);
         error!(error = %format!("{error:#}"), "pioneer command failed");
+        drop(sentry_guard);
         std::process::exit(1);
     }
 }
@@ -450,24 +454,4 @@ fn binary_display_name() -> String {
         })
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "pioneer".to_owned())
-}
-
-fn init_tracing() {
-    use tracing_subscriber::{
-        filter::{LevelFilter, Targets},
-        layer::SubscriberExt,
-        util::SubscriberInitExt,
-    };
-
-    let filter = Targets::new()
-        .with_default(LevelFilter::INFO)
-        .with_target("rmcp::service", LevelFilter::WARN);
-
-    let _ = tracing_subscriber::fmt()
-        .with_target(false)
-        .without_time()
-        .with_max_level(LevelFilter::TRACE)
-        .finish()
-        .with(filter)
-        .try_init();
 }

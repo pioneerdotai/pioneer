@@ -175,7 +175,7 @@ impl MessageProcessor {
         ) {
             Ok(notification) => notification,
             Err(error) => {
-                warn!(error = %error, "failed to encode thread/started notification");
+                error!(error = %error, "failed to encode thread/started notification");
                 return;
             }
         };
@@ -197,7 +197,7 @@ impl MessageProcessor {
                 }
             }
             Err(error) => {
-                warn!(error = %error, "failed to serialize thread/started notification");
+                error!(error = %error, "failed to serialize thread/started notification");
             }
         }
     }
@@ -1497,7 +1497,7 @@ impl MessageProcessor {
             match JsonRpcNotification::from_params(events::THREAD_CLOSED, &closed_notification) {
                 Ok(notification) => notification,
                 Err(error) => {
-                    warn!(error = %error, "failed to encode thread/closed notification");
+                    error!(error = %error, "failed to encode thread/closed notification");
                     return;
                 }
             };
@@ -1519,7 +1519,7 @@ impl MessageProcessor {
                 }
             }
             Err(error) => {
-                warn!(error = %error, "failed to serialize thread/closed notification");
+                error!(error = %error, "failed to serialize thread/closed notification");
             }
         }
 

@@ -98,14 +98,18 @@ impl HttpClient for DesktopHttpClient {
 }
 
 fn main() {
-    init_tracing();
+    let sentry_guard =
+        pioneer_observability::init_sentry(pioneer_observability::SentryTarget::Desktop);
+    pioneer_observability::init_tracing(sentry_guard.is_some());
     init_locale();
 
     if let Err(error) = gateway::ensure_runtime_home_dir() {
+        pioneer_observability::capture_anyhow(&error);
         error!(
             error = %format!("{error:#}"),
             message = %t!("logs.runtime.prepare_home_failed")
         );
+        drop(sentry_guard);
         std::process::exit(1);
     }
 
@@ -145,24 +149,4 @@ fn main() {
 fn init_locale() {
     let locale = settings::resolve_app_locale();
     rust_i18n::set_locale(locale.as_str());
-}
-
-fn init_tracing() {
-    use tracing_subscriber::{
-        filter::{LevelFilter, Targets},
-        layer::SubscriberExt,
-        util::SubscriberInitExt,
-    };
-
-    let filter = Targets::new()
-        .with_default(LevelFilter::INFO)
-        .with_target("rmcp::service", LevelFilter::WARN);
-
-    let _ = tracing_subscriber::fmt()
-        .with_target(false)
-        .without_time()
-        .with_max_level(LevelFilter::TRACE)
-        .finish()
-        .with(filter)
-        .try_init();
 }

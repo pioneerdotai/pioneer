@@ -381,7 +381,13 @@ impl UnifiedExecHandler {
         if session_cancelled {
             {
                 let mut guard = session.lock().await;
-                let _ = terminate_child_process(&mut guard.child).await;
+                if let Err(error) = terminate_child_process(&mut guard.child).await {
+                    tracing::error!(
+                        session_id,
+                        error = %format!("{error:#}"),
+                        "failed to terminate cancelled shell session"
+                    );
+                }
             }
             self.sessions.lock().await.remove(&session_id);
             if let Some(persistence) = self.persistence.as_ref() {
@@ -541,7 +547,13 @@ impl UnifiedExecHandler {
 
             if finished || expired {
                 if !finished {
-                    let _ = terminate_child_process(&mut guard.child).await;
+                    if let Err(error) = terminate_child_process(&mut guard.child).await {
+                        tracing::error!(
+                            session_id,
+                            error = %format!("{error:#}"),
+                            "failed to terminate stale shell session"
+                        );
+                    }
                 }
                 to_remove.push(session_id);
             }

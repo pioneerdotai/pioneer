@@ -30,7 +30,7 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep};
-use tracing::warn;
+use tracing::{error, warn};
 
 use crate::message::now_timestamp_secs;
 use crate::secrets::GatewaySecrets;
@@ -1163,7 +1163,7 @@ impl McpService {
         let scope_kind = match DomainScopeKind::from_str(row.scope_kind.as_str()) {
             Ok(scope_kind) => scope_kind,
             Err(error) => {
-                warn!(error, "failed to map MCP runtime scope");
+                error!(error, "failed to map MCP runtime scope");
                 return;
             }
         };
@@ -1398,14 +1398,14 @@ impl McpService {
         let notification = match JsonRpcNotification::from_params(method, payload) {
             Ok(notification) => notification,
             Err(error) => {
-                warn!(method, error = %error, "failed to encode MCP notification");
+                error!(method, error = %error, "failed to encode MCP notification");
                 return;
             }
         };
         let serialized = match serde_json::to_string(&notification) {
             Ok(payload) => payload,
             Err(error) => {
-                warn!(method, error = %error, "failed to serialize MCP notification");
+                error!(method, error = %error, "failed to serialize MCP notification");
                 return;
             }
         };

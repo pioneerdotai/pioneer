@@ -1129,7 +1129,7 @@ impl MessageProcessor {
         ) {
             Ok(notification) => notification,
             Err(error) => {
-                warn!(error = %error, "failed to encode turn/started notification");
+                error!(error = %error, "failed to encode turn/started notification");
                 return false;
             }
         };
@@ -1152,7 +1152,7 @@ impl MessageProcessor {
                 }
             }
             Err(error) => {
-                warn!(error = %error, "failed to serialize turn/started notification");
+                error!(error = %error, "failed to serialize turn/started notification");
             }
         }
         message_future(self.emit_user_message_item_lifecycle(

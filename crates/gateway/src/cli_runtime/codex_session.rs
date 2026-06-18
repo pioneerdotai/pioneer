@@ -147,7 +147,12 @@ struct CodexCLIAgentRuntimeSession {
 #[async_trait]
 impl CLIAgentRuntimeSession for CodexCLIAgentRuntimeSession {
     async fn close(&self) -> Result<()> {
-        let _ = self.client.rpc().shutdown().await;
+        if let Err(error) = self.client.rpc().shutdown().await {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "failed to request Codex CLI runtime shutdown"
+            );
+        }
         let mut process = self.process.lock().await;
         let _ = process.terminate_with_grace(self.shutdown_grace).await?;
         Ok(())

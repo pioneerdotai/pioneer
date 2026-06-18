@@ -626,7 +626,7 @@ impl MessageProcessor {
         ) {
             Ok(notification) => notification,
             Err(error) => {
-                warn!(connection_id, error = %error, "failed to encode artifact upload chunk ack");
+                error!(connection_id, error = %error, "failed to encode artifact upload chunk ack");
                 return;
             }
         };

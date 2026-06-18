@@ -100,7 +100,7 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep, timeout};
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{error, warn};
 
 const TURN_ITEM_ID_LEN: usize = 21;
 const MAX_REVIEW_REQUIRED_TASK_OBSERVATIONS: usize = 20;
@@ -122,7 +122,7 @@ async fn finish_tool_event_forwarder(mut forwarder: JoinHandle<()>) {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
             if !error.is_cancelled() {
-                warn!(error = %error, "tool event forwarder failed during turn shutdown");
+                error!(error = %error, "tool event forwarder failed during turn shutdown");
             }
         }
         Err(_) => {
@@ -130,7 +130,7 @@ async fn finish_tool_event_forwarder(mut forwarder: JoinHandle<()>) {
             if let Err(error) = forwarder.await
                 && !error.is_cancelled()
             {
-                warn!(error = %error, "tool event forwarder failed after abort");
+                error!(error = %error, "tool event forwarder failed after abort");
             }
         }
     }
@@ -4740,7 +4740,11 @@ async fn execute_agent_provider_response(
                             .await;
 
                         heartbeat_stop.cancel();
-                        let _ = heartbeat_task.await;
+                        if let Err(error) = heartbeat_task.await
+                            && !error.is_cancelled()
+                        {
+                            error!(error = %error, "tool heartbeat task failed");
+                        }
                         turn_control
                             .complete_attempt(turn_id.as_str(), item_id.as_str())
                             .await;

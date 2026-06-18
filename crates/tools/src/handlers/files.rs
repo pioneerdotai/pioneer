@@ -1978,7 +1978,13 @@ async fn write_text_atomically_for_tool(
         )));
     }
 
-    let _ = temp_file.sync_all().await;
+    if let Err(error) = temp_file.sync_all().await {
+        cleanup_write_temp_file(temp_path.as_path()).await;
+        return Err(ToolError::execution_failed(format!(
+            "failed to sync temporary file `{}`: {error}",
+            temp_path.display()
+        )));
+    }
     drop(temp_file);
 
     if let Err(error) = tokio::fs::rename(temp_path.as_path(), resolved_path).await {

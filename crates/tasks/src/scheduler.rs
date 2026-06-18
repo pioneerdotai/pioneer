@@ -14,7 +14,7 @@ use pioneer_protocol::{
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{Duration, sleep};
-use tracing::{debug, warn};
+use tracing::{debug, error};
 
 const ID_LEN: usize = 21;
 pub const TASK_EXECUTION_LEASE_SECONDS: i64 = 300;
@@ -81,7 +81,7 @@ impl TaskScheduler {
         loop {
             let now = now_timestamp_secs();
             if let Err(error) = self.process_due_once(now).await {
-                warn!(error = %format!("{error:#}"), "task scheduler due processing failed");
+                error!(error = %format!("{error:#}"), "task scheduler due processing failed");
             }
             let sleep_duration = self.next_sleep_duration(now).await;
             tokio::select! {
@@ -452,7 +452,7 @@ impl TaskScheduler {
         if run.executor_kind == TaskExecutorKind::Agent {
             tokio::spawn(async move {
                 if let Err(error) = dispatch_run_to_executor(executor, context, run, handle).await {
-                    warn!(error = %format!("{error:#}"), "agent task dispatch failed");
+                    error!(error = %format!("{error:#}"), "agent task dispatch failed");
                 }
             });
             return Ok(true);

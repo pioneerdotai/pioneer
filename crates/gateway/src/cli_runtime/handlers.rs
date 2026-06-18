@@ -808,7 +808,7 @@ impl MessageProcessor {
         ) {
             Ok(notification) => notification,
             Err(error) => {
-                warn!(error = %error, "failed to encode fork thread/started notification");
+                error!(error = %error, "failed to encode fork thread/started notification");
                 return;
             }
         };
@@ -829,7 +829,7 @@ impl MessageProcessor {
                 }
             }
             Err(error) => {
-                warn!(error = %error, "failed to serialize fork thread/started notification");
+                error!(error = %error, "failed to serialize fork thread/started notification");
             }
         }
         self.notify_thread_tree_changed(workspace_id).await;
