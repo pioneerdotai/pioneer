@@ -4,8 +4,9 @@ slug: memory
 owner: pioneer
 description: "Use this skill when Pioneer should proactively use durable memory or recalled context: decide whether memory can improve a turn, answer from remembered user/project facts, request memory tools, search/list/get stored memories, save durable preferences or project decisions, forget memories, audit or clean up memory, or recover from memory tool failures."
 version: "0.1.0"
-user-invocable: false
-disable-model-invocation: true
+user-invocable: true
+disable-model-invocation: false
+implicit-invocation: required
 catalog-hide: true
 ---
 

@@ -379,6 +379,64 @@ mod tests {
                 .skill_asset_root,
             expected_subagents_asset_root
         );
+
+        let memory = catalog
+            .skills
+            .iter()
+            .find(|skill| skill.identity.slug == "memory")
+            .expect("bundled memory skill should load");
+        assert!(matches!(
+            memory.identity.source_kind,
+            SkillSourceKind::System
+        ));
+        assert_eq!(memory.identity.owner, "pioneer");
+        assert_eq!(
+            memory.policy_hints.implicit_invocation,
+            SkillImplicitInvocationPolicy::Required
+        );
+        assert!(memory.policy_hints.catalog_hidden);
+
+        let expected_memory_asset_root = root_canonical.join("pioneer/memory").display().to_string();
+        let memory_active = vec![ResolvedSkill {
+            slug: "pioneer/memory".to_owned(),
+            reason: SkillResolvedReason::Implicit,
+            definition: memory.clone(),
+        }];
+        let memory_prompt = build_skill_prompt(
+            memory_active.as_slice(),
+            SkillPromptBudget {
+                max_chars: 4_000,
+                compact_mode_threshold: 6,
+                include_read_skill_hint: true,
+            },
+        );
+        assert!(
+            !memory_prompt.text.contains("system:pioneer/memory"),
+            "catalog-hidden memory skill should not appear in the ordinary skills prompt"
+        );
+
+        let memory_runtime_plan = build_skill_runtime_plan(
+            memory_active.as_slice(),
+            SkillRuntimeBudget {
+                enable_dynamic_tools: false,
+                max_dynamic_tools_per_skill: 16,
+                allow_shell_tools: false,
+                allow_http_tools: false,
+                allow_function_proxy_tools: false,
+                allow_untrusted_install: false,
+                min_trust_for_shell_tools: SkillTrustLevel::Verified,
+                min_trust_for_http_tools: SkillTrustLevel::Community,
+                min_trust_for_function_proxy_tools: SkillTrustLevel::Community,
+            },
+        );
+        assert_eq!(
+            memory_runtime_plan
+                .read_skill_index
+                .get("system:pioneer/memory")
+                .expect("system memory read_skill entry")
+                .skill_asset_root,
+            expected_memory_asset_root
+        );
     }
 
     #[test]
