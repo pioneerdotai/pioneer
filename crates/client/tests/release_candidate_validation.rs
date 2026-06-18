@@ -156,6 +156,7 @@ fn large_timeline_projection_has_stable_row_build_time() {
         item: TurnItem::AgentMessage {
             id: "agent_final".to_owned(),
             text: String::new(),
+            phase: Default::default(),
             markdown: None,
             markdown_version: None,
         },
@@ -166,6 +167,7 @@ fn large_timeline_projection_has_stable_row_build_time() {
         item: TurnItem::AgentMessage {
             id: "agent_final".to_owned(),
             text: "Done".to_owned(),
+            phase: Default::default(),
             markdown: None,
             markdown_version: None,
         },

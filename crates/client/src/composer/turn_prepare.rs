@@ -15,8 +15,8 @@ use crate::{
 };
 use anyhow::{Context as _, Result, anyhow};
 use pioneer_protocol::{
-    ArtifactCapabilitiesParams, ArtifactCapabilitiesResponse, ArtifactRef, ThreadMode,
-    TurnCapability, UserInput, UserMessageAttachment,
+    AgentExecutionBackend, ArtifactCapabilitiesParams, ArtifactCapabilitiesResponse, ArtifactRef,
+    ThreadMode, TurnCLIRuntimeOptions, TurnCapability, UserInput, UserMessageAttachment,
 };
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -49,14 +49,17 @@ pub struct PreparedComposerTurn {
     pub attachments: Vec<PreparedComposerAttachment>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PreparedComposerTurnSubmitContext {
     pub thread_id: String,
     pub turn_id: String,
     pub pending_request_id: String,
     pub selected_model: Option<String>,
     pub selected_provider: Option<String>,
+    pub turn_model_provider: Option<String>,
     pub selected_mode: Option<ThreadMode>,
+    pub execution_backend: Option<AgentExecutionBackend>,
+    pub cli_runtime_options: Option<TurnCLIRuntimeOptions>,
     pub updated_at_unix: i64,
 }
 
@@ -236,8 +239,10 @@ pub fn reduce_prepared_composer_turn_submit_success(
             input: prepared.input,
             capabilities: prepared.capabilities,
             model: context.selected_model,
-            model_provider: context.selected_provider,
+            model_provider: context.turn_model_provider,
             mode: context.selected_mode,
+            execution_backend: context.execution_backend,
+            cli_runtime_options: context.cli_runtime_options,
         },
         send_context,
     }
@@ -860,7 +865,10 @@ mod tests {
                 pending_request_id: "pending_a".to_owned(),
                 selected_model: Some("gpt-5".to_owned()),
                 selected_provider: Some("openai".to_owned()),
+                turn_model_provider: Some("openai".to_owned()),
                 selected_mode: Some(ThreadMode::Agent),
+                execution_backend: None,
+                cli_runtime_options: None,
                 updated_at_unix: 42,
             },
             prepared,

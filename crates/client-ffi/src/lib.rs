@@ -58,9 +58,16 @@ use pioneer_client::{
             SetGatewayWorkspaceRegistryPlan, UpdateRemoteGatewayRegistryPlan,
         },
     },
-    providers::presentation::{
-        ProviderModelDisplayKey, ProviderModelDisplayResolution, provider_model_display_key,
-        provider_model_display_models_params, resolve_provider_model_display_from_response,
+    providers::{
+        list::{
+            cli_runtime_list_models_params,
+            provider_models_response_from_cli_runtime_models_response,
+            runtime_id_from_cli_runtime_provider_key,
+        },
+        presentation::{
+            ProviderModelDisplayKey, ProviderModelDisplayResolution, provider_model_display_key,
+            provider_model_display_models_params, resolve_provider_model_display_from_response,
+        },
     },
     runtime::ClientRuntime,
     workspaces::{
@@ -69,6 +76,11 @@ use pioneer_client::{
     },
 };
 use pioneer_protocol::{
+    CLIRuntimeListModelsParams, CLIRuntimeListModelsResponse, CLIRuntimeListParams,
+    CLIRuntimeListResponse, CLIRuntimeRequestRespondParams, CLIRuntimeRequestRespondResponse,
+    CLIRuntimeReviewStartParams, CLIRuntimeReviewStartResponse, CLIRuntimeThreadBindingGetParams,
+    CLIRuntimeThreadBindingGetResponse, CLIRuntimeThreadCompactParams,
+    CLIRuntimeThreadCompactResponse, CLIRuntimeTurnSteerParams, CLIRuntimeTurnSteerResponse,
     ProviderListModelsParams, ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
     ThreadAgentsDocArchiveParams, ThreadAgentsDocArchiveResponse, ThreadAgentsDocGetParams,
     ThreadAgentsDocGetResponse, ThreadAgentsDocSaveParams, ThreadAgentsDocSaveResponse,
@@ -349,9 +361,114 @@ impl ClientFfiRuntime {
             .map_err(|error| format!("{error:#}"))
     }
 
+    fn cli_runtime_list(&self, input_json: &str) -> Result<CLIRuntimeListResponse, String> {
+        let params = serde_json::from_str::<CLIRuntimeListParams>(input_json)
+            .map_err(|error| format!("invalid CLI runtime list params: {error}"))?;
+
+        self.client_runtime
+            .ws_command_sender()
+            .cli_runtime_list(params)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn cli_runtime_list_models(
+        &self,
+        input_json: &str,
+    ) -> Result<CLIRuntimeListModelsResponse, String> {
+        let params = serde_json::from_str::<CLIRuntimeListModelsParams>(input_json)
+            .map_err(|error| format!("invalid CLI runtime list models params: {error}"))?;
+
+        self.client_runtime
+            .ws_command_sender()
+            .cli_runtime_list_models(params)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn cli_runtime_thread_binding_get(
+        &self,
+        input_json: &str,
+    ) -> Result<CLIRuntimeThreadBindingGetResponse, String> {
+        let params = serde_json::from_str::<CLIRuntimeThreadBindingGetParams>(input_json)
+            .map_err(|error| format!("invalid CLI runtime thread binding get params: {error}"))?;
+
+        self.client_runtime
+            .ws_command_sender()
+            .cli_runtime_thread_binding_get(params)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn cli_runtime_thread_compact(
+        &self,
+        input_json: &str,
+    ) -> Result<CLIRuntimeThreadCompactResponse, String> {
+        let params = serde_json::from_str::<CLIRuntimeThreadCompactParams>(input_json)
+            .map_err(|error| format!("invalid CLI runtime thread compact params: {error}"))?;
+
+        self.client_runtime
+            .ws_command_sender()
+            .cli_runtime_thread_compact(params)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn cli_runtime_turn_steer(
+        &self,
+        input_json: &str,
+    ) -> Result<CLIRuntimeTurnSteerResponse, String> {
+        let params = serde_json::from_str::<CLIRuntimeTurnSteerParams>(input_json)
+            .map_err(|error| format!("invalid CLI runtime turn steer params: {error}"))?;
+
+        self.client_runtime
+            .ws_command_sender()
+            .cli_runtime_turn_steer(params)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn cli_runtime_review_start(
+        &self,
+        input_json: &str,
+    ) -> Result<CLIRuntimeReviewStartResponse, String> {
+        let params = serde_json::from_str::<CLIRuntimeReviewStartParams>(input_json)
+            .map_err(|error| format!("invalid CLI runtime review start params: {error}"))?;
+
+        self.client_runtime
+            .ws_command_sender()
+            .cli_runtime_review_start(params)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn cli_runtime_request_respond(
+        &self,
+        input_json: &str,
+    ) -> Result<CLIRuntimeRequestRespondResponse, String> {
+        let params = serde_json::from_str::<CLIRuntimeRequestRespondParams>(input_json)
+            .map_err(|error| format!("invalid CLI runtime request respond params: {error}"))?;
+
+        self.client_runtime
+            .ws_command_sender()
+            .cli_runtime_request_respond(params)
+            .map_err(|error| format!("{error:#}"))
+    }
+
     fn provider_list_models(&self, input_json: &str) -> Result<ProviderListModelsResponse, String> {
         let params = serde_json::from_str::<ProviderListModelsParams>(input_json)
             .map_err(|error| format!("invalid provider list models params: {error}"))?;
+
+        if let Some(runtime_id) = runtime_id_from_cli_runtime_provider_key(params.provider.as_str())
+        {
+            let response = self
+                .client_runtime
+                .ws_command_sender()
+                .cli_runtime_list_models(cli_runtime_list_models_params(
+                    params.workspace_id,
+                    runtime_id.to_owned(),
+                ))
+                .map_err(|error| format!("{error:#}"))?;
+
+            return Ok(provider_models_response_from_cli_runtime_models_response(
+                params.provider,
+                response,
+            ));
+        }
 
         self.client_runtime
             .ws_command_sender()
@@ -371,11 +488,27 @@ impl ClientFfiRuntime {
             Some(request.model.as_str()),
         )
         .ok_or_else(|| "invalid provider model display request: empty selection".to_owned())?;
-        let response = self
-            .client_runtime
-            .ws_command_sender()
-            .provider_list_models(provider_model_display_models_params(&key))
-            .map_err(|error| format!("{error:#}"))?;
+        let response = if let Some(runtime_id) =
+            runtime_id_from_cli_runtime_provider_key(key.provider.as_str())
+        {
+            let cli_response = self
+                .client_runtime
+                .ws_command_sender()
+                .cli_runtime_list_models(cli_runtime_list_models_params(
+                    key.workspace_id.clone(),
+                    runtime_id.to_owned(),
+                ))
+                .map_err(|error| format!("{error:#}"))?;
+            provider_models_response_from_cli_runtime_models_response(
+                key.provider.clone(),
+                cli_response,
+            )
+        } else {
+            self.client_runtime
+                .ws_command_sender()
+                .provider_list_models(provider_model_display_models_params(&key))
+                .map_err(|error| format!("{error:#}"))?
+        };
 
         Ok(resolve_provider_model_display_from_response(
             &key, &response,
@@ -742,6 +875,31 @@ ffi_client_json_method!(pioneer_client_ffi_workspace_switch, workspace_switch);
 ffi_client_json_method!(pioneer_client_ffi_workspace_create, workspace_create);
 ffi_client_json_method!(pioneer_client_ffi_workspace_rename, workspace_rename);
 ffi_client_json_method!(pioneer_client_ffi_provider_list, provider_list);
+ffi_client_json_method!(pioneer_client_ffi_cli_runtime_list, cli_runtime_list);
+ffi_client_json_method!(
+    pioneer_client_ffi_cli_runtime_list_models,
+    cli_runtime_list_models
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_cli_runtime_thread_binding_get,
+    cli_runtime_thread_binding_get
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_cli_runtime_thread_compact,
+    cli_runtime_thread_compact
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_cli_runtime_turn_steer,
+    cli_runtime_turn_steer
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_cli_runtime_review_start,
+    cli_runtime_review_start
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_cli_runtime_request_respond,
+    cli_runtime_request_respond
+);
 ffi_client_json_method!(
     pioneer_client_ffi_provider_list_models,
     provider_list_models

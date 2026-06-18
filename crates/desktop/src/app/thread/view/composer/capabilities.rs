@@ -211,6 +211,10 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.composer_selected_provider_is_cli_runtime() {
+            return;
+        }
+
         let desktop_entity = cx.entity().clone();
         let rows = self.selectable_skill_capabilities("");
         let picker_state = cx.new(|cx| {
@@ -305,6 +309,10 @@ impl PioneerDesktop {
     }
 
     pub(super) fn open_composer_mcp_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.composer_selected_provider_is_cli_runtime() {
+            return;
+        }
+
         let desktop_entity = cx.entity().clone();
         let server_rows = self.selectable_mcp_server_capabilities("");
         let initial_details = self.mcp_server_details.clone();

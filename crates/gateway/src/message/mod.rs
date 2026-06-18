@@ -71,10 +71,9 @@ use pioneer_protocol::{
     CLIRuntimePendingRequestStatus, CLIRuntimeRefreshParams, CLIRuntimeRefreshResponse,
     CLIRuntimeRequestKind, CLIRuntimeRequestOpenedNotification, CLIRuntimeRequestResolution,
     CLIRuntimeRequestResolvedNotification, CLIRuntimeRequestRespondParams,
-    CLIRuntimeRequestRespondResponse, CLIRuntimeReviewStartParams, CLIRuntimeReviewStartResponse,
-    CLIRuntimeReviewTarget, CLIRuntimeStatusParams, CLIRuntimeStatusResponse,
-    CLIRuntimeThreadBinding, CLIRuntimeThreadBindingGetParams, CLIRuntimeThreadBindingGetResponse,
-    CLIRuntimeThreadCompactParams, CLIRuntimeThreadCompactResponse, CLIRuntimeThreadForkParams,
+    CLIRuntimeRequestRespondResponse, CLIRuntimeReviewStartParams, CLIRuntimeStatusParams,
+    CLIRuntimeStatusResponse, CLIRuntimeThreadBinding, CLIRuntimeThreadBindingGetParams,
+    CLIRuntimeThreadBindingGetResponse, CLIRuntimeThreadCompactParams, CLIRuntimeThreadForkParams,
     CLIRuntimeThreadForkResponse, CLIRuntimeTurnSteerParams, CLIRuntimeTurnSteerResponse,
     ContextCompressedNotification, ContextCompressingNotification, INVALID_PARAMS_CODE,
     INVALID_REQUEST_CODE, ItemCompletedNotification, ItemDeltaNotification, ItemDeltaStream,
@@ -112,7 +111,7 @@ use pioneer_protocol::{
     ThreadOriginKind, ThreadSidebarVisibility, ThreadStartParams, ThreadTreeChangedNotification,
     ThreadTreeParams, ThreadTreeResponse, ThreadUnsubscribeParams, ThreadUpdateParams,
     ThreadUpdateResponse, ThreadUpdatedNotification, TimelineItem, TimelineLane, TimelineOrigin,
-    TimelineOriginKind, TimelinePayload, ToolCallStatus, ToolStoragePayload,
+    TimelineOriginKind, TimelinePayload, ToolCallStatus, ToolStoragePayload, Turn,
     TurnBlockedNotification, TurnCancelParams, TurnCancelResponse, TurnCompletedNotification,
     TurnFailedNotification, TurnGetParams, TurnGetResponse, TurnItem, TurnItemEvent,
     TurnItemEventPayload, TurnItemType, TurnItemsParams, TurnResumeParams, TurnResumeResponse,
@@ -838,6 +837,9 @@ impl MessageProcessor {
                 if let Err(error) = this.process_due_task_deliveries(now, 64).await {
                     warn!(error = %format!("{error:#}"), "task delivery worker poll failed");
                 }
+
+                this.fail_stale_cli_runtime_turns(now_timestamp_millis())
+                    .await;
 
                 sleep(Duration::from_secs(2)).await;
             }

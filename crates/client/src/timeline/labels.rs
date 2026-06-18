@@ -1472,6 +1472,7 @@ mod tests {
             item: TurnItem::AgentMessage {
                 id: "item_1".to_owned(),
                 text: String::new(),
+                phase: Default::default(),
                 markdown: None,
                 markdown_version: None,
             },

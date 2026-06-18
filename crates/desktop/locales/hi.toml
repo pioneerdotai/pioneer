@@ -3,6 +3,7 @@ _version = 1
 [chat.composer]
 placeholder = "सहायक को संदेश भेजें"
 stop_reason = "उपयोगकर्ता ने टर्न रद्द किया"
+steer_codex = "चल रहे Codex टर्न को भेजें"
 
 [chat.composer.mode]
 agent_label = "एजेंट"
@@ -388,12 +389,14 @@ description = "उपलब्ध मॉडल प्रोवाइडरों
 empty_connected = "अभी तक कोई कनेक्टेड प्रोवाइडर नहीं है।"
 
 [providers.sidebar]
-all = "सभी"
+api = "API प्रदाता"
 connected = "कनेक्टेड"
+cli = "CLI प्रदाता"
 
 [providers.button]
-submit = "कुंजी सहेजें"
+submit = "सहेजें"
 remove_key = "कुंजी हटाएँ"
+refresh = "Refresh providers"
 
 [providers.dialog]
 title = "%{provider} कॉन्फ़िगर करें"
@@ -407,6 +410,95 @@ workspace_not_selected = "कार्यक्षेत्र चयनित �
 load_failed = "प्रोवाइडर कॉन्फ़िगरेशन लोड करने में विफल"
 save_failed = "API कुंजी सहेजने में विफल"
 delete_failed = "API कुंजी हटाने में विफल"
+
+[providers.cli]
+title = "CLI Providers"
+refreshing = "Refreshing"
+updated = "Updated"
+stale = "Stale"
+refresh_failed = "Refresh failed"
+not_refreshed = "Not refreshed"
+empty = "No CLI providers configured"
+diagnostics = "Diagnostics"
+native_events = "Native events"
+recent_stderr = "Recent stderr"
+copied_diagnostics = "Copied diagnostics for"
+login_code = "Code"
+login_open = "Open"
+login_started = "Codex login started"
+refresh_already_running = "CLI provider refresh is already running."
+refresh_wait = "CLI provider refresh is waiting for the refresh policy."
+
+[providers.cli.detail]
+account = "Account"
+version = "Version"
+binary = "Binary"
+home = "CODEX_HOME"
+shadow_home = "Shadow home"
+
+[providers.cli.value]
+disabled = "Disabled"
+
+[providers.cli.inline]
+display_name_label = "Display name"
+display_name_hint = "Name shown for this CLI provider in lists and pickers."
+display_name_placeholder = "Codex CLI"
+binary_label = "Binary path"
+binary_hint = "Path to the Codex binary used by this instance."
+home_label = "CODEX_HOME path"
+home_hint = "Custom Codex home and config directory."
+shadow_home_label = "Shadow home path"
+shadow_home_hint = "Account-specific Codex home; leave empty to disable."
+
+[providers.cli.action]
+add = "Add CLI Provider"
+refresh = "Refresh status"
+copy_diagnostics = "Copy diagnostics"
+edit = "Edit CLI Provider"
+duplicate = "Duplicate CLI Provider"
+disable = "Disable CLI Provider"
+enable = "Enable CLI Provider"
+login = "Log in"
+open_home = "Open CODEX_HOME"
+open_shadow_home = "Open shadow home"
+expand = "Show CLI provider details"
+collapse = "Hide CLI provider details"
+
+[providers.cli.status_detail]
+authenticated = "Authenticated as %{account}"
+authenticated_with_plan = "Authenticated as %{account} · %{plan}"
+not_on_path = "CLI `%{binary}` is not installed or not on PATH."
+unsupported_version = "Installed %{version}; minimum %{minimum}"
+
+[providers.cli.dialog]
+title_add = "Add CLI Provider"
+title_edit = "Edit CLI Provider"
+title_duplicate = "Duplicate CLI Provider"
+id_label = "Provider ID"
+display_name_label = "Display name"
+binary_label = "Binary"
+home_label = "CODEX_HOME"
+shadow_home_label = "Shadow home"
+enabled_label = "Enabled"
+id_placeholder = "codex_work"
+display_name_placeholder = "Codex Work"
+binary_placeholder = "codex"
+home_placeholder = "~/.codex"
+shadow_home_placeholder = "~/.pioneer/codex-work"
+
+[providers.cli.status]
+disabled = "Disabled"
+missing_binary = "Missing binary"
+spawn_failed = "Spawn failed"
+initializing = "Initializing"
+needs_auth = "Needs login"
+ready = "Ready"
+degraded = "Degraded"
+unsupported = "Unsupported"
+error = "Error"
+
+[providers.cli.error]
+open_path_failed = "Open path failed"
 
 [providers.catalog.anthropic]
 title = "Anthropic"

@@ -61,6 +61,7 @@ impl<'de> Deserialize<'de> for GatewaySettings {
             migrated: false,
         };
         settings.migrate_legacy_active_recall_model();
+        settings.migrate_default_codex_cli_display_name();
         Ok(settings)
     }
 }
@@ -413,6 +414,8 @@ impl GatewaySettings {
             config.cli_agent_runtime.enabled = false;
             config.cli_agent_runtimes =
                 cli_runtimes.to_gateway_cli_agent_runtime_instances_config();
+        } else if config.cli_agent_runtimes.is_empty() && !config.cli_agent_runtime.enabled {
+            config.cli_agent_runtime.enabled = true;
         }
         config
     }
@@ -430,6 +433,24 @@ impl GatewaySettings {
             }
             migrated = memory.legacy_active_recall_model.is_some();
             memory.legacy_active_recall_model = None;
+        }
+        self.migrated |= migrated;
+        migrated
+    }
+
+    fn migrate_default_codex_cli_display_name(&mut self) -> bool {
+        let Some(cli_runtimes) = &mut self.cli_runtimes else {
+            return false;
+        };
+        let mut migrated = false;
+        for instance in &mut cli_runtimes.instances {
+            if instance.id == "codex"
+                && instance.kind == GatewayCliAgentRuntimeKindConfig::Codex
+                && instance.display_name == "Codex"
+            {
+                instance.display_name = "Codex CLI".to_owned();
+                migrated = true;
+            }
         }
         self.migrated |= migrated;
         migrated
@@ -858,6 +879,10 @@ impl GatewayThreadEpisodicSettingsOverride {
 }
 
 impl GatewayCliRuntimeSettingsOverride {
+    fn default_supported() -> Result<Self> {
+        Self::from_protocol(pioneer_protocol::GatewayCliRuntimeSettings::default())
+    }
+
     fn from_protocol(settings: pioneer_protocol::GatewayCliRuntimeSettings) -> Result<Self> {
         let mut normalized_instances = Vec::with_capacity(settings.instances.len());
         let mut ids = HashSet::new();
@@ -1138,7 +1163,7 @@ pub fn load_or_create_gateway_settings(
         secrets: GatewaySecretsSettings::default(),
         memory: None,
         thread_episodic: None,
-        cli_runtimes: None,
+        cli_runtimes: Some(GatewayCliRuntimeSettingsOverride::default_supported()?),
         migrated: false,
     };
 
@@ -1186,6 +1211,7 @@ fn load_gateway_settings(
 pub fn save_gateway_settings(path: &Path, settings: &GatewaySettings) -> Result<()> {
     let mut settings = settings.clone();
     settings.migrate_legacy_active_recall_model();
+    settings.migrate_default_codex_cli_display_name();
     let content =
         toml::to_string_pretty(&settings).context("failed to serialize gateway settings")?;
     write_settings_file(path, content.as_str())
@@ -1280,6 +1306,10 @@ mod tests {
         assert!(!content.contains("[mcp.secrets]"));
         assert!(!content.contains("[memory]"));
         assert!(!content.contains("[thread_episodic]"));
+        assert!(content.contains("[[cli_runtimes.instances]]"));
+        assert!(content.contains("id = \"codex\""));
+        assert!(content.contains("display_name = \"Codex CLI\""));
+        assert!(content.contains("enabled = true"));
 
         let _ = fs::remove_dir_all(temp_dir);
     }
@@ -1750,11 +1780,91 @@ backend = "keystore"
 
         let changes = settings
             .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
-                cli_runtimes: Some(pioneer_protocol::GatewayCliRuntimeSettings::default()),
+                cli_runtimes: Some(pioneer_protocol::GatewayCliRuntimeSettings {
+                    instances: Vec::new(),
+                }),
                 ..pioneer_protocol::GatewaySettingsUpdate::default()
             })
             .expect("empty CLI runtime settings should apply");
         assert!(changes.cli_runtimes);
+    }
+
+    #[test]
+    fn gateway_settings_without_cli_runtimes_exposes_default_codex_runtime() {
+        let settings = toml::from_str::<super::GatewaySettings>(
+            r#"
+version = 1
+
+[secrets]
+backend = "keystore"
+"#,
+        )
+        .expect("gateway settings should parse");
+
+        let config = gateway_config_with_keepawake(false);
+        assert!(config.effective_cli_agent_runtime_instances().is_empty());
+
+        let snapshot = settings.snapshot(&config);
+        assert_eq!(snapshot.cli_runtimes.instances.len(), 1);
+        assert_eq!(snapshot.cli_runtimes.instances[0].id, "codex");
+        assert!(snapshot.cli_runtimes.instances[0].enabled);
+
+        let applied = settings.apply_to_gateway_config(config);
+        let instances = applied.effective_cli_agent_runtime_instances();
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].id, "codex");
+        assert!(instances[0].enabled);
+    }
+
+    #[test]
+    fn gateway_settings_migrates_default_codex_display_name() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let path = temp_dir.join("gateway-settings.toml");
+        fs::write(
+            &path,
+            r#"
+version = 1
+
+[secrets]
+backend = "keystore"
+
+[[cli_runtimes.instances]]
+id = "codex"
+kind = "codex"
+display_name = "Codex"
+enabled = true
+binary_path = "codex"
+home_path = "~/.codex"
+
+[[cli_runtimes.instances]]
+id = "codex_work"
+kind = "codex"
+display_name = "Codex Work"
+enabled = true
+binary_path = "codex"
+home_path = "~/.codex-work"
+"#,
+        )
+        .expect("write settings");
+
+        let settings = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
+            .expect("settings should load and migrate");
+        let snapshot = settings.snapshot(&gateway_config_with_keepawake(false));
+
+        assert_eq!(snapshot.cli_runtimes.instances[0].id, "codex");
+        assert_eq!(snapshot.cli_runtimes.instances[0].display_name, "Codex CLI");
+        assert_eq!(snapshot.cli_runtimes.instances[1].id, "codex_work");
+        assert_eq!(
+            snapshot.cli_runtimes.instances[1].display_name,
+            "Codex Work"
+        );
+
+        let content = fs::read_to_string(&path).expect("read migrated settings");
+        assert!(content.contains("display_name = \"Codex CLI\""));
+        assert!(content.contains("display_name = \"Codex Work\""));
+
+        let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[test]
@@ -1776,7 +1886,7 @@ backend = "keystore"
                         pioneer_protocol::GatewayCliRuntimeInstanceSettings {
                             id: "codex_one".to_owned(),
                             kind: pioneer_protocol::CLIAgentRuntimeKind::Codex,
-                            display_name: "Codex".to_owned(),
+                            display_name: "Codex CLI".to_owned(),
                             enabled: true,
                             binary_path: "codex".to_owned(),
                             home_path: "~/.codex".to_owned(),
@@ -1785,7 +1895,7 @@ backend = "keystore"
                         pioneer_protocol::GatewayCliRuntimeInstanceSettings {
                             id: "codex_two".to_owned(),
                             kind: pioneer_protocol::CLIAgentRuntimeKind::Codex,
-                            display_name: "codex".to_owned(),
+                            display_name: "codex cli".to_owned(),
                             enabled: true,
                             binary_path: "codex".to_owned(),
                             home_path: "~/.codex-two".to_owned(),

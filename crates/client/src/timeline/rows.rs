@@ -512,6 +512,7 @@ fn task_timeline_group_id(group_key: TaskTimelineGroupKey<'_>) -> String {
 fn is_parent_agent_message(item_view: &ItemView) -> bool {
     matches!(item_view.item, TurnItem::AgentMessage { .. })
         && task_timeline_origin_group_key(item_view).is_none()
+        && !is_commentary_agent_message(item_view)
 }
 
 fn is_terminal_parent_agent_message(item_view: &ItemView) -> bool {
@@ -523,6 +524,13 @@ fn is_terminal_parent_agent_message(item_view: &ItemView) -> bool {
                 | TimelineEntryStatus::Failed
                 | TimelineEntryStatus::Cancelled
         )
+}
+
+fn is_commentary_agent_message(item_view: &ItemView) -> bool {
+    let TurnItem::AgentMessage { phase, .. } = &item_view.item else {
+        return false;
+    };
+    *phase == pioneer_protocol::AgentMessagePhase::Commentary
 }
 
 fn is_task_system_work_event(item_view: &ItemView) -> bool {
@@ -694,6 +702,7 @@ mod tests {
                     TurnItem::AgentMessage {
                         id: "agent_1".to_owned(),
                         text: "Done".to_owned(),
+                        phase: Default::default(),
                         markdown: None,
                         markdown_version: None,
                     },
@@ -720,6 +729,276 @@ mod tests {
         assert_eq!(
             visible_item_ids(&projection, &expanded_rows),
             vec!["user_1", "tool_1", "task_event_1", "agent_1"]
+        );
+    }
+
+    #[test]
+    fn reasoning_and_tools_before_terminal_answer_collapse_as_turn_work() {
+        let projection = ConversationViewState {
+            timeline: vec![
+                timeline_entry("entry_user", "turn_parent", "user_1", 0),
+                timeline_entry("entry_reasoning", "turn_parent", "reasoning_1", 1),
+                timeline_entry("entry_tool", "turn_parent", "tool_1", 2),
+                timeline_entry("entry_agent", "turn_parent", "agent_1", 3),
+            ],
+            items: vec![
+                item_view(
+                    "user_1",
+                    "turn_parent",
+                    "user_message",
+                    TurnItem::UserMessage {
+                        id: "user_1".to_owned(),
+                        text: "Inspect project".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                    None,
+                ),
+                item_view(
+                    "reasoning_1",
+                    "turn_parent",
+                    "reasoning",
+                    TurnItem::Reasoning {
+                        id: "reasoning_1".to_owned(),
+                        summary: vec!["I will inspect the project.".to_owned()],
+                        content: Vec::new(),
+                    },
+                    None,
+                ),
+                item_view(
+                    "tool_1",
+                    "turn_parent",
+                    "dynamic_tool_call",
+                    TurnItem::DynamicToolCall {
+                        id: "tool_1".to_owned(),
+                        tool_name: "exec_command".to_owned(),
+                        arguments: serde_json::json!({}),
+                        status: ToolCallStatus::Completed,
+                        recovery_policy: None,
+                        output_policy: ToolOutputPolicySnapshot::for_tool_name("exec_command"),
+                        display: ToolDisplayPayload::Hidden,
+                        storage: ToolStoragePayload::None,
+                        recovery: None,
+                        success: Some(true),
+                        outcome: None,
+                        observation: None,
+                    },
+                    None,
+                ),
+                item_view(
+                    "agent_1",
+                    "turn_parent",
+                    "agent_message",
+                    TurnItem::AgentMessage {
+                        id: "agent_1".to_owned(),
+                        text: "Done".to_owned(),
+                        phase: Default::default(),
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                    None,
+                ),
+            ],
+            ..ConversationViewState::default()
+        };
+
+        let collapsed_rows = build_timeline_group_rows(&projection, &HashSet::new());
+        assert_eq!(
+            visible_item_ids(&projection, &collapsed_rows),
+            vec!["user_1", "agent_1"]
+        );
+        assert!(collapsed_rows.iter().any(|row| matches!(
+            row.kind,
+            TimelineRowKind::TurnWorkToggle(TurnWorkGroupRow { .. })
+        )));
+
+        let expanded_rows = build_timeline_group_rows(
+            &projection,
+            &HashSet::from([timeline_turn_work_group_key("entry_user")]),
+        );
+        assert_eq!(
+            visible_item_ids(&projection, &expanded_rows),
+            vec!["user_1", "reasoning_1", "tool_1", "agent_1"]
+        );
+    }
+
+    #[test]
+    fn expanded_turn_work_keeps_completed_empty_reasoning() {
+        let projection = ConversationViewState {
+            timeline: vec![
+                timeline_entry("entry_user", "turn_parent", "user_1", 0),
+                timeline_entry("entry_empty_reasoning", "turn_parent", "reasoning_empty", 1),
+                timeline_entry("entry_tool", "turn_parent", "tool_1", 2),
+                timeline_entry("entry_agent", "turn_parent", "agent_1", 3),
+            ],
+            items: vec![
+                item_view(
+                    "user_1",
+                    "turn_parent",
+                    "user_message",
+                    TurnItem::UserMessage {
+                        id: "user_1".to_owned(),
+                        text: "Inspect project".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                    None,
+                ),
+                ItemView {
+                    id: "reasoning_empty".to_owned(),
+                    turn_id: "turn_parent".to_owned(),
+                    item_type: "reasoning".to_owned(),
+                    status: TimelineEntryStatus::Completed,
+                    started_at_unix_ms: Some(2),
+                    updated_at_unix_ms: Some(3),
+                    completed_at_unix_ms: Some(3),
+                    partial_text: String::new(),
+                    final_text: None,
+                    partial_markdown: None,
+                    final_markdown: None,
+                    item: TurnItem::Reasoning {
+                        id: "reasoning_empty".to_owned(),
+                        summary: Vec::new(),
+                        content: Vec::new(),
+                    },
+                    timeline_origin: None,
+                    opaque_meta: None,
+                },
+                item_view(
+                    "tool_1",
+                    "turn_parent",
+                    "dynamic_tool_call",
+                    TurnItem::DynamicToolCall {
+                        id: "tool_1".to_owned(),
+                        tool_name: "exec_command".to_owned(),
+                        arguments: serde_json::json!({}),
+                        status: ToolCallStatus::Completed,
+                        recovery_policy: None,
+                        output_policy: ToolOutputPolicySnapshot::for_tool_name("exec_command"),
+                        display: ToolDisplayPayload::Hidden,
+                        storage: ToolStoragePayload::None,
+                        recovery: None,
+                        success: Some(true),
+                        outcome: None,
+                        observation: None,
+                    },
+                    None,
+                ),
+                item_view(
+                    "agent_1",
+                    "turn_parent",
+                    "agent_message",
+                    TurnItem::AgentMessage {
+                        id: "agent_1".to_owned(),
+                        text: "Done".to_owned(),
+                        phase: Default::default(),
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                    None,
+                ),
+            ],
+            ..ConversationViewState::default()
+        };
+
+        let collapsed_rows = build_timeline_group_rows(&projection, &HashSet::new());
+        assert_eq!(
+            visible_item_ids(&projection, &collapsed_rows),
+            vec!["user_1", "agent_1"]
+        );
+
+        let expanded_rows = build_timeline_group_rows(
+            &projection,
+            &HashSet::from([timeline_turn_work_group_key("entry_user")]),
+        );
+        assert_eq!(
+            visible_item_ids(&projection, &expanded_rows),
+            vec!["user_1", "reasoning_empty", "tool_1", "agent_1"]
+        );
+    }
+
+    #[test]
+    fn commentary_agent_message_is_work_item_not_terminal_answer() {
+        let projection = ConversationViewState {
+            timeline: vec![
+                timeline_entry("entry_user", "turn_parent", "user_1", 0),
+                timeline_entry("entry_commentary", "turn_parent", "commentary_1", 1),
+                timeline_entry("entry_tool", "turn_parent", "tool_1", 2),
+                timeline_entry("entry_final", "turn_parent", "final_1", 3),
+            ],
+            items: vec![
+                item_view(
+                    "user_1",
+                    "turn_parent",
+                    "user_message",
+                    TurnItem::UserMessage {
+                        id: "user_1".to_owned(),
+                        text: "Inspect project".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                    None,
+                ),
+                item_view(
+                    "commentary_1",
+                    "turn_parent",
+                    "agent_message",
+                    TurnItem::AgentMessage {
+                        id: "commentary_1".to_owned(),
+                        text: "I will inspect the project.".to_owned(),
+                        phase: pioneer_protocol::AgentMessagePhase::Commentary,
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                    None,
+                ),
+                item_view(
+                    "tool_1",
+                    "turn_parent",
+                    "dynamic_tool_call",
+                    TurnItem::DynamicToolCall {
+                        id: "tool_1".to_owned(),
+                        tool_name: "exec_command".to_owned(),
+                        arguments: serde_json::json!({}),
+                        status: ToolCallStatus::Completed,
+                        recovery_policy: None,
+                        output_policy: ToolOutputPolicySnapshot::for_tool_name("exec_command"),
+                        display: ToolDisplayPayload::Hidden,
+                        storage: ToolStoragePayload::None,
+                        recovery: None,
+                        success: Some(true),
+                        outcome: None,
+                        observation: None,
+                    },
+                    None,
+                ),
+                item_view(
+                    "final_1",
+                    "turn_parent",
+                    "agent_message",
+                    TurnItem::AgentMessage {
+                        id: "final_1".to_owned(),
+                        text: "Done".to_owned(),
+                        phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                    None,
+                ),
+            ],
+            ..ConversationViewState::default()
+        };
+
+        let collapsed_rows = build_timeline_group_rows(&projection, &HashSet::new());
+        assert_eq!(
+            visible_item_ids(&projection, &collapsed_rows),
+            vec!["user_1", "final_1"]
+        );
+
+        let expanded_rows = build_timeline_group_rows(
+            &projection,
+            &HashSet::from([timeline_turn_work_group_key("entry_user")]),
+        );
+        assert_eq!(
+            visible_item_ids(&projection, &expanded_rows),
+            vec!["user_1", "commentary_1", "tool_1", "final_1"]
         );
     }
 
@@ -1113,6 +1392,7 @@ mod desktop_parity_tests {
             item: TurnItem::AgentMessage {
                 id: id.to_owned(),
                 text: "Child result".to_owned(),
+                phase: Default::default(),
                 markdown: None,
                 markdown_version: None,
             },
@@ -1278,6 +1558,7 @@ mod desktop_parity_tests {
                     item: TurnItem::AgentMessage {
                         id: "parent_agent_1".to_owned(),
                         text: "Task cancelled.".to_owned(),
+                        phase: Default::default(),
                         markdown: None,
                         markdown_version: None,
                     },
@@ -1410,6 +1691,7 @@ mod desktop_parity_tests {
                     item: TurnItem::AgentMessage {
                         id: "other_agent".to_owned(),
                         text: "Other done".to_owned(),
+                        phase: Default::default(),
                         markdown: None,
                         markdown_version: None,
                     },
@@ -1431,6 +1713,7 @@ mod desktop_parity_tests {
                     item: TurnItem::AgentMessage {
                         id: "parent_agent_1".to_owned(),
                         text: "Done".to_owned(),
+                        phase: Default::default(),
                         markdown: None,
                         markdown_version: None,
                     },
@@ -1706,6 +1989,7 @@ mod desktop_parity_tests {
                     item: TurnItem::AgentMessage {
                         id: "agent_final".to_owned(),
                         text: String::new(),
+                        phase: Default::default(),
                         markdown: None,
                         markdown_version: None,
                     },
@@ -1722,6 +2006,7 @@ mod desktop_parity_tests {
                     item: TurnItem::AgentMessage {
                         id: "agent_final".to_owned(),
                         text: "Task cancelled.".to_owned(),
+                        phase: Default::default(),
                         markdown: None,
                         markdown_version: None,
                     },
@@ -2426,6 +2711,7 @@ mod desktop_parity_tests {
                     item: TurnItem::AgentMessage {
                         id: "child_agent_1".to_owned(),
                         text: "Child result".to_owned(),
+                        phase: Default::default(),
                         markdown: None,
                         markdown_version: None,
                     },
@@ -2476,6 +2762,7 @@ mod desktop_parity_tests {
                     item: TurnItem::AgentMessage {
                         id: "parent_agent_1".to_owned(),
                         text: "Parent final".to_owned(),
+                        phase: Default::default(),
                         markdown: None,
                         markdown_version: None,
                     },

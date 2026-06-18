@@ -190,6 +190,7 @@ pub fn keepawake_update_plan(
             }),
             memory: None,
             thread_episodic: None,
+            cli_runtimes: None,
         },
     })
 }
@@ -210,6 +211,7 @@ pub fn preflight_model_update_plan(
             }),
             memory: None,
             thread_episodic: None,
+            cli_runtimes: None,
         },
     })
 }
@@ -227,6 +229,7 @@ pub fn thread_episodic_enabled_update_plan(
             general: None,
             memory: None,
             thread_episodic: Some(GatewayThreadEpisodicSettingsUpdate::enabled(enabled)),
+            cli_runtimes: None,
         },
     })
 }
@@ -244,6 +247,7 @@ mod tests {
             },
             memory: GatewayMemorySettings::default(),
             thread_episodic: Default::default(),
+            cli_runtimes: Default::default(),
         }
     }
 
@@ -332,6 +336,7 @@ mod tests {
         assert!(params.update.general.is_none());
         assert!(params.update.memory.is_none());
         assert!(params.update.thread_episodic.is_none());
+        assert!(params.update.cli_runtimes.is_none());
         let _params: GatewaySettingsGetParams = gateway_settings_get_params();
 
         assert!(settings_action_matches_connection(7, 3, Some(7), 3));

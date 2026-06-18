@@ -6,16 +6,140 @@ use pioneer_client::composer::capabilities as composer_capabilities;
 use pioneer_client::composer::turn_prepare::{
     self as composer_turn_prepare, PrepareComposerTurnRequest,
 };
-use pioneer_client::turns::{cancel as turn_cancel, start as turn_start};
-use pioneer_protocol::ArtifactRef;
+use pioneer_client::providers::list as provider_list;
+use pioneer_client::turns::{cancel as turn_cancel, start as turn_start, steer as turn_steer};
+use pioneer_protocol::{
+    ArtifactRef, CLIRuntimeRequestResolution, CLIRuntimeRequestResolvedNotification,
+    CLIRuntimeRequestRespondParams,
+};
 use std::path::PathBuf;
+use tracing::warn;
 
 impl PioneerDesktop {
+    pub(super) fn steer_active_codex_turn(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let snapshot = self.client_snapshot().active_thread;
+        let (Some(thread_id), Some(workspace_id), Some(turn_id)) = (
+            snapshot.thread_id.clone(),
+            snapshot.workspace_id.clone(),
+            snapshot.in_flight_turn_id.clone(),
+        ) else {
+            return;
+        };
+        let Some(binding) = self.codex_cli_runtime_binding_for_thread(thread_id.as_str()) else {
+            return;
+        };
+        let message = self.composer_state.read(cx).value().trim().to_owned();
+        let Some(params) = turn_steer::plan_cli_runtime_turn_steer(
+            workspace_id,
+            binding.runtime_id.clone(),
+            thread_id.clone(),
+            turn_id.clone(),
+            message,
+        ) else {
+            return;
+        };
+
+        let ws_sender = self.gateway.ws_command_sender.clone();
+        cx.spawn_in(
+            window,
+            move |this: WeakEntity<Self>, cx: &mut AsyncWindowContext| {
+                let mut cx = cx.clone();
+                async move {
+                    let result = cx
+                        .background_spawn(async move { ws_sender.cli_runtime_turn_steer(params) })
+                        .await;
+
+                    let _ = this.update_in(&mut cx, move |view, window, cx| {
+                        match result {
+                            Ok(_) => {
+                                view.clear_composer(window, cx);
+                            }
+                            Err(error) => {
+                                warn!(
+                                    thread_id = thread_id.as_str(),
+                                    turn_id = turn_id.as_str(),
+                                    error = %format!("{error:#}"),
+                                    "failed to steer Codex turn"
+                                );
+                            }
+                        }
+                        cx.notify();
+                    });
+                }
+            },
+        )
+        .detach();
+    }
+
+    pub(super) fn respond_cli_runtime_pending_request(
+        &mut self,
+        request_id: String,
+        resolution: CLIRuntimeRequestResolution,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(entry) = self
+            .cli_runtime_pending_requests
+            .request(&request_id)
+            .cloned()
+        else {
+            return;
+        };
+
+        let ws_sender = self.gateway.ws_command_sender.clone();
+        let params = CLIRuntimeRequestRespondParams {
+            workspace_id: entry.workspace_id.clone(),
+            runtime_id: entry.runtime_id.clone(),
+            request_id: entry.request_id.clone(),
+            resolution,
+        };
+
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                let result = cx
+                    .background_spawn(async move { ws_sender.cli_runtime_request_respond(params) })
+                    .await;
+
+                let _ = this.update(&mut cx, |view, cx| match result {
+                    Ok(response) => {
+                        let reduction =
+                            pioneer_client::cli_runtime::approvals::reduce_cli_runtime_request_resolved_notification(
+                                CLIRuntimeRequestResolvedNotification {
+                                    workspace_id: response.workspace_id,
+                                    runtime_id: response.runtime_id,
+                                    request_id: response.request_id,
+                                    thread_id: response.thread_id,
+                                    turn_id: response.turn_id,
+                                    item_id: response.item_id,
+                                    resolution: response.resolution,
+                                },
+                            );
+                        view.cli_runtime_pending_requests.apply(reduction);
+                        cx.notify();
+                    }
+                    Err(error) => {
+                        warn!(
+                            request_id = entry.request_id.as_str(),
+                            runtime_id = entry.runtime_id.as_str(),
+                            error = %format!("{error:#}"),
+                            "failed to respond to CLI runtime pending request"
+                        );
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
     pub(super) fn open_composer_file_picker(
         &mut self,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.composer_selected_provider_is_cli_runtime() {
+            return;
+        }
+
         let selection = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -86,13 +210,48 @@ impl PioneerDesktop {
         let selected_mode = self.composer_turn_mode;
         let selected_model = self.composer_selected_model.clone();
         let selected_provider = self.composer_selected_provider.clone();
+        let selected_cli_runtime_backend =
+            match provider_list::resolve_cli_runtime_execution_backend(
+                selected_provider.as_deref(),
+                self.providers.cli_runtimes(),
+                self.gateway
+                    .settings
+                    .as_ref()
+                    .map(|settings| &settings.cli_runtimes),
+            ) {
+                Ok(backend) => backend,
+                Err(error) => {
+                    self.composer_upload_error = Some(error);
+                    cx.notify();
+                    return;
+                }
+            };
+        let cli_runtime_selected = selected_cli_runtime_backend.is_some();
+        let turn_model_provider = if selected_cli_runtime_backend.is_some() {
+            None
+        } else {
+            selected_provider.clone()
+        };
         let Some(thread_id) = self.active_thread_id.clone() else {
             return;
         };
 
         let composer_text = composer_state.read(cx).value().trim().to_owned();
-        let composer_attachments = self.composer_attachments.clone();
-        let composer_capabilities = self.composer_capabilities.clone();
+        if cli_runtime_selected {
+            self.composer_attachments.clear();
+            self.composer_capabilities.clear();
+            self.composer_upload_error = None;
+        }
+        let composer_attachments = if cli_runtime_selected {
+            Vec::new()
+        } else {
+            self.composer_attachments.clone()
+        };
+        let composer_capabilities = if cli_runtime_selected {
+            Vec::new()
+        } else {
+            self.composer_capabilities.clone()
+        };
         if !composer_turn_prepare::composer_has_sendable_content(
             composer_text.as_str(),
             !composer_attachments.is_empty(),
@@ -177,7 +336,10 @@ impl PioneerDesktop {
                                     pending_request_id: pending_request_id.clone(),
                                     selected_model: selected_model.clone(),
                                     selected_provider: selected_provider.clone(),
+                                    turn_model_provider: turn_model_provider.clone(),
                                     selected_mode: Some(selected_mode),
+                                    execution_backend: selected_cli_runtime_backend.clone(),
+                                    cli_runtime_options: None,
                                     updated_at_unix: turn_start::now_unix_seconds(),
                                 },
                                 prepared,
@@ -355,6 +517,10 @@ impl PioneerDesktop {
         artifact: ArtifactRef,
         cx: &mut Context<Self>,
     ) {
+        if self.composer_selected_provider_is_cli_runtime() {
+            return;
+        }
+
         if composer_attachments::add_composer_attachment_from_artifact(
             &mut self.composer_attachments,
             artifact,

@@ -23,6 +23,24 @@ fn cli_runtime_forbidden_input_kind(input: &UserInput) -> Option<&'static str> {
     }
 }
 
+fn cli_runtime_binding_status_for_terminal_turn(status: TurnStatus) -> Option<&'static str> {
+    match status {
+        TurnStatus::Completed => {
+            Some(crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_COMPLETED)
+        }
+        TurnStatus::Failed => {
+            Some(crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_FAILED)
+        }
+        TurnStatus::Interrupted => {
+            Some(crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_INTERRUPTED)
+        }
+        TurnStatus::Blocked => {
+            Some(crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_BLOCKED)
+        }
+        TurnStatus::InProgress => None,
+    }
+}
+
 impl MessageProcessor {
     pub(super) async fn turn_start(
         &self,
@@ -447,6 +465,32 @@ impl MessageProcessor {
                 return;
             }
         };
+        match self
+            .cli_runtime_turn_start_blocker_for_thread(&session_key)
+            .await
+        {
+            Ok(Some(message)) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
+                )
+                .await;
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to check active CLI runtime turns: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        }
         let mut input_mapping =
             match crate::cli_runtime::input_mapping::map_codex_turn_input_from_pioneer(
                 params.input.as_slice(),
@@ -874,6 +918,83 @@ impl MessageProcessor {
         }
 
         Some(runtime)
+    }
+
+    pub(super) async fn cli_runtime_turn_start_blocker_for_thread(
+        &self,
+        key: &crate::cli_runtime::manager::CLIAgentRuntimeSessionKey,
+    ) -> anyhow::Result<Option<String>> {
+        let bindings = self
+            .crud_store
+            .list_cli_runtime_turn_bindings_for_thread(key.thread_id.as_str())
+            .await?;
+        for binding in bindings.into_iter().rev() {
+            if binding.workspace_id != key.workspace_id || binding.runtime_id != key.runtime_id {
+                continue;
+            }
+            if binding.status != crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING
+                && binding.status
+                    != crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING
+            {
+                continue;
+            }
+
+            let Some((_workspace_id, turn)) = self
+                .thread_manager
+                .turn_get(binding.thread_id.as_str(), binding.turn_id.as_str())
+                .await
+            else {
+                continue;
+            };
+            if turn.status != TurnStatus::InProgress {
+                if let Some(status) = cli_runtime_binding_status_for_terminal_turn(turn.status)
+                    && let Err(error) =
+                        crate::cli_runtime::turn_binding::update_cli_runtime_turn_binding_status(
+                            self.crud_store.as_ref(),
+                            binding.turn_id.as_str(),
+                            status,
+                            chrono::Utc::now().fixed_offset(),
+                        )
+                        .await
+                {
+                    warn!(
+                        thread_id = binding.thread_id.as_str(),
+                        turn_id = binding.turn_id.as_str(),
+                        error = %format!("{error:#}"),
+                        "failed to reconcile stale CLI runtime binding before turn start"
+                    );
+                }
+                continue;
+            }
+
+            return Ok(Some(format!(
+                "CLI runtime thread `{}` already has active turn `{}`; wait for it to finish or cancel it before starting another CLI runtime turn",
+                key.thread_id, binding.turn_id
+            )));
+        }
+
+        let pending_native_turn_ids = self
+            .cli_runtime_pending_turn_events
+            .lock()
+            .await
+            .keys()
+            .filter(|pending| {
+                pending.workspace_id == key.workspace_id
+                    && pending.runtime_id == key.runtime_id
+                    && pending.thread_id == key.thread_id
+            })
+            .map(|pending| pending.native_turn_id.clone())
+            .take(3)
+            .collect::<Vec<_>>();
+        if !pending_native_turn_ids.is_empty() {
+            return Ok(Some(format!(
+                "CLI runtime thread `{}` has unbound native turn events for `{}`; wait for the native turn to finish before starting another CLI runtime turn",
+                key.thread_id,
+                pending_native_turn_ids.join(", ")
+            )));
+        }
+
+        Ok(None)
     }
 
     async fn compile_codex_cli_runtime_context_bundle_for_turn(

@@ -113,6 +113,7 @@ pub fn gateway_settings_snapshot_with_memory(
         general: GatewayGeneralSettings::default(),
         memory: GatewayMemorySettings::default(),
         thread_episodic: Default::default(),
+        cli_runtimes: Default::default(),
     });
     snapshot.memory = memory;
     snapshot
@@ -123,6 +124,7 @@ pub fn gateway_settings_update_for_memory(memory: GatewayMemorySettings) -> Gate
         general: None,
         memory: Some(memory),
         thread_episodic: None,
+        cli_runtimes: None,
     }
 }
 
@@ -138,6 +140,7 @@ mod tests {
             },
             memory: GatewayMemorySettings::default(),
             thread_episodic: Default::default(),
+            cli_runtimes: Default::default(),
         }
     }
 

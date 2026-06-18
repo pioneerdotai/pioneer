@@ -202,6 +202,7 @@ impl PioneerDesktop {
         };
 
         Self::load_providers_async(cx, &state);
+        Self::load_cli_runtimes_async(cx, &state);
         Self::preload_selected_provider_models_async(cx, &state, options.selected_provider);
         Self::show_model_selector_dialog(window, cx, state);
     }
@@ -228,6 +229,40 @@ impl PioneerDesktop {
                             selector
                                 .borrow_mut()
                                 .apply_provider_list_error(format!("{error:#}"));
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn load_cli_runtimes_async(cx: &mut Context<Self>, state: &ModelSelectorDialogState) {
+        let selector = state.selector.clone();
+        let ws_sender = state.ws_sender.clone();
+        let workspace_id = state.workspace_id.clone();
+
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                let result = cx
+                    .background_spawn(async move {
+                        ws_sender
+                            .cli_runtime_list(provider_list::cli_runtime_list_params(workspace_id))
+                    })
+                    .await;
+                let _ = this.update(&mut cx, |_view, cx| {
+                    match result {
+                        Ok(response) => {
+                            selector
+                                .borrow_mut()
+                                .apply_cli_runtime_list_success(response);
+                        }
+                        Err(error) => {
+                            selector
+                                .borrow_mut()
+                                .apply_cli_runtime_list_error(format!("{error:#}"));
                         }
                     }
                     cx.notify();
@@ -270,10 +305,28 @@ impl PioneerDesktop {
             async move {
                 let result = cx
                     .background_spawn(async move {
-                        ws_sender.provider_list_models(provider_list::provider_list_models_params(
-                            workspace_id,
-                            provider_name,
-                        ))
+                        if let Some(runtime_id) =
+                            provider_list::runtime_id_from_cli_runtime_provider_key(
+                                provider_name.as_str(),
+                            )
+                        {
+                            ws_sender
+                                .cli_runtime_list_models(provider_list::cli_runtime_list_models_params(
+                                    workspace_id,
+                                    runtime_id.to_owned(),
+                                ))
+                                .map(|response| {
+                                    provider_list::provider_models_response_from_cli_runtime_models_response(
+                                        provider_name,
+                                        response,
+                                    )
+                                })
+                        } else {
+                            ws_sender.provider_list_models(provider_list::provider_list_models_params(
+                                workspace_id,
+                                provider_name,
+                            ))
+                        }
                     })
                     .await;
                 let _ = desktop_entity.update(&mut cx, |_view, cx| {
@@ -378,8 +431,7 @@ impl PioneerDesktop {
         state
             .selector
             .borrow()
-            .selected_provider()
-            .map(str::to_owned)
+            .selected_provider_label()
             .unwrap_or_else(|| t!("chat.composer.model.provider_placeholder").to_string())
     }
 
@@ -477,10 +529,10 @@ impl PioneerDesktop {
         let popover_width =
             px((*state.provider_trigger_width_px.borrow()).max(SELECTOR_POPOVER_FALLBACK_WIDTH));
 
-        let (provider_list, is_loading, current_selected) = {
+        let (provider_rows, is_loading, current_selected) = {
             let selector = state.selector.borrow();
             (
-                selector.providers().to_vec(),
+                selector.provider_rows(),
                 selector.loading_providers(),
                 selector.selected_provider().map(str::to_owned),
             )
@@ -491,8 +543,18 @@ impl PioneerDesktop {
             .value()
             .to_owned();
 
-        let filtered =
-            provider_presentation::filter_model_selector_providers(&provider_list, &search_text);
+        let search = search_text.trim().to_ascii_lowercase();
+        let filtered = provider_rows
+            .into_iter()
+            .filter(|provider| {
+                search.is_empty()
+                    || provider.id.to_ascii_lowercase().contains(search.as_str())
+                    || provider
+                        .label
+                        .to_ascii_lowercase()
+                        .contains(search.as_str())
+            })
+            .collect::<Vec<_>>();
 
         let mut content = v_flex()
             .w(popover_width)
@@ -523,11 +585,12 @@ impl PioneerDesktop {
             );
         } else {
             for provider in filtered {
-                let is_active = current_selected.as_deref() == Some(provider.name.as_str());
-                let provider_name = provider.name.clone();
+                let is_active = current_selected.as_deref() == Some(provider.id.as_str());
+                let provider_id = provider.id.clone();
+                let provider_label = provider.label.clone();
                 let row_state = state.clone();
                 let popover_entity = popover_entity.clone();
-                let id: SharedString = format!("provider-opt-{}", provider.name).into();
+                let id: SharedString = format!("provider-opt-{}", provider.id).into();
 
                 list = list.child(
                     div()
@@ -548,12 +611,12 @@ impl PioneerDesktop {
                             Self::on_provider_selected(
                                 row_state.clone(),
                                 popover_entity.clone(),
-                                provider_name.clone(),
+                                provider_id.clone(),
                                 window,
                                 cx,
                             );
                         })
-                        .child(provider.name),
+                        .child(provider_label),
                 );
             }
         }

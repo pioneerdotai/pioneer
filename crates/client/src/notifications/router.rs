@@ -1,18 +1,26 @@
 //! Gateway notification routing.
 
-use crate::conversation::ConversationEvent;
+use crate::{
+    cli_runtime::approvals::{
+        CLIRuntimePendingRequestsReduction, reduce_cli_runtime_terminal_turn_cleanup,
+    },
+    conversation::ConversationEvent,
+};
 use pioneer_protocol::{
     ArtifactCreatedNotification, ArtifactDeletedNotification, ArtifactSummary,
-    ArtifactUpdatedNotification, ItemCompletedNotification, ItemDeltaNotification,
-    ItemRecoveryAttachedNotification, ItemRecoveryExhaustedNotification,
-    ItemRecoveryOpenedNotification, ItemRecoverySucceededNotification,
-    ItemRetryAttemptStartedNotification, ItemRetryScheduledNotification, ItemStartedNotification,
-    ItemTimeoutDetectedNotification, ItemToolRetryExhaustedNotification,
-    ItemToolRetryResolvedNotification, ItemToolRetryScheduledNotification, ItemUpdatedNotification,
-    SkillsChangedNotification, Thread, ThreadAgentsDocChangedNotification,
-    ThreadArtifactsChangedNotification, ThreadClosedNotification, ThreadStartedNotification,
-    ThreadStatus, ThreadTreeChangedNotification, ThreadUpdatedNotification,
-    TurnBlockedNotification, TurnCompletedNotification, TurnExecutionWindowBlockedNotification,
+    ArtifactUpdatedNotification, CLIRuntimeAccountUpdatedNotification,
+    CLIRuntimeAppsChangedNotification, CLIRuntimeRequestOpenedNotification,
+    CLIRuntimeRequestResolvedNotification, CLIRuntimeStatusChangedNotification,
+    ItemCompletedNotification, ItemDeltaNotification, ItemRecoveryAttachedNotification,
+    ItemRecoveryExhaustedNotification, ItemRecoveryOpenedNotification,
+    ItemRecoverySucceededNotification, ItemRetryAttemptStartedNotification,
+    ItemRetryScheduledNotification, ItemStartedNotification, ItemTimeoutDetectedNotification,
+    ItemToolRetryExhaustedNotification, ItemToolRetryResolvedNotification,
+    ItemToolRetryScheduledNotification, ItemUpdatedNotification, SkillsChangedNotification, Thread,
+    ThreadAgentsDocChangedNotification, ThreadArtifactsChangedNotification,
+    ThreadClosedNotification, ThreadStartedNotification, ThreadStatus,
+    ThreadTreeChangedNotification, ThreadUpdatedNotification, TurnBlockedNotification,
+    TurnCompletedNotification, TurnExecutionWindowBlockedNotification,
     TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
     TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification,
     TurnFailedNotification, TurnStartedNotification, TurnTimelineChangedNotification,
@@ -57,6 +65,7 @@ pub struct ThreadStartedReduction {
 pub struct TurnLifecycleReduction {
     pub thread_id: String,
     pub workspace_id: String,
+    pub turn_id: String,
     pub promote_thread_from_draft: bool,
     pub queue_thread_list_refresh: bool,
     pub thread_status: Option<ThreadStatus>,
@@ -65,6 +74,7 @@ pub struct TurnLifecycleReduction {
     pub reset_thread_resume: bool,
     pub refresh_thread_artifacts: bool,
     pub sync_composer_model_selection: bool,
+    pub cli_runtime_pending_requests: Option<CLIRuntimePendingRequestsReduction>,
 }
 
 #[derive(Clone, Debug)]
@@ -102,6 +112,14 @@ pub struct WorkspaceRefreshReduction {
 pub struct SkillsRefreshReduction {
     pub workspace_id: String,
     pub queue_skills_refresh: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CLIRuntimeRefreshReduction {
+    pub workspace_id: String,
+    pub runtime_id: Option<String>,
+    pub workspace_matches: bool,
+    pub queue_runtime_refresh: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -174,10 +192,12 @@ pub fn reduce_turn_started_notification(
 ) -> TurnLifecycleReduction {
     let thread_id = notification.thread_id.clone();
     let workspace_id = notification.workspace_id.clone();
+    let turn_id = notification.turn.id.clone();
 
     TurnLifecycleReduction {
         thread_id: thread_id.clone(),
         workspace_id,
+        turn_id,
         promote_thread_from_draft: true,
         queue_thread_list_refresh: true,
         thread_status: Some(ThreadStatus::Active),
@@ -189,6 +209,7 @@ pub fn reduce_turn_started_notification(
         reset_thread_resume: true,
         refresh_thread_artifacts: false,
         sync_composer_model_selection: true,
+        cli_runtime_pending_requests: None,
     }
 }
 
@@ -197,21 +218,28 @@ pub fn reduce_turn_completed_notification(
 ) -> TurnLifecycleReduction {
     let thread_id = notification.thread_id.clone();
     let workspace_id = notification.workspace_id.clone();
+    let turn_id = notification.turn.id.clone();
 
     TurnLifecycleReduction {
         thread_id: thread_id.clone(),
-        workspace_id,
+        workspace_id: workspace_id.clone(),
+        turn_id: turn_id.clone(),
         promote_thread_from_draft: false,
         queue_thread_list_refresh: false,
         thread_status: Some(ThreadStatus::Idle),
         conversation_event: ConversationEvent::TurnCompleted {
-            thread_id,
+            thread_id: thread_id.clone(),
             turn: notification.turn,
         },
         tick_conversation: true,
         reset_thread_resume: true,
         refresh_thread_artifacts: true,
         sync_composer_model_selection: false,
+        cli_runtime_pending_requests: Some(reduce_cli_runtime_terminal_turn_cleanup(
+            workspace_id,
+            thread_id,
+            turn_id,
+        )),
     }
 }
 
@@ -220,21 +248,28 @@ pub fn reduce_turn_failed_notification(
 ) -> TurnLifecycleReduction {
     let thread_id = notification.thread_id.clone();
     let workspace_id = notification.workspace_id.clone();
+    let turn_id = notification.turn.id.clone();
 
     TurnLifecycleReduction {
         thread_id: thread_id.clone(),
-        workspace_id,
+        workspace_id: workspace_id.clone(),
+        turn_id: turn_id.clone(),
         promote_thread_from_draft: false,
         queue_thread_list_refresh: false,
         thread_status: Some(ThreadStatus::Idle),
         conversation_event: ConversationEvent::TurnFailed {
-            thread_id,
+            thread_id: thread_id.clone(),
             turn: notification.turn,
         },
         tick_conversation: false,
         reset_thread_resume: true,
         refresh_thread_artifacts: false,
         sync_composer_model_selection: false,
+        cli_runtime_pending_requests: Some(reduce_cli_runtime_terminal_turn_cleanup(
+            workspace_id,
+            thread_id,
+            turn_id,
+        )),
     }
 }
 
@@ -243,10 +278,12 @@ pub fn reduce_turn_blocked_notification(
 ) -> TurnLifecycleReduction {
     let thread_id = notification.thread_id.clone();
     let workspace_id = notification.workspace_id.clone();
+    let turn_id = notification.turn.id.clone();
 
     TurnLifecycleReduction {
         thread_id: thread_id.clone(),
         workspace_id,
+        turn_id,
         promote_thread_from_draft: false,
         queue_thread_list_refresh: false,
         thread_status: Some(ThreadStatus::Idle),
@@ -259,6 +296,7 @@ pub fn reduce_turn_blocked_notification(
         reset_thread_resume: true,
         refresh_thread_artifacts: false,
         sync_composer_model_selection: false,
+        cli_runtime_pending_requests: None,
     }
 }
 
@@ -713,6 +751,77 @@ pub fn reduce_skills_changed_notification(
     }
 }
 
+pub fn reduce_cli_runtime_status_changed_notification(
+    notification: CLIRuntimeStatusChangedNotification,
+    active_workspace: Option<&str>,
+) -> CLIRuntimeRefreshReduction {
+    let runtime_id = notification.runtime.runtime_id;
+    reduce_cli_runtime_workspace_notification(
+        notification.workspace_id,
+        Some(runtime_id),
+        active_workspace,
+    )
+}
+
+pub fn reduce_cli_runtime_account_updated_notification(
+    notification: CLIRuntimeAccountUpdatedNotification,
+    active_workspace: Option<&str>,
+) -> CLIRuntimeRefreshReduction {
+    reduce_cli_runtime_workspace_notification(
+        notification.workspace_id,
+        Some(notification.runtime_id),
+        active_workspace,
+    )
+}
+
+pub fn reduce_cli_runtime_request_opened_notification(
+    notification: CLIRuntimeRequestOpenedNotification,
+    active_workspace: Option<&str>,
+) -> CLIRuntimeRefreshReduction {
+    reduce_cli_runtime_workspace_notification(
+        notification.workspace_id,
+        Some(notification.runtime_id),
+        active_workspace,
+    )
+}
+
+pub fn reduce_cli_runtime_request_resolved_notification(
+    notification: CLIRuntimeRequestResolvedNotification,
+    active_workspace: Option<&str>,
+) -> CLIRuntimeRefreshReduction {
+    reduce_cli_runtime_workspace_notification(
+        notification.workspace_id,
+        Some(notification.runtime_id),
+        active_workspace,
+    )
+}
+
+pub fn reduce_cli_runtime_apps_changed_notification(
+    notification: CLIRuntimeAppsChangedNotification,
+    active_workspace: Option<&str>,
+) -> CLIRuntimeRefreshReduction {
+    reduce_cli_runtime_workspace_notification(
+        notification.workspace_id,
+        Some(notification.runtime_id),
+        active_workspace,
+    )
+}
+
+fn reduce_cli_runtime_workspace_notification(
+    workspace_id: String,
+    runtime_id: Option<String>,
+    active_workspace: Option<&str>,
+) -> CLIRuntimeRefreshReduction {
+    let workspace_matches =
+        should_refresh_workspace_bound_data(active_workspace, workspace_id.as_str());
+    CLIRuntimeRefreshReduction {
+        workspace_id,
+        runtime_id,
+        workspace_matches,
+        queue_runtime_refresh: workspace_matches,
+    }
+}
+
 pub fn reduce_thread_artifacts_changed_notification(
     notification: ThreadArtifactsChangedNotification,
     matches_thread_workspace: bool,
@@ -802,12 +911,17 @@ mod tests {
     use pioneer_protocol::{
         ArtifactCreatedByKind, ArtifactCreatedNotification, ArtifactDeletedNotification,
         ArtifactKind, ArtifactRef, ArtifactStatus, ArtifactSummary, ArtifactUpdatedNotification,
+        CLIAgentRuntimeKind, CLIRuntimeAccountUpdatedNotification,
+        CLIRuntimeAppsChangedNotification, CLIRuntimePendingRequest, CLIRuntimeRequestKind,
+        CLIRuntimeRequestOpenedNotification, CLIRuntimeRequestResolution,
+        CLIRuntimeRequestResolvedNotification, CLIRuntimeStatusChangedNotification,
         ExecutionWindowStatus, ItemDeltaStream, McpChangedNotification, McpListItem,
         McpPolicyState, McpRuntimeState, McpRuntimeStatus, McpScopeKind,
         McpServerCatalogChangedNotification, McpServerCatalogDetails, McpServerDetailsResponse,
         McpServerHealthDetails, McpServerStatus, McpServerStatusChangedNotification,
         McpServerStatusItem, McpSourceKind, McpTransportSummary, RecoveryAction, RecoveryJobStatus,
-        RecoveryTrigger, SkillsChangedNotification, ThreadArtifactsChangedNotification, ThreadMode,
+        RecoveryTrigger, RuntimeCapabilities, RuntimeStatus, RuntimeSummary,
+        SkillsChangedNotification, ThreadArtifactsChangedNotification, ThreadMode,
         ThreadOriginKind, ThreadSidebarVisibility, ToolLoopBudgetAction, ToolLoopBudgetLimitKind,
         ToolRetryErrorClass, ToolRetryResolution, TurnItem, TurnItemTimeoutReason, TurnItemType,
         TurnStatus, TurnTimelineChangedNotification, TurnTimelineChangedReason, Workspace,
@@ -911,6 +1025,26 @@ mod tests {
         }
     }
 
+    fn runtime_summary(runtime_id: &str) -> RuntimeSummary {
+        RuntimeSummary {
+            runtime_id: runtime_id.to_owned(),
+            kind: CLIAgentRuntimeKind::Codex,
+            display_name: "Codex CLI".to_owned(),
+            enabled: true,
+            status: RuntimeStatus::Ready,
+            capabilities: RuntimeCapabilities::default(),
+            account: None,
+            version: None,
+            binary_path: None,
+            home_path: None,
+            shadow_home_path: None,
+            debug_native_events_enabled: false,
+            models_refreshed_at_unix_ms: None,
+            diagnostics: Vec::new(),
+            recent_stderr: Vec::new(),
+        }
+    }
+
     fn artifact_summary(artifact_id: &str, primary_thread_id: Option<&str>) -> ArtifactSummary {
         ArtifactSummary {
             artifact: ArtifactRef {
@@ -950,6 +1084,7 @@ mod tests {
         TurnItem::AgentMessage {
             id: id.to_owned(),
             text: text.to_owned(),
+            phase: Default::default(),
             markdown: None,
             markdown_version: None,
         }
@@ -1398,6 +1533,89 @@ mod tests {
         assert!(mcp.workspace_matches);
         assert!(mcp.queue_mcp_refresh);
         assert!(mcp.queue_mcp_details_refresh);
+    }
+
+    #[test]
+    fn cli_runtime_refresh_reductions_match_workspace_scope() {
+        let status = reduce_cli_runtime_status_changed_notification(
+            CLIRuntimeStatusChangedNotification {
+                workspace_id: "ws_a".to_owned(),
+                runtime: runtime_summary("codex_personal"),
+            },
+            Some("ws_a"),
+        );
+        assert!(status.workspace_matches);
+        assert!(status.queue_runtime_refresh);
+        assert_eq!(status.runtime_id.as_deref(), Some("codex_personal"));
+
+        let account = reduce_cli_runtime_account_updated_notification(
+            CLIRuntimeAccountUpdatedNotification {
+                workspace_id: "ws_a".to_owned(),
+                runtime_id: "codex_personal".to_owned(),
+                kind: Some(CLIAgentRuntimeKind::Codex),
+                account: None,
+                status: RuntimeStatus::Ready,
+            },
+            Some("ws_a"),
+        );
+        assert!(account.queue_runtime_refresh);
+
+        let opened = reduce_cli_runtime_request_opened_notification(
+            CLIRuntimeRequestOpenedNotification {
+                workspace_id: "ws_a".to_owned(),
+                runtime_id: "codex_personal".to_owned(),
+                request_id: "req_1".to_owned(),
+                thread_id: Some("thread_1".to_owned()),
+                turn_id: Some("turn_1".to_owned()),
+                item_id: None,
+                request: CLIRuntimePendingRequest {
+                    kind: CLIRuntimeRequestKind::CommandApproval,
+                    title: Some("Run command".to_owned()),
+                    message: None,
+                    native_request_id: None,
+                    payload: None,
+                },
+            },
+            Some("ws_a"),
+        );
+        assert!(opened.queue_runtime_refresh);
+
+        let resolved = reduce_cli_runtime_request_resolved_notification(
+            CLIRuntimeRequestResolvedNotification {
+                workspace_id: "ws_a".to_owned(),
+                runtime_id: "codex_personal".to_owned(),
+                request_id: "req_1".to_owned(),
+                thread_id: Some("thread_1".to_owned()),
+                turn_id: Some("turn_1".to_owned()),
+                item_id: None,
+                resolution: CLIRuntimeRequestResolution::Approved,
+            },
+            Some("ws_a"),
+        );
+        assert!(resolved.queue_runtime_refresh);
+
+        let apps = reduce_cli_runtime_apps_changed_notification(
+            CLIRuntimeAppsChangedNotification {
+                workspace_id: "ws_a".to_owned(),
+                runtime_id: "codex_personal".to_owned(),
+                apps: Vec::new(),
+                refreshed_at_unix_ms: None,
+            },
+            Some("ws_a"),
+        );
+        assert!(apps.queue_runtime_refresh);
+
+        let foreign = reduce_cli_runtime_apps_changed_notification(
+            CLIRuntimeAppsChangedNotification {
+                workspace_id: "ws_b".to_owned(),
+                runtime_id: "codex_personal".to_owned(),
+                apps: Vec::new(),
+                refreshed_at_unix_ms: None,
+            },
+            Some("ws_a"),
+        );
+        assert!(!foreign.workspace_matches);
+        assert!(!foreign.queue_runtime_refresh);
     }
 
     #[test]

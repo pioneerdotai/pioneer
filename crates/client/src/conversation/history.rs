@@ -1662,6 +1662,7 @@ mod tests {
                                 item: TurnItem::AgentMessage {
                                     id: child_item_id.to_owned(),
                                     text: String::new(),
+                                    phase: Default::default(),
                                     markdown: None,
                                     markdown_version: None,
                                 },
@@ -1687,6 +1688,7 @@ mod tests {
                                 item: TurnItem::AgentMessage {
                                     id: child_item_id.to_owned(),
                                     text: "Child final answer".to_owned(),
+                                    phase: Default::default(),
                                     markdown: None,
                                     markdown_version: None,
                                 },

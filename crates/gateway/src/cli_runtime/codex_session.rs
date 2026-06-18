@@ -2,10 +2,8 @@ use crate::cli_runtime::config::{
     codex_account_probe_config_from_instance, load_effective_cli_runtime_instances,
 };
 use crate::cli_runtime::manager::{
-    CLIAgentRuntimeCodexEventReceivers, CLIAgentRuntimeManager, CLIAgentRuntimeReviewStartRequest,
-    CLIAgentRuntimeReviewStartResult, CLIAgentRuntimeSession, CLIAgentRuntimeSessionFactory,
-    CLIAgentRuntimeSessionKey, CLIAgentRuntimeSessionStartOptions,
-    CLIAgentRuntimeThreadCompactRequest, CLIAgentRuntimeThreadCompactResult,
+    CLIAgentRuntimeCodexEventReceivers, CLIAgentRuntimeManager, CLIAgentRuntimeSession,
+    CLIAgentRuntimeSessionFactory, CLIAgentRuntimeSessionKey, CLIAgentRuntimeSessionStartOptions,
     CLIAgentRuntimeThreadForkRequest, CLIAgentRuntimeThreadForkResult,
     CLIAgentRuntimeThreadNameSetRequest, CLIAgentRuntimeThreadNameSetResult,
     CLIAgentRuntimeTurnSteerRequest, CLIAgentRuntimeTurnSteerResult,
@@ -13,18 +11,15 @@ use crate::cli_runtime::manager::{
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use pioneer_cli_agent_runtime::codex::{
-    CodexAppServerClient, CodexJsonlRpcClient, CodexReviewDelivery, CodexReviewStartParams,
-    CodexReviewTarget, CodexThreadCompactStartParams, CodexThreadForkParams,
-    CodexThreadNameSetParams, CodexThreadOpenSnapshot, CodexThreadStartParams,
-    CodexTurnStartParams, CodexTurnStartSnapshot, CodexTurnSteerParams,
-    codex_app_server_process_config,
+    CodexAppServerClient, CodexJsonlRpcClient, CodexThreadForkParams, CodexThreadNameSetParams,
+    CodexThreadOpenSnapshot, CodexThreadStartParams, CodexTurnStartParams, CodexTurnStartSnapshot,
+    CodexTurnSteerParams, codex_app_server_process_config,
 };
 use pioneer_cli_agent_runtime::driver::JsonlRpcId;
 use pioneer_cli_agent_runtime::process::{CLIAgentProcess, spawn_cli_agent_process};
 use pioneer_config::{
     EffectiveGatewayCliAgentRuntimeInstanceConfig, GatewayCliAgentRuntimeKindConfig,
 };
-use pioneer_protocol::{CLIRuntimeReviewDelivery, CLIRuntimeReviewTarget};
 use serde_json::Value as JsonValue;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -229,50 +224,6 @@ impl CLIAgentRuntimeSession for CodexCLIAgentRuntimeSession {
         Ok(())
     }
 
-    async fn review_start(
-        &self,
-        request: CLIAgentRuntimeReviewStartRequest,
-    ) -> Result<CLIAgentRuntimeReviewStartResult> {
-        let snapshot = self
-            .client
-            .review_start(
-                CodexReviewStartParams {
-                    thread_id: request.native_thread_id,
-                    delivery: codex_review_delivery(request.delivery),
-                    target: codex_review_target(request.target),
-                },
-                self.request_timeout,
-            )
-            .await
-            .context("Codex review/start failed")?;
-        Ok(CLIAgentRuntimeReviewStartResult {
-            native_thread_id: snapshot.native_thread_id,
-            review_thread_id: snapshot.review_thread_id,
-            native_turn_id: snapshot.native_turn_id,
-            raw: Some(snapshot.raw),
-        })
-    }
-
-    async fn thread_compact(
-        &self,
-        request: CLIAgentRuntimeThreadCompactRequest,
-    ) -> Result<CLIAgentRuntimeThreadCompactResult> {
-        let snapshot = self
-            .client
-            .thread_compact_start(
-                CodexThreadCompactStartParams {
-                    thread_id: request.native_thread_id,
-                },
-                self.request_timeout,
-            )
-            .await
-            .context("Codex thread/compact/start failed")?;
-        Ok(CLIAgentRuntimeThreadCompactResult {
-            native_thread_id: snapshot.native_thread_id,
-            raw: Some(snapshot.raw),
-        })
-    }
-
     async fn set_thread_name(
         &self,
         request: CLIAgentRuntimeThreadNameSetRequest,
@@ -341,23 +292,5 @@ impl CLIAgentRuntimeSession for CodexCLIAgentRuntimeSession {
             native_turn_id: snapshot.native_turn_id,
             raw: Some(snapshot.raw),
         })
-    }
-}
-
-fn codex_review_delivery(delivery: CLIRuntimeReviewDelivery) -> CodexReviewDelivery {
-    match delivery {
-        CLIRuntimeReviewDelivery::Inline => CodexReviewDelivery::Inline,
-        CLIRuntimeReviewDelivery::Detached => CodexReviewDelivery::Detached,
-    }
-}
-
-fn codex_review_target(target: CLIRuntimeReviewTarget) -> CodexReviewTarget {
-    match target {
-        CLIRuntimeReviewTarget::UncommittedChanges => CodexReviewTarget::UncommittedChanges,
-        CLIRuntimeReviewTarget::BaseBranch { branch } => CodexReviewTarget::BaseBranch { branch },
-        CLIRuntimeReviewTarget::Commit { sha, title } => CodexReviewTarget::Commit { sha, title },
-        CLIRuntimeReviewTarget::Custom { instructions } => {
-            CodexReviewTarget::Custom { instructions }
-        }
     }
 }

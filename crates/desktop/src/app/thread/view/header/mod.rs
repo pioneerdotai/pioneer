@@ -59,11 +59,12 @@ impl PioneerDesktop {
             .dropdown_menu_with_anchor(Corner::TopRight, move |menu, _, _| {
                 let thread_id = thread_id.clone();
                 let desktop_entity = desktop_entity.clone();
-                menu.min_w(px(160.)).item(
+                let edit_desktop_entity = desktop_entity.clone();
+                menu.min_w(px(180.)).item(
                     PopupMenuItem::new(t!("sidebar.contextmenu.thread.edit").to_string()).on_click(
                         move |_, window, cx| {
                             let thread_id = thread_id.clone();
-                            let _ = desktop_entity.update(cx, |view, cx| {
+                            let _ = edit_desktop_entity.update(cx, |view, cx| {
                                 view.open_rename_thread_dialog(thread_id, window, cx);
                                 cx.notify();
                             });

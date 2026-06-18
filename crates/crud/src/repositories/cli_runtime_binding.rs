@@ -222,6 +222,7 @@ pub struct CliRuntimeNativeEventListFilter {
     pub thread_id: Option<String>,
     pub turn_id: Option<String>,
     pub native_thread_id: Option<String>,
+    pub native_turn_id: Option<String>,
     pub limit: Option<u64>,
 }
 
@@ -625,6 +626,9 @@ pub async fn list_native_events<C: ConnectionTrait>(
     }
     if let Some(native_thread_id) = filter.native_thread_id {
         query = query.filter(cli_runtime_native_event::Column::NativeThreadId.eq(native_thread_id));
+    }
+    if let Some(native_turn_id) = filter.native_turn_id {
+        query = query.filter(cli_runtime_native_event::Column::NativeTurnId.eq(native_turn_id));
     }
     if let Some(limit) = filter.limit {
         query = query.limit(limit);

@@ -143,10 +143,18 @@ impl Default for GatewayThreadEpisodicSettings {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GatewayCliRuntimeSettings {
     #[serde(default)]
     pub instances: Vec<GatewayCliRuntimeInstanceSettings>,
+}
+
+impl Default for GatewayCliRuntimeSettings {
+    fn default() -> Self {
+        Self {
+            instances: vec![GatewayCliRuntimeInstanceSettings::default_codex()],
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -159,6 +167,20 @@ pub struct GatewayCliRuntimeInstanceSettings {
     pub home_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shadow_home_path: Option<String>,
+}
+
+impl GatewayCliRuntimeInstanceSettings {
+    pub fn default_codex() -> Self {
+        Self {
+            id: "codex".to_owned(),
+            kind: CLIAgentRuntimeKind::Codex,
+            display_name: "Codex CLI".to_owned(),
+            enabled: true,
+            binary_path: "codex".to_owned(),
+            home_path: "~/.codex".to_owned(),
+            shadow_home_path: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -311,6 +333,20 @@ mod tests {
 
         assert!(!settings.keepawake);
         assert!(settings.preflight_model.is_thread_model());
+    }
+
+    #[test]
+    fn cli_runtime_settings_default_to_enabled_codex() {
+        let settings = GatewayCliRuntimeSettings::default();
+
+        assert_eq!(settings.instances.len(), 1);
+        assert_eq!(settings.instances[0].id, "codex");
+        assert_eq!(settings.instances[0].kind, CLIAgentRuntimeKind::Codex);
+        assert_eq!(settings.instances[0].display_name, "Codex CLI");
+        assert!(settings.instances[0].enabled);
+        assert_eq!(settings.instances[0].binary_path, "codex");
+        assert_eq!(settings.instances[0].home_path, "~/.codex");
+        assert!(settings.instances[0].shadow_home_path.is_none());
     }
 
     #[test]

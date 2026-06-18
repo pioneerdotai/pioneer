@@ -129,10 +129,15 @@ pub enum GatewayNotification {
     MemoryChanged(MemoryChangedNotification),
     MemoryCandidateCreated(MemoryCandidateCreatedNotification),
     MemoryForgotten(MemoryForgottenNotification),
+    #[serde(rename = "cli_runtime_status_changed")]
     CLIRuntimeStatusChanged(CLIRuntimeStatusChangedNotification),
+    #[serde(rename = "cli_runtime_account_updated")]
     CLIRuntimeAccountUpdated(CLIRuntimeAccountUpdatedNotification),
+    #[serde(rename = "cli_runtime_request_opened")]
     CLIRuntimeRequestOpened(CLIRuntimeRequestOpenedNotification),
+    #[serde(rename = "cli_runtime_request_resolved")]
     CLIRuntimeRequestResolved(CLIRuntimeRequestResolvedNotification),
+    #[serde(rename = "cli_runtime_apps_changed")]
     CLIRuntimeAppsChanged(CLIRuntimeAppsChangedNotification),
     Unknown(UnknownGatewayNotification),
 }
@@ -891,6 +896,70 @@ mod tests {
             GatewayNotification::from_jsonrpc(apps_changed).expect("apps should map"),
             GatewayNotification::CLIRuntimeAppsChanged(_)
         ));
+    }
+
+    #[test]
+    fn cli_runtime_gateway_notifications_serialize_with_normal_snake_case_kinds() {
+        let cases = [
+            (
+                events::CLI_RUNTIME_STATUS_CHANGED,
+                "cli_runtime_status_changed",
+                json!({
+                    "workspace_id": "ws_1",
+                    "runtime": cli_runtime_summary_json()
+                }),
+            ),
+            (
+                events::CLI_RUNTIME_ACCOUNT_UPDATED,
+                "cli_runtime_account_updated",
+                json!({
+                    "workspace_id": "ws_1",
+                    "runtime_id": "codex_personal",
+                    "kind": "codex",
+                    "account": null,
+                    "status": { "state": "ready" }
+                }),
+            ),
+            (
+                events::CLI_RUNTIME_REQUEST_OPENED,
+                "cli_runtime_request_opened",
+                json!({
+                    "workspace_id": "ws_1",
+                    "runtime_id": "codex_personal",
+                    "request_id": "req_1",
+                    "request": { "kind": "command_approval" }
+                }),
+            ),
+            (
+                events::CLI_RUNTIME_REQUEST_RESOLVED,
+                "cli_runtime_request_resolved",
+                json!({
+                    "workspace_id": "ws_1",
+                    "runtime_id": "codex_personal",
+                    "request_id": "req_1",
+                    "resolution": { "status": "approved" }
+                }),
+            ),
+            (
+                events::CLI_RUNTIME_APPS_CHANGED,
+                "cli_runtime_apps_changed",
+                json!({
+                    "workspace_id": "ws_1",
+                    "runtime_id": "codex_personal",
+                    "apps": []
+                }),
+            ),
+        ];
+
+        for (method, expected_kind, params) in cases {
+            let notification = JsonRpcNotification::from_params(method, &params)
+                .expect("notification should encode");
+            let mapped =
+                GatewayNotification::from_jsonrpc(notification).expect("notification should map");
+            let serialized = serde_json::to_value(mapped).expect("notification should serialize");
+
+            assert_eq!(serialized["kind"], expected_kind);
+        }
     }
 
     #[test]

@@ -3,6 +3,7 @@ _version = 1
 [chat.composer]
 placeholder = "Отправьте сообщение ассистенту"
 stop_reason = "Ход остановлен пользователем"
+steer_codex = "Отправить в текущий ход Codex"
 
 [chat.composer.mode]
 agent_label = "Агент"
@@ -388,12 +389,14 @@ description = "Настройте API-ключи для доступных пр�
 empty_connected = "Подключенных провайдеров пока нет."
 
 [providers.sidebar]
-all = "Все"
+api = "Провайдеры API"
 connected = "Подключенные"
+cli = "Провайдеры CLI"
 
 [providers.button]
-submit = "Сохранить ключ"
+submit = "Сохранить"
 remove_key = "Удалить ключ"
+refresh = "Обновить провайдеров"
 
 [providers.dialog]
 title = "Настроить %{provider}"
@@ -407,6 +410,95 @@ workspace_not_selected = "Пространство не выбрано."
 load_failed = "Не удалось загрузить конфигурацию провайдеров"
 save_failed = "Не удалось сохранить API ключ"
 delete_failed = "Не удалось удалить API ключ"
+
+[providers.cli]
+title = "CLI провайдеры"
+refreshing = "Обновление"
+updated = "Обновлено"
+stale = "Данные устарели"
+refresh_failed = "Ошибка обновления"
+not_refreshed = "Еще не обновлялось"
+empty = "CLI провайдеры не настроены"
+diagnostics = "Диагностика"
+native_events = "Нативные события"
+recent_stderr = "Последний stderr"
+copied_diagnostics = "Скопирована диагностика для"
+login_code = "Код"
+login_open = "Открыть"
+login_started = "Вход Codex запущен"
+refresh_already_running = "Обновление CLI провайдеров уже выполняется."
+refresh_wait = "Обновление CLI провайдеров ожидает согласно политике обновления."
+
+[providers.cli.detail]
+account = "Аккаунт"
+version = "Версия"
+binary = "Бинарник"
+home = "CODEX_HOME"
+shadow_home = "Shadow home"
+
+[providers.cli.value]
+disabled = "Отключено"
+
+[providers.cli.inline]
+display_name_label = "Название"
+display_name_hint = "Имя этого CLI-провайдера в списках и пикерах."
+display_name_placeholder = "Codex CLI"
+binary_label = "Бинарник"
+binary_hint = "Путь к бинарнику Codex для этого инстанса."
+home_label = "CODEX_HOME"
+home_hint = "Домашняя директория Codex и конфигов."
+shadow_home_label = "Shadow home"
+shadow_home_hint = "Отдельная домашняя директория аккаунта; оставьте пустым, чтобы отключить."
+
+[providers.cli.action]
+add = "Добавить CLI провайдер"
+refresh = "Обновить статус"
+copy_diagnostics = "Скопировать диагностику"
+edit = "Изменить CLI провайдер"
+duplicate = "Дублировать CLI провайдер"
+disable = "Отключить CLI провайдер"
+enable = "Включить CLI провайдер"
+login = "Войти"
+open_home = "Открыть CODEX_HOME"
+open_shadow_home = "Открыть shadow home"
+expand = "Показать детали CLI провайдера"
+collapse = "Скрыть детали CLI провайдера"
+
+[providers.cli.status_detail]
+authenticated = "Вход выполнен: %{account}"
+authenticated_with_plan = "Вход выполнен: %{account} · %{plan}"
+not_on_path = "CLI `%{binary}` не установлен или отсутствует в PATH."
+unsupported_version = "Установлена %{version}; требуется минимум %{minimum}"
+
+[providers.cli.dialog]
+title_add = "Добавить CLI провайдер"
+title_edit = "Изменить CLI провайдер"
+title_duplicate = "Дублировать CLI провайдер"
+id_label = "ID провайдера"
+display_name_label = "Отображаемое имя"
+binary_label = "Бинарник"
+home_label = "CODEX_HOME"
+shadow_home_label = "Shadow home"
+enabled_label = "Включен"
+id_placeholder = "codex_work"
+display_name_placeholder = "Codex Work"
+binary_placeholder = "codex"
+home_placeholder = "~/.codex"
+shadow_home_placeholder = "~/.pioneer/codex-work"
+
+[providers.cli.status]
+disabled = "Отключено"
+missing_binary = "Бинарник не найден"
+spawn_failed = "Ошибка запуска"
+initializing = "Инициализация"
+needs_auth = "Нужен вход"
+ready = "Готов"
+degraded = "Требует внимания"
+unsupported = "Не поддерживается"
+error = "Ошибка"
+
+[providers.cli.error]
+open_path_failed = "Не удалось открыть путь"
 
 [providers.catalog.anthropic]
 title = "Anthropic"

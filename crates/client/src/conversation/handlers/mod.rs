@@ -122,6 +122,17 @@ impl TurnItemHandlerRegistry {
         markdown_version: Option<u16>,
         ts_unix_ms: i64,
     ) {
+        if projector.item_type_by_id(item_id).is_none()
+            && should_start_reasoning_from_delta(payload)
+        {
+            let item = TurnItem::Reasoning {
+                id: item_id.to_owned(),
+                summary: Vec::new(),
+                content: Vec::new(),
+            };
+            self.apply_started(projector, turn_id, &item, ts_unix_ms);
+        }
+
         let Some(handler) = projector
             .item_type_by_id(item_id)
             .and_then(|item_type| self.handlers.get(item_type).map(Box::as_ref))
@@ -153,6 +164,27 @@ impl TurnItemHandlerRegistry {
             handler.on_completed(projector, turn_id, item, ts_unix_ms);
         }
     }
+}
+
+fn should_start_reasoning_from_delta(payload: Option<&JsonValue>) -> bool {
+    let Some(payload) = payload else {
+        return false;
+    };
+    payload
+        .get("runtimeDeltaKind")
+        .and_then(JsonValue::as_str)
+        .is_some_and(|kind| kind.starts_with("reasoning_"))
+        || payload
+            .get("nativeItemKind")
+            .and_then(JsonValue::as_str)
+            .is_some_and(|kind| normalize_item_kind(kind) == "reasoning")
+}
+
+fn normalize_item_kind(kind: &str) -> String {
+    kind.chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 impl Default for TurnItemHandlerRegistry {

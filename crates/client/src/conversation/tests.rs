@@ -4,17 +4,18 @@ use super::{Conversation, ConversationEvent, MAX_EVENT_LOG_LEN, TimelineEntrySta
 use pioneer_protocol::{
     ArtifactKind, ArtifactRef, ArtifactStatus, ExecutionWindowExhaustionReason,
     ExecutionWindowStatus, ItemDeltaStream, RecoveryAction, RecoveryJobStatus, RecoveryTrigger,
-    TaskEvent, TaskEventPayload, TaskExecutorKind, TaskStatus, TaskTriggerKind, TaskTurnItem,
-    ThreadHistoryEvent, ThreadHistoryEventPayload, TimelineItem, TimelineLane, TimelineOrigin,
-    TimelineOriginKind, TimelinePayload, ToolCallStatus, ToolDisplayPayload, ToolLoopBudgetAction,
-    ToolLoopBudgetLimitKind, ToolMetadata, ToolOutputPolicySnapshot, ToolRecoveryIdempotencyMode,
-    ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass, ToolRetryBudgetKind, ToolRetryBudgetUsage,
-    ToolRetryErrorClass, ToolRetryExhaustionKind, ToolRetryResolution, ToolStoragePayload, Turn,
-    TurnBlockedResumeMetadata, TurnExecutionWindowBlockedNotification,
-    TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
-    TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification, TurnItem,
-    TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType, TurnStatus,
-    TurnTimelineResponse, UserInput, UserMessageAttachment,
+    SystemEventLevel, TaskEvent, TaskEventPayload, TaskExecutorKind, TaskStatus, TaskTriggerKind,
+    TaskTurnItem, ThreadHistoryEvent, ThreadHistoryEventPayload, TimelineItem, TimelineLane,
+    TimelineOrigin, TimelineOriginKind, TimelinePayload, ToolCallStatus, ToolDisplayPayload,
+    ToolLoopBudgetAction, ToolLoopBudgetLimitKind, ToolMetadata, ToolOutputPolicySnapshot,
+    ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass,
+    ToolRetryBudgetKind, ToolRetryBudgetUsage, ToolRetryErrorClass, ToolRetryExhaustionKind,
+    ToolRetryResolution, ToolStoragePayload, Turn, TurnBlockedResumeMetadata,
+    TurnExecutionWindowBlockedNotification, TurnExecutionWindowCheckpointedNotification,
+    TurnExecutionWindowContinuedNotification, TurnExecutionWindowExhaustedNotification,
+    TurnExecutionWindowStartedNotification, TurnItem, TurnItemEvent, TurnItemEventPayload,
+    TurnItemTimeoutReason, TurnItemType, TurnStatus, TurnTimelineResponse, UserInput,
+    UserMessageAttachment,
 };
 
 const THREAD_ID: &str = "thr_000000000000000001";
@@ -299,6 +300,103 @@ fn user_message_stays_before_work_items_even_if_it_arrives_late() {
 }
 
 #[test]
+fn agent_review_system_event_projects_to_completed_timeline_row() {
+    let mut conversation = Conversation::new(THREAD_ID);
+    let started_item = TurnItem::SystemEvent {
+        id: "agent_review_native_review_turn_1".to_owned(),
+        level: SystemEventLevel::Info,
+        message: "Review started".to_owned(),
+        code: Some("agent_review".to_owned()),
+        details: Some(serde_json::json!({
+            "status": "entered",
+            "nativeTurnId": "native_review_turn_1"
+        })),
+    };
+    conversation.apply(ConversationEvent::ItemStarted {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item: started_item,
+    });
+    conversation.apply(ConversationEvent::ItemCompleted {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item: TurnItem::SystemEvent {
+            id: "agent_review_native_review_turn_1".to_owned(),
+            level: SystemEventLevel::Info,
+            message: "Review completed".to_owned(),
+            code: Some("agent_review".to_owned()),
+            details: Some(serde_json::json!({
+                "status": "completed",
+                "nativeTurnId": "native_review_turn_1"
+            })),
+        },
+    });
+
+    let entry = conversation
+        .projection()
+        .timeline
+        .first()
+        .expect("review system event should create a timeline row");
+    let item = conversation
+        .projection()
+        .item_for_timeline_entry(entry)
+        .expect("review timeline item should resolve");
+    assert_eq!(item.status, TimelineEntryStatus::Completed);
+    assert_eq!(item.partial_text, "Review completed");
+    let (message, details) = system_event_details(&conversation, "agent_review");
+    assert_eq!(message, "Review completed");
+    assert_eq!(details.get("status"), Some(&serde_json::json!("completed")));
+}
+
+#[test]
+fn agent_compaction_system_event_projects_to_completed_timeline_row() {
+    let mut conversation = Conversation::new(THREAD_ID);
+    conversation.apply(ConversationEvent::ItemStarted {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item: TurnItem::SystemEvent {
+            id: "native_compaction_1".to_owned(),
+            level: SystemEventLevel::Info,
+            message: "Context compaction started".to_owned(),
+            code: Some("agent_context_compaction".to_owned()),
+            details: Some(serde_json::json!({
+                "status": "started",
+                "nativeItemKind": "contextCompaction"
+            })),
+        },
+    });
+    conversation.apply(ConversationEvent::ItemCompleted {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item: TurnItem::SystemEvent {
+            id: "native_compaction_1".to_owned(),
+            level: SystemEventLevel::Info,
+            message: "Context compaction completed".to_owned(),
+            code: Some("agent_context_compaction".to_owned()),
+            details: Some(serde_json::json!({
+                "status": "completed",
+                "nativeItemKind": "contextCompaction"
+            })),
+        },
+    });
+
+    let entry = conversation
+        .projection()
+        .timeline
+        .first()
+        .expect("compaction system event should create a timeline row");
+    let item = conversation
+        .projection()
+        .item_for_timeline_entry(entry)
+        .expect("compaction timeline item should resolve");
+    assert_eq!(item.status, TimelineEntryStatus::Completed);
+    assert_eq!(item.partial_text, "Context compaction completed");
+    let (message, details) = system_event_details(&conversation, "agent_context_compaction");
+    assert_eq!(message, "Context compaction completed");
+    assert_eq!(details.get("status"), Some(&serde_json::json!("completed")));
+}
+
+#[test]
 fn local_turn_start_projects_optimistic_user_message_with_artifacts() {
     let mut conversation = Conversation::new(THREAD_ID);
     let artifact = ArtifactRef {
@@ -483,6 +581,7 @@ fn item_delta_streams_text_until_completion() {
         item: TurnItem::AgentMessage {
             id: "item_0000000000000000001".to_owned(),
             text: String::new(),
+            phase: Default::default(),
             markdown: None,
             markdown_version: None,
         },
@@ -523,6 +622,7 @@ fn item_delta_streams_text_until_completion() {
         item: TurnItem::AgentMessage {
             id: "item_0000000000000000001".to_owned(),
             text: "hello".to_owned(),
+            phase: Default::default(),
             markdown: None,
             markdown_version: None,
         },
@@ -536,6 +636,263 @@ fn item_delta_streams_text_until_completion() {
         .expect("item should exist");
     assert_eq!(completed_item.final_text.as_deref(), Some("hello"));
     assert_eq!(completed_item.status, TimelineEntryStatus::Completed);
+}
+
+#[test]
+fn conversation_codex_reasoning_summary_does_not_overwrite_agent_message_text() {
+    let mut conversation = Conversation::new(THREAD_ID);
+    apply_in_progress_turn(&mut conversation);
+
+    conversation.apply(ConversationEvent::ItemStarted {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item: TurnItem::Reasoning {
+            id: "codex_reasoning_item".to_owned(),
+            summary: Vec::new(),
+            content: Vec::new(),
+        },
+    });
+    conversation.apply(ConversationEvent::ItemDelta {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item_id: "codex_reasoning_item".to_owned(),
+        delta: "Reasoning summary".to_owned(),
+        stream: Some(ItemDeltaStream::Generic),
+        payload: Some(serde_json::json!({
+            "runtimeDeltaKind": "reasoning_summary",
+            "nativeItemId": "codex_reasoning_item"
+        })),
+        markdown: None,
+        markdown_version: None,
+    });
+    conversation.apply(ConversationEvent::ItemStarted {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item: TurnItem::AgentMessage {
+            id: "codex_agent_item".to_owned(),
+            text: String::new(),
+            phase: Default::default(),
+            markdown: None,
+            markdown_version: None,
+        },
+    });
+    conversation.apply(ConversationEvent::ItemDelta {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item_id: "codex_agent_item".to_owned(),
+        delta: "Final answer".to_owned(),
+        stream: Some(ItemDeltaStream::AgentMessage),
+        payload: Some(serde_json::json!({
+            "runtimeDeltaKind": "agent_message",
+            "nativeItemId": "codex_agent_item"
+        })),
+        markdown: None,
+        markdown_version: None,
+    });
+    conversation.apply(ConversationEvent::ItemCompleted {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item: TurnItem::Reasoning {
+            id: "codex_reasoning_item".to_owned(),
+            summary: vec!["Reasoning summary".to_owned()],
+            content: Vec::new(),
+        },
+    });
+    conversation.apply(ConversationEvent::ItemCompleted {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item: TurnItem::AgentMessage {
+            id: "codex_agent_item".to_owned(),
+            text: "Final answer".to_owned(),
+            phase: Default::default(),
+            markdown: None,
+            markdown_version: None,
+        },
+    });
+    conversation.apply(ConversationEvent::TurnCompleted {
+        thread_id: THREAD_ID.to_owned(),
+        turn: Turn {
+            id: TURN_ID.to_owned(),
+            status: TurnStatus::Completed,
+            turn_kind: Default::default(),
+            origin: Default::default(),
+            error: None,
+            prompt_manifest: None,
+        },
+    });
+
+    let agent_item = conversation
+        .projection()
+        .items
+        .iter()
+        .find(|item| item.id == "codex_agent_item")
+        .expect("agent message item should exist");
+    assert_eq!(agent_item.partial_text, "Final answer");
+    assert_eq!(agent_item.final_text.as_deref(), Some("Final answer"));
+    assert_eq!(agent_item.status, TimelineEntryStatus::Completed);
+
+    let reasoning_item = conversation
+        .projection()
+        .items
+        .iter()
+        .find(|item| item.id == "codex_reasoning_item")
+        .expect("reasoning item should exist");
+    assert_eq!(reasoning_item.partial_text, "Reasoning summary");
+    assert!(!reasoning_item.partial_text.contains("Final answer"));
+    assert_eq!(reasoning_item.status, TimelineEntryStatus::Completed);
+    assert!(conversation.tick());
+    assert_eq!(conversation.status_label(), "completed");
+}
+
+#[test]
+fn conversation_codex_reasoning_delta_starts_missing_reasoning_item() {
+    let mut conversation = Conversation::new(THREAD_ID);
+    apply_in_progress_turn(&mut conversation);
+
+    conversation.apply(ConversationEvent::ItemDelta {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item_id: "late_reasoning_item".to_owned(),
+        delta: "Late reasoning summary".to_owned(),
+        stream: Some(ItemDeltaStream::Generic),
+        payload: Some(serde_json::json!({
+            "runtimeDeltaKind": "reasoning_summary",
+            "nativeItemKind": "reasoning",
+            "nativeItemId": "late_reasoning_item"
+        })),
+        markdown: None,
+        markdown_version: None,
+    });
+
+    let reasoning_item = conversation
+        .projection()
+        .items
+        .iter()
+        .find(|item| item.id == "late_reasoning_item")
+        .expect("late reasoning delta should create a reasoning item");
+    assert_eq!(reasoning_item.item_type, "reasoning");
+    assert_eq!(reasoning_item.partial_text, "Late reasoning summary");
+    assert_eq!(reasoning_item.status, TimelineEntryStatus::Running);
+
+    let reasoning_entry = conversation
+        .projection()
+        .timeline
+        .iter()
+        .find(|entry| entry.item_id == "late_reasoning_item")
+        .expect("late reasoning item should be visible in timeline");
+    assert_eq!(reasoning_entry.turn_id, TURN_ID);
+}
+
+#[test]
+fn timeline_codex_tool_output_and_file_change_rows_render_existing_tool_items() {
+    let mut conversation = Conversation::new(THREAD_ID);
+    apply_in_progress_turn(&mut conversation);
+
+    conversation.apply(ConversationEvent::ItemStarted {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item: TurnItem::CommandExecution {
+            id: "codex_cmd_item".to_owned(),
+            tool_name: "exec_command".to_owned(),
+            arguments: serde_json::json!({"nativeItemId": "codex_cmd_item"}),
+            status: ToolCallStatus::InProgress,
+            recovery_policy: None,
+            output_policy: ToolOutputPolicySnapshot::for_tool_name("exec_command"),
+            display: ToolDisplayPayload::default(),
+            storage: ToolStoragePayload::default(),
+            recovery: None,
+            command: vec!["echo".to_owned(), "hello".to_owned()],
+            cwd: Some("/repo".to_owned()),
+            success: None,
+            outcome: None,
+            observation: None,
+        },
+    });
+    conversation.apply(ConversationEvent::ItemDelta {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item_id: "codex_cmd_item".to_owned(),
+        delta: "hello\n".to_owned(),
+        stream: Some(ItemDeltaStream::Stdout),
+        payload: Some(serde_json::json!({"nativeItemId": "codex_cmd_item"})),
+        markdown: None,
+        markdown_version: None,
+    });
+    conversation.apply(ConversationEvent::ItemDelta {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item_id: "codex_cmd_item".to_owned(),
+        delta: "warn\n".to_owned(),
+        stream: Some(ItemDeltaStream::Stderr),
+        payload: Some(serde_json::json!({"nativeItemId": "codex_cmd_item"})),
+        markdown: None,
+        markdown_version: None,
+    });
+
+    let command_item = conversation
+        .projection()
+        .items
+        .iter()
+        .find(|item| item.id == "codex_cmd_item")
+        .expect("command item should exist");
+    assert!(command_item.partial_text.contains("Command: echo hello"));
+    assert!(command_item.partial_text.contains("hello"));
+    assert!(command_item.partial_text.contains("[Stderr] warn"));
+
+    conversation.apply(ConversationEvent::ItemStarted {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item: TurnItem::FileChange {
+            id: "codex_file_item".to_owned(),
+            tool_name: "apply_patch".to_owned(),
+            arguments: serde_json::json!({"nativeItemId": "codex_file_item"}),
+            status: ToolCallStatus::InProgress,
+            recovery_policy: None,
+            output_policy: ToolOutputPolicySnapshot::for_tool_name("apply_patch"),
+            display: ToolDisplayPayload::default(),
+            storage: ToolStoragePayload::default(),
+            recovery: None,
+            changed_files: vec!["src/lib.rs".to_owned()],
+            exit_code: None,
+            stdout: None,
+            stderr: None,
+            success: None,
+            outcome: None,
+            observation: None,
+        },
+    });
+    conversation.apply(ConversationEvent::ItemCompleted {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        item: TurnItem::FileChange {
+            id: "codex_file_item".to_owned(),
+            tool_name: "apply_patch".to_owned(),
+            arguments: serde_json::json!({"nativeItemId": "codex_file_item"}),
+            status: ToolCallStatus::Completed,
+            recovery_policy: None,
+            output_policy: ToolOutputPolicySnapshot::for_tool_name("apply_patch"),
+            display: ToolDisplayPayload::default(),
+            storage: ToolStoragePayload::default(),
+            recovery: None,
+            changed_files: vec!["src/lib.rs".to_owned()],
+            exit_code: Some(0),
+            stdout: None,
+            stderr: None,
+            success: Some(true),
+            outcome: None,
+            observation: None,
+        },
+    });
+
+    let file_item = conversation
+        .projection()
+        .items
+        .iter()
+        .find(|item| item.id == "codex_file_item")
+        .expect("file change item should exist");
+    assert_eq!(file_item.status, TimelineEntryStatus::Completed);
+    assert!(file_item.partial_text.contains("Changed files:"));
+    assert!(file_item.partial_text.contains("- src/lib.rs"));
 }
 
 #[test]
@@ -574,6 +931,7 @@ fn late_item_delta_does_not_reopen_completed_item() {
         item: TurnItem::AgentMessage {
             id: item_id.to_owned(),
             text: String::new(),
+            phase: Default::default(),
             markdown: None,
             markdown_version: None,
         },
@@ -584,6 +942,7 @@ fn late_item_delta_does_not_reopen_completed_item() {
         item: TurnItem::AgentMessage {
             id: item_id.to_owned(),
             text: "done".to_owned(),
+            phase: Default::default(),
             markdown: None,
             markdown_version: None,
         },
@@ -625,6 +984,7 @@ fn late_item_delta_does_not_move_terminal_item_clock() {
         TurnItem::AgentMessage {
             id: item_id.to_owned(),
             text: String::new(),
+            phase: Default::default(),
             markdown: None,
             markdown_version: None,
         },
@@ -639,6 +999,7 @@ fn late_item_delta_does_not_move_terminal_item_clock() {
         TurnItem::AgentMessage {
             id: item_id.to_owned(),
             text: "done".to_owned(),
+            phase: Default::default(),
             markdown: None,
             markdown_version: None,
         },
@@ -713,6 +1074,7 @@ fn late_item_started_does_not_reopen_completed_item() {
         item: TurnItem::AgentMessage {
             id: item_id.to_owned(),
             text: String::new(),
+            phase: Default::default(),
             markdown: None,
             markdown_version: None,
         },
@@ -723,6 +1085,7 @@ fn late_item_started_does_not_reopen_completed_item() {
         item: TurnItem::AgentMessage {
             id: item_id.to_owned(),
             text: "done".to_owned(),
+            phase: Default::default(),
             markdown: None,
             markdown_version: None,
         },
@@ -733,6 +1096,7 @@ fn late_item_started_does_not_reopen_completed_item() {
         item: TurnItem::AgentMessage {
             id: item_id.to_owned(),
             text: String::new(),
+            phase: Default::default(),
             markdown: None,
             markdown_version: None,
         },
@@ -1419,6 +1783,7 @@ fn replay_style_sequence_restores_final_state() {
         item: TurnItem::AgentMessage {
             id: "item_answer".to_owned(),
             text: String::new(),
+            phase: Default::default(),
             markdown: None,
             markdown_version: None,
         },
@@ -1439,6 +1804,7 @@ fn replay_style_sequence_restores_final_state() {
         item: TurnItem::AgentMessage {
             id: "item_answer".to_owned(),
             text: "final".to_owned(),
+            phase: Default::default(),
             markdown: None,
             markdown_version: None,
         },
@@ -2275,6 +2641,7 @@ fn hydrate_history_restores_all_items_and_thinking_duration() {
                 item: TurnItem::AgentMessage {
                     id: "item_answer_history".to_owned(),
                     text: String::new(),
+                    phase: Default::default(),
                     markdown: None,
                     markdown_version: None,
                 },
@@ -2307,6 +2674,7 @@ fn hydrate_history_restores_all_items_and_thinking_duration() {
                 item: TurnItem::AgentMessage {
                     id: "item_answer_history".to_owned(),
                     text: "history response".to_owned(),
+                    phase: Default::default(),
                     markdown: None,
                     markdown_version: None,
                 },
@@ -2784,6 +3152,7 @@ fn composed_child_answer_live_progress_matches_reloaded_projection() {
                             item: TurnItem::AgentMessage {
                                 id: "child_agent_live_reload".to_owned(),
                                 text: String::new(),
+                                phase: Default::default(),
                                 markdown: None,
                                 markdown_version: None,
                             },
@@ -2816,6 +3185,7 @@ fn composed_child_answer_live_progress_matches_reloaded_projection() {
                             item: TurnItem::AgentMessage {
                                 id: "child_agent_live_reload".to_owned(),
                                 text: "Child final answer".to_owned(),
+                                phase: Default::default(),
                                 markdown: None,
                                 markdown_version: None,
                             },
@@ -3022,6 +3392,7 @@ fn composed_timeline_inserts_late_task_events_by_event_time() {
                 item: TurnItem::AgentMessage {
                     id: "agent_final_late_timeline".to_owned(),
                     text: "done".to_owned(),
+                    phase: Default::default(),
                     markdown: None,
                     markdown_version: None,
                 },
@@ -3038,6 +3409,7 @@ fn composed_timeline_inserts_late_task_events_by_event_time() {
                 item: TurnItem::AgentMessage {
                     id: "agent_final_late_timeline".to_owned(),
                     text: "done".to_owned(),
+                    phase: Default::default(),
                     markdown: None,
                     markdown_version: None,
                 },

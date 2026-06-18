@@ -508,6 +508,8 @@ fn turn_start_request_receives_response_and_started_notification() {
             model_provider: None,
             sandbox_policy: None,
             mode: None,
+            execution_backend: None,
+            cli_runtime_options: None,
         })
         .expect("turn/start should succeed");
     assert_eq!(turn_response.turn.status, TurnStatus::InProgress);

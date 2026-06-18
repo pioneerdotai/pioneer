@@ -308,6 +308,87 @@ impl GatewayWsCommandSender {
         client_ws_commands::provider_list(self, params)
     }
 
+    pub fn cli_runtime_list(&self, params: CLIRuntimeListParams) -> Result<CLIRuntimeListResponse> {
+        client_ws_commands::cli_runtime_list(self, params)
+    }
+
+    pub fn cli_runtime_list_models(
+        &self,
+        params: CLIRuntimeListModelsParams,
+    ) -> Result<CLIRuntimeListModelsResponse> {
+        client_ws_commands::cli_runtime_list_models(self, params)
+    }
+
+    pub fn cli_runtime_status(
+        &self,
+        params: CLIRuntimeStatusParams,
+    ) -> Result<CLIRuntimeStatusResponse> {
+        client_ws_commands::cli_runtime_status(self, params)
+    }
+
+    pub fn cli_runtime_thread_binding_get(
+        &self,
+        params: CLIRuntimeThreadBindingGetParams,
+    ) -> Result<CLIRuntimeThreadBindingGetResponse> {
+        client_ws_commands::cli_runtime_thread_binding_get(self, params)
+    }
+
+    pub fn cli_runtime_thread_compact(
+        &self,
+        params: CLIRuntimeThreadCompactParams,
+    ) -> Result<CLIRuntimeThreadCompactResponse> {
+        client_ws_commands::cli_runtime_thread_compact(self, params)
+    }
+
+    pub fn cli_runtime_thread_fork(
+        &self,
+        params: CLIRuntimeThreadForkParams,
+    ) -> Result<CLIRuntimeThreadForkResponse> {
+        client_ws_commands::cli_runtime_thread_fork(self, params)
+    }
+
+    pub fn cli_runtime_turn_steer(
+        &self,
+        params: CLIRuntimeTurnSteerParams,
+    ) -> Result<CLIRuntimeTurnSteerResponse> {
+        client_ws_commands::cli_runtime_turn_steer(self, params)
+    }
+
+    pub fn cli_runtime_review_start(
+        &self,
+        params: CLIRuntimeReviewStartParams,
+    ) -> Result<CLIRuntimeReviewStartResponse> {
+        client_ws_commands::cli_runtime_review_start(self, params)
+    }
+
+    pub fn cli_runtime_refresh(
+        &self,
+        params: CLIRuntimeRefreshParams,
+    ) -> Result<CLIRuntimeRefreshResponse> {
+        client_ws_commands::cli_runtime_refresh(self, params)
+    }
+
+    pub fn cli_runtime_login_start(
+        &self,
+        params: CLIRuntimeLoginStartParams,
+    ) -> Result<CLIRuntimeLoginStartResponse> {
+        client_ws_commands::cli_runtime_login_start(self, params)
+    }
+
+    pub fn cli_runtime_login_cancel(
+        &self,
+        params: CLIRuntimeLoginCancelParams,
+    ) -> Result<CLIRuntimeLoginCancelResponse> {
+        client_ws_commands::cli_runtime_login_cancel(self, params)
+    }
+
+    pub fn cli_runtime_request_respond(
+        &self,
+        params: CLIRuntimeRequestRespondParams,
+    ) -> Result<CLIRuntimeRequestRespondResponse> {
+        client_ws_commands::cli_runtime_request_respond(self, params)
+    }
+
     pub fn gateway_settings_get(&self) -> Result<GatewaySettingsGetResponse> {
         client_ws_commands::gateway_settings_get(self)
     }

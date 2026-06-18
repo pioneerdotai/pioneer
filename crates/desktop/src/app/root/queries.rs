@@ -1,5 +1,6 @@
 use super::*;
 use pioneer_client::agents_doc::scope as agents_doc_scope;
+use pioneer_client::providers::list as provider_list;
 use pioneer_client::state::selectors as client_selectors;
 use pioneer_client::state::snapshot::{ClientSnapshot, ClientSnapshotInput};
 use pioneer_client::threads::tree as thread_tree;
@@ -88,6 +89,22 @@ impl PioneerDesktop {
         client_selectors::thread_workspace_id_from(&self.thread_coordinators, thread_id)
     }
 
+    pub(in crate::app) fn codex_cli_runtime_binding_for_thread(
+        &self,
+        thread_id: &str,
+    ) -> Option<&CLIRuntimeThreadBinding> {
+        self.cli_runtime_thread_bindings
+            .get(thread_id)
+            .filter(|binding| binding.runtime_kind == CLIAgentRuntimeKind::Codex)
+    }
+
+    pub(in crate::app) fn composer_selected_provider_is_cli_runtime(&self) -> bool {
+        self.composer_selected_provider
+            .as_deref()
+            .and_then(provider_list::runtime_id_from_cli_runtime_provider_key)
+            .is_some()
+    }
+
     pub(in crate::app) fn model_selector_workspace_id(&self) -> String {
         client_selectors::model_selector_workspace_id_from(
             self.active_workspace_id(),
@@ -158,6 +175,13 @@ impl PioneerDesktop {
             self.current_active_thread_id(),
             &self.thread_coordinators,
         )
+    }
+
+    pub(in crate::app) fn active_thread_cli_runtime_pending_requests(
+        &self,
+    ) -> Vec<CLIRuntimePendingRequestEntry> {
+        self.cli_runtime_pending_requests
+            .pending_for_scope(self.active_workspace_id(), self.current_active_thread_id())
     }
 
     pub(in crate::app) fn has_any_in_flight_turn(&self) -> bool {

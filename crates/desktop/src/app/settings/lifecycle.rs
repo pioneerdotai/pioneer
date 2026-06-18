@@ -250,7 +250,7 @@ impl PioneerDesktop {
         );
     }
 
-    fn apply_gateway_settings_update(
+    pub(in crate::app) fn apply_gateway_settings_update(
         &mut self,
         snapshot: pioneer_protocol::GatewaySettingsSnapshot,
         update: GatewaySettingsUpdate,
@@ -265,6 +265,7 @@ impl PioneerDesktop {
         };
         let connection_id = scope.connection_id;
         let connection_epoch = scope.connection_epoch;
+        let refresh_cli_providers_after_update = update.cli_runtimes.is_some();
 
         gateway_settings::apply_optimistic_gateway_settings_update(
             &mut self.gateway.settings,
@@ -297,6 +298,9 @@ impl PioneerDesktop {
                                 &mut view.gateway.settings_error,
                                 response,
                             );
+                            if refresh_cli_providers_after_update {
+                                view.refresh_cli_providers(cx);
+                            }
                         }
                         Err(error) => {
                             gateway_settings::apply_gateway_settings_update_error(

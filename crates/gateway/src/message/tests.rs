@@ -53,60 +53,59 @@ use pioneer_protocol::{
     CLIRuntimePendingRequest, CLIRuntimePendingRequestStatus, CLIRuntimeRequestKind,
     CLIRuntimeRequestOpenedNotification, CLIRuntimeRequestResolution,
     CLIRuntimeRequestResolvedNotification, CLIRuntimeRequestRespondResponse,
-    CLIRuntimeReviewDelivery, CLIRuntimeReviewStartResponse, CLIRuntimeReviewTarget,
-    CLIRuntimeThreadCompactResponse, CLIRuntimeThreadForkResponse, CLIRuntimeTurnSteerResponse,
-    ExecutionWindowExhaustionReason, ExecutionWindowStatus, INVALID_PARAMS_CODE,
-    INVALID_REQUEST_CODE, ItemCompletedNotification, ItemDeltaNotification, ItemDeltaStream,
-    ItemStartedNotification, ItemToolRetryScheduledNotification, JsonRpcErrorResponse,
-    JsonRpcNotification, JsonRpcResponse, McpChangedAction, McpChangedNotification,
-    McpInstallResponse, McpInstallResultStatus, McpInstallStatus, McpListResponse,
-    McpPolicySetResponse, McpRuntimeState, McpScopeKind, McpServerDetailsResponse, McpServerStatus,
-    McpSourceKind, McpTransportSummary, McpTurnBindingSummary, McpUninstallResponse, MemoryActor,
-    MemoryActorKind, MemoryCandidateDecision, MemoryCandidateStatus, MemoryCandidatesDecideParams,
-    MemoryCandidatesDecideResponse, MemoryCandidatesListParams, MemoryCandidatesListResponse,
-    MemoryCategory, MemoryChangeKind, MemoryChangedNotification, MemoryForgetParams,
-    MemoryForgetResponse, MemoryForgetTarget, MemoryForgottenNotification, MemoryGetParams,
-    MemoryGetResponse, MemoryListParams, MemoryListResponse, MemoryRememberParams,
-    MemoryRememberResponse, MemoryScope, MemoryScopeKind, MemorySearchParams, MemorySearchResponse,
-    MemorySensitivity, PromptManifest, PromptManifestDiagnostic, PromptManifestDiagnosticCode,
-    PromptManifestHookContributionKind, PromptManifestHookPhase, PromptManifestHookSource,
-    PromptManifestHookSourceEntry, PromptManifestHookTruncation, PromptManifestProfile,
-    ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse, ProviderFailureClass,
-    ProviderFailureDetails, ProviderFailureStage, ProviderListParams, ProviderListResponse,
-    ProviderSetApiKeyParams, ProviderSetApiKeyResponse, ProviderTransportKind, RecoveryAction,
-    RecoveryJobStatus, RecoveryTrigger, SandboxMode, SkillArchiveFormat,
-    SkillAuditEvent as ProtocolSkillAuditEvent, SkillListResponse, SkillsChangedNotification,
-    SkillsHealthResponse, SkillsInstallResponse, SkillsPolicySetResponse, SkillsUninstallResponse,
-    SkillsUpdateResponse, SkillsUploadAbortResponse, SkillsUploadChunkHeader,
-    SkillsUploadFinishResponse, SkillsUploadStartResponse, TaskAcceptResponse, TaskAgendaResponse,
-    TaskAgentPrompt, TaskAgentResultContract, TaskAgentResultFormat, TaskAgentReviewMode,
-    TaskAgentReviewPolicy, TaskAgentSpecInput, TaskAgentToolPolicy, TaskAgentWriteMode,
-    TaskAttachmentMode, TaskCompletionBehavior, TaskCreateParams, TaskDeliveriesParams,
-    TaskDeliveriesResponse, TaskDeliveryFormat, TaskDeliveryMode, TaskDeliveryPolicy,
-    TaskDeliveryStatus, TaskEventPayload, TaskExecutorKind, TaskLifecyclePolicy, TaskOwnerKind,
-    TaskParentTerminalAction, TaskPauseResponse, TaskResult, TaskResultCandidate,
-    TaskResultCandidateStatus, TaskResultReviewDecision, TaskResultReviewEventKind,
-    TaskResultReviewResolutionStrategy, TaskResultReviewerKind, TaskResumeResponse,
-    TaskRetryBackoffKind, TaskRetryPolicy, TaskReviseParams, TaskReviseResponse, TaskRun,
-    TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind,
-    TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskStatus, TaskThreadLineage,
-    TaskTriggerInput, TaskTriggerKind, TaskTriggerSpec, TaskTriggerStatus, TaskTurnItem, TaskValue,
-    TaskWaitParams, TaskWriteLockStatus, Thread, ThreadAgentsDocArchiveResponse,
-    ThreadAgentsDocGetResponse, ThreadAgentsDocResolveForThreadResponse,
-    ThreadAgentsDocSaveResponse, ThreadAgentsDocStatus, ThreadClosedNotification,
-    ThreadFolderCreateResponse, ThreadFolderDeleteResponse, ThreadFolderMoveResponse,
-    ThreadHistoryEventPayload, ThreadHistoryResponse, ThreadMode, ThreadMoveResponse,
-    ThreadOriginKind, ThreadSidebarVisibility, ThreadStartParams, ThreadStartResponse,
-    ThreadStatus, ThreadTreeResponse, ThreadUnsubscribeResponse, ThreadUnsubscribeStatus,
-    ThreadUpdateResponse, TimelineOriginKind, ToolCallStatus, ToolDisplayPayload, ToolMetadata,
-    ToolOutputPolicySnapshot, ToolOutputSummary, ToolResultView, ToolStoragePayload, Turn,
-    TurnAcceptedCapability, TurnCancelResponse, TurnCapabilityAcceptedReason, TurnCapabilityKind,
-    TurnCapabilityRejectedReason, TurnCompletedNotification, TurnFailedNotification,
-    TurnGetResponse, TurnItem, TurnItemEventPayload, TurnItemType, TurnKind, TurnOrigin,
-    TurnRejectedCapability, TurnSkillBinding, TurnStartResponse, TurnStatus, TurnTimelineParams,
-    TurnTimelineResponse, UserInput, UserMessageAttachment, WorkspaceChangeKind,
-    WorkspaceChangedNotification, WorkspaceCreateResponse, WorkspaceDefaultResponse,
-    WorkspaceListResponse, WorkspaceSelectResponse, WorkspaceUpdateResponse, constants::events,
+    CLIRuntimeThreadForkResponse, CLIRuntimeTurnSteerResponse, ExecutionWindowExhaustionReason,
+    ExecutionWindowStatus, INVALID_REQUEST_CODE, ItemCompletedNotification, ItemDeltaNotification,
+    ItemDeltaStream, ItemStartedNotification, ItemToolRetryScheduledNotification,
+    JsonRpcErrorResponse, JsonRpcNotification, JsonRpcResponse, McpChangedAction,
+    McpChangedNotification, McpInstallResponse, McpInstallResultStatus, McpInstallStatus,
+    McpListResponse, McpPolicySetResponse, McpRuntimeState, McpScopeKind, McpServerDetailsResponse,
+    McpServerStatus, McpSourceKind, McpTransportSummary, McpTurnBindingSummary,
+    McpUninstallResponse, MemoryActor, MemoryActorKind, MemoryCandidateDecision,
+    MemoryCandidateStatus, MemoryCandidatesDecideParams, MemoryCandidatesDecideResponse,
+    MemoryCandidatesListParams, MemoryCandidatesListResponse, MemoryCategory, MemoryChangeKind,
+    MemoryChangedNotification, MemoryForgetParams, MemoryForgetResponse, MemoryForgetTarget,
+    MemoryForgottenNotification, MemoryGetParams, MemoryGetResponse, MemoryListParams,
+    MemoryListResponse, MemoryRememberParams, MemoryRememberResponse, MemoryScope, MemoryScopeKind,
+    MemorySearchParams, MemorySearchResponse, MemorySensitivity, PromptManifest,
+    PromptManifestDiagnostic, PromptManifestDiagnosticCode, PromptManifestHookContributionKind,
+    PromptManifestHookPhase, PromptManifestHookSource, PromptManifestHookSourceEntry,
+    PromptManifestHookTruncation, PromptManifestProfile, ProviderDeleteApiKeyParams,
+    ProviderDeleteApiKeyResponse, ProviderFailureClass, ProviderFailureDetails,
+    ProviderFailureStage, ProviderListParams, ProviderListResponse, ProviderSetApiKeyParams,
+    ProviderSetApiKeyResponse, ProviderTransportKind, RecoveryAction, RecoveryJobStatus,
+    RecoveryTrigger, SandboxMode, SkillArchiveFormat, SkillAuditEvent as ProtocolSkillAuditEvent,
+    SkillListResponse, SkillsChangedNotification, SkillsHealthResponse, SkillsInstallResponse,
+    SkillsPolicySetResponse, SkillsUninstallResponse, SkillsUpdateResponse,
+    SkillsUploadAbortResponse, SkillsUploadChunkHeader, SkillsUploadFinishResponse,
+    SkillsUploadStartResponse, TaskAcceptResponse, TaskAgendaResponse, TaskAgentPrompt,
+    TaskAgentResultContract, TaskAgentResultFormat, TaskAgentReviewMode, TaskAgentReviewPolicy,
+    TaskAgentSpecInput, TaskAgentToolPolicy, TaskAgentWriteMode, TaskAttachmentMode,
+    TaskCompletionBehavior, TaskCreateParams, TaskDeliveriesParams, TaskDeliveriesResponse,
+    TaskDeliveryFormat, TaskDeliveryMode, TaskDeliveryPolicy, TaskDeliveryStatus, TaskEventPayload,
+    TaskExecutorKind, TaskLifecyclePolicy, TaskOwnerKind, TaskParentTerminalAction,
+    TaskPauseResponse, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
+    TaskResultReviewDecision, TaskResultReviewEventKind, TaskResultReviewResolutionStrategy,
+    TaskResultReviewerKind, TaskResumeResponse, TaskRetryBackoffKind, TaskRetryPolicy,
+    TaskReviseParams, TaskReviseResponse, TaskRun, TaskRunExecutionStatus, TaskRunStatus,
+    TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind,
+    TaskRunTurnStatus, TaskStatus, TaskThreadLineage, TaskTriggerInput, TaskTriggerKind,
+    TaskTriggerSpec, TaskTriggerStatus, TaskTurnItem, TaskValue, TaskWaitParams,
+    TaskWriteLockStatus, Thread, ThreadAgentsDocArchiveResponse, ThreadAgentsDocGetResponse,
+    ThreadAgentsDocResolveForThreadResponse, ThreadAgentsDocSaveResponse, ThreadAgentsDocStatus,
+    ThreadClosedNotification, ThreadFolderCreateResponse, ThreadFolderDeleteResponse,
+    ThreadFolderMoveResponse, ThreadHistoryEventPayload, ThreadHistoryResponse, ThreadMode,
+    ThreadMoveResponse, ThreadOriginKind, ThreadSidebarVisibility, ThreadStartParams,
+    ThreadStartResponse, ThreadStatus, ThreadTreeResponse, ThreadUnsubscribeResponse,
+    ThreadUnsubscribeStatus, ThreadUpdateResponse, TimelineOriginKind, ToolCallStatus,
+    ToolDisplayPayload, ToolMetadata, ToolOutputPolicySnapshot, ToolOutputSummary, ToolResultView,
+    ToolStoragePayload, Turn, TurnAcceptedCapability, TurnCancelResponse,
+    TurnCapabilityAcceptedReason, TurnCapabilityKind, TurnCapabilityRejectedReason,
+    TurnCompletedNotification, TurnFailedNotification, TurnGetResponse, TurnItem,
+    TurnItemEventPayload, TurnItemType, TurnKind, TurnOrigin, TurnRejectedCapability,
+    TurnSkillBinding, TurnStartResponse, TurnStatus, TurnTimelineParams, TurnTimelineResponse,
+    UserInput, UserMessageAttachment, WorkspaceChangeKind, WorkspaceChangedNotification,
+    WorkspaceCreateResponse, WorkspaceDefaultResponse, WorkspaceListResponse,
+    WorkspaceSelectResponse, WorkspaceUpdateResponse, constants::events,
 };
 use pioneer_provider::providers::EchoProvider;
 use pioneer_provider::{
@@ -12631,7 +12630,7 @@ async fn turn_start_cli_runtime_backend_disabled_errors_before_provider_dispatch
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn codex_review_start_uncommitted_changes_calls_runtime_and_persists_turn_binding() {
+async fn codex_review_start_uncommitted_changes_is_rejected_without_runtime_call() {
     let (tx, mut rx) = mpsc::channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = session_manager.register_connection(tx).await;
@@ -12715,44 +12714,29 @@ async fn codex_review_start_uncommitted_changes_calls_runtime_and_persists_turn_
         )
         .await;
 
-    let response = recv_response_by_id(&mut rx, "codexreviewstart00001").await;
-    let result: CLIRuntimeReviewStartResponse =
-        serde_json::from_value(response.result).expect("review start result should decode");
-    assert_eq!(result.runtime_id, "codex");
-    assert_eq!(result.thread_id, "thread_codex_review");
-    assert_eq!(result.turn_id.as_deref(), Some("turn_codex_review"));
-    assert_eq!(result.delivery, CLIRuntimeReviewDelivery::Inline);
-    assert_eq!(result.target, CLIRuntimeReviewTarget::UncommittedChanges);
-    assert_eq!(
-        result.native_turn_id.as_deref(),
-        Some("codex-review-turn-1")
+    let error = recv_error_by_id(&mut rx, "codexreviewstart00001").await;
+    assert_eq!(error.error.code, INVALID_REQUEST_CODE);
+    assert!(
+        error
+            .error
+            .message
+            .contains("review start is not supported"),
+        "error should mention unsupported review start: {}",
+        error.error.message
     );
-
-    let starts = cli_session.review_starts.lock().await;
-    assert_eq!(starts.len(), 1);
-    assert_eq!(starts[0].native_thread_id, "codex-thread-review");
-    assert_eq!(starts[0].target, CLIRuntimeReviewTarget::UncommittedChanges);
-    drop(starts);
-
-    let binding = crud_store
-        .get_cli_runtime_turn_binding("turn_codex_review")
-        .await
-        .expect("turn binding lookup should succeed")
-        .expect("review turn binding should persist");
-    assert_eq!(
-        binding.native_turn_id.as_deref(),
-        Some("codex-review-turn-1")
+    assert!(cli_session.review_starts.lock().await.is_empty());
+    assert!(
+        crud_store
+            .get_cli_runtime_turn_binding("turn_codex_review")
+            .await
+            .expect("turn binding lookup should succeed")
+            .is_none(),
+        "unsupported review start must not persist a turn binding"
     );
-    assert_eq!(
-        binding.status,
-        crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING
-    );
-    assert_eq!(binding.native_thread_id, "codex-thread-review");
-    assert!(binding.input_mapping_json.contains("codex_review_start"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn codex_review_start_custom_instructions_calls_runtime() {
+async fn codex_review_start_custom_instructions_is_rejected_without_runtime_call() {
     let (tx, mut rx) = mpsc::channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = session_manager.register_connection(tx).await;
@@ -12839,34 +12823,21 @@ async fn codex_review_start_custom_instructions_calls_runtime() {
         )
         .await;
 
-    let response = recv_response_by_id(&mut rx, "codexreviewstart00002").await;
-    let result: CLIRuntimeReviewStartResponse =
-        serde_json::from_value(response.result).expect("review start result should decode");
-    assert_eq!(result.delivery, CLIRuntimeReviewDelivery::Detached);
-    assert_eq!(
-        result.target,
-        CLIRuntimeReviewTarget::Custom {
-            instructions: "Review only auth-sensitive files".to_owned()
-        }
+    let error = recv_error_by_id(&mut rx, "codexreviewstart00002").await;
+    assert_eq!(error.error.code, INVALID_REQUEST_CODE);
+    assert!(
+        error
+            .error
+            .message
+            .contains("review start is not supported"),
+        "error should mention unsupported review start: {}",
+        error.error.message
     );
-    assert_eq!(
-        result.native_turn_id.as_deref(),
-        Some("codex-review-turn-custom")
-    );
-
-    let starts = cli_session.review_starts.lock().await;
-    assert_eq!(starts.len(), 1);
-    assert_eq!(starts[0].native_thread_id, "codex-thread-review-custom");
-    assert_eq!(
-        starts[0].target,
-        CLIRuntimeReviewTarget::Custom {
-            instructions: "Review only auth-sensitive files".to_owned()
-        }
-    );
+    assert!(cli_session.review_starts.lock().await.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn codex_review_start_rejects_invalid_custom_target() {
+async fn codex_review_start_rejects_before_target_validation() {
     let (tx, mut rx) = mpsc::channel(8);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = session_manager.register_connection(tx).await;
@@ -12906,16 +12877,19 @@ async fn codex_review_start_rejects_invalid_custom_target() {
         .await;
 
     let error = recv_error_by_id(&mut rx, "codexreviewbadtarget1").await;
-    assert_eq!(error.error.code, INVALID_PARAMS_CODE);
+    assert_eq!(error.error.code, INVALID_REQUEST_CODE);
     assert!(
-        error.error.message.contains("target.instructions"),
-        "error should mention invalid custom instructions: {}",
+        error
+            .error
+            .message
+            .contains("review start is not supported"),
+        "error should mention unsupported review start: {}",
         error.error.message
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn codex_compaction_start_calls_runtime_for_bound_thread() {
+async fn codex_compaction_start_is_rejected_without_runtime_call() {
     let (tx, mut rx) = mpsc::channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = session_manager.register_connection(tx).await;
@@ -12995,16 +12969,17 @@ async fn codex_compaction_start_calls_runtime_for_bound_thread() {
         )
         .await;
 
-    let response = recv_response_by_id(&mut rx, "codexcompactstart0001").await;
-    let result: CLIRuntimeThreadCompactResponse =
-        serde_json::from_value(response.result).expect("compact result should decode");
-    assert_eq!(result.runtime_id, "codex");
-    assert_eq!(result.thread_id, "thread_codex_compact");
-    assert_eq!(result.native_thread_id, "codex-thread-compact");
-
-    let compactions = cli_session.thread_compactions.lock().await;
-    assert_eq!(compactions.len(), 1);
-    assert_eq!(compactions[0].native_thread_id, "codex-thread-compact");
+    let error = recv_error_by_id(&mut rx, "codexcompactstart0001").await;
+    assert_eq!(error.error.code, INVALID_REQUEST_CODE);
+    assert!(
+        error
+            .error
+            .message
+            .contains("thread compaction is not supported"),
+        "error should mention unsupported compaction: {}",
+        error.error.message
+    );
+    assert!(cli_session.thread_compactions.lock().await.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -13089,7 +13064,7 @@ async fn codex_compaction_start_rejects_wrong_backend() {
         error
             .error
             .message
-            .contains("only supported for Codex threads")
+            .contains("thread compaction is not supported")
     );
     assert!(cli_session.thread_compactions.lock().await.is_empty());
 }
@@ -13362,6 +13337,285 @@ async fn start_loaded_thread_and_turn_for_cli_runtime_test(
     message_future(processor.process_request(connection_id, &turn_start_payload)).await;
     let _turn_response = recv_response_by_id(rx, turn_start_id).await;
     let _turn_started = recv_notification_by_method(rx, events::TURN_STARTED).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_turn_start_blocker_rejects_active_cli_binding() {
+    let (tx, mut rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        Arc::new(DelayedProvider {
+            delay: Duration::from_secs(30),
+            text: "late".to_owned(),
+        }),
+    ));
+    let processor = MessageProcessor::new(
+        thread_manager,
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+
+    start_loaded_thread_and_turn_for_cli_runtime_test(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        "thread_cli_busy",
+        "turn_cli_busy",
+    )
+    .await;
+
+    let now = chrono::Utc::now().fixed_offset();
+    crud_store
+        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+            turn_id: "turn_cli_busy".to_owned(),
+            thread_id: "thread_cli_busy".to_owned(),
+            workspace_id: workspace_id.clone(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            native_thread_id: "codex-thread-busy".to_owned(),
+            native_turn_id: Some("codex-turn-busy".to_owned()),
+            request_id: None,
+            status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING.to_owned(),
+            model: Some("gpt-5".to_owned()),
+            cwd: Some("/tmp/project".to_owned()),
+            sandbox_json: None,
+            approval_policy: None,
+            input_mapping_json: "{}".to_owned(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("turn binding should upsert");
+
+    let key = CLIAgentRuntimeSessionKey::new(workspace_id, "codex", "thread_cli_busy")
+        .expect("session key should build");
+    let blocker = processor
+        .cli_runtime_turn_start_blocker_for_thread(&key)
+        .await
+        .expect("blocker check should succeed")
+        .expect("active CLI runtime turn should block start");
+    assert!(
+        blocker.contains("already has active turn `turn_cli_busy`"),
+        "blocker should mention active turn: {blocker}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_stale_silent_running_binding_marks_turn_failed() {
+    let (tx, mut rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        Arc::new(DelayedProvider {
+            delay: Duration::from_secs(30),
+            text: "late".to_owned(),
+        }),
+    ));
+    let processor = MessageProcessor::new(
+        thread_manager,
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+
+    start_loaded_thread_and_turn_for_cli_runtime_test(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        "thread_cli_stale",
+        "turn_cli_stale",
+    )
+    .await;
+
+    let old = chrono::Utc::now().fixed_offset() - chrono::Duration::milliseconds(180_000);
+    crud_store
+        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+            turn_id: "turn_cli_stale".to_owned(),
+            thread_id: "thread_cli_stale".to_owned(),
+            workspace_id: workspace_id.clone(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            native_thread_id: "codex-thread-stale".to_owned(),
+            native_turn_id: Some("codex-turn-stale".to_owned()),
+            request_id: None,
+            status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING.to_owned(),
+            model: Some("gpt-5".to_owned()),
+            cwd: Some("/tmp/project".to_owned()),
+            sandbox_json: None,
+            approval_policy: None,
+            input_mapping_json: "{}".to_owned(),
+            created_at: old,
+            updated_at: old,
+        })
+        .await
+        .expect("turn binding should upsert");
+
+    processor
+        .fail_stale_cli_runtime_turns(chrono::Utc::now().fixed_offset().timestamp_millis())
+        .await;
+
+    let (_workspace_id, turn) = crud_store
+        .get_turn("thread_cli_stale", "turn_cli_stale")
+        .await
+        .expect("turn lookup should succeed")
+        .expect("turn should exist");
+    assert_eq!(turn.status, TurnStatus::Failed);
+    assert!(
+        turn.error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("did not emit any native events"),
+        "turn error should mention missing native events: {:?}",
+        turn.error
+    );
+    let binding = crud_store
+        .get_cli_runtime_turn_binding("turn_cli_stale")
+        .await
+        .expect("binding lookup should succeed")
+        .expect("binding should exist");
+    assert_eq!(
+        binding.status,
+        crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_FAILED
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_stale_db_only_running_binding_marks_turn_failed() {
+    let (tx, _rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+
+    let now_secs = chrono::Utc::now().timestamp();
+    let thread = Thread {
+        workspace_id: workspace_id.clone(),
+        id: "thread_cli_stale_db_only".to_owned(),
+        name: Some("DB-only stale CLI turn".to_owned()),
+        preview: "stale".to_owned(),
+        mode: ThreadMode::Agent,
+        model: "gpt-5".to_owned(),
+        model_provider: "cli_runtime:codex".to_owned(),
+        created_at: now_secs,
+        updated_at: now_secs,
+        status: ThreadStatus::Active,
+        origin_kind: ThreadOriginKind::User,
+        sidebar_visibility: ThreadSidebarVisibility::Visible,
+        agent_nickname: None,
+        agent_role: None,
+        turns: Vec::new(),
+    };
+    let turn = Turn {
+        id: "turn_cli_stale_db_only".to_owned(),
+        status: TurnStatus::InProgress,
+        turn_kind: TurnKind::default(),
+        origin: TurnOrigin::User,
+        error: None,
+        prompt_manifest: None,
+    };
+    crud_store
+        .materialize_turn_start(
+            &thread,
+            SandboxMode::FullAccess,
+            &turn,
+            &[UserInput::Text {
+                text: "stale db only".to_owned(),
+                text_elements: Vec::new(),
+            }],
+        )
+        .await
+        .expect("DB-only turn should materialize");
+
+    let old = chrono::Utc::now().fixed_offset() - chrono::Duration::milliseconds(180_000);
+    crud_store
+        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+            turn_id: "turn_cli_stale_db_only".to_owned(),
+            thread_id: "thread_cli_stale_db_only".to_owned(),
+            workspace_id: workspace_id.clone(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            native_thread_id: "codex-thread-stale-db-only".to_owned(),
+            native_turn_id: Some("codex-turn-stale-db-only".to_owned()),
+            request_id: None,
+            status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING.to_owned(),
+            model: Some("gpt-5".to_owned()),
+            cwd: Some("/tmp/project".to_owned()),
+            sandbox_json: None,
+            approval_policy: None,
+            input_mapping_json: "{}".to_owned(),
+            created_at: old,
+            updated_at: old,
+        })
+        .await
+        .expect("turn binding should upsert");
+
+    processor
+        .fail_stale_cli_runtime_turns(chrono::Utc::now().fixed_offset().timestamp_millis())
+        .await;
+
+    let (_workspace_id, turn) = crud_store
+        .get_turn("thread_cli_stale_db_only", "turn_cli_stale_db_only")
+        .await
+        .expect("turn lookup should succeed")
+        .expect("turn should exist");
+    assert_eq!(turn.status, TurnStatus::Failed);
+    assert!(
+        turn.error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("did not emit any native events"),
+        "turn error should mention missing native events: {:?}",
+        turn.error
+    );
+    let thread = crud_store
+        .get_thread_model("thread_cli_stale_db_only")
+        .await
+        .expect("thread lookup should succeed")
+        .expect("thread should exist");
+    assert_eq!(thread.status, ThreadStatus::Idle);
+    let binding = crud_store
+        .get_cli_runtime_turn_binding("turn_cli_stale_db_only")
+        .await
+        .expect("binding lookup should succeed")
+        .expect("binding should exist");
+    assert_eq!(
+        binding.status,
+        crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_FAILED
+    );
 }
 
 #[test]

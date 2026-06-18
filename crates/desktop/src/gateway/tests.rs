@@ -3,6 +3,7 @@ use super::runtime::is_same_gateway_version;
 use pioneer_client::gateway::types::{GatewayEndpoint, GatewayEndpointKind};
 use pioneer_config::{
     AppConfig, DesktopConfig, GatewayArtifactsConfig, GatewayAuthConfig,
+    GatewayCliAgentRuntimeConfig, GatewayCliAgentRuntimeInstancesConfig,
     GatewayComputerUseToolsConfig, GatewayConfig, GatewayDatabaseConfig, GatewayMemoryConfig,
     GatewayProviderConfig, GatewayRuntimeConfig, GatewaySkillsConfig, GatewayThreadConfig,
     GatewayToolLoopBudgetConfig, GatewayToolRetryBudgetConfig, GatewayToolsConfig,
@@ -346,6 +347,8 @@ pub(crate) fn test_config() -> AppConfig {
             },
             tasks: Default::default(),
             skills: GatewaySkillsConfig::default(),
+            cli_agent_runtime: GatewayCliAgentRuntimeConfig::default(),
+            cli_agent_runtimes: GatewayCliAgentRuntimeInstancesConfig::default(),
             memory: GatewayMemoryConfig::default(),
             thread_episodic: Default::default(),
             hooks: Default::default(),

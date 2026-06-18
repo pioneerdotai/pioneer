@@ -98,6 +98,8 @@ impl PioneerDesktop {
             composer_model_display_loading_key: None,
             main_content_view: MainContentView::Threads,
             providers: Default::default(),
+            cli_runtime_pending_requests: Default::default(),
+            cli_runtime_thread_bindings: HashMap::new(),
             mcp_servers: Vec::new(),
             mcp_selected_server_id: None,
             mcp_server_details: None,

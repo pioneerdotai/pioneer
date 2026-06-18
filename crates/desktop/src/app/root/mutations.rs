@@ -160,8 +160,13 @@ impl PioneerDesktop {
         self.composer_state.update(cx, move |state, cx| {
             state.set_value(draft.text.clone(), window, cx)
         });
-        self.composer_attachments = draft.attachments;
-        self.composer_capabilities = draft.capabilities;
+        if self.composer_selected_provider_is_cli_runtime() {
+            self.composer_attachments.clear();
+            self.composer_capabilities.clear();
+        } else {
+            self.composer_attachments = draft.attachments;
+            self.composer_capabilities = draft.capabilities;
+        }
     }
 
     pub(in crate::app) fn activate_thread_with_draft_restore(
@@ -294,6 +299,7 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn remove_thread_conversation(&mut self, thread_id: &str) {
+        let workspace_id = self.thread_workspace_id(thread_id).map(str::to_owned);
         client_state_reducers::remove_thread_scoped_entries(
             thread_id,
             &mut self.draft_thread_id,
@@ -304,6 +310,15 @@ impl PioneerDesktop {
             &mut self.thread_placements,
             &mut self.turn_timeline_refresh,
         );
+        if let Some(workspace_id) = workspace_id {
+            self.cli_runtime_pending_requests.apply(
+                pioneer_client::cli_runtime::approvals::reduce_cli_runtime_thread_closed_cleanup(
+                    workspace_id,
+                    thread_id.to_owned(),
+                ),
+            );
+        }
+        self.cli_runtime_thread_bindings.remove(thread_id);
     }
 
     pub(in crate::app) fn clear_thread_conversations(&mut self) {
@@ -329,6 +344,23 @@ impl PioneerDesktop {
         );
         self.composer_model_display_cache.clear();
         self.composer_model_display_loading_key = None;
+        self.cli_runtime_pending_requests = Default::default();
+        self.cli_runtime_thread_bindings.clear();
+    }
+
+    pub(in crate::app) fn set_cli_runtime_thread_binding(
+        &mut self,
+        thread_id: String,
+        binding: Option<CLIRuntimeThreadBinding>,
+    ) {
+        match binding {
+            Some(binding) => {
+                self.cli_runtime_thread_bindings.insert(thread_id, binding);
+            }
+            None => {
+                self.cli_runtime_thread_bindings.remove(thread_id.as_str());
+            }
+        }
     }
 
     pub(in crate::app) fn set_thread_tree_snapshot(

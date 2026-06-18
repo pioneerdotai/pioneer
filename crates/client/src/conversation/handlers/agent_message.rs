@@ -17,6 +17,7 @@ impl TurnItemHandler for AgentMessageHandler {
             text,
             markdown,
             markdown_version,
+            ..
         } = item
         else {
             return;
@@ -72,6 +73,7 @@ impl TurnItemHandler for AgentMessageHandler {
             text,
             markdown,
             markdown_version,
+            ..
         } = item
         else {
             return;

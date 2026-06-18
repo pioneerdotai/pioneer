@@ -1760,7 +1760,7 @@ fn default_codex_cli_agent_runtime_instance(
     EffectiveGatewayCliAgentRuntimeInstanceConfig {
         id: "codex".to_owned(),
         kind: GatewayCliAgentRuntimeKindConfig::Codex,
-        display_name: "Codex".to_owned(),
+        display_name: "Codex CLI".to_owned(),
         enabled: defaults.enabled,
         binary_path: "codex".to_owned(),
         home_path: "~/.codex".to_owned(),
@@ -2823,7 +2823,7 @@ request_timeout_ms = 60000
         assert_eq!(instances.len(), 1);
         assert_eq!(instances[0].id, "codex");
         assert_eq!(instances[0].kind, GatewayCliAgentRuntimeKindConfig::Codex);
-        assert_eq!(instances[0].display_name, "Codex");
+        assert_eq!(instances[0].display_name, "Codex CLI");
         assert!(instances[0].enabled);
         assert_eq!(instances[0].binary_path, "codex");
         assert_eq!(instances[0].home_path, "~/.codex");

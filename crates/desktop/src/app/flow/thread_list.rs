@@ -137,6 +137,16 @@ impl PioneerDesktop {
             if let Some(connection_id) = self.gateway.ws_connection_id {
                 self.ensure_thread_subscription(thread_id.clone(), workspace_id, connection_id, cx);
             }
+            if let Some(connection_id) = self.gateway.ws_connection_id
+                && let Some(workspace_id) = self.thread_workspace_id(thread_id.as_str())
+            {
+                self.refresh_cli_runtime_thread_binding(
+                    thread_id.clone(),
+                    workspace_id.to_owned(),
+                    connection_id,
+                    cx,
+                );
+            }
         }
 
         self.ensure_thread_history_loaded(thread_id.as_str(), cx);
@@ -244,6 +254,20 @@ impl PioneerDesktop {
                                 connection_id,
                                 cx,
                             );
+                            if let Some(thread_id) =
+                                view.current_active_thread_id().map(str::to_owned)
+                                && view.draft_thread_id() != Some(thread_id.as_str())
+                                && let Some(workspace_id) = view
+                                    .thread_workspace_id(thread_id.as_str())
+                                    .map(str::to_owned)
+                            {
+                                view.refresh_cli_runtime_thread_binding(
+                                    thread_id,
+                                    workspace_id,
+                                    connection_id,
+                                    cx,
+                                );
+                            }
                         }
                         Err(error) => {
                             warn!(
@@ -398,6 +422,68 @@ impl PioneerDesktop {
                         }
                     }
 
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn refresh_cli_runtime_thread_binding(
+        &mut self,
+        thread_id: String,
+        workspace_id: String,
+        connection_id: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if self.gateway.connection_state != GatewayConnectionState::Connected
+            || self.gateway.ws_connection_id != Some(connection_id)
+        {
+            return;
+        }
+
+        let ws_sender = self.gateway.ws_command_sender.clone();
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            let request_thread_id = thread_id.clone();
+            let request_workspace_id = workspace_id.clone();
+
+            async move {
+                let result = cx
+                    .background_spawn(async move {
+                        ws_sender.cli_runtime_thread_binding_get(
+                            pioneer_protocol::CLIRuntimeThreadBindingGetParams {
+                                workspace_id: request_workspace_id,
+                                thread_id: request_thread_id,
+                            },
+                        )
+                    })
+                    .await;
+
+                let _ = this.update(&mut cx, |view, cx| {
+                    if view.gateway.ws_connection_id != Some(connection_id) {
+                        return;
+                    }
+                    if view.thread_workspace_id(thread_id.as_str()) != Some(workspace_id.as_str()) {
+                        return;
+                    }
+
+                    match result {
+                        Ok(response) => {
+                            view.set_cli_runtime_thread_binding(
+                                thread_id.clone(),
+                                response.binding,
+                            );
+                        }
+                        Err(error) => {
+                            warn!(
+                                thread_id = thread_id.as_str(),
+                                error = %format!("{error:#}"),
+                                "failed to refresh CLI runtime thread binding"
+                            );
+                            view.set_cli_runtime_thread_binding(thread_id.clone(), None);
+                        }
+                    }
                     cx.notify();
                 });
             }

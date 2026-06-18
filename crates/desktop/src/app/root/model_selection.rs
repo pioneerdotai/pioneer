@@ -2,6 +2,7 @@ use super::*;
 use pioneer_client::composer::model_selection::{
     ComposerModelSelection, ComposerModelSelectionState,
 };
+use pioneer_client::providers::list as provider_list;
 use pioneer_client::providers::presentation::{
     ProviderModelDisplayKey, ProviderModelDisplayState, provider_model_display_key,
     provider_model_display_models_params, resolve_provider_model_display_from_response,
@@ -97,6 +98,12 @@ impl PioneerDesktop {
         self.composer_selected_provider = provider;
         self.composer_selected_model = model;
         self.composer_model_selection_manually_selected = manually_selected;
+        if self.composer_selected_provider_is_cli_runtime() {
+            self.composer_attachments.clear();
+            self.composer_capabilities.clear();
+            self.composer_upload_in_progress = false;
+            self.composer_upload_error = None;
+        }
     }
 
     fn composer_model_display_key(&self) -> Option<ProviderModelDisplayKey> {
@@ -118,10 +125,28 @@ impl PioneerDesktop {
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             async move {
-                let params = provider_model_display_models_params(&key);
-                let result = cx
-                    .background_spawn(async move { ws_sender.provider_list_models(params) })
-                    .await;
+                let result = if let Some(runtime_id) =
+                    provider_list::runtime_id_from_cli_runtime_provider_key(key.provider.as_str())
+                {
+                    let provider_key = key.provider.clone();
+                    let params = provider_list::cli_runtime_list_models_params(
+                        key.workspace_id.clone(),
+                        runtime_id.to_owned(),
+                    );
+                    cx.background_spawn(async move {
+                        ws_sender.cli_runtime_list_models(params).map(|response| {
+                            provider_list::provider_models_response_from_cli_runtime_models_response(
+                                provider_key,
+                                response,
+                            )
+                        })
+                    })
+                    .await
+                } else {
+                    let params = provider_model_display_models_params(&key);
+                    cx.background_spawn(async move { ws_sender.provider_list_models(params) })
+                        .await
+                };
                 let _ = this.update(&mut cx, |view, cx| {
                     if view.composer_model_display_loading_key.as_ref() != Some(&key) {
                         return;

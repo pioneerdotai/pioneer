@@ -2389,7 +2389,7 @@
           "properties": {
             "kind": {
               "type": "string",
-              "const": "c_l_i_runtime_status_changed"
+              "const": "cli_runtime_status_changed"
             },
             "params": {
               "$ref": "#/$defs/CLIRuntimeStatusChangedNotification"
@@ -2405,7 +2405,7 @@
           "properties": {
             "kind": {
               "type": "string",
-              "const": "c_l_i_runtime_account_updated"
+              "const": "cli_runtime_account_updated"
             },
             "params": {
               "$ref": "#/$defs/CLIRuntimeAccountUpdatedNotification"
@@ -2421,7 +2421,7 @@
           "properties": {
             "kind": {
               "type": "string",
-              "const": "c_l_i_runtime_request_opened"
+              "const": "cli_runtime_request_opened"
             },
             "params": {
               "$ref": "#/$defs/CLIRuntimeRequestOpenedNotification"
@@ -2437,7 +2437,7 @@
           "properties": {
             "kind": {
               "type": "string",
-              "const": "c_l_i_runtime_request_resolved"
+              "const": "cli_runtime_request_resolved"
             },
             "params": {
               "$ref": "#/$defs/CLIRuntimeRequestResolvedNotification"
@@ -2453,7 +2453,7 @@
           "properties": {
             "kind": {
               "type": "string",
-              "const": "c_l_i_runtime_apps_changed"
+              "const": "cli_runtime_apps_changed"
             },
             "params": {
               "$ref": "#/$defs/CLIRuntimeAppsChangedNotification"

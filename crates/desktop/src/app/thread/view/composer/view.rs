@@ -24,12 +24,29 @@ impl PioneerDesktop {
         let capabilities = self.composer_capabilities.clone();
         let upload_error = self.composer_upload_error.clone();
         let can_send = self.can_submit_message(cx);
+        let cli_runtime_selected = self.composer_selected_provider_is_cli_runtime();
         let active_thread_snapshot = self.client_snapshot().active_thread;
         let gateway_connected =
             self.gateway.connection_state == crate::app::root::GatewayConnectionState::Connected;
         let is_cancelling = active_thread_snapshot.is_cancelling_turn();
         let can_stop = active_thread_snapshot.can_request_turn_cancel(gateway_connected);
         let has_in_flight_turn = active_thread_snapshot.has_in_flight_turn();
+        let composer_text = composer_state.read(cx).value().trim().to_owned();
+        let has_codex_steer_target = has_in_flight_turn
+            && active_thread_snapshot
+                .thread_id
+                .as_deref()
+                .is_some_and(|thread_id| {
+                    self.codex_cli_runtime_binding_for_thread(thread_id)
+                        .is_some()
+                });
+        let can_steer_codex_turn = has_codex_steer_target
+            && gateway_connected
+            && !is_cancelling
+            && !self.composer_upload_in_progress
+            && attachments.is_empty()
+            && capabilities.is_empty()
+            && !composer_text.is_empty();
 
         let composer_action_id = if has_in_flight_turn {
             "stop-turn"
@@ -59,7 +76,8 @@ impl PioneerDesktop {
                                 .bg(cx.theme().background)
                                 .rounded_t_2xl()
                                 .when(
-                                    !attachments.is_empty() || !capabilities.is_empty(),
+                                    !cli_runtime_selected
+                                        && (!attachments.is_empty() || !capabilities.is_empty()),
                                     |this| this.child(self.render_composer_chip_badges(cx)),
                                 )
                                 .when_some(upload_error, |this, error| {
@@ -103,34 +121,63 @@ impl PioneerDesktop {
                                     h_flex()
                                         .items_center()
                                         .gap_2()
-                                        .child(self.render_composer_add_menu(cx))
+                                        .when(!cli_runtime_selected, |this| {
+                                            this.child(self.render_composer_add_menu(cx))
+                                        })
                                         .child(self.render_composer_mode_selector(cx))
                                         .child(self.render_composer_model_selector(cx)),
                                 )
                                 .child(
-                                    div().child(
-                                        Button::new(composer_action_id)
-                                            .primary()
-                                            .rounded_full()
-                                            .disabled(composer_action_disabled)
-                                            .loading(
-                                                self.composer_upload_in_progress
-                                                    || (has_in_flight_turn && is_cancelling),
+                                    h_flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .when(has_codex_steer_target, |this| {
+                                            this.child(
+                                                Button::new("steer-running-codex-turn")
+                                                    .small()
+                                                    .ghost()
+                                                    .rounded_full()
+                                                    .icon(IconName::ArrowUp)
+                                                    .tooltip(
+                                                        t!("chat.composer.steer_codex").to_string(),
+                                                    )
+                                                    .disabled(!can_steer_codex_turn)
+                                                    .on_click(cx.listener(
+                                                        move |view, _, window, cx| {
+                                                            view.steer_active_codex_turn(
+                                                                window, cx,
+                                                            );
+                                                        },
+                                                    )),
                                             )
-                                            .when(has_in_flight_turn, |this| {
-                                                this.icon(PioneerIconName::Square)
-                                            })
-                                            .when(!has_in_flight_turn, |this| {
-                                                this.icon(IconName::ArrowUp)
-                                            })
-                                            .on_click(cx.listener(move |view, _, window, cx| {
-                                                if has_in_flight_turn {
-                                                    view.stop_active_turn(window, cx);
-                                                } else {
-                                                    view.submit_composer_message(window, cx);
-                                                }
-                                            })),
-                                    ),
+                                        })
+                                        .child(
+                                            Button::new(composer_action_id)
+                                                .primary()
+                                                .rounded_full()
+                                                .disabled(composer_action_disabled)
+                                                .loading(
+                                                    self.composer_upload_in_progress
+                                                        || (has_in_flight_turn && is_cancelling),
+                                                )
+                                                .when(has_in_flight_turn, |this| {
+                                                    this.icon(PioneerIconName::Square)
+                                                })
+                                                .when(!has_in_flight_turn, |this| {
+                                                    this.icon(IconName::ArrowUp)
+                                                })
+                                                .on_click(cx.listener(
+                                                    move |view, _, window, cx| {
+                                                        if has_in_flight_turn {
+                                                            view.stop_active_turn(window, cx);
+                                                        } else {
+                                                            view.submit_composer_message(
+                                                                window, cx,
+                                                            );
+                                                        }
+                                                    },
+                                                )),
+                                        ),
                                 ),
                         ),
                 ),

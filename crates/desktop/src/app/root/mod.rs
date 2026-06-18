@@ -26,6 +26,7 @@ pub(super) use pioneer_client::{
     artifacts::actions::ArtifactActionStatus as ThreadArtifactActionStatus,
     artifacts::preview::ArtifactPreviewImagePaths as ThreadArtifactPreviewImagePaths,
     artifacts::state::{ThreadArtifactFilter, ThreadArtifactsState},
+    cli_runtime::approvals::{CLIRuntimePendingRequestEntry, CLIRuntimePendingRequestState},
     composer::attachments::{ComposerAttachment, ComposerAttachmentUploadState},
     composer::capabilities::{ComposerCapability, ComposerCapabilityKind},
     gateway::runtime::GatewaySetupAction,
@@ -39,8 +40,9 @@ pub(super) use pioneer_client::{
     turns::timeline_refresh::TurnTimelineRefreshState,
 };
 use pioneer_protocol::{
-    GatewaySettingsSnapshot, McpListItem, McpServerDetailsResponse, SkillHealthItem, SkillListItem,
-    Thread, ThreadAgentsDocSummary, ThreadFolder, ThreadMode, ThreadPlacement, Workspace,
+    CLIAgentRuntimeKind, CLIRuntimeThreadBinding, GatewaySettingsSnapshot, McpListItem,
+    McpServerDetailsResponse, SkillHealthItem, SkillListItem, Thread, ThreadAgentsDocSummary,
+    ThreadFolder, ThreadMode, ThreadPlacement, Workspace,
 };
 use std::{
     cell::RefCell,
@@ -209,6 +211,8 @@ pub struct PioneerDesktop {
     pub(super) composer_model_display_loading_key: Option<ProviderModelDisplayKey>,
     pub(super) main_content_view: MainContentView,
     pub(super) providers: ProviderListState,
+    pub(super) cli_runtime_pending_requests: CLIRuntimePendingRequestState,
+    pub(super) cli_runtime_thread_bindings: HashMap<String, CLIRuntimeThreadBinding>,
     pub(super) mcp_servers: Vec<McpListItem>,
     pub(super) mcp_selected_server_id: Option<String>,
     pub(super) mcp_server_details: Option<McpServerDetailsResponse>,

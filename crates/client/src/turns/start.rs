@@ -2,8 +2,9 @@
 
 use crate::conversation::events::ConversationEvent;
 use pioneer_protocol::{
-    REQUEST_ID_LEN, Thread, ThreadMode, TurnCapability, TurnStartParams, TurnStartResponse,
-    UserInput, UserMessageAttachment, generate_id,
+    AgentExecutionBackend, REQUEST_ID_LEN, Thread, ThreadMode, TurnCLIRuntimeOptions,
+    TurnCapability, TurnStartParams, TurnStartResponse, UserInput, UserMessageAttachment,
+    generate_id,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -22,7 +23,7 @@ pub struct TextTurnPreparation {
     pub user_message_text: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TurnStartParamsPlan {
     pub thread_id: String,
     pub turn_id: String,
@@ -31,6 +32,8 @@ pub struct TurnStartParamsPlan {
     pub model: Option<String>,
     pub model_provider: Option<String>,
     pub mode: Option<ThreadMode>,
+    pub execution_backend: Option<AgentExecutionBackend>,
+    pub cli_runtime_options: Option<TurnCLIRuntimeOptions>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -86,6 +89,8 @@ pub fn turn_start_params_from_plan(plan: TurnStartParamsPlan) -> TurnStartParams
         model_provider: plan.model_provider,
         sandbox_policy: None,
         mode: plan.mode,
+        execution_backend: plan.execution_backend,
+        cli_runtime_options: plan.cli_runtime_options,
     }
 }
 
@@ -243,6 +248,8 @@ mod tests {
             model: Some("gpt-5.4".to_owned()),
             model_provider: Some("openai".to_owned()),
             mode: Some(ThreadMode::Agent),
+            execution_backend: None,
+            cli_runtime_options: None,
         });
 
         assert_eq!(params.thread_id, "thread");
@@ -253,6 +260,8 @@ mod tests {
         assert_eq!(params.model_provider.as_deref(), Some("openai"));
         assert_eq!(params.mode, Some(ThreadMode::Agent));
         assert_eq!(params.sandbox_policy, None);
+        assert_eq!(params.execution_backend, None);
+        assert_eq!(params.cli_runtime_options, None);
     }
 
     #[test]

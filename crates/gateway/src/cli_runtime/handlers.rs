@@ -1,10 +1,9 @@
 use super::*;
 use crate::cli_runtime::config::codex_account_probe_config_from_instance;
 use crate::cli_runtime::manager::{
-    CLIAgentRuntimeCodexEventReceivers, CLIAgentRuntimeReviewStartRequest,
-    CLIAgentRuntimeReviewStartResult, CLIAgentRuntimeSession, CLIAgentRuntimeSessionKey,
-    CLIAgentRuntimeThreadCompactRequest, CLIAgentRuntimeThreadForkRequest,
-    CLIAgentRuntimeThreadNameSetRequest, CLIAgentRuntimeTurnSteerRequest,
+    CLIAgentRuntimeCodexEventReceivers, CLIAgentRuntimeSession, CLIAgentRuntimeSessionKey,
+    CLIAgentRuntimeThreadForkRequest, CLIAgentRuntimeThreadNameSetRequest,
+    CLIAgentRuntimeTurnSteerRequest,
 };
 use anyhow::Context as AnyhowContext;
 use pioneer_cli_agent_runtime::codex::{
@@ -33,6 +32,10 @@ use std::sync::Arc;
 const CLI_RUNTIME_FILE_CHANGE_DIFF_PREVIEW_MAX_CHARS: usize = 16_384;
 const CLI_RUNTIME_PENDING_TURN_EVENT_MAX_KEYS: usize = 128;
 const CLI_RUNTIME_PENDING_TURN_EVENT_MAX_PER_TURN: usize = 512;
+const CLI_RUNTIME_STALE_TURN_SCAN_LIMIT: u64 = 128;
+const CLI_RUNTIME_SILENT_TURN_STALE_AFTER_MS: i64 = 150_000;
+const CLI_RUNTIME_EVENTED_TURN_STALE_AFTER_MS: i64 = 15 * 60 * 1_000;
+const CLI_RUNTIME_PENDING_UNBOUND_EVENT_TTL_MS: i64 = 30_000;
 
 impl MessageProcessor {
     pub(super) async fn cli_runtime_list(
@@ -389,223 +392,25 @@ impl MessageProcessor {
         request_id: RequestId,
         params: CLIRuntimeThreadCompactParams,
     ) {
-        let Some(workspace_id) = self
+        let Some(_workspace_id) = self
             .validate_cli_runtime_workspace(
                 connection_id,
                 request_id.clone(),
                 methods::CLI_RUNTIME_THREAD_COMPACT,
-                params.workspace_id.clone(),
+                params.workspace_id,
             )
             .await
         else {
             return;
         };
-        let params = match validate_cli_runtime_thread_compact_params(params) {
-            Ok(params) => params,
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(Some(request_id), INVALID_PARAMS_CODE, error),
-                )
-                .await;
-                return;
-            }
-        };
 
-        let Some(thread) = self
-            .thread_manager
-            .thread_get(params.thread_id.as_str())
-            .await
-        else {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    format!("thread `{}` is not loaded", params.thread_id),
-                ),
-            )
-            .await;
-            return;
-        };
-        if thread.workspace_id != workspace_id {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_PARAMS_CODE,
-                    format!(
-                        "thread `{}` belongs to workspace `{}`",
-                        params.thread_id, thread.workspace_id
-                    ),
-                ),
-            )
-            .await;
-            return;
-        }
-
-        let binding = match self
-            .crud_store
-            .get_cli_runtime_thread_binding(params.thread_id.as_str())
-            .await
-        {
-            Ok(Some(binding)) => binding,
-            Ok(None) => {
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!(
-                            "thread `{}` is not bound to a CLI runtime",
-                            params.thread_id
-                        ),
-                    ),
-                )
-                .await;
-                return;
-            }
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!(
-                            "failed to load CLI runtime binding for thread `{}`: {error:#}",
-                            params.thread_id
-                        ),
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
-        if binding.workspace_id != workspace_id {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_PARAMS_CODE,
-                    format!(
-                        "CLI runtime binding for thread `{}` belongs to workspace `{}`",
-                        params.thread_id, binding.workspace_id
-                    ),
-                ),
-            )
-            .await;
-            return;
-        }
-        if binding.runtime_id != params.runtime_id {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_PARAMS_CODE,
-                    format!(
-                        "thread `{}` is bound to CLI runtime `{}`",
-                        params.thread_id, binding.runtime_id
-                    ),
-                ),
-            )
-            .await;
-            return;
-        }
-        if binding.runtime_kind != "codex" {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    format!(
-                        "CLI runtime compaction is only supported for Codex threads; thread `{}` is bound to `{}`",
-                        params.thread_id, binding.runtime_kind
-                    ),
-                ),
-            )
-            .await;
-            return;
-        }
-
-        let Some(manager) = self.cli_runtime_manager.as_ref() else {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    "CLI runtime manager is not available for thread compaction".to_owned(),
-                ),
-            )
-            .await;
-            return;
-        };
-        let key = match CLIAgentRuntimeSessionKey::new(
-            workspace_id.as_str(),
-            params.runtime_id.as_str(),
-            params.thread_id.as_str(),
-        ) {
-            Ok(key) => key,
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_PARAMS_CODE,
-                        format!("invalid CLI runtime compaction key: {error:#}"),
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
-        let handle = match manager.get_or_start(key).await {
-            Ok(handle) => handle,
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to start CLI runtime session for compaction: {error:#}"),
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
-        let compact = match handle
-            .session()
-            .thread_compact(CLIAgentRuntimeThreadCompactRequest {
-                native_thread_id: binding.native_thread_id.clone(),
-            })
-            .await
-        {
-            Ok(compact) => compact,
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to start CLI runtime compaction: {error:#}"),
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
-
-        self.send_cli_runtime_response(
+        self.send_error(
             connection_id,
-            request_id,
-            methods::CLI_RUNTIME_THREAD_COMPACT,
-            &CLIRuntimeThreadCompactResponse {
-                workspace_id,
-                runtime_id: params.runtime_id,
-                thread_id: params.thread_id,
-                native_thread_id: compact.native_thread_id,
-                raw: compact.raw,
-            },
+            JsonRpcErrorResponse::new(
+                Some(request_id),
+                INVALID_REQUEST_CODE,
+                "CLI runtime thread compaction is not supported for managed Pioneer CLI runtime threads".to_owned(),
+            ),
         )
         .await;
     }
@@ -1303,253 +1108,26 @@ impl MessageProcessor {
         request_id: RequestId,
         params: CLIRuntimeReviewStartParams,
     ) {
-        let Some(workspace_id) = self
+        let Some(_workspace_id) = self
             .validate_cli_runtime_workspace(
                 connection_id,
                 request_id.clone(),
                 methods::CLI_RUNTIME_REVIEW_START,
-                params.workspace_id.clone(),
+                params.workspace_id,
             )
             .await
         else {
             return;
         };
 
-        let params = match validate_cli_runtime_review_start_params(params) {
-            Ok(params) => params,
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(Some(request_id), INVALID_PARAMS_CODE, error),
-                )
-                .await;
-                return;
-            }
-        };
-
-        let Some(thread) = self
-            .thread_manager
-            .thread_get(params.thread_id.as_str())
-            .await
-        else {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    format!("thread `{}` is not loaded", params.thread_id),
-                ),
-            )
-            .await;
-            return;
-        };
-        if thread.workspace_id != workspace_id {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_PARAMS_CODE,
-                    format!(
-                        "thread `{}` belongs to workspace `{}`",
-                        params.thread_id, thread.workspace_id
-                    ),
-                ),
-            )
-            .await;
-            return;
-        }
-
-        let binding = match self
-            .crud_store
-            .get_cli_runtime_thread_binding(params.thread_id.as_str())
-            .await
-        {
-            Ok(Some(binding)) => binding,
-            Ok(None) => {
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!(
-                            "thread `{}` is not bound to a CLI runtime",
-                            params.thread_id
-                        ),
-                    ),
-                )
-                .await;
-                return;
-            }
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!(
-                            "failed to load CLI runtime binding for thread `{}`: {error:#}",
-                            params.thread_id
-                        ),
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
-        if binding.workspace_id != workspace_id {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_PARAMS_CODE,
-                    format!(
-                        "CLI runtime binding for thread `{}` belongs to workspace `{}`",
-                        params.thread_id, binding.workspace_id
-                    ),
-                ),
-            )
-            .await;
-            return;
-        }
-        if binding.runtime_id != params.runtime_id {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_PARAMS_CODE,
-                    format!(
-                        "thread `{}` is bound to CLI runtime `{}`",
-                        params.thread_id, binding.runtime_id
-                    ),
-                ),
-            )
-            .await;
-            return;
-        }
-        if binding.runtime_kind != "codex" {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    format!(
-                        "CLI runtime review is only supported for Codex threads; thread `{}` is bound to `{}`",
-                        params.thread_id, binding.runtime_kind
-                    ),
-                ),
-            )
-            .await;
-            return;
-        }
-
-        let Some(manager) = self.cli_runtime_manager.as_ref() else {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    "CLI runtime manager is not available for review start".to_owned(),
-                ),
-            )
-            .await;
-            return;
-        };
-
-        let key = match CLIAgentRuntimeSessionKey::new(
-            workspace_id.as_str(),
-            params.runtime_id.as_str(),
-            params.thread_id.as_str(),
-        ) {
-            Ok(key) => key,
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_PARAMS_CODE,
-                        format!("invalid CLI runtime review key: {error:#}"),
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
-        let handle = match manager.get_or_start(key).await {
-            Ok(handle) => handle,
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to start CLI runtime session for review: {error:#}"),
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
-        let review = match handle
-            .session()
-            .review_start(CLIAgentRuntimeReviewStartRequest {
-                native_thread_id: binding.native_thread_id.clone(),
-                delivery: params.delivery,
-                target: params.target.clone(),
-            })
-            .await
-        {
-            Ok(review) => review,
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to start CLI runtime review: {error:#}"),
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
-
-        if let Err(error) = self
-            .persist_cli_runtime_review_turn_binding_if_present(
-                &workspace_id,
-                &params,
-                &binding,
-                &review,
-            )
-            .await
-        {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    format!("failed to persist CLI runtime review binding: {error:#}"),
-                ),
-            )
-            .await;
-            return;
-        }
-
-        self.send_cli_runtime_response(
+        self.send_error(
             connection_id,
-            request_id,
-            methods::CLI_RUNTIME_REVIEW_START,
-            &CLIRuntimeReviewStartResponse {
-                workspace_id,
-                runtime_id: params.runtime_id,
-                thread_id: params.thread_id,
-                turn_id: params.turn_id,
-                delivery: params.delivery,
-                target: params.target,
-                native_thread_id: review.native_thread_id,
-                review_thread_id: review.review_thread_id,
-                native_turn_id: review.native_turn_id,
-                raw: review.raw,
-            },
+            JsonRpcErrorResponse::new(
+                Some(request_id),
+                INVALID_REQUEST_CODE,
+                "CLI runtime review start is not supported for managed Pioneer CLI runtime threads"
+                    .to_owned(),
+            ),
         )
         .await;
     }
@@ -2372,6 +1950,233 @@ impl MessageProcessor {
         }
     }
 
+    pub(super) async fn fail_stale_cli_runtime_turns(&self, now_unix_ms: i64) {
+        let bindings = match self
+            .crud_store
+            .list_cli_runtime_turn_bindings(pioneer_crud::CliRuntimeTurnBindingListFilter {
+                statuses: vec![
+                    crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING.to_owned(),
+                    crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING.to_owned(),
+                ],
+                limit: Some(CLI_RUNTIME_STALE_TURN_SCAN_LIMIT),
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(bindings) => bindings,
+            Err(error) => {
+                warn!(
+                    error = %format!("{error:#}"),
+                    "failed to scan stale CLI runtime turn bindings"
+                );
+                return;
+            }
+        };
+
+        for binding in bindings {
+            if let Err(error) = self
+                .fail_stale_cli_runtime_turn_binding(binding, now_unix_ms)
+                .await
+            {
+                warn!(
+                    error = %format!("{error:#}"),
+                    "failed to reconcile stale CLI runtime turn binding"
+                );
+            }
+        }
+        self.prune_stale_cli_runtime_pending_turn_events(now_unix_ms)
+            .await;
+    }
+
+    async fn fail_stale_cli_runtime_turn_binding(
+        &self,
+        binding: pioneer_crud::CliRuntimeTurnBindingRecord,
+        now_unix_ms: i64,
+    ) -> anyhow::Result<()> {
+        let (workspace_id, turn, turn_loaded_in_memory) = if let Some((workspace_id, turn)) = self
+            .thread_manager
+            .turn_get(binding.thread_id.as_str(), binding.turn_id.as_str())
+            .await
+        {
+            (workspace_id, turn, true)
+        } else {
+            let Some((workspace_id, turn)) = self
+                .crud_store
+                .get_turn(binding.thread_id.as_str(), binding.turn_id.as_str())
+                .await?
+            else {
+                return Ok(());
+            };
+            (workspace_id, turn, false)
+        };
+        if turn.status != TurnStatus::InProgress {
+            if let Some(status) = cli_runtime_terminal_binding_status_for_turn_status(turn.status) {
+                crate::cli_runtime::turn_binding::update_cli_runtime_turn_binding_status(
+                    self.crud_store.as_ref(),
+                    binding.turn_id.as_str(),
+                    status,
+                    chrono::Utc::now().fixed_offset(),
+                )
+                .await?;
+            }
+            return Ok(());
+        }
+
+        let latest_native_event_ms = self
+            .latest_cli_runtime_native_event_timestamp_ms(&binding)
+            .await?;
+        let last_activity_ms =
+            latest_native_event_ms.unwrap_or(binding.updated_at.timestamp_millis());
+        let stale_after_ms = if latest_native_event_ms.is_some() {
+            CLI_RUNTIME_EVENTED_TURN_STALE_AFTER_MS
+        } else {
+            CLI_RUNTIME_SILENT_TURN_STALE_AFTER_MS
+        };
+        if now_unix_ms.saturating_sub(last_activity_ms) < stale_after_ms {
+            return Ok(());
+        }
+
+        let message = if let Some(native_turn_id) = binding.native_turn_id.as_deref() {
+            if latest_native_event_ms.is_some() {
+                format!(
+                    "CLI runtime turn `{}` stopped emitting native events for native turn `{native_turn_id}` and was marked failed after {} ms of inactivity",
+                    binding.turn_id, stale_after_ms
+                )
+            } else {
+                format!(
+                    "CLI runtime turn `{}` did not emit any native events for native turn `{native_turn_id}` and was marked failed after {} ms",
+                    binding.turn_id, stale_after_ms
+                )
+            }
+        } else {
+            format!(
+                "CLI runtime turn `{}` did not receive a native turn id and was marked failed after {} ms",
+                binding.turn_id, stale_after_ms
+            )
+        };
+
+        let did_mark_failed = if turn_loaded_in_memory {
+            self.mark_turn_failed_terminal(
+                binding.thread_id.clone(),
+                binding.turn_id.clone(),
+                message,
+            )
+            .await
+        } else {
+            self.materialize_db_only_cli_runtime_turn_failed(
+                workspace_id,
+                binding.thread_id.clone(),
+                turn,
+                message,
+            )
+            .await?
+        };
+
+        if did_mark_failed {
+            crate::cli_runtime::turn_binding::update_cli_runtime_turn_binding_status(
+                self.crud_store.as_ref(),
+                binding.turn_id.as_str(),
+                crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_FAILED,
+                chrono::Utc::now().fixed_offset(),
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn materialize_db_only_cli_runtime_turn_failed(
+        &self,
+        workspace_id: String,
+        thread_id: String,
+        mut turn: Turn,
+        message: String,
+    ) -> anyhow::Result<bool> {
+        if turn.status != TurnStatus::InProgress {
+            return Ok(false);
+        }
+        turn.status = TurnStatus::Failed;
+        turn.error = Some(message);
+
+        let notification = TurnFailedNotification {
+            workspace_id,
+            thread_id,
+            turn,
+        };
+        let event_timestamp = now_timestamp_secs();
+        self.crud_store
+            .materialize_turn_failed(notification.clone(), event_timestamp)
+            .await?;
+        self.send_notification_to_workspace_connections(
+            notification.workspace_id.as_str(),
+            events::TURN_FAILED,
+            &notification,
+        )
+        .await;
+        Ok(true)
+    }
+
+    async fn latest_cli_runtime_native_event_timestamp_ms(
+        &self,
+        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+    ) -> anyhow::Result<Option<i64>> {
+        let Some(native_turn_id) = binding.native_turn_id.as_ref() else {
+            return Ok(None);
+        };
+        let events = self
+            .crud_store
+            .list_cli_runtime_native_events(pioneer_crud::CliRuntimeNativeEventListFilter {
+                runtime_id: Some(binding.runtime_id.clone()),
+                thread_id: Some(binding.thread_id.clone()),
+                turn_id: None,
+                native_thread_id: Some(binding.native_thread_id.clone()),
+                native_turn_id: Some(native_turn_id.clone()),
+                limit: None,
+            })
+            .await?;
+        Ok(events
+            .into_iter()
+            .map(|event| event.sequence.max(event.created_at.timestamp_millis()))
+            .max())
+    }
+
+    async fn prune_stale_cli_runtime_pending_turn_events(&self, now_unix_ms: i64) {
+        let mut removed = Vec::new();
+        {
+            let mut buffer = self.cli_runtime_pending_turn_events.lock().await;
+            buffer.retain(|key, events| {
+                let last_received_at = events
+                    .iter()
+                    .map(|event| event.received_at_unix_ms)
+                    .max()
+                    .unwrap_or(0);
+                let keep = now_unix_ms.saturating_sub(last_received_at)
+                    < CLI_RUNTIME_PENDING_UNBOUND_EVENT_TTL_MS;
+                if !keep {
+                    removed.push((
+                        key.workspace_id.clone(),
+                        key.runtime_id.clone(),
+                        key.thread_id.clone(),
+                        key.native_turn_id.clone(),
+                        events.len(),
+                    ));
+                }
+                keep
+            });
+        }
+
+        for (workspace_id, runtime_id, thread_id, native_turn_id, event_count) in removed {
+            warn!(
+                workspace_id = workspace_id.as_str(),
+                runtime_id = runtime_id.as_str(),
+                thread_id = thread_id.as_str(),
+                native_turn_id = native_turn_id.as_str(),
+                event_count,
+                "discarded unbound Codex native turn events after TTL"
+            );
+        }
+    }
+
     async fn buffer_cli_runtime_codex_event_until_turn_binding(
         &self,
         key: &CLIAgentRuntimeSessionKey,
@@ -2563,63 +2368,6 @@ impl MessageProcessor {
                 None
             }
         }
-    }
-
-    async fn persist_cli_runtime_review_turn_binding_if_present(
-        &self,
-        workspace_id: &str,
-        params: &CLIRuntimeReviewStartParams,
-        thread_binding: &pioneer_crud::CliRuntimeThreadBindingRecord,
-        review: &CLIAgentRuntimeReviewStartResult,
-    ) -> anyhow::Result<()> {
-        let (Some(turn_id), Some(native_turn_id)) =
-            (params.turn_id.as_ref(), review.native_turn_id.as_ref())
-        else {
-            return Ok(());
-        };
-
-        let now = chrono::Utc::now().fixed_offset();
-        let input_mapping_json = pioneer_crud::serialize_cli_runtime_json(&json!({
-            "kind": "codex_review_start",
-            "delivery": params.delivery,
-            "target": &params.target,
-            "nativeSourceThreadId": thread_binding.native_thread_id.as_str(),
-            "nativeReviewThreadId": review.review_thread_id.as_str(),
-            "nativeTurnId": native_turn_id,
-            "raw": review.raw.as_ref(),
-        }))
-        .context("failed to serialize CLI runtime review input mapping")?;
-
-        crate::cli_runtime::turn_binding::persist_cli_runtime_turn_binding_before_native_start(
-            self.crud_store.as_ref(),
-            crate::cli_runtime::turn_binding::CLIAgentRuntimeTurnBindingStartRequest {
-                workspace_id: workspace_id.to_owned(),
-                thread_id: params.thread_id.clone(),
-                turn_id: turn_id.clone(),
-                runtime_id: params.runtime_id.clone(),
-                runtime_kind: thread_binding.runtime_kind.clone(),
-                native_thread_id: review.native_thread_id.clone(),
-                request_id: None,
-                model: thread_binding.native_model.clone(),
-                cwd: thread_binding.native_cwd.clone(),
-                sandbox_json: None,
-                approval_policy: None,
-                input_mapping_json,
-                created_at: now,
-            },
-        )
-        .await?;
-        crate::cli_runtime::turn_binding::persist_cli_runtime_turn_binding_after_native_start(
-            self.crud_store.as_ref(),
-            crate::cli_runtime::turn_binding::CLIAgentRuntimeNativeTurnStarted {
-                turn_id: turn_id.clone(),
-                native_turn_id: native_turn_id.clone(),
-                request_id: None,
-                started_at: now,
-            },
-        )
-        .await?;
-        Ok(())
     }
 
     async fn emit_cli_runtime_steer_accepted_timeline_event(
@@ -3142,31 +2890,6 @@ fn cli_runtime_thread_binding_from_record(
     })
 }
 
-fn validate_cli_runtime_thread_compact_params(
-    params: CLIRuntimeThreadCompactParams,
-) -> Result<CLIRuntimeThreadCompactParams, String> {
-    Ok(CLIRuntimeThreadCompactParams {
-        workspace_id: normalize_cli_runtime_required_field(
-            methods::CLI_RUNTIME_THREAD_COMPACT,
-            "workspace_id",
-            params.workspace_id,
-            128,
-        )?,
-        runtime_id: normalize_cli_runtime_required_field(
-            methods::CLI_RUNTIME_THREAD_COMPACT,
-            "runtime_id",
-            params.runtime_id,
-            128,
-        )?,
-        thread_id: normalize_cli_runtime_required_field(
-            methods::CLI_RUNTIME_THREAD_COMPACT,
-            "thread_id",
-            params.thread_id,
-            128,
-        )?,
-    })
-}
-
 fn validate_cli_runtime_thread_fork_params(
     params: CLIRuntimeThreadForkParams,
 ) -> Result<CLIRuntimeThreadForkParams, String> {
@@ -3259,74 +2982,6 @@ fn validate_cli_runtime_turn_steer_params(
     })
 }
 
-fn validate_cli_runtime_review_start_params(
-    params: CLIRuntimeReviewStartParams,
-) -> Result<CLIRuntimeReviewStartParams, String> {
-    let workspace_id =
-        normalize_cli_runtime_review_required_field("workspace_id", params.workspace_id, 128)?;
-    let runtime_id =
-        normalize_cli_runtime_review_required_field("runtime_id", params.runtime_id, 128)?;
-    let thread_id =
-        normalize_cli_runtime_review_required_field("thread_id", params.thread_id, 128)?;
-    let turn_id = match params.turn_id {
-        Some(turn_id) => Some(normalize_cli_runtime_review_required_field(
-            "turn_id", turn_id, 128,
-        )?),
-        None => None,
-    };
-    let target = validate_cli_runtime_review_target(params.target)?;
-
-    Ok(CLIRuntimeReviewStartParams {
-        workspace_id,
-        runtime_id,
-        thread_id,
-        turn_id,
-        delivery: params.delivery,
-        target,
-    })
-}
-
-fn validate_cli_runtime_review_target(
-    target: CLIRuntimeReviewTarget,
-) -> Result<CLIRuntimeReviewTarget, String> {
-    match target {
-        CLIRuntimeReviewTarget::UncommittedChanges => Ok(target),
-        CLIRuntimeReviewTarget::BaseBranch { branch } => {
-            let branch = normalize_cli_runtime_review_required_field("target.branch", branch, 256)?;
-            Ok(CLIRuntimeReviewTarget::BaseBranch { branch })
-        }
-        CLIRuntimeReviewTarget::Commit { sha, title } => {
-            let sha = normalize_cli_runtime_review_required_field("target.sha", sha, 64)?;
-            if sha.len() < 4 || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                return Err("invalid params for `cli_runtime/review/start`: `target.sha` must be a 4-64 character hexadecimal commit SHA".to_owned());
-            }
-            let title = title
-                .map(|title| {
-                    normalize_cli_runtime_review_optional_field("target.title", title, 256)
-                })
-                .transpose()?
-                .flatten();
-            Ok(CLIRuntimeReviewTarget::Commit { sha, title })
-        }
-        CLIRuntimeReviewTarget::Custom { instructions } => {
-            let instructions = normalize_cli_runtime_review_required_field(
-                "target.instructions",
-                instructions,
-                20_000,
-            )?;
-            Ok(CLIRuntimeReviewTarget::Custom { instructions })
-        }
-    }
-}
-
-fn normalize_cli_runtime_review_required_field(
-    field: &str,
-    value: String,
-    max_chars: usize,
-) -> Result<String, String> {
-    normalize_cli_runtime_required_field(methods::CLI_RUNTIME_REVIEW_START, field, value, max_chars)
-}
-
 fn normalize_cli_runtime_required_field(
     method: &str,
     field: &str,
@@ -3339,14 +2994,6 @@ fn normalize_cli_runtime_required_field(
         ));
     };
     Ok(value)
-}
-
-fn normalize_cli_runtime_review_optional_field(
-    field: &str,
-    value: String,
-    max_chars: usize,
-) -> Result<Option<String>, String> {
-    normalize_cli_runtime_optional_field(methods::CLI_RUNTIME_REVIEW_START, field, value, max_chars)
 }
 
 fn normalize_cli_runtime_optional_field(
@@ -3437,8 +3084,8 @@ fn cli_runtime_capabilities_for_kind(
             supports_user_input_requests: true,
             supports_model_list: true,
             supports_apps: false,
-            supports_review: true,
-            supports_compaction: true,
+            supports_review: false,
+            supports_compaction: false,
             supports_goal: false,
             supports_diff_updates: true,
             supports_history_read: true,
@@ -4318,6 +3965,24 @@ fn cli_runtime_terminal_status_for_event(event: &RuntimeEvent) -> Option<&'stati
     }
 }
 
+fn cli_runtime_terminal_binding_status_for_turn_status(status: TurnStatus) -> Option<&'static str> {
+    match status {
+        TurnStatus::Completed => {
+            Some(crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_COMPLETED)
+        }
+        TurnStatus::Failed => {
+            Some(crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_FAILED)
+        }
+        TurnStatus::Interrupted => {
+            Some(crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_INTERRUPTED)
+        }
+        TurnStatus::Blocked => {
+            Some(crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_BLOCKED)
+        }
+        TurnStatus::InProgress => None,
+    }
+}
+
 fn cli_runtime_request_status_for_resolution(
     resolution: &CLIRuntimeRequestResolution,
 ) -> StoredCliRuntimePendingRequestStatus {
@@ -4455,8 +4120,8 @@ mod tests {
             Some("alex@example.com")
         );
         assert_eq!(runtime.diagnostics[0].code, "codex_probe.ready");
-        assert!(runtime.capabilities.supports_review);
-        assert!(runtime.capabilities.supports_compaction);
+        assert!(!runtime.capabilities.supports_review);
+        assert!(!runtime.capabilities.supports_compaction);
         assert!(!runtime.capabilities.supports_goal);
         assert!(!runtime.capabilities.supports_thread_archive);
         assert!(

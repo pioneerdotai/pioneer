@@ -21,6 +21,14 @@ use pioneer_protocol::{
     ArtifactReadResponse, ArtifactRestoreParams, ArtifactRestoreResponse,
     ArtifactUploadAbortParams, ArtifactUploadAbortResponse, ArtifactUploadFinishParams,
     ArtifactUploadFinishResponse, ArtifactUploadStartParams, ArtifactUploadStartResponse,
+    CLIRuntimeListModelsParams, CLIRuntimeListModelsResponse, CLIRuntimeListParams,
+    CLIRuntimeListResponse, CLIRuntimeLoginCancelParams, CLIRuntimeLoginCancelResponse,
+    CLIRuntimeLoginStartParams, CLIRuntimeLoginStartResponse, CLIRuntimeRefreshParams,
+    CLIRuntimeRefreshResponse, CLIRuntimeRequestRespondParams, CLIRuntimeRequestRespondResponse,
+    CLIRuntimeReviewStartParams, CLIRuntimeReviewStartResponse, CLIRuntimeStatusParams,
+    CLIRuntimeStatusResponse, CLIRuntimeThreadBindingGetParams, CLIRuntimeThreadBindingGetResponse,
+    CLIRuntimeThreadCompactParams, CLIRuntimeThreadCompactResponse, CLIRuntimeThreadForkParams,
+    CLIRuntimeThreadForkResponse, CLIRuntimeTurnSteerParams, CLIRuntimeTurnSteerResponse,
     GatewaySettingsGetParams, GatewaySettingsGetResponse, GatewaySettingsUpdate,
     GatewaySettingsUpdateParams, GatewaySettingsUpdateResponse, McpInstallParams,
     McpInstallResponse, McpListParams, McpListResponse, McpPolicySetParams, McpPolicySetResponse,
@@ -547,6 +555,363 @@ where
     send_json_rpc_request_typed(
         transport,
         methods::PROVIDER_LIST,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn cli_runtime_list<TTransport>(
+    transport: &TTransport,
+    params: CLIRuntimeListParams,
+) -> Result<CLIRuntimeListResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.workspace_id.as_str(),
+        "workspace_id",
+        methods::CLI_RUNTIME_LIST,
+    )?;
+
+    send_json_rpc_request_typed(
+        transport,
+        methods::CLI_RUNTIME_LIST,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn cli_runtime_list_models<TTransport>(
+    transport: &TTransport,
+    params: CLIRuntimeListModelsParams,
+) -> Result<CLIRuntimeListModelsResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.workspace_id.as_str(),
+        "workspace_id",
+        methods::CLI_RUNTIME_LIST_MODELS,
+    )?;
+    require_non_empty_field(
+        params.runtime_id.as_str(),
+        "runtime_id",
+        methods::CLI_RUNTIME_LIST_MODELS,
+    )?;
+
+    send_json_rpc_request_typed(
+        transport,
+        methods::CLI_RUNTIME_LIST_MODELS,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn cli_runtime_status<TTransport>(
+    transport: &TTransport,
+    params: CLIRuntimeStatusParams,
+) -> Result<CLIRuntimeStatusResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.workspace_id.as_str(),
+        "workspace_id",
+        methods::CLI_RUNTIME_STATUS,
+    )?;
+    require_non_empty_field(
+        params.runtime_id.as_str(),
+        "runtime_id",
+        methods::CLI_RUNTIME_STATUS,
+    )?;
+
+    send_json_rpc_request_typed(
+        transport,
+        methods::CLI_RUNTIME_STATUS,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn cli_runtime_thread_binding_get<TTransport>(
+    transport: &TTransport,
+    params: CLIRuntimeThreadBindingGetParams,
+) -> Result<CLIRuntimeThreadBindingGetResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.workspace_id.as_str(),
+        "workspace_id",
+        methods::CLI_RUNTIME_THREAD_BINDING_GET,
+    )?;
+    require_non_empty_field(
+        params.thread_id.as_str(),
+        "thread_id",
+        methods::CLI_RUNTIME_THREAD_BINDING_GET,
+    )?;
+
+    send_json_rpc_request_typed(
+        transport,
+        methods::CLI_RUNTIME_THREAD_BINDING_GET,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn cli_runtime_thread_compact<TTransport>(
+    transport: &TTransport,
+    params: CLIRuntimeThreadCompactParams,
+) -> Result<CLIRuntimeThreadCompactResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.workspace_id.as_str(),
+        "workspace_id",
+        methods::CLI_RUNTIME_THREAD_COMPACT,
+    )?;
+    require_non_empty_field(
+        params.runtime_id.as_str(),
+        "runtime_id",
+        methods::CLI_RUNTIME_THREAD_COMPACT,
+    )?;
+    require_non_empty_field(
+        params.thread_id.as_str(),
+        "thread_id",
+        methods::CLI_RUNTIME_THREAD_COMPACT,
+    )?;
+
+    send_json_rpc_request_typed(
+        transport,
+        methods::CLI_RUNTIME_THREAD_COMPACT,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn cli_runtime_thread_fork<TTransport>(
+    transport: &TTransport,
+    params: CLIRuntimeThreadForkParams,
+) -> Result<CLIRuntimeThreadForkResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.workspace_id.as_str(),
+        "workspace_id",
+        methods::CLI_RUNTIME_THREAD_FORK,
+    )?;
+    require_non_empty_field(
+        params.runtime_id.as_str(),
+        "runtime_id",
+        methods::CLI_RUNTIME_THREAD_FORK,
+    )?;
+    require_non_empty_field(
+        params.source_thread_id.as_str(),
+        "source_thread_id",
+        methods::CLI_RUNTIME_THREAD_FORK,
+    )?;
+    require_non_empty_field(
+        params.fork_thread_id.as_str(),
+        "fork_thread_id",
+        methods::CLI_RUNTIME_THREAD_FORK,
+    )?;
+    require_optional_non_empty_field(
+        params.name.as_deref(),
+        "name",
+        methods::CLI_RUNTIME_THREAD_FORK,
+    )?;
+
+    send_json_rpc_request_typed(
+        transport,
+        methods::CLI_RUNTIME_THREAD_FORK,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn cli_runtime_turn_steer<TTransport>(
+    transport: &TTransport,
+    params: CLIRuntimeTurnSteerParams,
+) -> Result<CLIRuntimeTurnSteerResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.workspace_id.as_str(),
+        "workspace_id",
+        methods::CLI_RUNTIME_TURN_STEER,
+    )?;
+    require_non_empty_field(
+        params.runtime_id.as_str(),
+        "runtime_id",
+        methods::CLI_RUNTIME_TURN_STEER,
+    )?;
+    require_non_empty_field(
+        params.thread_id.as_str(),
+        "thread_id",
+        methods::CLI_RUNTIME_TURN_STEER,
+    )?;
+    require_non_empty_field(
+        params.turn_id.as_str(),
+        "turn_id",
+        methods::CLI_RUNTIME_TURN_STEER,
+    )?;
+    require_non_empty_field(
+        params.message.as_str(),
+        "message",
+        methods::CLI_RUNTIME_TURN_STEER,
+    )?;
+
+    send_json_rpc_request_typed(
+        transport,
+        methods::CLI_RUNTIME_TURN_STEER,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn cli_runtime_review_start<TTransport>(
+    transport: &TTransport,
+    params: CLIRuntimeReviewStartParams,
+) -> Result<CLIRuntimeReviewStartResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.workspace_id.as_str(),
+        "workspace_id",
+        methods::CLI_RUNTIME_REVIEW_START,
+    )?;
+    require_non_empty_field(
+        params.runtime_id.as_str(),
+        "runtime_id",
+        methods::CLI_RUNTIME_REVIEW_START,
+    )?;
+    require_non_empty_field(
+        params.thread_id.as_str(),
+        "thread_id",
+        methods::CLI_RUNTIME_REVIEW_START,
+    )?;
+    require_optional_non_empty_field(
+        params.turn_id.as_deref(),
+        "turn_id",
+        methods::CLI_RUNTIME_REVIEW_START,
+    )?;
+
+    send_json_rpc_request_typed(
+        transport,
+        methods::CLI_RUNTIME_REVIEW_START,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn cli_runtime_refresh<TTransport>(
+    transport: &TTransport,
+    params: CLIRuntimeRefreshParams,
+) -> Result<CLIRuntimeRefreshResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.workspace_id.as_str(),
+        "workspace_id",
+        methods::CLI_RUNTIME_REFRESH,
+    )?;
+
+    send_json_rpc_request_typed(
+        transport,
+        methods::CLI_RUNTIME_REFRESH,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn cli_runtime_login_start<TTransport>(
+    transport: &TTransport,
+    params: CLIRuntimeLoginStartParams,
+) -> Result<CLIRuntimeLoginStartResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.workspace_id.as_str(),
+        "workspace_id",
+        methods::CLI_RUNTIME_LOGIN_START,
+    )?;
+    require_non_empty_field(
+        params.runtime_id.as_str(),
+        "runtime_id",
+        methods::CLI_RUNTIME_LOGIN_START,
+    )?;
+
+    send_json_rpc_request_typed(
+        transport,
+        methods::CLI_RUNTIME_LOGIN_START,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn cli_runtime_login_cancel<TTransport>(
+    transport: &TTransport,
+    params: CLIRuntimeLoginCancelParams,
+) -> Result<CLIRuntimeLoginCancelResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.workspace_id.as_str(),
+        "workspace_id",
+        methods::CLI_RUNTIME_LOGIN_CANCEL,
+    )?;
+    require_non_empty_field(
+        params.runtime_id.as_str(),
+        "runtime_id",
+        methods::CLI_RUNTIME_LOGIN_CANCEL,
+    )?;
+    require_non_empty_field(
+        params.login_id.as_str(),
+        "login_id",
+        methods::CLI_RUNTIME_LOGIN_CANCEL,
+    )?;
+
+    send_json_rpc_request_typed(
+        transport,
+        methods::CLI_RUNTIME_LOGIN_CANCEL,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn cli_runtime_request_respond<TTransport>(
+    transport: &TTransport,
+    params: CLIRuntimeRequestRespondParams,
+) -> Result<CLIRuntimeRequestRespondResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.workspace_id.as_str(),
+        "workspace_id",
+        methods::CLI_RUNTIME_REQUEST_RESPOND,
+    )?;
+    require_non_empty_field(
+        params.runtime_id.as_str(),
+        "runtime_id",
+        methods::CLI_RUNTIME_REQUEST_RESPOND,
+    )?;
+    require_non_empty_field(
+        params.request_id.as_str(),
+        "request_id",
+        methods::CLI_RUNTIME_REQUEST_RESPOND,
+    )?;
+
+    send_json_rpc_request_typed(
+        transport,
+        methods::CLI_RUNTIME_REQUEST_RESPOND,
         &params,
         RPC_REQUEST_TIMEOUT,
     )
@@ -1919,6 +2284,8 @@ mod tests {
                         model_provider: None,
                         sandbox_policy: None,
                         mode: None,
+                        execution_backend: None,
+                        cli_runtime_options: None,
                     },
                 )
                 .expect_err("thread id should be required")
@@ -1939,6 +2306,8 @@ mod tests {
                         model_provider: None,
                         sandbox_policy: None,
                         mode: None,
+                        execution_backend: None,
+                        cli_runtime_options: None,
                     },
                 )
                 .expect_err("turn id should be required")

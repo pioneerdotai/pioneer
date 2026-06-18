@@ -6,5 +6,6 @@ mod queries;
 mod sidebar;
 mod view;
 
-pub(super) const PROVIDERS_FILTER_ALL_NODE_ID: &str = "providers:all";
+pub(super) const PROVIDERS_FILTER_API_NODE_ID: &str = "providers:api";
 pub(super) const PROVIDERS_FILTER_CONNECTED_NODE_ID: &str = "providers:connected";
+pub(super) const PROVIDERS_FILTER_CLI_NODE_ID: &str = "providers:cli";

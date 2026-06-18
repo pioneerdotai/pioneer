@@ -1,8 +1,8 @@
 use super::*;
 use pioneer_client::notifications::router::{
-    ArtifactDeletedRefreshReduction, ArtifactThreadRefreshReduction, ConversationEventReduction,
-    SkillsRefreshReduction, ThreadArtifactsRefreshReduction, ThreadClosedReduction,
-    ThreadStartedReduction, ThreadUpdatedReduction, TurnLifecycleReduction,
+    ArtifactDeletedRefreshReduction, ArtifactThreadRefreshReduction, CLIRuntimeRefreshReduction,
+    ConversationEventReduction, SkillsRefreshReduction, ThreadArtifactsRefreshReduction,
+    ThreadClosedReduction, ThreadStartedReduction, ThreadUpdatedReduction, TurnLifecycleReduction,
     TurnTimelineRefreshReduction, WorkspacePreferenceReduction, WorkspaceRefreshReduction,
     apply_workspace_changed_to_catalog,
 };
@@ -104,6 +104,13 @@ impl PioneerDesktop {
             ClientRuntimeNotification::TurnTimelineRefresh(reduction) => {
                 self.apply_turn_timeline_refresh_reduction(reduction, cx);
             }
+            ClientRuntimeNotification::CLIRuntimeRefresh(reduction) => {
+                self.apply_cli_runtime_refresh_reduction(reduction, cx);
+            }
+            ClientRuntimeNotification::CLIRuntimePendingRequests { refresh, reduction } => {
+                self.apply_cli_runtime_pending_requests_reduction(reduction, cx);
+                self.apply_cli_runtime_refresh_reduction(refresh, cx);
+            }
             ClientRuntimeNotification::WorkspaceChanged {
                 notification,
                 preference,
@@ -183,6 +190,12 @@ impl PioneerDesktop {
         if reduction.sync_composer_model_selection {
             self.sync_composer_model_selection_for_active_thread();
         }
+        if let Some(pending_reduction) = reduction.cli_runtime_pending_requests
+            && self.cli_runtime_pending_requests.apply(pending_reduction)
+            && let Some(cx) = cx.as_deref_mut()
+        {
+            cx.notify();
+        }
     }
 
     fn apply_conversation_event_reduction(&mut self, reduction: ConversationEventReduction) {
@@ -194,6 +207,12 @@ impl PioneerDesktop {
     }
 
     fn apply_thread_closed_reduction(&mut self, reduction: ThreadClosedReduction) {
+        let pending_reduction =
+            pioneer_client::cli_runtime::approvals::reduce_cli_runtime_thread_closed_cleanup(
+                reduction.workspace_id.clone(),
+                reduction.thread_id.clone(),
+            );
+        self.cli_runtime_pending_requests.apply(pending_reduction);
         if reduction.remove_thread_conversation {
             self.remove_thread_conversation(reduction.thread_id.as_str());
         }
@@ -281,6 +300,26 @@ impl PioneerDesktop {
     ) {
         if reduction.queue_turn_timeline_refresh {
             self.refresh_turn_timeline(reduction.thread_id, reduction.turn_id, cx);
+        }
+    }
+
+    fn apply_cli_runtime_refresh_reduction(
+        &mut self,
+        reduction: CLIRuntimeRefreshReduction,
+        cx: &mut Context<Self>,
+    ) {
+        if reduction.queue_runtime_refresh {
+            self.refresh_cli_providers_auto(cx);
+        }
+    }
+
+    fn apply_cli_runtime_pending_requests_reduction(
+        &mut self,
+        reduction: pioneer_client::cli_runtime::approvals::CLIRuntimePendingRequestsReduction,
+        cx: &mut Context<Self>,
+    ) {
+        if self.cli_runtime_pending_requests.apply(reduction) {
+            cx.notify();
         }
     }
 

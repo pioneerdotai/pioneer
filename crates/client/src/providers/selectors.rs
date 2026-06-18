@@ -5,8 +5,9 @@ use std::collections::HashSet;
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub enum ProviderFilter {
-    All,
+    Api,
     Connected,
+    Cli,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17,22 +18,28 @@ pub struct ProviderAliasEntry<'a> {
 
 pub fn provider_filter_tree_index(filter: ProviderFilter) -> usize {
     match filter {
-        ProviderFilter::All => 0,
+        ProviderFilter::Api => 0,
         ProviderFilter::Connected => 1,
+        ProviderFilter::Cli => 2,
     }
 }
 
 pub fn provider_filter_from_node_id(
     value: &str,
-    all_node_id: &str,
+    api_node_id: &str,
     connected_node_id: &str,
+    cli_node_id: &str,
 ) -> Option<ProviderFilter> {
-    if value == all_node_id {
-        return Some(ProviderFilter::All);
+    if value == api_node_id {
+        return Some(ProviderFilter::Api);
     }
 
     if value == connected_node_id {
         return Some(ProviderFilter::Connected);
+    }
+
+    if value == cli_node_id {
+        return Some(ProviderFilter::Cli);
     }
 
     None
@@ -44,8 +51,9 @@ pub fn provider_filter_includes_provider(
     configured_provider_names: &HashSet<String>,
 ) -> bool {
     match filter {
-        ProviderFilter::All => true,
+        ProviderFilter::Api => true,
         ProviderFilter::Connected => configured_provider_names.contains(provider_id),
+        ProviderFilter::Cli => false,
     }
 }
 
@@ -54,6 +62,14 @@ pub fn provider_filter_empty_connected_state(
     visible_provider_count: usize,
 ) -> bool {
     filter == ProviderFilter::Connected && visible_provider_count == 0
+}
+
+pub fn provider_filter_shows_api_providers(filter: ProviderFilter) -> bool {
+    matches!(filter, ProviderFilter::Api | ProviderFilter::Connected)
+}
+
+pub fn provider_filter_shows_cli_providers(filter: ProviderFilter) -> bool {
+    filter == ProviderFilter::Cli
 }
 
 pub fn normalize_provider_name(value: &str) -> String {
@@ -115,25 +131,42 @@ mod tests {
 
     #[test]
     fn provider_filter_maps_to_tree_index_and_node_id() {
-        assert_eq!(provider_filter_tree_index(ProviderFilter::All), 0);
+        assert_eq!(provider_filter_tree_index(ProviderFilter::Api), 0);
         assert_eq!(provider_filter_tree_index(ProviderFilter::Connected), 1);
+        assert_eq!(provider_filter_tree_index(ProviderFilter::Cli), 2);
         assert_eq!(
-            provider_filter_from_node_id("providers:all", "providers:all", "providers:connected"),
-            Some(ProviderFilter::All)
+            provider_filter_from_node_id(
+                "providers:api",
+                "providers:api",
+                "providers:connected",
+                "providers:cli"
+            ),
+            Some(ProviderFilter::Api)
         );
         assert_eq!(
             provider_filter_from_node_id(
                 "providers:connected",
-                "providers:all",
-                "providers:connected"
+                "providers:api",
+                "providers:connected",
+                "providers:cli"
             ),
             Some(ProviderFilter::Connected)
         );
         assert_eq!(
             provider_filter_from_node_id(
+                "providers:cli",
+                "providers:api",
+                "providers:connected",
+                "providers:cli"
+            ),
+            Some(ProviderFilter::Cli)
+        );
+        assert_eq!(
+            provider_filter_from_node_id(
                 "providers:unknown",
-                "providers:all",
-                "providers:connected"
+                "providers:api",
+                "providers:connected",
+                "providers:cli"
             ),
             None
         );
@@ -144,7 +177,7 @@ mod tests {
         let configured = HashSet::from(["openai".to_owned()]);
 
         assert!(provider_filter_includes_provider(
-            ProviderFilter::All,
+            ProviderFilter::Api,
             "anthropic",
             &configured
         ));
@@ -162,6 +195,17 @@ mod tests {
             ProviderFilter::Connected,
             0
         ));
+        assert!(!provider_filter_includes_provider(
+            ProviderFilter::Cli,
+            "openai",
+            &configured
+        ));
+        assert!(provider_filter_shows_api_providers(ProviderFilter::Api));
+        assert!(provider_filter_shows_api_providers(
+            ProviderFilter::Connected
+        ));
+        assert!(!provider_filter_shows_api_providers(ProviderFilter::Cli));
+        assert!(provider_filter_shows_cli_providers(ProviderFilter::Cli));
     }
 
     #[test]

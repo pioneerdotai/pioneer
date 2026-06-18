@@ -7,18 +7,27 @@
 //! loops.
 
 use crate::{
+    cli_runtime::approvals::{
+        CLIRuntimePendingRequestsReduction, reduce_cli_runtime_request_opened_notification,
+        reduce_cli_runtime_request_resolved_notification,
+    },
     notifications::router::{
         ArtifactDeletedRefreshReduction, ArtifactThreadRefreshReduction,
-        ConversationEventReduction, McpRefreshReduction, McpServerCatalogChangedReduction,
-        McpServerStatusChangedReduction, SkillsRefreshReduction, ThreadArtifactsRefreshReduction,
-        ThreadClosedReduction, ThreadStartedContext, ThreadStartedReduction,
-        ThreadUpdatedReduction, TurnLifecycleReduction, TurnTimelineRefreshReduction,
-        WorkspacePreferenceReduction, WorkspaceRefreshReduction,
+        CLIRuntimeRefreshReduction, ConversationEventReduction, McpRefreshReduction,
+        McpServerCatalogChangedReduction, McpServerStatusChangedReduction, SkillsRefreshReduction,
+        ThreadArtifactsRefreshReduction, ThreadClosedReduction, ThreadStartedContext,
+        ThreadStartedReduction, ThreadUpdatedReduction, TurnLifecycleReduction,
+        TurnTimelineRefreshReduction, WorkspacePreferenceReduction, WorkspaceRefreshReduction,
         apply_workspace_changed_to_catalog, reduce_artifact_created_notification,
         reduce_artifact_deleted_notification, reduce_artifact_updated_notification,
-        reduce_item_completed_notification, reduce_item_delta_notification,
-        reduce_item_recovery_attached_notification, reduce_item_recovery_exhausted_notification,
-        reduce_item_recovery_opened_notification, reduce_item_recovery_succeeded_notification,
+        reduce_cli_runtime_account_updated_notification,
+        reduce_cli_runtime_apps_changed_notification,
+        reduce_cli_runtime_request_opened_notification as reduce_cli_runtime_request_opened_refresh,
+        reduce_cli_runtime_request_resolved_notification as reduce_cli_runtime_request_resolved_refresh,
+        reduce_cli_runtime_status_changed_notification, reduce_item_completed_notification,
+        reduce_item_delta_notification, reduce_item_recovery_attached_notification,
+        reduce_item_recovery_exhausted_notification, reduce_item_recovery_opened_notification,
+        reduce_item_recovery_succeeded_notification,
         reduce_item_retry_attempt_started_notification, reduce_item_retry_scheduled_notification,
         reduce_item_started_notification, reduce_item_timeout_detected_notification,
         reduce_item_tool_retry_exhausted_notification,
@@ -114,6 +123,11 @@ pub enum ClientRuntimeNotification {
     ArtifactThreadRefresh(ArtifactThreadRefreshReduction),
     ArtifactDeletedRefresh(ArtifactDeletedRefreshReduction),
     TurnTimelineRefresh(TurnTimelineRefreshReduction),
+    CLIRuntimeRefresh(CLIRuntimeRefreshReduction),
+    CLIRuntimePendingRequests {
+        refresh: CLIRuntimeRefreshReduction,
+        reduction: CLIRuntimePendingRequestsReduction,
+    },
     WorkspaceChanged {
         notification: WorkspaceChangedNotification,
         preference: WorkspacePreferenceReduction,
@@ -547,6 +561,46 @@ pub fn reduce_gateway_notification(
                 notification,
                 preference,
             })
+        }
+        GatewayNotification::CLIRuntimeStatusChanged(notification) => {
+            Some(ClientRuntimeNotification::CLIRuntimeRefresh(
+                reduce_cli_runtime_status_changed_notification(
+                    notification,
+                    context.active_workspace_id,
+                ),
+            ))
+        }
+        GatewayNotification::CLIRuntimeAccountUpdated(notification) => {
+            Some(ClientRuntimeNotification::CLIRuntimeRefresh(
+                reduce_cli_runtime_account_updated_notification(
+                    notification,
+                    context.active_workspace_id,
+                ),
+            ))
+        }
+        GatewayNotification::CLIRuntimeRequestOpened(notification) => {
+            let refresh = reduce_cli_runtime_request_opened_refresh(
+                notification.clone(),
+                context.active_workspace_id,
+            );
+            let reduction = reduce_cli_runtime_request_opened_notification(notification);
+            Some(ClientRuntimeNotification::CLIRuntimePendingRequests { refresh, reduction })
+        }
+        GatewayNotification::CLIRuntimeRequestResolved(notification) => {
+            let refresh = reduce_cli_runtime_request_resolved_refresh(
+                notification.clone(),
+                context.active_workspace_id,
+            );
+            let reduction = reduce_cli_runtime_request_resolved_notification(notification);
+            Some(ClientRuntimeNotification::CLIRuntimePendingRequests { refresh, reduction })
+        }
+        GatewayNotification::CLIRuntimeAppsChanged(notification) => {
+            Some(ClientRuntimeNotification::CLIRuntimeRefresh(
+                reduce_cli_runtime_apps_changed_notification(
+                    notification,
+                    context.active_workspace_id,
+                ),
+            ))
         }
         GatewayNotification::ContextCompressing(_)
         | GatewayNotification::ContextCompressed(_)

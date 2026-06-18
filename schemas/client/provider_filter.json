@@ -3,7 +3,8 @@
   "title": "ProviderFilter",
   "type": "string",
   "enum": [
-    "All",
-    "Connected"
+    "Api",
+    "Connected",
+    "Cli"
   ]
 }

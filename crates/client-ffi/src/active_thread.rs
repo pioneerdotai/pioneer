@@ -16,6 +16,10 @@ use pioneer_client::{
     conversation::ConversationViewState,
     notifications::effects::ClientEffect,
     notifications::router::TurnTimelineRefreshReduction,
+    providers::list::{
+        cli_runtime_list_params, resolve_cli_runtime_execution_backend,
+        runtime_id_from_cli_runtime_provider_key,
+    },
     runtime::{ClientRuntime, ClientRuntimeNotification, ClientRuntimeNotificationContext},
     state::{reducers as client_state_reducers, selectors as client_selectors},
     threads::{
@@ -39,7 +43,8 @@ use pioneer_client::{
     },
 };
 use pioneer_protocol::{
-    GatewayNotification, Thread, ThreadHistoryResponse, ThreadMode, TurnTimelineResponse,
+    AgentExecutionBackend, GatewayNotification, Thread, ThreadHistoryResponse, ThreadMode,
+    TurnTimelineResponse,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -299,16 +304,6 @@ impl ClientFfiActiveThreadState {
             expanded_keys,
         } = request;
 
-        if !composer_has_sendable_content(
-            text.as_str(),
-            !attachments.is_empty(),
-            !capabilities.is_empty(),
-        ) {
-            return Err(anyhow::anyhow!(
-                "message content is required before starting turn"
-            ));
-        }
-
         let requested_thread_id = non_empty_string(thread_id);
         let thread_id = match requested_thread_id {
             Some(thread_id) => thread_id,
@@ -327,6 +322,47 @@ impl ClientFfiActiveThreadState {
             })?;
             (coordinator.workspace_id.clone(), None)
         };
+        let selection = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
+            resolve_turn_selection(
+                &inner,
+                thread_id.as_str(),
+                selected_provider,
+                selected_model,
+                selected_mode,
+                text.as_str(),
+                !attachments.is_empty(),
+                !capabilities.is_empty(),
+            )?
+        };
+        let selected_cli_runtime_backend = resolve_selected_cli_runtime_backend(
+            runtime,
+            workspace_id.as_str(),
+            Some(selection.selected_provider.as_str()),
+        )?;
+        let cli_runtime_selected = selected_cli_runtime_backend.is_some();
+        let attachments = if cli_runtime_selected {
+            Vec::new()
+        } else {
+            attachments
+        };
+        let capabilities = if cli_runtime_selected {
+            Vec::new()
+        } else {
+            capabilities
+        };
+        if !composer_has_sendable_content(
+            text.as_str(),
+            !attachments.is_empty(),
+            !capabilities.is_empty(),
+        ) {
+            return Err(anyhow::anyhow!(
+                "message content is required before starting turn"
+            ));
+        }
         let prepared = prepare_composer_turn(
             &runtime.ws_command_sender(),
             &ClientFfiFileSystem,
@@ -340,21 +376,10 @@ impl ClientFfiActiveThreadState {
                 capabilities,
             },
         )?;
-        let selection = {
-            let inner = self
-                .inner
-                .lock()
-                .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
-            resolve_turn_selection(
-                &inner,
-                thread_id.as_str(),
-                selected_provider,
-                selected_model,
-                selected_mode,
-                prepared.user_text.as_str(),
-                !prepared.attachments.is_empty(),
-                !prepared.capabilities.is_empty(),
-            )?
+        let turn_model_provider = if cli_runtime_selected {
+            None
+        } else {
+            Some(selection.selected_provider.clone())
         };
         let submit_reduction = reduce_prepared_composer_turn_submit_success(
             PreparedComposerTurnSubmitContext {
@@ -362,8 +387,11 @@ impl ClientFfiActiveThreadState {
                 turn_id: turn_id.clone(),
                 pending_request_id: pending_request_id.clone(),
                 selected_model: Some(selection.selected_model),
-                selected_provider: Some(selection.selected_provider),
+                selected_provider: Some(selection.selected_provider.clone()),
+                turn_model_provider,
                 selected_mode: Some(selection.selected_mode),
+                execution_backend: selected_cli_runtime_backend,
+                cli_runtime_options: None,
                 updated_at_unix: now_unix_seconds(),
             },
             prepared,
@@ -808,6 +836,8 @@ impl ClientFfiActiveThreadState {
             | ClientRuntimeNotification::ThreadArtifactsRefresh(_)
             | ClientRuntimeNotification::ArtifactThreadRefresh(_)
             | ClientRuntimeNotification::ArtifactDeletedRefresh(_)
+            | ClientRuntimeNotification::CLIRuntimeRefresh(_)
+            | ClientRuntimeNotification::CLIRuntimePendingRequests { .. }
             | ClientRuntimeNotification::WorkspaceChanged { .. } => {}
         }
 
@@ -941,6 +971,31 @@ fn non_empty_string(value: Option<String>) -> Option<String> {
             Some(trimmed.to_owned())
         }
     })
+}
+
+fn resolve_selected_cli_runtime_backend(
+    runtime: &ClientRuntime,
+    workspace_id: &str,
+    selected_provider: Option<&str>,
+) -> anyhow::Result<Option<AgentExecutionBackend>> {
+    let Some(provider_key) = selected_provider
+        .map(str::trim)
+        .filter(|provider| !provider.is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(_) = runtime_id_from_cli_runtime_provider_key(provider_key) else {
+        return Ok(None);
+    };
+
+    let runtimes = ws_commands::cli_runtime_list(
+        &runtime.ws_command_sender(),
+        cli_runtime_list_params(workspace_id.to_owned()),
+    )?
+    .runtimes;
+
+    resolve_cli_runtime_execution_backend(Some(provider_key), runtimes.as_slice(), None)
+        .map_err(anyhow::Error::msg)
 }
 
 fn resolve_turn_selection(

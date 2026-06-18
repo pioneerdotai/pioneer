@@ -186,7 +186,16 @@
         "cli_runtimes": {
           "$ref": "#/$defs/GatewayCliRuntimeSettings",
           "default": {
-            "instances": []
+            "instances": [
+              {
+                "binary_path": "codex",
+                "display_name": "Codex CLI",
+                "enabled": true,
+                "home_path": "~/.codex",
+                "id": "codex",
+                "kind": "codex"
+              }
+            ]
           }
         },
         "general": {
