@@ -29,6 +29,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+        with:
+          submodules: recursive
 
       - name: setup-rust
         uses: dtolnay/rust-toolchain@stable
