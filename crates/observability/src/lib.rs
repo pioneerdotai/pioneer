@@ -131,7 +131,7 @@ where
         event.metadata().level(),
         event.metadata().target(),
         fields.message.as_deref(),
-    ) || should_demote_tantivy_reader_commit_reload_lock_not_found(
+    ) || should_demote_tantivy_reader_commit_reload_not_found(
         event.metadata().level(),
         event.metadata().target(),
         fields.log_target.as_deref(),
@@ -185,7 +185,7 @@ fn should_demote_rmcp_transport_worker_failure(
         })
 }
 
-fn should_demote_tantivy_reader_commit_reload_lock_not_found(
+fn should_demote_tantivy_reader_commit_reload_not_found(
     level: &tracing::Level,
     target: &str,
     log_target: Option<&str>,
@@ -193,14 +193,29 @@ fn should_demote_tantivy_reader_commit_reload_lock_not_found(
 ) -> bool {
     *level == tracing::Level::ERROR
         && effective_event_target(target, log_target) == "tantivy::reader"
-        && message.is_some_and(is_tantivy_reader_commit_reload_lock_not_found)
+        && message.is_some_and(is_tantivy_reader_commit_reload_not_found)
+}
+
+fn is_tantivy_reader_commit_reload_not_found(message: &str) -> bool {
+    is_tantivy_reader_commit_reload_error(message)
+        && (is_tantivy_reader_commit_reload_lock_not_found(message)
+            || is_tantivy_reader_commit_reload_meta_json_missing(message))
+}
+
+fn is_tantivy_reader_commit_reload_error(message: &str) -> bool {
+    message.contains("Error while loading searcher after commit was detected.")
 }
 
 fn is_tantivy_reader_commit_reload_lock_not_found(message: &str) -> bool {
-    message.contains("Error while loading searcher after commit was detected.")
-        && message.contains("LockFailure")
+    message.contains("LockFailure")
         && message.contains("kind: NotFound")
         && message.contains("No such file or directory")
+}
+
+fn is_tantivy_reader_commit_reload_meta_json_missing(message: &str) -> bool {
+    message.contains("OpenReadError")
+        && message.contains("FileDoesNotExist")
+        && message.contains("meta.json")
 }
 
 fn is_rmcp_streamable_http_initialize_response_failure(message: &str) -> bool {
@@ -267,7 +282,7 @@ fn non_empty(value: &str) -> Option<&str> {
 mod tests {
     use super::{
         sentry_event_filter, should_demote_rmcp_transport_worker_failure,
-        should_demote_tantivy_reader_commit_reload_lock_not_found,
+        should_demote_tantivy_reader_commit_reload_not_found,
     };
     use sentry::integrations::tracing::EventFilter;
 
@@ -315,7 +330,7 @@ mod tests {
 
     #[test]
     fn demotes_tantivy_reader_commit_reload_lock_not_found_from_log_target() {
-        assert!(should_demote_tantivy_reader_commit_reload_lock_not_found(
+        assert!(should_demote_tantivy_reader_commit_reload_not_found(
             &tracing::Level::ERROR,
             "log",
             Some("tantivy::reader"),
@@ -326,8 +341,20 @@ mod tests {
     }
 
     #[test]
+    fn demotes_tantivy_reader_commit_reload_meta_json_missing_from_log_target() {
+        assert!(should_demote_tantivy_reader_commit_reload_not_found(
+            &tracing::Level::ERROR,
+            "log",
+            Some("tantivy::reader"),
+            Some(
+                "Error while loading searcher after commit was detected. OpenReadError(FileDoesNotExist(\"meta.json\"))",
+            ),
+        ));
+    }
+
+    #[test]
     fn keeps_other_tantivy_reader_commit_reload_errors_as_events() {
-        assert!(!should_demote_tantivy_reader_commit_reload_lock_not_found(
+        assert!(!should_demote_tantivy_reader_commit_reload_not_found(
             &tracing::Level::ERROR,
             "log",
             Some("tantivy::reader"),
@@ -338,8 +365,20 @@ mod tests {
     }
 
     #[test]
+    fn keeps_other_tantivy_reader_missing_files_as_events() {
+        assert!(!should_demote_tantivy_reader_commit_reload_not_found(
+            &tracing::Level::ERROR,
+            "log",
+            Some("tantivy::reader"),
+            Some(
+                "Error while loading searcher after commit was detected. OpenReadError(FileDoesNotExist(\"segment_1.store\"))",
+            ),
+        ));
+    }
+
+    #[test]
     fn keeps_tantivy_lock_not_found_message_from_other_targets_as_events() {
-        assert!(!should_demote_tantivy_reader_commit_reload_lock_not_found(
+        assert!(!should_demote_tantivy_reader_commit_reload_not_found(
             &tracing::Level::ERROR,
             "pioneer_memory",
             None,
