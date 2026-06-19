@@ -39,6 +39,10 @@ fn gateway_normalize_address_accepts_websocket_urls_and_ipv6() {
         "wss://gateway.example.com/socket"
     );
     assert_eq!(
+        normalize_address("https://gateway.example.com").expect("HTTPS URL should be valid"),
+        "https://gateway.example.com"
+    );
+    assert_eq!(
         normalize_address("::1").expect("ipv6 without port should be valid"),
         format!("[::1]:{DEFAULT_GATEWAY_PORT}")
     );
@@ -56,6 +60,10 @@ fn gateway_resolve_socket_address_input_uses_ws_default_ports() {
     );
     assert_eq!(
         resolve_socket_address_input("wss://gateway.example.com").expect("wss default port"),
+        "gateway.example.com:443"
+    );
+    assert_eq!(
+        resolve_socket_address_input("https://gateway.example.com").expect("https default port"),
         "gateway.example.com:443"
     );
 }

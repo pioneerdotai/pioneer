@@ -25,6 +25,8 @@ pub fn normalize_ws_url(address: &str) -> String {
     let trimmed = address.trim();
     if trimmed.starts_with("ws://") || trimmed.starts_with("wss://") {
         trimmed.to_owned()
+    } else if let Some(rest) = trimmed.strip_prefix("https://") {
+        format!("wss://{rest}")
     } else {
         format!("ws://{trimmed}")
     }
@@ -49,6 +51,14 @@ mod tests {
         assert_eq!(
             normalize_ws_url(" gateway.example.com:443 "),
             "ws://gateway.example.com:443"
+        );
+    }
+
+    #[test]
+    fn transport_ws_normalize_ws_url_maps_https_to_wss() {
+        assert_eq!(
+            normalize_ws_url("https://gateway.example.com"),
+            "wss://gateway.example.com"
         );
     }
 

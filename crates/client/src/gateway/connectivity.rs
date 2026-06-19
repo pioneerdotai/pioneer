@@ -36,10 +36,14 @@ pub fn normalize_address(address: &str) -> Result<String, GatewayAddressError> {
         return normalize_ws_address(trimmed);
     }
 
+    if trimmed.starts_with("https://") {
+        return normalize_https_address(trimmed);
+    }
+
     if trimmed.contains("://") {
         return Err(GatewayAddressError::invalid(
             trimmed,
-            "gateway address must be a websocket URL, host, or host:port",
+            "gateway address must be an HTTPS URL, websocket URL, host, or host:port",
         ));
     }
 
@@ -72,6 +76,18 @@ pub fn resolve_socket_address_input(address: &str) -> Result<String, GatewayAddr
             ));
         };
 
+        return Ok(format_host_port(host, port));
+    }
+
+    if trimmed.starts_with("https://") {
+        let url = Url::parse(trimmed).map_err(|error| {
+            GatewayAddressError::invalid(trimmed, format!("invalid HTTPS URL: {error}"))
+        })?;
+        let host = url
+            .host_str()
+            .filter(|host| !host.trim().is_empty())
+            .ok_or_else(|| GatewayAddressError::invalid(trimmed, "address must include a host"))?;
+        let port = url.port().unwrap_or(443);
         return Ok(format_host_port(host, port));
     }
 
@@ -148,6 +164,26 @@ fn normalize_ws_address(address: &str) -> Result<String, GatewayAddressError> {
         return Err(GatewayAddressError::invalid(
             address,
             "websocket gateway address must include a host",
+        ));
+    }
+
+    Ok(address.to_owned())
+}
+
+fn normalize_https_address(address: &str) -> Result<String, GatewayAddressError> {
+    let url = Url::parse(address).map_err(|error| {
+        GatewayAddressError::invalid(address, format!("invalid HTTPS URL: {error}"))
+    })?;
+    if url.scheme() != "https" {
+        return Err(GatewayAddressError::invalid(
+            address,
+            "unsupported gateway URL scheme",
+        ));
+    }
+    if url.host_str().is_none() {
+        return Err(GatewayAddressError::invalid(
+            address,
+            "gateway URL must include a host",
         ));
     }
 
