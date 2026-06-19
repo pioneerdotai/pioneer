@@ -2564,10 +2564,12 @@ impl ThreadEpisodicIndexExecutor {
         attempt_started_at: Instant,
     ) -> ThreadEpisodicIndexJobProcessOutcome {
         let next_run_at_unix = retryable.then(|| self.next_retry_at(job, now_unix));
+        let sanitized_error =
+            error_message.map(|message| sanitize_thread_episodic_index_error(&message));
         let update = ThreadEpisodicIndexJobFailureUpdate {
             retryable,
             next_run_at_unix,
-            last_error: error_message.map(|message| sanitize_thread_episodic_index_error(&message)),
+            last_error: sanitized_error.clone(),
             capacity_error,
             last_attempt_latency_ms: Some(elapsed_ms(attempt_started_at)),
         };
@@ -2583,6 +2585,22 @@ impl ThreadEpisodicIndexExecutor {
             );
         }
         if !retryable {
+            tracing::error!(
+                job_id = %job.id,
+                workspace_id = %job.workspace_id,
+                thread_id = %job.thread_id,
+                chunk_id = %job.chunk_id,
+                capsule_id = job.capsule_id.as_deref(),
+                capsule_ref = job.capsule_ref.as_deref(),
+                segment_index = job.segment_index,
+                frame_uri = job.frame_uri.as_deref(),
+                attempt_count = job.attempt_count,
+                capacity_error_count = job.capacity_error_count,
+                capacity_error,
+                latency_ms = elapsed_ms(attempt_started_at),
+                error = sanitized_error.as_deref().unwrap_or("unknown thread episodic index failure"),
+                "thread episodic index job failed terminally"
+            );
             let _ = self
                 .crud_store
                 .mark_thread_episodic_chunk_failed(job.chunk_id.as_str(), now_unix)

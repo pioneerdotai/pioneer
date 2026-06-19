@@ -126,10 +126,16 @@ fn sentry_event_mapper<S>(event: &tracing::Event<'_>, _ctx: TracingContext<'_, S
 where
     S: tracing::Subscriber + for<'span> LookupSpan<'span>,
 {
+    let fields = tracing_event_fields(event);
     if should_demote_rmcp_transport_worker_failure(
         event.metadata().level(),
         event.metadata().target(),
-        tracing_event_message(event).as_deref(),
+        fields.message.as_deref(),
+    ) || should_demote_tantivy_reader_commit_reload_lock_not_found(
+        event.metadata().level(),
+        event.metadata().target(),
+        fields.log_target.as_deref(),
+        fields.message.as_deref(),
     ) {
         return EventMapping::Breadcrumb(breadcrumb_from_event(
             event,
@@ -162,6 +168,10 @@ fn sentry_event_filter(level: &tracing::Level) -> EventFilter {
     }
 }
 
+fn effective_event_target<'a>(target: &'a str, log_target: Option<&'a str>) -> &'a str {
+    log_target.unwrap_or(target)
+}
+
 fn should_demote_rmcp_transport_worker_failure(
     level: &tracing::Level,
     target: &str,
@@ -173,6 +183,24 @@ fn should_demote_rmcp_transport_worker_failure(
             is_rmcp_streamable_http_initialize_response_failure(message)
                 || is_rmcp_streamable_http_auth_rejection(message)
         })
+}
+
+fn should_demote_tantivy_reader_commit_reload_lock_not_found(
+    level: &tracing::Level,
+    target: &str,
+    log_target: Option<&str>,
+    message: Option<&str>,
+) -> bool {
+    *level == tracing::Level::ERROR
+        && effective_event_target(target, log_target) == "tantivy::reader"
+        && message.is_some_and(is_tantivy_reader_commit_reload_lock_not_found)
+}
+
+fn is_tantivy_reader_commit_reload_lock_not_found(message: &str) -> bool {
+    message.contains("Error while loading searcher after commit was detected.")
+        && message.contains("LockFailure")
+        && message.contains("kind: NotFound")
+        && message.contains("No such file or directory")
 }
 
 fn is_rmcp_streamable_http_initialize_response_failure(message: &str) -> bool {
@@ -189,27 +217,34 @@ fn is_rmcp_streamable_http_auth_rejection(message: &str) -> bool {
             || message.contains("InsufficientScope"))
 }
 
-fn tracing_event_message(event: &tracing::Event<'_>) -> Option<String> {
-    let mut visitor = MessageVisitor::default();
+fn tracing_event_fields(event: &tracing::Event<'_>) -> EventFieldVisitor {
+    let mut visitor = EventFieldVisitor::default();
     event.record(&mut visitor);
-    visitor.message
+    visitor
 }
 
 #[derive(Default)]
-struct MessageVisitor {
+struct EventFieldVisitor {
     message: Option<String>,
+    log_target: Option<String>,
 }
 
-impl Visit for MessageVisitor {
+impl Visit for EventFieldVisitor {
     fn record_str(&mut self, field: &Field, value: &str) {
-        if field.name() == "message" {
-            self.message = Some(value.to_owned());
+        match field.name() {
+            "message" => self.message = Some(value.to_owned()),
+            "log.target" => self.log_target = Some(value.to_owned()),
+            _ => {}
         }
     }
 
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" {
-            self.message = Some(format!("{value:?}"));
+        match field.name() {
+            "message" => self.message = Some(format!("{value:?}")),
+            "log.target" => {
+                self.log_target = Some(format!("{value:?}").trim_matches('"').to_owned())
+            }
+            _ => {}
         }
     }
 }
@@ -230,7 +265,10 @@ fn non_empty(value: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{sentry_event_filter, should_demote_rmcp_transport_worker_failure};
+    use super::{
+        sentry_event_filter, should_demote_rmcp_transport_worker_failure,
+        should_demote_tantivy_reader_commit_reload_lock_not_found,
+    };
     use sentry::integrations::tracing::EventFilter;
 
     #[test]
@@ -271,6 +309,42 @@ mod tests {
             "pioneer_gateway",
             Some(
                 "worker quit with fatal: unexpected server response: expect initialized, accepted, when process initialize response",
+            ),
+        ));
+    }
+
+    #[test]
+    fn demotes_tantivy_reader_commit_reload_lock_not_found_from_log_target() {
+        assert!(should_demote_tantivy_reader_commit_reload_lock_not_found(
+            &tracing::Level::ERROR,
+            "log",
+            Some("tantivy::reader"),
+            Some(
+                "Error while loading searcher after commit was detected. LockFailure(IoError(Os { code: 2, kind: NotFound, message: \"No such file or directory\" }), None)",
+            ),
+        ));
+    }
+
+    #[test]
+    fn keeps_other_tantivy_reader_commit_reload_errors_as_events() {
+        assert!(!should_demote_tantivy_reader_commit_reload_lock_not_found(
+            &tracing::Level::ERROR,
+            "log",
+            Some("tantivy::reader"),
+            Some(
+                "Error while loading searcher after commit was detected. LockFailure(IoError(Os { code: 13, kind: PermissionDenied, message: \"Permission denied\" }), None)",
+            ),
+        ));
+    }
+
+    #[test]
+    fn keeps_tantivy_lock_not_found_message_from_other_targets_as_events() {
+        assert!(!should_demote_tantivy_reader_commit_reload_lock_not_found(
+            &tracing::Level::ERROR,
+            "pioneer_memory",
+            None,
+            Some(
+                "Error while loading searcher after commit was detected. LockFailure(IoError(Os { code: 2, kind: NotFound, message: \"No such file or directory\" }), None)",
             ),
         ));
     }
