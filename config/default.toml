@@ -177,6 +177,15 @@ event_channel_capacity = 2048
 stderr_ring_lines = 200
 debug_native_events = false
 
+[gateway.remote_access]
+runtime_dir = "remote-access"
+local_addr = "127.0.0.1:17878"
+restart_initial_ms = 1000
+restart_max_ms = 30000
+restart_jitter_percent = 20
+# 0 means retry indefinitely.
+max_restarts = 0
+
 [gateway.provider.attachments]
 max_bytes_per_attachment = 104857600
 max_total_bytes_per_request = 209715200

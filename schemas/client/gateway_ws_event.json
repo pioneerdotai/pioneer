@@ -2469,6 +2469,22 @@
           "properties": {
             "kind": {
               "type": "string",
+              "const": "gateway_remote_access_status_changed"
+            },
+            "params": {
+              "$ref": "#/$defs/GatewayRemoteAccessStatusChangedNotification"
+            }
+          },
+          "required": [
+            "kind",
+            "params"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
               "const": "unknown"
             },
             "params": {
@@ -2481,6 +2497,77 @@
           ]
         }
       ]
+    },
+    "GatewayRemoteAccessErrorKind": {
+      "type": "string",
+      "enum": [
+        "invalid_settings",
+        "missing_key",
+        "missing_binary",
+        "local_gateway_unavailable",
+        "relay_resolve_failed",
+        "relay_connect_failed",
+        "tunnel_auth_failed",
+        "process_exited",
+        "unsupported_transport",
+        "restart_limit_reached",
+        "io",
+        "unknown"
+      ]
+    },
+    "GatewayRemoteAccessState": {
+      "type": "string",
+      "enum": [
+        "disabled",
+        "starting",
+        "connected",
+        "reconnecting",
+        "failed",
+        "stopped"
+      ]
+    },
+    "GatewayRemoteAccessStatusChangedNotification": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/GatewayRemoteAccessStatusSnapshot"
+        }
+      },
+      "required": [
+        "status"
+      ]
+    },
+    "GatewayRemoteAccessStatusSnapshot": {
+      "type": "object",
+      "properties": {
+        "error_kind": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayRemoteAccessErrorKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/GatewayRemoteAccessState",
+          "default": "disabled"
+        },
+        "updated_at_unix": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        }
+      }
     },
     "ItemCompletedNotification": {
       "type": "object",

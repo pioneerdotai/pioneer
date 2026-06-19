@@ -2498,7 +2498,7 @@ impl MessageProcessor {
             config.gateway.settings_version,
             settings_file_name.as_str(),
         )?;
-        Ok(settings.snapshot(&config.gateway))
+        self.gateway_settings_snapshot_from_settings(&config.gateway, &settings)
     }
 
     async fn update_gateway_settings(
@@ -2519,6 +2519,18 @@ impl MessageProcessor {
 
         let previous_general_settings = settings.effective_general_settings(&config.gateway);
         let changes = settings.apply_protocol_update(update)?;
+        if changes.remote_access.changed {
+            if let Some(key) = changes.remote_access.key.as_deref() {
+                self.gateway_secrets.put_remote_access_secret(
+                    changes.remote_access.secret_ref.as_str(),
+                    key,
+                    Some("remote access".to_owned()),
+                )?;
+            } else if changes.remote_access.clear_key {
+                self.gateway_secrets
+                    .delete_remote_access_secret(changes.remote_access.secret_ref.as_str())?;
+            }
+        }
         if let Some(keepawake) = changes.general.keepawake {
             self.apply_keepawake_setting(keepawake)
                 .context("failed to apply keepawake setting")?;
@@ -2539,7 +2551,19 @@ impl MessageProcessor {
             return Err(error);
         }
 
-        let snapshot = settings.snapshot(&config.gateway);
+        if changes.remote_access.changed {
+            if let Some(supervisor) = self.remote_access_supervisor.as_ref() {
+                supervisor
+                    .apply(crate::remote_access_desired_state(
+                        &settings,
+                        self.gateway_secrets.as_ref(),
+                    )?)
+                    .await
+                    .context("failed to apply remote access settings")?;
+            }
+        }
+
+        let snapshot = self.gateway_settings_snapshot_from_settings(&config.gateway, &settings)?;
         if changes.memory {
             let memory_settings =
                 crate::settings::GatewayMemorySettings::from_protocol(snapshot.memory.clone());
@@ -2562,6 +2586,27 @@ impl MessageProcessor {
         }
 
         Ok(snapshot)
+    }
+
+    fn gateway_settings_snapshot_from_settings(
+        &self,
+        config: &pioneer_config::GatewayConfig,
+        settings: &crate::settings::GatewaySettings,
+    ) -> anyhow::Result<pioneer_protocol::GatewaySettingsSnapshot> {
+        let has_remote_access_key = match settings.remote_access_secret_ref() {
+            Some(secret_ref) => self.gateway_secrets.has_remote_access_secret(secret_ref)?,
+            None => false,
+        };
+        let remote_access_status = self
+            .remote_access_supervisor
+            .as_ref()
+            .map(|supervisor| supervisor.status_snapshot())
+            .unwrap_or_default();
+        Ok(settings.snapshot_with_remote_access_status(
+            config,
+            has_remote_access_key,
+            remote_access_status,
+        ))
     }
 
     async fn send_invalid_params_error(

@@ -27,6 +27,7 @@ pioneer-entity.workspace = true
 pioneer-protocol.workspace = true
 pioneer-provider.workspace = true
 pioneer-promt.workspace = true
+pioneer-tunnel.workspace = true
 pioneer-skills.workspace = true
 pioneer-sqlite.workspace = true
 pioneer-tasks.workspace = true

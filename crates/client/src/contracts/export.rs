@@ -578,6 +578,13 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Provisional
         ),
         contract_type!(
+            "gateway_remote_access_status_label.json",
+            crate::settings::gateway::GatewayRemoteAccessStatusLabel,
+            Domain::Settings,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
             "gateway_settings_state.json",
             crate::settings::gateway::GatewaySettingsState,
             Domain::Settings,

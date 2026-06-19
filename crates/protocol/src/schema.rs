@@ -48,9 +48,12 @@ use crate::{
     ExecutionCheckpointWindowSummary, ExecutionWindowExhaustionReason, ExecutionWindowStatus,
     GatewayCliRuntimeInstanceSettings, GatewayCliRuntimeSettings, GatewayGeneralSettings,
     GatewayGeneralSettingsUpdate, GatewayMemoryModelSelection, GatewayMemoryModelSelectionSource,
-    GatewayMemorySettings, GatewayNotification, GatewaySettingsGetParams,
-    GatewaySettingsGetResponse, GatewaySettingsSnapshot, GatewaySettingsUpdate,
-    GatewaySettingsUpdateParams, GatewaySettingsUpdateResponse, GatewayThreadEpisodicSettings,
+    GatewayMemorySettings, GatewayNotification, GatewayRemoteAccessErrorKind,
+    GatewayRemoteAccessSettings, GatewayRemoteAccessSettingsUpdate, GatewayRemoteAccessState,
+    GatewayRemoteAccessStatusChangedNotification, GatewayRemoteAccessStatusSnapshot,
+    GatewayRemoteAccessTransport, GatewaySettingsGetParams, GatewaySettingsGetResponse,
+    GatewaySettingsSnapshot, GatewaySettingsUpdate, GatewaySettingsUpdateParams,
+    GatewaySettingsUpdateResponse, GatewayThreadEpisodicSettings,
     GatewayThreadEpisodicSettingsUpdate, ItemCompletedNotification, ItemDeltaNotification,
     ItemRecoveryAttachedNotification, ItemRecoveryExhaustedNotification,
     ItemRecoveryOpenedNotification, ItemRecoverySucceededNotification,
@@ -1301,6 +1304,31 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "gateway_cli_runtime_instance_settings.json",
             GatewayCliRuntimeInstanceSettings
+        ),
+        schema_doc!(
+            "gateway_remote_access_transport.json",
+            GatewayRemoteAccessTransport
+        ),
+        schema_doc!("gateway_remote_access_state.json", GatewayRemoteAccessState),
+        schema_doc!(
+            "gateway_remote_access_error_kind.json",
+            GatewayRemoteAccessErrorKind
+        ),
+        schema_doc!(
+            "gateway_remote_access_status_snapshot.json",
+            GatewayRemoteAccessStatusSnapshot
+        ),
+        schema_doc!(
+            "gateway_remote_access_status_changed_notification.json",
+            GatewayRemoteAccessStatusChangedNotification
+        ),
+        schema_doc!(
+            "gateway_remote_access_settings.json",
+            GatewayRemoteAccessSettings
+        ),
+        schema_doc!(
+            "gateway_remote_access_settings_update.json",
+            GatewayRemoteAccessSettingsUpdate
         ),
         schema_doc!("gateway_general_settings.json", GatewayGeneralSettings),
         schema_doc!(

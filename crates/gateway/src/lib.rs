@@ -58,6 +58,7 @@ use pioneer_tools::{
     ComputerUseToolsConfig, ExecutionWindowBudgetConfig, ExecutionWindowTotalBudgetConfig,
     ExecutionWindowsConfig, ToolLoopBudgetConfig, ToolRetryBudgetConfig, WebToolsConfig,
 };
+use pioneer_tunnel::{RemoteAccessDesiredState, RemoteAccessSupervisor};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -114,6 +115,10 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
     let gateway_settings = load_gateway_settings(&runtime_home, &config)?;
     config = gateway_settings.apply_to_app_config(config);
     let gateway_secrets = Arc::new(GatewaySecrets::open(&runtime_home)?);
+    let remote_access_supervisor = Arc::new(RemoteAccessSupervisor::new(
+        runtime_home.as_path(),
+        config.gateway.remote_access.clone(),
+    )?);
     let jwt_material = gateway_secrets
         .load_or_create_superuser_jwt_material(config.gateway.auth.secret_size_bytes)?;
     let auth = initialize_jwt_auth(&config, jwt_material.as_slice())?;
@@ -435,7 +440,7 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         session_manager.clone(),
         workspace_manager,
         crud_store,
-        gateway_secrets,
+        gateway_secrets.clone(),
         summary_config,
         context_budget,
         tool_loop_config,
@@ -448,7 +453,10 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
     if let Some(cli_runtime_manager) = cli_runtime_manager {
         message_processor = message_processor.with_cli_runtime_manager(cli_runtime_manager);
     }
+    message_processor =
+        message_processor.with_remote_access_supervisor(remote_access_supervisor.clone());
     let message_processor = Arc::new(message_processor);
+    message_processor.start_remote_access_status_notifications();
 
     message_processor
         .apply_keepawake_setting(config.gateway.keepawake)
@@ -466,12 +474,20 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
     message_processor.start_mcp_workspace_supervisor().await;
 
     let handle = spawn_server(config, auth, message_processor.clone(), session_manager).await?;
+    remote_access_supervisor
+        .apply(remote_access_desired_state(
+            &gateway_settings,
+            gateway_secrets.as_ref(),
+        )?)
+        .await
+        .context("failed to apply initial remote access settings")?;
 
     info!(listen_addr = %handle.local_addr(), "gateway daemon started");
 
     wait_for_shutdown_signal().await?;
 
     info!("gateway daemon stopping with telemetry snapshot");
+    message_processor.shutdown_remote_access_supervisor().await;
     handle.shutdown().await?;
     message_processor.shutdown_cli_runtime_manager().await;
     database
@@ -547,6 +563,24 @@ fn load_gateway_settings(runtime_home: &Path, config: &AppConfig) -> Result<Gate
         config.gateway.settings_version,
         settings_file_name.as_str(),
     )
+}
+
+fn remote_access_desired_state(
+    settings: &GatewaySettings,
+    gateway_secrets: &GatewaySecrets,
+) -> Result<RemoteAccessDesiredState> {
+    let key = match settings.remote_access_secret_ref() {
+        Some(secret_ref) => gateway_secrets.get_remote_access_secret(secret_ref)?,
+        None => None,
+    };
+    let has_key = key.is_some();
+    Ok(RemoteAccessDesiredState {
+        settings: settings.effective_remote_access_settings(
+            has_key,
+            pioneer_protocol::GatewayRemoteAccessStatusSnapshot::default(),
+        ),
+        key,
+    })
 }
 
 fn build_cli_runtime_manager(

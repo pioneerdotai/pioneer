@@ -114,6 +114,7 @@ pub fn gateway_settings_snapshot_with_memory(
         memory: GatewayMemorySettings::default(),
         thread_episodic: Default::default(),
         cli_runtimes: Default::default(),
+        remote_access: Default::default(),
     });
     snapshot.memory = memory;
     snapshot
@@ -125,6 +126,7 @@ pub fn gateway_settings_update_for_memory(memory: GatewayMemorySettings) -> Gate
         memory: Some(memory),
         thread_episodic: None,
         cli_runtimes: None,
+        remote_access: None,
     }
 }
 
@@ -141,6 +143,7 @@ mod tests {
             memory: GatewayMemorySettings::default(),
             thread_episodic: Default::default(),
             cli_runtimes: Default::default(),
+            remote_access: Default::default(),
         }
     }
 

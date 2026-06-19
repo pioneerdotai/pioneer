@@ -75,33 +75,34 @@ use pioneer_protocol::{
     CLIRuntimeStatusResponse, CLIRuntimeThreadBinding, CLIRuntimeThreadBindingGetParams,
     CLIRuntimeThreadBindingGetResponse, CLIRuntimeThreadCompactParams, CLIRuntimeThreadForkParams,
     CLIRuntimeThreadForkResponse, CLIRuntimeTurnSteerParams, CLIRuntimeTurnSteerResponse,
-    ContextCompressedNotification, ContextCompressingNotification, INVALID_PARAMS_CODE,
-    INVALID_REQUEST_CODE, ItemCompletedNotification, ItemDeltaNotification, ItemDeltaStream,
-    ItemStartedNotification, ItemTimeoutDetectedNotification, JSONRPC_VERSION,
-    JsonRpcErrorResponse, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
-    MARKDOWN_AST_VERSION, METHOD_NOT_FOUND_CODE, McpAuditEventSummary, McpChangedAction,
-    McpChangedItem, McpChangedNotification, McpDiagnosticLevel, McpInstallParams,
-    McpInstallResponse, McpInstallResult, McpInstallResultStatus, McpInstallStatus,
-    McpLifecycleAuditSummary, McpListItem, McpListParams, McpListResponse, McpPolicySetParams,
-    McpPolicySetResponse, McpPolicyState, McpPromptCatalogItem, McpResourceCatalogItem,
-    McpResourceTemplateCatalogItem, McpRuntimeState, McpRuntimeStatus, McpServerCatalogDetails,
-    McpServerDetailsParams, McpServerDetailsResponse, McpServerHealthDetails, McpServerPolicy,
-    McpServerRestartParams, McpServerRestartResponse, McpServerStatus, McpSourceKind,
-    McpToolAnnotationSummary, McpToolCatalogItem, McpTransportSummary, McpTurnBindingSummary,
-    McpUninstallParams, McpUninstallResponse, McpValidationDiagnostic, PARSE_ERROR_CODE,
-    ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse, ProviderListModelsParams,
-    ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
-    ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits, ProviderModelPricing,
-    ProviderSetApiKeyParams, ProviderSetApiKeyResponse, ProviderSummary, RequestId,
-    RuntimeAccountSnapshot, RuntimeCapabilities, RuntimeDiagnostic, RuntimeDiagnosticLevel,
-    RuntimeModelInfo, RuntimeStatus, RuntimeSummary, SkillsUploadAbortParams,
-    SkillsUploadFinishParams, SkillsUploadStartParams, SystemEventLevel, TaskAcceptParams,
-    TaskAgendaParams, TaskCancelParams, TaskCreateParams, TaskDeliveriesParams, TaskDelivery,
-    TaskDeliveryAttempt, TaskDeliveryMode, TaskDetachParams, TaskEventsParams, TaskGetParams,
-    TaskListParams, TaskPauseParams, TaskRescheduleParams, TaskResumeParams, TaskReviseParams,
-    TaskTreeParams as TaskTreeTaskParams, TaskWaitParams, ThreadAgentsDocArchiveParams,
-    ThreadAgentsDocArchiveResponse, ThreadAgentsDocChangedNotification, ThreadAgentsDocGetParams,
-    ThreadAgentsDocGetResponse, ThreadAgentsDocPayload, ThreadAgentsDocResolveForThreadParams,
+    ContextCompressedNotification, ContextCompressingNotification,
+    GatewayRemoteAccessStatusChangedNotification, INVALID_PARAMS_CODE, INVALID_REQUEST_CODE,
+    ItemCompletedNotification, ItemDeltaNotification, ItemDeltaStream, ItemStartedNotification,
+    ItemTimeoutDetectedNotification, JSONRPC_VERSION, JsonRpcErrorResponse, JsonRpcNotification,
+    JsonRpcRequest, JsonRpcResponse, MARKDOWN_AST_VERSION, METHOD_NOT_FOUND_CODE,
+    McpAuditEventSummary, McpChangedAction, McpChangedItem, McpChangedNotification,
+    McpDiagnosticLevel, McpInstallParams, McpInstallResponse, McpInstallResult,
+    McpInstallResultStatus, McpInstallStatus, McpLifecycleAuditSummary, McpListItem, McpListParams,
+    McpListResponse, McpPolicySetParams, McpPolicySetResponse, McpPolicyState,
+    McpPromptCatalogItem, McpResourceCatalogItem, McpResourceTemplateCatalogItem, McpRuntimeState,
+    McpRuntimeStatus, McpServerCatalogDetails, McpServerDetailsParams, McpServerDetailsResponse,
+    McpServerHealthDetails, McpServerPolicy, McpServerRestartParams, McpServerRestartResponse,
+    McpServerStatus, McpSourceKind, McpToolAnnotationSummary, McpToolCatalogItem,
+    McpTransportSummary, McpTurnBindingSummary, McpUninstallParams, McpUninstallResponse,
+    McpValidationDiagnostic, PARSE_ERROR_CODE, ProviderDeleteApiKeyParams,
+    ProviderDeleteApiKeyResponse, ProviderListModelsParams, ProviderListModelsResponse,
+    ProviderListParams, ProviderListResponse, ProviderModelCapabilities, ProviderModelInfo,
+    ProviderModelLimits, ProviderModelPricing, ProviderSetApiKeyParams, ProviderSetApiKeyResponse,
+    ProviderSummary, RequestId, RuntimeAccountSnapshot, RuntimeCapabilities, RuntimeDiagnostic,
+    RuntimeDiagnosticLevel, RuntimeModelInfo, RuntimeStatus, RuntimeSummary,
+    SkillsUploadAbortParams, SkillsUploadFinishParams, SkillsUploadStartParams, SystemEventLevel,
+    TaskAcceptParams, TaskAgendaParams, TaskCancelParams, TaskCreateParams, TaskDeliveriesParams,
+    TaskDelivery, TaskDeliveryAttempt, TaskDeliveryMode, TaskDetachParams, TaskEventsParams,
+    TaskGetParams, TaskListParams, TaskPauseParams, TaskRescheduleParams, TaskResumeParams,
+    TaskReviseParams, TaskTreeParams as TaskTreeTaskParams, TaskWaitParams,
+    ThreadAgentsDocArchiveParams, ThreadAgentsDocArchiveResponse,
+    ThreadAgentsDocChangedNotification, ThreadAgentsDocGetParams, ThreadAgentsDocGetResponse,
+    ThreadAgentsDocPayload, ThreadAgentsDocResolveForThreadParams,
     ThreadAgentsDocResolveForThreadResponse, ThreadAgentsDocResolvedPayload,
     ThreadAgentsDocSaveParams, ThreadAgentsDocSaveReason, ThreadAgentsDocSaveResponse,
     ThreadAgentsDocStatus, ThreadAgentsDocSummary, ThreadFolderCreateParams,
@@ -198,6 +199,7 @@ pub struct MessageProcessor {
     provider_registry: Arc<ProviderRegistry>,
     session_manager: Arc<SessionManager>,
     cli_runtime_manager: Option<Arc<CLIAgentRuntimeManager>>,
+    remote_access_supervisor: Option<Arc<pioneer_tunnel::RemoteAccessSupervisor>>,
     workspace_manager: Arc<WorkspaceManager>,
     pub(crate) crud_store: Arc<CrudStore>,
     gateway_secrets: Arc<GatewaySecrets>,
@@ -394,6 +396,7 @@ impl MessageProcessor {
             provider_registry,
             session_manager,
             cli_runtime_manager: None,
+            remote_access_supervisor: None,
             workspace_manager,
             crud_store: crud_store.clone(),
             gateway_secrets,
@@ -452,6 +455,54 @@ impl MessageProcessor {
 
     pub async fn set_hook_recovery_config(&self, config: GatewayHookRecoveryConfig) {
         *self.hook_recovery_config.write().await = config;
+    }
+
+    pub(crate) fn with_remote_access_supervisor(
+        mut self,
+        supervisor: Arc<pioneer_tunnel::RemoteAccessSupervisor>,
+    ) -> Self {
+        self.remote_access_supervisor = Some(supervisor);
+        self
+    }
+
+    pub fn start_remote_access_status_notifications(self: &Arc<Self>) {
+        let Some(supervisor) = self.remote_access_supervisor.as_ref() else {
+            return;
+        };
+        let mut status_rx = supervisor.subscribe_status();
+        let processor = Arc::downgrade(self);
+        let _status_notifications = tokio::spawn(async move {
+            let mut previous = status_rx.borrow().clone();
+
+            loop {
+                if status_rx.changed().await.is_err() {
+                    break;
+                }
+
+                let status = status_rx.borrow().clone();
+                if status == previous {
+                    continue;
+                }
+                previous = status.clone();
+
+                let Some(processor) = processor.upgrade() else {
+                    break;
+                };
+                processor
+                    .send_notification_to_all_connections(
+                        events::GATEWAY_REMOTE_ACCESS_STATUS_CHANGED,
+                        &GatewayRemoteAccessStatusChangedNotification { status },
+                    )
+                    .await;
+            }
+        });
+    }
+
+    pub async fn shutdown_remote_access_supervisor(&self) {
+        let Some(supervisor) = self.remote_access_supervisor.as_ref() else {
+            return;
+        };
+        supervisor.shutdown().await;
     }
 
     pub async fn shutdown_cli_runtime_manager(&self) {
@@ -1601,6 +1652,7 @@ impl MessageProcessor {
             provider_registry,
             session_manager,
             cli_runtime_manager: None,
+            remote_access_supervisor: None,
             workspace_manager,
             crud_store: crud_store.clone(),
             gateway_secrets,

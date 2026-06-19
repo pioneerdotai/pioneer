@@ -161,6 +161,35 @@
         "strict_diagnostics_enabled"
       ]
     },
+    "GatewayRemoteAccessSettingsUpdate": {
+      "type": "object",
+      "properties": {
+        "clear_key": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "server": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
     "GatewaySettingsUpdate": {
       "type": "object",
       "properties": {
@@ -188,6 +217,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/GatewayMemorySettings"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "remote_access": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayRemoteAccessSettingsUpdate"
             },
             {
               "type": "null"

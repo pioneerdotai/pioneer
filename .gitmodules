@@ -1,0 +1,3 @@
+[submodule "vendor/rathole"]
+	path = vendor/rathole
+	url = https://github.com/pioneerdotai/rathole.git

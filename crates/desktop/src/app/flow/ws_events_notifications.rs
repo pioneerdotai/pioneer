@@ -111,6 +111,9 @@ impl PioneerDesktop {
                 self.apply_cli_runtime_pending_requests_reduction(reduction, cx);
                 self.apply_cli_runtime_refresh_reduction(refresh, cx);
             }
+            ClientRuntimeNotification::GatewayRemoteAccessStatusChanged(notification) => {
+                self.apply_remote_access_status_changed(notification.status, cx);
+            }
             ClientRuntimeNotification::WorkspaceChanged {
                 notification,
                 preference,
@@ -119,6 +122,18 @@ impl PioneerDesktop {
                 self.apply_workspace_preference_reduction(preference);
             }
         }
+    }
+
+    fn apply_remote_access_status_changed(
+        &mut self,
+        status: pioneer_protocol::GatewayRemoteAccessStatusSnapshot,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(settings) = self.gateway.settings.as_mut() else {
+            return;
+        };
+        settings.remote_access.status = status;
+        cx.notify();
     }
 
     fn apply_thread_started_reduction(&mut self, reduction: ThreadStartedReduction) {

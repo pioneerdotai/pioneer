@@ -56,7 +56,8 @@ use crate::{
     },
 };
 use pioneer_protocol::{
-    ArtifactSummary, GatewayNotification, Workspace, WorkspaceChangedNotification,
+    ArtifactSummary, GatewayNotification, GatewayRemoteAccessStatusChangedNotification, Workspace,
+    WorkspaceChangedNotification,
 };
 
 #[derive(Clone)]
@@ -128,6 +129,7 @@ pub enum ClientRuntimeNotification {
         refresh: CLIRuntimeRefreshReduction,
         reduction: CLIRuntimePendingRequestsReduction,
     },
+    GatewayRemoteAccessStatusChanged(GatewayRemoteAccessStatusChangedNotification),
     WorkspaceChanged {
         notification: WorkspaceChangedNotification,
         preference: WorkspacePreferenceReduction,
@@ -602,6 +604,9 @@ pub fn reduce_gateway_notification(
                 ),
             ))
         }
+        GatewayNotification::GatewayRemoteAccessStatusChanged(notification) => Some(
+            ClientRuntimeNotification::GatewayRemoteAccessStatusChanged(notification),
+        ),
         GatewayNotification::ContextCompressing(_)
         | GatewayNotification::ContextCompressed(_)
         | GatewayNotification::Unknown(_)
@@ -654,6 +659,8 @@ mod tests {
         transport::ws::GatewayWsConnectSpec,
     };
     use pioneer_protocol::{
+        GatewayRemoteAccessErrorKind, GatewayRemoteAccessState,
+        GatewayRemoteAccessStatusChangedNotification, GatewayRemoteAccessStatusSnapshot,
         SkillsChangedNotification, UnknownGatewayNotification, Workspace, WorkspaceChangeKind,
         WorkspaceChangedNotification,
     };
@@ -957,6 +964,34 @@ mod tests {
         };
         assert_eq!(reduction.workspace_id, "ws_a");
         assert!(reduction.queue_skills_refresh);
+    }
+
+    #[test]
+    fn runtime_reduces_remote_access_status_notification() {
+        let notification = GatewayNotification::GatewayRemoteAccessStatusChanged(
+            GatewayRemoteAccessStatusChangedNotification {
+                status: GatewayRemoteAccessStatusSnapshot {
+                    state: GatewayRemoteAccessState::Failed,
+                    error_kind: Some(GatewayRemoteAccessErrorKind::RelayConnectFailed),
+                    message: Some("failed to connect".to_owned()),
+                    updated_at_unix: Some(1),
+                },
+            },
+        );
+
+        let reduced =
+            reduce_gateway_notification(notification, ClientRuntimeNotificationContext::default());
+
+        let Some(ClientRuntimeNotification::GatewayRemoteAccessStatusChanged(notification)) =
+            reduced
+        else {
+            panic!("expected remote access status reduction");
+        };
+        assert_eq!(notification.status.state, GatewayRemoteAccessState::Failed);
+        assert_eq!(
+            notification.status.error_kind,
+            Some(GatewayRemoteAccessErrorKind::RelayConnectFailed)
+        );
     }
 
     #[test]

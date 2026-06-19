@@ -349,6 +349,7 @@ pub(crate) fn test_config() -> AppConfig {
             skills: GatewaySkillsConfig::default(),
             cli_agent_runtime: GatewayCliAgentRuntimeConfig::default(),
             cli_agent_runtimes: GatewayCliAgentRuntimeInstancesConfig::default(),
+            remote_access: Default::default(),
             memory: GatewayMemoryConfig::default(),
             thread_episodic: Default::default(),
             hooks: Default::default(),

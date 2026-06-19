@@ -266,6 +266,7 @@ fn cli_runtime_provider_settings_plan(
             memory: None,
             thread_episodic: None,
             cli_runtimes: Some(cli_runtimes),
+            remote_access: None,
         },
     })
 }
@@ -528,6 +529,7 @@ mod tests {
             memory: GatewayMemorySettings::default(),
             thread_episodic: Default::default(),
             cli_runtimes: GatewayCliRuntimeSettings { instances },
+            remote_access: Default::default(),
         }
     }
 

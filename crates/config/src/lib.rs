@@ -55,6 +55,8 @@ pub struct GatewayConfig {
     pub cli_agent_runtime: GatewayCliAgentRuntimeConfig,
     #[serde(default)]
     pub cli_agent_runtimes: GatewayCliAgentRuntimeInstancesConfig,
+    #[serde(default)]
+    pub remote_access: GatewayRemoteAccessConfig,
     pub provider: GatewayProviderConfig,
     pub database: GatewayDatabaseConfig,
     #[serde(default)]
@@ -86,6 +88,59 @@ pub struct GatewayTaskReviewConfig {
     pub default_max_revision_rounds: u32,
     #[serde(default = "default_tasks_review_auto_accept_after_seconds")]
     pub auto_accept_after_seconds: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GatewayRemoteAccessConfig {
+    #[serde(default = "default_gateway_remote_access_runtime_dir")]
+    pub runtime_dir: String,
+    #[serde(default = "default_gateway_remote_access_local_addr")]
+    pub local_addr: String,
+    #[serde(default = "default_gateway_remote_access_restart_initial_ms")]
+    pub restart_initial_ms: u64,
+    #[serde(default = "default_gateway_remote_access_restart_max_ms")]
+    pub restart_max_ms: u64,
+    #[serde(default = "default_gateway_remote_access_restart_jitter_percent")]
+    pub restart_jitter_percent: u8,
+    #[serde(default = "default_gateway_remote_access_max_restarts")]
+    pub max_restarts: u32,
+}
+
+impl Default for GatewayRemoteAccessConfig {
+    fn default() -> Self {
+        Self {
+            runtime_dir: default_gateway_remote_access_runtime_dir(),
+            local_addr: default_gateway_remote_access_local_addr(),
+            restart_initial_ms: default_gateway_remote_access_restart_initial_ms(),
+            restart_max_ms: default_gateway_remote_access_restart_max_ms(),
+            restart_jitter_percent: default_gateway_remote_access_restart_jitter_percent(),
+            max_restarts: default_gateway_remote_access_max_restarts(),
+        }
+    }
+}
+
+fn default_gateway_remote_access_runtime_dir() -> String {
+    "remote-access".to_owned()
+}
+
+fn default_gateway_remote_access_local_addr() -> String {
+    "127.0.0.1:17878".to_owned()
+}
+
+const fn default_gateway_remote_access_restart_initial_ms() -> u64 {
+    1_000
+}
+
+const fn default_gateway_remote_access_restart_max_ms() -> u64 {
+    30_000
+}
+
+const fn default_gateway_remote_access_restart_jitter_percent() -> u8 {
+    20
+}
+
+const fn default_gateway_remote_access_max_restarts() -> u32 {
+    0
 }
 
 impl Default for GatewayTaskReviewConfig {

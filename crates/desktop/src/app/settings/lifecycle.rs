@@ -14,7 +14,11 @@ use gpui_component::{
 };
 use pioneer_client::settings::{gateway as gateway_settings, memory as settings_memory};
 use pioneer_protocol::{GatewayMemoryModelSelection, GatewayMemorySettings, GatewaySettingsUpdate};
+use std::time::Duration;
 use tracing::warn;
+
+const REMOTE_ACCESS_STATUS_POLL_ATTEMPTS: usize = 12;
+const REMOTE_ACCESS_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 impl PioneerDesktop {
     pub(in crate::app) fn open_settings_content_from_sidebar(
@@ -106,6 +110,78 @@ impl PioneerDesktop {
         };
 
         self.apply_gateway_settings_update(plan.snapshot, plan.update, cx);
+    }
+
+    pub(super) fn toggle_remote_access_settings_expanded(&mut self) {
+        self.remote_access_settings_expanded = !self.remote_access_settings_expanded;
+    }
+
+    pub(super) fn apply_remote_access_setting(
+        &mut self,
+        enabled: bool,
+        server: String,
+        key: Option<String>,
+        clear_key: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(plan) = gateway_settings::remote_access_update_plan(
+            self.gateway.settings.as_ref(),
+            enabled,
+            server,
+            key,
+            clear_key,
+        ) else {
+            self.refresh_gateway_settings(cx);
+            return;
+        };
+
+        self.apply_gateway_settings_update(plan.snapshot, plan.update, cx);
+    }
+
+    pub(super) fn save_remote_access_server_inline(
+        &mut self,
+        server: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(settings) = self.gateway.settings.as_ref() else {
+            self.refresh_gateway_settings(cx);
+            return;
+        };
+        let normalized_server = gateway_settings::normalize_remote_access_input(server.as_str());
+        if normalized_server == settings.remote_access.server {
+            return;
+        }
+        self.apply_remote_access_setting(
+            settings.remote_access.enabled,
+            normalized_server.unwrap_or_default(),
+            None,
+            false,
+            cx,
+        );
+    }
+
+    pub(super) fn save_remote_access_key_inline(
+        &mut self,
+        server: String,
+        key: String,
+        cx: &mut Context<Self>,
+    ) {
+        if key.trim().is_empty() {
+            return;
+        }
+        let Some(settings) = self.gateway.settings.as_ref() else {
+            self.refresh_gateway_settings(cx);
+            return;
+        };
+        self.remote_access_key_input_revision =
+            self.remote_access_key_input_revision.wrapping_add(1);
+        self.apply_remote_access_setting(
+            settings.remote_access.enabled,
+            server,
+            Some(key),
+            false,
+            cx,
+        );
     }
 
     pub(super) fn apply_memory_model_setting(
@@ -266,6 +342,7 @@ impl PioneerDesktop {
         let connection_id = scope.connection_id;
         let connection_epoch = scope.connection_epoch;
         let refresh_cli_providers_after_update = update.cli_runtimes.is_some();
+        let poll_remote_access_status_after_update = update.remote_access.is_some();
 
         gateway_settings::apply_optimistic_gateway_settings_update(
             &mut self.gateway.settings,
@@ -301,6 +378,13 @@ impl PioneerDesktop {
                             if refresh_cli_providers_after_update {
                                 view.refresh_cli_providers(cx);
                             }
+                            if poll_remote_access_status_after_update {
+                                view.schedule_remote_access_status_poll(
+                                    connection_id,
+                                    connection_epoch,
+                                    cx,
+                                );
+                            }
                         }
                         Err(error) => {
                             gateway_settings::apply_gateway_settings_update_error(
@@ -315,6 +399,54 @@ impl PioneerDesktop {
                     }
                     cx.notify();
                 });
+            }
+        })
+        .detach();
+    }
+
+    fn schedule_remote_access_status_poll(
+        &mut self,
+        connection_id: u64,
+        connection_epoch: u64,
+        cx: &mut Context<Self>,
+    ) {
+        self.remote_access_status_poll_generation =
+            self.remote_access_status_poll_generation.wrapping_add(1);
+        let generation = self.remote_access_status_poll_generation;
+
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                for _ in 0..REMOTE_ACCESS_STATUS_POLL_ATTEMPTS {
+                    Timer::after(REMOTE_ACCESS_STATUS_POLL_INTERVAL).await;
+
+                    let updated = this.update(&mut cx, |view, cx| {
+                        if view.remote_access_status_poll_generation != generation {
+                            return false;
+                        }
+                        if !gateway_settings::settings_action_matches_connection(
+                            connection_id,
+                            connection_epoch,
+                            view.gateway.ws_connection_id,
+                            view.gateway.connection_epoch,
+                        ) {
+                            return false;
+                        }
+                        if !gateway_settings::remote_access_status_needs_poll(
+                            view.gateway.settings.as_ref(),
+                        ) {
+                            return false;
+                        }
+
+                        view.refresh_gateway_settings(cx);
+                        true
+                    });
+
+                    match updated {
+                        Ok(true) => {}
+                        _ => break,
+                    }
+                }
             }
         })
         .detach();

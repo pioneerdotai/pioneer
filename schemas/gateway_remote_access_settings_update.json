@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GatewayRemoteAccessSettingsUpdate",
+  "type": "object",
+  "properties": {
+    "clear_key": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "enabled": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "key": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "server": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

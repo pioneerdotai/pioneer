@@ -82,7 +82,7 @@ impl Render for PioneerDesktop {
             v_flex()
                 .size_full()
                 .child(
-                    div().flex_1().w_full().overflow_hidden().child(
+                    div().flex_1().min_h_0().w_full().overflow_hidden().child(
                         h_resizable("desktop-layout")
                             .on_resize({
                                 let desktop_entity = desktop_entity.clone();
@@ -217,7 +217,14 @@ impl Render for PioneerDesktop {
                                 ),
                         ),
                     )
-                    .child(div().flex_1().w_full().overflow_hidden().child(body)),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .w_full()
+                            .overflow_hidden()
+                            .child(body),
+                    ),
             )
             .children(sheet_layer)
             .children(dialog_layer)

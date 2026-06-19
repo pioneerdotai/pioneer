@@ -26,6 +26,11 @@ pub struct GatewaySettings {
     thread_episodic: Option<GatewayThreadEpisodicSettingsOverride>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cli_runtimes: Option<GatewayCliRuntimeSettingsOverride>,
+    #[serde(
+        default,
+        skip_serializing_if = "GatewayRemoteAccessSettingsOverride::is_default"
+    )]
+    remote_access: GatewayRemoteAccessSettingsOverride,
     #[serde(skip)]
     migrated: bool,
 }
@@ -43,6 +48,8 @@ struct GatewaySettingsWire {
     thread_episodic: Option<GatewayThreadEpisodicSettingsOverride>,
     #[serde(default)]
     cli_runtimes: Option<GatewayCliRuntimeSettingsOverride>,
+    #[serde(default)]
+    remote_access: GatewayRemoteAccessSettingsOverride,
 }
 
 impl<'de> Deserialize<'de> for GatewaySettings {
@@ -58,6 +65,7 @@ impl<'de> Deserialize<'de> for GatewaySettings {
             memory: wire.memory,
             thread_episodic: wire.thread_episodic,
             cli_runtimes: wire.cli_runtimes,
+            remote_access: wire.remote_access,
             migrated: false,
         };
         settings.migrate_legacy_active_recall_model();
@@ -264,6 +272,102 @@ struct GatewayCliRuntimeInstanceSettingsOverride {
     shadow_home_path: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct GatewayRemoteAccessSettingsOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    server: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    public_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    service_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transport: Option<GatewayRemoteAccessTransportConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    secret_ref: Option<String>,
+}
+
+impl GatewayRemoteAccessSettingsOverride {
+    const DEFAULT_SECRET_REF: &'static str = "remote_access";
+    const DEFAULT_SERVICE_NAME: &'static str = "pioneer_gateway";
+
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    fn secret_ref(&self) -> &str {
+        self.secret_ref
+            .as_deref()
+            .unwrap_or(Self::DEFAULT_SECRET_REF)
+    }
+
+    fn service_name(&self) -> String {
+        self.service_name
+            .clone()
+            .unwrap_or_else(|| Self::DEFAULT_SERVICE_NAME.to_owned())
+    }
+
+    fn apply_protocol_update(
+        &mut self,
+        update: pioneer_protocol::GatewayRemoteAccessSettingsUpdate,
+    ) -> Result<GatewayRemoteAccessChangeSet> {
+        let mut changes = GatewayRemoteAccessChangeSet {
+            changed: true,
+            secret_ref: self.secret_ref().to_owned(),
+            ..GatewayRemoteAccessChangeSet::default()
+        };
+
+        if let Some(enabled) = update.enabled {
+            self.enabled = Some(enabled);
+            changes.enabled = Some(enabled);
+        }
+
+        if let Some(server) = update.server {
+            self.server = normalize_remote_access_optional_text(
+                "remote access server",
+                server.as_str(),
+                512,
+            )?;
+            changes.server_changed = true;
+        }
+
+        if let Some(key) = update.key {
+            let key =
+                normalize_remote_access_required_text("remote access key", key.as_str(), 4096)?;
+            self.secret_ref = Some(changes.secret_ref.clone());
+            changes.key = Some(key);
+            changes.clear_key = false;
+        } else if update.clear_key.unwrap_or(false) {
+            changes.clear_key = true;
+        }
+
+        Ok(changes)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum GatewayRemoteAccessTransportConfig {
+    #[default]
+    Tcp,
+    Tls,
+    Noise,
+    Websocket,
+}
+
+impl GatewayRemoteAccessTransportConfig {
+    fn to_protocol(self) -> pioneer_protocol::GatewayRemoteAccessTransport {
+        match self {
+            Self::Tcp => pioneer_protocol::GatewayRemoteAccessTransport::Tcp,
+            Self::Tls => pioneer_protocol::GatewayRemoteAccessTransport::Tls,
+            Self::Noise => pioneer_protocol::GatewayRemoteAccessTransport::Noise,
+            Self::Websocket => pioneer_protocol::GatewayRemoteAccessTransport::Websocket,
+        }
+    }
+}
+
 impl Default for GatewaySecretsSettings {
     fn default() -> Self {
         Self {
@@ -316,6 +420,42 @@ impl GatewaySettings {
         cli_runtime_settings_from_gateway_config(&self.apply_to_gateway_config(config.clone()))
     }
 
+    pub fn remote_access_secret_ref(&self) -> Option<&str> {
+        if self.remote_access.enabled.unwrap_or(false)
+            || self.remote_access.server.is_some()
+            || self.remote_access.secret_ref.is_some()
+        {
+            Some(
+                self.remote_access
+                    .secret_ref
+                    .as_deref()
+                    .unwrap_or(GatewayRemoteAccessSettingsOverride::DEFAULT_SECRET_REF),
+            )
+        } else {
+            None
+        }
+    }
+
+    pub fn effective_remote_access_settings(
+        &self,
+        has_key: bool,
+        status: pioneer_protocol::GatewayRemoteAccessStatusSnapshot,
+    ) -> pioneer_protocol::GatewayRemoteAccessSettings {
+        pioneer_protocol::GatewayRemoteAccessSettings {
+            enabled: self.remote_access.enabled.unwrap_or(false),
+            server: self.remote_access.server.clone(),
+            public_address: self.remote_access.public_address.clone(),
+            service_name: Some(self.remote_access.service_name()),
+            transport: self
+                .remote_access
+                .transport
+                .unwrap_or_default()
+                .to_protocol(),
+            has_key,
+            status,
+        }
+    }
+
     pub fn set_memory_settings(&mut self, memory: GatewayMemorySettings) {
         self.memory = Some(GatewayMemorySettingsOverride::from_memory_settings(memory));
     }
@@ -337,6 +477,19 @@ impl GatewaySettings {
     }
 
     pub fn snapshot(&self, config: &GatewayConfig) -> pioneer_protocol::GatewaySettingsSnapshot {
+        self.snapshot_with_remote_access_status(
+            config,
+            false,
+            pioneer_protocol::GatewayRemoteAccessStatusSnapshot::default(),
+        )
+    }
+
+    pub fn snapshot_with_remote_access_status(
+        &self,
+        config: &GatewayConfig,
+        has_remote_access_key: bool,
+        remote_access_status: pioneer_protocol::GatewayRemoteAccessStatusSnapshot,
+    ) -> pioneer_protocol::GatewaySettingsSnapshot {
         let general = self.effective_general_settings(config);
         pioneer_protocol::GatewaySettingsSnapshot {
             general,
@@ -345,6 +498,8 @@ impl GatewaySettings {
                 .effective_thread_episodic_settings(&config.thread_episodic)
                 .to_protocol(),
             cli_runtimes: self.effective_cli_runtime_settings(config),
+            remote_access: self
+                .effective_remote_access_settings(has_remote_access_key, remote_access_status),
         }
     }
 
@@ -368,6 +523,9 @@ impl GatewaySettings {
         if let Some(cli_runtimes) = update.cli_runtimes {
             self.set_cli_runtime_settings(cli_runtimes)?;
             changes.cli_runtimes = true;
+        }
+        if let Some(remote_access) = update.remote_access {
+            changes.remote_access = self.remote_access.apply_protocol_update(remote_access)?;
         }
         Ok(changes)
     }
@@ -587,12 +745,23 @@ pub struct GatewaySettingsChangeSet {
     pub memory: bool,
     pub thread_episodic: bool,
     pub cli_runtimes: bool,
+    pub remote_access: GatewayRemoteAccessChangeSet,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GatewayGeneralSettingsChangeSet {
     pub keepawake: Option<bool>,
     pub preflight_model: Option<GatewayMemoryModelSelectionConfig>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GatewayRemoteAccessChangeSet {
+    pub changed: bool,
+    pub enabled: Option<bool>,
+    pub server_changed: bool,
+    pub secret_ref: String,
+    pub key: Option<String>,
+    pub clear_key: bool,
 }
 
 impl GatewayMemorySettingsOverride {
@@ -1112,6 +1281,35 @@ fn normalize_cli_runtime_optional_path(field: &str, raw: Option<&str>) -> Result
     Ok(Some(trimmed.to_owned()))
 }
 
+fn normalize_remote_access_required_text(
+    field: &str,
+    raw: &str,
+    max_chars: usize,
+) -> Result<String> {
+    let Some(value) = normalize_remote_access_optional_text(field, raw, max_chars)? else {
+        bail!("{field} must not be empty");
+    };
+    Ok(value)
+}
+
+fn normalize_remote_access_optional_text(
+    field: &str,
+    raw: &str,
+    max_chars: usize,
+) -> Result<Option<String>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.chars().count() > max_chars {
+        bail!("{field} must be at most {max_chars} characters");
+    }
+    if trimmed.chars().any(is_disallowed_settings_text_char) {
+        bail!("{field} contains unsupported control characters");
+    }
+    Ok(Some(trimmed.to_owned()))
+}
+
 fn is_disallowed_settings_text_char(ch: char) -> bool {
     ch == '\0' || ch == '\n' || ch == '\r' || ch.is_control()
 }
@@ -1164,6 +1362,7 @@ pub fn load_or_create_gateway_settings(
         memory: None,
         thread_episodic: None,
         cli_runtimes: Some(GatewayCliRuntimeSettingsOverride::default_supported()?),
+        remote_access: GatewayRemoteAccessSettingsOverride::default(),
         migrated: false,
     };
 
@@ -1481,6 +1680,7 @@ backend = "keystore"
                 memory: None,
                 thread_episodic: None,
                 cli_runtimes: None,
+                remote_access: None,
             })
             .expect("settings update should apply");
         save_gateway_settings(&path, &settings).expect("settings should save");
@@ -1691,6 +1891,52 @@ near_capacity_percent = 75.0
         assert!(content.contains("enabled = false"));
         assert!(!content.contains("indexing_enabled"));
         assert!(!content.contains("recall_enabled"));
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn gateway_remote_access_update_keeps_key_out_of_settings_file() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let path = temp_dir.join("gateway-settings.toml");
+        let mut settings = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
+            .expect("settings should be created");
+
+        let changes = settings
+            .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+                remote_access: Some(pioneer_protocol::GatewayRemoteAccessSettingsUpdate {
+                    enabled: Some(true),
+                    server: Some(" relay.example.com:2333 ".to_owned()),
+                    key: Some(" tunnel-token ".to_owned()),
+                    clear_key: None,
+                }),
+                ..pioneer_protocol::GatewaySettingsUpdate::default()
+            })
+            .expect("remote access settings should apply");
+
+        assert!(changes.remote_access.changed);
+        assert_eq!(changes.remote_access.secret_ref, "remote_access");
+        assert_eq!(changes.remote_access.key.as_deref(), Some("tunnel-token"));
+
+        let snapshot = settings.snapshot_with_remote_access_status(
+            &gateway_config_with_keepawake(false),
+            true,
+            pioneer_protocol::GatewayRemoteAccessStatusSnapshot::default(),
+        );
+        assert!(snapshot.remote_access.enabled);
+        assert_eq!(
+            snapshot.remote_access.server.as_deref(),
+            Some("relay.example.com:2333")
+        );
+        assert!(snapshot.remote_access.has_key);
+
+        save_gateway_settings(&path, &settings).expect("settings should save");
+        let content = fs::read_to_string(&path).expect("read settings");
+        assert!(content.contains("[remote_access]"));
+        assert!(content.contains("enabled = true"));
+        assert!(content.contains("server = \"relay.example.com:2333\""));
+        assert!(!content.contains("tunnel-token"));
 
         let _ = fs::remove_dir_all(temp_dir);
     }
@@ -2251,6 +2497,7 @@ model = "legacy-model"
             skills: GatewaySkillsConfig::default(),
             cli_agent_runtime: GatewayCliAgentRuntimeConfig::default(),
             cli_agent_runtimes: GatewayCliAgentRuntimeInstancesConfig::default(),
+            remote_access: Default::default(),
             provider: GatewayProviderConfig::default(),
             database: GatewayDatabaseConfig {
                 file_name: "gateway.db".to_owned(),

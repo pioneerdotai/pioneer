@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GatewayRemoteAccessErrorKind",
+  "type": "string",
+  "enum": [
+    "invalid_settings",
+    "missing_key",
+    "missing_binary",
+    "local_gateway_unavailable",
+    "relay_resolve_failed",
+    "relay_connect_failed",
+    "tunnel_auth_failed",
+    "process_exited",
+    "unsupported_transport",
+    "restart_limit_reached",
+    "io",
+    "unknown"
+  ]
+}

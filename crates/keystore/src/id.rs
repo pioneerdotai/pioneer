@@ -6,6 +6,7 @@ pub const PROVIDER_API_KEY_SERVICE: &str = "pioneer.gateway.provider_api_key";
 pub const MCP_SECRET_SERVICE: &str = "pioneer.gateway.mcp_secret";
 pub const USER_JWT_TOKEN_SERVICE: &str = "pioneer.gateway.user_jwt_token";
 pub const SUPERUSER_JWT_TOKEN_SERVICE: &str = "pioneer.gateway.superuser_jwt_token";
+pub const GATEWAY_REMOTE_ACCESS_SECRET_SERVICE: &str = "pioneer.gateway.remote_access_secret";
 pub const DESKTOP_GATEWAY_AUTH_TOKEN_SERVICE: &str = "pioneer.desktop.gateway_auth_token";
 
 const SUPERUSER_JWT_TOKEN_USER: &str = "superuser";
@@ -54,6 +55,11 @@ impl SecretId {
         Self::from_service_user(DESKTOP_GATEWAY_AUTH_TOKEN_SERVICE, endpoint_id)
     }
 
+    pub fn gateway_remote_access_secret(secret_ref: &str) -> Result<Self> {
+        let secret_ref = validate_user("gateway remote access secret ref", secret_ref)?;
+        Self::from_service_user(GATEWAY_REMOTE_ACCESS_SECRET_SERVICE, secret_ref)
+    }
+
     pub fn service(&self) -> &str {
         &self.service
     }
@@ -79,6 +85,7 @@ pub enum SecretKind {
     McpSecret,
     UserJwtToken,
     SuperuserJwtToken,
+    GatewayRemoteAccessSecret,
     DesktopGatewayAuthToken,
 }
 
@@ -89,6 +96,7 @@ impl SecretKind {
             SecretKind::McpSecret => MCP_SECRET_SERVICE,
             SecretKind::UserJwtToken => USER_JWT_TOKEN_SERVICE,
             SecretKind::SuperuserJwtToken => SUPERUSER_JWT_TOKEN_SERVICE,
+            SecretKind::GatewayRemoteAccessSecret => GATEWAY_REMOTE_ACCESS_SECRET_SERVICE,
             SecretKind::DesktopGatewayAuthToken => DESKTOP_GATEWAY_AUTH_TOKEN_SERVICE,
         }
     }
@@ -99,6 +107,7 @@ impl SecretKind {
             MCP_SECRET_SERVICE => Some(SecretKind::McpSecret),
             USER_JWT_TOKEN_SERVICE => Some(SecretKind::UserJwtToken),
             SUPERUSER_JWT_TOKEN_SERVICE => Some(SecretKind::SuperuserJwtToken),
+            GATEWAY_REMOTE_ACCESS_SECRET_SERVICE => Some(SecretKind::GatewayRemoteAccessSecret),
             DESKTOP_GATEWAY_AUTH_TOKEN_SERVICE => Some(SecretKind::DesktopGatewayAuthToken),
             _ => None,
         }

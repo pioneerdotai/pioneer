@@ -5,14 +5,14 @@ use crate::{
     ArtifactUploadProgressNotification, CLIRuntimeAccountUpdatedNotification,
     CLIRuntimeAppsChangedNotification, CLIRuntimeRequestOpenedNotification,
     CLIRuntimeRequestResolvedNotification, CLIRuntimeStatusChangedNotification,
-    ContextCompressedNotification, ContextCompressingNotification, ItemCompletedNotification,
-    ItemDeltaNotification, ItemDeltaStream, ItemRecoveryAttachedNotification,
-    ItemRecoveryExhaustedNotification, ItemRecoveryOpenedNotification,
-    ItemRecoverySucceededNotification, ItemRetryAttemptStartedNotification,
-    ItemRetryScheduledNotification, ItemStartedNotification, ItemTimeoutDetectedNotification,
-    ItemToolRetryExhaustedNotification, ItemToolRetryResolvedNotification,
-    ItemToolRetryScheduledNotification, ItemUpdatedNotification, JsonRpcNotification,
-    McpChangedNotification, McpServerCatalogChangedNotification,
+    ContextCompressedNotification, ContextCompressingNotification,
+    GatewayRemoteAccessStatusChangedNotification, ItemCompletedNotification, ItemDeltaNotification,
+    ItemDeltaStream, ItemRecoveryAttachedNotification, ItemRecoveryExhaustedNotification,
+    ItemRecoveryOpenedNotification, ItemRecoverySucceededNotification,
+    ItemRetryAttemptStartedNotification, ItemRetryScheduledNotification, ItemStartedNotification,
+    ItemTimeoutDetectedNotification, ItemToolRetryExhaustedNotification,
+    ItemToolRetryResolvedNotification, ItemToolRetryScheduledNotification, ItemUpdatedNotification,
+    JsonRpcNotification, McpChangedNotification, McpServerCatalogChangedNotification,
     McpServerStatusChangedNotification, MemoryCandidateCreatedNotification,
     MemoryChangedNotification, MemoryForgottenNotification, SkillsChangedNotification,
     SkillsUploadChunkAckNotification, TaskCancelledNotification, TaskCompletedNotification,
@@ -139,6 +139,8 @@ pub enum GatewayNotification {
     CLIRuntimeRequestResolved(CLIRuntimeRequestResolvedNotification),
     #[serde(rename = "cli_runtime_apps_changed")]
     CLIRuntimeAppsChanged(CLIRuntimeAppsChangedNotification),
+    #[serde(rename = "gateway_remote_access_status_changed")]
+    GatewayRemoteAccessStatusChanged(GatewayRemoteAccessStatusChangedNotification),
     Unknown(UnknownGatewayNotification),
 }
 
@@ -382,6 +384,14 @@ impl GatewayNotification {
             >(
                 method, params, Self::CLIRuntimeAppsChanged
             ),
+            events::GATEWAY_REMOTE_ACCESS_STATUS_CHANGED => {
+                match serde_json::from_value::<GatewayRemoteAccessStatusChangedNotification>(
+                    params.clone(),
+                ) {
+                    Ok(notification) => Some(Self::GatewayRemoteAccessStatusChanged(notification)),
+                    Err(_) => Some(Self::Unknown(unknown_notification(method, params))),
+                }
+            }
             events::ARTIFACT_CREATED => {
                 serde_json::from_value::<ArtifactCreatedNotification>(params)
                     .ok()
@@ -541,6 +551,7 @@ impl GatewayNotification {
                 || method.starts_with("task/")
                 || method.starts_with("memory/")
                 || method.starts_with("workspace/")
+                || method.starts_with("gateway/")
                 || method.starts_with("artifact/")
                 || method.starts_with("cli_runtime/")
                 || method.starts_with("thread/artifacts_") =>
@@ -740,6 +751,38 @@ mod tests {
                 assert_eq!(notification.workspace.id, "ws_000000000000000001");
             }
             other => panic!("expected workspace changed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maps_gateway_remote_access_status_changed_notification() {
+        let notification = JsonRpcNotification::from_params(
+            "gateway/remote_access/status_changed",
+            &json!({
+                "status": {
+                    "state": "failed",
+                    "error_kind": "relay_connect_failed",
+                    "message": "failed to connect",
+                    "updated_at_unix": 1
+                }
+            }),
+        )
+        .expect("remote access status notification should encode");
+
+        let mapped = GatewayNotification::from_jsonrpc(notification)
+            .expect("remote access status changed should map");
+        match mapped {
+            GatewayNotification::GatewayRemoteAccessStatusChanged(notification) => {
+                assert_eq!(
+                    notification.status.state,
+                    crate::GatewayRemoteAccessState::Failed
+                );
+                assert_eq!(
+                    notification.status.error_kind,
+                    Some(crate::GatewayRemoteAccessErrorKind::RelayConnectFailed)
+                );
+            }
+            other => panic!("expected remote access status changed, got {other:?}"),
         }
     }
 
@@ -1458,6 +1501,7 @@ mod tests {
             "workspace_update_response.json",
             "workspace_change_kind.json",
             "workspace_changed_notification.json",
+            "gateway_remote_access_status_changed_notification.json",
             "mcp_list_params.json",
             "mcp_list_response.json",
             "mcp_scope_kind.json",

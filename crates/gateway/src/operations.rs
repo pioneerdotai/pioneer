@@ -42,6 +42,7 @@ pub struct SecretKindCounts {
     pub mcp_secret: usize,
     pub superuser_jwt_token: usize,
     pub user_jwt_token: usize,
+    pub gateway_remote_access_secret: usize,
     pub desktop_gateway_auth_token: usize,
     pub unknown: usize,
 }
@@ -275,6 +276,10 @@ fn count_secret_kinds(entries: &[SecretEntryMeta]) -> SecretKindCounts {
             }
             Some(SecretKind::UserJwtToken) => {
                 counts.user_jwt_token = counts.user_jwt_token.saturating_add(1)
+            }
+            Some(SecretKind::GatewayRemoteAccessSecret) => {
+                counts.gateway_remote_access_secret =
+                    counts.gateway_remote_access_secret.saturating_add(1)
             }
             Some(SecretKind::DesktopGatewayAuthToken) => {
                 counts.desktop_gateway_auth_token =
@@ -716,6 +721,7 @@ mod tests {
                 skills: GatewaySkillsConfig::default(),
                 cli_agent_runtime: GatewayCliAgentRuntimeConfig::default(),
                 cli_agent_runtimes: GatewayCliAgentRuntimeInstancesConfig::default(),
+                remote_access: Default::default(),
                 provider: GatewayProviderConfig::default(),
                 database: GatewayDatabaseConfig {
                     file_name: "gateway.db".to_owned(),

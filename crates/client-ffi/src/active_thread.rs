@@ -838,6 +838,7 @@ impl ClientFfiActiveThreadState {
             | ClientRuntimeNotification::ArtifactDeletedRefresh(_)
             | ClientRuntimeNotification::CLIRuntimeRefresh(_)
             | ClientRuntimeNotification::CLIRuntimePendingRequests { .. }
+            | ClientRuntimeNotification::GatewayRemoteAccessStatusChanged(_)
             | ClientRuntimeNotification::WorkspaceChanged { .. } => {}
         }
 
@@ -925,6 +926,7 @@ fn thread_ids_from_effects(effects: Vec<ClientEffect>) -> Vec<String> {
             ClientEffect::UnsubscribeThreads { thread_ids } => thread_ids,
             ClientEffect::RefreshWorkspaceList
             | ClientEffect::RefreshGatewaySettings
+            | ClientEffect::RefreshProviderLists
             | ClientEffect::QueueSkillsRefresh
             | ClientEffect::EnqueueInFlightTurnsForResume => Vec::new(),
         })

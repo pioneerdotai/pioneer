@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GatewayRemoteAccessSettings",
+  "type": "object",
+  "properties": {
+    "enabled": {
+      "type": "boolean",
+      "default": false
+    },
+    "has_key": {
+      "type": "boolean",
+      "default": false
+    },
+    "public_address": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "server": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "service_name": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "status": {
+      "$ref": "#/$defs/GatewayRemoteAccessStatusSnapshot",
+      "default": {
+        "state": "disabled"
+      }
+    },
+    "transport": {
+      "$ref": "#/$defs/GatewayRemoteAccessTransport",
+      "default": "tcp"
+    }
+  },
+  "$defs": {
+    "GatewayRemoteAccessErrorKind": {
+      "type": "string",
+      "enum": [
+        "invalid_settings",
+        "missing_key",
+        "missing_binary",
+        "local_gateway_unavailable",
+        "relay_resolve_failed",
+        "relay_connect_failed",
+        "tunnel_auth_failed",
+        "process_exited",
+        "unsupported_transport",
+        "restart_limit_reached",
+        "io",
+        "unknown"
+      ]
+    },
+    "GatewayRemoteAccessState": {
+      "type": "string",
+      "enum": [
+        "disabled",
+        "starting",
+        "connected",
+        "reconnecting",
+        "failed",
+        "stopped"
+      ]
+    },
+    "GatewayRemoteAccessStatusSnapshot": {
+      "type": "object",
+      "properties": {
+        "error_kind": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayRemoteAccessErrorKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/GatewayRemoteAccessState",
+          "default": "disabled"
+        },
+        "updated_at_unix": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        }
+      }
+    },
+    "GatewayRemoteAccessTransport": {
+      "type": "string",
+      "enum": [
+        "tcp",
+        "tls",
+        "noise",
+        "websocket"
+      ]
+    }
+  }
+}

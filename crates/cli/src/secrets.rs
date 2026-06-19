@@ -462,6 +462,7 @@ mod tests {
                 superuser_jwt_token: 1,
                 user_jwt_token: 0,
                 desktop_gateway_auth_token: 1,
+                gateway_remote_access_secret: 0,
                 unknown: 0,
             },
             total_entries: 5,

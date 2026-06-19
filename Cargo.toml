@@ -1,5 +1,6 @@
 [workspace]
 resolver = "3"
+exclude = ["vendor/rathole"]
 members = [
   "crates/agent",
   "crates/artifacts",
@@ -21,6 +22,7 @@ members = [
   "crates/memory",
   "crates/protocol",
   "crates/provider",
+  "crates/tunnel",
   "crates/skills",
   "crates/sqlite",
   "crates/tasks",
@@ -54,11 +56,13 @@ pioneer-mcp = { path = "crates/mcp" }
 pioneer-memory = { path = "crates/memory" }
 pioneer-protocol = { path = "crates/protocol" }
 pioneer-provider = { path = "crates/provider" }
+pioneer-tunnel = { path = "crates/tunnel" }
 pioneer-skills = { path = "crates/skills" }
 pioneer-tasks = { path = "crates/tasks" }
 pioneer-tools = { path = "crates/tools" }
 pioneer-sqlite = { path = "crates/sqlite" }
 pioneer-promt = { path = "crates/promt" }
+rathole = { path = "vendor/rathole", default-features = false, features = ["client"] }
 
 # Error handling
 anyhow = "1"

@@ -461,6 +461,69 @@ impl GatewaySecrets {
             .context("failed to list secrets from keystore")
     }
 
+    pub(crate) fn get_remote_access_secret(&self, ref_id: &str) -> Result<Option<String>> {
+        let id = SecretId::gateway_remote_access_secret(ref_id)
+            .context("invalid gateway remote access secret ref id")?;
+        self.store
+            .get_string(&id)
+            .context("failed to read gateway remote access secret from keystore")
+    }
+
+    pub(crate) fn has_remote_access_secret(&self, ref_id: &str) -> Result<bool> {
+        let id = SecretId::gateway_remote_access_secret(ref_id)
+            .context("invalid gateway remote access secret ref id")?;
+        self.store
+            .exists(&id)
+            .context("failed to check gateway remote access secret in keystore")
+    }
+
+    pub(crate) fn put_remote_access_secret(
+        &self,
+        ref_id: &str,
+        value: &str,
+        label: Option<String>,
+    ) -> Result<()> {
+        let value = value.trim();
+        if value.is_empty() {
+            bail!("gateway remote access secret value must not be empty");
+        }
+
+        let id = SecretId::gateway_remote_access_secret(ref_id)
+            .context("invalid gateway remote access secret ref id")?;
+        let now = current_unix_i64()?;
+        let created_at = self
+            .existing_remote_access_secret_meta(&id)?
+            .and_then(|entry| entry.created_at_unix)
+            .unwrap_or(now);
+        let label = label
+            .and_then(|label| {
+                let trimmed = label.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_owned())
+            })
+            .unwrap_or_else(|| id.user().to_owned());
+
+        self.store
+            .put_string(
+                &id,
+                value,
+                SecretMeta {
+                    kind: SecretKind::GatewayRemoteAccessSecret,
+                    label: Some(label),
+                    created_at_unix: created_at,
+                    updated_at_unix: now.max(created_at),
+                },
+            )
+            .context("failed to write gateway remote access secret to keystore")
+    }
+
+    pub(crate) fn delete_remote_access_secret(&self, ref_id: &str) -> Result<bool> {
+        let id = SecretId::gateway_remote_access_secret(ref_id)
+            .context("invalid gateway remote access secret ref id")?;
+        self.store
+            .delete(&id)
+            .context("failed to delete gateway remote access secret from keystore")
+    }
+
     pub(crate) fn get_mcp_secret(&self, ref_id: &str) -> Result<Option<String>> {
         let id = SecretId::mcp_secret(ref_id).context("invalid MCP secret ref id")?;
         self.store
@@ -570,6 +633,14 @@ impl GatewaySecrets {
             .store
             .list(SecretFilter::Kind(SecretKind::McpSecret))
             .context("failed to read MCP secret metadata from keystore")?;
+        Ok(entries.into_iter().find(|entry| entry.id == *id))
+    }
+
+    fn existing_remote_access_secret_meta(&self, id: &SecretId) -> Result<Option<SecretEntryMeta>> {
+        let entries = self
+            .store
+            .list(SecretFilter::Kind(SecretKind::GatewayRemoteAccessSecret))
+            .context("failed to read gateway remote access secret metadata from keystore")?;
         Ok(entries.into_iter().find(|entry| entry.id == *id))
     }
 

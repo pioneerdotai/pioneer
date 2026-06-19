@@ -13,17 +13,27 @@ use crate::{
 use gpui::{prelude::*, *};
 use gpui_component::{
     button::*,
+    input::{Input, InputEvent, InputState},
     popover::{Popover, PopoverState},
     switch::Switch,
     theme::ActiveTheme,
     *,
 };
-use pioneer_client::settings::gateway::ThreadEpisodicSettingToggle;
+use pioneer_client::settings::gateway::{self as gateway_settings, ThreadEpisodicSettingToggle};
 use pioneer_client::settings::memory as settings_memory;
-use pioneer_protocol::{GatewayMemoryModelSelection, GatewayMemorySettings};
+use pioneer_protocol::{
+    GatewayMemoryModelSelection, GatewayMemorySettings, GatewayRemoteAccessSettings,
+};
 use std::rc::Rc;
 
 const SETTINGS_CONTENT_MAX_WIDTH_PX: f32 = 860.0;
+
+struct RemoteAccessSettingsInputState {
+    server: Entity<InputState>,
+    key: Entity<InputState>,
+    _server_subscription: Subscription,
+    _key_subscription: Subscription,
+}
 
 const LANGUAGE_OPTIONS: [AppLanguagePreference; 9] = [
     AppLanguagePreference::System,
@@ -38,14 +48,18 @@ const LANGUAGE_OPTIONS: [AppLanguagePreference; 9] = [
 ];
 
 impl PioneerDesktop {
-    pub(crate) fn render_settings(&self, _window: &Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(crate) fn render_settings(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         match self.settings_content_view {
-            SettingsContentView::General => self.render_settings_general(cx),
+            SettingsContentView::General => self.render_settings_general(window, cx),
             SettingsContentView::Memory => self.render_settings_memory(cx),
         }
     }
 
-    fn render_settings_general(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_settings_general(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let selected_language = settings::app_language(cx);
         let selected_theme = settings::window_theme(cx);
         let desktop_entity = cx.entity().clone();
@@ -82,7 +96,16 @@ impl PioneerDesktop {
                 .child(Self::render_settings_divider(cx))
                 .child(Self::render_preflight_model_setting(
                     settings.general.preflight_model.clone(),
+                    desktop_entity.clone(),
+                    cx,
+                ))
+                .child(Self::render_settings_divider(cx))
+                .child(Self::render_remote_access_setting(
+                    settings.remote_access.clone(),
+                    self.remote_access_settings_expanded,
+                    self.remote_access_key_input_revision,
                     desktop_entity,
+                    window,
                     cx,
                 )),
             None => general_settings
@@ -95,7 +118,7 @@ impl PioneerDesktop {
         v_flex()
             .id("settings-scroll")
             .flex_1()
-            .overflow_y_scroll()
+            .min_h_0()
             .p_6()
             .bg(cx.theme().background)
             .child(
@@ -142,6 +165,7 @@ impl PioneerDesktop {
         v_flex()
             .id("settings-memory-scroll")
             .flex_1()
+            .min_h_0()
             .overflow_y_scroll()
             .p_6()
             .bg(cx.theme().background)
@@ -559,6 +583,270 @@ impl PioneerDesktop {
             .into_any_element()
     }
 
+    fn render_remote_access_setting(
+        settings: GatewayRemoteAccessSettings,
+        expanded: bool,
+        key_input_revision: u64,
+        desktop_entity: Entity<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let input_state = Self::remote_access_settings_input_state(
+            &settings,
+            key_input_revision,
+            desktop_entity.clone(),
+            window,
+            cx,
+        );
+        let server_input = input_state.read(cx).server.clone();
+        let key_input = input_state.read(cx).key.clone();
+        let status_label = Self::remote_access_status_label(&settings);
+
+        v_flex()
+            .w_full()
+            .gap_0()
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_4()
+                    .px_0()
+                    .py_3()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .flex_1()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_semibold()
+                                    .child(t!("settings.remote_access.label").to_string()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .opacity(0.6)
+                                    .child(t!("settings.remote_access.description").to_string()),
+                            )
+                            .child(div().text_xs().mt_1().opacity(0.72).child(status_label)),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                Button::new("settings-remote-access-expand")
+                                    .small()
+                                    .ghost()
+                                    .icon(if expanded {
+                                        IconName::ChevronUp
+                                    } else {
+                                        IconName::ChevronDown
+                                    })
+                                    .tooltip(if expanded {
+                                        t!("settings.remote_access.collapse").to_string()
+                                    } else {
+                                        t!("settings.remote_access.expand").to_string()
+                                    })
+                                    .on_click({
+                                        let desktop_entity = desktop_entity.clone();
+                                        move |_, _, cx| {
+                                            let _ = desktop_entity.update(cx, |view, cx| {
+                                                view.toggle_remote_access_settings_expanded();
+                                                cx.notify();
+                                            });
+                                        }
+                                    }),
+                            )
+                            .child(
+                                Switch::new("settings-remote-access-enabled")
+                                    .checked(settings.enabled)
+                                    .on_click({
+                                        let desktop_entity = desktop_entity.clone();
+                                        let server_input = server_input.clone();
+                                        move |enabled, _, cx| {
+                                            let server = server_input.read(cx).value().to_string();
+                                            let _ = desktop_entity.update(cx, |view, cx| {
+                                                view.apply_remote_access_setting(
+                                                    *enabled, server, None, false, cx,
+                                                );
+                                                cx.notify();
+                                            });
+                                        }
+                                    }),
+                            ),
+                    ),
+            )
+            .when(expanded, |this| {
+                this.child(
+                    v_flex()
+                        .w_full()
+                        .border_t_1()
+                        .border_color(cx.theme().border)
+                        .child(
+                            v_flex()
+                                .w_full()
+                                .child(
+                                    v_flex()
+                                        .w_full()
+                                        .py_3()
+                                        .gap_1p5()
+                                        .border_b_1()
+                                        .border_color(cx.theme().border)
+                                        .child(div().text_sm().font_medium().child(
+                                            t!("settings.remote_access.server_label").to_string(),
+                                        ))
+                                        .child(Input::new(&server_input).w_full().min_w_0())
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .line_height(relative(1.35))
+                                                .opacity(0.6)
+                                                .child(
+                                                    t!("settings.remote_access.server_hint")
+                                                        .to_string(),
+                                                ),
+                                        ),
+                                )
+                                .child(
+                                    v_flex()
+                                        .w_full()
+                                        .py_3()
+                                        .gap_1p5()
+                                        .child(div().text_sm().font_medium().child(
+                                            t!("settings.remote_access.key_label").to_string(),
+                                        ))
+                                        .child(
+                                            Input::new(&key_input).w_full().min_w_0().mask_toggle(),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .line_height(relative(1.35))
+                                                .opacity(0.6)
+                                                .child(
+                                                    t!("settings.remote_access.key_hint")
+                                                        .to_string(),
+                                                ),
+                                        ),
+                                ),
+                        ),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn remote_access_settings_input_state(
+        settings: &GatewayRemoteAccessSettings,
+        key_input_revision: u64,
+        desktop_entity: Entity<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<RemoteAccessSettingsInputState> {
+        let server = settings.server.clone().unwrap_or_default();
+        let key_placeholder = if settings.has_key {
+            t!("settings.remote_access.key_placeholder_configured").to_string()
+        } else {
+            t!("settings.remote_access.key_placeholder").to_string()
+        };
+        let state_key = SharedString::from(format!(
+            "settings-remote-access-input:{}",
+            key_input_revision
+        ));
+
+        window.use_keyed_state(state_key, cx, |window, cx| {
+            let server_input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder(t!("settings.remote_access.server_placeholder").to_string())
+                    .default_value(server)
+            });
+            let key_input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder(key_placeholder)
+                    .masked(true)
+            });
+            let server_subscription = cx.subscribe(&server_input, {
+                let desktop_entity = desktop_entity.clone();
+                move |_, input, event: &InputEvent, cx| {
+                    if !matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
+                        return;
+                    }
+                    let server = input.read(cx).value().to_string();
+                    let _ = desktop_entity.update(cx, |view, cx| {
+                        view.save_remote_access_server_inline(server, cx);
+                        cx.notify();
+                    });
+                }
+            });
+            let key_subscription = cx.subscribe(&key_input, {
+                let desktop_entity = desktop_entity.clone();
+                let server_input = server_input.clone();
+                move |_, input, event: &InputEvent, cx| {
+                    if !matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
+                        return;
+                    }
+                    let key = input.read(cx).value().to_string();
+                    if key.trim().is_empty() {
+                        return;
+                    }
+                    let server = server_input.read(cx).value().to_string();
+                    let _ = desktop_entity.update(cx, |view, cx| {
+                        view.save_remote_access_key_inline(server, key, cx);
+                        cx.notify();
+                    });
+                }
+            });
+
+            RemoteAccessSettingsInputState {
+                server: server_input,
+                key: key_input,
+                _server_subscription: server_subscription,
+                _key_subscription: key_subscription,
+            }
+        })
+    }
+
+    fn remote_access_status_label(settings: &GatewayRemoteAccessSettings) -> String {
+        match gateway_settings::remote_access_status_label(settings) {
+            gateway_settings::GatewayRemoteAccessStatusLabel::Disabled => {
+                t!("settings.remote_access.status_disabled")
+            }
+            gateway_settings::GatewayRemoteAccessStatusLabel::NotRunning => {
+                t!("settings.remote_access.status_not_running")
+            }
+            gateway_settings::GatewayRemoteAccessStatusLabel::InvalidSettings => {
+                t!("settings.remote_access.status_invalid_settings")
+            }
+            gateway_settings::GatewayRemoteAccessStatusLabel::MissingKey => {
+                t!("settings.remote_access.status_missing_key")
+            }
+            gateway_settings::GatewayRemoteAccessStatusLabel::ConnectFailed => {
+                t!("settings.remote_access.status_connect_failed")
+            }
+            gateway_settings::GatewayRemoteAccessStatusLabel::AuthFailed => {
+                t!("settings.remote_access.status_auth_failed")
+            }
+            gateway_settings::GatewayRemoteAccessStatusLabel::Starting => {
+                t!("settings.remote_access.status_starting")
+            }
+            gateway_settings::GatewayRemoteAccessStatusLabel::Connected => {
+                t!("settings.remote_access.status_connected")
+            }
+            gateway_settings::GatewayRemoteAccessStatusLabel::Reconnecting => {
+                t!("settings.remote_access.status_reconnecting")
+            }
+            gateway_settings::GatewayRemoteAccessStatusLabel::Failed => {
+                t!("settings.remote_access.status_failed")
+            }
+            gateway_settings::GatewayRemoteAccessStatusLabel::Stopped => {
+                t!("settings.remote_access.status_stopped")
+            }
+        }
+        .to_string()
+    }
+
     fn render_settings_divider(cx: &mut Context<Self>) -> AnyElement {
         div()
             .w_full()
@@ -860,11 +1148,81 @@ impl PioneerDesktop {
 
 #[cfg(test)]
 mod tests {
+    use pioneer_protocol::{
+        GatewayRemoteAccessErrorKind, GatewayRemoteAccessSettings, GatewayRemoteAccessState,
+    };
+
     fn production_view_source() -> &'static str {
         include_str!("view.rs")
             .split("#[cfg(test)]")
             .next()
             .expect("production source segment exists")
+    }
+
+    #[test]
+    fn remote_access_status_label_follows_switch_state() {
+        rust_i18n::set_locale("en");
+
+        let mut settings = GatewayRemoteAccessSettings {
+            enabled: true,
+            ..GatewayRemoteAccessSettings::default()
+        };
+        settings.status.state = GatewayRemoteAccessState::Disabled;
+        settings.status.message = Some("remote access tunnel is disabled".to_owned());
+
+        assert_eq!(
+            super::PioneerDesktop::remote_access_status_label(&settings),
+            "Service is not running."
+        );
+
+        settings.enabled = false;
+        settings.status.state = GatewayRemoteAccessState::Connected;
+        settings.status.message = Some("remote access tunnel is running".to_owned());
+
+        assert_eq!(
+            super::PioneerDesktop::remote_access_status_label(&settings),
+            "Remote access is disabled."
+        );
+    }
+
+    #[test]
+    fn remote_access_status_label_localizes_validation_failures() {
+        rust_i18n::set_locale("en");
+
+        let mut settings = GatewayRemoteAccessSettings {
+            enabled: true,
+            ..GatewayRemoteAccessSettings::default()
+        };
+        settings.status.state = GatewayRemoteAccessState::Failed;
+        settings.status.error_kind = Some(GatewayRemoteAccessErrorKind::InvalidSettings);
+        settings.status.message =
+            Some("remote access server must include host and port".to_owned());
+
+        assert_eq!(
+            super::PioneerDesktop::remote_access_status_label(&settings),
+            "Enter an HTTPS tunnel address, for example https://getpioneer.dev, or IP:port."
+        );
+
+        settings.status.error_kind = Some(GatewayRemoteAccessErrorKind::MissingKey);
+
+        assert_eq!(
+            super::PioneerDesktop::remote_access_status_label(&settings),
+            "Paste a new key and press Enter."
+        );
+
+        settings.status.error_kind = Some(GatewayRemoteAccessErrorKind::RelayConnectFailed);
+
+        assert_eq!(
+            super::PioneerDesktop::remote_access_status_label(&settings),
+            "Could not connect to the tunnel address."
+        );
+
+        settings.status.error_kind = Some(GatewayRemoteAccessErrorKind::TunnelAuthFailed);
+
+        assert_eq!(
+            super::PioneerDesktop::remote_access_status_label(&settings),
+            "Key rejected."
+        );
     }
 
     #[test]
@@ -879,10 +1237,28 @@ mod tests {
             .expect("general renderer body exists");
 
         assert!(general_view.contains("render_preflight_model_setting"));
+        assert!(general_view.contains("render_remote_access_setting"));
         assert!(general_view.contains("settings.general.preflight_model"));
+        assert!(general_view.contains("settings.remote_access"));
         assert!(!general_view.contains("\"settings-general-thread-context\""));
         assert!(!general_view.contains("settings.general.thread_context"));
         assert!(source.contains("\"settings-preflight-model\""));
+
+        let remote_access_view = source
+            .split("fn render_remote_access_setting")
+            .nth(1)
+            .expect("remote access renderer exists")
+            .split("fn remote_access_settings_input_state")
+            .next()
+            .expect("remote access renderer body exists");
+        assert!(remote_access_view.contains(".border_b_1()"));
+        assert!(!remote_access_view.contains("v_form()"));
+        assert!(!remote_access_view.contains("field().label_indent(false)"));
+        assert!(!remote_access_view.contains("settings-remote-access-save"));
+        assert!(!remote_access_view.contains("settings.remote_access.save"));
+        assert!(!remote_access_view.contains("settings-remote-access-clear-key"));
+        assert!(!remote_access_view.contains("clear_remote_access_key_inline"));
+        assert!(source.contains("save_remote_access_server_inline"));
     }
 
     #[test]
@@ -921,6 +1297,13 @@ mod tests {
                 "[settings.general.preflight_model]",
                 "select_model",
                 "dialog_title",
+                "[settings.remote_access]",
+                "key_placeholder_configured",
+                "status_not_running",
+                "status_invalid_settings",
+                "status_missing_key",
+                "status_connect_failed",
+                "status_auth_failed",
                 "[settings.memory.thread_context]",
                 "[settings.memory.active_recall]",
                 "[settings.memory.proactive_writes_model]",

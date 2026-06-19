@@ -21,6 +21,8 @@ pub struct GatewaySettingsUpdate {
     pub thread_episodic: Option<GatewayThreadEpisodicSettingsUpdate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cli_runtimes: Option<GatewayCliRuntimeSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_access: Option<GatewayRemoteAccessSettingsUpdate>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -50,6 +52,8 @@ pub struct GatewaySettingsSnapshot {
     pub thread_episodic: GatewayThreadEpisodicSettings,
     #[serde(default)]
     pub cli_runtimes: GatewayCliRuntimeSettings,
+    #[serde(default)]
+    pub remote_access: GatewayRemoteAccessSettings,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -181,6 +185,127 @@ impl GatewayCliRuntimeInstanceSettings {
             shadow_home_path: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GatewayRemoteAccessSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
+    #[serde(default)]
+    pub transport: GatewayRemoteAccessTransport,
+    #[serde(default)]
+    pub has_key: bool,
+    #[serde(default)]
+    pub status: GatewayRemoteAccessStatusSnapshot,
+}
+
+impl Default for GatewayRemoteAccessSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            server: None,
+            public_address: None,
+            service_name: None,
+            transport: GatewayRemoteAccessTransport::default(),
+            has_key: false,
+            status: GatewayRemoteAccessStatusSnapshot::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayRemoteAccessTransport {
+    Tcp,
+    Tls,
+    Noise,
+    Websocket,
+}
+
+impl Default for GatewayRemoteAccessTransport {
+    fn default() -> Self {
+        Self::Tcp
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GatewayRemoteAccessStatusSnapshot {
+    #[serde(default)]
+    pub state: GatewayRemoteAccessState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<GatewayRemoteAccessErrorKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at_unix: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GatewayRemoteAccessStatusChangedNotification {
+    pub status: GatewayRemoteAccessStatusSnapshot,
+}
+
+impl Default for GatewayRemoteAccessStatusSnapshot {
+    fn default() -> Self {
+        Self {
+            state: GatewayRemoteAccessState::Disabled,
+            error_kind: None,
+            message: None,
+            updated_at_unix: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayRemoteAccessState {
+    Disabled,
+    Starting,
+    Connected,
+    Reconnecting,
+    Failed,
+    Stopped,
+}
+
+impl Default for GatewayRemoteAccessState {
+    fn default() -> Self {
+        Self::Disabled
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayRemoteAccessErrorKind {
+    InvalidSettings,
+    MissingKey,
+    MissingBinary,
+    LocalGatewayUnavailable,
+    RelayResolveFailed,
+    RelayConnectFailed,
+    TunnelAuthFailed,
+    ProcessExited,
+    UnsupportedTransport,
+    RestartLimitReached,
+    Io,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GatewayRemoteAccessSettingsUpdate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clear_key: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -408,6 +533,7 @@ mod tests {
                     shadow_home_path: Some("~/.pioneer/codex-work".to_owned()),
                 }],
             },
+            remote_access: Default::default(),
         };
 
         let serialized = serde_json::to_string(&snapshot).expect("snapshot should serialize");

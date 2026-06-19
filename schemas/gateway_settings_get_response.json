@@ -155,6 +155,116 @@
         "strict_diagnostics_enabled"
       ]
     },
+    "GatewayRemoteAccessErrorKind": {
+      "type": "string",
+      "enum": [
+        "invalid_settings",
+        "missing_key",
+        "missing_binary",
+        "local_gateway_unavailable",
+        "relay_resolve_failed",
+        "relay_connect_failed",
+        "tunnel_auth_failed",
+        "process_exited",
+        "unsupported_transport",
+        "restart_limit_reached",
+        "io",
+        "unknown"
+      ]
+    },
+    "GatewayRemoteAccessSettings": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "has_key": {
+          "type": "boolean",
+          "default": false
+        },
+        "public_address": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "server": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "service_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/GatewayRemoteAccessStatusSnapshot",
+          "default": {
+            "state": "disabled"
+          }
+        },
+        "transport": {
+          "$ref": "#/$defs/GatewayRemoteAccessTransport",
+          "default": "tcp"
+        }
+      }
+    },
+    "GatewayRemoteAccessState": {
+      "type": "string",
+      "enum": [
+        "disabled",
+        "starting",
+        "connected",
+        "reconnecting",
+        "failed",
+        "stopped"
+      ]
+    },
+    "GatewayRemoteAccessStatusSnapshot": {
+      "type": "object",
+      "properties": {
+        "error_kind": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayRemoteAccessErrorKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/GatewayRemoteAccessState",
+          "default": "disabled"
+        },
+        "updated_at_unix": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        }
+      }
+    },
+    "GatewayRemoteAccessTransport": {
+      "type": "string",
+      "enum": [
+        "tcp",
+        "tls",
+        "noise",
+        "websocket"
+      ]
+    },
     "GatewaySettingsSnapshot": {
       "type": "object",
       "properties": {
@@ -184,6 +294,17 @@
         },
         "memory": {
           "$ref": "#/$defs/GatewayMemorySettings"
+        },
+        "remote_access": {
+          "$ref": "#/$defs/GatewayRemoteAccessSettings",
+          "default": {
+            "enabled": false,
+            "has_key": false,
+            "status": {
+              "state": "disabled"
+            },
+            "transport": "tcp"
+          }
         },
         "thread_episodic": {
           "$ref": "#/$defs/GatewayThreadEpisodicSettings",

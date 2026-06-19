@@ -189,6 +189,10 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             crate::gateway::setup::DeleteRemoteGatewayRegistryPlan
         ),
         schema_doc!(
+            "gateway_remote_access_status_label.json",
+            crate::settings::gateway::GatewayRemoteAccessStatusLabel
+        ),
+        schema_doc!(
             "gateway_settings_state.json",
             crate::settings::gateway::GatewaySettingsState
         ),

@@ -33,6 +33,16 @@
         }
       ]
     },
+    "remote_access": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GatewayRemoteAccessSettingsUpdate"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "thread_episodic": {
       "anyOf": [
         {
@@ -194,6 +204,35 @@
         "debug_trace_enabled",
         "strict_diagnostics_enabled"
       ]
+    },
+    "GatewayRemoteAccessSettingsUpdate": {
+      "type": "object",
+      "properties": {
+        "clear_key": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "server": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
     },
     "GatewayThreadEpisodicSettingsUpdate": {
       "type": "object",

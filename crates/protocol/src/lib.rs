@@ -125,7 +125,10 @@ pub use provider::{
 pub use settings::{
     GatewayCliRuntimeInstanceSettings, GatewayCliRuntimeSettings, GatewayGeneralSettings,
     GatewayGeneralSettingsUpdate, GatewayMemoryModelSelection, GatewayMemoryModelSelectionSource,
-    GatewayMemorySettings, GatewaySettingsGetParams, GatewaySettingsGetResponse,
+    GatewayMemorySettings, GatewayRemoteAccessErrorKind, GatewayRemoteAccessSettings,
+    GatewayRemoteAccessSettingsUpdate, GatewayRemoteAccessState,
+    GatewayRemoteAccessStatusChangedNotification, GatewayRemoteAccessStatusSnapshot,
+    GatewayRemoteAccessTransport, GatewaySettingsGetParams, GatewaySettingsGetResponse,
     GatewaySettingsSnapshot, GatewaySettingsUpdate, GatewaySettingsUpdateParams,
     GatewaySettingsUpdateResponse, GatewayThreadEpisodicSettings,
     GatewayThreadEpisodicSettingsUpdate,

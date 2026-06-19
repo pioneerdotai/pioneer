@@ -1,9 +1,10 @@
 //! Gateway settings state.
 
 use pioneer_protocol::{
-    GatewayGeneralSettingsUpdate, GatewayMemoryModelSelection, GatewaySettingsGetParams,
-    GatewaySettingsGetResponse, GatewaySettingsSnapshot, GatewaySettingsUpdate,
-    GatewaySettingsUpdateParams, GatewaySettingsUpdateResponse,
+    GatewayGeneralSettingsUpdate, GatewayMemoryModelSelection, GatewayRemoteAccessErrorKind,
+    GatewayRemoteAccessSettings, GatewayRemoteAccessSettingsUpdate, GatewayRemoteAccessState,
+    GatewaySettingsGetParams, GatewaySettingsGetResponse, GatewaySettingsSnapshot,
+    GatewaySettingsUpdate, GatewaySettingsUpdateParams, GatewaySettingsUpdateResponse,
     GatewayThreadEpisodicSettingsUpdate,
 };
 
@@ -47,6 +48,23 @@ pub enum GatewaySettingsRefreshPlan {
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub enum ThreadEpisodicSettingToggle {
     Enabled,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayRemoteAccessStatusLabel {
+    Disabled,
+    NotRunning,
+    InvalidSettings,
+    MissingKey,
+    ConnectFailed,
+    AuthFailed,
+    Starting,
+    Connected,
+    Reconnecting,
+    Failed,
+    Stopped,
 }
 
 pub fn gateway_settings_get_params() -> GatewaySettingsGetParams {
@@ -191,6 +209,7 @@ pub fn keepawake_update_plan(
             memory: None,
             thread_episodic: None,
             cli_runtimes: None,
+            remote_access: None,
         },
     })
 }
@@ -212,6 +231,7 @@ pub fn preflight_model_update_plan(
             memory: None,
             thread_episodic: None,
             cli_runtimes: None,
+            remote_access: None,
         },
     })
 }
@@ -230,14 +250,113 @@ pub fn thread_episodic_enabled_update_plan(
             memory: None,
             thread_episodic: Some(GatewayThreadEpisodicSettingsUpdate::enabled(enabled)),
             cli_runtimes: None,
+            remote_access: None,
         },
     })
+}
+
+pub fn remote_access_update_plan(
+    current: Option<&GatewaySettingsSnapshot>,
+    enabled: bool,
+    server: impl Into<String>,
+    key: Option<String>,
+    clear_key: bool,
+) -> Option<GatewaySettingsUpdatePlan> {
+    let mut snapshot = current.cloned()?;
+    let server = server.into();
+    let normalized_server = normalize_optional_text(server.as_str());
+    let normalized_key = key.and_then(|value| normalize_optional_text(value.as_str()));
+    let clear_key = clear_key && normalized_key.is_none();
+
+    snapshot.remote_access.enabled = enabled;
+    snapshot.remote_access.server = normalized_server.clone();
+    if normalized_key.is_some() {
+        snapshot.remote_access.has_key = true;
+    } else if clear_key {
+        snapshot.remote_access.has_key = false;
+    }
+
+    Some(GatewaySettingsUpdatePlan {
+        snapshot,
+        update: GatewaySettingsUpdate {
+            general: None,
+            memory: None,
+            thread_episodic: None,
+            cli_runtimes: None,
+            remote_access: Some(GatewayRemoteAccessSettingsUpdate {
+                enabled: Some(enabled),
+                server: Some(server),
+                key: normalized_key,
+                clear_key: clear_key.then_some(true),
+            }),
+        },
+    })
+}
+
+pub fn normalize_remote_access_input(value: &str) -> Option<String> {
+    normalize_optional_text(value)
+}
+
+pub fn remote_access_status_needs_poll(settings: Option<&GatewaySettingsSnapshot>) -> bool {
+    let Some(settings) = settings else {
+        return false;
+    };
+
+    settings.remote_access.enabled
+        && matches!(
+            settings.remote_access.status.state,
+            GatewayRemoteAccessState::Starting | GatewayRemoteAccessState::Reconnecting
+        )
+}
+
+pub fn remote_access_status_label(
+    settings: &GatewayRemoteAccessSettings,
+) -> GatewayRemoteAccessStatusLabel {
+    if !settings.enabled {
+        return GatewayRemoteAccessStatusLabel::Disabled;
+    }
+
+    if settings.status.state == GatewayRemoteAccessState::Disabled {
+        return GatewayRemoteAccessStatusLabel::NotRunning;
+    }
+
+    match settings.status.error_kind {
+        Some(GatewayRemoteAccessErrorKind::InvalidSettings) => {
+            return GatewayRemoteAccessStatusLabel::InvalidSettings;
+        }
+        Some(GatewayRemoteAccessErrorKind::MissingKey) => {
+            return GatewayRemoteAccessStatusLabel::MissingKey;
+        }
+        Some(GatewayRemoteAccessErrorKind::RelayConnectFailed) => {
+            return GatewayRemoteAccessStatusLabel::ConnectFailed;
+        }
+        Some(GatewayRemoteAccessErrorKind::TunnelAuthFailed) => {
+            return GatewayRemoteAccessStatusLabel::AuthFailed;
+        }
+        _ => {}
+    }
+
+    match settings.status.state {
+        GatewayRemoteAccessState::Disabled => GatewayRemoteAccessStatusLabel::Disabled,
+        GatewayRemoteAccessState::Starting => GatewayRemoteAccessStatusLabel::Starting,
+        GatewayRemoteAccessState::Connected => GatewayRemoteAccessStatusLabel::Connected,
+        GatewayRemoteAccessState::Reconnecting => GatewayRemoteAccessStatusLabel::Reconnecting,
+        GatewayRemoteAccessState::Failed => GatewayRemoteAccessStatusLabel::Failed,
+        GatewayRemoteAccessState::Stopped => GatewayRemoteAccessStatusLabel::Stopped,
+    }
+}
+
+fn normalize_optional_text(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pioneer_protocol::{GatewayGeneralSettings, GatewayMemorySettings};
+    use pioneer_protocol::{
+        GatewayGeneralSettings, GatewayMemorySettings, GatewayRemoteAccessSettings,
+    };
 
     fn snapshot(keepawake: bool) -> GatewaySettingsSnapshot {
         GatewaySettingsSnapshot {
@@ -248,6 +367,7 @@ mod tests {
             memory: GatewayMemorySettings::default(),
             thread_episodic: Default::default(),
             cli_runtimes: Default::default(),
+            remote_access: Default::default(),
         }
     }
 
@@ -430,5 +550,68 @@ mod tests {
             Some(GatewayThreadEpisodicSettingsUpdate::enabled(false))
         );
         assert!(thread_episodic_enabled_update_plan(None, true).is_none());
+    }
+
+    #[test]
+    fn remote_access_input_normalization_is_shared() {
+        assert_eq!(
+            normalize_remote_access_input(" https://getpioneer.dev "),
+            Some("https://getpioneer.dev".to_owned())
+        );
+        assert_eq!(normalize_remote_access_input("  "), None);
+    }
+
+    #[test]
+    fn remote_access_status_poll_plan_tracks_transient_states() {
+        let mut current = snapshot(true);
+        current.remote_access.enabled = true;
+        current.remote_access.status.state = GatewayRemoteAccessState::Starting;
+        assert!(remote_access_status_needs_poll(Some(&current)));
+
+        current.remote_access.status.state = GatewayRemoteAccessState::Reconnecting;
+        assert!(remote_access_status_needs_poll(Some(&current)));
+
+        current.remote_access.status.state = GatewayRemoteAccessState::Connected;
+        assert!(!remote_access_status_needs_poll(Some(&current)));
+
+        current.remote_access.enabled = false;
+        current.remote_access.status.state = GatewayRemoteAccessState::Starting;
+        assert!(!remote_access_status_needs_poll(Some(&current)));
+        assert!(!remote_access_status_needs_poll(None));
+    }
+
+    #[test]
+    fn remote_access_status_label_is_platform_neutral() {
+        let mut settings = GatewayRemoteAccessSettings {
+            enabled: true,
+            ..GatewayRemoteAccessSettings::default()
+        };
+        settings.status.state = GatewayRemoteAccessState::Disabled;
+        assert_eq!(
+            remote_access_status_label(&settings),
+            GatewayRemoteAccessStatusLabel::NotRunning
+        );
+
+        settings.enabled = false;
+        settings.status.state = GatewayRemoteAccessState::Connected;
+        assert_eq!(
+            remote_access_status_label(&settings),
+            GatewayRemoteAccessStatusLabel::Disabled
+        );
+
+        settings.enabled = true;
+        settings.status.state = GatewayRemoteAccessState::Failed;
+        settings.status.error_kind = Some(GatewayRemoteAccessErrorKind::RelayConnectFailed);
+        assert_eq!(
+            remote_access_status_label(&settings),
+            GatewayRemoteAccessStatusLabel::ConnectFailed
+        );
+
+        settings.status.error_kind = None;
+        settings.status.state = GatewayRemoteAccessState::Reconnecting;
+        assert_eq!(
+            remote_access_status_label(&settings),
+            GatewayRemoteAccessStatusLabel::Reconnecting
+        );
     }
 }
