@@ -125,6 +125,10 @@ use pioneer_protocol::{
     generate_id, sanitize_runtime_diagnostic_line, sanitize_runtime_diagnostic_lines,
 };
 use pioneer_provider::{ChatMessage, ProviderRegistry};
+use pioneer_sqlite::{
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, is_anyhow_sqlite_transient_open,
+    retry_with_backoff,
+};
 use pioneer_tasks::{TaskRuntime, TaskRuntimeConfig};
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -162,6 +166,44 @@ where
     F: Future<Output = T> + Send + 'a,
 {
     Box::pin(future)
+}
+
+const RESILIENCE_WORKER_POLL_INTERVAL_SECONDS: u64 = 2;
+const RESILIENCE_WORKER_TRANSIENT_STORAGE_BACKOFF_SECONDS: u64 = 60;
+
+async fn retry_transient_storage_open<T, F, Fut>(operation: F) -> anyhow::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<T>>,
+{
+    retry_with_backoff(
+        operation,
+        is_anyhow_sqlite_transient_open,
+        DEFAULT_LOCK_RETRY_ATTEMPTS,
+        Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
+    )
+    .await
+}
+
+fn record_transient_storage_poll_error(
+    error: &anyhow::Error,
+    transient_storage_poll_failed: &mut bool,
+) {
+    if is_anyhow_sqlite_transient_open(error) {
+        *transient_storage_poll_failed = true;
+    }
+}
+
+async fn sleep_after_transient_storage_poll_failure(transient_storage_poll_failed: bool) -> bool {
+    if !transient_storage_poll_failed {
+        return false;
+    }
+
+    sleep(Duration::from_secs(
+        RESILIENCE_WORKER_TRANSIENT_STORAGE_BACKOFF_SECONDS,
+    ))
+    .await;
+    true
 }
 
 #[derive(Clone, Copy)]
@@ -808,37 +850,60 @@ impl MessageProcessor {
             let mut next_skill_upload_cleanup = 0;
             loop {
                 let now = now_timestamp_secs();
+                let mut transient_storage_poll_failed = false;
                 if now >= next_skill_upload_cleanup {
                     this.cleanup_stale_skill_uploads(now).await;
                     next_skill_upload_cleanup = now.saturating_add(60);
                 }
 
-                match this.timeout_supervisor.poll_timeouts(now, 64).await {
+                match retry_transient_storage_open(|| {
+                    this.timeout_supervisor.poll_timeouts(now, 64)
+                })
+                .await
+                {
                     Ok(candidates) => {
                         for candidate in candidates {
                             this.handle_timeout_candidate(candidate, now).await;
                         }
                     }
                     Err(error) => {
+                        record_transient_storage_poll_error(
+                            &error,
+                            &mut transient_storage_poll_failed,
+                        );
                         error!(error = %format!("{error:#}"), "timeout supervisor poll failed");
                     }
                 }
+                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
+                    continue;
+                }
 
-                match this.recovery_coordinator.run_ready_jobs(now, 64).await {
+                match retry_transient_storage_open(|| {
+                    this.recovery_coordinator.run_ready_jobs(now, 64)
+                })
+                .await
+                {
                     Ok(events) => {
                         for event in events {
                             this.handle_recovery_event(event, now).await;
                         }
                     }
                     Err(error) => {
+                        record_transient_storage_poll_error(
+                            &error,
+                            &mut transient_storage_poll_failed,
+                        );
                         error!(error = %format!("{error:#}"), "recovery coordinator poll failed");
                     }
                 }
+                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
+                    continue;
+                }
 
-                match this
-                    .crud_store
-                    .replay_due_turn_event_projections(now, 64)
-                    .await
+                match retry_transient_storage_open(|| {
+                    this.crud_store.replay_due_turn_event_projections(now, 64)
+                })
+                .await
                 {
                     Ok(summary) => {
                         if summary.exhausted > 0 || summary.missing_events > 0 {
@@ -878,21 +943,34 @@ impl MessageProcessor {
                         }
                     }
                     Err(error) => {
+                        record_transient_storage_poll_error(
+                            &error,
+                            &mut transient_storage_poll_failed,
+                        );
                         error!(
                             error = %format!("{error:#}"),
                             "turn event projection replay poll failed"
                         );
                     }
                 }
+                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
+                    continue;
+                }
 
-                if let Err(error) = this.process_due_task_deliveries(now, 64).await {
+                if let Err(error) =
+                    retry_transient_storage_open(|| this.process_due_task_deliveries(now, 64)).await
+                {
+                    record_transient_storage_poll_error(&error, &mut transient_storage_poll_failed);
                     error!(error = %format!("{error:#}"), "task delivery worker poll failed");
+                }
+                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
+                    continue;
                 }
 
                 this.fail_stale_cli_runtime_turns(now_timestamp_millis())
                     .await;
 
-                sleep(Duration::from_secs(2)).await;
+                sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)).await;
             }
         });
 
