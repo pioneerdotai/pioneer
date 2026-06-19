@@ -289,7 +289,6 @@ struct GatewayRemoteAccessSettingsOverride {
 
 impl GatewayRemoteAccessSettingsOverride {
     const DEFAULT_SECRET_REF: &'static str = "remote_access";
-    const DEFAULT_SERVICE_NAME: &'static str = "pioneer_gateway";
 
     fn is_default(&self) -> bool {
         self == &Self::default()
@@ -301,10 +300,10 @@ impl GatewayRemoteAccessSettingsOverride {
             .unwrap_or(Self::DEFAULT_SECRET_REF)
     }
 
-    fn service_name(&self) -> String {
+    fn service_name(&self, config: &GatewayRemoteAccessConfig) -> String {
         self.service_name
             .clone()
-            .unwrap_or_else(|| Self::DEFAULT_SERVICE_NAME.to_owned())
+            .unwrap_or_else(|| config.service_name.clone())
     }
 
     fn apply_protocol_update(
@@ -443,7 +442,7 @@ impl GatewaySettings {
         pioneer_protocol::GatewayRemoteAccessSettings {
             enabled: self.remote_access.enabled.unwrap_or(false),
             server: Some(config.relay_addr.clone()),
-            service_name: Some(self.remote_access.service_name()),
+            service_name: Some(self.remote_access.service_name(config)),
             transport: self
                 .remote_access
                 .transport

@@ -181,6 +181,7 @@ debug_native_events = false
 runtime_dir = "remote-access"
 relay_addr = "relay-eu-west-1.getpioneer.dev:2333"
 local_addr = "127.0.0.1:17878"
+service_name = "pioneer_gateway"
 restart_initial_ms = 1000
 restart_max_ms = 30000
 restart_jitter_percent = 20

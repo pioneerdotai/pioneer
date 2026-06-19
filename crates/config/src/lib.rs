@@ -98,6 +98,8 @@ pub struct GatewayRemoteAccessConfig {
     pub relay_addr: String,
     #[serde(default = "default_gateway_remote_access_local_addr")]
     pub local_addr: String,
+    #[serde(default = "default_gateway_remote_access_service_name")]
+    pub service_name: String,
     #[serde(default = "default_gateway_remote_access_restart_initial_ms")]
     pub restart_initial_ms: u64,
     #[serde(default = "default_gateway_remote_access_restart_max_ms")]
@@ -114,6 +116,7 @@ impl Default for GatewayRemoteAccessConfig {
             runtime_dir: default_gateway_remote_access_runtime_dir(),
             relay_addr: default_gateway_remote_access_relay_addr(),
             local_addr: default_gateway_remote_access_local_addr(),
+            service_name: default_gateway_remote_access_service_name(),
             restart_initial_ms: default_gateway_remote_access_restart_initial_ms(),
             restart_max_ms: default_gateway_remote_access_restart_max_ms(),
             restart_jitter_percent: default_gateway_remote_access_restart_jitter_percent(),
@@ -132,6 +135,10 @@ fn default_gateway_remote_access_relay_addr() -> String {
 
 fn default_gateway_remote_access_local_addr() -> String {
     "127.0.0.1:17878".to_owned()
+}
+
+fn default_gateway_remote_access_service_name() -> String {
+    "pioneer_gateway".to_owned()
 }
 
 const fn default_gateway_remote_access_restart_initial_ms() -> u64 {
