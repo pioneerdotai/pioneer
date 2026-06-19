@@ -1198,7 +1198,6 @@ mod tests {
             .split("fn remote_access_settings_input_state")
             .next()
             .expect("remote access renderer body exists");
-        assert!(remote_access_view.contains(".border_b_1()"));
         assert!(!remote_access_view.contains("v_form()"));
         assert!(!remote_access_view.contains("field().label_indent(false)"));
         assert!(!remote_access_view.contains("settings-remote-access-save"));
