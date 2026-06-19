@@ -136,6 +136,11 @@ where
         event.metadata().target(),
         fields.log_target.as_deref(),
         fields.message.as_deref(),
+    ) || should_demote_gpui_asset_cache_http_not_found(
+        event.metadata().level(),
+        event.metadata().target(),
+        fields.log_target.as_deref(),
+        fields.message.as_deref(),
     ) {
         return EventMapping::Breadcrumb(breadcrumb_from_event(
             event,
@@ -194,6 +199,29 @@ fn should_demote_tantivy_reader_commit_reload_not_found(
     *level == tracing::Level::ERROR
         && effective_event_target(target, log_target) == "tantivy::reader"
         && message.is_some_and(is_tantivy_reader_commit_reload_not_found)
+}
+
+fn should_demote_gpui_asset_cache_http_not_found(
+    level: &tracing::Level,
+    target: &str,
+    log_target: Option<&str>,
+    message: Option<&str>,
+) -> bool {
+    *level == tracing::Level::ERROR
+        && effective_event_target(target, log_target) == "gpui::asset_cache"
+        && message.is_some_and(is_gpui_asset_cache_http_not_found)
+}
+
+fn is_gpui_asset_cache_http_not_found(message: &str) -> bool {
+    const PREFIX: &str = "Failed to load asset: unexpected http status for ";
+    let Some(rest) = message.strip_prefix(PREFIX) else {
+        return false;
+    };
+    let Some((uri, _)) = rest.split_once(": 404 Not Found") else {
+        return false;
+    };
+
+    uri.starts_with("http://") || uri.starts_with("https://")
 }
 
 fn is_tantivy_reader_commit_reload_not_found(message: &str) -> bool {
@@ -281,7 +309,8 @@ fn non_empty(value: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        sentry_event_filter, should_demote_rmcp_transport_worker_failure,
+        sentry_event_filter, should_demote_gpui_asset_cache_http_not_found,
+        should_demote_rmcp_transport_worker_failure,
         should_demote_tantivy_reader_commit_reload_not_found,
     };
     use sentry::integrations::tracing::EventFilter;
@@ -384,6 +413,54 @@ mod tests {
             None,
             Some(
                 "Error while loading searcher after commit was detected. LockFailure(IoError(Os { code: 2, kind: NotFound, message: \"No such file or directory\" }), None)",
+            ),
+        ));
+    }
+
+    #[test]
+    fn demotes_gpui_asset_cache_http_not_found_from_log_target() {
+        assert!(should_demote_gpui_asset_cache_http_not_found(
+            &tracing::Level::ERROR,
+            "log",
+            Some("gpui::asset_cache"),
+            Some(
+                "Failed to load asset: unexpected http status for https://icons.duckduckgo.com/ip3/api.github.com.ico: 404 Not Found, body: PNG",
+            ),
+        ));
+    }
+
+    #[test]
+    fn demotes_gpui_asset_cache_generic_http_not_found() {
+        assert!(should_demote_gpui_asset_cache_http_not_found(
+            &tracing::Level::ERROR,
+            "gpui::asset_cache",
+            None,
+            Some(
+                "Failed to load asset: unexpected http status for https://example.com/missing.png: 404 Not Found, body: not found",
+            ),
+        ));
+    }
+
+    #[test]
+    fn keeps_gpui_asset_cache_http_server_error_as_event() {
+        assert!(!should_demote_gpui_asset_cache_http_not_found(
+            &tracing::Level::ERROR,
+            "log",
+            Some("gpui::asset_cache"),
+            Some(
+                "Failed to load asset: unexpected http status for https://example.com/favicon.ico: 500 Internal Server Error, body: error",
+            ),
+        ));
+    }
+
+    #[test]
+    fn keeps_gpui_asset_cache_not_found_from_other_targets_as_event() {
+        assert!(!should_demote_gpui_asset_cache_http_not_found(
+            &tracing::Level::ERROR,
+            "pioneer_desktop",
+            None,
+            Some(
+                "Failed to load asset: unexpected http status for https://example.com/favicon.ico: 404 Not Found, body: not found",
             ),
         ));
     }
