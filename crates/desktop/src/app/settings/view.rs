@@ -29,9 +29,7 @@ use std::rc::Rc;
 const SETTINGS_CONTENT_MAX_WIDTH_PX: f32 = 860.0;
 
 struct RemoteAccessSettingsInputState {
-    server: Entity<InputState>,
     key: Entity<InputState>,
-    _server_subscription: Subscription,
     _key_subscription: Subscription,
 }
 
@@ -598,7 +596,6 @@ impl PioneerDesktop {
             window,
             cx,
         );
-        let server_input = input_state.read(cx).server.clone();
         let key_input = input_state.read(cx).key.clone();
         let status_label = Self::remote_access_status_label(&settings);
 
@@ -665,12 +662,10 @@ impl PioneerDesktop {
                                     .checked(settings.enabled)
                                     .on_click({
                                         let desktop_entity = desktop_entity.clone();
-                                        let server_input = server_input.clone();
                                         move |enabled, _, cx| {
-                                            let server = server_input.read(cx).value().to_string();
                                             let _ = desktop_entity.update(cx, |view, cx| {
                                                 view.apply_remote_access_setting(
-                                                    *enabled, server, None, false, cx,
+                                                    *enabled, None, false, cx,
                                                 );
                                                 cx.notify();
                                             });
@@ -686,52 +681,27 @@ impl PioneerDesktop {
                         .border_t_1()
                         .border_color(cx.theme().border)
                         .child(
-                            v_flex()
-                                .w_full()
-                                .child(
-                                    v_flex()
-                                        .w_full()
-                                        .py_3()
-                                        .gap_1p5()
-                                        .border_b_1()
-                                        .border_color(cx.theme().border)
-                                        .child(div().text_sm().font_medium().child(
-                                            t!("settings.remote_access.server_label").to_string(),
-                                        ))
-                                        .child(Input::new(&server_input).w_full().min_w_0())
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .line_height(relative(1.35))
-                                                .opacity(0.6)
-                                                .child(
-                                                    t!("settings.remote_access.server_hint")
-                                                        .to_string(),
-                                                ),
-                                        ),
-                                )
-                                .child(
-                                    v_flex()
-                                        .w_full()
-                                        .py_3()
-                                        .gap_1p5()
-                                        .child(div().text_sm().font_medium().child(
+                            v_flex().w_full().child(
+                                v_flex()
+                                    .w_full()
+                                    .py_3()
+                                    .gap_1p5()
+                                    .child(
+                                        div().text_sm().font_medium().child(
                                             t!("settings.remote_access.key_label").to_string(),
-                                        ))
-                                        .child(
-                                            Input::new(&key_input).w_full().min_w_0().mask_toggle(),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .line_height(relative(1.35))
-                                                .opacity(0.6)
-                                                .child(
-                                                    t!("settings.remote_access.key_hint")
-                                                        .to_string(),
-                                                ),
                                         ),
-                                ),
+                                    )
+                                    .child(Input::new(&key_input).w_full().min_w_0().mask_toggle())
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .line_height(relative(1.35))
+                                            .opacity(0.6)
+                                            .child(
+                                                t!("settings.remote_access.key_hint").to_string(),
+                                            ),
+                                    ),
+                            ),
                         ),
                 )
             })
@@ -745,7 +715,6 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<RemoteAccessSettingsInputState> {
-        let server = settings.server.clone().unwrap_or_default();
         let key_placeholder = if settings.has_key {
             t!("settings.remote_access.key_placeholder_configured").to_string()
         } else {
@@ -757,32 +726,13 @@ impl PioneerDesktop {
         ));
 
         window.use_keyed_state(state_key, cx, |window, cx| {
-            let server_input = cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder(t!("settings.remote_access.server_placeholder").to_string())
-                    .default_value(server)
-            });
             let key_input = cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder(key_placeholder)
                     .masked(true)
             });
-            let server_subscription = cx.subscribe(&server_input, {
-                let desktop_entity = desktop_entity.clone();
-                move |_, input, event: &InputEvent, cx| {
-                    if !matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
-                        return;
-                    }
-                    let server = input.read(cx).value().to_string();
-                    let _ = desktop_entity.update(cx, |view, cx| {
-                        view.save_remote_access_server_inline(server, cx);
-                        cx.notify();
-                    });
-                }
-            });
             let key_subscription = cx.subscribe(&key_input, {
                 let desktop_entity = desktop_entity.clone();
-                let server_input = server_input.clone();
                 move |_, input, event: &InputEvent, cx| {
                     if !matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
                         return;
@@ -791,18 +741,15 @@ impl PioneerDesktop {
                     if key.trim().is_empty() {
                         return;
                     }
-                    let server = server_input.read(cx).value().to_string();
                     let _ = desktop_entity.update(cx, |view, cx| {
-                        view.save_remote_access_key_inline(server, key, cx);
+                        view.save_remote_access_key_inline(key, cx);
                         cx.notify();
                     });
                 }
             });
 
             RemoteAccessSettingsInputState {
-                server: server_input,
                 key: key_input,
-                _server_subscription: server_subscription,
                 _key_subscription: key_subscription,
             }
         })
@@ -1196,25 +1143,25 @@ mod tests {
         settings.status.state = GatewayRemoteAccessState::Failed;
         settings.status.error_kind = Some(GatewayRemoteAccessErrorKind::InvalidSettings);
         settings.status.message =
-            Some("remote access server must include host and port".to_owned());
+            Some("remote access relay address must include a port".to_owned());
 
         assert_eq!(
             super::PioneerDesktop::remote_access_status_label(&settings),
-            "Enter an HTTPS tunnel address, for example https://getpioneer.dev, or IP:port."
+            "Remote access config is invalid."
         );
 
         settings.status.error_kind = Some(GatewayRemoteAccessErrorKind::MissingKey);
 
         assert_eq!(
             super::PioneerDesktop::remote_access_status_label(&settings),
-            "Paste a new key and press Enter."
+            "Paste a new service token and press Enter."
         );
 
         settings.status.error_kind = Some(GatewayRemoteAccessErrorKind::RelayConnectFailed);
 
         assert_eq!(
             super::PioneerDesktop::remote_access_status_label(&settings),
-            "Could not connect to the tunnel address."
+            "Could not connect to the relay."
         );
 
         settings.status.error_kind = Some(GatewayRemoteAccessErrorKind::TunnelAuthFailed);
@@ -1258,7 +1205,7 @@ mod tests {
         assert!(!remote_access_view.contains("settings.remote_access.save"));
         assert!(!remote_access_view.contains("settings-remote-access-clear-key"));
         assert!(!remote_access_view.contains("clear_remote_access_key_inline"));
-        assert!(source.contains("save_remote_access_server_inline"));
+        assert!(!source.contains("save_remote_access_server_inline"));
     }
 
     #[test]

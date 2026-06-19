@@ -119,7 +119,6 @@ impl PioneerDesktop {
     pub(super) fn apply_remote_access_setting(
         &mut self,
         enabled: bool,
-        server: String,
         key: Option<String>,
         clear_key: bool,
         cx: &mut Context<Self>,
@@ -127,7 +126,6 @@ impl PioneerDesktop {
         let Some(plan) = gateway_settings::remote_access_update_plan(
             self.gateway.settings.as_ref(),
             enabled,
-            server,
             key,
             clear_key,
         ) else {
@@ -138,34 +136,7 @@ impl PioneerDesktop {
         self.apply_gateway_settings_update(plan.snapshot, plan.update, cx);
     }
 
-    pub(super) fn save_remote_access_server_inline(
-        &mut self,
-        server: String,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(settings) = self.gateway.settings.as_ref() else {
-            self.refresh_gateway_settings(cx);
-            return;
-        };
-        let normalized_server = gateway_settings::normalize_remote_access_input(server.as_str());
-        if normalized_server == settings.remote_access.server {
-            return;
-        }
-        self.apply_remote_access_setting(
-            settings.remote_access.enabled,
-            normalized_server.unwrap_or_default(),
-            None,
-            false,
-            cx,
-        );
-    }
-
-    pub(super) fn save_remote_access_key_inline(
-        &mut self,
-        server: String,
-        key: String,
-        cx: &mut Context<Self>,
-    ) {
+    pub(super) fn save_remote_access_key_inline(&mut self, key: String, cx: &mut Context<Self>) {
         if key.trim().is_empty() {
             return;
         }
@@ -175,13 +146,7 @@ impl PioneerDesktop {
         };
         self.remote_access_key_input_revision =
             self.remote_access_key_input_revision.wrapping_add(1);
-        self.apply_remote_access_setting(
-            settings.remote_access.enabled,
-            server,
-            Some(key),
-            false,
-            cx,
-        );
+        self.apply_remote_access_setting(settings.remote_access.enabled, Some(key), false, cx);
     }
 
     pub(super) fn apply_memory_model_setting(

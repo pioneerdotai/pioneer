@@ -16,7 +16,6 @@ use serde::Serialize;
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
-use url::{Host, Url};
 
 #[derive(Debug, Clone)]
 pub struct RemoteAccessDesiredState {
@@ -76,6 +75,7 @@ struct RatholeClientSection {
 
 #[derive(Serialize)]
 struct RatholeClientService {
+    auth: &'static str,
     token: String,
     local_addr: String,
 }
@@ -129,7 +129,7 @@ impl RemoteAccessSupervisor {
             &self.status_tx,
             GatewayRemoteAccessState::Starting,
             None,
-            Some("starting vendored rathole client".to_owned()),
+            Some("starting remote access relay client".to_owned()),
         );
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -178,24 +178,7 @@ impl RemoteAccessSupervisor {
             return Ok(None);
         }
 
-        let Some(remote_addr) = desired
-            .settings
-            .server
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-        else {
-            publish_status(
-                &self.status_tx,
-                GatewayRemoteAccessState::Failed,
-                Some(GatewayRemoteAccessErrorKind::InvalidSettings),
-                Some("remote access server is not configured".to_owned()),
-            );
-            return Ok(None);
-        };
-
-        let remote_addr = match normalize_rathole_remote_addr(remote_addr.as_str()) {
+        let remote_addr = match normalize_rathole_remote_addr(self.config.relay_addr.as_str()) {
             Ok(remote_addr) => remote_addr,
             Err(error) => {
                 publish_status(
@@ -300,7 +283,7 @@ async fn supervise_rathole(
                 &status_tx,
                 GatewayRemoteAccessState::Reconnecting,
                 None,
-                Some("reconnecting vendored rathole client".to_owned()),
+                Some("reconnecting remote access relay client".to_owned()),
             );
         }
 
@@ -319,14 +302,14 @@ async fn supervise_rathole(
                     &status_tx,
                     GatewayRemoteAccessState::Reconnecting,
                     Some(GatewayRemoteAccessErrorKind::ProcessExited),
-                    Some("vendored rathole client exited".to_owned()),
+                    Some("remote access relay client exited".to_owned()),
                 );
             }
             Err(error) => {
                 warn!(
                     generation = run_config.generation,
                     error = %format!("{error:#}"),
-                    "vendored rathole client failed"
+                    "remote access relay client failed"
                 );
                 publish_status(
                     &status_tx,
@@ -387,8 +370,8 @@ async fn run_rathole_once(
                 remove_runtime_config(config_path.as_path());
                 return match result {
                     Ok(Ok(())) => Ok(RatholeRunOutcome::Exited),
-                    Ok(Err(error)) => Err(error).context("vendored rathole client returned an error"),
-                    Err(error) => Err(error).context("vendored rathole client task failed"),
+                    Ok(Err(error)) => Err(error).context("remote access relay client returned an error"),
+                    Err(error) => Err(error).context("remote access relay client task failed"),
                 };
             }
             Some(event) = event_rx.recv() => {
@@ -400,8 +383,8 @@ async fn run_rathole_once(
                     let _ = rathole_shutdown_tx.send(true);
                     return match tokio::time::timeout(Duration::from_secs(5), &mut task).await {
                         Ok(Ok(Ok(()))) => Ok(RatholeRunOutcome::Stopped),
-                        Ok(Ok(Err(error))) => Err(error).context("vendored rathole client failed during shutdown"),
-                        Ok(Err(error)) => Err(error).context("vendored rathole client task failed during shutdown"),
+                        Ok(Ok(Err(error))) => Err(error).context("remote access relay client failed during shutdown"),
+                        Ok(Err(error)) => Err(error).context("remote access relay client task failed during shutdown"),
                         Err(_) => {
                             task.abort();
                             Ok(RatholeRunOutcome::Stopped)
@@ -427,6 +410,7 @@ fn write_rathole_client_config(run_config: &RemoteAccessRunConfig) -> Result<Pat
     services.insert(
         run_config.service_name.clone(),
         RatholeClientService {
+            auth: "token_hash",
             token: run_config.token.clone(),
             local_addr: run_config.local_addr.clone(),
         },
@@ -501,56 +485,47 @@ fn validate_rathole_service_name(service_name: &str) -> Result<()> {
 
 fn normalize_rathole_remote_addr(remote_addr: &str) -> Result<String> {
     if remote_addr.is_empty() {
-        bail!("remote access server must not be empty");
+        bail!("remote access relay address must not be empty");
     }
     if remote_addr.trim() != remote_addr || remote_addr.chars().any(char::is_whitespace) {
-        bail!("remote access server must not contain whitespace");
-    }
-
-    if remote_addr.contains("://") {
-        return normalize_rathole_remote_url(remote_addr);
+        bail!("remote access relay address must not contain whitespace");
     }
 
     if let Ok(socket_addr) = remote_addr.parse::<SocketAddr>() {
         if socket_addr.port() == 0 {
-            bail!("remote access server port must be between 1 and 65535");
+            bail!("remote access relay port must be between 1 and 65535");
         }
         return Ok(remote_addr.to_owned());
     }
 
-    bail!("remote access server must be an https URL or an IP address with port")
-}
-
-fn normalize_rathole_remote_url(remote_addr: &str) -> Result<String> {
-    let url = Url::parse(remote_addr).context("failed to parse remote access server URL")?;
-    if url.scheme() != "https" {
-        bail!("remote access server URL must start with https://");
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        bail!("remote access server URL must not include credentials");
-    }
-    if url.query().is_some() || url.fragment().is_some() {
-        bail!("remote access server URL must not include query or fragment");
-    }
-    if !matches!(url.path(), "" | "/") {
-        bail!("remote access server URL must not include a path");
+    if remote_addr.contains("://") || remote_addr.contains('/') {
+        bail!("remote access relay address must be host:port");
     }
 
-    let port = url
-        .port_or_known_default()
-        .context("remote access server URL must include a port or use https")?;
+    let Some((host, port)) = remote_addr.rsplit_once(':') else {
+        bail!("remote access relay address must include a port");
+    };
+    if host.is_empty() || port.is_empty() {
+        bail!("remote access relay address must be host:port");
+    }
+    if host.contains(':') {
+        bail!("remote access relay IPv6 address must use [addr]:port format");
+    }
+
+    let port = port
+        .parse::<u16>()
+        .context("remote access relay port must be a number")?;
     if port == 0 {
-        bail!("remote access server port must be between 1 and 65535");
+        bail!("remote access relay port must be between 1 and 65535");
     }
-    let host = url
-        .host()
-        .context("remote access server URL must include a host")?;
+    if host
+        .chars()
+        .any(|ch| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '.'))
+    {
+        bail!("remote access relay host contains unsupported characters");
+    }
 
-    Ok(match host {
-        Host::Domain(host) => format!("{host}:{port}"),
-        Host::Ipv4(host) => format!("{host}:{port}"),
-        Host::Ipv6(host) => format!("[{host}]:{port}"),
-    })
+    Ok(format!("{host}:{port}"))
 }
 
 fn should_restart(max_restarts: u32, restart_count: u32) -> bool {
@@ -756,6 +731,7 @@ mod tests {
         assert!(content.contains("[client]"));
         assert!(content.contains("remote_addr = \"relay.example.com:2333\""));
         assert!(content.contains("[client.services.pioneer_gateway]"));
+        assert!(content.contains("auth = \"token_hash\""));
         assert!(content.contains("token = \"secret-token\""));
         assert!(content.contains("local_addr = \"127.0.0.1:17878\""));
 
@@ -780,8 +756,13 @@ mod tests {
     }
 
     #[test]
-    fn remote_addr_accepts_https_url_or_ip_with_port() {
-        for value in ["https://getpioneer.dev", "127.0.0.1:2333", "[::1]:2333"] {
+    fn remote_addr_accepts_host_or_ip_with_port() {
+        for value in [
+            "relay-eu-west-1.getpioneer.dev:2333",
+            "localhost:2333",
+            "127.0.0.1:2333",
+            "[::1]:2333",
+        ] {
             assert!(
                 normalize_rathole_remote_addr(value).is_ok(),
                 "{value} should be valid"
@@ -789,8 +770,8 @@ mod tests {
         }
 
         for value in [
+            "https://getpioneer.dev",
             "getpioneer.dev",
-            "relay.example.com:2333",
             "localhost",
             "127.0.0.1",
             "[::1]",
@@ -810,15 +791,19 @@ mod tests {
     }
 
     #[test]
-    fn https_remote_addr_uses_https_default_port() {
+    fn run_config_uses_gateway_config_relay_addr() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let supervisor =
-            RemoteAccessSupervisor::new(temp_dir.path(), GatewayRemoteAccessConfig::default())
-                .expect("supervisor");
+        let supervisor = RemoteAccessSupervisor::new(
+            temp_dir.path(),
+            GatewayRemoteAccessConfig {
+                relay_addr: "relay-eu-west-1.getpioneer.dev:2333".to_owned(),
+                ..GatewayRemoteAccessConfig::default()
+            },
+        )
+        .expect("supervisor");
         let desired = RemoteAccessDesiredState {
             settings: GatewayRemoteAccessSettings {
                 enabled: true,
-                server: Some("https://getpioneer.dev".to_owned()),
                 service_name: Some("pioneer_gateway".to_owned()),
                 has_key: true,
                 ..GatewayRemoteAccessSettings::default()
@@ -831,19 +816,26 @@ mod tests {
             .expect("validate run config");
 
         let run_config = run_config.expect("run config");
-        assert_eq!(run_config.remote_addr, "getpioneer.dev:443");
+        assert_eq!(
+            run_config.remote_addr,
+            "relay-eu-west-1.getpioneer.dev:2333"
+        );
     }
 
     #[test]
     fn invalid_remote_addr_publishes_failed_status() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let supervisor =
-            RemoteAccessSupervisor::new(temp_dir.path(), GatewayRemoteAccessConfig::default())
-                .expect("supervisor");
+        let supervisor = RemoteAccessSupervisor::new(
+            temp_dir.path(),
+            GatewayRemoteAccessConfig {
+                relay_addr: "getpioneer.dev".to_owned(),
+                ..GatewayRemoteAccessConfig::default()
+            },
+        )
+        .expect("supervisor");
         let desired = RemoteAccessDesiredState {
             settings: GatewayRemoteAccessSettings {
                 enabled: true,
-                server: Some("getpioneer.dev".to_owned()),
                 service_name: Some("pioneer_gateway".to_owned()),
                 has_key: true,
                 ..GatewayRemoteAccessSettings::default()
@@ -985,22 +977,16 @@ mod tests {
     }
 
     #[test]
-    fn remote_addr_normalization_maps_https_url_to_rathole_endpoint() {
+    fn remote_addr_normalization_keeps_host_port_endpoint() {
         assert_eq!(
-            normalize_rathole_remote_addr("https://getpioneer.dev").expect("normalize"),
-            "getpioneer.dev:443"
-        );
-        assert_eq!(
-            normalize_rathole_remote_addr("https://getpioneer.dev:8443").expect("normalize"),
-            "getpioneer.dev:8443"
-        );
-        assert_eq!(
-            normalize_rathole_remote_addr("https://[::1]").expect("normalize"),
-            "[::1]:443"
+            normalize_rathole_remote_addr("relay-eu-west-1.getpioneer.dev:2333")
+                .expect("normalize"),
+            "relay-eu-west-1.getpioneer.dev:2333"
         );
         assert_eq!(
             normalize_rathole_remote_addr("127.0.0.1:2333").expect("normalize"),
             "127.0.0.1:2333"
         );
+        assert!(normalize_rathole_remote_addr("https://getpioneer.dev").is_err());
     }
 }

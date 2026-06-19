@@ -2555,6 +2555,7 @@ impl MessageProcessor {
             if let Some(supervisor) = self.remote_access_supervisor.as_ref() {
                 supervisor
                     .apply(crate::remote_access_desired_state(
+                        &config.gateway.remote_access,
                         &settings,
                         self.gateway_secrets.as_ref(),
                     )?)

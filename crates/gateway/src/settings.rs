@@ -4,7 +4,7 @@ use pioneer_config::{
     GatewayCliAgentRuntimeKindConfig, GatewayConfig, GatewayMemoryConfig,
     GatewayMemoryModelSelectionConfig,
     GatewayMemoryModelSelectionSource as ConfigGatewayMemoryModelSelectionSource,
-    GatewayThreadEpisodicConfig,
+    GatewayRemoteAccessConfig, GatewayThreadEpisodicConfig,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -280,8 +280,6 @@ struct GatewayRemoteAccessSettingsOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     server: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    public_address: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     service_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     transport: Option<GatewayRemoteAccessTransportConfig>,
@@ -438,13 +436,13 @@ impl GatewaySettings {
 
     pub fn effective_remote_access_settings(
         &self,
+        config: &GatewayRemoteAccessConfig,
         has_key: bool,
         status: pioneer_protocol::GatewayRemoteAccessStatusSnapshot,
     ) -> pioneer_protocol::GatewayRemoteAccessSettings {
         pioneer_protocol::GatewayRemoteAccessSettings {
             enabled: self.remote_access.enabled.unwrap_or(false),
-            server: self.remote_access.server.clone(),
-            public_address: self.remote_access.public_address.clone(),
+            server: Some(config.relay_addr.clone()),
             service_name: Some(self.remote_access.service_name()),
             transport: self
                 .remote_access
@@ -498,8 +496,11 @@ impl GatewaySettings {
                 .effective_thread_episodic_settings(&config.thread_episodic)
                 .to_protocol(),
             cli_runtimes: self.effective_cli_runtime_settings(config),
-            remote_access: self
-                .effective_remote_access_settings(has_remote_access_key, remote_access_status),
+            remote_access: self.effective_remote_access_settings(
+                &config.remote_access,
+                has_remote_access_key,
+                remote_access_status,
+            ),
         }
     }
 
@@ -1907,7 +1908,7 @@ near_capacity_percent = 75.0
             .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
                 remote_access: Some(pioneer_protocol::GatewayRemoteAccessSettingsUpdate {
                     enabled: Some(true),
-                    server: Some(" relay.example.com:2333 ".to_owned()),
+                    server: None,
                     key: Some(" tunnel-token ".to_owned()),
                     clear_key: None,
                 }),
@@ -1927,7 +1928,7 @@ near_capacity_percent = 75.0
         assert!(snapshot.remote_access.enabled);
         assert_eq!(
             snapshot.remote_access.server.as_deref(),
-            Some("relay.example.com:2333")
+            Some("relay-eu-west-1.getpioneer.dev:2333")
         );
         assert!(snapshot.remote_access.has_key);
 
@@ -1935,7 +1936,7 @@ near_capacity_percent = 75.0
         let content = fs::read_to_string(&path).expect("read settings");
         assert!(content.contains("[remote_access]"));
         assert!(content.contains("enabled = true"));
-        assert!(content.contains("server = \"relay.example.com:2333\""));
+        assert!(!content.contains("server = "));
         assert!(!content.contains("tunnel-token"));
 
         let _ = fs::remove_dir_all(temp_dir);

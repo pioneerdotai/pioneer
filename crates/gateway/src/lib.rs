@@ -473,9 +473,11 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
     message_processor.start_skills_watcher().await;
     message_processor.start_mcp_workspace_supervisor().await;
 
+    let remote_access_config = config.gateway.remote_access.clone();
     let handle = spawn_server(config, auth, message_processor.clone(), session_manager).await?;
     remote_access_supervisor
         .apply(remote_access_desired_state(
+            &remote_access_config,
             &gateway_settings,
             gateway_secrets.as_ref(),
         )?)
@@ -566,6 +568,7 @@ fn load_gateway_settings(runtime_home: &Path, config: &AppConfig) -> Result<Gate
 }
 
 fn remote_access_desired_state(
+    config: &pioneer_config::GatewayRemoteAccessConfig,
     settings: &GatewaySettings,
     gateway_secrets: &GatewaySecrets,
 ) -> Result<RemoteAccessDesiredState> {
@@ -576,6 +579,7 @@ fn remote_access_desired_state(
     let has_key = key.is_some();
     Ok(RemoteAccessDesiredState {
         settings: settings.effective_remote_access_settings(
+            config,
             has_key,
             pioneer_protocol::GatewayRemoteAccessStatusSnapshot::default(),
         ),

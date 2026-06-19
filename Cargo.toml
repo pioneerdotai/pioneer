@@ -1,6 +1,5 @@
 [workspace]
 resolver = "3"
-exclude = ["vendor/rathole"]
 members = [
   "crates/agent",
   "crates/artifacts",
@@ -62,7 +61,6 @@ pioneer-tasks = { path = "crates/tasks" }
 pioneer-tools = { path = "crates/tools" }
 pioneer-sqlite = { path = "crates/sqlite" }
 pioneer-promt = { path = "crates/promt" }
-rathole = { path = "vendor/rathole", default-features = false, features = ["client"] }
 
 # Error handling
 anyhow = "1"
@@ -127,6 +125,7 @@ sys-locale = "0.3"
 # HTTP
 reqwest = { version = "0.13", features = ["json", "query", "stream", "multipart", "blocking"] }
 http = "1"
+rathole = { git = "https://github.com/pioneerdotai/relay.git", default-features = false, features = ["client"] }
 
 # Crypto
 hmac = "0.13"

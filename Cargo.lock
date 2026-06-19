@@ -7984,7 +7984,6 @@ dependencies = [
  "tokio",
  "toml 1.1.2+spec-1.1.0",
  "tracing",
- "url",
 ]
 
 [[package]]
@@ -8647,6 +8646,7 @@ dependencies = [
 [[package]]
 name = "rathole"
 version = "0.5.0"
+source = "git+https://github.com/pioneerdotai/relay.git#e720bd1e56e6971d70a9536f28f41a43360130a9"
 dependencies = [
  "anyhow",
  "async-http-proxy",

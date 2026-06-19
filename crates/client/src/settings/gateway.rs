@@ -258,18 +258,14 @@ pub fn thread_episodic_enabled_update_plan(
 pub fn remote_access_update_plan(
     current: Option<&GatewaySettingsSnapshot>,
     enabled: bool,
-    server: impl Into<String>,
     key: Option<String>,
     clear_key: bool,
 ) -> Option<GatewaySettingsUpdatePlan> {
     let mut snapshot = current.cloned()?;
-    let server = server.into();
-    let normalized_server = normalize_optional_text(server.as_str());
     let normalized_key = key.and_then(|value| normalize_optional_text(value.as_str()));
     let clear_key = clear_key && normalized_key.is_none();
 
     snapshot.remote_access.enabled = enabled;
-    snapshot.remote_access.server = normalized_server.clone();
     if normalized_key.is_some() {
         snapshot.remote_access.has_key = true;
     } else if clear_key {
@@ -285,16 +281,12 @@ pub fn remote_access_update_plan(
             cli_runtimes: None,
             remote_access: Some(GatewayRemoteAccessSettingsUpdate {
                 enabled: Some(enabled),
-                server: Some(server),
+                server: None,
                 key: normalized_key,
                 clear_key: clear_key.then_some(true),
             }),
         },
     })
-}
-
-pub fn normalize_remote_access_input(value: &str) -> Option<String> {
-    normalize_optional_text(value)
 }
 
 pub fn remote_access_status_needs_poll(settings: Option<&GatewaySettingsSnapshot>) -> bool {
@@ -550,15 +542,6 @@ mod tests {
             Some(GatewayThreadEpisodicSettingsUpdate::enabled(false))
         );
         assert!(thread_episodic_enabled_update_plan(None, true).is_none());
-    }
-
-    #[test]
-    fn remote_access_input_normalization_is_shared() {
-        assert_eq!(
-            normalize_remote_access_input(" https://getpioneer.dev "),
-            Some("https://getpioneer.dev".to_owned())
-        );
-        assert_eq!(normalize_remote_access_input("  "), None);
     }
 
     #[test]

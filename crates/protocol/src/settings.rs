@@ -194,8 +194,6 @@ pub struct GatewayRemoteAccessSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub public_address: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_name: Option<String>,
     #[serde(default)]
     pub transport: GatewayRemoteAccessTransport,
@@ -210,7 +208,6 @@ impl Default for GatewayRemoteAccessSettings {
         Self {
             enabled: false,
             server: None,
-            public_address: None,
             service_name: None,
             transport: GatewayRemoteAccessTransport::default(),
             has_key: false,

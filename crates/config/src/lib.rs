@@ -94,6 +94,8 @@ pub struct GatewayTaskReviewConfig {
 pub struct GatewayRemoteAccessConfig {
     #[serde(default = "default_gateway_remote_access_runtime_dir")]
     pub runtime_dir: String,
+    #[serde(default = "default_gateway_remote_access_relay_addr")]
+    pub relay_addr: String,
     #[serde(default = "default_gateway_remote_access_local_addr")]
     pub local_addr: String,
     #[serde(default = "default_gateway_remote_access_restart_initial_ms")]
@@ -110,6 +112,7 @@ impl Default for GatewayRemoteAccessConfig {
     fn default() -> Self {
         Self {
             runtime_dir: default_gateway_remote_access_runtime_dir(),
+            relay_addr: default_gateway_remote_access_relay_addr(),
             local_addr: default_gateway_remote_access_local_addr(),
             restart_initial_ms: default_gateway_remote_access_restart_initial_ms(),
             restart_max_ms: default_gateway_remote_access_restart_max_ms(),
@@ -121,6 +124,10 @@ impl Default for GatewayRemoteAccessConfig {
 
 fn default_gateway_remote_access_runtime_dir() -> String {
     "remote-access".to_owned()
+}
+
+fn default_gateway_remote_access_relay_addr() -> String {
+    "relay-eu-west-1.getpioneer.dev:2333".to_owned()
 }
 
 fn default_gateway_remote_access_local_addr() -> String {

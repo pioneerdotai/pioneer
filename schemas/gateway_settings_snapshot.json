@@ -244,12 +244,6 @@
           "type": "boolean",
           "default": false
         },
-        "public_address": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "server": {
           "type": [
             "string",
