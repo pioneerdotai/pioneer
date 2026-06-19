@@ -11,6 +11,10 @@ use pioneer_protocol::{
     TaskErrorClass, TaskEventPayload, TaskExecutorKind, TaskRescheduleReason, TaskRun,
     TaskRunStatus, TaskTrigger, TaskTriggerKind, TaskTriggerStatus, generate_id,
 };
+use pioneer_sqlite::{
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, is_anyhow_sqlite_transient_open,
+    retry_with_backoff,
+};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{Duration, sleep};
@@ -80,16 +84,40 @@ impl TaskScheduler {
         let mut events = self.event_bus.subscribe(Default::default());
         loop {
             let now = now_timestamp_secs();
-            if let Err(error) = self.process_due_once(now).await {
-                error!(error = %format!("{error:#}"), "task scheduler due processing failed");
-            }
-            let sleep_duration = self.next_sleep_duration(now).await;
+            let processing = self
+                .process_due_once_with_transient_storage_retry(now)
+                .await;
+            let sleep_duration = match processing {
+                Ok(_) => self.next_sleep_duration(now).await,
+                Err(error) => {
+                    let is_transient_storage = is_anyhow_sqlite_transient_open(&error);
+                    error!(error = %format!("{error:#}"), "task scheduler due processing failed");
+                    if is_transient_storage {
+                        Duration::from_secs(TASK_SCHEDULER_MAX_SLEEP_SECONDS)
+                    } else {
+                        self.next_sleep_duration(now).await
+                    }
+                }
+            };
             tokio::select! {
                 _ = self.notify.notified() => {}
                 _ = events.recv() => {}
                 _ = sleep(sleep_duration) => {}
             }
         }
+    }
+
+    async fn process_due_once_with_transient_storage_retry(
+        &self,
+        now: i64,
+    ) -> TaskRuntimeResult<usize> {
+        retry_with_backoff(
+            || self.process_due_once(now),
+            is_anyhow_sqlite_transient_open,
+            DEFAULT_LOCK_RETRY_ATTEMPTS,
+            Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
+        )
+        .await
     }
 
     pub async fn process_due_once(&self, now: i64) -> TaskRuntimeResult<usize> {

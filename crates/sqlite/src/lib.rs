@@ -98,6 +98,15 @@ pub fn is_anyhow_sqlite_lock(error: &anyhow::Error) -> bool {
     is_sqlite_lock_message(format!("{error:#}").as_str())
 }
 
+pub fn is_sqlite_transient_open_message(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("sqlite_cantopen") || normalized.contains("unable to open database file")
+}
+
+pub fn is_anyhow_sqlite_transient_open(error: &anyhow::Error) -> bool {
+    is_sqlite_transient_open_message(format!("{error:#}").as_str())
+}
+
 pub async fn apply_sqlite_pragmas(connection: &DatabaseConnection) -> Result<()> {
     connection
         .query_one_raw(Statement::from_string(
@@ -168,4 +177,24 @@ fn is_disallowed_component(component: Component<'_>) -> bool {
         component,
         Component::ParentDir | Component::RootDir | Component::Prefix(_)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_sqlite_lock_message, is_sqlite_transient_open_message};
+
+    #[test]
+    fn detects_sqlite_transient_open_errors() {
+        assert!(is_sqlite_transient_open_message(
+            "Query Error: error returned from database: (code: 14) unable to open database file"
+        ));
+        assert!(is_sqlite_transient_open_message("SQLITE_CANTOPEN"));
+    }
+
+    #[test]
+    fn transient_open_errors_do_not_match_lock_only_predicate() {
+        assert!(!is_sqlite_lock_message(
+            "Query Error: error returned from database: (code: 14) unable to open database file"
+        ));
+    }
 }

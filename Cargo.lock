@@ -7934,6 +7934,7 @@ dependencies = [
  "pioneer-crud",
  "pioneer-migration",
  "pioneer-protocol",
+ "pioneer-sqlite",
  "sea-orm",
  "serde",
  "serde_json",
