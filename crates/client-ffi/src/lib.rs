@@ -149,10 +149,16 @@ enum FfiResponse<T> {
 
 impl PioneerClientFfi {
     fn new() -> Self {
+        install_rustls_crypto_provider();
+
         Self {
             runtime: ClientFfiRuntime::default(),
         }
     }
+}
+
+fn install_rustls_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 impl ClientFfiRuntime {

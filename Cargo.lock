@@ -7618,6 +7618,7 @@ dependencies = [
  "anyhow",
  "pioneer-client",
  "pioneer-protocol",
+ "rustls",
  "schemars",
  "serde",
  "serde_json",
