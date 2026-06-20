@@ -3945,6 +3945,8 @@ impl MessageProcessor {
         }
         self.clear_turn_llm_context_state(turn_id).await;
         self.clear_artifact_finalization_state(turn_id).await;
+        self.ensure_cli_runtime_turn_blocked_cleanup(thread_id, turn_id, reason)
+            .await;
     }
 
     pub(super) async fn report_legacy_turn_failure(

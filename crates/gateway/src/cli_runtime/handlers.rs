@@ -1,9 +1,9 @@
 use super::*;
 use crate::cli_runtime::config::codex_account_probe_config_from_instance;
 use crate::cli_runtime::manager::{
-    CLIAgentRuntimeCodexEventReceivers, CLIAgentRuntimeSession, CLIAgentRuntimeSessionKey,
-    CLIAgentRuntimeThreadForkRequest, CLIAgentRuntimeThreadNameSetRequest,
-    CLIAgentRuntimeTurnSteerRequest,
+    CLIAgentRuntimeCodexEventReceivers, CLIAgentRuntimeSession, CLIAgentRuntimeSessionHandle,
+    CLIAgentRuntimeSessionKey, CLIAgentRuntimeThreadForkRequest,
+    CLIAgentRuntimeThreadNameSetRequest, CLIAgentRuntimeTurnSteerRequest,
 };
 use anyhow::Context as AnyhowContext;
 use pioneer_cli_agent_runtime::codex::{
@@ -1038,20 +1038,17 @@ impl MessageProcessor {
                 return;
             }
         };
-        let handle = match manager.get_or_start(key).await {
-            Ok(handle) => handle,
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to start CLI runtime session for steering: {error:#}"),
-                    ),
-                )
-                .await;
-                return;
-            }
+        let Some(handle) = manager.existing_session(&key).await else {
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_REQUEST_CODE,
+                    "CLI runtime session is not active for turn steering".to_owned(),
+                ),
+            )
+            .await;
+            return;
         };
         let steer = match handle
             .session()
@@ -1362,6 +1359,75 @@ impl MessageProcessor {
             return;
         }
 
+        if let Err(error) = self
+            .validate_cli_runtime_pending_request_active_turn(&pending)
+            .await
+        {
+            if let Err(expire_error) = self
+                .expire_cli_runtime_pending_request_as_stale(&pending)
+                .await
+            {
+                warn!(
+                    workspace_id = pending.workspace_id.as_str(),
+                    runtime_id = pending.runtime_id.as_str(),
+                    thread_id = pending.thread_id.as_str(),
+                    turn_id = pending.turn_id.as_deref(),
+                    request_id = pending.request_id.as_str(),
+                    error = %format!("{expire_error:#}"),
+                    "failed to expire stale CLI runtime pending request"
+                );
+            }
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_PARAMS_CODE,
+                    format!(
+                        "stale CLI runtime request `{}` cannot be answered: {error:#}",
+                        pending.request_id
+                    ),
+                ),
+            )
+            .await;
+            return;
+        }
+
+        let native_response_session = match self
+            .cli_runtime_existing_session_for_pending_request(&pending)
+            .await
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                if let Err(expire_error) = self
+                    .expire_cli_runtime_pending_request_as_stale(&pending)
+                    .await
+                {
+                    warn!(
+                        workspace_id = pending.workspace_id.as_str(),
+                        runtime_id = pending.runtime_id.as_str(),
+                        thread_id = pending.thread_id.as_str(),
+                        turn_id = pending.turn_id.as_deref(),
+                        request_id = pending.request_id.as_str(),
+                        error = %format!("{expire_error:#}"),
+                        "failed to expire CLI runtime pending request after missing runtime session"
+                    );
+                }
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!(
+                            "CLI runtime request `{}` cannot be answered: {error:#}",
+                            pending.request_id
+                        ),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+
         let response_json = match pioneer_crud::serialize_cli_runtime_json(&resolution) {
             Ok(payload) => Some(payload),
             Err(error) => {
@@ -1418,7 +1484,7 @@ impl MessageProcessor {
         };
 
         if let Err(error) = self
-            .respond_to_cli_runtime_native_request(&resolved, &resolution)
+            .respond_to_cli_runtime_native_request(&resolved, &resolution, native_response_session)
             .await
         {
             self.send_error(
@@ -1756,8 +1822,12 @@ impl MessageProcessor {
                 .or_else(|| json_string_path(params, &["item", "id"]))
         });
         let turn_id = if let Some(native_turn_id) = native_turn_id.as_deref() {
-            self.cli_runtime_pioneer_turn_id_for_native_turn(key, Some(native_turn_id))
-                .await
+            self.cli_runtime_pioneer_turn_id_for_native_turn(
+                key,
+                native_thread_id.as_deref(),
+                Some(native_turn_id),
+            )
+            .await
         } else {
             None
         };
@@ -1816,7 +1886,7 @@ impl MessageProcessor {
         }
     }
 
-    async fn handle_cli_runtime_codex_event(
+    pub(super) async fn handle_cli_runtime_codex_event(
         &self,
         key: &CLIAgentRuntimeSessionKey,
         event: RuntimeEvent,
@@ -1838,12 +1908,46 @@ impl MessageProcessor {
                 .await;
             return;
         };
+        let Some(native_thread_id) =
+            cli_runtime_native_thread_id_for_event(&event).map(str::to_owned)
+        else {
+            debug!(
+                workspace_id = key.workspace_id.as_str(),
+                runtime_id = key.runtime_id.as_str(),
+                thread_id = key.thread_id.as_str(),
+                native_turn_id = native_turn_id.as_str(),
+                "ignored Codex event without native thread id"
+            );
+            return;
+        };
         let Some(turn_binding) = self
-            .cli_runtime_turn_binding_for_native_turn(key, native_turn_id.as_str())
+            .cli_runtime_turn_binding_for_native_turn(
+                key,
+                native_thread_id.as_str(),
+                native_turn_id.as_str(),
+            )
             .await
         else {
+            if !self
+                .cli_runtime_has_starting_turn_binding_without_native_turn(
+                    key,
+                    native_thread_id.as_str(),
+                )
+                .await
+            {
+                debug!(
+                    workspace_id = key.workspace_id.as_str(),
+                    runtime_id = key.runtime_id.as_str(),
+                    thread_id = key.thread_id.as_str(),
+                    native_thread_id,
+                    native_turn_id = native_turn_id.as_str(),
+                    "ignored Codex event without matching Pioneer turn binding"
+                );
+                return;
+            }
             self.buffer_cli_runtime_codex_event_until_turn_binding(
                 key,
+                native_thread_id.as_str(),
                 native_turn_id.as_str(),
                 event,
             )
@@ -1869,6 +1973,29 @@ impl MessageProcessor {
         event: RuntimeEvent,
     ) {
         let native_turn_id = cli_runtime_native_turn_id_for_event(&event).unwrap_or("<none>");
+        let native_thread_id = cli_runtime_native_thread_id_for_event(&event);
+        let event_label = cli_runtime_event_log_label(&event);
+        if !self
+            .cli_runtime_turn_binding_accepts_native_activity(
+                key,
+                &turn_binding,
+                native_thread_id,
+                event_label.as_str(),
+            )
+            .await
+        {
+            debug!(
+                workspace_id = key.workspace_id.as_str(),
+                runtime_id = key.runtime_id.as_str(),
+                thread_id = key.thread_id.as_str(),
+                turn_id = turn_binding.turn_id.as_str(),
+                native_turn_id,
+                event = %event_label,
+                binding_status = turn_binding.status.as_str(),
+                "ignored Codex CLI runtime event for non-active Pioneer turn"
+            );
+            return;
+        }
         let context = crate::cli_runtime::projector::CLIRuntimeProjectorContext {
             workspace_id: key.workspace_id.clone(),
             thread_id: key.thread_id.clone(),
@@ -1881,36 +2008,27 @@ impl MessageProcessor {
         for progress in projected.progress {
             self.handle_progress_agent_event(progress).await;
         }
-        if let Some(status) = cli_runtime_terminal_status_for_event(&event)
-            && let Err(error) =
-                crate::cli_runtime::turn_binding::update_cli_runtime_turn_binding_status(
-                    self.crud_store.as_ref(),
-                    turn_binding.turn_id.as_str(),
-                    status,
-                    chrono::Utc::now().fixed_offset(),
-                )
-                .await
-        {
-            warn!(
-                workspace_id = key.workspace_id.as_str(),
-                runtime_id = key.runtime_id.as_str(),
-                thread_id = key.thread_id.as_str(),
-                native_turn_id,
-                error = %format!("{error:#}"),
-                "failed to update CLI runtime turn binding terminal status"
-            );
+        if let Some(status) = cli_runtime_turn_status_for_terminal_event(&event) {
+            self.cleanup_cli_runtime_terminal_turn_status(
+                &turn_binding,
+                status,
+                event_label.as_str(),
+            )
+            .await;
         }
     }
 
     pub(super) async fn flush_cli_runtime_codex_events_for_native_turn(
         &self,
         key: &CLIAgentRuntimeSessionKey,
+        native_thread_id: &str,
         native_turn_id: &str,
     ) {
         let pending_key = CLIRuntimePendingTurnEventKey {
             workspace_id: key.workspace_id.clone(),
             runtime_id: key.runtime_id.clone(),
             thread_id: key.thread_id.clone(),
+            native_thread_id: native_thread_id.to_owned(),
             native_turn_id: native_turn_id.to_owned(),
         };
         let pending = self
@@ -1919,34 +2037,102 @@ impl MessageProcessor {
             .await
             .remove(&pending_key)
             .unwrap_or_default();
-        if pending.is_empty() {
+        let pending_requests = self
+            .cli_runtime_pending_turn_server_requests
+            .lock()
+            .await
+            .remove(&pending_key)
+            .unwrap_or_default();
+        if pending.is_empty() && pending_requests.is_empty() {
             return;
         }
 
         let Some(turn_binding) = self
-            .cli_runtime_turn_binding_for_native_turn(key, native_turn_id)
+            .cli_runtime_turn_binding_for_native_turn(key, native_thread_id, native_turn_id)
             .await
         else {
-            let mut buffer = self.cli_runtime_pending_turn_events.lock().await;
-            buffer.entry(pending_key).or_default().extend(pending);
+            if !pending.is_empty() {
+                let mut buffer = self.cli_runtime_pending_turn_events.lock().await;
+                buffer
+                    .entry(pending_key.clone())
+                    .or_default()
+                    .extend(pending);
+            }
+            if !pending_requests.is_empty() {
+                let mut buffer = self.cli_runtime_pending_turn_server_requests.lock().await;
+                buffer
+                    .entry(pending_key)
+                    .or_default()
+                    .extend(pending_requests);
+            }
             return;
         };
 
-        for pending_event in pending {
-            debug!(
-                workspace_id = key.workspace_id.as_str(),
-                runtime_id = key.runtime_id.as_str(),
-                thread_id = key.thread_id.as_str(),
-                native_turn_id,
-                received_at_unix_ms = pending_event.received_at_unix_ms,
-                "flushing buffered Codex CLI runtime event"
-            );
-            self.process_bound_cli_runtime_codex_event(
-                key,
-                turn_binding.clone(),
-                pending_event.event,
+        enum PendingTurnActivity {
+            Event(CLIRuntimePendingTurnEvent),
+            ServerRequest(CLIRuntimePendingTurnServerRequest),
+        }
+
+        impl PendingTurnActivity {
+            fn received_sequence(&self) -> u64 {
+                match self {
+                    Self::Event(event) => event.received_sequence,
+                    Self::ServerRequest(request) => request.received_sequence,
+                }
+            }
+        }
+
+        let mut activities: Vec<PendingTurnActivity> = pending
+            .into_iter()
+            .map(PendingTurnActivity::Event)
+            .chain(
+                pending_requests
+                    .into_iter()
+                    .map(PendingTurnActivity::ServerRequest),
             )
-            .await;
+            .collect();
+        activities.sort_by_key(PendingTurnActivity::received_sequence);
+
+        for activity in activities {
+            match activity {
+                PendingTurnActivity::Event(pending_event) => {
+                    debug!(
+                        workspace_id = key.workspace_id.as_str(),
+                        runtime_id = key.runtime_id.as_str(),
+                        thread_id = key.thread_id.as_str(),
+                        native_thread_id,
+                        native_turn_id,
+                        received_at_unix_ms = pending_event.received_at_unix_ms,
+                        received_sequence = pending_event.received_sequence,
+                        "flushing buffered Codex CLI runtime event"
+                    );
+                    self.process_bound_cli_runtime_codex_event(
+                        key,
+                        turn_binding.clone(),
+                        pending_event.event,
+                    )
+                    .await;
+                }
+                PendingTurnActivity::ServerRequest(pending_request) => {
+                    debug!(
+                        workspace_id = key.workspace_id.as_str(),
+                        runtime_id = key.runtime_id.as_str(),
+                        thread_id = key.thread_id.as_str(),
+                        native_thread_id,
+                        native_turn_id,
+                        method = pending_request.request.method.as_str(),
+                        received_at_unix_ms = pending_request.received_at_unix_ms,
+                        received_sequence = pending_request.received_sequence,
+                        "flushing buffered Codex CLI runtime server request"
+                    );
+                    self.handle_cli_runtime_codex_server_request(
+                        key,
+                        pending_request.request,
+                        pending_request.event,
+                    )
+                    .await;
+                }
+            }
         }
     }
 
@@ -1986,6 +2172,8 @@ impl MessageProcessor {
         }
         self.prune_stale_cli_runtime_pending_turn_events(now_unix_ms)
             .await;
+        self.prune_stale_cli_runtime_pending_turn_server_requests(now_unix_ms)
+            .await;
     }
 
     async fn fail_stale_cli_runtime_turn_binding(
@@ -2010,15 +2198,12 @@ impl MessageProcessor {
             (workspace_id, turn, false)
         };
         if turn.status != TurnStatus::InProgress {
-            if let Some(status) = cli_runtime_terminal_binding_status_for_turn_status(turn.status) {
-                crate::cli_runtime::turn_binding::update_cli_runtime_turn_binding_status(
-                    self.crud_store.as_ref(),
-                    binding.turn_id.as_str(),
-                    status,
-                    chrono::Utc::now().fixed_offset(),
-                )
-                .await?;
-            }
+            self.cleanup_cli_runtime_terminal_turn_status(
+                &binding,
+                turn.status,
+                "stale CLI runtime turn scan",
+            )
+            .await;
             return Ok(());
         }
 
@@ -2073,13 +2258,12 @@ impl MessageProcessor {
         };
 
         if did_mark_failed {
-            crate::cli_runtime::turn_binding::update_cli_runtime_turn_binding_status(
-                self.crud_store.as_ref(),
-                binding.turn_id.as_str(),
-                crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_FAILED,
-                chrono::Utc::now().fixed_offset(),
+            self.cleanup_cli_runtime_terminal_turn_status(
+                &binding,
+                TurnStatus::Failed,
+                "stale CLI runtime turn failed",
             )
-            .await?;
+            .await;
         }
 
         Ok(())
@@ -2157,6 +2341,7 @@ impl MessageProcessor {
                         key.workspace_id.clone(),
                         key.runtime_id.clone(),
                         key.thread_id.clone(),
+                        key.native_thread_id.clone(),
                         key.native_turn_id.clone(),
                         events.len(),
                     ));
@@ -2165,11 +2350,14 @@ impl MessageProcessor {
             });
         }
 
-        for (workspace_id, runtime_id, thread_id, native_turn_id, event_count) in removed {
+        for (workspace_id, runtime_id, thread_id, native_thread_id, native_turn_id, event_count) in
+            removed
+        {
             warn!(
                 workspace_id = workspace_id.as_str(),
                 runtime_id = runtime_id.as_str(),
                 thread_id = thread_id.as_str(),
+                native_thread_id = native_thread_id.as_str(),
                 native_turn_id = native_turn_id.as_str(),
                 event_count,
                 "discarded unbound Codex native turn events after TTL"
@@ -2177,9 +2365,57 @@ impl MessageProcessor {
         }
     }
 
+    async fn prune_stale_cli_runtime_pending_turn_server_requests(&self, now_unix_ms: i64) {
+        let mut removed = Vec::new();
+        {
+            let mut buffer = self.cli_runtime_pending_turn_server_requests.lock().await;
+            buffer.retain(|key, requests| {
+                let last_received_at = requests
+                    .iter()
+                    .map(|request| request.received_at_unix_ms)
+                    .max()
+                    .unwrap_or(0);
+                let keep = now_unix_ms.saturating_sub(last_received_at)
+                    < CLI_RUNTIME_PENDING_UNBOUND_EVENT_TTL_MS;
+                if !keep {
+                    removed.push((
+                        key.workspace_id.clone(),
+                        key.runtime_id.clone(),
+                        key.thread_id.clone(),
+                        key.native_thread_id.clone(),
+                        key.native_turn_id.clone(),
+                        requests.len(),
+                    ));
+                }
+                keep
+            });
+        }
+
+        for (
+            workspace_id,
+            runtime_id,
+            thread_id,
+            native_thread_id,
+            native_turn_id,
+            request_count,
+        ) in removed
+        {
+            warn!(
+                workspace_id = workspace_id.as_str(),
+                runtime_id = runtime_id.as_str(),
+                thread_id = thread_id.as_str(),
+                native_thread_id = native_thread_id.as_str(),
+                native_turn_id = native_turn_id.as_str(),
+                request_count,
+                "discarded unbound Codex native turn server requests after TTL"
+            );
+        }
+    }
+
     async fn buffer_cli_runtime_codex_event_until_turn_binding(
         &self,
         key: &CLIAgentRuntimeSessionKey,
+        native_thread_id: &str,
         native_turn_id: &str,
         event: RuntimeEvent,
     ) {
@@ -2187,6 +2423,7 @@ impl MessageProcessor {
             workspace_id: key.workspace_id.clone(),
             runtime_id: key.runtime_id.clone(),
             thread_id: key.thread_id.clone(),
+            native_thread_id: native_thread_id.to_owned(),
             native_turn_id: native_turn_id.to_owned(),
         };
         let mut buffer = self.cli_runtime_pending_turn_events.lock().await;
@@ -2203,6 +2440,45 @@ impl MessageProcessor {
         events.push(CLIRuntimePendingTurnEvent {
             event,
             received_at_unix_ms: now_timestamp_millis(),
+            received_sequence: self
+                .cli_runtime_pending_turn_activity_sequence
+                .fetch_add(1, Ordering::Relaxed),
+        });
+    }
+
+    async fn buffer_cli_runtime_codex_server_request_until_turn_binding(
+        &self,
+        key: &CLIAgentRuntimeSessionKey,
+        native_thread_id: &str,
+        native_turn_id: &str,
+        request: CodexJsonlRpcServerRequest,
+        event: RuntimeEvent,
+    ) {
+        let pending_key = CLIRuntimePendingTurnEventKey {
+            workspace_id: key.workspace_id.clone(),
+            runtime_id: key.runtime_id.clone(),
+            thread_id: key.thread_id.clone(),
+            native_thread_id: native_thread_id.to_owned(),
+            native_turn_id: native_turn_id.to_owned(),
+        };
+        let mut buffer = self.cli_runtime_pending_turn_server_requests.lock().await;
+        if !buffer.contains_key(&pending_key)
+            && buffer.len() >= CLI_RUNTIME_PENDING_TURN_EVENT_MAX_KEYS
+            && let Some(oldest_key) = buffer.keys().next().cloned()
+        {
+            buffer.remove(&oldest_key);
+        }
+        let requests = buffer.entry(pending_key).or_default();
+        if requests.len() >= CLI_RUNTIME_PENDING_TURN_EVENT_MAX_PER_TURN {
+            requests.remove(0);
+        }
+        requests.push(CLIRuntimePendingTurnServerRequest {
+            request,
+            event,
+            received_at_unix_ms: now_timestamp_millis(),
+            received_sequence: self
+                .cli_runtime_pending_turn_activity_sequence
+                .fetch_add(1, Ordering::Relaxed),
         });
     }
 
@@ -2223,86 +2499,417 @@ impl MessageProcessor {
             return;
         }
 
-        let result = match request.method.as_str() {
+        match request.method.as_str() {
             "item/commandExecution/requestApproval" => {
                 let decoded = decode_codex_command_approval_request(&request);
-                let turn_id = self
-                    .cli_runtime_pioneer_turn_id_for_native_turn(
+                let Some(turn_binding) = self
+                    .cli_runtime_turn_binding_for_native_turn_option(
                         key,
+                        decoded.native_thread_id.as_deref(),
                         decoded.native_turn_id.as_deref(),
                     )
+                    .await
+                else {
+                    if self
+                        .buffer_cli_runtime_codex_server_request_if_turn_binding_pending(
+                            key,
+                            decoded.native_thread_id.as_deref(),
+                            decoded.native_turn_id.as_deref(),
+                            &request,
+                            &event,
+                        )
+                        .await
+                    {
+                        return;
+                    }
+                    self.cancel_stale_codex_command_approval_request(
+                        key,
+                        &decoded,
+                        "missing Pioneer turn binding",
+                    )
                     .await;
-                self.open_codex_command_approval_request_for_turn(
-                    key.workspace_id.as_str(),
-                    key.runtime_id.as_str(),
-                    "codex",
-                    key.thread_id.as_str(),
-                    turn_id,
-                    decoded,
-                )
-                .await
-                .map(|_| ())
+                    return;
+                };
+                if !self
+                    .cli_runtime_turn_binding_accepts_native_activity(
+                        key,
+                        &turn_binding,
+                        decoded.native_thread_id.as_deref(),
+                        request.method.as_str(),
+                    )
+                    .await
+                {
+                    self.cancel_stale_codex_command_approval_request(
+                        key,
+                        &decoded,
+                        "terminal turn",
+                    )
+                    .await;
+                    return;
+                }
+                if let Err(error) = self
+                    .open_codex_command_approval_request_for_turn(
+                        key.workspace_id.as_str(),
+                        key.runtime_id.as_str(),
+                        "codex",
+                        key.thread_id.as_str(),
+                        Some(turn_binding.turn_id),
+                        decoded.clone(),
+                    )
+                    .await
+                {
+                    warn!(
+                        workspace_id = key.workspace_id.as_str(),
+                        runtime_id = key.runtime_id.as_str(),
+                        thread_id = key.thread_id.as_str(),
+                        method = request.method.as_str(),
+                        error = %format!("{error:#}"),
+                        "failed to open Codex CLI runtime command approval request"
+                    );
+                    self.cancel_stale_codex_command_approval_request(
+                        key,
+                        &decoded,
+                        "failed to open Pioneer pending request",
+                    )
+                    .await;
+                }
             }
             "item/fileChange/requestApproval" => {
                 let decoded = decode_codex_file_change_approval_request(&request);
-                let turn_id = self
-                    .cli_runtime_pioneer_turn_id_for_native_turn(
+                let Some(turn_binding) = self
+                    .cli_runtime_turn_binding_for_native_turn_option(
                         key,
+                        decoded.native_thread_id.as_deref(),
                         decoded.native_turn_id.as_deref(),
                     )
+                    .await
+                else {
+                    if self
+                        .buffer_cli_runtime_codex_server_request_if_turn_binding_pending(
+                            key,
+                            decoded.native_thread_id.as_deref(),
+                            decoded.native_turn_id.as_deref(),
+                            &request,
+                            &event,
+                        )
+                        .await
+                    {
+                        return;
+                    }
+                    self.cancel_stale_codex_file_change_approval_request(
+                        key,
+                        &decoded,
+                        "missing Pioneer turn binding",
+                    )
                     .await;
-                self.open_codex_file_change_approval_request_for_turn(
-                    key.workspace_id.as_str(),
-                    key.runtime_id.as_str(),
-                    "codex",
-                    key.thread_id.as_str(),
-                    turn_id,
-                    decoded,
-                )
-                .await
-                .map(|_| ())
+                    return;
+                };
+                if !self
+                    .cli_runtime_turn_binding_accepts_native_activity(
+                        key,
+                        &turn_binding,
+                        decoded.native_thread_id.as_deref(),
+                        request.method.as_str(),
+                    )
+                    .await
+                {
+                    self.cancel_stale_codex_file_change_approval_request(
+                        key,
+                        &decoded,
+                        "terminal turn",
+                    )
+                    .await;
+                    return;
+                }
+                if let Err(error) = self
+                    .open_codex_file_change_approval_request_for_turn(
+                        key.workspace_id.as_str(),
+                        key.runtime_id.as_str(),
+                        "codex",
+                        key.thread_id.as_str(),
+                        Some(turn_binding.turn_id),
+                        decoded.clone(),
+                    )
+                    .await
+                {
+                    warn!(
+                        workspace_id = key.workspace_id.as_str(),
+                        runtime_id = key.runtime_id.as_str(),
+                        thread_id = key.thread_id.as_str(),
+                        method = request.method.as_str(),
+                        error = %format!("{error:#}"),
+                        "failed to open Codex CLI runtime file change approval request"
+                    );
+                    self.cancel_stale_codex_file_change_approval_request(
+                        key,
+                        &decoded,
+                        "failed to open Pioneer pending request",
+                    )
+                    .await;
+                }
             }
             "item/tool/requestUserInput" | "tool/requestUserInput" | "userInput/request" => {
                 let decoded = decode_codex_user_input_request(&request);
-                let turn_id = self
-                    .cli_runtime_pioneer_turn_id_for_native_turn(
+                let Some(turn_binding) = self
+                    .cli_runtime_turn_binding_for_native_turn_option(
                         key,
+                        decoded.native_thread_id.as_deref(),
                         decoded.native_turn_id.as_deref(),
                     )
+                    .await
+                else {
+                    if self
+                        .buffer_cli_runtime_codex_server_request_if_turn_binding_pending(
+                            key,
+                            decoded.native_thread_id.as_deref(),
+                            decoded.native_turn_id.as_deref(),
+                            &request,
+                            &event,
+                        )
+                        .await
+                    {
+                        return;
+                    }
+                    self.cancel_stale_codex_user_input_request(
+                        key,
+                        &decoded,
+                        "missing Pioneer turn binding",
+                    )
                     .await;
-                self.open_codex_user_input_request_for_turn(
-                    key.workspace_id.as_str(),
-                    key.runtime_id.as_str(),
-                    "codex",
-                    key.thread_id.as_str(),
-                    turn_id,
-                    decoded,
-                )
-                .await
-                .map(|_| ())
+                    return;
+                };
+                if !self
+                    .cli_runtime_turn_binding_accepts_native_activity(
+                        key,
+                        &turn_binding,
+                        decoded.native_thread_id.as_deref(),
+                        request.method.as_str(),
+                    )
+                    .await
+                {
+                    self.cancel_stale_codex_user_input_request(key, &decoded, "terminal turn")
+                        .await;
+                    return;
+                }
+                if let Err(error) = self
+                    .open_codex_user_input_request_for_turn(
+                        key.workspace_id.as_str(),
+                        key.runtime_id.as_str(),
+                        "codex",
+                        key.thread_id.as_str(),
+                        Some(turn_binding.turn_id),
+                        decoded.clone(),
+                    )
+                    .await
+                {
+                    warn!(
+                        workspace_id = key.workspace_id.as_str(),
+                        runtime_id = key.runtime_id.as_str(),
+                        thread_id = key.thread_id.as_str(),
+                        method = request.method.as_str(),
+                        error = %format!("{error:#}"),
+                        "failed to open Codex CLI runtime user input request"
+                    );
+                    self.cancel_stale_codex_user_input_request(
+                        key,
+                        &decoded,
+                        "failed to open Pioneer pending request",
+                    )
+                    .await;
+                }
             }
-            _ => Ok(()),
-        };
+            _ => {}
+        }
+    }
 
-        if let Err(error) = result {
+    async fn cli_runtime_turn_binding_for_native_turn_option(
+        &self,
+        key: &CLIAgentRuntimeSessionKey,
+        native_thread_id: Option<&str>,
+        native_turn_id: Option<&str>,
+    ) -> Option<pioneer_crud::CliRuntimeTurnBindingRecord> {
+        let native_thread_id = native_thread_id?;
+        let native_turn_id = native_turn_id?;
+        self.cli_runtime_turn_binding_for_native_turn(key, native_thread_id, native_turn_id)
+            .await
+    }
+
+    async fn buffer_cli_runtime_codex_server_request_if_turn_binding_pending(
+        &self,
+        key: &CLIAgentRuntimeSessionKey,
+        native_thread_id: Option<&str>,
+        native_turn_id: Option<&str>,
+        request: &CodexJsonlRpcServerRequest,
+        event: &RuntimeEvent,
+    ) -> bool {
+        let Some(native_turn_id) = native_turn_id else {
+            return false;
+        };
+        let Some(native_thread_id) = native_thread_id else {
+            return false;
+        };
+        if !self
+            .cli_runtime_has_starting_turn_binding_without_native_turn(key, native_thread_id)
+            .await
+        {
+            return false;
+        }
+        self.buffer_cli_runtime_codex_server_request_until_turn_binding(
+            key,
+            native_thread_id,
+            native_turn_id,
+            request.clone(),
+            event.clone(),
+        )
+        .await;
+        debug!(
+            workspace_id = key.workspace_id.as_str(),
+            runtime_id = key.runtime_id.as_str(),
+            thread_id = key.thread_id.as_str(),
+            native_turn_id,
+            method = request.method.as_str(),
+            "buffering Codex CLI runtime server request before Pioneer turn binding has native turn id"
+        );
+        true
+    }
+
+    async fn cli_runtime_has_starting_turn_binding_without_native_turn(
+        &self,
+        key: &CLIAgentRuntimeSessionKey,
+        native_thread_id: &str,
+    ) -> bool {
+        match self
+            .crud_store
+            .list_cli_runtime_turn_bindings_for_thread(key.thread_id.as_str())
+            .await
+        {
+            Ok(bindings) => bindings.into_iter().any(|binding| {
+                binding.workspace_id == key.workspace_id
+                    && binding.runtime_id == key.runtime_id
+                    && binding.status
+                        == crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING
+                    && binding.native_turn_id.is_none()
+                    && binding.native_thread_id == native_thread_id
+            }),
+            Err(error) => {
+                warn!(
+                    workspace_id = key.workspace_id.as_str(),
+                    runtime_id = key.runtime_id.as_str(),
+                    thread_id = key.thread_id.as_str(),
+                    error = %format!("{error:#}"),
+                    "failed to check starting CLI runtime turn binding for server request buffering"
+                );
+                false
+            }
+        }
+    }
+
+    async fn cli_runtime_turn_binding_accepts_native_activity(
+        &self,
+        key: &CLIAgentRuntimeSessionKey,
+        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+        native_thread_id: Option<&str>,
+        source: &str,
+    ) -> bool {
+        if binding.workspace_id != key.workspace_id
+            || binding.runtime_id != key.runtime_id
+            || binding.thread_id != key.thread_id
+        {
             warn!(
                 workspace_id = key.workspace_id.as_str(),
                 runtime_id = key.runtime_id.as_str(),
                 thread_id = key.thread_id.as_str(),
-                method = request.method.as_str(),
-                error = %format!("{error:#}"),
-                "failed to open Codex CLI runtime server request"
+                turn_id = binding.turn_id.as_str(),
+                binding_workspace_id = binding.workspace_id.as_str(),
+                binding_runtime_id = binding.runtime_id.as_str(),
+                binding_thread_id = binding.thread_id.as_str(),
+                source,
+                "rejected Codex CLI runtime activity for mismatched turn binding"
             );
+            return false;
         }
+
+        if let Some(native_thread_id) = native_thread_id
+            && binding.native_thread_id != native_thread_id
+        {
+            warn!(
+                workspace_id = key.workspace_id.as_str(),
+                runtime_id = key.runtime_id.as_str(),
+                thread_id = key.thread_id.as_str(),
+                turn_id = binding.turn_id.as_str(),
+                binding_native_thread_id = binding.native_thread_id.as_str(),
+                native_thread_id,
+                source,
+                "rejected Codex CLI runtime activity for mismatched native thread"
+            );
+            return false;
+        }
+
+        if !cli_runtime_turn_binding_status_is_active(binding.status.as_str()) {
+            return false;
+        }
+
+        match self.cli_runtime_turn_status_for_binding(binding).await {
+            Ok(Some(TurnStatus::InProgress)) => true,
+            Ok(Some(status)) => {
+                self.cleanup_cli_runtime_terminal_turn_status(binding, status, source)
+                    .await;
+                false
+            }
+            Ok(None) => {
+                warn!(
+                    workspace_id = binding.workspace_id.as_str(),
+                    runtime_id = binding.runtime_id.as_str(),
+                    thread_id = binding.thread_id.as_str(),
+                    turn_id = binding.turn_id.as_str(),
+                    source,
+                    "rejected Codex CLI runtime activity for missing Pioneer turn"
+                );
+                false
+            }
+            Err(error) => {
+                warn!(
+                    workspace_id = binding.workspace_id.as_str(),
+                    runtime_id = binding.runtime_id.as_str(),
+                    thread_id = binding.thread_id.as_str(),
+                    turn_id = binding.turn_id.as_str(),
+                    source,
+                    error = %format!("{error:#}"),
+                    "failed to validate Pioneer turn status for Codex CLI runtime activity"
+                );
+                false
+            }
+        }
+    }
+
+    async fn cli_runtime_turn_status_for_binding(
+        &self,
+        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+    ) -> anyhow::Result<Option<TurnStatus>> {
+        if let Some((_workspace_id, turn)) = self
+            .thread_manager
+            .turn_get(binding.thread_id.as_str(), binding.turn_id.as_str())
+            .await
+        {
+            return Ok(Some(turn.status));
+        }
+
+        Ok(self
+            .crud_store
+            .get_turn(binding.thread_id.as_str(), binding.turn_id.as_str())
+            .await?
+            .map(|(_workspace_id, turn)| turn.status))
     }
 
     async fn cli_runtime_pioneer_turn_id_for_native_turn(
         &self,
         key: &CLIAgentRuntimeSessionKey,
+        native_thread_id: Option<&str>,
         native_turn_id: Option<&str>,
     ) -> Option<String> {
+        let native_thread_id = native_thread_id?;
         let native_turn_id = native_turn_id?;
-        self.cli_runtime_turn_binding_for_native_turn(key, native_turn_id)
+        self.cli_runtime_turn_binding_for_native_turn(key, native_thread_id, native_turn_id)
             .await
             .map(|binding| binding.turn_id)
     }
@@ -2310,6 +2917,7 @@ impl MessageProcessor {
     async fn cli_runtime_turn_binding_for_native_turn(
         &self,
         key: &CLIAgentRuntimeSessionKey,
+        native_thread_id: &str,
         native_turn_id: &str,
     ) -> Option<pioneer_crud::CliRuntimeTurnBindingRecord> {
         match self
@@ -2321,6 +2929,7 @@ impl MessageProcessor {
                 binding.workspace_id == key.workspace_id
                     && binding.runtime_id == key.runtime_id
                     && binding.native_turn_id.as_deref() == Some(native_turn_id)
+                    && binding.native_thread_id == native_thread_id
             }),
             Err(error) => {
                 warn!(
@@ -2344,6 +2953,9 @@ impl MessageProcessor {
         if !cli_runtime_event_can_use_running_turn_fallback(event) {
             return None;
         }
+        let Some(native_thread_id) = cli_runtime_native_thread_id_for_event(event) else {
+            return None;
+        };
         match self
             .crud_store
             .list_cli_runtime_turn_bindings_for_thread(key.thread_id.as_str())
@@ -2355,6 +2967,7 @@ impl MessageProcessor {
                     && binding.status
                         == crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING
                     && binding.native_turn_id.is_some()
+                    && binding.native_thread_id == native_thread_id
             }),
             Err(error) => {
                 warn!(
@@ -2463,18 +3076,14 @@ impl MessageProcessor {
                 return;
             }
         };
-        let handle = match manager.get_or_start(key).await {
-            Ok(handle) => handle,
-            Err(error) => {
-                warn!(
-                    workspace_id,
-                    thread_id,
-                    runtime_id = binding.runtime_id.as_str(),
-                    error = %format!("{error:#}"),
-                    "failed to start CLI runtime session for best-effort name sync"
-                );
-                return;
-            }
+        let Some(handle) = manager.existing_session(&key).await else {
+            debug!(
+                workspace_id,
+                thread_id,
+                runtime_id = binding.runtime_id.as_str(),
+                "skipping CLI runtime thread name sync because session is not active"
+            );
+            return;
         };
         if let Err(error) = handle
             .session()
@@ -2494,10 +3103,671 @@ impl MessageProcessor {
         }
     }
 
+    pub(crate) async fn ensure_cli_runtime_turn_blocked_cleanup(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        reason: Option<&str>,
+    ) {
+        let binding = match self.crud_store.get_cli_runtime_turn_binding(turn_id).await {
+            Ok(Some(binding)) => binding,
+            Ok(None) => return,
+            Err(error) => {
+                warn!(
+                    thread_id,
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to load CLI runtime turn binding for blocked cleanup"
+                );
+                return;
+            }
+        };
+
+        if binding.thread_id != thread_id {
+            warn!(
+                thread_id,
+                turn_id,
+                binding_thread_id = binding.thread_id.as_str(),
+                "CLI runtime turn binding thread mismatch during blocked cleanup"
+            );
+        }
+
+        if binding.status != crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_BLOCKED
+            && let Err(error) =
+                crate::cli_runtime::turn_binding::update_cli_runtime_turn_binding_status(
+                    self.crud_store.as_ref(),
+                    turn_id,
+                    crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_BLOCKED,
+                    chrono::Utc::now().fixed_offset(),
+                )
+                .await
+        {
+            warn!(
+                workspace_id = binding.workspace_id.as_str(),
+                runtime_id = binding.runtime_id.as_str(),
+                thread_id = binding.thread_id.as_str(),
+                turn_id = binding.turn_id.as_str(),
+                error = %format!("{error:#}"),
+                "failed to mark CLI runtime turn binding blocked"
+            );
+        }
+
+        self.expire_cli_runtime_pending_requests_for_turn(turn_id)
+            .await;
+        self.interrupt_and_close_cli_runtime_binding(&binding, reason)
+            .await;
+    }
+
+    pub(crate) async fn ensure_cli_runtime_turn_interrupted_cleanup(
+        &self,
+        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+        reason: Option<&str>,
+    ) {
+        if binding.status != crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_INTERRUPTED
+            && let Err(error) =
+                crate::cli_runtime::turn_binding::update_cli_runtime_turn_binding_status(
+                    self.crud_store.as_ref(),
+                    binding.turn_id.as_str(),
+                    crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_INTERRUPTED,
+                    chrono::Utc::now().fixed_offset(),
+                )
+                .await
+        {
+            warn!(
+                workspace_id = binding.workspace_id.as_str(),
+                runtime_id = binding.runtime_id.as_str(),
+                thread_id = binding.thread_id.as_str(),
+                turn_id = binding.turn_id.as_str(),
+                error = %format!("{error:#}"),
+                "failed to mark CLI runtime turn binding interrupted"
+            );
+        }
+
+        self.expire_cli_runtime_pending_requests_for_turn(binding.turn_id.as_str())
+            .await;
+        self.interrupt_and_close_cli_runtime_binding(binding, reason)
+            .await;
+    }
+
+    async fn validate_cli_runtime_pending_request_active_turn(
+        &self,
+        pending: &CliRuntimePendingRequestRecord,
+    ) -> anyhow::Result<()> {
+        let request_kind = cli_runtime_request_kind_from_stored(pending.request_kind.as_str());
+        let Some(turn_id) = pending.turn_id.as_deref() else {
+            if cli_runtime_request_kind_requires_turn_binding(request_kind) {
+                anyhow::bail!(
+                    "CLI runtime request `{}` is not bound to a Pioneer turn",
+                    pending.request_id
+                );
+            }
+            return Ok(());
+        };
+        let binding = self
+            .crud_store
+            .get_cli_runtime_turn_binding(turn_id)
+            .await
+            .with_context(|| {
+                format!("failed to load CLI runtime turn binding for turn `{turn_id}`")
+            })?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Pioneer turn `{turn_id}` is not bound to CLI runtime `{}`",
+                    pending.runtime_id
+                )
+            })?;
+
+        if binding.workspace_id != pending.workspace_id
+            || binding.runtime_id != pending.runtime_id
+            || binding.thread_id != pending.thread_id
+        {
+            anyhow::bail!(
+                "turn binding `{}` belongs to `{}/{}/{}` but request belongs to `{}/{}/{}`",
+                binding.turn_id,
+                binding.workspace_id,
+                binding.runtime_id,
+                binding.thread_id,
+                pending.workspace_id,
+                pending.runtime_id,
+                pending.thread_id
+            );
+        }
+        if cli_runtime_request_kind_requires_turn_binding(request_kind) {
+            let native_thread_id = pending.native_thread_id.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "CLI runtime request `{}` is not bound to a native thread",
+                    pending.request_id
+                )
+            })?;
+            let native_turn_id = pending.native_turn_id.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "CLI runtime request `{}` is not bound to a native turn",
+                    pending.request_id
+                )
+            })?;
+            if binding.native_thread_id != native_thread_id {
+                anyhow::bail!(
+                    "request native thread `{native_thread_id}` does not match binding native thread `{}`",
+                    binding.native_thread_id
+                );
+            }
+            if binding.native_turn_id.as_deref() != Some(native_turn_id) {
+                anyhow::bail!(
+                    "request native turn `{native_turn_id}` does not match binding native turn `{:?}`",
+                    binding.native_turn_id
+                );
+            }
+        }
+        if !cli_runtime_turn_binding_status_is_active(binding.status.as_str()) {
+            self.cleanup_cli_runtime_terminal_binding_status(
+                &binding,
+                "stale CLI runtime request response",
+            )
+            .await;
+            anyhow::bail!(
+                "turn `{}` is no longer active for CLI runtime `{}`; binding status is `{}`",
+                binding.turn_id,
+                binding.runtime_id,
+                binding.status
+            );
+        }
+
+        match self.cli_runtime_turn_status_for_binding(&binding).await? {
+            Some(TurnStatus::InProgress) => Ok(()),
+            Some(status) => {
+                self.cleanup_cli_runtime_terminal_turn_status(
+                    &binding,
+                    status,
+                    "stale CLI runtime request response",
+                )
+                .await;
+                anyhow::bail!(
+                    "Pioneer turn `{}` is `{}`",
+                    binding.turn_id,
+                    cli_runtime_turn_status_label(status)
+                )
+            }
+            None => anyhow::bail!("Pioneer turn `{}` is missing", binding.turn_id),
+        }
+    }
+
+    pub(super) async fn cleanup_cli_runtime_terminal_turn_status(
+        &self,
+        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+        status: TurnStatus,
+        reason: &str,
+    ) {
+        match status {
+            TurnStatus::InProgress => {}
+            TurnStatus::Completed => {
+                self.update_cli_runtime_turn_binding_terminal_status(
+                    binding,
+                    crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_COMPLETED,
+                    reason,
+                )
+                .await;
+                self.expire_cli_runtime_pending_requests_for_turn(binding.turn_id.as_str())
+                    .await;
+            }
+            TurnStatus::Failed => {
+                self.update_cli_runtime_turn_binding_terminal_status(
+                    binding,
+                    crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_FAILED,
+                    reason,
+                )
+                .await;
+                self.expire_cli_runtime_pending_requests_for_turn(binding.turn_id.as_str())
+                    .await;
+                self.interrupt_and_close_cli_runtime_binding(binding, Some(reason))
+                    .await;
+            }
+            TurnStatus::Interrupted => {
+                self.ensure_cli_runtime_turn_interrupted_cleanup(binding, Some(reason))
+                    .await;
+            }
+            TurnStatus::Blocked => {
+                self.ensure_cli_runtime_turn_blocked_cleanup(
+                    binding.thread_id.as_str(),
+                    binding.turn_id.as_str(),
+                    Some(reason),
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn cleanup_cli_runtime_terminal_binding_status(
+        &self,
+        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+        reason: &str,
+    ) {
+        match binding.status.as_str() {
+            crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_COMPLETED => {
+                self.expire_cli_runtime_pending_requests_for_turn(binding.turn_id.as_str())
+                    .await;
+            }
+            crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_FAILED => {
+                self.expire_cli_runtime_pending_requests_for_turn(binding.turn_id.as_str())
+                    .await;
+                self.interrupt_and_close_cli_runtime_binding(binding, Some(reason))
+                    .await;
+            }
+            crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_INTERRUPTED => {
+                self.ensure_cli_runtime_turn_interrupted_cleanup(binding, Some(reason))
+                    .await;
+            }
+            crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_BLOCKED => {
+                self.ensure_cli_runtime_turn_blocked_cleanup(
+                    binding.thread_id.as_str(),
+                    binding.turn_id.as_str(),
+                    Some(reason),
+                )
+                .await;
+            }
+            _ => {}
+        }
+    }
+
+    async fn update_cli_runtime_turn_binding_terminal_status(
+        &self,
+        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+        terminal_status: &str,
+        reason: &str,
+    ) {
+        if binding.status == terminal_status {
+            return;
+        }
+        if let Err(error) =
+            crate::cli_runtime::turn_binding::update_cli_runtime_turn_binding_status(
+                self.crud_store.as_ref(),
+                binding.turn_id.as_str(),
+                terminal_status,
+                chrono::Utc::now().fixed_offset(),
+            )
+            .await
+        {
+            warn!(
+                workspace_id = binding.workspace_id.as_str(),
+                runtime_id = binding.runtime_id.as_str(),
+                thread_id = binding.thread_id.as_str(),
+                turn_id = binding.turn_id.as_str(),
+                terminal_status,
+                reason,
+                error = %format!("{error:#}"),
+                "failed to reconcile CLI runtime turn binding terminal status"
+            );
+        }
+    }
+
+    async fn expire_cli_runtime_pending_requests_for_turn(&self, turn_id: &str) {
+        let pending_requests = match self
+            .crud_store
+            .list_cli_runtime_pending_requests(pioneer_crud::CliRuntimePendingRequestListFilter {
+                turn_id: Some(turn_id.to_owned()),
+                status: Some(StoredCliRuntimePendingRequestStatus::Pending),
+                limit: None,
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(requests) => requests,
+            Err(error) => {
+                warn!(
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to list CLI runtime pending requests for terminal cleanup"
+                );
+                return;
+            }
+        };
+
+        for request in pending_requests {
+            if let Err(error) = self
+                .expire_cli_runtime_pending_request_as_stale(&request)
+                .await
+            {
+                warn!(
+                    workspace_id = request.workspace_id.as_str(),
+                    runtime_id = request.runtime_id.as_str(),
+                    thread_id = request.thread_id.as_str(),
+                    turn_id = request.turn_id.as_deref(),
+                    request_id = request.request_id.as_str(),
+                    error = %format!("{error:#}"),
+                    "failed to expire CLI runtime pending request for terminal cleanup"
+                );
+            }
+        }
+    }
+
+    async fn expire_cli_runtime_pending_request_as_stale(
+        &self,
+        request: &CliRuntimePendingRequestRecord,
+    ) -> anyhow::Result<Option<CliRuntimePendingRequestRecord>> {
+        if let Some(current) = self
+            .crud_store
+            .get_cli_runtime_pending_request(request.request_id.as_str())
+            .await?
+            && current.status != StoredCliRuntimePendingRequestStatus::Pending
+        {
+            return Ok(Some(current));
+        }
+
+        let resolution = CLIRuntimeRequestResolution::Expired;
+        let response_json = Some(
+            pioneer_crud::serialize_cli_runtime_json(&resolution)
+                .context("failed to serialize expired CLI runtime request resolution")?,
+        );
+        let now = cli_runtime_request_timestamp();
+        let expired = self
+            .crud_store
+            .expire_cli_runtime_pending_request(request.request_id.as_str(), response_json, now)
+            .await?;
+        if let Some(expired) = expired.as_ref() {
+            self.emit_cli_runtime_request_resolved(expired.clone(), resolution.clone())
+                .await;
+            if expired.request_kind
+                == cli_runtime_request_kind_as_str(CLIRuntimeRequestKind::FileChangeApproval)
+            {
+                self.emit_cli_runtime_file_change_approval_timeline_update(
+                    expired,
+                    file_change_approval_timeline_status_for_resolution(&resolution),
+                )
+                .await;
+            }
+        }
+        Ok(expired)
+    }
+
+    async fn interrupt_and_close_cli_runtime_binding(
+        &self,
+        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+        reason: Option<&str>,
+    ) {
+        let Some(manager) = self.cli_runtime_manager.as_ref() else {
+            return;
+        };
+        let key = match CLIAgentRuntimeSessionKey::new(
+            binding.workspace_id.as_str(),
+            binding.runtime_id.as_str(),
+            binding.thread_id.as_str(),
+        ) {
+            Ok(key) => key,
+            Err(error) => {
+                warn!(
+                    workspace_id = binding.workspace_id.as_str(),
+                    runtime_id = binding.runtime_id.as_str(),
+                    thread_id = binding.thread_id.as_str(),
+                    turn_id = binding.turn_id.as_str(),
+                    error = %format!("{error:#}"),
+                    "invalid CLI runtime key during terminal cleanup"
+                );
+                return;
+            }
+        };
+
+        if let Some(handle) = manager.existing_session(&key).await {
+            let session = handle.session();
+            if let Err(error) = session
+                .interrupt_turn(
+                    Some(binding.native_thread_id.as_str()),
+                    binding.native_turn_id.as_deref(),
+                )
+                .await
+            {
+                debug!(
+                    workspace_id = binding.workspace_id.as_str(),
+                    runtime_id = binding.runtime_id.as_str(),
+                    thread_id = binding.thread_id.as_str(),
+                    turn_id = binding.turn_id.as_str(),
+                    native_turn_id = binding.native_turn_id.as_deref(),
+                    reason,
+                    error = %format!("{error:#}"),
+                    "failed to interrupt CLI runtime turn during terminal cleanup"
+                );
+            }
+        }
+
+        if self
+            .cli_runtime_has_active_other_turn_binding(
+                &key,
+                Some(binding.native_thread_id.as_str()),
+                binding.native_turn_id.as_deref(),
+            )
+            .await
+        {
+            debug!(
+                workspace_id = binding.workspace_id.as_str(),
+                runtime_id = binding.runtime_id.as_str(),
+                thread_id = binding.thread_id.as_str(),
+                turn_id = binding.turn_id.as_str(),
+                native_turn_id = binding.native_turn_id.as_deref(),
+                reason,
+                "kept CLI runtime session open during terminal cleanup because another turn binding is active"
+            );
+            return;
+        }
+
+        if let Err(error) = manager.close_session(&key).await {
+            warn!(
+                workspace_id = binding.workspace_id.as_str(),
+                runtime_id = binding.runtime_id.as_str(),
+                thread_id = binding.thread_id.as_str(),
+                turn_id = binding.turn_id.as_str(),
+                reason,
+                error = %format!("{error:#}"),
+                "failed to close CLI runtime session during terminal cleanup"
+            );
+        }
+    }
+
+    async fn cancel_stale_codex_command_approval_request(
+        &self,
+        key: &CLIAgentRuntimeSessionKey,
+        request: &CodexCommandApprovalRequest,
+        reason: &str,
+    ) {
+        self.cancel_stale_codex_native_request(
+            key,
+            "item/commandExecution/requestApproval",
+            request.native_request_id_json.clone(),
+            codex_command_approval_response(CodexCommandApprovalDecision::Cancel),
+            request.native_thread_id.as_deref(),
+            request.native_turn_id.as_deref(),
+            reason,
+        )
+        .await;
+    }
+
+    async fn cancel_stale_codex_file_change_approval_request(
+        &self,
+        key: &CLIAgentRuntimeSessionKey,
+        request: &CodexFileChangeApprovalRequest,
+        reason: &str,
+    ) {
+        self.cancel_stale_codex_native_request(
+            key,
+            "item/fileChange/requestApproval",
+            request.native_request_id_json.clone(),
+            codex_file_change_approval_response(CodexFileChangeApprovalDecision::Cancel),
+            request.native_thread_id.as_deref(),
+            request.native_turn_id.as_deref(),
+            reason,
+        )
+        .await;
+    }
+
+    async fn cancel_stale_codex_user_input_request(
+        &self,
+        key: &CLIAgentRuntimeSessionKey,
+        request: &CodexUserInputRequest,
+        reason: &str,
+    ) {
+        self.cancel_stale_codex_native_request(
+            key,
+            "item/tool/requestUserInput",
+            request.native_request_id_json.clone(),
+            codex_user_input_response(BTreeMap::new()),
+            request.native_thread_id.as_deref(),
+            request.native_turn_id.as_deref(),
+            reason,
+        )
+        .await;
+    }
+
+    async fn cancel_stale_codex_native_request(
+        &self,
+        key: &CLIAgentRuntimeSessionKey,
+        method: &str,
+        native_request_id: JsonValue,
+        response: JsonValue,
+        native_thread_id: Option<&str>,
+        native_turn_id: Option<&str>,
+        reason: &str,
+    ) {
+        let Some(manager) = self.cli_runtime_manager.as_ref() else {
+            return;
+        };
+        let Some(handle) = manager.existing_session(key).await else {
+            debug!(
+                workspace_id = key.workspace_id.as_str(),
+                runtime_id = key.runtime_id.as_str(),
+                thread_id = key.thread_id.as_str(),
+                method,
+                reason,
+                "dropped stale Codex CLI runtime server request because session is already closed"
+            );
+            return;
+        };
+        let session = handle.session();
+        if let Err(error) = session
+            .respond_to_request(native_request_id, response)
+            .await
+        {
+            warn!(
+                workspace_id = key.workspace_id.as_str(),
+                runtime_id = key.runtime_id.as_str(),
+                thread_id = key.thread_id.as_str(),
+                method,
+                reason,
+                error = %format!("{error:#}"),
+                "failed to cancel stale Codex CLI runtime server request"
+            );
+        }
+        if native_turn_id.is_some()
+            && let Err(error) = session
+                .interrupt_turn(native_thread_id, native_turn_id)
+                .await
+        {
+            debug!(
+                workspace_id = key.workspace_id.as_str(),
+                runtime_id = key.runtime_id.as_str(),
+                thread_id = key.thread_id.as_str(),
+                method,
+                reason,
+                error = %format!("{error:#}"),
+                "failed to interrupt stale Codex CLI runtime turn"
+            );
+        }
+        if self
+            .cli_runtime_has_active_other_turn_binding(key, native_thread_id, native_turn_id)
+            .await
+        {
+            debug!(
+                workspace_id = key.workspace_id.as_str(),
+                runtime_id = key.runtime_id.as_str(),
+                thread_id = key.thread_id.as_str(),
+                method,
+                reason,
+                native_thread_id,
+                native_turn_id,
+                "kept CLI runtime session open after stale Codex server request because another turn binding is active"
+            );
+            return;
+        }
+        if let Err(error) = manager.close_session(key).await {
+            warn!(
+                workspace_id = key.workspace_id.as_str(),
+                runtime_id = key.runtime_id.as_str(),
+                thread_id = key.thread_id.as_str(),
+                method,
+                reason,
+                error = %format!("{error:#}"),
+                "failed to close CLI runtime session after stale Codex server request"
+            );
+        }
+    }
+
+    async fn cli_runtime_has_active_other_turn_binding(
+        &self,
+        key: &CLIAgentRuntimeSessionKey,
+        native_thread_id: Option<&str>,
+        native_turn_id: Option<&str>,
+    ) -> bool {
+        match self
+            .crud_store
+            .list_cli_runtime_turn_bindings_for_thread(key.thread_id.as_str())
+            .await
+        {
+            Ok(bindings) => bindings.into_iter().any(|binding| {
+                binding.workspace_id == key.workspace_id
+                    && binding.runtime_id == key.runtime_id
+                    && cli_runtime_turn_binding_status_is_active(binding.status.as_str())
+                    && !cli_runtime_turn_binding_matches_native_activity(
+                        &binding,
+                        native_thread_id,
+                        native_turn_id,
+                    )
+            }),
+            Err(error) => {
+                warn!(
+                    workspace_id = key.workspace_id.as_str(),
+                    runtime_id = key.runtime_id.as_str(),
+                    thread_id = key.thread_id.as_str(),
+                    native_thread_id,
+                    native_turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to check active CLI runtime turn bindings before closing stale server request session"
+                );
+                false
+            }
+        }
+    }
+
+    async fn cli_runtime_existing_session_for_pending_request(
+        &self,
+        request: &CliRuntimePendingRequestRecord,
+    ) -> anyhow::Result<Option<CLIAgentRuntimeSessionHandle>> {
+        if cli_runtime_request_kind_from_stored(request.request_kind.as_str())
+            == CLIRuntimeRequestKind::Other
+        {
+            return Ok(None);
+        }
+
+        let Some(manager) = self.cli_runtime_manager.as_ref() else {
+            anyhow::bail!(
+                "CLI runtime manager is not available for CLI runtime request `{}`",
+                request.request_id
+            );
+        };
+        let key = CLIAgentRuntimeSessionKey::new(
+            request.workspace_id.as_str(),
+            request.runtime_id.as_str(),
+            request.thread_id.as_str(),
+        )?;
+        let Some(handle) = manager.existing_session(&key).await else {
+            anyhow::bail!(
+                "CLI runtime session is not active for request `{}`",
+                request.request_id
+            );
+        };
+        Ok(Some(handle))
+    }
+
     async fn respond_to_cli_runtime_native_request(
         &self,
         request: &CliRuntimePendingRequestRecord,
         resolution: &CLIRuntimeRequestResolution,
+        native_response_session: Option<CLIAgentRuntimeSessionHandle>,
     ) -> anyhow::Result<()> {
         let (response, should_interrupt) =
             match cli_runtime_request_kind_from_stored(request.request_kind.as_str()) {
@@ -2522,18 +3792,12 @@ impl MessageProcessor {
                 CLIRuntimeRequestKind::Other => return Ok(()),
             };
         let native_request_id = cli_runtime_native_request_id_json_from_record(request)?;
-        let Some(manager) = self.cli_runtime_manager.as_ref() else {
+        let Some(handle) = native_response_session else {
             anyhow::bail!(
-                "CLI runtime manager is not available for CLI runtime request `{}`",
+                "CLI runtime session is not active for request `{}`",
                 request.request_id
             );
         };
-        let key = CLIAgentRuntimeSessionKey::new(
-            request.workspace_id.as_str(),
-            request.runtime_id.as_str(),
-            request.thread_id.as_str(),
-        )?;
-        let handle = manager.get_or_start(key).await?;
         let session = handle.session();
         session
             .respond_to_request(native_request_id, response)
@@ -3883,6 +5147,15 @@ fn cli_runtime_request_kind_from_stored(value: &str) -> CLIRuntimeRequestKind {
     }
 }
 
+fn cli_runtime_request_kind_requires_turn_binding(kind: CLIRuntimeRequestKind) -> bool {
+    matches!(
+        kind,
+        CLIRuntimeRequestKind::CommandApproval
+            | CLIRuntimeRequestKind::FileChangeApproval
+            | CLIRuntimeRequestKind::UserInput
+    )
+}
+
 fn cli_runtime_event_can_use_running_turn_fallback(event: &RuntimeEvent) -> bool {
     matches!(event, RuntimeEvent::ThreadStateChanged(_))
         || matches!(
@@ -3950,36 +5223,64 @@ fn cli_runtime_native_turn_id_for_event(event: &RuntimeEvent) -> Option<&str> {
     }
 }
 
-fn cli_runtime_terminal_status_for_event(event: &RuntimeEvent) -> Option<&'static str> {
+fn cli_runtime_native_thread_id_for_event(event: &RuntimeEvent) -> Option<&str> {
     match event {
-        RuntimeEvent::TurnCompleted(_) => {
-            Some(crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_COMPLETED)
-        }
-        RuntimeEvent::TurnFailed(_) | RuntimeEvent::Error(_) => {
-            Some(crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_FAILED)
-        }
-        RuntimeEvent::TurnInterrupted(_) => {
-            Some(crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_INTERRUPTED)
-        }
+        RuntimeEvent::ThreadStateChanged(event) => event.native_thread_id.as_deref(),
+        RuntimeEvent::TurnStarted(event) => event.native_thread_id.as_deref(),
+        RuntimeEvent::TurnCompleted(event) => event.native_thread_id.as_deref(),
+        RuntimeEvent::TurnFailed(event) => event.native_thread_id.as_deref(),
+        RuntimeEvent::TurnInterrupted(event) => event.native_thread_id.as_deref(),
+        RuntimeEvent::ItemStarted(event) => event.native_thread_id.as_deref(),
+        RuntimeEvent::ItemDelta(event) => event.native_thread_id.as_deref(),
+        RuntimeEvent::ItemCompleted(event) => event.native_thread_id.as_deref(),
+        RuntimeEvent::ItemUpdated(event) => event.native_thread_id.as_deref(),
+        RuntimeEvent::PlanUpdated(event) => event.native_thread_id.as_deref(),
+        RuntimeEvent::DiffUpdated(event) => event.native_thread_id.as_deref(),
+        RuntimeEvent::RequestOpened(event) => event.native_thread_id.as_deref(),
+        RuntimeEvent::ReviewModeChanged(event) => event.native_thread_id.as_deref(),
+        RuntimeEvent::Error(event) => event.native_thread_id.as_deref(),
+        RuntimeEvent::Raw(event) => event.native_thread_id.as_deref(),
+        RuntimeEvent::SessionStateChanged(_)
+        | RuntimeEvent::RequestResolved(_)
+        | RuntimeEvent::AccountUpdated(_)
+        | RuntimeEvent::AppListUpdated(_) => None,
+    }
+}
+
+fn cli_runtime_turn_status_for_terminal_event(event: &RuntimeEvent) -> Option<TurnStatus> {
+    match event {
+        RuntimeEvent::TurnCompleted(_) => Some(TurnStatus::Completed),
+        RuntimeEvent::TurnFailed(_) | RuntimeEvent::Error(_) => Some(TurnStatus::Failed),
+        RuntimeEvent::TurnInterrupted(_) => Some(TurnStatus::Interrupted),
         _ => None,
     }
 }
 
-fn cli_runtime_terminal_binding_status_for_turn_status(status: TurnStatus) -> Option<&'static str> {
+fn cli_runtime_turn_binding_status_is_active(status: &str) -> bool {
+    matches!(
+        status,
+        crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING
+            | crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING
+    )
+}
+
+fn cli_runtime_turn_binding_matches_native_activity(
+    binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+    native_thread_id: Option<&str>,
+    native_turn_id: Option<&str>,
+) -> bool {
+    native_thread_id.is_some_and(|native_thread_id| binding.native_thread_id == native_thread_id)
+        && native_turn_id
+            .is_some_and(|native_turn_id| binding.native_turn_id.as_deref() == Some(native_turn_id))
+}
+
+fn cli_runtime_turn_status_label(status: TurnStatus) -> &'static str {
     match status {
-        TurnStatus::Completed => {
-            Some(crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_COMPLETED)
-        }
-        TurnStatus::Failed => {
-            Some(crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_FAILED)
-        }
-        TurnStatus::Interrupted => {
-            Some(crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_INTERRUPTED)
-        }
-        TurnStatus::Blocked => {
-            Some(crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_BLOCKED)
-        }
-        TurnStatus::InProgress => None,
+        TurnStatus::InProgress => "in_progress",
+        TurnStatus::Completed => "completed",
+        TurnStatus::Failed => "failed",
+        TurnStatus::Interrupted => "interrupted",
+        TurnStatus::Blocked => "blocked",
     }
 }
 

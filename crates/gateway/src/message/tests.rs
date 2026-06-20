@@ -1,12 +1,12 @@
 use super::{MessageProcessor, message_future};
 use crate::bootstrap::bootstrap;
 use crate::cli_runtime::manager::{
-    CLIAgentRuntimeManager, CLIAgentRuntimeReviewStartRequest, CLIAgentRuntimeReviewStartResult,
-    CLIAgentRuntimeSession, CLIAgentRuntimeSessionFactory, CLIAgentRuntimeSessionKey,
-    CLIAgentRuntimeThreadCompactRequest, CLIAgentRuntimeThreadCompactResult,
-    CLIAgentRuntimeThreadForkRequest, CLIAgentRuntimeThreadForkResult,
-    CLIAgentRuntimeThreadNameSetRequest, CLIAgentRuntimeThreadNameSetResult,
-    CLIAgentRuntimeTurnSteerRequest, CLIAgentRuntimeTurnSteerResult,
+    CLIAgentRuntimeManager, CLIAgentRuntimeSession, CLIAgentRuntimeSessionFactory,
+    CLIAgentRuntimeSessionKey, CLIAgentRuntimeThreadCompactRequest,
+    CLIAgentRuntimeThreadCompactResult, CLIAgentRuntimeThreadForkRequest,
+    CLIAgentRuntimeThreadForkResult, CLIAgentRuntimeThreadNameSetRequest,
+    CLIAgentRuntimeThreadNameSetResult, CLIAgentRuntimeTurnSteerRequest,
+    CLIAgentRuntimeTurnSteerResult,
 };
 use crate::memory_runtime::GatewayMemoryRuntime;
 use crate::secrets::GatewaySecrets;
@@ -30,6 +30,10 @@ use pioneer_cli_agent_runtime::codex::{
     decode_codex_file_change_approval_request, decode_codex_user_input_request,
 };
 use pioneer_cli_agent_runtime::driver::JsonlRpcId;
+use pioneer_cli_agent_runtime::event::{
+    RuntimeEvent, RuntimeEventMappingOptions, RuntimeThreadStateChanged, RuntimeTurnCompleted,
+    map_codex_server_request_event,
+};
 use pioneer_config::{GatewayHookRecoveryConfig, GatewayMemoryConfig, GatewayWebToolsConfig};
 use pioneer_crud::{
     AgentMemoryListFilter, CrudStore, MemoryActorRecord, NewAgentMemoryCandidate,
@@ -158,8 +162,6 @@ struct RecordingCliRuntimeSession {
     turn_starts: TokioMutex<Vec<CodexTurnStartParams>>,
     responses: TokioMutex<Vec<(JsonValue, JsonValue)>>,
     interrupts: TokioMutex<Vec<(Option<String>, Option<String>)>>,
-    review_starts: TokioMutex<Vec<CLIAgentRuntimeReviewStartRequest>>,
-    review_start_result: TokioMutex<Option<CLIAgentRuntimeReviewStartResult>>,
     thread_compactions: TokioMutex<Vec<CLIAgentRuntimeThreadCompactRequest>>,
     thread_compact_result: TokioMutex<Option<CLIAgentRuntimeThreadCompactResult>>,
     thread_name_sets: TokioMutex<Vec<CLIAgentRuntimeThreadNameSetRequest>>,
@@ -262,21 +264,6 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
             native_turn_id.map(str::to_owned),
         ));
         Ok(())
-    }
-
-    async fn review_start(
-        &self,
-        request: CLIAgentRuntimeReviewStartRequest,
-    ) -> anyhow::Result<CLIAgentRuntimeReviewStartResult> {
-        self.review_starts.lock().await.push(request.clone());
-        Ok(self.review_start_result.lock().await.clone().unwrap_or(
-            CLIAgentRuntimeReviewStartResult {
-                native_thread_id: request.native_thread_id,
-                review_thread_id: "codex-review-thread-default".to_owned(),
-                native_turn_id: Some("codex-review-turn-default".to_owned()),
-                raw: Some(json!({"ok": true})),
-            },
-        ))
     }
 
     async fn thread_compact(
@@ -12643,12 +12630,6 @@ async fn codex_review_start_uncommitted_changes_is_rejected_without_runtime_call
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let cli_session = Arc::new(RecordingCliRuntimeSession::default());
-    *cli_session.review_start_result.lock().await = Some(CLIAgentRuntimeReviewStartResult {
-        native_thread_id: "codex-thread-review".to_owned(),
-        review_thread_id: "codex-thread-review".to_owned(),
-        native_turn_id: Some("codex-review-turn-1".to_owned()),
-        raw: Some(json!({"reviewThreadId": "codex-thread-review"})),
-    });
     let processor = MessageProcessor::new(
         thread_manager,
         test_provider(),
@@ -12730,7 +12711,7 @@ async fn codex_review_start_uncommitted_changes_is_rejected_without_runtime_call
         "error should mention unsupported review start: {}",
         error.error.message
     );
-    assert!(cli_session.review_starts.lock().await.is_empty());
+    assert!(cli_session.turn_starts.lock().await.is_empty());
     assert!(
         crud_store
             .get_cli_runtime_turn_binding("turn_codex_review")
@@ -12749,12 +12730,6 @@ async fn codex_review_start_custom_instructions_is_rejected_without_runtime_call
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let cli_session = Arc::new(RecordingCliRuntimeSession::default());
-    *cli_session.review_start_result.lock().await = Some(CLIAgentRuntimeReviewStartResult {
-        native_thread_id: "codex-review-thread-custom".to_owned(),
-        review_thread_id: "codex-review-thread-custom".to_owned(),
-        native_turn_id: Some("codex-review-turn-custom".to_owned()),
-        raw: Some(json!({"reviewThreadId": "codex-review-thread-custom"})),
-    });
     let processor = MessageProcessor::new(
         thread_manager,
         test_provider(),
@@ -12839,7 +12814,7 @@ async fn codex_review_start_custom_instructions_is_rejected_without_runtime_call
         "error should mention unsupported review start: {}",
         error.error.message
     );
-    assert!(cli_session.review_starts.lock().await.is_empty());
+    assert!(cli_session.turn_starts.lock().await.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -13084,6 +13059,7 @@ async fn codex_thread_ops_name_sync_failure_does_not_break_pioneer_rename() {
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let cli_session = Arc::new(RecordingCliRuntimeSession::default());
     *cli_session.thread_name_set_error.lock().await = Some("native rename failed".to_owned());
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
     let processor = MessageProcessor::new(
         thread_manager,
         test_provider(),
@@ -13095,7 +13071,7 @@ async fn codex_thread_ops_name_sync_failure_does_not_break_pioneer_rename() {
         test_context_budget(),
         test_tool_loop_config(),
     )
-    .with_cli_runtime_manager_for_tests(test_cli_runtime_manager(cli_session.clone()));
+    .with_cli_runtime_manager_for_tests(cli_manager.clone());
 
     processor
         .process_request(
@@ -13158,7 +13134,7 @@ async fn codex_thread_ops_name_sync_failure_does_not_break_pioneer_rename() {
                 "id": "codexopsrenameupdate1",
                 "method": "thread/update",
                 "params": {
-                    "workspace_id": workspace_id,
+                    "workspace_id": workspace_id.as_str(),
                     "thread_id": "thread_codex_ops_rename",
                     "name": "After rename"
                 }
@@ -13172,10 +13148,45 @@ async fn codex_thread_ops_name_sync_failure_does_not_break_pioneer_rename() {
         serde_json::from_value(response.result).expect("thread/update should decode");
     assert_eq!(result.thread.name.as_deref(), Some("After rename"));
 
+    assert!(
+        cli_session.thread_name_sets.lock().await.is_empty(),
+        "best-effort CLI thread name sync must not start a runtime session"
+    );
+
+    let session_key =
+        CLIAgentRuntimeSessionKey::new(workspace_id.as_str(), "codex", "thread_codex_ops_rename")
+            .expect("session key should build");
+    cli_manager
+        .get_or_start(session_key)
+        .await
+        .expect("CLI runtime session should start for active-session rename case");
+
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "codexopsrenameupdate2",
+                "method": "thread/update",
+                "params": {
+                    "workspace_id": workspace_id,
+                    "thread_id": "thread_codex_ops_rename",
+                    "name": "After active rename"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+
+    let response = recv_response_by_id(&mut rx, "codexopsrenameupdate2").await;
+    let result: ThreadUpdateResponse =
+        serde_json::from_value(response.result).expect("thread/update should decode");
+    assert_eq!(result.thread.name.as_deref(), Some("After active rename"));
+
     let name_sets = cli_session.thread_name_sets.lock().await;
     assert_eq!(name_sets.len(), 1);
     assert_eq!(name_sets[0].native_thread_id, "codex-native-rename");
-    assert_eq!(name_sets[0].name, "After rename");
+    assert_eq!(name_sets[0].name, "After active rename");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -13418,6 +13429,246 @@ async fn cli_runtime_turn_start_blocker_rejects_active_cli_binding() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_turn_start_blocker_rejects_db_only_active_cli_binding() {
+    let (tx, _rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+
+    seed_cli_runtime_approval_turn(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        "thread_cli_db_only_busy",
+        "turn_cli_db_only_busy",
+        "codex-thread-db-only-busy",
+    )
+    .await;
+
+    let key = CLIAgentRuntimeSessionKey::new(workspace_id, "codex", "thread_cli_db_only_busy")
+        .expect("session key should build");
+    let blocker = processor
+        .cli_runtime_turn_start_blocker_for_thread(&key)
+        .await
+        .expect("blocker check should succeed")
+        .expect("DB-only active CLI runtime turn should block start");
+    assert!(
+        blocker.contains("already has active turn `turn_cli_db_only_busy`"),
+        "blocker should mention DB-only active turn: {blocker}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_turn_start_blocker_reconciles_db_only_terminal_binding() {
+    let (tx, _rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+
+    let thread_id = "thread_cli_db_only_terminal";
+    let turn_id = "turn_cli_db_only_terminal";
+    seed_cli_runtime_approval_turn(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+        "codex-thread-db-only-terminal",
+    )
+    .await;
+    crud_store
+        .materialize_turn_completed(
+            TurnCompletedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: thread_id.to_owned(),
+                turn: Turn {
+                    id: turn_id.to_owned(),
+                    status: TurnStatus::Completed,
+                    turn_kind: TurnKind::default(),
+                    origin: TurnOrigin::User,
+                    error: None,
+                    prompt_manifest: None,
+                },
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .expect("turn should complete in durable store");
+
+    let pending_payload = CLIRuntimePendingRequest {
+        kind: CLIRuntimeRequestKind::CommandApproval,
+        title: Some("Run terminal command".to_owned()),
+        message: Some("Codex wants approval after completion".to_owned()),
+        native_request_id: Some("native-approval-db-terminal".to_owned()),
+        payload: Some(json!({
+            "nativeRequestIdJson": "native-approval-db-terminal",
+            "command": "echo terminal"
+        })),
+    };
+    processor
+        .open_cli_runtime_pending_request(NewCliRuntimePendingRequest {
+            request_id: "cli-approval-db-terminal".to_owned(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            workspace_id: workspace_id.clone(),
+            thread_id: thread_id.to_owned(),
+            turn_id: Some(turn_id.to_owned()),
+            native_thread_id: Some("codex-thread-db-only-terminal".to_owned()),
+            native_turn_id: Some(turn_id.to_owned()),
+            native_item_id: Some("codex-item-db-terminal".to_owned()),
+            request_kind: "command_approval".to_owned(),
+            payload_json: pioneer_crud::serialize_cli_runtime_json(&pending_payload)
+                .expect("pending payload should serialize"),
+            created_at: chrono::Utc::now().fixed_offset(),
+            updated_at: chrono::Utc::now().fixed_offset(),
+        })
+        .await
+        .expect("pending request should open");
+
+    let key = CLIAgentRuntimeSessionKey::new(workspace_id, "codex", thread_id)
+        .expect("session key should build");
+    let blocker = processor
+        .cli_runtime_turn_start_blocker_for_thread(&key)
+        .await
+        .expect("blocker check should succeed");
+    assert!(
+        blocker.is_none(),
+        "terminal DB-only binding should be reconciled, not block start: {blocker:?}"
+    );
+
+    let pending = crud_store
+        .get_cli_runtime_pending_request("cli-approval-db-terminal")
+        .await
+        .expect("pending request should load")
+        .expect("pending request should exist");
+    assert_eq!(
+        pending.status,
+        pioneer_crud::CliRuntimePendingRequestStatus::Expired
+    );
+    let binding = crud_store
+        .get_cli_runtime_turn_binding(turn_id)
+        .await
+        .expect("binding should load")
+        .expect("binding should exist");
+    assert_eq!(
+        binding.status,
+        crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_COMPLETED
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_turn_start_blocker_rejects_unbound_server_request() {
+    let (tx, _rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_cli_runtime_manager_for_tests(test_cli_runtime_manager(cli_session));
+
+    let thread_id = "thread_cli_busy_unbound_request";
+    let turn_id = "turn_cli_busy_unbound_request";
+    let native_thread_id = "codex-thread-busy-unbound-request";
+    let native_turn_id = "codex-turn-busy-unbound-request";
+    let now = chrono::Utc::now().fixed_offset();
+    crud_store
+        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+            turn_id: turn_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            workspace_id: workspace_id.clone(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            native_thread_id: native_thread_id.to_owned(),
+            native_turn_id: None,
+            request_id: None,
+            status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING.to_owned(),
+            model: Some("gpt-5".to_owned()),
+            cwd: Some("/tmp/project".to_owned()),
+            sandbox_json: None,
+            approval_policy: None,
+            input_mapping_json: "{}".to_owned(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("starting turn binding should upsert");
+
+    let key = CLIAgentRuntimeSessionKey::new(workspace_id, "codex", thread_id)
+        .expect("session key should build");
+    let request = CodexJsonlRpcServerRequest {
+        id: JsonlRpcId::from(63_i64),
+        method: "item/commandExecution/requestApproval".to_owned(),
+        params: Some(json!({
+            "threadId": native_thread_id,
+            "turnId": native_turn_id,
+            "itemId": "codex-item-busy-unbound-request",
+            "command": "echo buffered",
+            "cwd": "/tmp/project"
+        })),
+        raw: json!({
+            "id": 63,
+            "method": "item/commandExecution/requestApproval"
+        }),
+    };
+    let event = map_codex_server_request_event(&request, RuntimeEventMappingOptions::default());
+    processor
+        .handle_cli_runtime_codex_server_request(&key, request, event)
+        .await;
+
+    let blocker = processor
+        .cli_runtime_turn_start_blocker_for_thread(&key)
+        .await
+        .expect("blocker check should succeed")
+        .expect("unbound CLI runtime server request should block start");
+    assert!(
+        blocker.contains("unbound native turn activity") && blocker.contains(native_turn_id),
+        "blocker should mention unbound native turn activity: {blocker}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_stale_silent_running_binding_marks_turn_failed() {
     let (tx, mut rx) = mpsc::channel(32);
     let session_manager = Arc::new(SessionManager::new());
@@ -13431,6 +13682,8 @@ async fn cli_runtime_stale_silent_running_binding_marks_turn_failed() {
             text: "late".to_owned(),
         }),
     ));
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
     let processor = MessageProcessor::new(
         thread_manager,
         provider_registry,
@@ -13441,7 +13694,8 @@ async fn cli_runtime_stale_silent_running_binding_marks_turn_failed() {
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
-    );
+    )
+    .with_cli_runtime_manager_for_tests(cli_manager.clone());
 
     start_loaded_thread_and_turn_for_cli_runtime_test(
         &processor,
@@ -13476,6 +13730,43 @@ async fn cli_runtime_stale_silent_running_binding_marks_turn_failed() {
         .await
         .expect("turn binding should upsert");
 
+    let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", "thread_cli_stale")
+        .expect("session key should build");
+    cli_manager
+        .get_or_start(key)
+        .await
+        .expect("test CLI runtime session should start");
+
+    let pending_payload = CLIRuntimePendingRequest {
+        kind: CLIRuntimeRequestKind::CommandApproval,
+        title: Some("Run stale command".to_owned()),
+        message: Some("Codex wants approval before stale cleanup".to_owned()),
+        native_request_id: Some("native-approval-stale-cleanup".to_owned()),
+        payload: Some(json!({
+            "nativeRequestIdJson": "native-approval-stale-cleanup",
+            "command": "sleep 30"
+        })),
+    };
+    processor
+        .open_cli_runtime_pending_request(NewCliRuntimePendingRequest {
+            request_id: "cli-approval-stale-cleanup".to_owned(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            workspace_id: workspace_id.clone(),
+            thread_id: "thread_cli_stale".to_owned(),
+            turn_id: Some("turn_cli_stale".to_owned()),
+            native_thread_id: Some("codex-thread-stale".to_owned()),
+            native_turn_id: Some("codex-turn-stale".to_owned()),
+            native_item_id: Some("codex-item-stale-cleanup".to_owned()),
+            request_kind: "command_approval".to_owned(),
+            payload_json: pioneer_crud::serialize_cli_runtime_json(&pending_payload)
+                .expect("pending payload should serialize"),
+            created_at: old,
+            updated_at: old,
+        })
+        .await
+        .expect("pending request should open");
+
     processor
         .fail_stale_cli_runtime_turns(chrono::Utc::now().fixed_offset().timestamp_millis())
         .await;
@@ -13502,6 +13793,133 @@ async fn cli_runtime_stale_silent_running_binding_marks_turn_failed() {
     assert_eq!(
         binding.status,
         crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_FAILED
+    );
+
+    let pending = crud_store
+        .get_cli_runtime_pending_request("cli-approval-stale-cleanup")
+        .await
+        .expect("pending request should load")
+        .expect("pending request should exist");
+    assert_eq!(
+        pending.status,
+        pioneer_crud::CliRuntimePendingRequestStatus::Expired
+    );
+    assert_eq!(
+        *cli_session.interrupts.lock().await,
+        vec![(
+            Some("codex-thread-stale".to_owned()),
+            Some("codex-turn-stale".to_owned())
+        )]
+    );
+    assert_eq!(cli_session.closes.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_terminal_cleanup_keeps_session_open_for_other_active_turn() {
+    let (tx, _rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+
+    let thread_id = "thread_cli_terminal_cleanup_other_active";
+    let old_turn_id = "turn_cli_terminal_cleanup_old";
+    let active_turn_id = "turn_cli_terminal_cleanup_active";
+    let now = chrono::Utc::now().fixed_offset();
+    for (turn_id, native_thread_id, native_turn_id) in [
+        (
+            old_turn_id,
+            "codex-thread-terminal-cleanup-old",
+            "codex-turn-terminal-cleanup-old",
+        ),
+        (
+            active_turn_id,
+            "codex-thread-terminal-cleanup-active",
+            "codex-turn-terminal-cleanup-active",
+        ),
+    ] {
+        crud_store
+            .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+                turn_id: turn_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                workspace_id: workspace_id.clone(),
+                runtime_id: "codex".to_owned(),
+                runtime_kind: "codex".to_owned(),
+                native_thread_id: native_thread_id.to_owned(),
+                native_turn_id: Some(native_turn_id.to_owned()),
+                request_id: None,
+                status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING
+                    .to_owned(),
+                model: Some("gpt-5".to_owned()),
+                cwd: Some("/tmp/project".to_owned()),
+                sandbox_json: None,
+                approval_policy: None,
+                input_mapping_json: "{}".to_owned(),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .expect("CLI runtime turn binding should upsert");
+    }
+
+    let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
+        .expect("session key should build");
+    cli_manager
+        .get_or_start(key.clone())
+        .await
+        .expect("test CLI runtime session should start");
+
+    processor
+        .ensure_cli_runtime_turn_blocked_cleanup(thread_id, old_turn_id, Some("test block"))
+        .await;
+
+    assert_eq!(
+        *cli_session.interrupts.lock().await,
+        vec![(
+            Some("codex-thread-terminal-cleanup-old".to_owned()),
+            Some("codex-turn-terminal-cleanup-old".to_owned())
+        )]
+    );
+    assert_eq!(cli_session.closes.load(Ordering::SeqCst), 0);
+    assert!(
+        cli_manager.existing_session(&key).await.is_some(),
+        "terminal cleanup for one turn must not close another active turn session"
+    );
+
+    let old_binding = crud_store
+        .get_cli_runtime_turn_binding(old_turn_id)
+        .await
+        .expect("old binding should load")
+        .expect("old binding should exist");
+    assert_eq!(
+        old_binding.status,
+        crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_BLOCKED
+    );
+    let active_binding = crud_store
+        .get_cli_runtime_turn_binding(active_turn_id)
+        .await
+        .expect("active binding should load")
+        .expect("active binding should exist");
+    assert_eq!(
+        active_binding.status,
+        crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING
     );
 }
 
@@ -13624,6 +14042,111 @@ async fn cli_runtime_stale_db_only_running_binding_marks_turn_failed() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_stale_scan_reconciles_db_only_terminal_binding() {
+    let (tx, _rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+
+    let thread_id = "thread_cli_stale_db_terminal";
+    let turn_id = "turn_cli_stale_db_terminal";
+    seed_cli_runtime_approval_turn(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+        "codex-thread-stale-db-terminal",
+    )
+    .await;
+    crud_store
+        .materialize_turn_completed(
+            TurnCompletedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: thread_id.to_owned(),
+                turn: Turn {
+                    id: turn_id.to_owned(),
+                    status: TurnStatus::Completed,
+                    turn_kind: TurnKind::default(),
+                    origin: TurnOrigin::User,
+                    error: None,
+                    prompt_manifest: None,
+                },
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .expect("turn should complete in durable store");
+
+    let pending_payload = CLIRuntimePendingRequest {
+        kind: CLIRuntimeRequestKind::CommandApproval,
+        title: Some("Run stale terminal command".to_owned()),
+        message: Some("Codex wants approval after durable completion".to_owned()),
+        native_request_id: Some("native-approval-stale-db-terminal".to_owned()),
+        payload: Some(json!({
+            "nativeRequestIdJson": "native-approval-stale-db-terminal",
+            "command": "echo terminal"
+        })),
+    };
+    processor
+        .open_cli_runtime_pending_request(NewCliRuntimePendingRequest {
+            request_id: "cli-approval-stale-db-terminal".to_owned(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            workspace_id: workspace_id.clone(),
+            thread_id: thread_id.to_owned(),
+            turn_id: Some(turn_id.to_owned()),
+            native_thread_id: Some("codex-thread-stale-db-terminal".to_owned()),
+            native_turn_id: Some(turn_id.to_owned()),
+            native_item_id: Some("codex-item-stale-db-terminal".to_owned()),
+            request_kind: "command_approval".to_owned(),
+            payload_json: pioneer_crud::serialize_cli_runtime_json(&pending_payload)
+                .expect("pending payload should serialize"),
+            created_at: chrono::Utc::now().fixed_offset(),
+            updated_at: chrono::Utc::now().fixed_offset(),
+        })
+        .await
+        .expect("pending request should open");
+
+    processor
+        .fail_stale_cli_runtime_turns(chrono::Utc::now().fixed_offset().timestamp_millis())
+        .await;
+
+    let pending = crud_store
+        .get_cli_runtime_pending_request("cli-approval-stale-db-terminal")
+        .await
+        .expect("pending request should load")
+        .expect("pending request should exist");
+    assert_eq!(
+        pending.status,
+        pioneer_crud::CliRuntimePendingRequestStatus::Expired
+    );
+    let binding = crud_store
+        .get_cli_runtime_turn_binding(turn_id)
+        .await
+        .expect("binding should load")
+        .expect("binding should exist");
+    assert_eq!(
+        binding.status,
+        crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_COMPLETED
+    );
+}
+
 #[test]
 fn codex_steer_calls_runtime_for_running_codex_turn() {
     run_gateway_message_test("codex-steer-test", || async {
@@ -13638,6 +14161,7 @@ fn codex_steer_calls_runtime_for_running_codex_turn() {
             native_turn_id: "codex-turn-steer".to_owned(),
             raw: Some(json!({"turnId": "codex-turn-steer"})),
         });
+        let cli_manager = test_cli_runtime_manager(cli_session.clone());
         let processor = MessageProcessor::new(
             thread_manager,
             test_provider(),
@@ -13649,7 +14173,7 @@ fn codex_steer_calls_runtime_for_running_codex_turn() {
             test_context_budget(),
             test_tool_loop_config(),
         )
-        .with_cli_runtime_manager_for_tests(test_cli_runtime_manager(cli_session.clone()));
+        .with_cli_runtime_manager_for_tests(cli_manager.clone());
 
         start_loaded_thread_and_turn_for_cli_runtime_test(
             &processor,
@@ -13685,6 +14209,14 @@ fn codex_steer_calls_runtime_for_running_codex_turn() {
             .await
             .expect("turn binding should upsert");
 
+        cli_manager
+            .get_or_start(
+                CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", "thread_codex_steer")
+                    .expect("session key should build"),
+            )
+            .await
+            .expect("CLI runtime session should be active for steering");
+
         let steer_payload = json!({
             "jsonrpc": "2.0",
             "id": "codexsteer00000000001",
@@ -13715,6 +14247,85 @@ fn codex_steer_calls_runtime_for_running_codex_turn() {
         assert_eq!(steers[0].native_turn_id, "codex-turn-steer");
         assert_eq!(steers[0].message, "Focus on the failing test");
     });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_steer_rejects_missing_active_runtime_session() {
+    let (tx, mut rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+
+    start_loaded_thread_and_turn_for_cli_runtime_test(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        "thread_codex_steer_no_session",
+        "turn_codex_steer_no_session",
+    )
+    .await;
+
+    let now = chrono::Utc::now().fixed_offset();
+    crud_store
+        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+            turn_id: "turn_codex_steer_no_session".to_owned(),
+            thread_id: "thread_codex_steer_no_session".to_owned(),
+            workspace_id: workspace_id.clone(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            native_thread_id: "codex-thread-steer-no-session".to_owned(),
+            native_turn_id: Some("codex-turn-steer-no-session".to_owned()),
+            request_id: None,
+            status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING.to_owned(),
+            model: Some("gpt-5".to_owned()),
+            cwd: Some("/tmp/project".to_owned()),
+            sandbox_json: None,
+            approval_policy: None,
+            input_mapping_json: "{}".to_owned(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("turn binding should upsert");
+
+    let steer_payload = json!({
+        "jsonrpc": "2.0",
+        "id": "codexsteer00000000004",
+        "method": pioneer_protocol::constants::methods::CLI_RUNTIME_TURN_STEER,
+        "params": {
+            "workspace_id": workspace_id,
+            "runtime_id": "codex",
+            "thread_id": "thread_codex_steer_no_session",
+            "turn_id": "turn_codex_steer_no_session",
+            "message": "Focus on the failing test"
+        }
+    })
+    .to_string();
+    message_future(processor.process_request(connection_id, &steer_payload)).await;
+
+    let error = recv_error_by_id(&mut rx, "codexsteer00000000004").await;
+    assert!(
+        error.error.message.contains("session is not active"),
+        "error should mention missing active session: {}",
+        error.error.message
+    );
+    assert!(cli_session.turn_steers.lock().await.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -13864,6 +14475,7 @@ async fn cli_runtime_request_respond_resolves_pending_and_broadcasts_notificatio
         .set_connection_workspace(connection_id, Some(workspace_id.clone()))
         .await;
     let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
     let processor = MessageProcessor::new(
         thread_manager,
         test_provider(),
@@ -13875,7 +14487,23 @@ async fn cli_runtime_request_respond_resolves_pending_and_broadcasts_notificatio
         test_context_budget(),
         test_tool_loop_config(),
     )
-    .with_cli_runtime_manager_for_tests(test_cli_runtime_manager(cli_session.clone()));
+    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+
+    seed_cli_runtime_approval_turn(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        "thread_cli_request",
+        "turn_cli_request",
+        "codex-thread-request",
+    )
+    .await;
+    cli_manager
+        .get_or_start(
+            CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", "thread_cli_request")
+                .expect("session key should build"),
+        )
+        .await
+        .expect("CLI runtime session should be active for native request response");
 
     let request_payload = CLIRuntimePendingRequest {
         kind: CLIRuntimeRequestKind::CommandApproval,
@@ -13898,7 +14526,7 @@ async fn cli_runtime_request_respond_resolves_pending_and_broadcasts_notificatio
             thread_id: "thread_cli_request".to_owned(),
             turn_id: Some("turn_cli_request".to_owned()),
             native_thread_id: Some("codex-thread-request".to_owned()),
-            native_turn_id: Some("codex-turn-request".to_owned()),
+            native_turn_id: Some("turn_cli_request".to_owned()),
             native_item_id: Some("item-command-1".to_owned()),
             request_kind: "command_approval".to_owned(),
             payload_json,
@@ -14026,6 +14654,97 @@ async fn cli_runtime_request_respond_rejects_stale_request_ids() {
         "stale request error should be explicit: {}",
         error.error.message
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_request_respond_rejects_pending_without_turn_binding() {
+    let (tx, mut rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+
+    let request_payload = CLIRuntimePendingRequest {
+        kind: CLIRuntimeRequestKind::CommandApproval,
+        title: Some("Run unbound command".to_owned()),
+        message: Some("Codex wants approval without a binding".to_owned()),
+        native_request_id: Some("native-approval-unbound-respond".to_owned()),
+        payload: Some(json!({
+            "nativeRequestIdJson": "native-approval-unbound-respond",
+            "command": "echo unbound"
+        })),
+    };
+    processor
+        .open_cli_runtime_pending_request(NewCliRuntimePendingRequest {
+            request_id: "cli-approval-unbound-respond".to_owned(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            workspace_id: workspace_id.clone(),
+            thread_id: "thread_cli_unbound_respond".to_owned(),
+            turn_id: Some("turn_cli_unbound_respond".to_owned()),
+            native_thread_id: Some("codex-thread-unbound-respond".to_owned()),
+            native_turn_id: Some("codex-turn-unbound-respond".to_owned()),
+            native_item_id: Some("codex-item-unbound-respond".to_owned()),
+            request_kind: "command_approval".to_owned(),
+            payload_json: pioneer_crud::serialize_cli_runtime_json(&request_payload)
+                .expect("pending payload should serialize"),
+            created_at: chrono::Utc::now().fixed_offset(),
+            updated_at: chrono::Utc::now().fixed_offset(),
+        })
+        .await
+        .expect("pending request should open");
+
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "cliruntime_unbound001",
+                "method": pioneer_protocol::constants::methods::CLI_RUNTIME_REQUEST_RESPOND,
+                "params": {
+                    "workspace_id": workspace_id,
+                    "runtime_id": "codex",
+                    "request_id": "cli-approval-unbound-respond",
+                    "resolution": { "status": "approved" }
+                }
+            })
+            .to_string(),
+        )
+        .await;
+
+    let error = recv_error_by_id(&mut rx, "cliruntime_unbound001").await;
+    assert!(
+        error.error.message.contains("not bound to CLI runtime"),
+        "error should mention missing turn binding: {}",
+        error.error.message
+    );
+    let pending = crud_store
+        .get_cli_runtime_pending_request("cli-approval-unbound-respond")
+        .await
+        .expect("pending request should load")
+        .expect("pending request should exist");
+    assert_eq!(
+        pending.status,
+        pioneer_crud::CliRuntimePendingRequestStatus::Expired
+    );
+    assert!(cli_session.responses.lock().await.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -14643,6 +15362,7 @@ async fn cli_runtime_approval_processor() -> (
         .set_connection_workspace(connection_id, Some(workspace_id.clone()))
         .await;
     let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
     let processor = MessageProcessor::new(
         thread_manager,
         test_provider(),
@@ -14654,7 +15374,45 @@ async fn cli_runtime_approval_processor() -> (
         test_context_budget(),
         test_tool_loop_config(),
     )
-    .with_cli_runtime_manager_for_tests(test_cli_runtime_manager(cli_session.clone()));
+    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+
+    seed_cli_runtime_approval_turn(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        "thread_cli_command_approval",
+        "codex-turn-command",
+        "codex-thread-command",
+    )
+    .await;
+    seed_cli_runtime_approval_turn(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        "thread_cli_file_change_approval",
+        "codex-turn-file",
+        "codex-thread-file",
+    )
+    .await;
+    seed_cli_runtime_approval_turn(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        "thread_cli_user_input_request",
+        "codex-turn-user-input",
+        "codex-thread-user-input",
+    )
+    .await;
+    for thread_id in [
+        "thread_cli_command_approval",
+        "thread_cli_file_change_approval",
+        "thread_cli_user_input_request",
+    ] {
+        cli_manager
+            .get_or_start(
+                CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
+                    .expect("session key should build"),
+            )
+            .await
+            .expect("CLI runtime session should be active for native request response");
+    }
 
     (
         processor,
@@ -14664,6 +15422,76 @@ async fn cli_runtime_approval_processor() -> (
         crud_store,
         cli_session,
     )
+}
+
+async fn seed_cli_runtime_approval_turn(
+    crud_store: &CrudStore,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    native_thread_id: &str,
+) {
+    let now_secs = chrono::Utc::now().timestamp();
+    let thread = Thread {
+        workspace_id: workspace_id.to_owned(),
+        id: thread_id.to_owned(),
+        name: Some("CLI approval test".to_owned()),
+        preview: String::new(),
+        mode: ThreadMode::Agent,
+        model: "gpt-5".to_owned(),
+        model_provider: "cli_runtime:codex".to_owned(),
+        created_at: now_secs,
+        updated_at: now_secs,
+        status: ThreadStatus::Active,
+        origin_kind: ThreadOriginKind::User,
+        sidebar_visibility: ThreadSidebarVisibility::Visible,
+        agent_nickname: None,
+        agent_role: None,
+        turns: Vec::new(),
+    };
+    let turn = Turn {
+        id: turn_id.to_owned(),
+        status: TurnStatus::InProgress,
+        turn_kind: TurnKind::default(),
+        origin: TurnOrigin::User,
+        error: None,
+        prompt_manifest: None,
+    };
+    crud_store
+        .materialize_turn_start(
+            &thread,
+            SandboxMode::FullAccess,
+            &turn,
+            &[UserInput::Text {
+                text: "approval".to_owned(),
+                text_elements: Vec::new(),
+            }],
+        )
+        .await
+        .expect("CLI approval test turn should materialize");
+
+    let now = chrono::Utc::now().fixed_offset();
+    crud_store
+        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+            turn_id: turn_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            native_thread_id: native_thread_id.to_owned(),
+            native_turn_id: Some(turn_id.to_owned()),
+            request_id: None,
+            status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING.to_owned(),
+            model: Some("gpt-5".to_owned()),
+            cwd: Some("/tmp/project".to_owned()),
+            sandbox_json: None,
+            approval_policy: None,
+            input_mapping_json: "{}".to_owned(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("CLI approval test turn binding should upsert");
 }
 
 async fn open_test_codex_command_approval(
@@ -15906,6 +16734,175 @@ async fn turn_cancel_interrupts_running_turn_and_is_idempotent() {
         .expect("interrupted turn should be persisted");
     assert_eq!(persisted_turn.status, TurnStatus::Interrupted);
     assert_eq!(persisted_turn.error.as_deref(), Some("user clicked stop"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_cancel_cli_runtime_without_active_session_does_not_start_runtime() {
+    let (tx, mut rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "delayed"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "delayed",
+        Arc::new(DelayedProvider {
+            delay: Duration::from_secs(30),
+            text: "too late".to_owned(),
+        }),
+    ));
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
+    let processor = MessageProcessor::new(
+        thread_manager,
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+
+    let thread_id = "thr_cli_cancel_no_session";
+    let turn_id = "turn_cli_cancel_no_session";
+    let thread_start_request_id = generate_test_request_id("clicancel", "thread");
+    let thread_start_request = json!({
+        "jsonrpc": "2.0",
+        "id": thread_start_request_id,
+        "method": "thread/start",
+        "params": {
+            "thread_id": thread_id,
+            "workspace_id": workspace_id,
+            "model": "test-model",
+            "model_provider": "delayed"
+        }
+    });
+    processor
+        .process_request(connection_id, &thread_start_request.to_string())
+        .await;
+    let _ = recv_response_by_id(&mut rx, thread_start_request_id.as_str()).await;
+
+    let turn_start_request_id = generate_test_request_id("clicancel", "start");
+    let turn_start_request = json!({
+        "jsonrpc": "2.0",
+        "id": turn_start_request_id,
+        "method": "turn/start",
+        "params": {
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+            "mode": "Chat",
+            "model": "test-model",
+            "model_provider": "delayed",
+            "input": [{"type": "text", "text": "hello"}]
+        }
+    });
+    processor
+        .process_request(connection_id, &turn_start_request.to_string())
+        .await;
+    let _ = recv_response_by_id(&mut rx, turn_start_request_id.as_str()).await;
+    let _ = recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
+
+    let now = chrono::Utc::now().fixed_offset();
+    crud_store
+        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+            turn_id: turn_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            workspace_id: workspace_id.clone(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            native_thread_id: "codex-thread-cancel-no-session".to_owned(),
+            native_turn_id: Some("codex-turn-cancel-no-session".to_owned()),
+            request_id: None,
+            status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING.to_owned(),
+            model: Some("gpt-5".to_owned()),
+            cwd: Some("/tmp/project".to_owned()),
+            sandbox_json: None,
+            approval_policy: None,
+            input_mapping_json: "{}".to_owned(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("CLI runtime cancel test binding should upsert");
+    let pending_request = crud_store
+        .open_cli_runtime_pending_request(NewCliRuntimePendingRequest {
+            request_id: "cli_req_cancel_no_session".to_owned(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            workspace_id: workspace_id.clone(),
+            thread_id: thread_id.to_owned(),
+            turn_id: Some(turn_id.to_owned()),
+            native_thread_id: Some("codex-thread-cancel-no-session".to_owned()),
+            native_turn_id: Some("codex-turn-cancel-no-session".to_owned()),
+            native_item_id: Some("item-cancel-no-session".to_owned()),
+            request_kind: "command_approval".to_owned(),
+            payload_json: "{}".to_owned(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("pending CLI runtime request should open");
+    assert_eq!(
+        pending_request.status,
+        pioneer_crud::CliRuntimePendingRequestStatus::Pending
+    );
+
+    let turn_cancel_request_id = generate_test_request_id("clicancel", "stop");
+    let turn_cancel_request = json!({
+        "jsonrpc": "2.0",
+        "id": turn_cancel_request_id,
+        "method": "turn/cancel",
+        "params": {
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+            "reason": "user clicked stop"
+        }
+    });
+    processor
+        .process_request(connection_id, &turn_cancel_request.to_string())
+        .await;
+
+    let (cancel_response, failed_notification) = recv_response_and_notification_by_id_method(
+        &mut rx,
+        turn_cancel_request_id.as_str(),
+        events::TURN_FAILED,
+    )
+    .await;
+    let failed_params = failed_notification
+        .params
+        .expect("turn/failed params should exist");
+    let failed: TurnFailedNotification =
+        serde_json::from_value(failed_params).expect("turn/failed params should decode");
+    assert_eq!(failed.turn.id, turn_id);
+    assert_eq!(failed.turn.status, TurnStatus::Interrupted);
+
+    let cancel_result: TurnCancelResponse =
+        serde_json::from_value(cancel_response.result).expect("turn/cancel response should decode");
+    assert_eq!(cancel_result.thread_id, thread_id);
+    assert_eq!(cancel_result.turn.status, TurnStatus::Interrupted);
+
+    let session_key = CLIAgentRuntimeSessionKey::new(workspace_id.as_str(), "codex", thread_id)
+        .expect("session key should build");
+    assert!(
+        cli_manager.existing_session(&session_key).await.is_none(),
+        "turn/cancel must not start a CLI runtime session when none is active"
+    );
+    assert!(
+        cli_session.interrupts.lock().await.is_empty(),
+        "turn/cancel must not send a native interrupt through a newly-started session"
+    );
+    let expired_request = crud_store
+        .get_cli_runtime_pending_request("cli_req_cancel_no_session")
+        .await
+        .expect("pending request lookup should succeed")
+        .expect("pending request should still exist");
+    assert_eq!(
+        expired_request.status,
+        pioneer_crud::CliRuntimePendingRequestStatus::Expired,
+        "turn/cancel must expire pending CLI runtime requests for the interrupted turn"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -17605,6 +18602,2040 @@ async fn cli_recovery_blocked_event_surfaces_projection_root_cause() {
             && resume.blocked_recovery_job_id.as_deref() == Some(job.id.as_str())
             && resume.human_message == root_reason
             && !resume.can_resume_same_turn
+    )));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_recovery_blocked_event_expires_pending_requests_and_closes_runtime_session() {
+    let thread_id = "thr_cli_recovery_blocked_cleanup";
+    let turn_id = "turn_cli_recovery_blocked_cleanup";
+    let (processor, crud_store, workspace_id) =
+        setup_execution_window_terminal_turn(thread_id, turn_id).await;
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
+    let processor = processor.with_cli_runtime_manager_for_tests(cli_manager.clone());
+
+    let now = chrono::Utc::now().fixed_offset();
+    crud_store
+        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+            turn_id: turn_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            workspace_id: workspace_id.clone(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            native_thread_id: "codex-thread-blocked-cleanup".to_owned(),
+            native_turn_id: Some("codex-turn-blocked-cleanup".to_owned()),
+            request_id: None,
+            status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING.to_owned(),
+            model: Some("gpt-5".to_owned()),
+            cwd: Some("/tmp/project".to_owned()),
+            sandbox_json: None,
+            approval_policy: None,
+            input_mapping_json: "{}".to_owned(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("CLI runtime turn binding should upsert");
+
+    let key = CLIAgentRuntimeSessionKey::new(
+        workspace_id.clone(),
+        "codex",
+        "thr_cli_recovery_blocked_cleanup",
+    )
+    .expect("session key should build");
+    cli_manager
+        .get_or_start(key)
+        .await
+        .expect("test CLI runtime session should start");
+
+    let pending_payload = CLIRuntimePendingRequest {
+        kind: CLIRuntimeRequestKind::CommandApproval,
+        title: Some("Run command".to_owned()),
+        message: Some("Codex wants approval".to_owned()),
+        native_request_id: Some("native-approval-blocked-cleanup".to_owned()),
+        payload: Some(json!({
+            "nativeRequestIdJson": "native-approval-blocked-cleanup",
+            "command": "sleep 1"
+        })),
+    };
+    processor
+        .open_cli_runtime_pending_request(NewCliRuntimePendingRequest {
+            request_id: "cli-approval-blocked-cleanup".to_owned(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            workspace_id: workspace_id.clone(),
+            thread_id: thread_id.to_owned(),
+            turn_id: Some(turn_id.to_owned()),
+            native_thread_id: Some("codex-thread-blocked-cleanup".to_owned()),
+            native_turn_id: Some("codex-turn-blocked-cleanup".to_owned()),
+            native_item_id: Some("codex-item-blocked-cleanup".to_owned()),
+            request_kind: "command_approval".to_owned(),
+            payload_json: pioneer_crud::serialize_cli_runtime_json(&pending_payload)
+                .expect("pending payload should serialize"),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("pending request should open");
+
+    let blocked_reason = "cannot restore recovery after agent loop loss because durable turn runtime snapshot is missing";
+    let job = crud_store
+        .enqueue_recovery_job(
+            turn_id.to_owned(),
+            "tool_cleanup".to_owned(),
+            TurnItemType::DynamicToolCall,
+            None,
+            RecoveryTrigger::Timeout,
+            RecoveryAction::RetryAttempt,
+            Some("approval timeout".to_owned()),
+            None,
+            None,
+            None,
+            0,
+            2,
+            json!({}),
+            json!({
+                "base_backoff_secs": 0,
+                "max_wall_clock_secs": 60,
+                "no_progress_limit": 3,
+            }),
+            1_700_000_030,
+        )
+        .await
+        .expect("recovery job should enqueue");
+    crud_store
+        .mark_recovery_job_terminal(
+            job.id.as_str(),
+            RecoveryJobStatus::Blocked,
+            Some(blocked_reason.to_owned()),
+            1_700_000_031,
+        )
+        .await
+        .expect("recovery job should be blocked before event dispatch");
+
+    processor
+        .handle_recovery_event(
+            crate::resilience::RecoveryCoordinatorEvent::RecoveryBlocked {
+                job_id: job.id,
+                turn_id: turn_id.to_owned(),
+                reason: blocked_reason.to_owned(),
+            },
+            1_700_000_032,
+        )
+        .await;
+
+    let binding = crud_store
+        .get_cli_runtime_turn_binding(turn_id)
+        .await
+        .expect("binding should load")
+        .expect("binding should exist");
+    assert_eq!(
+        binding.status,
+        crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_BLOCKED
+    );
+
+    let pending = crud_store
+        .get_cli_runtime_pending_request("cli-approval-blocked-cleanup")
+        .await
+        .expect("pending request should load")
+        .expect("pending request should exist");
+    assert_eq!(
+        pending.status,
+        pioneer_crud::CliRuntimePendingRequestStatus::Expired
+    );
+    assert!(cli_session.responses.lock().await.is_empty());
+    assert_eq!(
+        *cli_session.interrupts.lock().await,
+        vec![(
+            Some("codex-thread-blocked-cleanup".to_owned()),
+            Some("codex-turn-blocked-cleanup".to_owned())
+        )]
+    );
+    assert_eq!(cli_session.closes.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_request_respond_rejects_pending_for_blocked_turn_without_native_response() {
+    let (tx, mut rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_cli_runtime_manager_for_tests(test_cli_runtime_manager(cli_session.clone()));
+
+    start_loaded_thread_and_turn_for_cli_runtime_test(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        "thread_cli_blocked_respond",
+        "turn_cli_blocked_respond",
+    )
+    .await;
+
+    let now = chrono::Utc::now().fixed_offset();
+    crud_store
+        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+            turn_id: "turn_cli_blocked_respond".to_owned(),
+            thread_id: "thread_cli_blocked_respond".to_owned(),
+            workspace_id: workspace_id.clone(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            native_thread_id: "codex-thread-blocked-respond".to_owned(),
+            native_turn_id: Some("codex-turn-blocked-respond".to_owned()),
+            request_id: None,
+            status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_BLOCKED.to_owned(),
+            model: Some("gpt-5".to_owned()),
+            cwd: Some("/tmp/project".to_owned()),
+            sandbox_json: None,
+            approval_policy: None,
+            input_mapping_json: "{}".to_owned(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("blocked CLI runtime turn binding should upsert");
+
+    let pending_payload = CLIRuntimePendingRequest {
+        kind: CLIRuntimeRequestKind::CommandApproval,
+        title: Some("Run stale command".to_owned()),
+        message: Some("Codex wants approval after block".to_owned()),
+        native_request_id: Some("native-approval-blocked-respond".to_owned()),
+        payload: Some(json!({
+            "nativeRequestIdJson": "native-approval-blocked-respond",
+            "command": "echo stale"
+        })),
+    };
+    processor
+        .open_cli_runtime_pending_request(NewCliRuntimePendingRequest {
+            request_id: "cli-approval-blocked-respond".to_owned(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            workspace_id: workspace_id.clone(),
+            thread_id: "thread_cli_blocked_respond".to_owned(),
+            turn_id: Some("turn_cli_blocked_respond".to_owned()),
+            native_thread_id: Some("codex-thread-blocked-respond".to_owned()),
+            native_turn_id: Some("codex-turn-blocked-respond".to_owned()),
+            native_item_id: Some("codex-item-blocked-respond".to_owned()),
+            request_kind: "command_approval".to_owned(),
+            payload_json: pioneer_crud::serialize_cli_runtime_json(&pending_payload)
+                .expect("pending payload should serialize"),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("pending request should open");
+
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "cliruntime_reqblock01",
+                "method": pioneer_protocol::constants::methods::CLI_RUNTIME_REQUEST_RESPOND,
+                "params": {
+                    "workspace_id": workspace_id,
+                    "runtime_id": "codex",
+                    "request_id": "cli-approval-blocked-respond",
+                    "resolution": { "status": "approved" }
+                }
+            })
+            .to_string(),
+        )
+        .await;
+
+    let error = recv_error_by_id(&mut rx, "cliruntime_reqblock01").await;
+    assert!(
+        error.error.message.contains("binding status is `blocked`"),
+        "error should mention blocked binding: {}",
+        error.error.message
+    );
+
+    let pending = crud_store
+        .get_cli_runtime_pending_request("cli-approval-blocked-respond")
+        .await
+        .expect("pending request should load")
+        .expect("pending request should exist");
+    assert_eq!(
+        pending.status,
+        pioneer_crud::CliRuntimePendingRequestStatus::Expired
+    );
+    assert!(cli_session.responses.lock().await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_request_respond_for_completed_turn_expires_all_pending_requests() {
+    let (tx, mut rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+
+    let thread_id = "thread_cli_completed_pending_cleanup";
+    let turn_id = "turn_cli_completed_pending_cleanup";
+    let native_thread_id = "codex-thread-completed-pending-cleanup";
+    seed_cli_runtime_approval_turn(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+        native_thread_id,
+    )
+    .await;
+    let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
+        .expect("session key should build");
+    cli_manager
+        .get_or_start(key.clone())
+        .await
+        .expect("test CLI runtime session should start");
+
+    for suffix in ["one", "two"] {
+        let request_id = format!("cli-approval-completed-{suffix}");
+        let native_request_id = format!("native-approval-completed-{suffix}");
+        let pending_payload = CLIRuntimePendingRequest {
+            kind: CLIRuntimeRequestKind::CommandApproval,
+            title: Some("Run stale command".to_owned()),
+            message: Some("Codex wants approval after completion".to_owned()),
+            native_request_id: Some(native_request_id.clone()),
+            payload: Some(json!({
+                "nativeRequestIdJson": native_request_id,
+                "command": "echo stale"
+            })),
+        };
+        processor
+            .open_cli_runtime_pending_request(NewCliRuntimePendingRequest {
+                request_id,
+                runtime_id: "codex".to_owned(),
+                runtime_kind: "codex".to_owned(),
+                workspace_id: workspace_id.clone(),
+                thread_id: thread_id.to_owned(),
+                turn_id: Some(turn_id.to_owned()),
+                native_thread_id: Some(native_thread_id.to_owned()),
+                native_turn_id: Some(turn_id.to_owned()),
+                native_item_id: Some(format!("codex-item-completed-{suffix}")),
+                request_kind: "command_approval".to_owned(),
+                payload_json: pioneer_crud::serialize_cli_runtime_json(&pending_payload)
+                    .expect("pending payload should serialize"),
+                created_at: chrono::Utc::now().fixed_offset(),
+                updated_at: chrono::Utc::now().fixed_offset(),
+            })
+            .await
+            .expect("pending request should open");
+    }
+
+    crate::cli_runtime::turn_binding::update_cli_runtime_turn_binding_status(
+        crud_store.as_ref(),
+        turn_id,
+        crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_COMPLETED,
+        chrono::Utc::now().fixed_offset(),
+    )
+    .await
+    .expect("test turn binding should complete");
+    let completed_binding = crud_store
+        .get_cli_runtime_turn_binding(turn_id)
+        .await
+        .expect("turn binding should reload")
+        .expect("turn binding should exist");
+    assert_eq!(
+        completed_binding.status,
+        crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_COMPLETED
+    );
+
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "cliruntime_reqdone001",
+                "method": pioneer_protocol::constants::methods::CLI_RUNTIME_REQUEST_RESPOND,
+                "params": {
+                    "workspace_id": workspace_id,
+                    "runtime_id": "codex",
+                    "request_id": "cli-approval-completed-one",
+                    "resolution": { "status": "approved" }
+                }
+            })
+            .to_string(),
+        )
+        .await;
+
+    let first_after_response = crud_store
+        .get_cli_runtime_pending_request("cli-approval-completed-one")
+        .await
+        .expect("first pending request should reload")
+        .expect("first pending request should exist");
+    assert_eq!(
+        first_after_response.status,
+        pioneer_crud::CliRuntimePendingRequestStatus::Expired,
+        "completed binding validation should expire the answered request before native response"
+    );
+
+    let error = recv_error_by_id(&mut rx, "cliruntime_reqdone001").await;
+    assert!(
+        error.error.message.contains("completed"),
+        "error should mention completed turn: {}",
+        error.error.message
+    );
+
+    for request_id in ["cli-approval-completed-one", "cli-approval-completed-two"] {
+        let pending = crud_store
+            .get_cli_runtime_pending_request(request_id)
+            .await
+            .expect("pending request should load")
+            .expect("pending request should exist");
+        assert_eq!(
+            pending.status,
+            pioneer_crud::CliRuntimePendingRequestStatus::Expired,
+            "{request_id} should expire when the turn is already completed"
+        );
+    }
+    let binding = crud_store
+        .get_cli_runtime_turn_binding(turn_id)
+        .await
+        .expect("turn binding should load")
+        .expect("turn binding should exist");
+    assert_eq!(
+        binding.status,
+        crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_COMPLETED
+    );
+    assert!(cli_session.responses.lock().await.is_empty());
+    assert!(cli_session.interrupts.lock().await.is_empty());
+    assert_eq!(cli_session.closes.load(Ordering::SeqCst), 0);
+    assert!(
+        cli_manager.existing_session(&key).await.is_some(),
+        "completed-turn pending cleanup should not close the reusable CLI runtime session"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_request_respond_rejects_pending_without_active_runtime_session() {
+    let (tx, mut rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+
+    let thread_id = "thread_cli_no_active_session_respond";
+    let turn_id = "codex-turn-no-active-session-respond";
+    seed_cli_runtime_approval_turn(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+        "codex-thread-no-active-session-respond",
+    )
+    .await;
+
+    let request_payload = CLIRuntimePendingRequest {
+        kind: CLIRuntimeRequestKind::CommandApproval,
+        title: Some("Run stale command".to_owned()),
+        message: Some("Codex wants approval after runtime session disappeared".to_owned()),
+        native_request_id: Some("native-approval-no-active-session".to_owned()),
+        payload: Some(json!({
+            "nativeRequestIdJson": "native-approval-no-active-session",
+            "command": "echo stale"
+        })),
+    };
+    processor
+        .open_cli_runtime_pending_request(NewCliRuntimePendingRequest {
+            request_id: "cli-approval-no-active-session".to_owned(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            workspace_id: workspace_id.clone(),
+            thread_id: thread_id.to_owned(),
+            turn_id: Some(turn_id.to_owned()),
+            native_thread_id: Some("codex-thread-no-active-session-respond".to_owned()),
+            native_turn_id: Some(turn_id.to_owned()),
+            native_item_id: Some("codex-item-no-active-session".to_owned()),
+            request_kind: "command_approval".to_owned(),
+            payload_json: pioneer_crud::serialize_cli_runtime_json(&request_payload)
+                .expect("pending payload should serialize"),
+            created_at: chrono::Utc::now().fixed_offset(),
+            updated_at: chrono::Utc::now().fixed_offset(),
+        })
+        .await
+        .expect("pending request should open");
+
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "cliruntimenoactive001",
+                "method": pioneer_protocol::constants::methods::CLI_RUNTIME_REQUEST_RESPOND,
+                "params": {
+                    "workspace_id": workspace_id,
+                    "runtime_id": "codex",
+                    "request_id": "cli-approval-no-active-session",
+                    "resolution": { "status": "approved" }
+                }
+            })
+            .to_string(),
+        )
+        .await;
+
+    let error = recv_error_by_id(&mut rx, "cliruntimenoactive001").await;
+    assert!(
+        error.error.message.contains("session is not active"),
+        "error should mention missing active session: {}",
+        error.error.message
+    );
+    let pending = crud_store
+        .get_cli_runtime_pending_request("cli-approval-no-active-session")
+        .await
+        .expect("pending request should load")
+        .expect("pending request should exist");
+    assert_eq!(
+        pending.status,
+        pioneer_crud::CliRuntimePendingRequestStatus::Expired
+    );
+    assert!(cli_session.responses.lock().await.is_empty());
+    assert!(
+        cli_manager
+            .existing_session(
+                &CLIAgentRuntimeSessionKey::new(workspace_id, "codex", thread_id)
+                    .expect("session key should build")
+            )
+            .await
+            .is_none(),
+        "responding to a stale pending request must not start a new CLI runtime session"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_request_respond_rejects_pending_with_mismatched_native_thread_id() {
+    let (tx, mut rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_cli_runtime_manager_for_tests(test_cli_runtime_manager(cli_session.clone()));
+
+    let thread_id = "thread_cli_mismatched_native_thread_respond";
+    let turn_id = "codex-turn-respond-active";
+    let native_thread_id = "codex-thread-respond-active";
+    seed_cli_runtime_approval_turn(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+        native_thread_id,
+    )
+    .await;
+
+    let now = chrono::Utc::now().fixed_offset();
+    let pending_payload = CLIRuntimePendingRequest {
+        kind: CLIRuntimeRequestKind::CommandApproval,
+        title: Some("Run stale command".to_owned()),
+        message: Some("Codex wants approval with mismatched native thread".to_owned()),
+        native_request_id: Some("native-approval-mismatched-native-thread".to_owned()),
+        payload: Some(json!({
+            "nativeRequestIdJson": "native-approval-mismatched-native-thread",
+            "command": "echo stale"
+        })),
+    };
+    processor
+        .open_cli_runtime_pending_request(NewCliRuntimePendingRequest {
+            request_id: "cli-approval-mismatched-native-thread".to_owned(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            workspace_id: workspace_id.clone(),
+            thread_id: thread_id.to_owned(),
+            turn_id: Some(turn_id.to_owned()),
+            native_thread_id: Some("codex-thread-respond-other".to_owned()),
+            native_turn_id: Some(turn_id.to_owned()),
+            native_item_id: Some("codex-item-mismatched-native-thread".to_owned()),
+            request_kind: "command_approval".to_owned(),
+            payload_json: pioneer_crud::serialize_cli_runtime_json(&pending_payload)
+                .expect("pending payload should serialize"),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("pending request should open");
+
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "cliruntimereqthr00001",
+                "method": pioneer_protocol::constants::methods::CLI_RUNTIME_REQUEST_RESPOND,
+                "params": {
+                    "workspace_id": workspace_id,
+                    "runtime_id": "codex",
+                    "request_id": "cli-approval-mismatched-native-thread",
+                    "resolution": { "status": "approved" }
+                }
+            })
+            .to_string(),
+        )
+        .await;
+
+    let mut response = None;
+    for _ in 0..20 {
+        let payload = recv_text_timeout(&mut rx, Duration::from_secs(2)).await;
+        let value: serde_json::Value =
+            serde_json::from_str(&payload).expect("json-rpc payload should decode");
+        if value.get("id").and_then(serde_json::Value::as_str) == Some("cliruntimereqthr00001") {
+            response = Some(value);
+            break;
+        }
+    }
+    let response = response.expect("request response should be emitted");
+    assert!(
+        response.get("error").is_some(),
+        "expected mismatched native thread error, got response: {response}"
+    );
+    let error: JsonRpcErrorResponse =
+        serde_json::from_value(response).expect("error response should decode");
+    assert!(
+        error.error.message.contains("request native thread"),
+        "error should mention mismatched native thread: {}",
+        error.error.message
+    );
+
+    let pending = crud_store
+        .get_cli_runtime_pending_request("cli-approval-mismatched-native-thread")
+        .await
+        .expect("pending request should load")
+        .expect("pending request should exist");
+    assert_eq!(
+        pending.status,
+        pioneer_crud::CliRuntimePendingRequestStatus::Expired
+    );
+    assert!(cli_session.responses.lock().await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_server_request_without_turn_binding_is_cancelled_without_pending_request() {
+    let (tx, _rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+
+    let key =
+        CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", "thread_cli_unbound_request")
+            .expect("session key should build");
+    cli_manager
+        .get_or_start(key.clone())
+        .await
+        .expect("test CLI runtime session should start");
+
+    let request = CodexJsonlRpcServerRequest {
+        id: JsonlRpcId::from(55_i64),
+        method: "item/commandExecution/requestApproval".to_owned(),
+        params: Some(json!({
+            "threadId": "codex-thread-unbound-request",
+            "turnId": "codex-turn-unbound-request",
+            "itemId": "codex-item-unbound-request",
+            "command": "echo should-not-open",
+            "cwd": "/tmp/project"
+        })),
+        raw: json!({
+            "id": 55,
+            "method": "item/commandExecution/requestApproval"
+        }),
+    };
+    let event = map_codex_server_request_event(&request, RuntimeEventMappingOptions::default());
+    processor
+        .handle_cli_runtime_codex_server_request(&key, request, event)
+        .await;
+
+    let pending = crud_store
+        .list_cli_runtime_pending_requests(pioneer_crud::CliRuntimePendingRequestListFilter {
+            thread_id: Some("thread_cli_unbound_request".to_owned()),
+            limit: None,
+            ..Default::default()
+        })
+        .await
+        .expect("pending request list should load");
+    assert!(
+        pending.is_empty(),
+        "unbound native server request must not create UI pending requests"
+    );
+
+    let responses = cli_session.responses.lock().await;
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].0, json!(55));
+    assert_eq!(responses[0].1, json!({ "decision": "cancel" }));
+    drop(responses);
+    assert_eq!(
+        *cli_session.interrupts.lock().await,
+        vec![(
+            Some("codex-thread-unbound-request".to_owned()),
+            Some("codex-turn-unbound-request".to_owned())
+        )]
+    );
+    assert_eq!(cli_session.closes.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_server_request_waits_for_starting_turn_binding_native_id() {
+    let (tx, mut rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+
+    let thread_id = "thread_cli_buffered_request";
+    let turn_id = "turn_cli_buffered_request";
+    let native_thread_id = "codex-thread-buffered-request";
+    let native_turn_id = "codex-turn-buffered-request";
+    seed_cli_runtime_approval_turn(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+        native_thread_id,
+    )
+    .await;
+
+    let now = chrono::Utc::now().fixed_offset();
+    crud_store
+        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+            turn_id: turn_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            workspace_id: workspace_id.clone(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            native_thread_id: native_thread_id.to_owned(),
+            native_turn_id: None,
+            request_id: None,
+            status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING.to_owned(),
+            model: Some("gpt-5".to_owned()),
+            cwd: Some("/tmp/project".to_owned()),
+            sandbox_json: None,
+            approval_policy: None,
+            input_mapping_json: "{}".to_owned(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("starting CLI runtime turn binding should upsert");
+
+    let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
+        .expect("session key should build");
+    cli_manager
+        .get_or_start(key.clone())
+        .await
+        .expect("test CLI runtime session should start");
+
+    let request = CodexJsonlRpcServerRequest {
+        id: JsonlRpcId::from(56_i64),
+        method: "item/commandExecution/requestApproval".to_owned(),
+        params: Some(json!({
+            "threadId": native_thread_id,
+            "turnId": native_turn_id,
+            "itemId": "codex-item-buffered-request",
+            "command": "echo buffered",
+            "cwd": "/tmp/project"
+        })),
+        raw: json!({
+            "id": 56,
+            "method": "item/commandExecution/requestApproval"
+        }),
+    };
+    let event = map_codex_server_request_event(&request, RuntimeEventMappingOptions::default());
+    processor
+        .handle_cli_runtime_codex_server_request(&key, request, event)
+        .await;
+
+    let pending_before_flush = crud_store
+        .list_cli_runtime_pending_requests(pioneer_crud::CliRuntimePendingRequestListFilter {
+            thread_id: Some(thread_id.to_owned()),
+            limit: None,
+            ..Default::default()
+        })
+        .await
+        .expect("pending request list should load");
+    assert!(
+        pending_before_flush.is_empty(),
+        "server request should wait until the native turn id is bound"
+    );
+    assert!(cli_session.responses.lock().await.is_empty());
+
+    crate::cli_runtime::turn_binding::persist_cli_runtime_turn_binding_after_native_start(
+        crud_store.as_ref(),
+        crate::cli_runtime::turn_binding::CLIAgentRuntimeNativeTurnStarted {
+            turn_id: turn_id.to_owned(),
+            native_turn_id: native_turn_id.to_owned(),
+            request_id: None,
+            started_at: chrono::Utc::now().fixed_offset(),
+        },
+    )
+    .await
+    .expect("native turn id should persist");
+
+    processor
+        .flush_cli_runtime_codex_events_for_native_turn(&key, native_thread_id, native_turn_id)
+        .await;
+
+    let opened = recv_notification_by_method(&mut rx, events::CLI_RUNTIME_REQUEST_OPENED).await;
+    let opened_payload: CLIRuntimeRequestOpenedNotification =
+        serde_json::from_value(opened.params.expect("request_opened params"))
+            .expect("request_opened payload should decode");
+    assert_eq!(opened_payload.runtime_id, "codex");
+    assert_eq!(opened_payload.thread_id.as_deref(), Some(thread_id));
+    assert_eq!(opened_payload.turn_id.as_deref(), Some(turn_id));
+    assert_eq!(
+        opened_payload.request.kind,
+        CLIRuntimeRequestKind::CommandApproval
+    );
+
+    let pending_after_flush = crud_store
+        .list_cli_runtime_pending_requests(pioneer_crud::CliRuntimePendingRequestListFilter {
+            thread_id: Some(thread_id.to_owned()),
+            limit: None,
+            ..Default::default()
+        })
+        .await
+        .expect("pending request list should load");
+    assert_eq!(pending_after_flush.len(), 1);
+    assert_eq!(pending_after_flush[0].turn_id.as_deref(), Some(turn_id));
+    assert_eq!(
+        pending_after_flush[0].native_turn_id.as_deref(),
+        Some(native_turn_id)
+    );
+    assert!(
+        cli_session.responses.lock().await.is_empty(),
+        "buffered request should not send a cancel/approval response before the user decides"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_server_request_buffered_flush_preserves_order_before_terminal_event() {
+    let (tx, _rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+
+    let thread_id = "thread_cli_buffered_request_before_terminal";
+    let turn_id = "turn_cli_buffered_request_before_terminal";
+    let native_thread_id = "codex-thread-buffered-request-before-terminal";
+    let native_turn_id = "codex-turn-buffered-request-before-terminal";
+    seed_cli_runtime_approval_turn(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+        native_thread_id,
+    )
+    .await;
+
+    let now = chrono::Utc::now().fixed_offset();
+    crud_store
+        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+            turn_id: turn_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            workspace_id: workspace_id.clone(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            native_thread_id: native_thread_id.to_owned(),
+            native_turn_id: None,
+            request_id: None,
+            status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING.to_owned(),
+            model: Some("gpt-5".to_owned()),
+            cwd: Some("/tmp/project".to_owned()),
+            sandbox_json: None,
+            approval_policy: None,
+            input_mapping_json: "{}".to_owned(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("starting CLI runtime turn binding should upsert");
+
+    let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
+        .expect("session key should build");
+    cli_manager
+        .get_or_start(key.clone())
+        .await
+        .expect("test CLI runtime session should start");
+
+    let request = CodexJsonlRpcServerRequest {
+        id: JsonlRpcId::from(62_i64),
+        method: "item/commandExecution/requestApproval".to_owned(),
+        params: Some(json!({
+            "threadId": native_thread_id,
+            "turnId": native_turn_id,
+            "itemId": "codex-item-buffered-request-before-terminal",
+            "command": "echo buffered",
+            "cwd": "/tmp/project"
+        })),
+        raw: json!({
+            "id": 62,
+            "method": "item/commandExecution/requestApproval"
+        }),
+    };
+    let event = map_codex_server_request_event(&request, RuntimeEventMappingOptions::default());
+    processor
+        .handle_cli_runtime_codex_server_request(&key, request, event)
+        .await;
+    processor
+        .handle_cli_runtime_codex_event(
+            &key,
+            RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
+                native_thread_id: Some(native_thread_id.to_owned()),
+                native_turn_id: native_turn_id.to_owned(),
+                status: "completed".to_owned(),
+                native: None,
+            }),
+        )
+        .await;
+
+    crate::cli_runtime::turn_binding::persist_cli_runtime_turn_binding_after_native_start(
+        crud_store.as_ref(),
+        crate::cli_runtime::turn_binding::CLIAgentRuntimeNativeTurnStarted {
+            turn_id: turn_id.to_owned(),
+            native_turn_id: native_turn_id.to_owned(),
+            request_id: None,
+            started_at: chrono::Utc::now().fixed_offset(),
+        },
+    )
+    .await
+    .expect("native turn id should persist");
+
+    processor
+        .flush_cli_runtime_codex_events_for_native_turn(&key, native_thread_id, native_turn_id)
+        .await;
+
+    let pending_after_flush = crud_store
+        .list_cli_runtime_pending_requests(pioneer_crud::CliRuntimePendingRequestListFilter {
+            thread_id: Some(thread_id.to_owned()),
+            limit: None,
+            ..Default::default()
+        })
+        .await
+        .expect("pending request list should load");
+    assert_eq!(pending_after_flush.len(), 1);
+    assert_eq!(
+        pending_after_flush[0].status,
+        pioneer_crud::CliRuntimePendingRequestStatus::Expired
+    );
+
+    let binding = crud_store
+        .get_cli_runtime_turn_binding(turn_id)
+        .await
+        .expect("binding should load")
+        .expect("binding should exist");
+    assert_eq!(
+        binding.status,
+        crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_COMPLETED
+    );
+    assert!(
+        cli_session.responses.lock().await.is_empty(),
+        "terminal event should expire buffered request without sending a stale cancel response"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_server_request_with_mismatched_starting_native_thread_is_cancelled() {
+    let (tx, _rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+
+    let thread_id = "thread_cli_mismatched_buffered_request";
+    let turn_id = "turn_cli_mismatched_buffered_request";
+    let native_thread_id = "codex-thread-mismatched-starting";
+    seed_cli_runtime_approval_turn(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+        native_thread_id,
+    )
+    .await;
+
+    let now = chrono::Utc::now().fixed_offset();
+    crud_store
+        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+            turn_id: turn_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            workspace_id: workspace_id.clone(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            native_thread_id: native_thread_id.to_owned(),
+            native_turn_id: None,
+            request_id: None,
+            status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING.to_owned(),
+            model: Some("gpt-5".to_owned()),
+            cwd: Some("/tmp/project".to_owned()),
+            sandbox_json: None,
+            approval_policy: None,
+            input_mapping_json: "{}".to_owned(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("starting CLI runtime turn binding should upsert");
+
+    let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
+        .expect("session key should build");
+    cli_manager
+        .get_or_start(key.clone())
+        .await
+        .expect("test CLI runtime session should start");
+
+    let request = CodexJsonlRpcServerRequest {
+        id: JsonlRpcId::from(57_i64),
+        method: "item/commandExecution/requestApproval".to_owned(),
+        params: Some(json!({
+            "threadId": "codex-thread-not-this-starting-turn",
+            "turnId": "codex-turn-mismatched-buffered-request",
+            "itemId": "codex-item-mismatched-buffered-request",
+            "command": "echo stale",
+            "cwd": "/tmp/project"
+        })),
+        raw: json!({
+            "id": 57,
+            "method": "item/commandExecution/requestApproval"
+        }),
+    };
+    let event = map_codex_server_request_event(&request, RuntimeEventMappingOptions::default());
+    processor
+        .handle_cli_runtime_codex_server_request(&key, request, event)
+        .await;
+
+    let pending = crud_store
+        .list_cli_runtime_pending_requests(pioneer_crud::CliRuntimePendingRequestListFilter {
+            thread_id: Some(thread_id.to_owned()),
+            limit: None,
+            ..Default::default()
+        })
+        .await
+        .expect("pending request list should load");
+    assert!(
+        pending.is_empty(),
+        "mismatched native thread request must not buffer or create UI pending requests"
+    );
+
+    let responses = cli_session.responses.lock().await;
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].0, json!(57));
+    assert_eq!(responses[0].1, json!({ "decision": "cancel" }));
+    drop(responses);
+    assert_eq!(cli_session.closes.load(Ordering::SeqCst), 0);
+    assert!(
+        cli_manager.existing_session(&key).await.is_some(),
+        "stale request for another native thread must not close the active starting turn session"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_server_request_without_native_thread_does_not_buffer_on_starting_binding() {
+    let (tx, _rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+
+    let thread_id = "thread_cli_missing_native_thread_request";
+    let turn_id = "turn_cli_missing_native_thread_request";
+    let native_thread_id = "codex-thread-missing-native-thread";
+    seed_cli_runtime_approval_turn(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+        native_thread_id,
+    )
+    .await;
+
+    let now = chrono::Utc::now().fixed_offset();
+    crud_store
+        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+            turn_id: turn_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            workspace_id: workspace_id.clone(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            native_thread_id: native_thread_id.to_owned(),
+            native_turn_id: None,
+            request_id: None,
+            status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING.to_owned(),
+            model: Some("gpt-5".to_owned()),
+            cwd: Some("/tmp/project".to_owned()),
+            sandbox_json: None,
+            approval_policy: None,
+            input_mapping_json: "{}".to_owned(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("starting CLI runtime turn binding should upsert");
+
+    let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
+        .expect("session key should build");
+    cli_manager
+        .get_or_start(key.clone())
+        .await
+        .expect("test CLI runtime session should start");
+
+    let request = CodexJsonlRpcServerRequest {
+        id: JsonlRpcId::from(58_i64),
+        method: "item/commandExecution/requestApproval".to_owned(),
+        params: Some(json!({
+            "turnId": "codex-turn-missing-native-thread",
+            "itemId": "codex-item-missing-native-thread",
+            "command": "echo stale",
+            "cwd": "/tmp/project"
+        })),
+        raw: json!({
+            "id": 58,
+            "method": "item/commandExecution/requestApproval"
+        }),
+    };
+    let event = map_codex_server_request_event(&request, RuntimeEventMappingOptions::default());
+    processor
+        .handle_cli_runtime_codex_server_request(&key, request, event)
+        .await;
+
+    let pending = crud_store
+        .list_cli_runtime_pending_requests(pioneer_crud::CliRuntimePendingRequestListFilter {
+            thread_id: Some(thread_id.to_owned()),
+            limit: None,
+            ..Default::default()
+        })
+        .await
+        .expect("pending request list should load");
+    assert!(
+        pending.is_empty(),
+        "request without native thread id must not be guessed into a starting turn"
+    );
+
+    let responses = cli_session.responses.lock().await;
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].0, json!(58));
+    assert_eq!(responses[0].1, json!({ "decision": "cancel" }));
+    drop(responses);
+    assert_eq!(cli_session.closes.load(Ordering::SeqCst), 0);
+    assert!(
+        cli_manager.existing_session(&key).await.is_some(),
+        "stale request without native thread must not close the active starting turn session"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_server_request_without_native_turn_does_not_close_starting_session() {
+    let (tx, _rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+
+    let thread_id = "thread_cli_missing_native_turn_request";
+    let turn_id = "turn_cli_missing_native_turn_request";
+    let native_thread_id = "codex-thread-missing-native-turn";
+    seed_cli_runtime_approval_turn(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+        native_thread_id,
+    )
+    .await;
+
+    let now = chrono::Utc::now().fixed_offset();
+    crud_store
+        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+            turn_id: turn_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            workspace_id: workspace_id.clone(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            native_thread_id: native_thread_id.to_owned(),
+            native_turn_id: None,
+            request_id: None,
+            status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING.to_owned(),
+            model: Some("gpt-5".to_owned()),
+            cwd: Some("/tmp/project".to_owned()),
+            sandbox_json: None,
+            approval_policy: None,
+            input_mapping_json: "{}".to_owned(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("starting CLI runtime turn binding should upsert");
+
+    let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
+        .expect("session key should build");
+    cli_manager
+        .get_or_start(key.clone())
+        .await
+        .expect("test CLI runtime session should start");
+
+    let request = CodexJsonlRpcServerRequest {
+        id: JsonlRpcId::from(61_i64),
+        method: "item/commandExecution/requestApproval".to_owned(),
+        params: Some(json!({
+            "threadId": native_thread_id,
+            "itemId": "codex-item-missing-native-turn",
+            "command": "echo stale",
+            "cwd": "/tmp/project"
+        })),
+        raw: json!({
+            "id": 61,
+            "method": "item/commandExecution/requestApproval"
+        }),
+    };
+    let event = map_codex_server_request_event(&request, RuntimeEventMappingOptions::default());
+    processor
+        .handle_cli_runtime_codex_server_request(&key, request, event)
+        .await;
+
+    let pending = crud_store
+        .list_cli_runtime_pending_requests(pioneer_crud::CliRuntimePendingRequestListFilter {
+            thread_id: Some(thread_id.to_owned()),
+            limit: None,
+            ..Default::default()
+        })
+        .await
+        .expect("pending request list should load");
+    assert!(
+        pending.is_empty(),
+        "request without native turn id must not be guessed into a starting turn"
+    );
+
+    let responses = cli_session.responses.lock().await;
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].0, json!(61));
+    assert_eq!(responses[0].1, json!({ "decision": "cancel" }));
+    drop(responses);
+    assert_eq!(cli_session.closes.load(Ordering::SeqCst), 0);
+    assert!(
+        cli_manager.existing_session(&key).await.is_some(),
+        "stale request without native turn must not close the active starting turn session"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_server_request_with_bound_native_turn_but_mismatched_native_thread_is_cancelled()
+ {
+    let (tx, _rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+
+    let thread_id = "thread_cli_bound_mismatched_native_thread_request";
+    let turn_id = "codex-turn-bound-mismatched-native-thread";
+    let native_thread_id = "codex-thread-bound-mismatched-native-thread";
+    seed_cli_runtime_approval_turn(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+        native_thread_id,
+    )
+    .await;
+
+    let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
+        .expect("session key should build");
+    cli_manager
+        .get_or_start(key.clone())
+        .await
+        .expect("test CLI runtime session should start");
+
+    let request = CodexJsonlRpcServerRequest {
+        id: JsonlRpcId::from(59_i64),
+        method: "item/commandExecution/requestApproval".to_owned(),
+        params: Some(json!({
+            "threadId": "codex-thread-bound-mismatched-native-thread-other",
+            "turnId": turn_id,
+            "itemId": "codex-item-bound-mismatched-native-thread",
+            "command": "echo stale",
+            "cwd": "/tmp/project"
+        })),
+        raw: json!({
+            "id": 59,
+            "method": "item/commandExecution/requestApproval"
+        }),
+    };
+    let event = map_codex_server_request_event(&request, RuntimeEventMappingOptions::default());
+    processor
+        .handle_cli_runtime_codex_server_request(&key, request, event)
+        .await;
+
+    let pending = crud_store
+        .list_cli_runtime_pending_requests(pioneer_crud::CliRuntimePendingRequestListFilter {
+            thread_id: Some(thread_id.to_owned()),
+            limit: None,
+            ..Default::default()
+        })
+        .await
+        .expect("pending request list should load");
+    assert!(
+        pending.is_empty(),
+        "mismatched native thread must not bind by native turn id alone"
+    );
+
+    let responses = cli_session.responses.lock().await;
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].0, json!(59));
+    assert_eq!(responses[0].1, json!({ "decision": "cancel" }));
+    drop(responses);
+    assert_eq!(cli_session.closes.load(Ordering::SeqCst), 0);
+    assert!(
+        cli_manager.existing_session(&key).await.is_some(),
+        "stale request for another native thread must not close the active bound turn session"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_server_request_with_bound_native_turn_but_missing_native_thread_is_cancelled()
+{
+    let (tx, _rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+
+    let thread_id = "thread_cli_bound_missing_native_thread_request";
+    let turn_id = "codex-turn-bound-missing-native-thread";
+    let native_thread_id = "codex-thread-bound-missing-native-thread";
+    seed_cli_runtime_approval_turn(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+        native_thread_id,
+    )
+    .await;
+
+    let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
+        .expect("session key should build");
+    cli_manager
+        .get_or_start(key.clone())
+        .await
+        .expect("test CLI runtime session should start");
+
+    let request = CodexJsonlRpcServerRequest {
+        id: JsonlRpcId::from(60_i64),
+        method: "item/commandExecution/requestApproval".to_owned(),
+        params: Some(json!({
+            "turnId": turn_id,
+            "itemId": "codex-item-bound-missing-native-thread",
+            "command": "echo stale",
+            "cwd": "/tmp/project"
+        })),
+        raw: json!({
+            "id": 60,
+            "method": "item/commandExecution/requestApproval"
+        }),
+    };
+    let event = map_codex_server_request_event(&request, RuntimeEventMappingOptions::default());
+    processor
+        .handle_cli_runtime_codex_server_request(&key, request, event)
+        .await;
+
+    let pending = crud_store
+        .list_cli_runtime_pending_requests(pioneer_crud::CliRuntimePendingRequestListFilter {
+            thread_id: Some(thread_id.to_owned()),
+            limit: None,
+            ..Default::default()
+        })
+        .await
+        .expect("pending request list should load");
+    assert!(
+        pending.is_empty(),
+        "missing native thread must not bind by native turn id alone"
+    );
+
+    let responses = cli_session.responses.lock().await;
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].0, json!(60));
+    assert_eq!(responses[0].1, json!({ "decision": "cancel" }));
+    drop(responses);
+    assert_eq!(cli_session.closes.load(Ordering::SeqCst), 0);
+    assert!(
+        cli_manager.existing_session(&key).await.is_some(),
+        "stale request without native thread must not close the active bound turn session"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_event_with_bound_native_turn_but_mismatched_native_thread_is_ignored() {
+    let thread_id = "thr_cli_event_mismatched_native_thread";
+    let turn_id = "turn_cli_event_mismatched_native_thread";
+    let (processor, crud_store, workspace_id) =
+        setup_execution_window_terminal_turn(thread_id, turn_id).await;
+
+    let now = chrono::Utc::now().fixed_offset();
+    crud_store
+        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+            turn_id: turn_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            workspace_id: workspace_id.clone(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            native_thread_id: "codex-thread-event-mismatched-native-thread".to_owned(),
+            native_turn_id: Some("codex-turn-event-mismatched-native-thread".to_owned()),
+            request_id: None,
+            status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING.to_owned(),
+            model: Some("gpt-5".to_owned()),
+            cwd: Some("/tmp/project".to_owned()),
+            sandbox_json: None,
+            approval_policy: None,
+            input_mapping_json: "{}".to_owned(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("CLI runtime turn binding should upsert");
+
+    let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
+        .expect("session key should build");
+    processor
+        .handle_cli_runtime_codex_event(
+            &key,
+            RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
+                native_thread_id: Some(
+                    "codex-thread-event-mismatched-native-thread-other".to_owned(),
+                ),
+                native_turn_id: "codex-turn-event-mismatched-native-thread".to_owned(),
+                status: "completed".to_owned(),
+                native: None,
+            }),
+        )
+        .await;
+
+    let (_workspace_id, turn) = crud_store
+        .get_turn(thread_id, turn_id)
+        .await
+        .expect("turn should load")
+        .expect("turn should exist");
+    assert_eq!(turn.status, TurnStatus::InProgress);
+
+    let binding = crud_store
+        .get_cli_runtime_turn_binding(turn_id)
+        .await
+        .expect("binding should load")
+        .expect("binding should exist");
+    assert_eq!(
+        binding.status,
+        crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_event_with_bound_native_turn_but_missing_native_thread_is_ignored() {
+    let thread_id = "thr_cli_event_missing_native_thread_bound";
+    let turn_id = "turn_cli_event_missing_native_thread_bound";
+    let (processor, crud_store, workspace_id) =
+        setup_execution_window_terminal_turn(thread_id, turn_id).await;
+
+    let now = chrono::Utc::now().fixed_offset();
+    crud_store
+        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+            turn_id: turn_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            workspace_id: workspace_id.clone(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            native_thread_id: "codex-thread-event-missing-native-thread-bound".to_owned(),
+            native_turn_id: Some("codex-turn-event-missing-native-thread-bound".to_owned()),
+            request_id: None,
+            status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING.to_owned(),
+            model: Some("gpt-5".to_owned()),
+            cwd: Some("/tmp/project".to_owned()),
+            sandbox_json: None,
+            approval_policy: None,
+            input_mapping_json: "{}".to_owned(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("CLI runtime turn binding should upsert");
+
+    let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
+        .expect("session key should build");
+    processor
+        .handle_cli_runtime_codex_event(
+            &key,
+            RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
+                native_thread_id: None,
+                native_turn_id: "codex-turn-event-missing-native-thread-bound".to_owned(),
+                status: "completed".to_owned(),
+                native: None,
+            }),
+        )
+        .await;
+
+    let (_workspace_id, turn) = crud_store
+        .get_turn(thread_id, turn_id)
+        .await
+        .expect("turn should load")
+        .expect("turn should exist");
+    assert_eq!(turn.status, TurnStatus::InProgress);
+
+    let binding = crud_store
+        .get_cli_runtime_turn_binding(turn_id)
+        .await
+        .expect("binding should load")
+        .expect("binding should exist");
+    assert_eq!(
+        binding.status,
+        crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_thread_state_event_without_native_thread_is_ignored() {
+    let thread_id = "thr_cli_thread_state_missing_native_thread";
+    let turn_id = "turn_cli_thread_state_missing_native_thread";
+    let (processor, crud_store, workspace_id) =
+        setup_execution_window_terminal_turn(thread_id, turn_id).await;
+
+    let now = chrono::Utc::now().fixed_offset();
+    crud_store
+        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+            turn_id: turn_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            workspace_id: workspace_id.clone(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            native_thread_id: "codex-thread-state-missing-native-thread".to_owned(),
+            native_turn_id: Some("codex-turn-thread-state-missing-native-thread".to_owned()),
+            request_id: None,
+            status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING.to_owned(),
+            model: Some("gpt-5".to_owned()),
+            cwd: Some("/tmp/project".to_owned()),
+            sandbox_json: None,
+            approval_policy: None,
+            input_mapping_json: "{}".to_owned(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("CLI runtime turn binding should upsert");
+
+    let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
+        .expect("session key should build");
+    processor
+        .handle_cli_runtime_codex_event(
+            &key,
+            RuntimeEvent::ThreadStateChanged(RuntimeThreadStateChanged {
+                native_thread_id: None,
+                status: "closed".to_owned(),
+                native: None,
+            }),
+        )
+        .await;
+
+    let history = crud_store
+        .get_thread_history(thread_id, Some(32))
+        .await
+        .expect("thread history should load")
+        .expect("thread history should exist");
+    assert!(!history.events.iter().any(|event| matches!(
+        &event.payload,
+        ThreadHistoryEventPayload::ItemCompleted {
+            item: TurnItem::SystemEvent {
+                code: Some(code), ..
+            },
+            ..
+        } if code == "agent_thread_status_changed"
+    )));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_event_without_native_thread_does_not_buffer_before_turn_binding() {
+    let thread_id = "thr_cli_event_missing_native_thread_before_binding";
+    let turn_id = "turn_cli_event_missing_native_thread_before_binding";
+    let native_thread_id = "codex-thread-event-missing-native-thread-before-binding";
+    let native_turn_id = "codex-turn-event-missing-native-thread-before-binding";
+    let (processor, crud_store, workspace_id) =
+        setup_execution_window_terminal_turn(thread_id, turn_id).await;
+
+    let now = chrono::Utc::now().fixed_offset();
+    crud_store
+        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+            turn_id: turn_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            workspace_id: workspace_id.clone(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            native_thread_id: native_thread_id.to_owned(),
+            native_turn_id: None,
+            request_id: None,
+            status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING.to_owned(),
+            model: Some("gpt-5".to_owned()),
+            cwd: Some("/tmp/project".to_owned()),
+            sandbox_json: None,
+            approval_policy: None,
+            input_mapping_json: "{}".to_owned(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("CLI runtime starting turn binding should upsert");
+
+    let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
+        .expect("session key should build");
+    processor
+        .handle_cli_runtime_codex_event(
+            &key,
+            RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
+                native_thread_id: None,
+                native_turn_id: native_turn_id.to_owned(),
+                status: "completed".to_owned(),
+                native: None,
+            }),
+        )
+        .await;
+
+    crate::cli_runtime::turn_binding::persist_cli_runtime_turn_binding_after_native_start(
+        crud_store.as_ref(),
+        crate::cli_runtime::turn_binding::CLIAgentRuntimeNativeTurnStarted {
+            turn_id: turn_id.to_owned(),
+            native_turn_id: native_turn_id.to_owned(),
+            request_id: None,
+            started_at: chrono::Utc::now().fixed_offset(),
+        },
+    )
+    .await
+    .expect("native turn id should persist");
+    processor
+        .flush_cli_runtime_codex_events_for_native_turn(&key, native_thread_id, native_turn_id)
+        .await;
+
+    let (_workspace_id, turn) = crud_store
+        .get_turn(thread_id, turn_id)
+        .await
+        .expect("turn should load")
+        .expect("turn should exist");
+    assert_eq!(turn.status, TurnStatus::InProgress);
+
+    let binding = crud_store
+        .get_cli_runtime_turn_binding(turn_id)
+        .await
+        .expect("binding should load")
+        .expect("binding should exist");
+    assert_eq!(
+        binding.status,
+        crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_terminal_event_expires_pending_requests_for_turn() {
+    let thread_id = "thr_cli_terminal_event_expires_pending";
+    let turn_id = "turn_cli_terminal_event_expires_pending";
+    let native_thread_id = "codex-thread-terminal-event-expires-pending";
+    let native_turn_id = "codex-turn-terminal-event-expires-pending";
+    let (processor, crud_store, workspace_id) =
+        setup_execution_window_terminal_turn(thread_id, turn_id).await;
+
+    let now = chrono::Utc::now().fixed_offset();
+    crud_store
+        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+            turn_id: turn_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            workspace_id: workspace_id.clone(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            native_thread_id: native_thread_id.to_owned(),
+            native_turn_id: Some(native_turn_id.to_owned()),
+            request_id: None,
+            status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING.to_owned(),
+            model: Some("gpt-5".to_owned()),
+            cwd: Some("/tmp/project".to_owned()),
+            sandbox_json: None,
+            approval_policy: None,
+            input_mapping_json: "{}".to_owned(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("CLI runtime turn binding should upsert");
+
+    let pending_payload = CLIRuntimePendingRequest {
+        kind: CLIRuntimeRequestKind::CommandApproval,
+        title: Some("Run command".to_owned()),
+        message: Some("Codex wants approval before terminal event".to_owned()),
+        native_request_id: Some("native-approval-terminal-event".to_owned()),
+        payload: Some(json!({
+            "nativeRequestIdJson": "native-approval-terminal-event",
+            "command": "sleep 30"
+        })),
+    };
+    processor
+        .open_cli_runtime_pending_request(NewCliRuntimePendingRequest {
+            request_id: "cli-approval-terminal-event".to_owned(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            workspace_id: workspace_id.clone(),
+            thread_id: thread_id.to_owned(),
+            turn_id: Some(turn_id.to_owned()),
+            native_thread_id: Some(native_thread_id.to_owned()),
+            native_turn_id: Some(native_turn_id.to_owned()),
+            native_item_id: Some("codex-item-terminal-event".to_owned()),
+            request_kind: "command_approval".to_owned(),
+            payload_json: pioneer_crud::serialize_cli_runtime_json(&pending_payload)
+                .expect("pending payload should serialize"),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("pending request should open");
+
+    let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
+        .expect("session key should build");
+    processor
+        .handle_cli_runtime_codex_event(
+            &key,
+            RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
+                native_thread_id: Some(native_thread_id.to_owned()),
+                native_turn_id: native_turn_id.to_owned(),
+                status: "completed".to_owned(),
+                native: None,
+            }),
+        )
+        .await;
+
+    let pending = crud_store
+        .get_cli_runtime_pending_request("cli-approval-terminal-event")
+        .await
+        .expect("pending request should load")
+        .expect("pending request should exist");
+    assert_eq!(
+        pending.status,
+        pioneer_crud::CliRuntimePendingRequestStatus::Expired
+    );
+
+    let binding = crud_store
+        .get_cli_runtime_turn_binding(turn_id)
+        .await
+        .expect("binding should load")
+        .expect("binding should exist");
+    assert_eq!(
+        binding.status,
+        crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_COMPLETED
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_late_terminal_event_after_blocked_turn_is_ignored() {
+    let thread_id = "thr_cli_late_event_after_blocked";
+    let turn_id = "turn_cli_late_event_after_blocked";
+    let (processor, crud_store, workspace_id) =
+        setup_execution_window_terminal_turn(thread_id, turn_id).await;
+
+    let now = chrono::Utc::now().fixed_offset();
+    crud_store
+        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+            turn_id: turn_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            workspace_id: workspace_id.clone(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            native_thread_id: "codex-thread-late-event".to_owned(),
+            native_turn_id: Some("codex-turn-late-event".to_owned()),
+            request_id: None,
+            status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING.to_owned(),
+            model: Some("gpt-5".to_owned()),
+            cwd: Some("/tmp/project".to_owned()),
+            sandbox_json: None,
+            approval_policy: None,
+            input_mapping_json: "{}".to_owned(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("CLI runtime turn binding should upsert");
+
+    let blocked_reason = "cannot restore recovery after agent loop loss because durable turn runtime snapshot is missing";
+    let job = crud_store
+        .enqueue_recovery_job(
+            turn_id.to_owned(),
+            "tool_late_event".to_owned(),
+            TurnItemType::DynamicToolCall,
+            None,
+            RecoveryTrigger::Timeout,
+            RecoveryAction::RetryAttempt,
+            Some("late event timeout".to_owned()),
+            None,
+            None,
+            None,
+            0,
+            2,
+            json!({}),
+            json!({
+                "base_backoff_secs": 0,
+                "max_wall_clock_secs": 60,
+                "no_progress_limit": 3,
+            }),
+            1_700_000_040,
+        )
+        .await
+        .expect("recovery job should enqueue");
+    crud_store
+        .mark_recovery_job_terminal(
+            job.id.as_str(),
+            RecoveryJobStatus::Blocked,
+            Some(blocked_reason.to_owned()),
+            1_700_000_041,
+        )
+        .await
+        .expect("recovery job should be blocked before event dispatch");
+    processor
+        .handle_recovery_event(
+            crate::resilience::RecoveryCoordinatorEvent::RecoveryBlocked {
+                job_id: job.id,
+                turn_id: turn_id.to_owned(),
+                reason: blocked_reason.to_owned(),
+            },
+            1_700_000_042,
+        )
+        .await;
+
+    let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
+        .expect("session key should build");
+    processor
+        .handle_cli_runtime_codex_event(
+            &key,
+            RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
+                native_thread_id: Some("codex-thread-late-event".to_owned()),
+                native_turn_id: "codex-turn-late-event".to_owned(),
+                status: "completed".to_owned(),
+                native: None,
+            }),
+        )
+        .await;
+
+    let binding = crud_store
+        .get_cli_runtime_turn_binding(turn_id)
+        .await
+        .expect("binding should load")
+        .expect("binding should exist");
+    assert_eq!(
+        binding.status,
+        crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_BLOCKED
+    );
+
+    let (_workspace_id, turn) = crud_store
+        .get_turn(thread_id, turn_id)
+        .await
+        .expect("turn should load")
+        .expect("turn should exist");
+    assert_eq!(turn.status, TurnStatus::Blocked);
+
+    let history = crud_store
+        .get_thread_history(thread_id, Some(32))
+        .await
+        .expect("thread history should load")
+        .expect("thread history should exist");
+    assert!(!history.events.iter().any(|event| matches!(
+        &event.payload,
+        ThreadHistoryEventPayload::TurnCompleted { turn, .. }
+            if turn.id == turn_id
     )));
 }
 

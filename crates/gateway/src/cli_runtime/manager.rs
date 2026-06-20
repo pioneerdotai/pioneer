@@ -7,7 +7,6 @@ use pioneer_cli_agent_runtime::codex::{
     CodexJsonlRpcClientDiagnostic, CodexJsonlRpcNotificationEvent, CodexJsonlRpcServerRequest,
     CodexThreadOpenSnapshot, CodexThreadStartParams, CodexTurnStartParams, CodexTurnStartSnapshot,
 };
-use pioneer_protocol::{CLIRuntimeReviewDelivery, CLIRuntimeReviewTarget};
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -36,21 +35,6 @@ impl CLIAgentRuntimeSessionKey {
             thread_id,
         })
     }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct CLIAgentRuntimeReviewStartRequest {
-    pub native_thread_id: String,
-    pub delivery: CLIRuntimeReviewDelivery,
-    pub target: CLIRuntimeReviewTarget,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct CLIAgentRuntimeReviewStartResult {
-    pub native_thread_id: String,
-    pub review_thread_id: String,
-    pub native_turn_id: Option<String>,
-    pub raw: Option<JsonValue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,14 +151,6 @@ pub(crate) trait CLIAgentRuntimeSession: Send + Sync {
     ) -> Result<()> {
         let _ = (native_thread_id, native_turn_id);
         bail!("CLI runtime session does not support turn interrupt");
-    }
-
-    async fn review_start(
-        &self,
-        request: CLIAgentRuntimeReviewStartRequest,
-    ) -> Result<CLIAgentRuntimeReviewStartResult> {
-        let _ = request;
-        bail!("CLI runtime session does not support review start");
     }
 
     async fn thread_compact(
@@ -368,6 +344,17 @@ impl CLIAgentRuntimeManager {
         }
         cached.last_used_at_ms = now_ms;
         Some(cached.handle(key))
+    }
+
+    pub(crate) async fn existing_session(
+        &self,
+        key: &CLIAgentRuntimeSessionKey,
+    ) -> Option<CLIAgentRuntimeSessionHandle> {
+        self.sessions
+            .lock()
+            .await
+            .get(key)
+            .map(|cached| cached.handle(key))
     }
 
     async fn remove_session_with_different_options(

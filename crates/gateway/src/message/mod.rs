@@ -252,6 +252,9 @@ pub struct MessageProcessor {
     parent_timeline_targets: Arc<Mutex<HashMap<String, agent_runtime::ParentTimelineTarget>>>,
     cli_runtime_pending_turn_events:
         Arc<Mutex<HashMap<CLIRuntimePendingTurnEventKey, Vec<CLIRuntimePendingTurnEvent>>>>,
+    cli_runtime_pending_turn_server_requests:
+        Arc<Mutex<HashMap<CLIRuntimePendingTurnEventKey, Vec<CLIRuntimePendingTurnServerRequest>>>>,
+    cli_runtime_pending_turn_activity_sequence: Arc<AtomicU64>,
     turn_llm_context_sequences: Arc<Mutex<HashMap<String, i64>>>,
     artifact_tool_states: Arc<Mutex<HashMap<String, Arc<ArtifactToolState>>>>,
     artifact_output_dirs: Arc<Mutex<HashMap<String, String>>>,
@@ -300,6 +303,7 @@ struct CLIRuntimePendingTurnEventKey {
     workspace_id: String,
     runtime_id: String,
     thread_id: String,
+    native_thread_id: String,
     native_turn_id: String,
 }
 
@@ -307,6 +311,15 @@ struct CLIRuntimePendingTurnEventKey {
 struct CLIRuntimePendingTurnEvent {
     event: RuntimeEvent,
     received_at_unix_ms: i64,
+    received_sequence: u64,
+}
+
+#[derive(Clone, Debug)]
+struct CLIRuntimePendingTurnServerRequest {
+    request: pioneer_cli_agent_runtime::codex::CodexJsonlRpcServerRequest,
+    event: RuntimeEvent,
+    received_at_unix_ms: i64,
+    received_sequence: u64,
 }
 
 impl MessageProcessor {
@@ -449,6 +462,8 @@ impl MessageProcessor {
             agent_message_buffers: Arc::new(Mutex::new(HashMap::new())),
             parent_timeline_targets: Arc::new(Mutex::new(HashMap::new())),
             cli_runtime_pending_turn_events: Arc::new(Mutex::new(HashMap::new())),
+            cli_runtime_pending_turn_server_requests: Arc::new(Mutex::new(HashMap::new())),
+            cli_runtime_pending_turn_activity_sequence: Arc::new(AtomicU64::new(0)),
             turn_llm_context_sequences: Arc::new(Mutex::new(HashMap::new())),
             artifact_tool_states: Arc::new(Mutex::new(HashMap::new())),
             artifact_output_dirs: Arc::new(Mutex::new(HashMap::new())),
@@ -1749,6 +1764,8 @@ impl MessageProcessor {
             agent_message_buffers: Arc::new(Mutex::new(HashMap::new())),
             parent_timeline_targets: Arc::new(Mutex::new(HashMap::new())),
             cli_runtime_pending_turn_events: Arc::new(Mutex::new(HashMap::new())),
+            cli_runtime_pending_turn_server_requests: Arc::new(Mutex::new(HashMap::new())),
+            cli_runtime_pending_turn_activity_sequence: Arc::new(AtomicU64::new(0)),
             turn_llm_context_sequences: Arc::new(Mutex::new(HashMap::new())),
             artifact_tool_states: Arc::new(Mutex::new(HashMap::new())),
             artifact_output_dirs: Arc::new(Mutex::new(HashMap::new())),
