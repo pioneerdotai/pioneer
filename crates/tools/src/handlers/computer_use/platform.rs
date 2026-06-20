@@ -1,5 +1,6 @@
 use super::model::{AppHandle, AppMeta, AppTarget};
 use crate::error::ToolError;
+#[cfg(target_os = "macos")]
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;

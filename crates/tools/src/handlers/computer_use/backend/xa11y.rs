@@ -877,9 +877,9 @@ fn xa11y_failure_class(error: &xa11y::Error) -> &'static str {
             "action_not_supported"
         }
         xa11y::Error::Timeout { .. } => "element_not_found",
-        xa11y::Error::InvalidSelector { .. } | xa11y::Error::InvalidActionData { .. } => {
-            "runtime_action_error"
-        }
+        xa11y::Error::InvalidSelector { .. }
+        | xa11y::Error::InvalidActionData { .. }
+        | xa11y::Error::InvalidConfig { .. } => "runtime_action_error",
         xa11y::Error::NoElementBounds | xa11y::Error::Unsupported { .. } => {
             "accessibility_unavailable"
         }
