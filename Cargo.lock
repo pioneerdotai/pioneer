@@ -8589,7 +8589,7 @@ dependencies = [
 [[package]]
 name = "rathole"
 version = "0.5.0"
-source = "git+https://github.com/pioneerdotai/relay.git#0f21ae8ed239ba533ab1c1f4ed6a4ed433f536a1"
+source = "git+https://github.com/pioneerdotai/relay.git#6e2090d53661da65449803e63b9ed9462cd182b1"
 dependencies = [
  "anyhow",
  "async-http-proxy",
@@ -9341,7 +9341,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

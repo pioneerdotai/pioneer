@@ -1,8 +1,6 @@
 use std::collections::BTreeMap;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -24,7 +22,6 @@ pub struct RemoteAccessDesiredState {
 }
 
 pub struct RemoteAccessSupervisor {
-    runtime_dir: PathBuf,
     config: GatewayRemoteAccessConfig,
     status_tx: watch::Sender<GatewayRemoteAccessStatusSnapshot>,
     state: Mutex<RemoteAccessSupervisorState>,
@@ -39,7 +36,6 @@ struct RemoteAccessSupervisorState {
 #[derive(Clone)]
 struct RemoteAccessRunConfig {
     generation: u64,
-    runtime_dir: PathBuf,
     remote_addr: String,
     local_addr: String,
     service_name: String,
@@ -89,6 +85,7 @@ impl RemoteAccessSupervisor {
                 runtime_dir.display()
             )
         })?;
+        remove_stale_runtime_configs(runtime_dir.as_path());
 
         let (status_tx, _status_rx) = watch::channel(status_snapshot(
             GatewayRemoteAccessState::Disabled,
@@ -97,7 +94,6 @@ impl RemoteAccessSupervisor {
         ));
 
         Ok(Self {
-            runtime_dir,
             config,
             status_tx,
             state: Mutex::new(RemoteAccessSupervisorState {
@@ -236,7 +232,6 @@ impl RemoteAccessSupervisor {
 
         Ok(Some(RemoteAccessRunConfig {
             generation,
-            runtime_dir: self.runtime_dir.clone(),
             remote_addr,
             local_addr: self.config.local_addr.clone(),
             service_name,
@@ -350,9 +345,9 @@ async fn run_rathole_once(
     status_tx: &watch::Sender<GatewayRemoteAccessStatusSnapshot>,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> Result<RatholeRunOutcome> {
-    let config_path = write_rathole_client_config(run_config)?;
+    let config = build_rathole_client_config(run_config)?;
     let args = rathole::Cli {
-        config_path: Some(config_path.clone()),
+        config_path: None,
         client: true,
         server: false,
         ..rathole::Cli::default()
@@ -361,13 +356,12 @@ async fn run_rathole_once(
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let mut event_state = RatholeEventState::default();
     let mut task = tokio::spawn(async move {
-        rathole::run_with_events(args, rathole_shutdown_rx, Some(event_tx)).await
+        rathole::run_config_with_events(config, args, rathole_shutdown_rx, Some(event_tx)).await
     });
 
     loop {
         tokio::select! {
             result = &mut task => {
-                remove_runtime_config(config_path.as_path());
                 return match result {
                     Ok(Ok(())) => Ok(RatholeRunOutcome::Exited),
                     Ok(Err(error)) => Err(error).context("remote access relay client returned an error"),
@@ -378,7 +372,6 @@ async fn run_rathole_once(
                 publish_rathole_event(status_tx, event, &mut event_state);
             }
             changed = shutdown_rx.changed() => {
-                remove_runtime_config(config_path.as_path());
                 if changed.is_ok() && *shutdown_rx.borrow() {
                     let _ = rathole_shutdown_tx.send(true);
                     return match tokio::time::timeout(Duration::from_secs(5), &mut task).await {
@@ -398,14 +391,12 @@ async fn run_rathole_once(
     }
 }
 
-fn write_rathole_client_config(run_config: &RemoteAccessRunConfig) -> Result<PathBuf> {
-    std::fs::create_dir_all(run_config.runtime_dir.as_path()).with_context(|| {
-        format!(
-            "failed to create remote access runtime dir `{}`",
-            run_config.runtime_dir.display()
-        )
-    })?;
+fn build_rathole_client_config(run_config: &RemoteAccessRunConfig) -> Result<rathole::Config> {
+    let content = render_rathole_client_config(run_config)?;
+    rathole::Config::from_str(content.as_str()).context("failed to build rathole client config")
+}
 
+fn render_rathole_client_config(run_config: &RemoteAccessRunConfig) -> Result<String> {
     let mut services = BTreeMap::new();
     services.insert(
         run_config.service_name.clone(),
@@ -422,49 +413,34 @@ fn write_rathole_client_config(run_config: &RemoteAccessRunConfig) -> Result<Pat
             services,
         },
     };
-    let content =
-        toml::to_string_pretty(&config).context("failed to serialize rathole client config")?;
-    let path = run_config
-        .runtime_dir
-        .join(format!("rathole-client-{}.toml", run_config.generation));
-    write_private_file(path.as_path(), content.as_bytes())?;
-    set_private_permissions(path.as_path())?;
-    Ok(path)
+    toml::to_string_pretty(&config).context("failed to serialize rathole client config")
 }
 
-fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+fn remove_stale_runtime_configs(runtime_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(runtime_dir) else {
+        return;
+    };
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-
-        options.mode(0o600);
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !is_stale_rathole_client_config(path.as_path()) {
+            continue;
+        }
+        if let Err(error) = std::fs::remove_file(path.as_path()) {
+            debug!(
+                path = %path.display(),
+                error = %format!("{error:#}"),
+                "failed to remove stale rathole client config"
+            );
+        }
     }
-
-    let mut file = options.open(path).with_context(|| {
-        format!(
-            "failed to create transient rathole client config `{}`",
-            path.display()
-        )
-    })?;
-    file.write_all(bytes).with_context(|| {
-        format!(
-            "failed to write transient rathole client config `{}`",
-            path.display()
-        )
-    })
 }
 
-fn remove_runtime_config(path: &Path) {
-    if let Err(error) = std::fs::remove_file(path) {
-        debug!(
-            path = %path.display(),
-            error = %format!("{error:#}"),
-            "failed to remove transient rathole client config"
-        );
-    }
+fn is_stale_rathole_client_config(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    file_name.starts_with("rathole-client-") && file_name.ends_with(".toml")
 }
 
 fn validate_rathole_service_name(service_name: &str) -> Result<()> {
@@ -682,23 +658,6 @@ fn unix_timestamp_secs() -> Result<u64> {
         .as_secs())
 }
 
-#[cfg(unix)]
-fn set_private_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let mut permissions = std::fs::metadata(path)
-        .with_context(|| format!("failed to read metadata for `{}`", path.display()))?
-        .permissions();
-    permissions.set_mode(0o600);
-    std::fs::set_permissions(path, permissions)
-        .with_context(|| format!("failed to set permissions for `{}`", path.display()))
-}
-
-#[cfg(not(unix))]
-fn set_private_permissions(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
 impl Drop for RemoteAccessSupervisor {
     fn drop(&mut self) {
         info!("remote access supervisor dropped");
@@ -710,11 +669,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rathole_client_config_uses_service_token_and_local_gateway() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
+    fn rathole_client_config_uses_service_token_without_runtime_file() {
         let run_config = RemoteAccessRunConfig {
             generation: 7,
-            runtime_dir: temp_dir.path().to_path_buf(),
             remote_addr: "relay.example.com:2333".to_owned(),
             local_addr: "127.0.0.1:17878".to_owned(),
             service_name: "pioneer_gateway".to_owned(),
@@ -725,8 +682,8 @@ mod tests {
             max_restarts: 0,
         };
 
-        let path = write_rathole_client_config(&run_config).expect("write config");
-        let content = std::fs::read_to_string(path).expect("read config");
+        let content = render_rathole_client_config(&run_config).expect("render config");
+        build_rathole_client_config(&run_config).expect("build config");
 
         assert!(content.contains("[client]"));
         assert!(content.contains("remote_addr = \"relay.example.com:2333\""));
@@ -734,18 +691,20 @@ mod tests {
         assert!(content.contains("auth = \"token_hash\""));
         assert!(content.contains("token = \"secret-token\""));
         assert!(content.contains("local_addr = \"127.0.0.1:17878\""));
+    }
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn stale_rathole_client_configs_are_removed() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let stale = temp_dir.path().join("rathole-client-7.toml");
+        let unrelated = temp_dir.path().join("other.toml");
+        std::fs::write(&stale, "token = \"secret-token\"").expect("write stale");
+        std::fs::write(&unrelated, "token = \"keep\"").expect("write unrelated");
 
-            let mode = std::fs::metadata(temp_dir.path().join("rathole-client-7.toml"))
-                .expect("metadata")
-                .permissions()
-                .mode()
-                & 0o777;
-            assert_eq!(mode, 0o600);
-        }
+        remove_stale_runtime_configs(temp_dir.path());
+
+        assert!(!stale.exists());
+        assert!(unrelated.exists());
     }
 
     #[test]
