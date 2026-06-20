@@ -27,7 +27,14 @@ impl PioneerDesktop {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let (text, markdown) = match item {
-            TurnItem::AgentMessage { text, markdown, .. } => (text.as_str(), markdown.as_ref()),
+            TurnItem::AgentMessage { markdown, .. } => (
+                Self::timeline_entry_text(item_view),
+                item_view
+                    .final_markdown
+                    .as_ref()
+                    .or(item_view.partial_markdown.as_ref())
+                    .or(markdown.as_ref()),
+            ),
             _ => (
                 Self::timeline_entry_text(item_view),
                 item_view.partial_markdown.as_ref(),
