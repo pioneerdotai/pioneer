@@ -8610,7 +8610,7 @@ dependencies = [
 [[package]]
 name = "rathole"
 version = "0.5.0"
-source = "git+https://github.com/pioneerdotai/relay.git#40a037b947b5c2780b842bb2a5e1aa24c6dcfda2"
+source = "git+https://github.com/pioneerdotai/relay.git#1651204f887ba0adb9ef71d98e1f83def2e03156"
 dependencies = [
  "anyhow",
  "async-http-proxy",
