@@ -86,6 +86,10 @@ fn looks_like_raw_tool_call_markup(text: &str) -> bool {
         return false;
     }
 
+    if looks_like_sanitized_dsml_tool_call_markup(trimmed) {
+        return true;
+    }
+
     let lower = trimmed.to_ascii_lowercase();
     let Some(tool_call_start) = raw_tool_call_opening_tag_index(lower.as_str()) else {
         return false;
@@ -107,6 +111,21 @@ fn looks_like_raw_tool_call_markup(text: &str) -> bool {
         || body.contains("</item>");
 
     has_tool_call_open && has_tool_call_close && (has_invoke_tag || has_tool_payload_tag)
+}
+
+fn looks_like_sanitized_dsml_tool_call_markup(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let compact = lower
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    let Some(tool_calls_start) = compact.find("<||dsml||tool_calls") else {
+        return false;
+    };
+    let body = &compact[tool_calls_start..];
+    body.contains("</||dsml||tool_calls>")
+        && (body.contains("<||dsml||invoke") || body.contains("</||dsml||invoke>"))
+        && (body.contains("<||dsml||parameter") || body.contains("</||dsml||parameter>"))
 }
 
 fn raw_tool_call_opening_tag_index(lower: &str) -> Option<usize> {
@@ -235,6 +254,14 @@ mod tests {
         assert!(looks_like_raw_tool_call_markup(
             "<tool_call>\n<invoke name=\"read_file\"><arguments>{\"path\":\"/tmp/a.md\"}</arguments></invoke>\n</tool_call>"
         ));
+        assert!(looks_like_raw_tool_call_markup(
+            "< | | DSML | | tool_calls>\n\
+             < | | DSML | | invoke name=\"exec_command\">\n\
+             < | | DSML | | parameter name=\"command\" string=\"false\">[\"brew\",\"install\",\"mole\"]</| | DSML | | parameter>\n\
+             < | | DSML | | parameter name=\"timeout_ms\" string=\"false\">120000</| | DSML | | parameter>\n\
+             </| | DSML | | invoke>\n\
+             </| | DSML | | tool_calls>"
+        ));
     }
 
     #[test]
@@ -256,6 +283,9 @@ mod tests {
         ));
         assert!(!looks_like_raw_tool_call_markup(
             "How LLM tool calls work:\n<toolcall><invoke name=\"exec_command\"></invoke></toolcall>"
+        ));
+        assert!(!looks_like_raw_tool_call_markup(
+            "Use DSML tags like < | | DSML | | tool_calls> only in documentation examples."
         ));
     }
 
