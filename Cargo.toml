@@ -82,7 +82,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 # Tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3" }
-sentry = { version = "0.46.2", default-features = false, features = ["anyhow", "backtrace", "contexts", "panic", "transport", "tracing"] }
+sentry = { version = "0.48", default-features = false, features = ["anyhow", "backtrace", "contexts", "panic", "transport", "tracing"] }
 dotenvy = "0.15"
 
 # UI
@@ -93,7 +93,7 @@ gpui-terminal = "0.1.0"
 markdown = "1"
 
 # Tokenization
-tiktoken-rs = "0.11"
+tiktoken-rs = "0.12"
 
 # Utils
 nanoid = "0.5"
@@ -109,7 +109,7 @@ scraper = "0.27"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 chrono-tz = "0.10"
 xcap = "0.9"
-xa11y = "0.8.1"
+xa11y = "0.9"
 tempfile = "3"
 keepawake = "0.6"
 
@@ -142,8 +142,8 @@ tar = "0.4"
 windows-sys = "0.61"
 
 # Database
-sea-orm = "2.0.0-rc.38"
-sea-orm-migration = "2.0.0-rc.38"
+sea-orm = "2.0.0-rc.41"
+sea-orm-migration = "2.0.0-rc.41"
 
 # MCP
 rmcp = { version = "1.7", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
