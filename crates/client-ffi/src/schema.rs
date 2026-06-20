@@ -34,6 +34,10 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             "client_error_event.json",
             crate::contracts::ClientErrorEvent
         ),
+        schema_doc!(
+            "client_diagnostic_event.json",
+            crate::diagnostics::ClientDiagnosticEvent
+        ),
         schema_doc!("client_event.json", crate::contracts::ClientEvent),
         schema_doc!(
             "client_active_thread_clear_result.json",

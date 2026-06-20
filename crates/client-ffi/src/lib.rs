@@ -6,6 +6,7 @@
 mod active_thread;
 mod composer;
 mod contracts;
+mod diagnostics;
 mod gateway;
 #[cfg(feature = "schema")]
 pub mod schema;
@@ -36,6 +37,7 @@ use contracts::{
     ClientEvent, ClientGatewayConnectRequest, ClientGatewayConnectResult,
     reduce_gateway_ws_events_to_client_events,
 };
+use diagnostics::{ClientDiagnosticEvent, ClientFfiDiagnostics};
 use gateway::{
     AddAndActivateRemoteGatewayRegistryPlan, AddRemoteGatewayPlan, PlanActivateGatewayRequest,
     PlanAddRemoteGatewayRequest, PlanDeleteRemoteGatewayRequest, PlanSetGatewayWorkspaceRequest,
@@ -115,6 +117,7 @@ struct ClientFfiRuntime {
     client_runtime: ClientRuntime,
     active_thread: ClientFfiActiveThreadState,
     active_connection_id: Mutex<Option<u64>>,
+    diagnostics: ClientFfiDiagnostics,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -775,31 +778,51 @@ impl ClientFfiRuntime {
             .clear(&self.client_runtime)
             .map_err(|error| format!("{error:#}"))
     }
+
+    fn diagnostics_drain(&self) -> Result<Vec<ClientDiagnosticEvent>, String> {
+        self.diagnostics.drain()
+    }
 }
 
 fn ffi_client_json_response<T, F>(
     ptr: *mut PioneerClientFfi,
     input_json: *const c_char,
+    operation_name: &'static str,
     operation: F,
 ) -> *mut c_char
 where
     T: Serialize,
     F: FnOnce(&ClientFfiRuntime, &str) -> Result<T, String>,
 {
-    into_ffi_response(|| {
-        let client = unsafe { ffi_ref(ptr)? };
-        let input_json = unsafe { read_c_string(input_json)? };
+    let client = match unsafe { ffi_ref(ptr) } {
+        Ok(client) => client,
+        Err(error) => return into_c_string(to_json_response::<()>(Err(error))),
+    };
+    let input_json = match unsafe { read_c_string(input_json) } {
+        Ok(input_json) => input_json,
+        Err(error) => return into_c_string(to_json_response::<()>(Err(error))),
+    };
+
+    into_ffi_response_with_diagnostics(&client.runtime.diagnostics, operation_name, || {
         operation(&client.runtime, input_json.as_str())
     })
 }
 
-fn ffi_client_response<T, F>(ptr: *mut PioneerClientFfi, operation: F) -> *mut c_char
+fn ffi_client_response<T, F>(
+    ptr: *mut PioneerClientFfi,
+    operation_name: &'static str,
+    operation: F,
+) -> *mut c_char
 where
     T: Serialize,
     F: FnOnce(&ClientFfiRuntime) -> Result<T, String>,
 {
-    into_ffi_response(|| {
-        let client = unsafe { ffi_ref(ptr)? };
+    let client = match unsafe { ffi_ref(ptr) } {
+        Ok(client) => client,
+        Err(error) => return into_c_string(to_json_response::<()>(Err(error))),
+    };
+
+    into_ffi_response_with_diagnostics(&client.runtime.diagnostics, operation_name, || {
         operation(&client.runtime)
     })
 }
@@ -811,9 +834,12 @@ macro_rules! ffi_client_json_method {
             ptr: *mut PioneerClientFfi,
             input_json: *const c_char,
         ) -> *mut c_char {
-            ffi_client_json_response(ptr, input_json, |runtime, input_json| {
-                runtime.$runtime_method(input_json)
-            })
+            ffi_client_json_response(
+                ptr,
+                input_json,
+                stringify!($runtime_method),
+                |runtime, input_json| runtime.$runtime_method(input_json),
+            )
         }
     };
 }
@@ -982,21 +1008,36 @@ ffi_client_json_method!(
 pub unsafe extern "C" fn pioneer_client_ffi_active_thread_clear(
     ptr: *mut PioneerClientFfi,
 ) -> *mut c_char {
-    ffi_client_response(ptr, |runtime| runtime.active_thread_clear())
+    ffi_client_response(ptr, "active_thread_clear", |runtime| {
+        runtime.active_thread_clear()
+    })
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pioneer_client_ffi_gateway_next_events(
     ptr: *mut PioneerClientFfi,
 ) -> *mut c_char {
-    ffi_client_response(ptr, |runtime| runtime.gateway_next_events())
+    ffi_client_response(ptr, "gateway_next_events", |runtime| {
+        runtime.gateway_next_events()
+    })
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pioneer_client_ffi_gateway_disconnect(
     ptr: *mut PioneerClientFfi,
 ) -> *mut c_char {
-    ffi_client_response(ptr, |runtime| runtime.gateway_disconnect())
+    ffi_client_response(ptr, "gateway_disconnect", |runtime| {
+        runtime.gateway_disconnect()
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pioneer_client_ffi_diagnostics_drain(
+    ptr: *mut PioneerClientFfi,
+) -> *mut c_char {
+    ffi_client_response(ptr, "diagnostics_drain", |runtime| {
+        runtime.diagnostics_drain()
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -1047,14 +1088,20 @@ fn gateway_auth_token_ref_for_endpoint(endpoint_id: &str) -> Result<String, Gate
 }
 
 fn to_json_response<T: Serialize>(result: Result<T, String>) -> String {
-    let response = match result {
-        Ok(value) => serde_json::to_string(&FfiResponse::Ok { value }),
-        Err(message) => serde_json::to_string(&FfiResponse::<()>::Error {
-            message,
-            code: Some("pioneer_client_ffi_error".to_owned()),
-        }),
-    };
+    match result {
+        Ok(value) => serialize_json_response(serde_json::to_string(&FfiResponse::Ok { value })),
+        Err(message) => to_json_error_response(message, "pioneer_client_ffi_error"),
+    }
+}
 
+fn to_json_error_response(message: String, code: &'static str) -> String {
+    serialize_json_response(serde_json::to_string(&FfiResponse::<()>::Error {
+        message,
+        code: Some(code.to_owned()),
+    }))
+}
+
+fn serialize_json_response(response: Result<String, serde_json::Error>) -> String {
     response.unwrap_or_else(|error| {
         format!(
             r#"{{"status":"error","message":"failed to serialize ffi response: {}","code":"pioneer_client_ffi_serialize_error"}}"#,
@@ -1071,16 +1118,48 @@ where
     into_c_string(ffi_response_json(operation))
 }
 
+fn into_ffi_response_with_diagnostics<T, F>(
+    diagnostics: &ClientFfiDiagnostics,
+    operation_name: &'static str,
+    operation: F,
+) -> *mut c_char
+where
+    T: Serialize,
+    F: FnOnce() -> Result<T, String>,
+{
+    into_c_string(ffi_response_json_with_diagnostics(
+        diagnostics,
+        operation_name,
+        operation,
+    ))
+}
+
 fn ffi_response_json<T, F>(operation: F) -> String
 where
     T: Serialize,
     F: FnOnce() -> Result<T, String>,
 {
     catch_unwind(AssertUnwindSafe(|| to_json_response(operation()))).unwrap_or_else(|payload| {
-        to_json_response::<()>(Err(format!(
-            "panic in pioneer client ffi: {}",
-            panic_message(payload)
-        )))
+        to_json_error_response(
+            format!("panic in pioneer client ffi: {}", panic_message(payload)),
+            "pioneer_client_ffi_panic",
+        )
+    })
+}
+
+fn ffi_response_json_with_diagnostics<T, F>(
+    diagnostics: &ClientFfiDiagnostics,
+    operation_name: &'static str,
+    operation: F,
+) -> String
+where
+    T: Serialize,
+    F: FnOnce() -> Result<T, String>,
+{
+    catch_unwind(AssertUnwindSafe(|| to_json_response(operation()))).unwrap_or_else(|payload| {
+        let message = format!("panic in pioneer client ffi: {}", panic_message(payload));
+        diagnostics.record_error(operation_name, message.clone(), "pioneer_client_ffi_panic");
+        to_json_error_response(message, "pioneer_client_ffi_panic")
     })
 }
 
@@ -1411,7 +1490,7 @@ mod tests {
         let error = serde_json::from_str::<serde_json::Value>(response.as_str()).expect("json");
 
         assert_eq!(error["status"], "error");
-        assert_eq!(error["code"], "pioneer_client_ffi_error");
+        assert_eq!(error["code"], "pioneer_client_ffi_panic");
         assert!(error["message"].as_str().unwrap().contains("boom"));
     }
 }
