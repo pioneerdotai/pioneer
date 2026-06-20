@@ -344,11 +344,6 @@ impl ClientFfiActiveThreadState {
             Some(selection.selected_provider.as_str()),
         )?;
         let cli_runtime_selected = selected_cli_runtime_backend.is_some();
-        let attachments = if cli_runtime_selected {
-            Vec::new()
-        } else {
-            attachments
-        };
         let capabilities = if cli_runtime_selected {
             Vec::new()
         } else {

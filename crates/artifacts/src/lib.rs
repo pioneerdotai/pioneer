@@ -9,6 +9,7 @@ pub mod output_dir;
 pub mod projection;
 pub mod provider_resolver;
 pub mod quota;
+pub mod readable_copy;
 pub mod registration;
 pub mod security;
 pub mod service;
@@ -36,6 +37,11 @@ pub use output_dir::{
 pub use projection::ArtifactProjectionRecord;
 pub use provider_resolver::ResolvedProviderArtifact;
 pub use quota::{ArtifactQuotaPolicy, ArtifactQuotaWarning, ArtifactWorkspaceUsage};
+pub use readable_copy::{
+    ARTIFACT_READABLE_COPY_DIR_NAME, ArtifactReadableCopyGcCandidate, ArtifactReadableCopyGcPlan,
+    ArtifactReadableCopyGcReport, artifact_readable_copy_workspace_root, execute_readable_copy_gc,
+    plan_readable_copy_gc,
+};
 pub use registration::{
     ArtifactRegistrationCandidate, ArtifactRegistrationContext, ArtifactRegistrationSource,
 };

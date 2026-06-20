@@ -99,7 +99,6 @@ impl PioneerDesktop {
         self.composer_selected_model = model;
         self.composer_model_selection_manually_selected = manually_selected;
         if self.composer_selected_provider_is_cli_runtime() {
-            self.composer_attachments.clear();
             self.composer_capabilities.clear();
             self.composer_upload_in_progress = false;
             self.composer_upload_error = None;

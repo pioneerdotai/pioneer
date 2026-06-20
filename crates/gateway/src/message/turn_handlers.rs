@@ -10,15 +10,15 @@ use pioneer_protocol::{
 fn cli_runtime_forbidden_input_kind(input: &UserInput) -> Option<&'static str> {
     match input {
         UserInput::Text { .. } => None,
-        UserInput::Image { .. } => Some("image"),
-        UserInput::LocalImage { .. } => Some("local_image"),
-        UserInput::File { .. } => Some("file"),
-        UserInput::LocalFile { .. } => Some("local_file"),
-        UserInput::Audio { .. } => Some("audio"),
-        UserInput::LocalAudio { .. } => Some("local_audio"),
-        UserInput::Video { .. } => Some("video"),
-        UserInput::LocalVideo { .. } => Some("local_video"),
-        UserInput::Artifact { .. } => Some("artifact"),
+        UserInput::Image { .. }
+        | UserInput::LocalImage { .. }
+        | UserInput::File { .. }
+        | UserInput::LocalFile { .. }
+        | UserInput::Audio { .. }
+        | UserInput::LocalAudio { .. }
+        | UserInput::Video { .. }
+        | UserInput::LocalVideo { .. }
+        | UserInput::Artifact { .. } => None,
         UserInput::Mention { .. } => Some("mention"),
     }
 }
@@ -414,7 +414,7 @@ impl MessageProcessor {
                     Some(request_id),
                     INVALID_REQUEST_CODE,
                     format!(
-                        "CLI runtime providers only support text input; `{input_kind}` attachments are not supported"
+                        "CLI runtime providers only support text, file, and image inputs; `{input_kind}` input is not supported"
                     ),
                 ),
             )
@@ -495,9 +495,43 @@ impl MessageProcessor {
                 return;
             }
         }
+        if let Err(error) = self
+            .validate_artifact_user_inputs(thread.workspace_id.as_str(), params.input.as_slice())
+            .await
+        {
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_REQUEST_CODE,
+                    format!("failed to validate CLI runtime artifact input: {error:#}"),
+                ),
+            )
+            .await;
+            return;
+        }
+        let resolved_artifacts = match self
+            .resolve_provider_artifact_inputs(thread.workspace_id.as_str(), params.input.as_slice())
+            .await
+        {
+            Ok(resolved_artifacts) => resolved_artifacts,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to materialize CLI runtime artifact input: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
         let mut input_mapping =
             match crate::cli_runtime::input_mapping::map_codex_turn_input_from_pioneer(
                 params.input.as_slice(),
+                resolved_artifacts.as_slice(),
             ) {
                 Ok(input_mapping) => input_mapping,
                 Err(error) => {

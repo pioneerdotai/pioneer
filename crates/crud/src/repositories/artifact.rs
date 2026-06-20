@@ -1006,6 +1006,10 @@ fn conversation_artifact_ref_bucket(
     direction: ArtifactBindingDirection,
     role: Option<ArtifactRole>,
 ) -> Option<ConversationArtifactRefBucket> {
+    if binding_kind == ArtifactBindingKind::DraftUpload {
+        return None;
+    }
+
     if role == Some(ArtifactRole::User)
         || binding_kind == ArtifactBindingKind::UserInput
         || direction == ArtifactBindingDirection::Input

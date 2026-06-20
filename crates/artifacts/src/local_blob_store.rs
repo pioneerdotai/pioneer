@@ -258,7 +258,7 @@ impl ArtifactBlobStore for LocalArtifactBlobStore {
         remove_file_if_exists(&path).await
     }
 
-    async fn materialize_temp(
+    async fn materialize_readable_copy(
         &self,
         workspace_id: &str,
         storage_key: &str,
@@ -596,7 +596,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn materialize_temp_writes_readable_copy_with_safe_name() {
+    async fn materialize_readable_copy_writes_readable_copy_with_safe_name() {
         let temp = tempfile::tempdir().expect("temp dir");
         let store = store(temp.path());
         let stored = store
@@ -605,7 +605,7 @@ mod tests {
             .expect("put bytes");
 
         let path = store
-            .materialize_temp("wsA123", &stored.storage_key, "preview.txt")
+            .materialize_readable_copy("wsA123", &stored.storage_key, "preview.txt")
             .await
             .expect("materialize");
         let bytes = fs::read(&path).await.expect("read materialized");
@@ -616,7 +616,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn materialize_temp_rejects_path_escape_name() {
+    async fn materialize_readable_copy_rejects_path_escape_name() {
         let temp = tempfile::tempdir().expect("temp dir");
         let store = store(temp.path());
         let stored = store
@@ -625,7 +625,7 @@ mod tests {
             .expect("put bytes");
 
         let error = store
-            .materialize_temp("wsA123", &stored.storage_key, "../preview.txt")
+            .materialize_readable_copy("wsA123", &stored.storage_key, "../preview.txt")
             .await
             .expect_err("unsafe materialized name should be rejected");
 

@@ -42,7 +42,7 @@ impl ArtifactService {
         let safe_name = provider_safe_name(summary.artifact.display_name.as_str());
         let path = self
             .blob_store
-            .materialize_temp(workspace_id, blob.storage_key.as_str(), safe_name.as_str())
+            .materialize_readable_copy(workspace_id, blob.storage_key.as_str(), safe_name.as_str())
             .await?;
         let mime_type = summary
             .artifact

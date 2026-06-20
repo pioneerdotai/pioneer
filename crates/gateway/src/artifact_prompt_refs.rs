@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use pioneer_crud::ConversationArtifactRef;
 
 pub(crate) const HISTORY_USER_ARTIFACT_REFS_HEADER: &str =
@@ -51,6 +53,7 @@ fn render_artifact_refs_block(
     if !text.is_empty() {
         output.push_str(text);
     }
+    let refs = dedupe_artifact_refs(refs);
     if !refs.is_empty() {
         if !output.is_empty() {
             output.push_str("\n\n");
@@ -62,6 +65,18 @@ fn render_artifact_refs_block(
         }
     }
     Some(output)
+}
+
+fn dedupe_artifact_refs(refs: &[ConversationArtifactRef]) -> Vec<&ConversationArtifactRef> {
+    let mut seen = HashSet::<(&str, Option<&str>)>::new();
+    refs.iter()
+        .filter(|artifact_ref| {
+            seen.insert((
+                artifact_ref.artifact_id.as_str(),
+                artifact_ref.version_id.as_deref(),
+            ))
+        })
+        .collect()
 }
 
 fn render_artifact_ref_line(artifact_ref: &ConversationArtifactRef) -> String {
@@ -164,6 +179,23 @@ mod tests {
         assert!(rendered.contains("artifactId=art_car"));
         assert!(rendered.contains("kind=image"));
         assert!(!rendered.contains("artifact_read"));
+    }
+
+    #[test]
+    fn history_artifact_refs_dedupe_same_artifact_version() {
+        let duplicate = ConversationArtifactRef {
+            binding_kind: ArtifactBindingKind::DraftUpload,
+            message_id: None,
+            ..artifact_ref()
+        };
+        let rendered = append_history_artifact_refs(
+            Some("Что за машина?"),
+            &[artifact_ref(), duplicate],
+            HistoryArtifactRefRole::User,
+        )
+        .expect("rendered");
+
+        assert_eq!(rendered.matches("artifactId=art_car").count(), 1);
     }
 
     #[test]

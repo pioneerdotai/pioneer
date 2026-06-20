@@ -281,7 +281,9 @@ mod tests {
             &mut mapping,
             &bundle
         ));
-        let CodexTurnInputItem::Text { text } = &mapping.input[0];
+        let CodexTurnInputItem::Text { text } = &mapping.input[0] else {
+            panic!("prepended Pioneer context should be text input");
+        };
         assert!(text.contains("Pioneer Context"));
         assert!(text.contains("Codex CLI"));
         assert_eq!(mapping.input.len(), 2);

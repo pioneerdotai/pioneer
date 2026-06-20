@@ -76,8 +76,8 @@ impl PioneerDesktop {
                                 .bg(cx.theme().background)
                                 .rounded_t_2xl()
                                 .when(
-                                    !cli_runtime_selected
-                                        && (!attachments.is_empty() || !capabilities.is_empty()),
+                                    !attachments.is_empty()
+                                        || (!cli_runtime_selected && !capabilities.is_empty()),
                                     |this| this.child(self.render_composer_chip_badges(cx)),
                                 )
                                 .when_some(upload_error, |this, error| {
@@ -121,9 +121,7 @@ impl PioneerDesktop {
                                     h_flex()
                                         .items_center()
                                         .gap_2()
-                                        .when(!cli_runtime_selected, |this| {
-                                            this.child(self.render_composer_add_menu(cx))
-                                        })
+                                        .child(self.render_composer_add_menu(cx))
                                         .child(self.render_composer_mode_selector(cx))
                                         .child(self.render_composer_model_selector(cx)),
                                 )
@@ -188,6 +186,7 @@ impl PioneerDesktop {
     fn render_composer_add_menu(&self, cx: &mut Context<Self>) -> AnyElement {
         let desktop_entity = cx.entity().clone();
         let disabled = self.composer_upload_in_progress;
+        let cli_runtime_selected = self.composer_selected_provider_is_cli_runtime();
 
         Button::new("composer-add-attachment")
             .small()
@@ -196,21 +195,24 @@ impl PioneerDesktop {
             .child(Icon::new(IconName::Plus).size_5().opacity(0.6))
             .disabled(disabled)
             .dropdown_menu_with_anchor(Corner::BottomLeft, move |menu, _, _| {
-                menu.min_w(px(196.))
-                    .item(Self::composer_add_menu_item(
-                        t!("chat.composer.add_menu.files").to_string().into(),
-                        PioneerIconName::Paperclip,
-                        {
-                            let desktop_entity = desktop_entity.clone();
-                            move |window, cx| {
-                                let _ = desktop_entity.update(cx, |view, cx| {
-                                    view.open_composer_file_picker(window, cx);
-                                    cx.notify();
-                                });
-                            }
-                        },
-                    ))
-                    .item(Self::composer_add_menu_item(
+                let menu = menu.min_w(px(196.)).item(Self::composer_add_menu_item(
+                    t!("chat.composer.add_menu.files").to_string().into(),
+                    PioneerIconName::Paperclip,
+                    {
+                        let desktop_entity = desktop_entity.clone();
+                        move |window, cx| {
+                            let _ = desktop_entity.update(cx, |view, cx| {
+                                view.open_composer_file_picker(window, cx);
+                                cx.notify();
+                            });
+                        }
+                    },
+                ));
+
+                if cli_runtime_selected {
+                    menu
+                } else {
+                    menu.item(Self::composer_add_menu_item(
                         t!("chat.composer.add_menu.skills").to_string().into(),
                         PioneerIconName::Zap,
                         {
@@ -236,6 +238,7 @@ impl PioneerDesktop {
                             }
                         },
                     ))
+                }
             })
             .into_any_element()
     }
@@ -268,14 +271,16 @@ impl PioneerDesktop {
                     start_index: row_index * 3,
                     items: chunk.to_vec(),
                 });
-        let capability_rows =
-            self.composer_capabilities
-                .chunks(3)
-                .enumerate()
-                .map(|(row_index, chunk)| ComposerChipRow::Capabilities {
-                    start_index: row_index * 3,
-                    items: chunk.to_vec(),
-                });
+        let cli_runtime_selected = self.composer_selected_provider_is_cli_runtime();
+        let capability_rows = self
+            .composer_capabilities
+            .chunks(3)
+            .enumerate()
+            .filter(move |_| !cli_runtime_selected)
+            .map(|(row_index, chunk)| ComposerChipRow::Capabilities {
+                start_index: row_index * 3,
+                items: chunk.to_vec(),
+            });
         let rows = attachment_rows.chain(capability_rows).collect::<Vec<_>>();
 
         v_flex()

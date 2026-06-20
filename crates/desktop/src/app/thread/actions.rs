@@ -136,10 +136,6 @@ impl PioneerDesktop {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.composer_selected_provider_is_cli_runtime() {
-            return;
-        }
-
         let selection = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -238,15 +234,10 @@ impl PioneerDesktop {
 
         let composer_text = composer_state.read(cx).value().trim().to_owned();
         if cli_runtime_selected {
-            self.composer_attachments.clear();
             self.composer_capabilities.clear();
             self.composer_upload_error = None;
         }
-        let composer_attachments = if cli_runtime_selected {
-            Vec::new()
-        } else {
-            self.composer_attachments.clone()
-        };
+        let composer_attachments = self.composer_attachments.clone();
         let composer_capabilities = if cli_runtime_selected {
             Vec::new()
         } else {
@@ -517,10 +508,6 @@ impl PioneerDesktop {
         artifact: ArtifactRef,
         cx: &mut Context<Self>,
     ) {
-        if self.composer_selected_provider_is_cli_runtime() {
-            return;
-        }
-
         if composer_attachments::add_composer_attachment_from_artifact(
             &mut self.composer_attachments,
             artifact,

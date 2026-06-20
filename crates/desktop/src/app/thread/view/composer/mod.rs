@@ -12,6 +12,7 @@ use pioneer_client::composer::turn_prepare::{
 impl PioneerDesktop {
     pub(in crate::app::thread) fn can_submit_message(&self, cx: &Context<Self>) -> bool {
         let composer_text = self.composer_state.read(cx).value();
+        let cli_runtime_selected = self.composer_selected_provider_is_cli_runtime();
         can_submit_composer_message(ComposerSubmitAvailabilityInput {
             gateway_connected: self.gateway.connection_state == GatewayConnectionState::Connected,
             upload_in_progress: self.composer_upload_in_progress,
@@ -22,7 +23,7 @@ impl PioneerDesktop {
                 .is_some_and(|conversation| conversation.can_submit_message()),
             text: composer_text.as_str(),
             has_attachments: !self.composer_attachments.is_empty(),
-            has_capabilities: !self.composer_capabilities.is_empty(),
+            has_capabilities: !cli_runtime_selected && !self.composer_capabilities.is_empty(),
         })
     }
 }

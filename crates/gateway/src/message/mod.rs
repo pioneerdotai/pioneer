@@ -403,6 +403,7 @@ impl MessageProcessor {
             ArtifactGcPolicy {
                 grace_secs: artifacts_config.gc_grace_secs,
                 output_dir_ttl_secs: artifacts_config.output_dir_ttl_secs,
+                readable_copy_ttl_secs: artifacts_config.readable_copy_ttl_secs,
             },
         ));
         let artifact_uploads = Arc::new(artifacts::upload::ArtifactUploadSessionManager::new(

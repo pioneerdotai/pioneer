@@ -2425,7 +2425,7 @@ mod tests {
             Ok(())
         }
 
-        async fn materialize_temp(
+        async fn materialize_readable_copy(
             &self,
             _workspace_id: &str,
             _storage_key: &str,
@@ -2473,7 +2473,7 @@ mod tests {
             })
         }
 
-        async fn materialize_temp(
+        async fn materialize_readable_copy(
             &self,
             _workspace_id: &str,
             _storage_key: &str,

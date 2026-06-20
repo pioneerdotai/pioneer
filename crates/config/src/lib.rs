@@ -206,6 +206,8 @@ pub struct GatewayArtifactsConfig {
     pub gc_grace_secs: u64,
     #[serde(default = "default_gateway_artifacts_output_dir_ttl_secs")]
     pub output_dir_ttl_secs: u64,
+    #[serde(default = "default_gateway_artifacts_readable_copy_ttl_secs")]
+    pub readable_copy_ttl_secs: u64,
     #[serde(default = "default_gateway_artifacts_quota_warn_at_percent")]
     pub quota_warn_at_percent: u8,
 }
@@ -220,6 +222,7 @@ impl Default for GatewayArtifactsConfig {
             download_session_ttl_secs: default_gateway_artifacts_download_session_ttl_secs(),
             gc_grace_secs: default_gateway_artifacts_gc_grace_secs(),
             output_dir_ttl_secs: default_gateway_artifacts_output_dir_ttl_secs(),
+            readable_copy_ttl_secs: default_gateway_artifacts_readable_copy_ttl_secs(),
             quota_warn_at_percent: default_gateway_artifacts_quota_warn_at_percent(),
         }
     }
@@ -2083,6 +2086,10 @@ const fn default_gateway_artifacts_gc_grace_secs() -> u64 {
 }
 
 const fn default_gateway_artifacts_output_dir_ttl_secs() -> u64 {
+    24 * 60 * 60
+}
+
+const fn default_gateway_artifacts_readable_copy_ttl_secs() -> u64 {
     24 * 60 * 60
 }
 

@@ -161,7 +161,7 @@ impl PioneerDesktop {
             state.set_value(draft.text.clone(), window, cx)
         });
         if self.composer_selected_provider_is_cli_runtime() {
-            self.composer_attachments.clear();
+            self.composer_attachments = draft.attachments;
             self.composer_capabilities.clear();
         } else {
             self.composer_attachments = draft.attachments;

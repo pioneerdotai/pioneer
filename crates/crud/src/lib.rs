@@ -10469,16 +10469,17 @@ fn recovery_job_record_from_model(model: pioneer_entity::recovery_job::Model) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockedTurnRecoveryResumeOutcome, ClaimedRecoveryActivation,
+        ArtifactBindingTargetRecord, BlockedTurnRecoveryResumeOutcome, ClaimedRecoveryActivation,
         CliRuntimeNativeEventListFilter, CliRuntimePendingRequestListFilter,
-        CliRuntimePendingRequestStatus, CliRuntimeTurnBindingListFilter, CrudStore,
+        CliRuntimePendingRequestStatus, CliRuntimeTurnBindingListFilter,
+        ConversationArtifactRefLimits, CrudStore, IngestArtifactMetadataRecord,
         McpAuditEventRecord, McpServerCatalogSnapshotRecord, McpServerInstallationRecord,
-        NewCliRuntimeNativeEvent, NewCliRuntimePendingRequest, NewCliRuntimeThreadBinding,
-        NewCliRuntimeTurnBinding, NewThreadEpisodicChunkRecord, NewTurnExecutionCheckpointRecord,
-        NewTurnExecutionWindowRecord, NewTurnLlmContextEntry, NewTurnRuntimeSnapshot,
-        ResolveCliRuntimePendingRequest, SkillAuditEventRecord, SkillInstallationRecord,
-        TaskEventPayload, TaskRunChildAnchor, ThreadAgentsDocError, ThreadAgentsDocSaveReason,
-        ThreadAgentsDocStatus, ThreadEpisodicActiveWriteSegmentRequest,
+        NewArtifactBlobRecord, NewCliRuntimeNativeEvent, NewCliRuntimePendingRequest,
+        NewCliRuntimeThreadBinding, NewCliRuntimeTurnBinding, NewThreadEpisodicChunkRecord,
+        NewTurnExecutionCheckpointRecord, NewTurnExecutionWindowRecord, NewTurnLlmContextEntry,
+        NewTurnRuntimeSnapshot, ResolveCliRuntimePendingRequest, SkillAuditEventRecord,
+        SkillInstallationRecord, TaskEventPayload, TaskRunChildAnchor, ThreadAgentsDocError,
+        ThreadAgentsDocSaveReason, ThreadAgentsDocStatus, ThreadEpisodicActiveWriteSegmentRequest,
         ThreadEpisodicCapsuleCapacityUpdate, ThreadEpisodicCapsuleWriteState,
         ThreadEpisodicChunkStatus, ThreadEpisodicChunkVisibility, ThreadEpisodicSourceActorRole,
         ThreadEpisodicSourceRuntimeKind, TurnExecutionCheckpointKind,
@@ -10489,11 +10490,12 @@ mod tests {
     use crate::util::unix_to_datetime;
     use migration::{Migrator, MigratorTrait};
     use pioneer_protocol::{
-        ExecutionWindowExhaustionReason, ExecutionWindowStatus, ItemCompletedNotification,
-        ItemRecoveryAttachedNotification, ItemRecoveryExhaustedNotification,
-        ItemRecoveryOpenedNotification, ItemRecoverySucceededNotification,
-        ItemRetryAttemptStartedNotification, ItemRetryScheduledNotification,
-        ItemStartedNotification, ItemTimeoutDetectedNotification,
+        ArtifactBindingDirection, ArtifactBindingKind, ArtifactCreatedByKind, ArtifactKind,
+        ArtifactRole, ExecutionWindowExhaustionReason, ExecutionWindowStatus,
+        ItemCompletedNotification, ItemRecoveryAttachedNotification,
+        ItemRecoveryExhaustedNotification, ItemRecoveryOpenedNotification,
+        ItemRecoverySucceededNotification, ItemRetryAttemptStartedNotification,
+        ItemRetryScheduledNotification, ItemStartedNotification, ItemTimeoutDetectedNotification,
         ItemToolRetryExhaustedNotification, ItemToolRetryResolvedNotification,
         ItemToolRetryScheduledNotification, PromptManifest, PromptManifestDiagnostic,
         PromptManifestDiagnosticCode, PromptManifestHookContributionKind, PromptManifestHookPhase,
@@ -10543,6 +10545,92 @@ mod tests {
         .expect("workspace insert should succeed");
 
         CrudStore::new(connection)
+    }
+
+    fn test_artifact_binding(
+        binding_kind: ArtifactBindingKind,
+        message_id: Option<&str>,
+    ) -> ArtifactBindingTargetRecord {
+        ArtifactBindingTargetRecord {
+            thread_id: Some("thread_artifact_refs".to_owned()),
+            turn_id: Some("turn_artifact_refs".to_owned()),
+            message_id: message_id.map(ToOwned::to_owned),
+            turn_item_id: Some("item_artifact_refs".to_owned()),
+            tool_call_id: None,
+            task_id: None,
+            task_run_id: None,
+            binding_kind,
+            direction: ArtifactBindingDirection::Input,
+            role: Some(ArtifactRole::User),
+            item_index: Some(0),
+        }
+    }
+
+    #[tokio::test]
+    async fn conversation_artifact_refs_exclude_draft_upload_bindings() {
+        let store = test_store_with_workspace("ws_artifact_refs").await;
+        let ingested = store
+            .ingest_artifact_metadata(
+                NewArtifactBlobRecord {
+                    workspace_id: "ws_artifact_refs".to_owned(),
+                    sha256: "sha256_artifact_refs".to_owned(),
+                    size_bytes: 128,
+                    mime_type: Some("image/png".to_owned()),
+                    storage_backend: "memory".to_owned(),
+                    storage_key: "blob_artifact_refs".to_owned(),
+                    metadata: BTreeMap::new(),
+                },
+                IngestArtifactMetadataRecord {
+                    workspace_id: "ws_artifact_refs".to_owned(),
+                    primary_thread_id: Some("thread_artifact_refs".to_owned()),
+                    display_name: "image.png".to_owned(),
+                    kind: ArtifactKind::Image,
+                    mime_type: Some("image/png".to_owned()),
+                    created_by_kind: ArtifactCreatedByKind::User,
+                    created_by_actor_id: Some("user_1".to_owned()),
+                    metadata: BTreeMap::new(),
+                },
+                Some(test_artifact_binding(
+                    ArtifactBindingKind::DraftUpload,
+                    None,
+                )),
+                BTreeMap::new(),
+            )
+            .await
+            .expect("artifact ingest should succeed");
+
+        store
+            .bind_artifact(
+                "ws_artifact_refs",
+                &ingested.artifact.id,
+                Some(&ingested.version.id),
+                test_artifact_binding(ArtifactBindingKind::UserInput, Some("user_message_1")),
+                BTreeMap::new(),
+            )
+            .await
+            .expect("user input binding should succeed");
+
+        let refs = store
+            .list_conversation_artifact_refs(
+                "ws_artifact_refs",
+                "thread_artifact_refs",
+                &["turn_artifact_refs".to_owned()],
+                ConversationArtifactRefLimits::default(),
+            )
+            .await
+            .expect("conversation refs should load");
+        let turn_refs = refs.get("turn_artifact_refs").expect("turn refs");
+
+        assert_eq!(turn_refs.user.len(), 1);
+        assert_eq!(
+            turn_refs.user[0].binding_kind,
+            ArtifactBindingKind::UserInput
+        );
+        assert_eq!(
+            turn_refs.user[0].message_id.as_deref(),
+            Some("user_message_1")
+        );
+        assert!(turn_refs.assistant.is_empty());
     }
 
     fn thread_episodic_chunk_fixture(

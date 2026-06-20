@@ -86,7 +86,7 @@ pub trait ArtifactBlobStore: Send + Sync {
         storage_key: &str,
     ) -> ArtifactResult<()>;
 
-    async fn materialize_temp(
+    async fn materialize_readable_copy(
         &self,
         workspace_id: &str,
         storage_key: &str,

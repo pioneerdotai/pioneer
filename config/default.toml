@@ -37,6 +37,7 @@ upload_session_ttl_secs = 3600
 download_session_ttl_secs = 900
 gc_grace_secs = 86400
 output_dir_ttl_secs = 86400
+readable_copy_ttl_secs = 86400
 quota_warn_at_percent = 80
 
 [gateway.tasks.review]
