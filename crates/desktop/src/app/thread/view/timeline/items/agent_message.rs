@@ -12,7 +12,7 @@ use gpui_component::{
     Icon, IconName, clipboard::Clipboard, collapsible::Collapsible, h_flex, v_flex,
 };
 use pioneer_client::timeline::labels::is_task_timeline_agent_message;
-use pioneer_protocol::TurnItem;
+use pioneer_protocol::{AgentMessagePhase, TurnItem};
 use std::hash::{Hash, Hasher};
 
 impl PioneerDesktop {
@@ -50,6 +50,14 @@ impl PioneerDesktop {
             .unwrap_or_default();
 
         let copy_text = text.to_owned();
+
+        let is_commentary = matches!(
+            item,
+            TurnItem::AgentMessage {
+                phase: AgentMessagePhase::Commentary,
+                ..
+            }
+        );
 
         if is_task_timeline_agent_message(item_view) {
             let body_element =
@@ -171,23 +179,25 @@ impl PioneerDesktop {
                         self.render_markdown_auto(text, None, cx)
                     },
                 ))
-                .child(
-                    h_flex()
-                        .h(px(30.))
-                        .justify_start()
-                        .items_center()
-                        .gap_2()
-                        .text_xs()
-                        .opacity(0.0)
-                        .group_hover(format!("agent-message-{}", item_view.id), |this| {
-                            this.opacity(0.6)
-                        })
-                        .child(timestamp_text)
-                        .child(
-                            Clipboard::new(("copy-agent-message", entry.item_index))
-                                .value(copy_text),
-                        ),
-                ),
+                .when(!is_commentary, |this| {
+                    this.child(
+                        h_flex()
+                            .h(px(30.))
+                            .justify_start()
+                            .items_center()
+                            .gap_2()
+                            .text_xs()
+                            .opacity(0.0)
+                            .group_hover(format!("agent-message-{}", item_view.id), |this| {
+                                this.opacity(0.6)
+                            })
+                            .child(timestamp_text)
+                            .child(
+                                Clipboard::new(("copy-agent-message", entry.item_index))
+                                    .value(copy_text),
+                            ),
+                    )
+                }),
         )
         .into_any_element()
     }
