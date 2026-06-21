@@ -29,8 +29,12 @@ impl PioneerDesktop {
                 .iter()
                 .any(|row| matches!(row, TimelineRenderRow::PendingRequest(_)));
 
+        if thread_changed || !force_follow {
+            state.autoscroll_paused_by_user = false;
+        }
+
         let should_follow = if force_follow {
-            item_count > 0
+            item_count > 0 && !state.autoscroll_paused_by_user
         } else if thread_changed {
             item_count > 0
         } else {
@@ -108,5 +112,48 @@ impl PioneerDesktop {
         let current_offset = self.thread_timeline_scroll_handle.offset().y;
         let bottom_offset = px(0.) - max_offset;
         (current_offset - bottom_offset).abs() <= px(24.)
+    }
+
+    pub(super) fn on_timeline_scroll_wheel(
+        &self,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let force_follow_active = self
+            .active_thread_conversation()
+            .is_some_and(|conversation| running_turn_display(conversation.projection()).is_some())
+            || !self.active_thread_cli_runtime_pending_requests().is_empty();
+        if !force_follow_active {
+            return;
+        }
+
+        let delta_y = event.delta.pixel_delta(window.line_height()).y;
+        if delta_y > px(0.) {
+            self.thread_timeline_view_state
+                .borrow_mut()
+                .autoscroll_paused_by_user = true;
+            cx.notify();
+            return;
+        }
+
+        if delta_y < px(0.) && self.timeline_scroll_wheel_reaches_bottom(delta_y) {
+            self.thread_timeline_view_state
+                .borrow_mut()
+                .autoscroll_paused_by_user = false;
+            cx.notify();
+        }
+    }
+
+    fn timeline_scroll_wheel_reaches_bottom(&self, delta_y: Pixels) -> bool {
+        let max_offset = self.thread_timeline_scroll_handle.max_offset().height;
+        if max_offset <= px(1.) {
+            return true;
+        }
+
+        let next_offset = (self.thread_timeline_scroll_handle.offset().y + delta_y)
+            .clamp(px(0.) - max_offset, px(0.));
+        let bottom_offset = px(0.) - max_offset;
+        (next_offset - bottom_offset).abs() <= px(24.)
     }
 }

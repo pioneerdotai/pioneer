@@ -126,6 +126,9 @@ impl PioneerDesktop {
             .h_full()
             .relative()
             .overflow_hidden()
+            .on_scroll_wheel(cx.listener(|view, event, window, cx| {
+                view.on_timeline_scroll_wheel(event, window, cx);
+            }))
             .child(
                 v_virtual_list(
                     cx.entity(),

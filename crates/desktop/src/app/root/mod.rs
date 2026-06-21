@@ -145,6 +145,7 @@ pub(super) struct ThreadTimelineViewState {
     pub(super) item_count: usize,
     pub(super) tail_entry_id: Option<String>,
     pub(super) tail_text_len: usize,
+    pub(super) autoscroll_paused_by_user: bool,
     pub(super) measured_list_width: Pixels,
     pub(super) pending_width_probe: bool,
     pub(super) width_probe_attempts: u8,
