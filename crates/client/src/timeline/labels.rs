@@ -1,9 +1,11 @@
 //! UI-neutral timeline labels and status codes.
 
-use crate::conversation::{ItemView, TimelineEntryStatus};
+use crate::conversation::{
+    ConversationViewState, ItemView, TimelineEntryStatus, reducer::TurnPhase,
+};
 use pioneer_protocol::{
-    ArtifactRef, SystemEventLevel, ToolDisplayPayload, ToolMetadataValue, ToolStoragePayload,
-    TurnItem, UserMessageAttachment,
+    AgentMessagePhase, ArtifactRef, SystemEventLevel, ToolDisplayPayload, ToolMetadataValue,
+    ToolStoragePayload, TurnItem, UserMessageAttachment,
 };
 use serde_json::Value as JsonValue;
 use std::{
@@ -42,6 +44,78 @@ pub fn format_item_elapsed(item_view: &ItemView) -> Option<String> {
         .or(item_view.updated_at_unix_ms)
         .unwrap_or(started);
     Some(format_elapsed_ms(ended.saturating_sub(started) as u64))
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RunningTurnDisplay {
+    pub turn_id: String,
+    pub started_at_unix_ms: Option<i64>,
+}
+
+pub fn running_turn_display(projection: &ConversationViewState) -> Option<RunningTurnDisplay> {
+    let active_turn = projection
+        .in_flight_turn_id
+        .as_deref()
+        .and_then(|turn_id| {
+            projection
+                .turns
+                .iter()
+                .find(|turn| turn.id == turn_id && is_running_turn_phase(turn.phase))
+        })
+        .or_else(|| {
+            projection
+                .turns
+                .iter()
+                .rev()
+                .find(|turn| is_running_turn_phase(turn.phase))
+        })?;
+
+    if turn_has_parent_final_answer_item(projection, active_turn.id.as_str()) {
+        return None;
+    }
+
+    Some(RunningTurnDisplay {
+        turn_id: active_turn.id.clone(),
+        started_at_unix_ms: active_turn
+            .started_at_unix_ms
+            .or_else(|| first_turn_item_started_at(projection, active_turn.id.as_str())),
+    })
+}
+
+fn is_running_turn_phase(phase: TurnPhase) -> bool {
+    matches!(
+        phase,
+        TurnPhase::Starting | TurnPhase::Running | TurnPhase::Completing
+    )
+}
+
+fn turn_has_parent_final_answer_item(projection: &ConversationViewState, turn_id: &str) -> bool {
+    projection.items.iter().any(|item_view| {
+        item_view.turn_id == turn_id
+            && item_view.timeline_origin.is_none()
+            && matches!(
+                item_view.item,
+                TurnItem::AgentMessage {
+                    phase: AgentMessagePhase::FinalAnswer,
+                    ..
+                }
+            )
+    })
+}
+
+fn first_turn_item_started_at(projection: &ConversationViewState, turn_id: &str) -> Option<i64> {
+    projection
+        .items
+        .iter()
+        .filter(|item_view| item_view.turn_id == turn_id)
+        .filter_map(|item_view| {
+            item_view
+                .started_at_unix_ms
+                .or(item_view.updated_at_unix_ms)
+                .or(item_view.completed_at_unix_ms)
+        })
+        .min()
 }
 
 pub fn timeline_entry_text(item_view: &ItemView) -> &str {
@@ -1448,6 +1522,7 @@ pub fn system_event_presentation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conversation::reducer::TurnView;
     use pioneer_protocol::{
         ArtifactKind, ArtifactStatus, McpScopeKind, TimelineLane, TimelineOrigin,
         TimelineOriginKind, ToolCallStatus, ToolDisplayPayload, ToolMetadata,
@@ -1945,5 +2020,69 @@ mod tests {
                     && row.value
                         == SystemEventDetailValue::Text("max_total_windows_exceeded".to_owned()))
         );
+    }
+
+    #[test]
+    fn running_turn_display_uses_active_turn_before_final_answer_arrives() {
+        let projection = ConversationViewState {
+            turns: vec![TurnView {
+                id: "turn_1".to_owned(),
+                phase: TurnPhase::Running,
+                started_at_unix_ms: Some(42),
+                completed_at_unix_ms: None,
+                error: None,
+                resume: None,
+            }],
+            in_flight_turn_id: Some("turn_1".to_owned()),
+            ..ConversationViewState::default()
+        };
+
+        assert_eq!(
+            running_turn_display(&projection),
+            Some(RunningTurnDisplay {
+                turn_id: "turn_1".to_owned(),
+                started_at_unix_ms: Some(42),
+            })
+        );
+    }
+
+    #[test]
+    fn running_turn_display_stops_when_parent_final_answer_arrives() {
+        let projection = ConversationViewState {
+            turns: vec![TurnView {
+                id: "turn_1".to_owned(),
+                phase: TurnPhase::Completing,
+                started_at_unix_ms: Some(42),
+                completed_at_unix_ms: None,
+                error: None,
+                resume: None,
+            }],
+            items: vec![ItemView {
+                id: "agent_1".to_owned(),
+                turn_id: "turn_1".to_owned(),
+                item_type: "agent_message".to_owned(),
+                status: TimelineEntryStatus::Running,
+                started_at_unix_ms: Some(50),
+                updated_at_unix_ms: Some(51),
+                completed_at_unix_ms: None,
+                partial_text: "Final".to_owned(),
+                final_text: None,
+                partial_markdown: None,
+                final_markdown: None,
+                item: TurnItem::AgentMessage {
+                    id: "agent_1".to_owned(),
+                    text: "Final".to_owned(),
+                    phase: AgentMessagePhase::FinalAnswer,
+                    markdown: None,
+                    markdown_version: None,
+                },
+                timeline_origin: None,
+                opaque_meta: None,
+            }],
+            in_flight_turn_id: Some("turn_1".to_owned()),
+            ..ConversationViewState::default()
+        };
+
+        assert_eq!(running_turn_display(&projection), None);
     }
 }

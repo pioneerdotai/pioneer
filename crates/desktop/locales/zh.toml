@@ -1111,6 +1111,9 @@ hours_minutes = "%{hours} 小时 %{minutes} 分"
 minutes_seconds = "%{minutes} 分 %{seconds} 秒"
 seconds = "%{seconds} 秒"
 
+[timeline.running]
+turn = "正在工作"
+
 [timeline.task.status]
 draft = "草稿"
 scheduled = "已计划"

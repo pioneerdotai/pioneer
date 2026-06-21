@@ -19,7 +19,28 @@ use pioneer_client::timeline::labels as timeline_labels;
 use pioneer_protocol::{TaskStatus, TurnItem};
 
 pub(super) fn format_elapsed_ms(elapsed_ms: u64) -> String {
-    timeline_labels::format_elapsed_ms(elapsed_ms)
+    let total_seconds = elapsed_ms / 1_000;
+    let hours = total_seconds / 3_600;
+    let minutes = (total_seconds % 3_600) / 60;
+    let seconds = total_seconds % 60;
+
+    if hours > 0 {
+        t!(
+            "timeline.elapsed.hours_minutes",
+            hours = hours,
+            minutes = format!("{minutes:02}")
+        )
+        .to_string()
+    } else if minutes > 0 {
+        t!(
+            "timeline.elapsed.minutes_seconds",
+            minutes = minutes,
+            seconds = format!("{seconds:02}")
+        )
+        .to_string()
+    } else {
+        t!("timeline.elapsed.seconds", seconds = seconds).to_string()
+    }
 }
 
 pub(super) fn now_unix_ms() -> i64 {
@@ -27,7 +48,13 @@ pub(super) fn now_unix_ms() -> i64 {
 }
 
 pub(super) fn format_elapsed(item_view: &ItemView) -> Option<String> {
-    timeline_labels::format_item_elapsed(item_view)
+    let started = item_view.started_at_unix_ms?;
+    let ended = item_view
+        .completed_at_unix_ms
+        .or(item_view.updated_at_unix_ms)
+        .unwrap_or(started);
+
+    Some(format_elapsed_ms(ended.saturating_sub(started) as u64))
 }
 
 pub(super) fn host_from_url(url: &str) -> Option<String> {

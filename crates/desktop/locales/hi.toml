@@ -1111,6 +1111,9 @@ hours_minutes = "%{hours} घं %{minutes} मि"
 minutes_seconds = "%{minutes} मि %{seconds} से"
 seconds = "%{seconds} से"
 
+[timeline.running]
+turn = "काम कर रहा हूँ"
+
 [timeline.task.status]
 draft = "ड्राफ्ट"
 scheduled = "शेड्यूल"

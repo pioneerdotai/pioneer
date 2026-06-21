@@ -1111,6 +1111,9 @@ hours_minutes = "%{hours} h %{minutes} min"
 minutes_seconds = "%{minutes} min %{seconds} s"
 seconds = "%{seconds} s"
 
+[timeline.running]
+turn = "Travaille"
+
 [timeline.task.status]
 draft = "Brouillon"
 scheduled = "Planifiée"

@@ -46,6 +46,11 @@ pub fn timeline_row_layout_hash(
             group.is_open.hash(&mut hasher);
             group.kind.hash(&mut hasher);
         }
+        TimelineRowKind::RunningTurn(running_turn) => {
+            3u8.hash(&mut hasher);
+            running_turn.turn_id.hash(&mut hasher);
+            running_turn.started_at_unix_ms.hash(&mut hasher);
+        }
         TimelineRowKind::Item { timeline_index } => {
             0u8.hash(&mut hasher);
             timeline_index.hash(&mut hasher);
@@ -107,10 +112,12 @@ pub fn timeline_row_text_len(projection: &ConversationViewState, row: &TimelineR
             len
         }
         TimelineRowKind::CoalescedTools(group) => coalesced_tools_text_len_estimate(group),
+        TimelineRowKind::RunningTurn(_) => RUNNING_TURN_TEXT_LEN_ESTIMATE,
     }
 }
 
 const TURN_WORK_GROUP_COMPLETED_TEXT_LEN_ESTIMATE: usize = 9;
+const RUNNING_TURN_TEXT_LEN_ESTIMATE: usize = 12;
 
 fn coalesced_tools_text_len_estimate(group: &TimelineCoalescedToolsRow) -> usize {
     let count_len = group.count.to_string().len();
@@ -125,6 +132,6 @@ pub fn timeline_row_toggle_key(row: &TimelineRow) -> Option<&str> {
     match &row.kind {
         TimelineRowKind::TurnWorkToggle(group) => Some(group.toggle_key.as_str()),
         TimelineRowKind::CoalescedTools(group) => Some(group.toggle_key.as_str()),
-        TimelineRowKind::Item { .. } => None,
+        TimelineRowKind::Item { .. } | TimelineRowKind::RunningTurn(_) => None,
     }
 }

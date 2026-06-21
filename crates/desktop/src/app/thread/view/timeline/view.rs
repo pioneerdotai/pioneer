@@ -64,6 +64,8 @@ impl PioneerDesktop {
             }
         };
 
+        let rows = self.hydrate_running_turn_rows(rows, cx);
+
         self.sync_timeline_scroll(active_thread_id, projection, rows.as_ref());
 
         if rows.is_empty() {
@@ -199,6 +201,13 @@ impl PioneerDesktop {
             ),
             TimelineRowKind::CoalescedTools(group) => self.render_coalesced_tools_toggle(
                 group,
+                is_first_row,
+                is_last_row,
+                content_width,
+                cx,
+            ),
+            TimelineRowKind::RunningTurn(running_turn) => self.render_running_turn_row(
+                running_turn,
                 is_first_row,
                 is_last_row,
                 content_width,

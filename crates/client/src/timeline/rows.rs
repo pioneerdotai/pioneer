@@ -1,8 +1,8 @@
 //! Timeline row models and work-group selectors.
 
 use crate::{
-    conversation::{ConversationViewState, ItemView, TimelineEntryStatus},
-    timeline::labels::task_wait_review_display,
+    conversation::{ConversationViewState, ItemView},
+    timeline::labels::{RunningTurnDisplay, running_turn_display, task_wait_review_display},
 };
 use pioneer_protocol::{TaskStatus, TaskTriggerKind, TaskTurnItem, ToolCallStatus, TurnItem};
 use std::collections::{HashMap, HashSet};
@@ -48,6 +48,7 @@ pub enum TimelineRowKind {
     Item { timeline_index: usize },
     TurnWorkToggle(TurnWorkGroupRow),
     CoalescedTools(TimelineCoalescedToolsRow),
+    RunningTurn(RunningTurnDisplay),
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -185,10 +186,16 @@ pub fn build_timeline_rows(
                     kind: TimelineRowKind::CoalescedTools(group),
                 });
             }
+            TimelineRowKind::RunningTurn(running_turn) => {
+                rows.push(TimelineRow {
+                    key,
+                    kind: TimelineRowKind::RunningTurn(running_turn),
+                });
+            }
         }
     }
 
-    pin_bottom_approval_rows(projection, rows)
+    append_running_turn_row(projection, pin_bottom_approval_rows(projection, rows))
 }
 
 pub fn build_timeline_group_rows(
@@ -228,7 +235,7 @@ pub fn build_timeline_group_rows(
                 let timeline_index = indices[*pos];
                 projection
                     .item_for_timeline_entry(&timeline[timeline_index])
-                    .is_some_and(is_terminal_parent_agent_message)
+                    .is_some_and(is_parent_final_answer_message)
             }) else {
                 break;
             };
@@ -391,6 +398,20 @@ fn pin_bottom_approval_rows(
     }
     normal_rows.extend(approval_rows);
     normal_rows
+}
+
+fn append_running_turn_row(
+    projection: &ConversationViewState,
+    mut rows: Vec<TimelineRow>,
+) -> Vec<TimelineRow> {
+    if let Some(running_turn) = running_turn_display(projection) {
+        rows.push(TimelineRow {
+            key: format!("timeline-running-turn::{}", running_turn.turn_id),
+            kind: TimelineRowKind::RunningTurn(running_turn),
+        });
+    }
+
+    rows
 }
 
 fn is_bottom_pinned_approval_row(projection: &ConversationViewState, row: &TimelineRow) -> bool {
@@ -558,15 +579,8 @@ fn is_parent_agent_message(item_view: &ItemView) -> bool {
         && !is_commentary_agent_message(item_view)
 }
 
-fn is_terminal_parent_agent_message(item_view: &ItemView) -> bool {
+fn is_parent_final_answer_message(item_view: &ItemView) -> bool {
     is_parent_agent_message(item_view)
-        && matches!(
-            item_view.status,
-            TimelineEntryStatus::Completed
-                | TimelineEntryStatus::Blocked
-                | TimelineEntryStatus::Failed
-                | TimelineEntryStatus::Cancelled
-        )
 }
 
 fn is_commentary_agent_message(item_view: &ItemView) -> bool {
@@ -631,6 +645,7 @@ mod tests {
     use super::*;
     use crate::conversation::{
         ConversationViewState, ItemView, TimelineEntry, TimelineEntryStatus,
+        reducer::{TurnPhase, TurnView},
     };
     use pioneer_protocol::{
         SystemEventLevel, TaskExecutorKind, TaskStatus, TaskTriggerKind, TaskTurnItem,
@@ -677,13 +692,14 @@ mod tests {
         rows: &[TimelineRow],
     ) -> Vec<&'a str> {
         rows.iter()
-            .filter_map(|row| match row.kind {
+            .filter_map(|row| match &row.kind {
                 TimelineRowKind::Item { timeline_index } => projection
                     .timeline
-                    .get(timeline_index)
+                    .get(*timeline_index)
                     .map(|entry| entry.item_id.as_str()),
                 TimelineRowKind::TurnWorkToggle(_) => None,
                 TimelineRowKind::CoalescedTools(_) => None,
+                TimelineRowKind::RunningTurn(_) => None,
             })
             .collect()
     }
@@ -896,6 +912,101 @@ mod tests {
                     },
                     None,
                 ),
+            ],
+            ..ConversationViewState::default()
+        };
+
+        let collapsed_rows = build_timeline_group_rows(&projection, &HashSet::new());
+        assert_eq!(
+            visible_item_ids(&projection, &collapsed_rows),
+            vec!["user_1", "agent_1"]
+        );
+        assert!(collapsed_rows.iter().any(|row| matches!(
+            row.kind,
+            TimelineRowKind::TurnWorkToggle(TurnWorkGroupRow { .. })
+        )));
+
+        let expanded_rows = build_timeline_group_rows(
+            &projection,
+            &HashSet::from([timeline_turn_work_group_key("entry_user")]),
+        );
+        assert_eq!(
+            visible_item_ids(&projection, &expanded_rows),
+            vec!["user_1", "reasoning_1", "tool_1", "agent_1"]
+        );
+    }
+
+    #[test]
+    fn work_collapses_when_parent_final_answer_starts_streaming() {
+        let mut streaming_agent = item_view(
+            "agent_1",
+            "turn_parent",
+            "agent_message",
+            TurnItem::AgentMessage {
+                id: "agent_1".to_owned(),
+                text: "Streaming".to_owned(),
+                phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                markdown: None,
+                markdown_version: None,
+            },
+            None,
+        );
+        streaming_agent.status = TimelineEntryStatus::Running;
+        streaming_agent.completed_at_unix_ms = None;
+        streaming_agent.final_text = None;
+        streaming_agent.final_markdown = None;
+
+        let projection = ConversationViewState {
+            timeline: vec![
+                timeline_entry("entry_user", "turn_parent", "user_1", 0),
+                timeline_entry("entry_reasoning", "turn_parent", "reasoning_1", 1),
+                timeline_entry("entry_tool", "turn_parent", "tool_1", 2),
+                timeline_entry("entry_agent", "turn_parent", "agent_1", 3),
+            ],
+            items: vec![
+                item_view(
+                    "user_1",
+                    "turn_parent",
+                    "user_message",
+                    TurnItem::UserMessage {
+                        id: "user_1".to_owned(),
+                        text: "Inspect project".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                    None,
+                ),
+                item_view(
+                    "reasoning_1",
+                    "turn_parent",
+                    "reasoning",
+                    TurnItem::Reasoning {
+                        id: "reasoning_1".to_owned(),
+                        summary: vec!["I will inspect the project.".to_owned()],
+                        content: Vec::new(),
+                    },
+                    None,
+                ),
+                item_view(
+                    "tool_1",
+                    "turn_parent",
+                    "dynamic_tool_call",
+                    TurnItem::DynamicToolCall {
+                        id: "tool_1".to_owned(),
+                        tool_name: "exec_command".to_owned(),
+                        arguments: serde_json::json!({}),
+                        status: ToolCallStatus::Completed,
+                        recovery_policy: None,
+                        output_policy: ToolOutputPolicySnapshot::for_tool_name("exec_command"),
+                        display: ToolDisplayPayload::Hidden,
+                        storage: ToolStoragePayload::None,
+                        recovery: None,
+                        success: Some(true),
+                        outcome: None,
+                        observation: None,
+                    },
+                    None,
+                ),
+                streaming_agent,
             ],
             ..ConversationViewState::default()
         };
@@ -1405,6 +1516,73 @@ mod tests {
             visible_item_ids(&projection, &rows),
             vec!["user_1", "tool_after", "approval_1"]
         );
+    }
+
+    #[test]
+    fn running_turn_row_pins_after_bottom_approval_rows() {
+        let projection = ConversationViewState {
+            timeline: vec![
+                timeline_entry("entry_user", "turn_parent", "user_1", 0),
+                timeline_entry("entry_approval", "turn_parent", "approval_1", 1),
+                timeline_entry("entry_tool_after", "turn_parent", "tool_after", 2),
+            ],
+            turns: vec![TurnView {
+                id: "turn_parent".to_owned(),
+                phase: TurnPhase::Running,
+                started_at_unix_ms: Some(10),
+                completed_at_unix_ms: None,
+                error: None,
+                resume: None,
+            }],
+            items: vec![
+                item_view(
+                    "user_1",
+                    "turn_parent",
+                    "user_message",
+                    TurnItem::UserMessage {
+                        id: "user_1".to_owned(),
+                        text: "Wait for review".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                    None,
+                ),
+                task_wait_user_approval_item("approval_1", "turn_parent"),
+                item_view(
+                    "tool_after",
+                    "turn_parent",
+                    "dynamic_tool_call",
+                    TurnItem::DynamicToolCall {
+                        id: "tool_after".to_owned(),
+                        tool_name: "read_file".to_owned(),
+                        arguments: serde_json::json!({ "path": "README.md" }),
+                        status: ToolCallStatus::Completed,
+                        recovery_policy: None,
+                        output_policy: ToolOutputPolicySnapshot::for_tool_name("read_file"),
+                        display: ToolDisplayPayload::Hidden,
+                        storage: ToolStoragePayload::None,
+                        recovery: None,
+                        success: Some(true),
+                        outcome: None,
+                        observation: None,
+                    },
+                    None,
+                ),
+            ],
+            in_flight_turn_id: Some("turn_parent".to_owned()),
+            ..ConversationViewState::default()
+        };
+
+        let rows = build_timeline_rows(&projection, &HashSet::new());
+
+        assert_eq!(
+            visible_item_ids(&projection, &rows),
+            vec!["user_1", "tool_after", "approval_1"]
+        );
+        assert!(matches!(
+            rows.last().map(|row| &row.kind),
+            Some(TimelineRowKind::RunningTurn(running_turn))
+                if running_turn.turn_id == "turn_parent"
+        ));
     }
 
     #[test]

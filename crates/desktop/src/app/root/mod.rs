@@ -160,6 +160,9 @@ pub(super) struct ThreadTimelineViewState {
     pub(super) cached_model_signature_hash: u64,
     pub(super) cached_model_rows_layout_hash: u64,
     pub(super) cached_model_rows: Option<Rc<Vec<TimelineRow>>>,
+    pub(super) running_turn_indicator_timer_active: bool,
+    pub(super) running_turn_indicator_fallback_turn_id: Option<String>,
+    pub(super) running_turn_indicator_fallback_started_at_unix_ms: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug)]

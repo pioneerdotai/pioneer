@@ -1,10 +1,11 @@
 mod items;
 mod markdown;
 pub(crate) mod model;
+mod running_indicator;
 mod scroll;
 mod view;
 
-use self::model::TimelineRow;
+use self::model::{TimelineRow, TimelineRowKind};
 use crate::app::{
     conversation::{ConversationViewState, ItemView},
     root::{CachedTimelineEntryLayout, PioneerDesktop, ThreadTimelineViewState},
@@ -125,6 +126,10 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Size<Pixels> {
+        if matches!(row.kind, TimelineRowKind::RunningTurn(_)) {
+            return self.running_turn_row_size(is_first_row, is_last_row);
+        }
+
         let mut layout_hash = self.timeline_row_layout_hash(projection, row, expanded);
         if is_first_row {
             layout_hash = layout_hash.wrapping_add(1);

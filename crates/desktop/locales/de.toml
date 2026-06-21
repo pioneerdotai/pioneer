@@ -1111,6 +1111,9 @@ hours_minutes = "%{hours} Std. %{minutes} Min."
 minutes_seconds = "%{minutes} Min. %{seconds} Sek."
 seconds = "%{seconds} Sek."
 
+[timeline.running]
+turn = "Arbeite"
+
 [timeline.task.status]
 draft = "Entwurf"
 scheduled = "Geplant"

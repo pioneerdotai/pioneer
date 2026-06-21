@@ -1025,6 +1025,66 @@ fn late_item_delta_does_not_move_terminal_item_clock() {
 }
 
 #[test]
+fn later_item_starts_do_not_move_turn_start_clock() {
+    let mut projector = ConversationProjector::default();
+
+    projector.apply_local_turn_start_requested(TURN_ID, "hello", &[], 1_000);
+    projector.start_item_view(
+        "reasoning_1",
+        TURN_ID,
+        "reasoning",
+        TimelineEntryStatus::Running,
+        String::new(),
+        None,
+        TurnItem::Reasoning {
+            id: "reasoning_1".to_owned(),
+            summary: Vec::new(),
+            content: Vec::new(),
+        },
+        None,
+        5_000,
+    );
+    projector.start_item_view(
+        "command_1",
+        TURN_ID,
+        "command_execution",
+        TimelineEntryStatus::Running,
+        String::new(),
+        None,
+        TurnItem::CommandExecution {
+            id: "command_1".to_owned(),
+            tool_name: "exec_command".to_owned(),
+            arguments: serde_json::json!({"cmd": "pwd"}),
+            status: ToolCallStatus::InProgress,
+            recovery_policy: None,
+            output_policy: ToolOutputPolicySnapshot::for_tool_name("exec_command"),
+            display: ToolDisplayPayload::default(),
+            storage: ToolStoragePayload::default(),
+            recovery: None,
+            command: vec!["pwd".to_owned()],
+            cwd: None,
+            success: None,
+            outcome: None,
+            observation: None,
+        },
+        None,
+        9_000,
+    );
+
+    let turn = projector
+        .view_state()
+        .turns
+        .iter()
+        .find(|turn| turn.id == TURN_ID)
+        .expect("turn should exist");
+    assert_eq!(
+        turn.started_at_unix_ms,
+        Some(1_000),
+        "turn elapsed clock must stay anchored to turn start, not latest item start"
+    );
+}
+
+#[test]
 fn terminal_turn_stamps_running_items_completed_at() {
     let mut conversation = Conversation::new(THREAD_ID);
     let item_id = "item_running_when_turn_completes";

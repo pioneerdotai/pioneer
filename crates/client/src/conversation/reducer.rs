@@ -1054,8 +1054,12 @@ impl ConversationProjector {
             && let Some(turn) = self.view_state.turns.get_mut(index)
         {
             turn.phase = phase;
-            if started_at_unix_ms.is_some() {
-                turn.started_at_unix_ms = started_at_unix_ms;
+            if let Some(started_at_unix_ms) = started_at_unix_ms {
+                turn.started_at_unix_ms = Some(
+                    turn.started_at_unix_ms
+                        .map(|current| current.min(started_at_unix_ms))
+                        .unwrap_or(started_at_unix_ms),
+                );
             }
             if completed_at_unix_ms.is_some() {
                 turn.completed_at_unix_ms = completed_at_unix_ms;

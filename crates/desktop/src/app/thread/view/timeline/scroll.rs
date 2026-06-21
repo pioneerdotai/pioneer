@@ -1,5 +1,6 @@
 use super::model::{TimelineRow, timeline_row_text_len, timeline_row_toggle_key};
 use super::*;
+use pioneer_client::timeline::labels::running_turn_display;
 
 impl PioneerDesktop {
     pub(super) fn sync_timeline_scroll(
@@ -24,7 +25,11 @@ impl PioneerDesktop {
             || state.tail_entry_id.as_deref() != tail_entry_id
             || state.tail_text_len != tail_text_len;
 
-        let should_follow = if thread_changed {
+        let force_follow = running_turn_display(projection).is_some();
+
+        let should_follow = if force_follow {
+            item_count > 0
+        } else if thread_changed {
             item_count > 0
         } else {
             timeline_changed && item_count > 0 && self.timeline_is_near_bottom()
