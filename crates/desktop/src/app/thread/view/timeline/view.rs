@@ -1,11 +1,15 @@
 use super::{
+    TimelinePendingRequestRow, TimelineRenderRow,
     items::format_elapsed_ms,
     model::{
         TimelineCoalescedToolsKind, TimelineCoalescedToolsRow, TimelineRow, TimelineRowKind,
         TurnWorkGroupRow, build_timeline_rows, timeline_rows_layout_hash,
     },
 };
-use crate::app::{conversation::ConversationViewState, root::PioneerDesktop};
+use crate::app::{
+    conversation::ConversationViewState,
+    root::{CLIRuntimePendingRequestEntry, PioneerDesktop},
+};
 use gpui::{prelude::*, *};
 use gpui_component::{Icon, IconName, h_flex, scroll::Scrollbar, v_flex, v_virtual_list};
 use std::{
@@ -18,12 +22,13 @@ impl PioneerDesktop {
         &self,
         active_thread_id: Option<&str>,
         projection: &ConversationViewState,
+        pending_cli_runtime_requests: Vec<CLIRuntimePendingRequestEntry>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         self.sync_timeline_layout_width(cx);
 
-        if projection.timeline.is_empty() {
+        if projection.timeline.is_empty() && pending_cli_runtime_requests.is_empty() {
             return v_flex()
                 .w_full()
                 .h_full()
@@ -65,6 +70,8 @@ impl PioneerDesktop {
         };
 
         let rows = self.hydrate_running_turn_rows(rows, cx);
+        let rows = Rc::new(timeline_render_rows(rows, pending_cli_runtime_requests));
+        let rows_layout_hash = rows_layout_hash ^ timeline_render_rows_layout_hash(rows.as_ref());
 
         self.sync_timeline_scroll(active_thread_id, projection, rows.as_ref());
 
@@ -73,7 +80,7 @@ impl PioneerDesktop {
         }
 
         let width_px = (list_width / px(1.)).round() as i32;
-        let tail_row_key = rows.last().map(|row| row.key.as_str());
+        let tail_row_key = rows.last().map(|row| row.key());
 
         let item_sizes = {
             let mut state = self.thread_timeline_view_state.borrow_mut();
@@ -167,14 +174,17 @@ impl PioneerDesktop {
     pub(super) fn render_timeline_row(
         &self,
         projection: &ConversationViewState,
-        row: &TimelineRow,
+        row: &TimelineRenderRow,
         is_first_row: bool,
         is_last_row: bool,
         content_width: Pixels,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        match &row.kind {
-            TimelineRowKind::Item { timeline_index } => {
+        match row {
+            TimelineRenderRow::Timeline(TimelineRow {
+                kind: TimelineRowKind::Item { timeline_index },
+                ..
+            }) => {
                 let Some(entry) = projection.timeline.get(*timeline_index) else {
                     return div().into_any_element();
                 };
@@ -192,27 +202,40 @@ impl PioneerDesktop {
                     cx,
                 )
             }
-            TimelineRowKind::TurnWorkToggle(group) => self.render_turn_work_group_toggle(
+            TimelineRenderRow::Timeline(TimelineRow {
+                kind: TimelineRowKind::TurnWorkToggle(group),
+                ..
+            }) => self.render_turn_work_group_toggle(
                 group,
                 is_first_row,
                 is_last_row,
                 content_width,
                 cx,
             ),
-            TimelineRowKind::CoalescedTools(group) => self.render_coalesced_tools_toggle(
+            TimelineRenderRow::Timeline(TimelineRow {
+                kind: TimelineRowKind::CoalescedTools(group),
+                ..
+            }) => self.render_coalesced_tools_toggle(
                 group,
                 is_first_row,
                 is_last_row,
                 content_width,
                 cx,
             ),
-            TimelineRowKind::RunningTurn(running_turn) => self.render_running_turn_row(
+            TimelineRenderRow::Timeline(TimelineRow {
+                kind: TimelineRowKind::RunningTurn(running_turn),
+                ..
+            }) => self.render_running_turn_row(
                 running_turn,
                 is_first_row,
                 is_last_row,
                 content_width,
                 cx,
             ),
+            TimelineRenderRow::PendingRequest(row) => {
+                let content = self.render_cli_runtime_pending_request_card(row.entry.clone(), cx);
+                self.render_item_row(is_first_row, is_last_row, content_width, content)
+            }
         }
     }
 
@@ -351,4 +374,62 @@ fn coalesced_tools_label(group: &TimelineCoalescedToolsRow) -> String {
         )
         .to_string(),
     }
+}
+
+fn timeline_render_rows(
+    rows: Rc<Vec<TimelineRow>>,
+    pending_requests: Vec<CLIRuntimePendingRequestEntry>,
+) -> Vec<TimelineRenderRow> {
+    if pending_requests.is_empty() {
+        return rows
+            .iter()
+            .cloned()
+            .map(TimelineRenderRow::Timeline)
+            .collect();
+    }
+
+    let running_index = rows
+        .iter()
+        .position(|row| matches!(row.kind, TimelineRowKind::RunningTurn(_)))
+        .unwrap_or(rows.len());
+
+    let mut render_rows = Vec::with_capacity(rows.len() + pending_requests.len());
+    render_rows.extend(
+        rows[..running_index]
+            .iter()
+            .cloned()
+            .map(TimelineRenderRow::Timeline),
+    );
+    render_rows.extend(pending_requests.into_iter().map(|entry| {
+        TimelineRenderRow::PendingRequest(TimelinePendingRequestRow {
+            key: format!("timeline-cli-runtime-request::{}", entry.request_id),
+            entry,
+        })
+    }));
+    render_rows.extend(
+        rows[running_index..]
+            .iter()
+            .cloned()
+            .map(TimelineRenderRow::Timeline),
+    );
+    render_rows
+}
+
+fn timeline_render_rows_layout_hash(rows: &[TimelineRenderRow]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for row in rows {
+        row.key().hash(&mut hasher);
+        if let TimelineRenderRow::PendingRequest(row) = row {
+            row.entry.request_id.hash(&mut hasher);
+            row.entry.request.title.hash(&mut hasher);
+            row.entry.request.message.hash(&mut hasher);
+            row.entry
+                .request
+                .payload
+                .as_ref()
+                .map(serde_json::Value::to_string)
+                .hash(&mut hasher);
+        }
+    }
+    hasher.finish()
 }

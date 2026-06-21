@@ -17,31 +17,7 @@ use serde_json::{Map as JsonMap, Value as JsonValue, json};
 use std::rc::Rc;
 
 impl PioneerDesktop {
-    pub(super) fn render_cli_runtime_pending_requests_panel(
-        &self,
-        requests: Vec<CLIRuntimePendingRequestEntry>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        if requests.is_empty() {
-            return div().into_any_element();
-        }
-
-        h_flex()
-            .w_full()
-            .justify_center()
-            .px_6()
-            .pb_2()
-            .child(
-                v_flex().w_full().max_w(px(800.)).gap_2().children(
-                    requests
-                        .into_iter()
-                        .map(|request| self.render_cli_runtime_pending_request_card(request, cx)),
-                ),
-            )
-            .into_any_element()
-    }
-
-    fn render_cli_runtime_pending_request_card(
+    pub(super) fn render_cli_runtime_pending_request_card(
         &self,
         entry: CLIRuntimePendingRequestEntry,
         cx: &mut Context<Self>,

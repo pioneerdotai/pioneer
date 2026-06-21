@@ -8,10 +8,38 @@ mod view;
 use self::model::{TimelineRow, TimelineRowKind};
 use crate::app::{
     conversation::{ConversationViewState, ItemView},
-    root::{CachedTimelineEntryLayout, PioneerDesktop, ThreadTimelineViewState},
+    root::{
+        CLIRuntimePendingRequestEntry, CachedTimelineEntryLayout, PioneerDesktop,
+        ThreadTimelineViewState,
+    },
 };
 use gpui::{prelude::*, *};
-use std::{collections::HashSet, rc::Rc};
+use std::{
+    collections::HashSet,
+    hash::{Hash, Hasher},
+    rc::Rc,
+};
+
+#[derive(Clone)]
+pub(super) struct TimelinePendingRequestRow {
+    pub key: String,
+    pub entry: CLIRuntimePendingRequestEntry,
+}
+
+#[derive(Clone)]
+pub(super) enum TimelineRenderRow {
+    Timeline(TimelineRow),
+    PendingRequest(TimelinePendingRequestRow),
+}
+
+impl TimelineRenderRow {
+    pub(super) fn key(&self) -> &str {
+        match self {
+            TimelineRenderRow::Timeline(row) => row.key.as_str(),
+            TimelineRenderRow::PendingRequest(row) => row.key.as_str(),
+        }
+    }
+}
 
 impl PioneerDesktop {
     fn sync_timeline_layout_width(&self, cx: &mut Context<Self>) {
@@ -49,10 +77,15 @@ impl PioneerDesktop {
     fn timeline_row_layout_hash(
         &self,
         projection: &ConversationViewState,
-        row: &TimelineRow,
+        row: &TimelineRenderRow,
         expanded: &HashSet<String>,
     ) -> u64 {
-        model::timeline_row_layout_hash(projection, row, expanded)
+        match row {
+            TimelineRenderRow::Timeline(row) => {
+                model::timeline_row_layout_hash(projection, row, expanded)
+            }
+            TimelineRenderRow::PendingRequest(row) => timeline_pending_request_layout_hash(row),
+        }
     }
 
     fn timeline_content_width(&self, window: &Window) -> Pixels {
@@ -85,7 +118,7 @@ impl PioneerDesktop {
     fn measure_timeline_row_size(
         &self,
         projection: &ConversationViewState,
-        row: &TimelineRow,
+        row: &TimelineRenderRow,
         is_first_row: bool,
         is_last_row: bool,
         row_width: Pixels,
@@ -117,7 +150,7 @@ impl PioneerDesktop {
         &self,
         state: &mut ThreadTimelineViewState,
         projection: &ConversationViewState,
-        row: &TimelineRow,
+        row: &TimelineRenderRow,
         is_first_row: bool,
         is_last_row: bool,
         row_width: Pixels,
@@ -126,7 +159,13 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Size<Pixels> {
-        if matches!(row.kind, TimelineRowKind::RunningTurn(_)) {
+        if matches!(
+            row,
+            TimelineRenderRow::Timeline(TimelineRow {
+                kind: TimelineRowKind::RunningTurn(_),
+                ..
+            })
+        ) {
             return self.running_turn_row_size(is_first_row, is_last_row);
         }
 
@@ -138,7 +177,7 @@ impl PioneerDesktop {
             layout_hash = layout_hash.wrapping_add(2);
         }
 
-        if let Some(cached) = state.entry_layout_cache.get(row.key.as_str())
+        if let Some(cached) = state.entry_layout_cache.get(row.key())
             && cached.layout_hash == layout_hash
         {
             return size(px(0.), cached.height.max(px(1.)));
@@ -155,7 +194,7 @@ impl PioneerDesktop {
             cx,
         );
         state.entry_layout_cache.insert(
-            row.key.clone(),
+            row.key().to_owned(),
             CachedTimelineEntryLayout {
                 layout_hash,
                 height: measured.height,
@@ -168,7 +207,7 @@ impl PioneerDesktop {
         &self,
         state: &mut ThreadTimelineViewState,
         projection: &ConversationViewState,
-        rows: &[TimelineRow],
+        rows: &[TimelineRenderRow],
         row_width: Pixels,
         content_width: Pixels,
         expanded: &HashSet<String>,
@@ -196,4 +235,51 @@ impl PioneerDesktop {
                 .collect::<Vec<_>>(),
         )
     }
+
+    fn timeline_render_row_text_len(
+        projection: &ConversationViewState,
+        row: &TimelineRenderRow,
+    ) -> usize {
+        match row {
+            TimelineRenderRow::Timeline(row) => model::timeline_row_text_len(projection, row),
+            TimelineRenderRow::PendingRequest(row) => {
+                row.entry.request.title.as_deref().unwrap_or_default().len()
+                    + row
+                        .entry
+                        .request
+                        .message
+                        .as_deref()
+                        .unwrap_or_default()
+                        .len()
+                    + row.entry.request_id.len()
+            }
+        }
+    }
+
+    fn timeline_render_row_toggle_key(row: &TimelineRenderRow) -> Option<&str> {
+        match row {
+            TimelineRenderRow::Timeline(row) => model::timeline_row_toggle_key(row),
+            TimelineRenderRow::PendingRequest(_) => None,
+        }
+    }
+}
+
+fn timeline_pending_request_layout_hash(row: &TimelinePendingRequestRow) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    row.entry.workspace_id.hash(&mut hasher);
+    row.entry.runtime_id.hash(&mut hasher);
+    row.entry.request_id.hash(&mut hasher);
+    row.entry.thread_id.hash(&mut hasher);
+    row.entry.turn_id.hash(&mut hasher);
+    row.entry.item_id.hash(&mut hasher);
+    format!("{:?}", row.entry.request.kind).hash(&mut hasher);
+    row.entry.request.title.hash(&mut hasher);
+    row.entry.request.message.hash(&mut hasher);
+    row.entry
+        .request
+        .payload
+        .as_ref()
+        .map(serde_json::Value::to_string)
+        .hash(&mut hasher);
+    hasher.finish()
 }

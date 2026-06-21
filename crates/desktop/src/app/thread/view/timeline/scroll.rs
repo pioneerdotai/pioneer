@@ -1,4 +1,3 @@
-use super::model::{TimelineRow, timeline_row_text_len, timeline_row_toggle_key};
 use super::*;
 use pioneer_client::timeline::labels::running_turn_display;
 
@@ -7,14 +6,14 @@ impl PioneerDesktop {
         &self,
         active_thread_id: Option<&str>,
         projection: &ConversationViewState,
-        rows: &[TimelineRow],
+        rows: &[TimelineRenderRow],
     ) {
         let item_count = rows.len();
 
-        let tail_entry_id = rows.last().map(|row| row.key.as_str());
+        let tail_entry_id = rows.last().map(TimelineRenderRow::key);
         let tail_text_len = rows
             .last()
-            .map(|row| timeline_row_text_len(projection, row))
+            .map(|row| Self::timeline_render_row_text_len(projection, row))
             .unwrap_or_default();
 
         let mut state = self.thread_timeline_view_state.borrow_mut();
@@ -25,7 +24,10 @@ impl PioneerDesktop {
             || state.tail_entry_id.as_deref() != tail_entry_id
             || state.tail_text_len != tail_text_len;
 
-        let force_follow = running_turn_display(projection).is_some();
+        let force_follow = running_turn_display(projection).is_some()
+            || rows
+                .iter()
+                .any(|row| matches!(row, TimelineRenderRow::PendingRequest(_)));
 
         let should_follow = if force_follow {
             item_count > 0
@@ -46,7 +48,7 @@ impl PioneerDesktop {
         } else if timeline_changed {
             let live_row_keys = rows
                 .iter()
-                .map(|row| row.key.as_str())
+                .map(TimelineRenderRow::key)
                 .collect::<HashSet<_>>();
             state
                 .entry_layout_cache
@@ -74,7 +76,7 @@ impl PioneerDesktop {
                 .collect::<HashSet<_>>();
             let live_expand_keys = rows
                 .iter()
-                .filter_map(timeline_row_toggle_key)
+                .filter_map(Self::timeline_render_row_toggle_key)
                 .chain(live_entry_ids.iter().copied())
                 .collect::<HashSet<_>>();
 

@@ -28,8 +28,14 @@ impl PioneerDesktop {
             .unwrap_or(&default_projection);
 
         let desktop_entity = cx.entity().clone();
-        let timeline = self.render_timeline(active_thread_id.as_deref(), projection, window, cx);
         let pending_cli_runtime_requests = self.active_thread_cli_runtime_pending_requests();
+        let timeline = self.render_timeline(
+            active_thread_id.as_deref(),
+            projection,
+            pending_cli_runtime_requests,
+            window,
+            cx,
+        );
         let thread_body = v_flex()
             .size_full()
             .min_w_0()
@@ -42,10 +48,6 @@ impl PioneerDesktop {
                     .min_h_0()
                     .overflow_hidden()
                     .child(div().flex_1().min_h_0().child(timeline))
-                    .child(self.render_cli_runtime_pending_requests_panel(
-                        pending_cli_runtime_requests,
-                        cx,
-                    ))
                     .child(self.render_composer(cx)),
             );
 
