@@ -427,6 +427,13 @@ pub struct RunningAttemptDeadlineRepairCandidate {
     pub started_at_unix: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct RunningTurnItemAttempt {
+    pub turn_id: String,
+    pub item_id: String,
+    pub item_type: TurnItemType,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadModelInvariantKind {
     TerminalToolPayloadInProgress,
@@ -8000,6 +8007,22 @@ impl CrudStore {
                 item_type: turn_item_type_from_db(row.item_type.as_str())
                     .unwrap_or(TurnItemType::DynamicToolCall),
                 started_at_unix: row.started_at.timestamp(),
+            })
+            .collect())
+    }
+
+    pub async fn list_running_turn_item_attempts_for_turn(
+        &self,
+        turn_id: &str,
+    ) -> Result<Vec<RunningTurnItemAttempt>> {
+        let rows =
+            turn_item_attempt::list_running_attempts_for_turn(&self.connection, turn_id).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| RunningTurnItemAttempt {
+                turn_id: row.turn_id,
+                item_id: row.item_id,
+                item_type: row.item_type,
             })
             .collect())
     }

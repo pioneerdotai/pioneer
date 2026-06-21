@@ -36,6 +36,7 @@ const CLI_RUNTIME_STALE_TURN_SCAN_LIMIT: u64 = 128;
 const CLI_RUNTIME_SILENT_TURN_STALE_AFTER_MS: i64 = 150_000;
 const CLI_RUNTIME_EVENTED_TURN_STALE_AFTER_MS: i64 = 15 * 60 * 1_000;
 const CLI_RUNTIME_PENDING_UNBOUND_EVENT_TTL_MS: i64 = 30_000;
+const CLI_RUNTIME_HUMAN_RESPONSE_TIMEOUT_MS: i64 = 24 * 60 * 60 * 1_000;
 
 impl MessageProcessor {
     pub(super) async fn cli_runtime_list(
@@ -1343,22 +1344,6 @@ impl MessageProcessor {
             return;
         }
 
-        if let Err(error) = validate_cli_runtime_native_request_resolution(&pending, &resolution) {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_PARAMS_CODE,
-                    format!(
-                        "invalid CLI runtime request `{}` resolution: {error:#}",
-                        pending.request_id
-                    ),
-                ),
-            )
-            .await;
-            return;
-        }
-
         if let Err(error) = self
             .validate_cli_runtime_pending_request_active_turn(&pending)
             .await
@@ -1384,6 +1369,84 @@ impl MessageProcessor {
                     INVALID_PARAMS_CODE,
                     format!(
                         "stale CLI runtime request `{}` cannot be answered: {error:#}",
+                        pending.request_id
+                    ),
+                ),
+            )
+            .await;
+            return;
+        }
+
+        if cli_runtime_pending_request_is_human_wait(pending.request_kind.as_str()) {
+            let now_unix_ms = chrono::Utc::now().timestamp_millis();
+            if now_unix_ms.saturating_sub(pending.created_at.timestamp_millis())
+                >= CLI_RUNTIME_HUMAN_RESPONSE_TIMEOUT_MS
+            {
+                if let Some(turn_id) = pending.turn_id.as_deref() {
+                    if let Err(error) = self
+                        .reconcile_cli_runtime_human_wait_for_turn(
+                            turn_id,
+                            now_unix_ms,
+                            "CLI runtime request response",
+                        )
+                        .await
+                    {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request_id),
+                                INVALID_REQUEST_CODE,
+                                format!(
+                                    "failed to handle expired CLI runtime request `{}` after user response timeout: {error:#}",
+                                    pending.request_id
+                                ),
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                } else if let Err(error) = self
+                    .expire_cli_runtime_pending_request_as_stale(&pending)
+                    .await
+                {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!(
+                                "failed to expire CLI runtime request `{}` after user response timeout: {error:#}",
+                                pending.request_id
+                            ),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_PARAMS_CODE,
+                        format!(
+                            "CLI runtime request `{}` expired after waiting for user response for {} ms",
+                            pending.request_id, CLI_RUNTIME_HUMAN_RESPONSE_TIMEOUT_MS
+                        ),
+                    ),
+                )
+                .await;
+                return;
+            }
+        }
+
+        if let Err(error) = validate_cli_runtime_native_request_resolution(&pending, &resolution) {
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_PARAMS_CODE,
+                    format!(
+                        "invalid CLI runtime request `{}` resolution: {error:#}",
                         pending.request_id
                     ),
                 ),
@@ -1500,6 +1563,23 @@ impl MessageProcessor {
             )
             .await;
             return;
+        }
+
+        if let Some(turn_id) = resolved.turn_id.as_deref()
+            && let Err(error) = self
+                .timeout_supervisor
+                .renew_running_attempt_deadlines_for_turn(turn_id, now_timestamp_secs())
+                .await
+        {
+            warn!(
+                workspace_id = resolved.workspace_id.as_str(),
+                runtime_id = resolved.runtime_id.as_str(),
+                thread_id = resolved.thread_id.as_str(),
+                turn_id,
+                request_id = resolved.request_id.as_str(),
+                error = %format!("{error:#}"),
+                "failed to renew turn item deadlines after CLI runtime user response"
+            );
         }
 
         self.emit_cli_runtime_request_resolved(resolved.clone(), resolution.clone())
@@ -2176,6 +2256,125 @@ impl MessageProcessor {
             .await;
     }
 
+    pub(super) async fn reconcile_cli_runtime_human_wait_for_turn(
+        &self,
+        turn_id: &str,
+        now_unix_ms: i64,
+        source: &str,
+    ) -> anyhow::Result<bool> {
+        let pending_requests = self
+            .crud_store
+            .list_cli_runtime_pending_requests(pioneer_crud::CliRuntimePendingRequestListFilter {
+                turn_id: Some(turn_id.to_owned()),
+                status: Some(StoredCliRuntimePendingRequestStatus::Pending),
+                limit: None,
+                ..Default::default()
+            })
+            .await?;
+
+        let mut human_requests = pending_requests
+            .into_iter()
+            .filter(|request| {
+                cli_runtime_pending_request_is_human_wait(request.request_kind.as_str())
+            })
+            .collect::<Vec<_>>();
+        if human_requests.is_empty() {
+            return Ok(false);
+        }
+
+        let Some(binding) = self
+            .crud_store
+            .get_cli_runtime_turn_binding(turn_id)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to load CLI runtime turn binding while reconciling human wait for turn `{turn_id}`"
+                )
+            })?
+        else {
+            debug!(
+                turn_id,
+                source,
+                request_count = human_requests.len(),
+                "ignoring CLI runtime human wait for turn without CLI runtime binding"
+            );
+            return Ok(false);
+        };
+        if !cli_runtime_turn_binding_status_is_active(binding.status.as_str()) {
+            self.cleanup_cli_runtime_terminal_binding_status(
+                &binding,
+                "CLI runtime human wait reconciliation",
+            )
+            .await;
+            return Ok(false);
+        }
+        human_requests.retain(|request| {
+            request.workspace_id == binding.workspace_id
+                && request.runtime_id == binding.runtime_id
+                && request.thread_id == binding.thread_id
+                && request.turn_id.as_deref() == Some(binding.turn_id.as_str())
+        });
+        if human_requests.is_empty() {
+            debug!(
+                turn_id,
+                source,
+                binding_workspace_id = binding.workspace_id.as_str(),
+                binding_runtime_id = binding.runtime_id.as_str(),
+                binding_thread_id = binding.thread_id.as_str(),
+                "ignoring CLI runtime human wait requests that do not match the active turn binding"
+            );
+            return Ok(false);
+        }
+
+        human_requests.sort_by_key(|request| request.created_at);
+        let expired = human_requests
+            .iter()
+            .filter(|request| {
+                now_unix_ms.saturating_sub(request.created_at.timestamp_millis())
+                    >= CLI_RUNTIME_HUMAN_RESPONSE_TIMEOUT_MS
+            })
+            .collect::<Vec<_>>();
+        if expired.is_empty() {
+            debug!(
+                turn_id,
+                source,
+                request_count = human_requests.len(),
+                "deferred turn timeout while waiting for CLI runtime user response"
+            );
+            return Ok(true);
+        }
+
+        let first_expired = expired[0];
+        let wait_ms = now_unix_ms.saturating_sub(first_expired.created_at.timestamp_millis());
+        let reason = format!(
+            "CLI runtime turn `{turn_id}` was blocked because pending user response request `{}` ({}) was not answered within {} ms",
+            first_expired.request_id,
+            first_expired.request_kind,
+            CLI_RUNTIME_HUMAN_RESPONSE_TIMEOUT_MS
+        );
+        warn!(
+            workspace_id = first_expired.workspace_id.as_str(),
+            runtime_id = first_expired.runtime_id.as_str(),
+            thread_id = first_expired.thread_id.as_str(),
+            turn_id,
+            request_id = first_expired.request_id.as_str(),
+            request_kind = first_expired.request_kind.as_str(),
+            wait_ms,
+            source,
+            "blocking CLI runtime turn after human response timeout"
+        );
+        if !self
+            .mark_turn_blocked(first_expired.thread_id.clone(), turn_id.to_owned(), reason)
+            .await
+        {
+            anyhow::bail!(
+                "failed to mark CLI runtime turn `{turn_id}` blocked after human response timeout for request `{}`",
+                first_expired.request_id
+            );
+        }
+        Ok(true)
+    }
+
     async fn fail_stale_cli_runtime_turn_binding(
         &self,
         binding: pioneer_crud::CliRuntimeTurnBindingRecord,
@@ -2204,6 +2403,17 @@ impl MessageProcessor {
                 "stale CLI runtime turn scan",
             )
             .await;
+            return Ok(());
+        }
+
+        if self
+            .reconcile_cli_runtime_human_wait_for_turn(
+                binding.turn_id.as_str(),
+                now_unix_ms,
+                "CLI runtime stale turn scan",
+            )
+            .await?
+        {
             return Ok(());
         }
 
@@ -5154,6 +5364,12 @@ fn cli_runtime_request_kind_requires_turn_binding(kind: CLIRuntimeRequestKind) -
             | CLIRuntimeRequestKind::FileChangeApproval
             | CLIRuntimeRequestKind::UserInput
     )
+}
+
+fn cli_runtime_pending_request_is_human_wait(request_kind: &str) -> bool {
+    cli_runtime_request_kind_requires_turn_binding(cli_runtime_request_kind_from_stored(
+        request_kind,
+    ))
 }
 
 fn cli_runtime_event_can_use_running_turn_fallback(event: &RuntimeEvent) -> bool {

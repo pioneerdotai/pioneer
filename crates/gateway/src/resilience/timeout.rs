@@ -232,22 +232,54 @@ impl TimeoutSupervisor {
         Ok(())
     }
 
-    pub async fn poll_timeouts(&self, now_unix: i64, limit: u64) -> Result<Vec<TimeoutCandidate>> {
-        let candidates = self
-            .crud_store
+    pub async fn list_timeout_candidates(
+        &self,
+        now_unix: i64,
+        limit: u64,
+    ) -> Result<Vec<TimeoutCandidate>> {
+        self.crud_store
             .list_timeout_candidates(now_unix, limit)
+            .await
+    }
+
+    pub async fn transition_timeout_candidate(
+        &self,
+        candidate: &TimeoutCandidate,
+        now_unix: i64,
+    ) -> Result<bool> {
+        self.crud_store
+            .transition_timeout_candidate(candidate, now_unix)
+            .await
+    }
+
+    pub async fn renew_running_attempt_deadlines_for_turn(
+        &self,
+        turn_id: &str,
+        now_unix: i64,
+    ) -> Result<usize> {
+        let attempts = self
+            .crud_store
+            .list_running_turn_item_attempts_for_turn(turn_id)
             .await?;
-        let mut timed_out = Vec::new();
-        for candidate in candidates {
-            let transitioned = self
+        let mut renewed = 0usize;
+        for attempt in attempts {
+            let deadlines = self.deadlines_for(attempt.item_type, now_unix);
+            if self
                 .crud_store
-                .transition_timeout_candidate(&candidate, now_unix)
-                .await?;
-            if transitioned {
-                timed_out.push(candidate);
+                .configure_turn_item_attempt_deadlines(
+                    attempt.turn_id.as_str(),
+                    attempt.item_id.as_str(),
+                    now_unix,
+                    deadlines.lease_expires_at_unix,
+                    deadlines.idle_deadline_at_unix,
+                    deadlines.hard_deadline_at_unix,
+                )
+                .await?
+            {
+                renewed = renewed.saturating_add(1);
             }
         }
-        Ok(timed_out)
+        Ok(renewed)
     }
 }
 

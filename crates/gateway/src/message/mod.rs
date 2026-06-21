@@ -873,7 +873,7 @@ impl MessageProcessor {
                 }
 
                 match retry_transient_storage_open(|| {
-                    this.timeout_supervisor.poll_timeouts(now, 64)
+                    this.poll_timeouts_respecting_human_wait(now, 64)
                 })
                 .await
                 {

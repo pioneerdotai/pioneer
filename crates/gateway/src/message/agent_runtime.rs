@@ -2558,6 +2558,39 @@ impl MessageProcessor {
         }
     }
 
+    pub(super) async fn poll_timeouts_respecting_human_wait(
+        &self,
+        now_unix: i64,
+        limit: u64,
+    ) -> Result<Vec<TimeoutCandidate>> {
+        let candidates = self
+            .timeout_supervisor
+            .list_timeout_candidates(now_unix, limit)
+            .await?;
+        let now_unix_ms = now_unix.saturating_mul(1_000);
+        let mut timed_out = Vec::new();
+        for candidate in candidates {
+            if self
+                .reconcile_cli_runtime_human_wait_for_turn(
+                    candidate.turn_id.as_str(),
+                    now_unix_ms,
+                    "timeout supervisor",
+                )
+                .await?
+            {
+                continue;
+            }
+            if self
+                .timeout_supervisor
+                .transition_timeout_candidate(&candidate, now_unix)
+                .await?
+            {
+                timed_out.push(candidate);
+            }
+        }
+        Ok(timed_out)
+    }
+
     pub(super) async fn handle_recovery_terminal_outcome(
         &self,
         outcome: RecoveryTerminalOutcome,
@@ -3732,7 +3765,7 @@ impl MessageProcessor {
         recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
         resume: Option<pioneer_protocol::TurnBlockedResumeMetadata>,
     ) -> bool {
-        if let Some((_workspace_id, current_turn)) = self
+        let turn_loaded_in_memory = if let Some((_workspace_id, current_turn)) = self
             .thread_manager
             .turn_get(thread_id.as_str(), turn_id.as_str())
             .await
@@ -3770,7 +3803,10 @@ impl MessageProcessor {
             if current_turn.status != TurnStatus::InProgress {
                 return false;
             }
-        }
+            true
+        } else {
+            false
+        };
 
         if let Some(recovery) = recovery.as_ref() {
             match self
@@ -3792,6 +3828,18 @@ impl MessageProcessor {
                     return false;
                 }
             }
+        }
+
+        if !turn_loaded_in_memory {
+            return self
+                .mark_unloaded_turn_blocked_with_resume_metadata(
+                    thread_id,
+                    turn_id,
+                    reason,
+                    recovery.as_ref(),
+                    resume,
+                )
+                .await;
         }
 
         let finish_outcome = match self
@@ -3905,6 +3953,156 @@ impl MessageProcessor {
         {
             self.agent_manager.remove_thread(thread_id.as_str()).await;
         }
+
+        true
+    }
+
+    async fn mark_unloaded_turn_blocked_with_resume_metadata(
+        &self,
+        thread_id: String,
+        turn_id: String,
+        reason: String,
+        recovery: Option<&pioneer_protocol::RecoveryAttemptContext>,
+        resume: Option<pioneer_protocol::TurnBlockedResumeMetadata>,
+    ) -> bool {
+        let (workspace_id, current_turn) = match self
+            .crud_store
+            .get_turn(thread_id.as_str(), turn_id.as_str())
+            .await
+        {
+            Ok(Some(turn_state)) => turn_state,
+            Ok(None) => {
+                warn!(
+                    thread_id,
+                    turn_id, "turn missing before marking unloaded turn as blocked"
+                );
+                return false;
+            }
+            Err(error) => {
+                warn!(
+                    thread_id,
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to load unloaded turn before marking it as blocked"
+                );
+                return false;
+            }
+        };
+
+        if current_turn.status == TurnStatus::Blocked {
+            let block_reason = current_turn
+                .error
+                .as_deref()
+                .unwrap_or_else(|| reason.as_str());
+            self.ensure_blocked_turn_terminal_cleanup(
+                thread_id.as_str(),
+                turn_id.as_str(),
+                Some(block_reason),
+            )
+            .await;
+            if let Err(error) = self
+                .recovery_coordinator
+                .block_active_recoveries_for_turn(
+                    turn_id.as_str(),
+                    recovery,
+                    block_reason,
+                    now_timestamp_secs(),
+                )
+                .await
+            {
+                warn!(
+                    thread_id,
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to mark active recovery jobs blocked for already blocked unloaded turn"
+                );
+            }
+            return true;
+        }
+        if current_turn.status != TurnStatus::InProgress {
+            return false;
+        }
+
+        let turn_blocked = TurnBlockedNotification {
+            workspace_id: workspace_id.clone(),
+            thread_id: thread_id.clone(),
+            turn: Turn {
+                status: TurnStatus::Blocked,
+                error: Some(reason.clone()),
+                ..current_turn
+            },
+            resume,
+        };
+        let event_timestamp = now_timestamp_secs();
+        if let Err(error) = self
+            .crud_store
+            .materialize_turn_blocked(turn_blocked.clone(), event_timestamp)
+            .await
+        {
+            warn!(
+                thread_id,
+                turn_id,
+                error = %format!("{error:#}"),
+                "failed to persist unloaded turn/blocked event"
+            );
+            return false;
+        }
+
+        self.ensure_blocked_turn_terminal_cleanup(
+            thread_id.as_str(),
+            turn_id.as_str(),
+            turn_blocked.turn.error.as_deref(),
+        )
+        .await;
+
+        if let Err(error) = self
+            .task_agent_executor
+            .reconcile_child_turn_blocked(
+                thread_id.as_str(),
+                turn_id.as_str(),
+                turn_blocked.turn.error.as_deref().unwrap_or("turn blocked"),
+            )
+            .await
+        {
+            warn!(
+                thread_id,
+                turn_id,
+                error = %format!("{error:#}"),
+                "failed to reconcile blocked child task turn for unloaded turn"
+            );
+        }
+
+        if let Err(error) = self
+            .recovery_coordinator
+            .block_active_recoveries_for_turn(
+                turn_id.as_str(),
+                recovery,
+                turn_blocked.turn.error.as_deref().unwrap_or("turn blocked"),
+                event_timestamp,
+            )
+            .await
+        {
+            warn!(
+                thread_id,
+                turn_id,
+                error = %format!("{error:#}"),
+                "failed to mark active recovery jobs blocked for unloaded turn"
+            );
+        }
+
+        self.send_notification_to_workspace_connections(
+            workspace_id.as_str(),
+            events::TURN_BLOCKED,
+            &turn_blocked,
+        )
+        .await;
+        self.notify_parent_timeline_changed_for_child_turn(
+            turn_blocked.thread_id.as_str(),
+            turn_blocked.turn.id.as_str(),
+            Some(turn_blocked.workspace_id.as_str()),
+            TurnTimelineChangedReason::ChildTurnChanged,
+        )
+        .await;
 
         true
     }
