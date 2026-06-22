@@ -5,6 +5,8 @@ use std::borrow::Cow;
 
 #[derive(RustEmbed)]
 #[folder = "assets"]
+#[include = "dino-dark.webp"]
+#[include = "dino-light.webp"]
 #[include = "icons/**/*.svg"]
 #[include = "logos/**/*.svg"]
 struct PioneerAssets;
@@ -89,5 +91,18 @@ impl IconNamed for PioneerIconName {
 impl RenderOnce for PioneerIconName {
     fn render(self, _: &mut gpui::Window, _: &mut gpui::App) -> impl IntoElement {
         Icon::new(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PioneerAssetsSource;
+    use gpui::AssetSource as _;
+
+    #[test]
+    fn serves_running_turn_dino_assets() {
+        let assets = PioneerAssetsSource;
+        assert!(assets.load("dino-dark.webp").unwrap().is_some());
+        assert!(assets.load("dino-light.webp").unwrap().is_some());
     }
 }

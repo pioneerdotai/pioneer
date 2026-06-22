@@ -1,17 +1,18 @@
 use super::items::format_elapsed_ms;
 use super::model::{TimelineRow, TimelineRowKind};
 use crate::app::root::PioneerDesktop;
-use gpui::{prelude::*, *};
+use gpui::{ImageSource, Resource, prelude::*, *};
 use gpui_component::{StyledExt, h_flex, theme::ActiveTheme};
 use pioneer_client::timeline::labels::{RunningTurnDisplay, now_unix_ms, running_turn_display};
-use std::{path::PathBuf, rc::Rc, time::Duration};
+use std::{rc::Rc, time::Duration};
 
-fn running_turn_dino_path(is_dark: bool) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(if is_dark {
-        "assets/dino-dark.webp"
+fn running_turn_dino_image_source(is_dark: bool) -> ImageSource {
+    let asset_path = if is_dark {
+        "dino-dark.webp"
     } else {
-        "assets/dino-light.webp"
-    })
+        "dino-light.webp"
+    };
+    ImageSource::Resource(Resource::Embedded(asset_path.into()))
 }
 
 impl PioneerDesktop {
@@ -106,7 +107,8 @@ impl PioneerDesktop {
         } else {
             String::new()
         };
-        let dino_path = running_turn_dino_path(cx.theme().mode.is_dark());
+        let is_dark = cx.theme().mode.is_dark();
+        let dino_image_source = running_turn_dino_image_source(is_dark);
 
         let content = h_flex()
             .w_full()
@@ -121,7 +123,7 @@ impl PioneerDesktop {
                     .gap_4()
                     .child(
                         div().size_8().child(
-                            img(dino_path)
+                            img(dino_image_source)
                                 .id("running-turn-dino")
                                 .w_full()
                                 .h_full()
