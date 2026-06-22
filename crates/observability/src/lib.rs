@@ -192,6 +192,7 @@ fn should_demote_rmcp_transport_worker_failure(
         && message.is_some_and(|message| {
             is_rmcp_streamable_http_initialize_response_failure(message)
                 || is_rmcp_streamable_http_auth_rejection(message)
+                || is_rmcp_streamable_http_initialized_notification_send_failure(message)
         })
 }
 
@@ -285,6 +286,12 @@ fn is_rmcp_streamable_http_auth_rejection(message: &str) -> bool {
             || message.contains("InsufficientScope"))
 }
 
+fn is_rmcp_streamable_http_initialized_notification_send_failure(message: &str) -> bool {
+    message.contains("worker quit with fatal: Client error:")
+        && message.contains("error sending request for url (")
+        && message.contains("), when send initialized notification")
+}
+
 fn tracing_event_fields(event: &tracing::Event<'_>) -> EventFieldVisitor {
     let mut visitor = EventFieldVisitor::default();
     event.record(&mut visitor);
@@ -359,6 +366,28 @@ mod tests {
             "rmcp::transport::worker",
             Some(
                 "worker quit with fatal: Transport channel closed, when UnexpectedServerResponse(\"HTTP 403 Forbidden: forbidden: access denied\\n\")",
+            ),
+        ));
+    }
+
+    #[test]
+    fn demotes_expected_rmcp_streamable_http_initialized_notification_send_failure() {
+        assert!(should_demote_rmcp_transport_worker_failure(
+            &tracing::Level::ERROR,
+            "rmcp::transport::worker",
+            Some(
+                "worker quit with fatal: Client error: error sending request for url (https://mcp.posthog.com/mcp), when send initialized notification",
+            ),
+        ));
+    }
+
+    #[test]
+    fn keeps_rmcp_client_errors_from_other_stages_as_events() {
+        assert!(!should_demote_rmcp_transport_worker_failure(
+            &tracing::Level::ERROR,
+            "rmcp::transport::worker",
+            Some(
+                "worker quit with fatal: Client error: error sending request for url (https://mcp.posthog.com/mcp), when call tools/list",
             ),
         ));
     }
