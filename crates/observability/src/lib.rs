@@ -538,6 +538,14 @@ mod tests {
                 "Failed to run the control channel: Failed to read cmd: early eof. Retry in 470.57167ms...",
             ),
         ));
+        assert!(should_demote_rathole_client_control_channel_retry(
+            &tracing::Level::ERROR,
+            "rathole::client",
+            None,
+            Some(
+                "Failed to run the control channel: Heartbeat timed out. Retry in 539.863684ms...",
+            ),
+        ));
     }
 
     #[test]
