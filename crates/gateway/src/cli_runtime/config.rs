@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use pioneer_cli_agent_runtime::claude::ClaudeAccountProbeConfig;
 use pioneer_cli_agent_runtime::codex::CodexAccountProbeConfig;
 use pioneer_config::{AppConfig, EffectiveGatewayCliAgentRuntimeInstanceConfig};
 use std::path::{Path, PathBuf};
@@ -33,6 +34,20 @@ pub(crate) fn codex_account_probe_config_from_instance(
         request_timeout: Duration::from_millis(instance.request_timeout_ms),
         shutdown_grace: Duration::from_secs(2),
         stderr_ring_lines: instance.stderr_ring_lines,
+    }
+}
+
+pub(crate) fn claude_account_probe_config_from_instance(
+    instance: &EffectiveGatewayCliAgentRuntimeInstanceConfig,
+) -> ClaudeAccountProbeConfig {
+    ClaudeAccountProbeConfig {
+        executable: instance.binary_path.clone(),
+        config_dir_path: instance
+            .shadow_home_path
+            .clone()
+            .unwrap_or_else(|| instance.home_path.clone()),
+        home_dir: None,
+        request_timeout: Duration::from_millis(instance.startup_probe_timeout_ms),
     }
 }
 

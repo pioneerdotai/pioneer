@@ -1,6 +1,5 @@
 use super::agent_runtime::TurnFailureRecoveryKind;
 use super::*;
-use pioneer_cli_agent_runtime::codex::CodexTurnStartParams;
 use pioneer_protocol::{
     AgentExecutionBackend, CLIAgentRuntimeKind, TaskAttachmentMode, TaskEvent, TaskEventPayload,
     TaskGetResponse, TaskRunThreadBindingKind, TaskRunTurn, TaskThreadLineage, ThreadLineage,
@@ -396,7 +395,7 @@ impl MessageProcessor {
                     Some(request_id),
                     INVALID_REQUEST_CODE,
                     format!(
-                        "CLI runtime providers only support text, file, and image inputs; `{input_kind}` input is not supported"
+                        "CLI runtime providers only support text and attachment inputs; `{input_kind}` input is not supported"
                     ),
                 ),
             )
@@ -510,25 +509,34 @@ impl MessageProcessor {
                 return;
             }
         };
-        let mut input_mapping =
-            match crate::cli_runtime::input_mapping::map_codex_turn_input_from_pioneer(
-                params.input.as_slice(),
-                resolved_artifacts.as_slice(),
-            ) {
-                Ok(input_mapping) => input_mapping,
-                Err(error) => {
-                    self.send_error(
-                        connection_id,
-                        JsonRpcErrorResponse::new(
-                            Some(request_id),
-                            INVALID_REQUEST_CODE,
-                            format!("{error}"),
-                        ),
-                    )
-                    .await;
-                    return;
-                }
-            };
+        let mut input_mapping = match match runtime_kind {
+            CLIAgentRuntimeKind::Codex => {
+                crate::cli_runtime::input_mapping::map_codex_turn_input_from_pioneer(
+                    params.input.as_slice(),
+                    resolved_artifacts.as_slice(),
+                )
+            }
+            CLIAgentRuntimeKind::Claude => {
+                crate::cli_runtime::input_mapping::map_claude_turn_input_from_pioneer(
+                    params.input.as_slice(),
+                    resolved_artifacts.as_slice(),
+                )
+            }
+        } {
+            Ok(input_mapping) => input_mapping,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("{error}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
         let sandbox_json = match params
             .cli_runtime_options
             .as_ref()
@@ -556,17 +564,17 @@ impl MessageProcessor {
             .as_ref()
             .and_then(|options| options.approval_policy.as_ref())
             .map(|policy| policy.0.clone());
-        let effective_approval_policy = cli_runtime_codex_approval_policy(&params);
-        let sandbox_policy_value = cli_runtime_codex_sandbox_policy_value(&params);
-        let codex_effort = params
+        let effective_approval_policy = cli_runtime_approval_policy(&params);
+        let sandbox_policy_value = cli_runtime_sandbox_policy_value(&params);
+        let cli_runtime_effort = params
             .cli_runtime_options
             .as_ref()
             .and_then(|options| options.effort.clone());
-        let codex_personality = params
+        let cli_runtime_personality = params
             .cli_runtime_options
             .as_ref()
             .and_then(|options| options.personality.clone());
-        let codex_summary = params
+        let cli_runtime_summary = params
             .cli_runtime_options
             .as_ref()
             .and_then(|options| options.summary.clone());
@@ -611,7 +619,11 @@ impl MessageProcessor {
         }
         self.ensure_hook_runtime_with_run_store().await;
         let context_bundle = match self
-            .compile_codex_cli_runtime_context_bundle_for_turn(runtime_id.as_str(), &outcome)
+            .compile_cli_runtime_context_bundle_for_turn(
+                runtime_id.as_str(),
+                runtime_kind,
+                &outcome,
+            )
             .await
         {
             Ok(context_bundle) => context_bundle,
@@ -634,14 +646,39 @@ impl MessageProcessor {
                 return;
             }
         };
-        crate::cli_runtime::context::prepend_codex_cli_runtime_context_input(
+        crate::cli_runtime::context::prepend_cli_runtime_context_input(
             &mut input_mapping,
             &context_bundle,
+            cli_runtime_context_label(runtime_kind),
         );
+        let native_cwd = match crate::cli_runtime::config::current_process_cwd() {
+            Ok(cwd) => cwd,
+            Err(error) => {
+                self.mark_turn_blocked(
+                    outcome.started_notification.thread_id.clone(),
+                    outcome.started_notification.turn.id.clone(),
+                    format!("failed to resolve CLI runtime cwd: {error:#}"),
+                )
+                .await;
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id.clone()),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to resolve CLI runtime cwd: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
         let session_handle = match manager
             .get_or_start_with_options(
                 session_key.clone(),
-                crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions::default(),
+                crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
+                    cwd: Some(std::path::PathBuf::from(native_cwd.as_str())),
+                    ..Default::default()
+                },
             )
             .await
         {
@@ -672,68 +709,51 @@ impl MessageProcessor {
             runtime_config.debug_native_events,
         )
         .await;
-        let native_cwd = match crate::cli_runtime::config::current_process_cwd() {
-            Ok(cwd) => cwd,
-            Err(error) => {
-                self.mark_turn_blocked(
-                    outcome.started_notification.thread_id.clone(),
-                    outcome.started_notification.turn.id.clone(),
-                    format!("failed to resolve CLI runtime cwd: {error:#}"),
-                )
-                .await;
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id.clone()),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to resolve CLI runtime cwd: {error:#}"),
+        let native_thread =
+            match crate::cli_runtime::thread_binding::open_cli_runtime_thread_binding(
+                self.crud_store.as_ref(),
+                &cli_session,
+                crate::cli_runtime::thread_binding::CLIAgentRuntimeThreadBindingOpenRequest {
+                    workspace_id: outcome.started_notification.workspace_id.clone(),
+                    thread_id: outcome.started_notification.thread_id.clone(),
+                    runtime_id: runtime_id.clone(),
+                    runtime_kind: cli_runtime_protocol_kind_label(runtime_kind).to_owned(),
+                    cwd: native_cwd,
+                    model: Some(outcome.materialization.thread.model.clone()),
+                    approval_policy: Some(effective_approval_policy.clone()),
+                    sandbox: Some(serde_json::json!(cli_runtime_thread_sandbox_label(
+                        sandbox_policy_value.as_ref()
+                    ))),
+                    service_tier: None,
+                    resume_existing: cli_runtime_supports_durable_thread_resume(runtime_kind),
+                    request_timeout: std::time::Duration::from_millis(
+                        runtime_config.request_timeout_ms,
                     ),
-                )
-                .await;
-                return;
-            }
-        };
-        let native_thread = match crate::cli_runtime::thread_binding::open_codex_thread_binding(
-            self.crud_store.as_ref(),
-            &cli_session,
-            crate::cli_runtime::thread_binding::CodexThreadBindingOpenRequest {
-                workspace_id: outcome.started_notification.workspace_id.clone(),
-                thread_id: outcome.started_notification.thread_id.clone(),
-                runtime_id: runtime_id.clone(),
-                runtime_kind: cli_runtime_protocol_kind_label(runtime_kind).to_owned(),
-                cwd: native_cwd,
-                model: Some(outcome.materialization.thread.model.clone()),
-                approval_policy: effective_approval_policy.clone(),
-                sandbox: cli_runtime_codex_thread_sandbox_label(sandbox_policy_value.as_ref()),
-                service_tier: None,
-                request_timeout: std::time::Duration::from_millis(
-                    runtime_config.request_timeout_ms,
-                ),
-                opened_at: chrono::Utc::now().fixed_offset(),
-            },
-        )
-        .await
-        {
-            Ok(opened) => opened,
-            Err(error) => {
-                self.mark_turn_blocked(
-                    outcome.started_notification.thread_id.clone(),
-                    outcome.started_notification.turn.id.clone(),
-                    format!("failed to open Codex CLI runtime thread: {error:#}"),
-                )
-                .await;
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id.clone()),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to open Codex CLI runtime thread: {error:#}"),
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
+                    opened_at: chrono::Utc::now().fixed_offset(),
+                },
+            )
+            .await
+            {
+                Ok(opened) => opened,
+                Err(error) => {
+                    self.mark_turn_blocked(
+                        outcome.started_notification.thread_id.clone(),
+                        outcome.started_notification.turn.id.clone(),
+                        format!("failed to open CLI runtime thread: {error:#}"),
+                    )
+                    .await;
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id.clone()),
+                            INVALID_REQUEST_CODE,
+                            format!("failed to open CLI runtime thread: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
         let input_mapping_json = match pioneer_crud::serialize_cli_runtime_json(&input_mapping) {
             Ok(input_mapping_json) => input_mapping_json,
             Err(error) => {
@@ -783,18 +803,39 @@ impl MessageProcessor {
             .await;
             return;
         }
+        let native_turn_input = match serde_json::to_value(&input_mapping.input) {
+            Ok(input) => input,
+            Err(error) => {
+                self.mark_turn_blocked(
+                    outcome.started_notification.thread_id.clone(),
+                    outcome.started_notification.turn.id.clone(),
+                    format!("failed to encode CLI runtime turn input: {error:#}"),
+                )
+                .await;
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id.clone()),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to encode CLI runtime turn input: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
         let native_turn = match cli_session
-            .start_codex_turn(
-                CodexTurnStartParams {
-                    thread_id: native_thread.binding.native_thread_id.clone(),
-                    input: input_mapping.input.clone(),
+            .start_turn(
+                crate::cli_runtime::manager::CLIAgentRuntimeTurnStartParams {
+                    native_thread_id: native_thread.binding.native_thread_id.clone(),
+                    input: native_turn_input,
                     cwd: native_thread.binding.native_cwd.clone(),
                     approval_policy: Some(effective_approval_policy),
-                    sandbox_policy: sandbox_policy_value,
+                    sandbox: sandbox_policy_value,
                     model: Some(outcome.materialization.thread.model.clone()),
-                    effort: codex_effort,
-                    personality: codex_personality,
-                    summary: codex_summary,
+                    effort: cli_runtime_effort,
+                    personality: cli_runtime_personality,
+                    summary: cli_runtime_summary,
                 },
                 std::time::Duration::from_millis(runtime_config.request_timeout_ms),
             )
@@ -805,7 +846,7 @@ impl MessageProcessor {
                 self.mark_turn_blocked(
                     outcome.started_notification.thread_id.clone(),
                     outcome.started_notification.turn.id.clone(),
-                    format!("failed to start Codex CLI runtime turn: {error:#}"),
+                    format!("failed to start CLI runtime turn: {error:#}"),
                 )
                 .await;
                 self.send_error(
@@ -813,7 +854,7 @@ impl MessageProcessor {
                     JsonRpcErrorResponse::new(
                         Some(request_id.clone()),
                         INVALID_REQUEST_CODE,
-                        format!("failed to start Codex CLI runtime turn: {error:#}"),
+                        format!("failed to start CLI runtime turn: {error:#}"),
                     ),
                 )
                 .await;
@@ -836,7 +877,7 @@ impl MessageProcessor {
             self.mark_turn_blocked(
                 outcome.started_notification.thread_id.clone(),
                 outcome.started_notification.turn.id.clone(),
-                format!("failed to persist Codex CLI runtime native turn id: {error:#}"),
+                format!("failed to persist CLI runtime native turn id: {error:#}"),
             )
             .await;
             self.send_error(
@@ -844,13 +885,13 @@ impl MessageProcessor {
                 JsonRpcErrorResponse::new(
                     Some(request_id.clone()),
                     INVALID_REQUEST_CODE,
-                    format!("failed to persist Codex CLI runtime native turn id: {error:#}"),
+                    format!("failed to persist CLI runtime native turn id: {error:#}"),
                 ),
             )
             .await;
             return;
         }
-        self.flush_cli_runtime_codex_events_for_native_turn(
+        self.flush_cli_runtime_events_for_native_turn(
             &session_key,
             native_thread.binding.native_thread_id.as_str(),
             native_turn_id.as_str(),
@@ -1068,9 +1109,10 @@ impl MessageProcessor {
         Ok(None)
     }
 
-    async fn compile_codex_cli_runtime_context_bundle_for_turn(
+    async fn compile_cli_runtime_context_bundle_for_turn(
         &self,
         runtime_id: &str,
+        runtime_kind: CLIAgentRuntimeKind,
         outcome: &crate::thread::TurnStartOutcome,
     ) -> anyhow::Result<pioneer_promt::CompiledPromptBundle> {
         let native_cwd = self
@@ -1085,13 +1127,14 @@ impl MessageProcessor {
                 outcome.started_notification.turn.id.as_str(),
             )
             .await;
-        crate::cli_runtime::context::compile_codex_cli_runtime_context_bundle(
+        crate::cli_runtime::context::compile_cli_runtime_context_bundle(
             self.artifact_runtime_home.as_path(),
-            crate::cli_runtime::context::CodexCliRuntimeContextBuildInput {
+            crate::cli_runtime::context::CLIRuntimeContextBuildInput {
                 workspace_id: outcome.started_notification.workspace_id.as_str(),
                 thread_id: outcome.started_notification.thread_id.as_str(),
                 turn_id: outcome.started_notification.turn.id.as_str(),
                 runtime_id,
+                runtime_label: cli_runtime_context_label(runtime_kind),
                 model: Some(outcome.materialization.thread.model.as_str()),
                 cwd: native_cwd.as_deref(),
                 history: history.as_slice(),
@@ -1105,8 +1148,7 @@ impl MessageProcessor {
         turn_id: &str,
         bundle: &pioneer_promt::CompiledPromptBundle,
     ) -> anyhow::Result<()> {
-        let manifest =
-            crate::cli_runtime::context::codex_cli_runtime_prompt_manifest_from_bundle(bundle);
+        let manifest = crate::cli_runtime::context::cli_runtime_prompt_manifest_from_bundle(bundle);
         self.thread_manager
             .set_turn_prompt_manifest(thread_id, turn_id, manifest.clone())
             .await;
@@ -2643,7 +2685,7 @@ fn source_priority(kind: TimelineOriginKind) -> u8 {
     }
 }
 
-fn cli_runtime_codex_approval_policy(params: &TurnStartParams) -> String {
+fn cli_runtime_approval_policy(params: &TurnStartParams) -> String {
     params
         .cli_runtime_options
         .as_ref()
@@ -2654,7 +2696,7 @@ fn cli_runtime_codex_approval_policy(params: &TurnStartParams) -> String {
         .to_owned()
 }
 
-fn cli_runtime_codex_sandbox_policy_value(params: &TurnStartParams) -> Option<JsonValue> {
+fn cli_runtime_sandbox_policy_value(params: &TurnStartParams) -> Option<JsonValue> {
     params
         .cli_runtime_options
         .as_ref()
@@ -2662,7 +2704,7 @@ fn cli_runtime_codex_sandbox_policy_value(params: &TurnStartParams) -> Option<Js
         .map(|sandbox| sandbox.0.clone())
 }
 
-fn cli_runtime_codex_thread_sandbox_label(sandbox_policy: Option<&JsonValue>) -> String {
+fn cli_runtime_thread_sandbox_label(sandbox_policy: Option<&JsonValue>) -> String {
     let Some(sandbox_policy) = sandbox_policy else {
         return "workspace-write".to_owned();
     };
@@ -2700,6 +2742,9 @@ fn cli_runtime_kind_matches_config(
         (
             CLIAgentRuntimeKind::Codex,
             pioneer_config::GatewayCliAgentRuntimeKindConfig::Codex
+        ) | (
+            CLIAgentRuntimeKind::Claude,
+            pioneer_config::GatewayCliAgentRuntimeKindConfig::Claude
         )
     )
 }
@@ -2711,11 +2756,26 @@ fn cli_runtime_protocol_kind_label(kind: CLIAgentRuntimeKind) -> &'static str {
     }
 }
 
+fn cli_runtime_context_label(kind: CLIAgentRuntimeKind) -> &'static str {
+    match kind {
+        CLIAgentRuntimeKind::Codex => "Codex CLI",
+        CLIAgentRuntimeKind::Claude => "Claude CLI",
+    }
+}
+
+fn cli_runtime_supports_durable_thread_resume(kind: CLIAgentRuntimeKind) -> bool {
+    match kind {
+        CLIAgentRuntimeKind::Codex => true,
+        CLIAgentRuntimeKind::Claude => false,
+    }
+}
+
 fn cli_runtime_config_kind_label(
     kind: pioneer_config::GatewayCliAgentRuntimeKindConfig,
 ) -> &'static str {
     match kind {
         pioneer_config::GatewayCliAgentRuntimeKindConfig::Codex => "codex",
+        pioneer_config::GatewayCliAgentRuntimeKindConfig::Claude => "claude",
     }
 }
 

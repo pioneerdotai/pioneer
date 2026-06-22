@@ -1,11 +1,11 @@
 //! Codex app-server runtime implementation boundary.
 
-use crate::codex_input::CodexTurnInputItem;
 use crate::driver::{
     JsonlRpcDecodeError, JsonlRpcError, JsonlRpcId, JsonlRpcIncomingMessage, JsonlRpcNotification,
     JsonlRpcRequest, JsonlRpcResponse, read_jsonl_rpc_message, write_jsonl_rpc_message,
     write_jsonl_rpc_request,
 };
+use crate::input::CLIRuntimeTurnInputItem;
 use crate::process::{CLIAgentProcessSpawnConfig, expand_home_path, spawn_cli_agent_process};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -1590,7 +1590,7 @@ pub struct CodexThreadCompactStartSnapshot {
 #[serde(rename_all = "camelCase")]
 pub struct CodexTurnStartParams {
     pub thread_id: String,
-    pub input: Vec<CodexTurnInputItem>,
+    pub input: Vec<CLIRuntimeTurnInputItem>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1638,7 +1638,7 @@ pub struct CodexThreadForkParams {
 pub struct CodexTurnSteerParams {
     pub thread_id: String,
     pub expected_turn_id: String,
-    pub input: Vec<CodexTurnInputItem>,
+    pub input: Vec<CLIRuntimeTurnInputItem>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -4338,7 +4338,7 @@ while read line; do :; done
                 .turn_start(
                     CodexTurnStartParams {
                         thread_id: "codex-thread-existing".to_owned(),
-                        input: vec![CodexTurnInputItem::Text {
+                        input: vec![CLIRuntimeTurnInputItem::Text {
                             text: "Run tests".to_owned(),
                         }],
                         cwd: Some("/tmp/project".to_owned()),
@@ -4654,7 +4654,7 @@ while read line; do :; done
                     CodexTurnSteerParams {
                         thread_id: "codex-thread-existing".to_owned(),
                         expected_turn_id: "codex-turn-running".to_owned(),
-                        input: vec![CodexTurnInputItem::Text {
+                        input: vec![CLIRuntimeTurnInputItem::Text {
                             text: "Focus on the failing test".to_owned(),
                         }],
                     },

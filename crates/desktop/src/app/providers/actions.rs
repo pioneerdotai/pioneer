@@ -386,14 +386,16 @@ fn normalize_cli_runtime_provider_inline_field(
         }
         cli_provider_settings::CLIRuntimeProviderDraftField::BinaryPath => {
             if trimmed.is_empty() {
-                "codex".to_owned()
+                cli_provider_settings::cli_runtime_provider_default_binary_path(instance.kind)
+                    .to_owned()
             } else {
                 trimmed.to_owned()
             }
         }
         cli_provider_settings::CLIRuntimeProviderDraftField::HomePath => {
             if trimmed.is_empty() {
-                "~/.codex".to_owned()
+                cli_provider_settings::cli_runtime_provider_default_home_path(instance.kind)
+                    .to_owned()
             } else {
                 trimmed.to_owned()
             }
@@ -425,8 +427,16 @@ fn current_cli_runtime_provider_inline_field_value(
 fn default_cli_runtime_display_name(
     instance: &pioneer_protocol::GatewayCliRuntimeInstanceSettings,
 ) -> String {
-    if instance.kind == pioneer_protocol::CLIAgentRuntimeKind::Codex && instance.id == "codex" {
-        return "Codex CLI".to_owned();
+    match instance.kind {
+        pioneer_protocol::CLIAgentRuntimeKind::Codex if instance.id == "codex" => {
+            return cli_provider_settings::cli_runtime_provider_default_display_name(instance.kind)
+                .to_owned();
+        }
+        pioneer_protocol::CLIAgentRuntimeKind::Claude if instance.id == "claude" => {
+            return cli_provider_settings::cli_runtime_provider_default_display_name(instance.kind)
+                .to_owned();
+        }
+        _ => {}
     }
     instance
         .id

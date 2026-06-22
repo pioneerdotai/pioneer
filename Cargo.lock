@@ -7654,6 +7654,7 @@ version = "0.16.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "flate2",
  "futures-util",
@@ -7661,6 +7662,7 @@ dependencies = [
  "jsonwebtoken",
  "keepawake",
  "markdown",
+ "mime_guess",
  "pioneer-agent",
  "pioneer-artifacts",
  "pioneer-cli-agent-runtime",

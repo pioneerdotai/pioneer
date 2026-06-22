@@ -3,28 +3,28 @@ use crate::profile::PromptProfile;
 pub fn include_workspace_context(profile: PromptProfile) -> bool {
     !matches!(
         profile,
-        PromptProfile::AssistantNone | PromptProfile::CliRuntimeCodex
+        PromptProfile::AssistantNone | PromptProfile::CliRuntime
     )
 }
 
 pub fn include_safety(profile: PromptProfile) -> bool {
     !matches!(
         profile,
-        PromptProfile::AssistantNone | PromptProfile::CliRuntimeCodex
+        PromptProfile::AssistantNone | PromptProfile::CliRuntime
     )
 }
 
 pub fn include_artifact_output_contract(profile: PromptProfile) -> bool {
     !matches!(
         profile,
-        PromptProfile::AssistantNone | PromptProfile::CliRuntimeCodex
+        PromptProfile::AssistantNone | PromptProfile::CliRuntime
     )
 }
 
 pub fn include_tool_usage_policy(profile: PromptProfile) -> bool {
     !matches!(
         profile,
-        PromptProfile::AssistantNone | PromptProfile::CliRuntimeCodex
+        PromptProfile::AssistantNone | PromptProfile::CliRuntime
     )
 }
 
@@ -35,10 +35,10 @@ pub fn include_tool_recovery_policy(
     include_tool_recovery_policy
         && !matches!(
             profile,
-            PromptProfile::AssistantNone | PromptProfile::CliRuntimeCodex
+            PromptProfile::AssistantNone | PromptProfile::CliRuntime
         )
 }
 
 pub fn include_identity_base(profile: PromptProfile) -> bool {
-    !matches!(profile, PromptProfile::CliRuntimeCodex)
+    !matches!(profile, PromptProfile::CliRuntime)
 }

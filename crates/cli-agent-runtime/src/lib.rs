@@ -1,7 +1,7 @@
 //! Shared boundary for local CLI-backed agent runtimes.
 //!
 //! `pioneer-cli-agent-runtime` is for runtimes that drive a local CLI process,
-//! such as `codex app-server` now and Claude CLI later. It is intentionally
+//! such as Codex app-server and Claude CLI. It is intentionally
 //! separate from `pioneer-provider`, which remains the API-provider transport
 //! abstraction.
 //!
@@ -9,11 +9,12 @@
 //! this CLI process/runtime boundary.
 
 pub mod approval;
+pub mod claude;
 pub mod codex;
-pub mod codex_input;
 pub mod config;
 pub mod driver;
 pub mod event;
+pub mod input;
 pub mod process;
 pub mod registry;
 pub mod session;

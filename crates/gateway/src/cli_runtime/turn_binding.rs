@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-// CLI runtime turn binding is persisted before Codex turn execution is wired in later WP steps.
+// Persists Pioneer turn to native CLI runtime turn bindings.
 
 use anyhow::{Context, Result, bail};
 use pioneer_crud::{

@@ -935,6 +935,7 @@ impl PioneerDesktop {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         model.id.hash(&mut hasher);
         model.name.hash(&mut hasher);
+        model.description.hash(&mut hasher);
         row_width.as_f32().to_bits().hash(&mut hasher);
         hasher.finish()
     }
@@ -952,9 +953,8 @@ impl PioneerDesktop {
     ) -> AnyElement {
         let model_id = model.id.clone();
         let display_name = provider_presentation::model_selector_model_display_name(model);
+        let secondary_text = provider_presentation::model_selector_model_secondary_text(model);
         let is_active = state.selector.borrow().selected_model() == Some(model_id.as_str());
-        let has_name = provider_presentation::model_selector_model_has_name(model);
-        let raw_id = model.id.clone();
         let id: SharedString = format!("model-vl-{ix}").into();
 
         div()
@@ -985,14 +985,14 @@ impl PioneerDesktop {
                     .w_full()
                     .min_w_0()
                     .child(div().text_sm().whitespace_normal().child(display_name))
-                    .when(has_name, |d| {
+                    .when_some(secondary_text, |d, secondary_text| {
                         d.child(
                             div()
                                 .text_xs()
                                 .whitespace_normal()
                                 .line_height(relative(1.3))
                                 .opacity(0.6)
-                                .child(raw_id),
+                                .child(secondary_text),
                         )
                     }),
             )

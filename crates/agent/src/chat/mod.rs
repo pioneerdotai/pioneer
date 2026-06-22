@@ -1872,7 +1872,7 @@ fn prompt_manifest_profile(profile: PromptProfile) -> PromptManifestProfile {
         PromptProfile::AssistantFull => PromptManifestProfile::AssistantFull,
         PromptProfile::AssistantMinimal => PromptManifestProfile::AssistantMinimal,
         PromptProfile::AssistantNone => PromptManifestProfile::AssistantNone,
-        PromptProfile::CliRuntimeCodex => PromptManifestProfile::CliRuntimeCodex,
+        PromptProfile::CliRuntime => PromptManifestProfile::CliRuntime,
     }
 }
 

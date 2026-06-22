@@ -6,14 +6,16 @@ use crate::cli_runtime::manager::{
     CLIAgentRuntimeSessionFactory, CLIAgentRuntimeSessionKey, CLIAgentRuntimeSessionStartOptions,
     CLIAgentRuntimeThreadForkRequest, CLIAgentRuntimeThreadForkResult,
     CLIAgentRuntimeThreadNameSetRequest, CLIAgentRuntimeThreadNameSetResult,
+    CLIAgentRuntimeThreadOpenParams, CLIAgentRuntimeThreadOpenSnapshot,
+    CLIAgentRuntimeTurnStartParams, CLIAgentRuntimeTurnStartSnapshot,
     CLIAgentRuntimeTurnSteerRequest, CLIAgentRuntimeTurnSteerResult,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use pioneer_cli_agent_runtime::codex::{
     CodexAppServerClient, CodexJsonlRpcClient, CodexThreadForkParams, CodexThreadNameSetParams,
-    CodexThreadOpenSnapshot, CodexThreadStartParams, CodexTurnStartParams, CodexTurnStartSnapshot,
-    CodexTurnSteerParams, codex_app_server_process_config,
+    CodexThreadStartParams, CodexTurnStartParams, CodexTurnSteerParams,
+    codex_app_server_process_config,
 };
 use pioneer_cli_agent_runtime::driver::JsonlRpcId;
 use pioneer_cli_agent_runtime::process::{CLIAgentProcess, spawn_cli_agent_process};
@@ -26,15 +28,57 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::io::BufReader;
 
-pub(crate) fn codex_cli_runtime_manager(
+pub(crate) fn cli_runtime_manager(
     runtime_home: PathBuf,
     idle_session_ttl: Duration,
 ) -> Result<Arc<CLIAgentRuntimeManager>> {
-    let factory = Arc::new(CodexCLIAgentRuntimeSessionFactory { runtime_home });
+    let factory = Arc::new(DispatchingCLIAgentRuntimeSessionFactory { runtime_home });
     Ok(Arc::new(CLIAgentRuntimeManager::new(
         factory,
         idle_session_ttl,
     )?))
+}
+
+struct DispatchingCLIAgentRuntimeSessionFactory {
+    runtime_home: PathBuf,
+}
+
+#[async_trait]
+impl CLIAgentRuntimeSessionFactory for DispatchingCLIAgentRuntimeSessionFactory {
+    async fn start_session(
+        &self,
+        key: &CLIAgentRuntimeSessionKey,
+    ) -> Result<Arc<dyn CLIAgentRuntimeSession>> {
+        self.start_session_with_options(key, &CLIAgentRuntimeSessionStartOptions::default())
+            .await
+    }
+
+    async fn start_session_with_options(
+        &self,
+        key: &CLIAgentRuntimeSessionKey,
+        options: &CLIAgentRuntimeSessionStartOptions,
+    ) -> Result<Arc<dyn CLIAgentRuntimeSession>> {
+        let instance = load_effective_cli_runtime_instances(self.runtime_home.as_path())?
+            .into_iter()
+            .find(|instance| instance.id == key.runtime_id)
+            .ok_or_else(|| anyhow!("unknown CLI runtime `{}`", key.runtime_id))?;
+        match instance.kind {
+            GatewayCliAgentRuntimeKindConfig::Codex => {
+                CodexCLIAgentRuntimeSessionFactory {
+                    runtime_home: self.runtime_home.clone(),
+                }
+                .start_session_with_options(key, options)
+                .await
+            }
+            GatewayCliAgentRuntimeKindConfig::Claude => {
+                crate::cli_runtime::claude_session::ClaudeCLIAgentRuntimeSessionFactory::new(
+                    self.runtime_home.clone(),
+                )
+                .start_session_with_options(key, options)
+                .await
+            }
+        }
+    }
 }
 
 struct CodexCLIAgentRuntimeSessionFactory {
@@ -69,7 +113,7 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
         }
 
         let mut probe_config = codex_account_probe_config_from_instance(&instance);
-        probe_config.cwd = std::env::current_dir().ok();
+        probe_config.cwd = options.cwd.clone().or_else(|| std::env::current_dir().ok());
         let mut process_config = codex_app_server_process_config(&probe_config)
             .map_err(|error| anyhow!("failed to prepare Codex home layout: {error}"))?;
         process_config.args.extend(instance.app_server_args.clone());
@@ -165,38 +209,108 @@ impl CLIAgentRuntimeSession for CodexCLIAgentRuntimeSession {
             .take()
     }
 
-    async fn start_codex_thread(
-        &self,
-        params: CodexThreadStartParams,
-        timeout: Duration,
-    ) -> Result<CodexThreadOpenSnapshot> {
-        self.client
-            .thread_start(params, timeout)
-            .await
-            .context("Codex thread/start failed")
+    fn supports_thread_name_sync(&self) -> bool {
+        true
     }
 
-    async fn resume_codex_thread(
+    async fn start_thread(
+        &self,
+        params: CLIAgentRuntimeThreadOpenParams,
+        timeout: Duration,
+    ) -> Result<CLIAgentRuntimeThreadOpenSnapshot> {
+        let opened = self
+            .client
+            .thread_start(
+                CodexThreadStartParams {
+                    cwd: params.cwd,
+                    approval_policy: params
+                        .approval_policy
+                        .unwrap_or_else(|| "default".to_owned()),
+                    sandbox: params
+                        .sandbox
+                        .as_ref()
+                        .and_then(|value| value.as_str().map(str::to_owned))
+                        .unwrap_or_else(|| "read-only".to_owned()),
+                    model: params.model,
+                    service_tier: params.service_tier,
+                },
+                timeout,
+            )
+            .await
+            .context("Codex thread/start failed")?;
+        Ok(CLIAgentRuntimeThreadOpenSnapshot {
+            native_thread_id: opened.native_thread_id,
+            cwd: opened.cwd,
+            model: opened.model,
+            raw: opened.raw,
+        })
+    }
+
+    async fn resume_thread(
         &self,
         native_thread_id: &str,
-        params: CodexThreadStartParams,
+        params: CLIAgentRuntimeThreadOpenParams,
         timeout: Duration,
-    ) -> Result<CodexThreadOpenSnapshot> {
-        self.client
-            .thread_resume(native_thread_id, params, timeout)
+    ) -> Result<CLIAgentRuntimeThreadOpenSnapshot> {
+        let opened = self
+            .client
+            .thread_resume(
+                native_thread_id,
+                CodexThreadStartParams {
+                    cwd: params.cwd,
+                    approval_policy: params
+                        .approval_policy
+                        .unwrap_or_else(|| "default".to_owned()),
+                    sandbox: params
+                        .sandbox
+                        .as_ref()
+                        .and_then(|value| value.as_str().map(str::to_owned))
+                        .unwrap_or_else(|| "read-only".to_owned()),
+                    model: params.model,
+                    service_tier: params.service_tier,
+                },
+                timeout,
+            )
             .await
-            .context("Codex thread/resume failed")
+            .context("Codex thread/resume failed")?;
+        Ok(CLIAgentRuntimeThreadOpenSnapshot {
+            native_thread_id: opened.native_thread_id,
+            cwd: opened.cwd,
+            model: opened.model,
+            raw: opened.raw,
+        })
     }
 
-    async fn start_codex_turn(
+    async fn start_turn(
         &self,
-        params: CodexTurnStartParams,
+        params: CLIAgentRuntimeTurnStartParams,
         timeout: Duration,
-    ) -> Result<CodexTurnStartSnapshot> {
-        self.client
-            .turn_start(params, timeout)
+    ) -> Result<CLIAgentRuntimeTurnStartSnapshot> {
+        let input = serde_json::from_value(params.input)
+            .context("failed to decode generic CLI runtime input for Codex")?;
+        let started = self
+            .client
+            .turn_start(
+                CodexTurnStartParams {
+                    thread_id: params.native_thread_id,
+                    input,
+                    cwd: params.cwd,
+                    approval_policy: params.approval_policy,
+                    sandbox_policy: params.sandbox,
+                    model: params.model,
+                    effort: params.effort,
+                    personality: params.personality,
+                    summary: params.summary,
+                },
+                timeout,
+            )
             .await
-            .context("Codex turn/start failed")
+            .context("Codex turn/start failed")?;
+        Ok(CLIAgentRuntimeTurnStartSnapshot {
+            native_thread_id: started.native_thread_id,
+            native_turn_id: started.native_turn_id,
+            raw: started.raw,
+        })
     }
 
     async fn respond_to_request(
@@ -283,7 +397,7 @@ impl CLIAgentRuntimeSession for CodexCLIAgentRuntimeSession {
                     thread_id: request.native_thread_id,
                     expected_turn_id: request.native_turn_id,
                     input: vec![
-                        pioneer_cli_agent_runtime::codex_input::CodexTurnInputItem::Text {
+                        pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Text {
                             text: request.message,
                         },
                     ],

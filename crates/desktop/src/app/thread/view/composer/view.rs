@@ -32,15 +32,24 @@ impl PioneerDesktop {
         let can_stop = active_thread_snapshot.can_request_turn_cancel(gateway_connected);
         let has_in_flight_turn = active_thread_snapshot.has_in_flight_turn();
         let composer_text = composer_state.read(cx).value().trim().to_owned();
-        let has_codex_steer_target = has_in_flight_turn
-            && active_thread_snapshot
+        let cli_runtime_thread_binding = if has_in_flight_turn {
+            active_thread_snapshot
                 .thread_id
                 .as_deref()
-                .is_some_and(|thread_id| {
-                    self.codex_cli_runtime_binding_for_thread(thread_id)
-                        .is_some()
-                });
-        let can_steer_codex_turn = has_codex_steer_target
+                .and_then(|thread_id| self.cli_runtime_binding_for_thread(thread_id))
+        } else {
+            None
+        };
+        let has_cli_runtime_steer_target =
+            cli_runtime_thread_binding.as_ref().is_some_and(|binding| {
+                self.providers
+                    .cli_runtimes()
+                    .iter()
+                    .find(|runtime| runtime.runtime_id == binding.runtime_id)
+                    .map(|runtime| runtime.capabilities.supports_steer)
+                    .unwrap_or(false)
+            });
+        let can_steer_cli_runtime_turn = has_cli_runtime_steer_target
             && gateway_connected
             && !is_cancelling
             && !self.composer_upload_in_progress
@@ -129,20 +138,21 @@ impl PioneerDesktop {
                                     h_flex()
                                         .items_center()
                                         .gap_2()
-                                        .when(has_codex_steer_target, |this| {
+                                        .when(has_cli_runtime_steer_target, |this| {
                                             this.child(
-                                                Button::new("steer-running-codex-turn")
+                                                Button::new("steer-running-cli-runtime-turn")
                                                     .small()
                                                     .ghost()
                                                     .rounded_full()
                                                     .icon(IconName::ArrowUp)
                                                     .tooltip(
-                                                        t!("chat.composer.steer_codex").to_string(),
+                                                        t!("chat.composer.steer_cli_runtime")
+                                                            .to_string(),
                                                     )
-                                                    .disabled(!can_steer_codex_turn)
+                                                    .disabled(!can_steer_cli_runtime_turn)
                                                     .on_click(cx.listener(
                                                         move |view, _, window, cx| {
-                                                            view.steer_active_codex_turn(
+                                                            view.steer_active_cli_runtime_turn(
                                                                 window, cx,
                                                             );
                                                         },

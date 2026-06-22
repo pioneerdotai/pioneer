@@ -89,13 +89,11 @@ impl PioneerDesktop {
         client_selectors::thread_workspace_id_from(&self.thread_coordinators, thread_id)
     }
 
-    pub(in crate::app) fn codex_cli_runtime_binding_for_thread(
+    pub(in crate::app) fn cli_runtime_binding_for_thread(
         &self,
         thread_id: &str,
     ) -> Option<&CLIRuntimeThreadBinding> {
-        self.cli_runtime_thread_bindings
-            .get(thread_id)
-            .filter(|binding| binding.runtime_kind == CLIAgentRuntimeKind::Codex)
+        self.cli_runtime_thread_bindings.get(thread_id)
     }
 
     pub(in crate::app) fn composer_selected_provider_is_cli_runtime(&self) -> bool {

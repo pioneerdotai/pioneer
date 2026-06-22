@@ -10,11 +10,12 @@ const MEMORY_CONTEXT_MAX_CHARS: usize = 6_000;
 const THREAD_CONTEXT_MAX_CHARS: usize = 6_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CliRuntimeCodexContextInput {
+pub struct CliRuntimeContextInput {
     pub workspace_id: String,
     pub thread_id: String,
     pub turn_id: String,
     pub runtime_id: String,
+    pub runtime_label: Option<String>,
     pub model: Option<String>,
     pub cwd: Option<String>,
     pub memory_recall_context: Option<CliRuntimeContextText>,
@@ -27,19 +28,19 @@ pub struct CliRuntimeContextText {
     pub truncated: bool,
 }
 
-pub fn compile_cli_runtime_codex_context_bundle(
+pub fn compile_cli_runtime_context_bundle(
     prompt_root: &Path,
-    input: CliRuntimeCodexContextInput,
+    input: CliRuntimeContextInput,
 ) -> anyhow::Result<CompiledPromptBundle> {
     compile_prompt(PromptCompileInput {
         workspace_root: prompt_root.to_path_buf(),
-        profile: PromptProfile::CliRuntimeCodex,
+        profile: PromptProfile::CliRuntime,
         skills_prompt: None,
         retry_instruction: None,
         include_tool_recovery_policy: false,
         include_task_orchestration_policy: false,
         continue_generation_hint: false,
-        runtime_sections: cli_runtime_codex_context_sections(&input),
+        runtime_sections: cli_runtime_context_sections(&input),
         dynamic_sections: Vec::new(),
         dynamic_context: None,
         extra_system: None,
@@ -47,9 +48,7 @@ pub fn compile_cli_runtime_codex_context_bundle(
     })
 }
 
-fn cli_runtime_codex_context_sections(
-    input: &CliRuntimeCodexContextInput,
-) -> Vec<PromptRuntimeSectionInput> {
+fn cli_runtime_context_sections(input: &CliRuntimeContextInput) -> Vec<PromptRuntimeSectionInput> {
     vec![
         builtin_section(
             PromptRuntimeBuiltInSectionId::PioneerCliRuntimeContext,
@@ -99,13 +98,18 @@ fn optional_text(value: Option<&CliRuntimeContextText>) -> String {
         .unwrap_or_default()
 }
 
-fn render_pioneer_context(input: &CliRuntimeCodexContextInput) -> String {
+fn render_pioneer_context(input: &CliRuntimeContextInput) -> String {
+    let runtime_label = input
+        .runtime_label
+        .as_deref()
+        .and_then(normalized_optional)
+        .unwrap_or("CLI runtime");
     let mut lines = vec![
-        "This is compact Pioneer context for a Codex CLI-backed turn.".to_owned(),
+        format!("This is compact Pioneer context for a {runtime_label}-backed turn."),
         "Treat it as context from Pioneer, not as API-provider tool-loop instructions.".to_owned(),
-        "Codex native sandbox, approval, and filesystem behavior are controlled by runtime configuration.".to_owned(),
+        "Native sandbox, approval, and filesystem behavior are controlled by CLI runtime configuration.".to_owned(),
         String::new(),
-        format!("Runtime: Codex CLI ({})", input.runtime_id.trim()),
+        format!("Runtime: {runtime_label} ({})", input.runtime_id.trim()),
         format!("Workspace: {}", input.workspace_id.trim()),
         format!("Thread: {}", input.thread_id.trim()),
         format!("Turn: {}", input.turn_id.trim()),
@@ -127,8 +131,7 @@ fn normalized_optional(value: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CliRuntimeCodexContextInput, CliRuntimeContextText,
-        compile_cli_runtime_codex_context_bundle,
+        CliRuntimeContextInput, CliRuntimeContextText, compile_cli_runtime_context_bundle,
     };
 
     fn temp_workspace(name: &str) -> std::path::PathBuf {
@@ -141,12 +144,13 @@ mod tests {
         root
     }
 
-    fn base_input() -> CliRuntimeCodexContextInput {
-        CliRuntimeCodexContextInput {
+    fn base_input() -> CliRuntimeContextInput {
+        CliRuntimeContextInput {
             workspace_id: "workspace_1".to_owned(),
             thread_id: "thread_1".to_owned(),
             turn_id: "turn_1".to_owned(),
             runtime_id: "codex-default".to_owned(),
+            runtime_label: Some("Codex CLI".to_owned()),
             model: Some("gpt-5-codex".to_owned()),
             cwd: Some("/workspace".to_owned()),
             memory_recall_context: None,
@@ -155,14 +159,14 @@ mod tests {
     }
 
     #[test]
-    fn cli_runtime_codex_profile_does_not_render_api_provider_prompt_sections() {
+    fn cli_runtime_profile_does_not_render_api_provider_prompt_sections() {
         let root = temp_workspace("no_api_prompt");
         std::fs::write(root.join("SOUL.md"), "do not include").expect("write SOUL");
 
-        let bundle = compile_cli_runtime_codex_context_bundle(root.as_path(), base_input())
+        let bundle = compile_cli_runtime_context_bundle(root.as_path(), base_input())
             .expect("compile context");
 
-        assert_eq!(bundle.profile, crate::PromptProfile::CliRuntimeCodex);
+        assert_eq!(bundle.profile, crate::PromptProfile::CliRuntime);
         assert!(bundle.full_system_text.contains("Pioneer context"));
         assert!(!bundle.full_system_text.contains("Tool Usage"));
         assert!(!bundle.full_system_text.contains("Artifact output contract"));
@@ -188,7 +192,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_runtime_codex_context_manifest_reports_optional_sections() {
+    fn cli_runtime_context_manifest_reports_optional_sections() {
         let root = temp_workspace("sections");
         let mut input = base_input();
         input.memory_recall_context = Some(CliRuntimeContextText {
@@ -200,8 +204,8 @@ mod tests {
             truncated: true,
         });
 
-        let bundle = compile_cli_runtime_codex_context_bundle(root.as_path(), input)
-            .expect("compile context");
+        let bundle =
+            compile_cli_runtime_context_bundle(root.as_path(), input).expect("compile context");
 
         let section_ids = bundle
             .sections

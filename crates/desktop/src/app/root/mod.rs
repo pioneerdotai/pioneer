@@ -40,9 +40,9 @@ pub(super) use pioneer_client::{
     turns::timeline_refresh::TurnTimelineRefreshState,
 };
 use pioneer_protocol::{
-    CLIAgentRuntimeKind, CLIRuntimeThreadBinding, GatewaySettingsSnapshot, McpListItem,
-    McpServerDetailsResponse, SkillHealthItem, SkillListItem, Thread, ThreadAgentsDocSummary,
-    ThreadFolder, ThreadMode, ThreadPlacement, Workspace,
+    CLIRuntimeThreadBinding, GatewaySettingsSnapshot, McpListItem, McpServerDetailsResponse,
+    SkillHealthItem, SkillListItem, Thread, ThreadAgentsDocSummary, ThreadFolder, ThreadMode,
+    ThreadPlacement, Workspace,
 };
 use std::{
     cell::RefCell,

@@ -950,7 +950,10 @@ mod tests {
         state.cli_loading = true;
         state.cli_error = Some("old cli error".to_owned());
         state.cli_login_message = Some("old login message".to_owned());
-        state.cli_runtime_draft = Some(CLIRuntimeProviderDraft::create(None));
+        state.cli_runtime_draft = Some(CLIRuntimeProviderDraft::create_for_kind(
+            None,
+            CLIAgentRuntimeKind::Codex,
+        ));
         state.expanded_cli_runtime_ids.insert("codex".to_owned());
 
         state.clear_for_gateway_switch();

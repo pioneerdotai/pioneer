@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-// Startup recovery skeleton is introduced before Codex event hydration is implemented.
+// Startup recovery classifier skeleton until runtime-specific native turn hydration is wired.
 
 use anyhow::Result;
 use pioneer_crud::{CliRuntimeTurnBindingListFilter, CliRuntimeTurnBindingRecord, CrudStore};
@@ -179,7 +179,7 @@ fn classify_cli_runtime_turn_recovery_outcome(
     match &runtime.status {
         RuntimeStatus::Ready => CLIAgentRuntimeTurnRecoveryOutcome::Recoverable {
             reason: format!(
-                "CLI runtime `{}` is ready; native turn hydration is deferred to Codex turn recovery.",
+                "CLI runtime `{}` is ready; native turn hydration is deferred to runtime-specific recovery.",
                 runtime.runtime_id
             ),
         },

@@ -5,7 +5,9 @@ use crate::cli_runtime::manager::{
     CLIAgentRuntimeSessionKey, CLIAgentRuntimeThreadCompactRequest,
     CLIAgentRuntimeThreadCompactResult, CLIAgentRuntimeThreadForkRequest,
     CLIAgentRuntimeThreadForkResult, CLIAgentRuntimeThreadNameSetRequest,
-    CLIAgentRuntimeThreadNameSetResult, CLIAgentRuntimeTurnSteerRequest,
+    CLIAgentRuntimeThreadNameSetResult, CLIAgentRuntimeThreadOpenParams,
+    CLIAgentRuntimeThreadOpenSnapshot, CLIAgentRuntimeTurnStartParams,
+    CLIAgentRuntimeTurnStartSnapshot, CLIAgentRuntimeTurnSteerRequest,
     CLIAgentRuntimeTurnSteerResult,
 };
 use crate::memory_runtime::GatewayMemoryRuntime;
@@ -25,14 +27,13 @@ use pioneer_agent::{
     ToolLoopConfig,
 };
 use pioneer_cli_agent_runtime::codex::{
-    CodexJsonlRpcServerRequest, CodexThreadOpenSnapshot, CodexThreadStartParams,
-    CodexTurnStartParams, CodexTurnStartSnapshot, decode_codex_command_approval_request,
+    CodexJsonlRpcServerRequest, decode_codex_command_approval_request,
     decode_codex_file_change_approval_request, decode_codex_user_input_request,
 };
 use pioneer_cli_agent_runtime::driver::JsonlRpcId;
 use pioneer_cli_agent_runtime::event::{
-    RuntimeEvent, RuntimeEventMappingOptions, RuntimeThreadStateChanged, RuntimeTurnCompleted,
-    map_codex_server_request_event,
+    RuntimeEvent, RuntimeEventMappingOptions, RuntimeRequestOpened, RuntimeRequestResolved,
+    RuntimeThreadStateChanged, RuntimeTurnCompleted, map_codex_server_request_event,
 };
 use pioneer_config::{GatewayHookRecoveryConfig, GatewayMemoryConfig, GatewayWebToolsConfig};
 use pioneer_crud::{
@@ -157,9 +158,9 @@ impl ThreadEpisodicIngestor for RecordingThreadEpisodicIngestor {
 
 #[derive(Default)]
 struct RecordingCliRuntimeSession {
-    thread_starts: TokioMutex<Vec<CodexThreadStartParams>>,
-    thread_resumes: TokioMutex<Vec<(String, CodexThreadStartParams)>>,
-    turn_starts: TokioMutex<Vec<CodexTurnStartParams>>,
+    thread_starts: TokioMutex<Vec<CLIAgentRuntimeThreadOpenParams>>,
+    thread_resumes: TokioMutex<Vec<(String, CLIAgentRuntimeThreadOpenParams)>>,
+    turn_starts: TokioMutex<Vec<CLIAgentRuntimeTurnStartParams>>,
     responses: TokioMutex<Vec<(JsonValue, JsonValue)>>,
     interrupts: TokioMutex<Vec<(Option<String>, Option<String>)>>,
     thread_compactions: TokioMutex<Vec<CLIAgentRuntimeThreadCompactRequest>>,
@@ -181,13 +182,13 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
         Ok(())
     }
 
-    async fn start_codex_thread(
+    async fn start_thread(
         &self,
-        params: CodexThreadStartParams,
+        params: CLIAgentRuntimeThreadOpenParams,
         _timeout: Duration,
-    ) -> anyhow::Result<CodexThreadOpenSnapshot> {
+    ) -> anyhow::Result<CLIAgentRuntimeThreadOpenSnapshot> {
         self.thread_starts.lock().await.push(params.clone());
-        Ok(CodexThreadOpenSnapshot {
+        Ok(CLIAgentRuntimeThreadOpenSnapshot {
             native_thread_id: "native_thread_default".to_owned(),
             cwd: Some(params.cwd.clone()),
             model: params.model.clone(),
@@ -201,17 +202,17 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
         })
     }
 
-    async fn resume_codex_thread(
+    async fn resume_thread(
         &self,
         native_thread_id: &str,
-        params: CodexThreadStartParams,
+        params: CLIAgentRuntimeThreadOpenParams,
         _timeout: Duration,
-    ) -> anyhow::Result<CodexThreadOpenSnapshot> {
+    ) -> anyhow::Result<CLIAgentRuntimeThreadOpenSnapshot> {
         self.thread_resumes
             .lock()
             .await
             .push((native_thread_id.to_owned(), params.clone()));
-        Ok(CodexThreadOpenSnapshot {
+        Ok(CLIAgentRuntimeThreadOpenSnapshot {
             native_thread_id: native_thread_id.to_owned(),
             cwd: Some(params.cwd.clone()),
             model: params.model.clone(),
@@ -225,14 +226,14 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
         })
     }
 
-    async fn start_codex_turn(
+    async fn start_turn(
         &self,
-        params: CodexTurnStartParams,
+        params: CLIAgentRuntimeTurnStartParams,
         _timeout: Duration,
-    ) -> anyhow::Result<CodexTurnStartSnapshot> {
+    ) -> anyhow::Result<CLIAgentRuntimeTurnStartSnapshot> {
         self.turn_starts.lock().await.push(params.clone());
-        Ok(CodexTurnStartSnapshot {
-            native_thread_id: params.thread_id,
+        Ok(CLIAgentRuntimeTurnStartSnapshot {
+            native_thread_id: params.native_thread_id,
             native_turn_id: "native_turn_default".to_owned(),
             raw: json!({
                 "turn": {
@@ -14418,7 +14419,7 @@ async fn codex_steer_rejects_wrong_backend() {
         error
             .error
             .message
-            .contains("only supported for Codex turns"),
+            .contains("is not supported for `claude` turns"),
         "error should mention backend mismatch: {}",
         error.error.message
     );
@@ -14570,6 +14571,115 @@ async fn cli_runtime_request_respond_resolves_pending_and_broadcasts_notificatio
     assert_eq!(responses.len(), 1);
     assert_eq!(responses[0].0, json!("codex-native-request-1"));
     assert_eq!(responses[0].1, json!({"decision": "accept"}));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_native_request_resolved_cancels_matching_pending_request() {
+    let (tx, mut rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("sonnet", "cli_runtime:claude"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+
+    seed_cli_runtime_approval_turn(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        "thread_cli_native_cancel",
+        "turn_cli_native_cancel",
+        "claude-thread-native-cancel",
+    )
+    .await;
+
+    let request_payload = CLIRuntimePendingRequest {
+        kind: CLIRuntimeRequestKind::CommandApproval,
+        title: Some("Approve command".to_owned()),
+        message: Some("Claude wants to execute a command".to_owned()),
+        native_request_id: Some("claude-native-request-cancel".to_owned()),
+        payload: Some(json!({
+            "nativeRequestId": "claude-native-request-cancel",
+            "nativeRequestIdJson": "claude-native-request-cancel",
+            "command": "echo cancel"
+        })),
+    };
+    let payload_json = pioneer_crud::serialize_cli_runtime_json(&request_payload)
+        .expect("pending request payload should serialize");
+    processor
+        .open_cli_runtime_pending_request(NewCliRuntimePendingRequest {
+            request_id: "cli-approval-native-cancel".to_owned(),
+            runtime_id: "claude".to_owned(),
+            runtime_kind: "claude".to_owned(),
+            workspace_id: workspace_id.clone(),
+            thread_id: "thread_cli_native_cancel".to_owned(),
+            turn_id: Some("turn_cli_native_cancel".to_owned()),
+            native_thread_id: Some("claude-thread-native-cancel".to_owned()),
+            native_turn_id: Some("claude-turn-native-cancel".to_owned()),
+            native_item_id: Some("claude-item-native-cancel".to_owned()),
+            request_kind: "command_approval".to_owned(),
+            payload_json,
+            created_at: chrono::Utc::now().fixed_offset(),
+            updated_at: chrono::Utc::now().fixed_offset(),
+        })
+        .await
+        .expect("pending request should open");
+
+    let opened = recv_notification_by_method(&mut rx, events::CLI_RUNTIME_REQUEST_OPENED).await;
+    let opened_payload: CLIRuntimeRequestOpenedNotification =
+        serde_json::from_value(opened.params.expect("request_opened params"))
+            .expect("request_opened payload should decode");
+    assert_eq!(opened_payload.request_id, "cli-approval-native-cancel");
+
+    let key =
+        CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "claude", "thread_cli_native_cancel")
+            .expect("session key should build");
+    processor
+        .handle_cli_runtime_event(
+            &key,
+            RuntimeEvent::RequestResolved(RuntimeRequestResolved {
+                native_request_id: "claude-native-request-cancel".to_owned(),
+                native: None,
+            }),
+        )
+        .await;
+
+    let resolved = recv_notification_by_method(&mut rx, events::CLI_RUNTIME_REQUEST_RESOLVED).await;
+    let resolved_payload: CLIRuntimeRequestResolvedNotification =
+        serde_json::from_value(resolved.params.expect("request_resolved params"))
+            .expect("request_resolved payload should decode");
+    assert_eq!(resolved_payload.request_id, "cli-approval-native-cancel");
+    assert_eq!(
+        resolved_payload.resolution,
+        CLIRuntimeRequestResolution::Cancelled
+    );
+
+    let stored = crud_store
+        .get_cli_runtime_pending_request("cli-approval-native-cancel")
+        .await
+        .expect("pending request lookup should succeed")
+        .expect("pending request should remain durable");
+    assert_eq!(
+        stored.status,
+        pioneer_crud::CliRuntimePendingRequestStatus::Cancelled
+    );
+    assert!(
+        stored
+            .response_json
+            .as_deref()
+            .is_some_and(|payload| payload.contains("cancelled"))
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -19819,7 +19929,7 @@ async fn cli_runtime_server_request_waits_for_starting_turn_binding_native_id() 
     .expect("native turn id should persist");
 
     processor
-        .flush_cli_runtime_codex_events_for_native_turn(&key, native_thread_id, native_turn_id)
+        .flush_cli_runtime_events_for_native_turn(&key, native_thread_id, native_turn_id)
         .await;
 
     let opened = recv_notification_by_method(&mut rx, events::CLI_RUNTIME_REQUEST_OPENED).await;
@@ -19851,6 +19961,144 @@ async fn cli_runtime_server_request_waits_for_starting_turn_binding_native_id() 
     assert!(
         cli_session.responses.lock().await.is_empty(),
         "buffered request should not send a cancel/approval response before the user decides"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_generic_request_event_waits_for_starting_turn_binding_native_id() {
+    let (tx, mut rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("sonnet", "cli_runtime:claude"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+
+    let thread_id = "thread_cli_generic_buffered_request";
+    let turn_id = "turn_cli_generic_buffered_request";
+    let native_thread_id = "claude-thread-buffered-request";
+    let native_turn_id = "claude-turn-buffered-request";
+    seed_cli_runtime_approval_turn(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+        native_thread_id,
+    )
+    .await;
+
+    let now = chrono::Utc::now().fixed_offset();
+    crud_store
+        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+            turn_id: turn_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            workspace_id: workspace_id.clone(),
+            runtime_id: "claude".to_owned(),
+            runtime_kind: "claude".to_owned(),
+            native_thread_id: native_thread_id.to_owned(),
+            native_turn_id: None,
+            request_id: None,
+            status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING.to_owned(),
+            model: Some("sonnet".to_owned()),
+            cwd: Some("/tmp/project".to_owned()),
+            sandbox_json: None,
+            approval_policy: None,
+            input_mapping_json: "{}".to_owned(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("starting CLI runtime turn binding should upsert");
+
+    let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "claude", thread_id)
+        .expect("session key should build");
+    processor
+        .handle_cli_runtime_event(
+            &key,
+            RuntimeEvent::RequestOpened(RuntimeRequestOpened {
+                native_request_id: "claude-request-buffered".to_owned(),
+                native_request_id_json: Some(json!("claude-request-buffered")),
+                request_kind: "command_approval".to_owned(),
+                native_thread_id: Some(native_thread_id.to_owned()),
+                native_turn_id: Some(native_turn_id.to_owned()),
+                native_item_id: Some("claude-item-buffered-request".to_owned()),
+                payload_redacted: Some(json!({
+                    "title": "Approve command",
+                    "command": "echo buffered",
+                    "input": { "command": "echo buffered" }
+                })),
+                native: None,
+            }),
+        )
+        .await;
+
+    let pending_before_flush = crud_store
+        .list_cli_runtime_pending_requests(pioneer_crud::CliRuntimePendingRequestListFilter {
+            thread_id: Some(thread_id.to_owned()),
+            limit: None,
+            ..Default::default()
+        })
+        .await
+        .expect("pending request list should load");
+    assert!(
+        pending_before_flush.is_empty(),
+        "generic request event should wait until the native turn id is bound"
+    );
+
+    crate::cli_runtime::turn_binding::persist_cli_runtime_turn_binding_after_native_start(
+        crud_store.as_ref(),
+        crate::cli_runtime::turn_binding::CLIAgentRuntimeNativeTurnStarted {
+            turn_id: turn_id.to_owned(),
+            native_turn_id: native_turn_id.to_owned(),
+            request_id: None,
+            started_at: chrono::Utc::now().fixed_offset(),
+        },
+    )
+    .await
+    .expect("native turn id should persist");
+
+    processor
+        .flush_cli_runtime_events_for_native_turn(&key, native_thread_id, native_turn_id)
+        .await;
+
+    let opened = recv_notification_by_method(&mut rx, events::CLI_RUNTIME_REQUEST_OPENED).await;
+    let opened_payload: CLIRuntimeRequestOpenedNotification =
+        serde_json::from_value(opened.params.expect("request_opened params"))
+            .expect("request_opened payload should decode");
+    assert_eq!(opened_payload.runtime_id, "claude");
+    assert_eq!(opened_payload.thread_id.as_deref(), Some(thread_id));
+    assert_eq!(opened_payload.turn_id.as_deref(), Some(turn_id));
+    assert_eq!(
+        opened_payload.request.kind,
+        CLIRuntimeRequestKind::CommandApproval
+    );
+
+    let pending_after_flush = crud_store
+        .list_cli_runtime_pending_requests(pioneer_crud::CliRuntimePendingRequestListFilter {
+            thread_id: Some(thread_id.to_owned()),
+            limit: None,
+            ..Default::default()
+        })
+        .await
+        .expect("pending request list should load");
+    assert_eq!(pending_after_flush.len(), 1);
+    assert_eq!(pending_after_flush[0].runtime_kind, "claude");
+    assert_eq!(pending_after_flush[0].turn_id.as_deref(), Some(turn_id));
+    assert_eq!(
+        pending_after_flush[0].native_turn_id.as_deref(),
+        Some(native_turn_id)
     );
 }
 
@@ -19942,7 +20190,7 @@ async fn cli_runtime_server_request_buffered_flush_preserves_order_before_termin
         .handle_cli_runtime_codex_server_request(&key, request, event)
         .await;
     processor
-        .handle_cli_runtime_codex_event(
+        .handle_cli_runtime_timeline_event(
             &key,
             RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
                 native_thread_id: Some(native_thread_id.to_owned()),
@@ -19966,7 +20214,7 @@ async fn cli_runtime_server_request_buffered_flush_preserves_order_before_termin
     .expect("native turn id should persist");
 
     processor
-        .flush_cli_runtime_codex_events_for_native_turn(&key, native_thread_id, native_turn_id)
+        .flush_cli_runtime_events_for_native_turn(&key, native_thread_id, native_turn_id)
         .await;
 
     let pending_after_flush = crud_store
@@ -20544,7 +20792,7 @@ async fn cli_runtime_event_with_bound_native_turn_but_mismatched_native_thread_i
     let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
         .expect("session key should build");
     processor
-        .handle_cli_runtime_codex_event(
+        .handle_cli_runtime_timeline_event(
             &key,
             RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
                 native_thread_id: Some(
@@ -20608,7 +20856,7 @@ async fn cli_runtime_event_with_bound_native_turn_but_missing_native_thread_is_i
     let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
         .expect("session key should build");
     processor
-        .handle_cli_runtime_codex_event(
+        .handle_cli_runtime_timeline_event(
             &key,
             RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
                 native_thread_id: None,
@@ -20670,7 +20918,7 @@ async fn cli_runtime_thread_state_event_without_native_thread_is_ignored() {
     let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
         .expect("session key should build");
     processor
-        .handle_cli_runtime_codex_event(
+        .handle_cli_runtime_timeline_event(
             &key,
             RuntimeEvent::ThreadStateChanged(RuntimeThreadStateChanged {
                 native_thread_id: None,
@@ -20731,7 +20979,7 @@ async fn cli_runtime_event_without_native_thread_does_not_buffer_before_turn_bin
     let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
         .expect("session key should build");
     processor
-        .handle_cli_runtime_codex_event(
+        .handle_cli_runtime_timeline_event(
             &key,
             RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
                 native_thread_id: None,
@@ -20754,7 +21002,7 @@ async fn cli_runtime_event_without_native_thread_does_not_buffer_before_turn_bin
     .await
     .expect("native turn id should persist");
     processor
-        .flush_cli_runtime_codex_events_for_native_turn(&key, native_thread_id, native_turn_id)
+        .flush_cli_runtime_events_for_native_turn(&key, native_thread_id, native_turn_id)
         .await;
 
     let (_workspace_id, turn) = crud_store
@@ -20840,7 +21088,7 @@ async fn cli_runtime_terminal_event_expires_pending_requests_for_turn() {
     let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
         .expect("session key should build");
     processor
-        .handle_cli_runtime_codex_event(
+        .handle_cli_runtime_timeline_event(
             &key,
             RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
                 native_thread_id: Some(native_thread_id.to_owned()),
@@ -20950,7 +21198,7 @@ async fn cli_runtime_late_terminal_event_after_blocked_turn_is_ignored() {
     let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
         .expect("session key should build");
     processor
-        .handle_cli_runtime_codex_event(
+        .handle_cli_runtime_timeline_event(
             &key,
             RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
                 native_thread_id: Some("codex-thread-late-event".to_owned()),

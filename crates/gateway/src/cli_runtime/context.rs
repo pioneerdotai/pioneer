@@ -1,15 +1,13 @@
-#![allow(dead_code)]
-// Native Codex turn dispatch is wired in later WP steps; this module prepares
-// the compact context payload and manifest that dispatch will consume.
+// Prepares the compact Pioneer context payload and manifest shared by CLI runtimes.
 
 use anyhow::Result;
-use pioneer_cli_agent_runtime::codex_input::{
-    CodexInputMappingDiagnostic, CodexInputMappingDiagnosticLevel, CodexTurnInputItem,
-    CodexTurnInputMapping,
+use pioneer_cli_agent_runtime::input::{
+    CLIRuntimeInputMappingDiagnostic, CLIRuntimeInputMappingDiagnosticLevel,
+    CLIRuntimeTurnInputItem, CLIRuntimeTurnInputMapping,
 };
 use pioneer_promt::{
-    CliRuntimeCodexContextInput, CliRuntimeContextText, CompiledPromptBundle, PromptDiagnosticCode,
-    PromptProfile, compile_cli_runtime_codex_context_bundle,
+    CliRuntimeContextInput, CliRuntimeContextText, CompiledPromptBundle, PromptDiagnosticCode,
+    PromptProfile, compile_cli_runtime_context_bundle as compile_prompt_cli_runtime_context_bundle,
 };
 use pioneer_protocol::{
     PromptManifest, PromptManifestDiagnostic, PromptManifestDiagnosticCode, PromptManifestProfile,
@@ -21,27 +19,29 @@ const THREAD_CONTEXT_MAX_MESSAGES: usize = 12;
 const THREAD_CONTEXT_MAX_CHARS: usize = 6_000;
 const THREAD_CONTEXT_MESSAGE_MAX_CHARS: usize = 800;
 
-pub(crate) struct CodexCliRuntimeContextBuildInput<'a> {
+pub(crate) struct CLIRuntimeContextBuildInput<'a> {
     pub workspace_id: &'a str,
     pub thread_id: &'a str,
     pub turn_id: &'a str,
     pub runtime_id: &'a str,
+    pub runtime_label: &'a str,
     pub model: Option<&'a str>,
     pub cwd: Option<&'a str>,
     pub history: &'a [ChatMessage],
 }
 
-pub(crate) fn compile_codex_cli_runtime_context_bundle(
+pub(crate) fn compile_cli_runtime_context_bundle(
     prompt_root: &Path,
-    input: CodexCliRuntimeContextBuildInput<'_>,
+    input: CLIRuntimeContextBuildInput<'_>,
 ) -> Result<CompiledPromptBundle> {
-    compile_cli_runtime_codex_context_bundle(
+    compile_prompt_cli_runtime_context_bundle(
         prompt_root,
-        CliRuntimeCodexContextInput {
+        CliRuntimeContextInput {
             workspace_id: input.workspace_id.to_owned(),
             thread_id: input.thread_id.to_owned(),
             turn_id: input.turn_id.to_owned(),
             runtime_id: input.runtime_id.to_owned(),
+            runtime_label: Some(input.runtime_label.to_owned()),
             model: input.model.and_then(normalized_optional).map(str::to_owned),
             cwd: input.cwd.and_then(normalized_optional).map(str::to_owned),
             memory_recall_context: None,
@@ -50,26 +50,42 @@ pub(crate) fn compile_codex_cli_runtime_context_bundle(
     )
 }
 
-pub(crate) fn prepend_codex_cli_runtime_context_input(
-    mapping: &mut CodexTurnInputMapping,
+pub(crate) fn prepend_cli_runtime_context_input(
+    mapping: &mut CLIRuntimeTurnInputMapping,
     bundle: &CompiledPromptBundle,
+    runtime_label: &str,
 ) -> bool {
-    let Some(context_text) = codex_cli_runtime_context_text(bundle) else {
+    prepend_cli_runtime_context_input_with_diagnostic(
+        mapping,
+        bundle,
+        runtime_label,
+        "cli_runtime_input.pioneer_context_mapped",
+    )
+}
+
+fn prepend_cli_runtime_context_input_with_diagnostic(
+    mapping: &mut CLIRuntimeTurnInputMapping,
+    bundle: &CompiledPromptBundle,
+    runtime_label: &str,
+    diagnostic_code: &str,
+) -> bool {
+    let Some(context_text) = cli_runtime_context_text(bundle) else {
         return false;
     };
+    let runtime_label = normalized_optional(runtime_label).unwrap_or("CLI runtime");
     mapping
         .input
-        .insert(0, CodexTurnInputItem::Text { text: context_text });
-    mapping.diagnostics.push(CodexInputMappingDiagnostic {
-        level: CodexInputMappingDiagnosticLevel::Info,
-        code: "codex_input.pioneer_context_mapped".to_owned(),
-        message: "Prepended compact Pioneer CLI runtime context for Codex.".to_owned(),
+        .insert(0, CLIRuntimeTurnInputItem::Text { text: context_text });
+    mapping.diagnostics.push(CLIRuntimeInputMappingDiagnostic {
+        level: CLIRuntimeInputMappingDiagnosticLevel::Info,
+        code: diagnostic_code.to_owned(),
+        message: format!("Prepended compact Pioneer CLI runtime context for {runtime_label}."),
         input_index: None,
     });
     true
 }
 
-pub(crate) fn codex_cli_runtime_prompt_manifest_from_bundle(
+pub(crate) fn cli_runtime_prompt_manifest_from_bundle(
     bundle: &CompiledPromptBundle,
 ) -> PromptManifest {
     PromptManifest {
@@ -98,7 +114,7 @@ pub(crate) fn codex_cli_runtime_prompt_manifest_from_bundle(
     }
 }
 
-fn codex_cli_runtime_context_text(bundle: &CompiledPromptBundle) -> Option<String> {
+fn cli_runtime_context_text(bundle: &CompiledPromptBundle) -> Option<String> {
     let text = bundle.dynamic_system_text.trim();
     (!text.is_empty()).then(|| text.to_owned())
 }
@@ -108,7 +124,7 @@ fn prompt_manifest_profile(profile: PromptProfile) -> PromptManifestProfile {
         PromptProfile::AssistantFull => PromptManifestProfile::AssistantFull,
         PromptProfile::AssistantMinimal => PromptManifestProfile::AssistantMinimal,
         PromptProfile::AssistantNone => PromptManifestProfile::AssistantNone,
-        PromptProfile::CliRuntimeCodex => PromptManifestProfile::CliRuntimeCodex,
+        PromptProfile::CliRuntime => PromptManifestProfile::CliRuntime,
     }
 }
 
@@ -207,10 +223,10 @@ fn normalized_optional(value: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CodexCliRuntimeContextBuildInput, codex_cli_runtime_prompt_manifest_from_bundle,
-        compile_codex_cli_runtime_context_bundle, prepend_codex_cli_runtime_context_input,
+        CLIRuntimeContextBuildInput, cli_runtime_prompt_manifest_from_bundle,
+        compile_cli_runtime_context_bundle, prepend_cli_runtime_context_input,
     };
-    use pioneer_cli_agent_runtime::codex_input::{CodexTurnInputItem, CodexTurnInputMapping};
+    use pioneer_cli_agent_runtime::input::{CLIRuntimeTurnInputItem, CLIRuntimeTurnInputMapping};
     use pioneer_protocol::PromptManifestProfile;
     use pioneer_provider::ChatMessage;
 
@@ -225,16 +241,17 @@ mod tests {
     }
 
     #[test]
-    fn cli_runtime_prompt_manifest_uses_codex_profile_without_api_sections() {
+    fn cli_runtime_prompt_manifest_uses_runtime_profile_without_api_sections() {
         let root = temp_workspace("manifest");
         std::fs::write(root.join("SOUL.md"), "api prompt file").expect("write SOUL");
-        let bundle = compile_codex_cli_runtime_context_bundle(
+        let bundle = compile_cli_runtime_context_bundle(
             root.as_path(),
-            CodexCliRuntimeContextBuildInput {
+            CLIRuntimeContextBuildInput {
                 workspace_id: "workspace_1",
                 thread_id: "thread_1",
                 turn_id: "turn_1",
                 runtime_id: "codex-default",
+                runtime_label: "Codex CLI",
                 model: Some("gpt-5-codex"),
                 cwd: Some("/workspace"),
                 history: &[ChatMessage::user("continue from prior context")],
@@ -242,8 +259,8 @@ mod tests {
         )
         .expect("compile bundle");
 
-        let manifest = codex_cli_runtime_prompt_manifest_from_bundle(&bundle);
-        assert_eq!(manifest.profile, PromptManifestProfile::CliRuntimeCodex);
+        let manifest = cli_runtime_prompt_manifest_from_bundle(&bundle);
+        assert_eq!(manifest.profile, PromptManifestProfile::CliRuntime);
         assert!(
             manifest
                 .section_ids
@@ -255,43 +272,46 @@ mod tests {
     }
 
     #[test]
-    fn cli_runtime_context_is_prepended_to_codex_input_mapping() {
+    fn cli_runtime_context_is_prepended_to_runtime_input_mapping() {
         let root = temp_workspace("input");
-        let bundle = compile_codex_cli_runtime_context_bundle(
+        let bundle = compile_cli_runtime_context_bundle(
             root.as_path(),
-            CodexCliRuntimeContextBuildInput {
+            CLIRuntimeContextBuildInput {
                 workspace_id: "workspace_1",
                 thread_id: "thread_1",
                 turn_id: "turn_1",
-                runtime_id: "codex-default",
+                runtime_id: "claude-default",
+                runtime_label: "Claude CLI",
                 model: None,
                 cwd: None,
                 history: &[],
             },
         )
         .expect("compile bundle");
-        let mut mapping = CodexTurnInputMapping {
-            input: vec![CodexTurnInputItem::Text {
+        let mut mapping = CLIRuntimeTurnInputMapping {
+            input: vec![CLIRuntimeTurnInputItem::Text {
                 text: "user request".to_owned(),
             }],
             diagnostics: Vec::new(),
         };
 
-        assert!(prepend_codex_cli_runtime_context_input(
+        assert!(prepend_cli_runtime_context_input(
             &mut mapping,
-            &bundle
+            &bundle,
+            "Claude CLI"
         ));
-        let CodexTurnInputItem::Text { text } = &mapping.input[0] else {
+        let CLIRuntimeTurnInputItem::Text { text } = &mapping.input[0] else {
             panic!("prepended Pioneer context should be text input");
         };
         assert!(text.contains("Pioneer Context"));
-        assert!(text.contains("Codex CLI"));
+        assert!(text.contains("Claude CLI"));
+        assert!(!text.contains("Codex CLI"));
         assert_eq!(mapping.input.len(), 2);
         assert!(
             mapping
                 .diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.code == "codex_input.pioneer_context_mapped")
+                .any(|diagnostic| diagnostic.code == "cli_runtime_input.pioneer_context_mapped")
         );
     }
 }

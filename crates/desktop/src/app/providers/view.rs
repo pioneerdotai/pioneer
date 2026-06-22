@@ -8,7 +8,7 @@ use gpui_component::{
     button::*,
     form::{field, v_form},
     input::{Input, InputEvent, InputState},
-    menu::{ContextMenuExt, PopupMenuItem},
+    menu::{ContextMenuExt, DropdownMenu, PopupMenuItem},
     switch::Switch,
     theme::ActiveTheme,
     *,
@@ -22,6 +22,7 @@ use pioneer_protocol::{
     RuntimeDiagnosticLevel, RuntimeStatus, RuntimeSummary,
 };
 use std::{
+    cmp::Ordering,
     collections::HashSet,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -41,6 +42,14 @@ impl PioneerDesktop {
             .settings
             .as_ref()
             .map(|settings| settings.cli_runtimes.instances.clone());
+        let cli_runtime_input_scope_key = format!(
+            "{}:{}",
+            self.gateway
+                .ws_connection_id
+                .map(|connection_id| connection_id.to_string())
+                .unwrap_or_else(|| "disconnected".to_owned()),
+            self.active_workspace_id().unwrap_or("no-workspace")
+        );
         let is_loading = self.providers.loading() || self.providers.cli_loading();
         let is_connected = self.gateway.connection_state == GatewayConnectionState::Connected;
         let configured_provider_names = self.providers.configured_names().clone();
@@ -118,19 +127,36 @@ impl PioneerDesktop {
                                     .icon(IconName::Plus)
                                     .tooltip(t!("providers.cli.action.add").to_string())
                                     .disabled(!is_connected)
-                                    .on_click({
+                                    .dropdown_menu_with_anchor(Corner::TopRight, {
                                         let desktop_entity = desktop_entity.clone();
-                                        move |_, window, cx| {
-                                            let _ = desktop_entity.update(cx, |view, cx| {
-                                                let draft =
-                                                    cli_provider_settings::CLIRuntimeProviderDraft::create(
-                                                        view.gateway.settings.as_ref(),
-                                                    );
-                                                view.open_cli_runtime_provider_dialog(
-                                                    draft, window, cx,
-                                                );
-                                                cx.notify();
-                                            });
+                                        move |menu, _, _| {
+                                            cli_provider_settings::CLI_RUNTIME_PROVIDER_SUPPORTED_KINDS
+                                                .iter()
+                                                .fold(menu.min_w(px(180.)), |menu, kind| {
+                                                    let kind = *kind;
+                                                    let desktop_entity = desktop_entity.clone();
+                                                    menu.item(
+                                                        PopupMenuItem::new(
+                                                            cli_provider_settings::cli_runtime_provider_kind_label(
+                                                                kind,
+                                                            )
+                                                            .to_owned(),
+                                                        )
+                                                        .on_click(move |_, window, cx| {
+                                                            let _ = desktop_entity.update(cx, |view, cx| {
+                                                                let draft =
+                                                                    cli_provider_settings::CLIRuntimeProviderDraft::create_for_kind(
+                                                                        view.gateway.settings.as_ref(),
+                                                                        kind,
+                                                                    );
+                                                                view.open_cli_runtime_provider_dialog(
+                                                                    draft, window, cx,
+                                                                );
+                                                                cx.notify();
+                                                            });
+                                                        }),
+                                                    )
+                                                })
                                         }
                                     }),
                             )
@@ -238,6 +264,7 @@ impl PioneerDesktop {
                                     is_connected,
                                     self.providers.cli_loading(),
                                     &expanded_cli_runtime_ids,
+                                    cli_runtime_input_scope_key.as_str(),
                                     desktop_entity.clone(),
                                     window,
                                     cx,
@@ -378,6 +405,7 @@ impl PioneerDesktop {
         is_connected: bool,
         is_loading: bool,
         expanded_runtime_ids: &HashSet<String>,
+        input_scope_key: &str,
         desktop_entity: Entity<Self>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -448,6 +476,7 @@ impl PioneerDesktop {
                                     expanded_runtime_ids.contains(runtime.runtime_id.as_str()),
                                     is_connected,
                                     is_loading,
+                                    input_scope_key,
                                     desktop_entity.clone(),
                                     window,
                                     cx,
@@ -465,12 +494,14 @@ impl PioneerDesktop {
         expanded: bool,
         is_connected: bool,
         is_loading: bool,
+        input_scope_key: &str,
         desktop_entity: Entity<Self>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let runtime_id = runtime.runtime_id.clone();
-        let can_login = matches!(runtime.status, RuntimeStatus::NeedsAuth);
+        let can_login = runtime.capabilities.supports_auth_management
+            && matches!(runtime.status, RuntimeStatus::NeedsAuth);
         let menu_runtime = runtime.clone();
         let menu_runtime_id = runtime_id.clone();
         let menu_home_path = runtime.home_path.clone();
@@ -526,80 +557,92 @@ impl PioneerDesktop {
                     menu = menu.separator();
                 }
 
-                menu.item(
-                    PopupMenuItem::new(t!("providers.cli.action.refresh").to_string())
-                        .disabled(!is_connected || is_loading)
-                        .on_click({
-                            let runtime_id = runtime_id.clone();
-                            let desktop_entity = desktop_entity.clone();
-                            move |_, _, cx| {
-                                let _ = desktop_entity.update(cx, |view, cx| {
-                                    view.refresh_cli_provider(runtime_id.clone(), cx);
-                                    cx.notify();
-                                });
-                            }
-                        }),
-                )
-                .item(
-                    PopupMenuItem::new(t!("providers.cli.action.copy_diagnostics").to_string())
-                        .on_click({
-                            let runtime = runtime.clone();
-                            let desktop_entity = desktop_entity.clone();
-                            move |_, _, cx| {
+                let mut menu = menu
+                    .item(
+                        PopupMenuItem::new(t!("providers.cli.action.refresh").to_string())
+                            .disabled(!is_connected || is_loading)
+                            .on_click({
+                                let runtime_id = runtime_id.clone();
+                                let desktop_entity = desktop_entity.clone();
+                                move |_, _, cx| {
+                                    let _ = desktop_entity.update(cx, |view, cx| {
+                                        view.refresh_cli_provider(runtime_id.clone(), cx);
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    )
+                    .item(
+                        PopupMenuItem::new(t!("providers.cli.action.copy_diagnostics").to_string())
+                            .on_click({
                                 let runtime = runtime.clone();
-                                let _ = desktop_entity.update(cx, |view, cx| {
-                                    view.copy_cli_runtime_provider_diagnostics(runtime.clone(), cx);
-                                    cx.notify();
-                                });
-                            }
-                        }),
-                )
-                .separator()
-                .item(
-                    PopupMenuItem::new(t!("providers.cli.action.duplicate").to_string())
-                        .disabled(!is_connected)
-                        .on_click({
-                            let runtime_id = runtime_id.clone();
-                            let desktop_entity = desktop_entity.clone();
-                            move |_, window, cx| {
-                                let _ = desktop_entity.update(cx, |view, cx| {
-                                    let Some(instance) =
-                                        cli_provider_settings::find_cli_runtime_provider_instance(
-                                            view.gateway.settings.as_ref(),
-                                            runtime_id.as_str(),
-                                        )
-                                        .cloned()
-                                    else {
-                                        view.refresh_gateway_settings(cx);
-                                        return;
-                                    };
-                                    view.open_cli_runtime_provider_dialog(
-                                        cli_provider_settings::CLIRuntimeProviderDraft::duplicate(
-                                            view.gateway.settings.as_ref(),
-                                            &instance,
-                                        ),
-                                        window,
-                                        cx,
-                                    );
-                                    cx.notify();
-                                });
-                            }
-                        }),
-                )
-                .item(
-                    PopupMenuItem::new(t!("providers.cli.action.login").to_string())
-                        .disabled(!is_connected || !can_login)
-                        .on_click({
-                            let runtime_id = runtime_id.clone();
-                            let desktop_entity = desktop_entity.clone();
-                            move |_, _, cx| {
-                                let _ = desktop_entity.update(cx, |view, cx| {
-                                    view.start_cli_runtime_login(runtime_id.clone(), cx);
-                                    cx.notify();
-                                });
-                            }
-                        }),
-                )
+                                let desktop_entity = desktop_entity.clone();
+                                move |_, _, cx| {
+                                    let runtime = runtime.clone();
+                                    let _ = desktop_entity.update(cx, |view, cx| {
+                                        view.copy_cli_runtime_provider_diagnostics(
+                                            runtime.clone(),
+                                            cx,
+                                        );
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    )
+                    .separator()
+                    .item(
+                        PopupMenuItem::new(t!("providers.cli.action.duplicate").to_string())
+                            .disabled(!is_connected)
+                            .on_click({
+                                let runtime_id = runtime_id.clone();
+                                let desktop_entity = desktop_entity.clone();
+                                move |_, window, cx| {
+                                    let _ = desktop_entity.update(cx, |view, cx| {
+                                        let settings = view.gateway.settings.as_ref();
+                                        let instance =
+                                            cli_provider_settings::find_cli_runtime_provider_instance(
+                                                settings,
+                                                runtime_id.as_str(),
+                                            )
+                                            .cloned();
+
+                                        match instance {
+                                            Some(instance) => {
+                                                let draft =
+                                                    cli_provider_settings::CLIRuntimeProviderDraft::duplicate(
+                                                        settings,
+                                                        &instance,
+                                                    );
+                                                view.open_cli_runtime_provider_dialog(
+                                                    draft, window, cx,
+                                                );
+                                            }
+                                            None => view.refresh_gateway_settings(cx),
+                                        }
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    );
+
+                if runtime.capabilities.supports_auth_management {
+                    menu = menu.item(
+                        PopupMenuItem::new(t!("providers.cli.action.login").to_string())
+                            .disabled(!is_connected || !can_login)
+                            .on_click({
+                                let runtime_id = runtime_id.clone();
+                                let desktop_entity = desktop_entity.clone();
+                                move |_, _, cx| {
+                                    let _ = desktop_entity.update(cx, |view, cx| {
+                                        view.start_cli_runtime_login(runtime_id.clone(), cx);
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    );
+                }
+
+                menu
             })
             .child(
                 h_flex()
@@ -719,10 +762,13 @@ impl PioneerDesktop {
                                                 .to_string(),
                                             t!("providers.cli.inline.display_name_hint")
                                                 .to_string(),
-                                            t!("providers.cli.inline.display_name_placeholder")
-                                                .to_string(),
+                                            cli_runtime_inline_field_placeholder(
+                                                runtime,
+                                                CLIRuntimeProviderDraftField::DisplayName,
+                                            ),
                                             is_connected,
                                             true,
+                                            input_scope_key,
                                             desktop_entity.clone(),
                                             window,
                                             cx,
@@ -732,10 +778,13 @@ impl PioneerDesktop {
                                             CLIRuntimeProviderDraftField::BinaryPath,
                                             t!("providers.cli.inline.binary_label").to_string(),
                                             t!("providers.cli.inline.binary_hint").to_string(),
-                                            t!("providers.cli.dialog.binary_placeholder")
-                                                .to_string(),
+                                            cli_runtime_inline_field_placeholder(
+                                                runtime,
+                                                CLIRuntimeProviderDraftField::BinaryPath,
+                                            ),
                                             is_connected,
                                             true,
+                                            input_scope_key,
                                             desktop_entity.clone(),
                                             window,
                                             cx,
@@ -745,9 +794,13 @@ impl PioneerDesktop {
                                             CLIRuntimeProviderDraftField::HomePath,
                                             t!("providers.cli.inline.home_label").to_string(),
                                             t!("providers.cli.inline.home_hint").to_string(),
-                                            t!("providers.cli.dialog.home_placeholder").to_string(),
+                                            cli_runtime_inline_field_placeholder(
+                                                runtime,
+                                                CLIRuntimeProviderDraftField::HomePath,
+                                            ),
                                             is_connected,
                                             true,
+                                            input_scope_key,
                                             desktop_entity.clone(),
                                             window,
                                             cx,
@@ -761,6 +814,7 @@ impl PioneerDesktop {
                                             t!("providers.cli.value.disabled").to_string(),
                                             is_connected,
                                             false,
+                                            input_scope_key,
                                             desktop_entity.clone(),
                                             window,
                                             cx,
@@ -869,10 +923,12 @@ fn cli_runtime_displayed_runtimes(
     live_runtimes: &[RuntimeSummary],
 ) -> Vec<RuntimeSummary> {
     let Some(settings_instances) = settings_instances else {
-        return live_runtimes.to_vec();
+        let mut runtimes = live_runtimes.to_vec();
+        sort_cli_runtime_display_order(runtimes.as_mut_slice());
+        return runtimes;
     };
 
-    settings_instances
+    let mut runtimes = settings_instances
         .iter()
         .map(|instance| {
             let Some(mut runtime) = live_runtimes
@@ -890,7 +946,31 @@ fn cli_runtime_displayed_runtimes(
             runtime.shadow_home_path = instance.shadow_home_path.clone();
             runtime
         })
-        .collect()
+        .collect::<Vec<_>>();
+    sort_cli_runtime_display_order(runtimes.as_mut_slice());
+    runtimes
+}
+
+fn sort_cli_runtime_display_order(runtimes: &mut [RuntimeSummary]) {
+    runtimes.sort_by(|left, right| {
+        let left_order = cli_runtime_default_display_order(left.runtime_id.as_str());
+        let right_order = cli_runtime_default_display_order(right.runtime_id.as_str());
+        left_order.cmp(&right_order).then_with(|| {
+            if left_order == usize::MAX {
+                Ordering::Equal
+            } else {
+                left.runtime_id.cmp(&right.runtime_id)
+            }
+        })
+    });
+}
+
+fn cli_runtime_default_display_order(runtime_id: &str) -> usize {
+    match runtime_id {
+        "codex" => 0,
+        "claude" => 1,
+        _ => usize::MAX,
+    }
 }
 
 fn cli_runtime_summary_from_settings(
@@ -1067,12 +1147,20 @@ fn cli_runtime_inline_settings_row(
     placeholder: String,
     is_connected: bool,
     show_divider: bool,
+    input_scope_key: &str,
     desktop_entity: Entity<PioneerDesktop>,
     window: &mut Window,
     cx: &mut Context<PioneerDesktop>,
 ) -> AnyElement {
-    let input_state =
-        cli_runtime_inline_input_state(runtime, field_id, placeholder, desktop_entity, window, cx);
+    let input_state = cli_runtime_inline_input_state(
+        runtime,
+        field_id,
+        placeholder,
+        input_scope_key,
+        desktop_entity,
+        window,
+        cx,
+    );
     let input = input_state.read(cx).input.clone();
 
     v_flex()
@@ -1104,6 +1192,7 @@ fn cli_runtime_inline_input_state(
     runtime: &RuntimeSummary,
     field_id: CLIRuntimeProviderDraftField,
     placeholder: String,
+    input_scope_key: &str,
     desktop_entity: Entity<PioneerDesktop>,
     window: &mut Window,
     cx: &mut Context<PioneerDesktop>,
@@ -1111,7 +1200,8 @@ fn cli_runtime_inline_input_state(
     let runtime_id = runtime.runtime_id.clone();
     let initial_value = cli_runtime_inline_field_value(runtime, field_id);
     let state_key = SharedString::from(format!(
-        "cli-runtime-inline-input:{}:{}",
+        "cli-runtime-inline-input:{}:{}:{}",
+        input_scope_key,
         runtime_id,
         cli_runtime_inline_field_key(field_id)
     ));
@@ -1154,16 +1244,42 @@ fn cli_runtime_inline_field_value(
 ) -> String {
     match field_id {
         CLIRuntimeProviderDraftField::DisplayName => runtime.display_name.clone(),
-        CLIRuntimeProviderDraftField::BinaryPath => runtime
-            .binary_path
-            .clone()
-            .unwrap_or_else(|| "codex".to_owned()),
-        CLIRuntimeProviderDraftField::HomePath => runtime
-            .home_path
-            .clone()
-            .unwrap_or_else(|| "~/.codex".to_owned()),
+        CLIRuntimeProviderDraftField::BinaryPath => {
+            runtime.binary_path.clone().unwrap_or_else(|| {
+                cli_provider_settings::cli_runtime_provider_default_binary_path(runtime.kind)
+                    .to_owned()
+            })
+        }
+        CLIRuntimeProviderDraftField::HomePath => runtime.home_path.clone().unwrap_or_else(|| {
+            cli_provider_settings::cli_runtime_provider_default_home_path(runtime.kind).to_owned()
+        }),
         CLIRuntimeProviderDraftField::ShadowHomePath => {
             runtime.shadow_home_path.clone().unwrap_or_default()
+        }
+        CLIRuntimeProviderDraftField::Id => String::new(),
+    }
+}
+
+fn cli_runtime_inline_field_placeholder(
+    runtime: &RuntimeSummary,
+    field_id: CLIRuntimeProviderDraftField,
+) -> String {
+    match field_id {
+        CLIRuntimeProviderDraftField::DisplayName => {
+            cli_provider_settings::cli_runtime_provider_default_display_name(runtime.kind)
+                .to_owned()
+        }
+        CLIRuntimeProviderDraftField::BinaryPath => {
+            cli_provider_settings::cli_runtime_provider_default_binary_path(runtime.kind).to_owned()
+        }
+        CLIRuntimeProviderDraftField::HomePath => {
+            cli_provider_settings::cli_runtime_provider_default_home_path(runtime.kind).to_owned()
+        }
+        CLIRuntimeProviderDraftField::ShadowHomePath => {
+            cli_provider_settings::cli_runtime_provider_default_shadow_home_placeholder(
+                runtime.kind,
+            )
+            .to_owned()
         }
         CLIRuntimeProviderDraftField::Id => String::new(),
     }

@@ -16,7 +16,11 @@ use std::path::PathBuf;
 use tracing::warn;
 
 impl PioneerDesktop {
-    pub(super) fn steer_active_codex_turn(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn steer_active_cli_runtime_turn(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let snapshot = self.client_snapshot().active_thread;
         let (Some(thread_id), Some(workspace_id), Some(turn_id)) = (
             snapshot.thread_id.clone(),
@@ -25,7 +29,7 @@ impl PioneerDesktop {
         ) else {
             return;
         };
-        let Some(binding) = self.codex_cli_runtime_binding_for_thread(thread_id.as_str()) else {
+        let Some(binding) = self.cli_runtime_binding_for_thread(thread_id.as_str()) else {
             return;
         };
         let message = self.composer_state.read(cx).value().trim().to_owned();
@@ -59,7 +63,7 @@ impl PioneerDesktop {
                                     thread_id = thread_id.as_str(),
                                     turn_id = turn_id.as_str(),
                                     error = %format!("{error:#}"),
-                                    "failed to steer Codex turn"
+                                    "failed to steer CLI runtime turn"
                                 );
                             }
                         }

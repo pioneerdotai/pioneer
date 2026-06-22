@@ -854,7 +854,8 @@ pub enum PromptManifestProfile {
     AssistantFull,
     AssistantMinimal,
     AssistantNone,
-    CliRuntimeCodex,
+    #[serde(alias = "cli_runtime_codex")]
+    CliRuntime,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]

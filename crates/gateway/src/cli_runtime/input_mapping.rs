@@ -1,34 +1,54 @@
 use pioneer_agent::ResolvedArtifactInput;
-use pioneer_cli_agent_runtime::codex_input::{
-    CodexFileReferenceLocation, CodexInputMappingRequest, CodexInputSource, CodexTurnInputMapping,
-    map_codex_turn_input,
+use pioneer_cli_agent_runtime::input::{
+    CLIRuntimeFileReferenceLocation, CLIRuntimeInputMappingError, CLIRuntimeInputMappingRequest,
+    CLIRuntimeInputSource, CLIRuntimeTurnInputMapping, map_cli_runtime_turn_input_for_runtime,
 };
 use pioneer_protocol::UserInput;
 use pioneer_provider::{AttachmentDataSource, InputContentType};
 
+type CLIRuntimeInputMappingResult = Result<CLIRuntimeTurnInputMapping, CLIRuntimeInputMappingError>;
+
 pub(crate) fn map_codex_turn_input_from_pioneer(
     input: &[UserInput],
     resolved_artifacts: &[ResolvedArtifactInput],
-) -> Result<CodexTurnInputMapping, pioneer_cli_agent_runtime::codex_input::CodexInputMappingError> {
-    map_codex_turn_input(CodexInputMappingRequest {
-        inputs: input
-            .iter()
-            .map(|input| codex_input_source_from_pioneer(input, resolved_artifacts))
-            .collect(),
-    })
+) -> CLIRuntimeInputMappingResult {
+    map_cli_runtime_turn_input_from_pioneer_for_runtime(input, resolved_artifacts, "Codex")
 }
 
-fn codex_input_source_from_pioneer(
+pub(crate) fn map_claude_turn_input_from_pioneer(
+    input: &[UserInput],
+    resolved_artifacts: &[ResolvedArtifactInput],
+) -> CLIRuntimeInputMappingResult {
+    map_cli_runtime_turn_input_from_pioneer_for_runtime(input, resolved_artifacts, "Claude")
+}
+
+fn map_cli_runtime_turn_input_from_pioneer_for_runtime(
+    input: &[UserInput],
+    resolved_artifacts: &[ResolvedArtifactInput],
+    runtime_label: &str,
+) -> CLIRuntimeInputMappingResult {
+    map_cli_runtime_turn_input_for_runtime(
+        CLIRuntimeInputMappingRequest {
+            inputs: input
+                .iter()
+                .map(|input| cli_runtime_input_source_from_pioneer(input, resolved_artifacts))
+                .collect(),
+        },
+        runtime_label,
+    )
+}
+
+fn cli_runtime_input_source_from_pioneer(
     input: &UserInput,
     resolved_artifacts: &[ResolvedArtifactInput],
-) -> CodexInputSource {
+) -> CLIRuntimeInputSource {
     match input {
-        UserInput::Text { text, .. } => CodexInputSource::Text { text: text.clone() },
-        UserInput::Image { url } => CodexInputSource::ImageUrl { url: url.clone() },
-        UserInput::LocalImage { path } => CodexInputSource::LocalImage { path: path.clone() },
+        UserInput::Text { text, .. } => CLIRuntimeInputSource::Text { text: text.clone() },
+        UserInput::Image { url } => CLIRuntimeInputSource::ImageUrl { url: url.clone() },
+        UserInput::LocalImage { path } => CLIRuntimeInputSource::LocalImage { path: path.clone() },
         UserInput::File { url } | UserInput::Audio { url } | UserInput::Video { url } => {
-            CodexInputSource::FileReference {
-                location: CodexFileReferenceLocation::Url(url.clone()),
+            CLIRuntimeInputSource::FileReference {
+                location: CLIRuntimeFileReferenceLocation::Url(url.clone()),
                 name: None,
                 mime_type: None,
                 size_bytes: None,
@@ -37,8 +57,8 @@ fn codex_input_source_from_pioneer(
         }
         UserInput::LocalFile { path }
         | UserInput::LocalAudio { path }
-        | UserInput::LocalVideo { path } => CodexInputSource::FileReference {
-            location: CodexFileReferenceLocation::Path(path.clone()),
+        | UserInput::LocalVideo { path } => CLIRuntimeInputSource::FileReference {
+            location: CLIRuntimeFileReferenceLocation::Path(path.clone()),
             name: file_name_from_path(path),
             mime_type: None,
             size_bytes: None,
@@ -48,8 +68,8 @@ fn codex_input_source_from_pioneer(
             artifact_id,
             version_id,
         } => resolved_artifact_input_source(artifact_id, version_id.as_deref(), resolved_artifacts)
-            .unwrap_or_else(|| CodexInputSource::FileReference {
-                location: CodexFileReferenceLocation::Reference(format!(
+            .unwrap_or_else(|| CLIRuntimeInputSource::FileReference {
+                location: CLIRuntimeFileReferenceLocation::Reference(format!(
                     "artifact://{}{}",
                     artifact_id,
                     version_id
@@ -72,7 +92,7 @@ fn resolved_artifact_input_source(
     artifact_id: &str,
     version_id: Option<&str>,
     resolved_artifacts: &[ResolvedArtifactInput],
-) -> Option<CodexInputSource> {
+) -> Option<CLIRuntimeInputSource> {
     let resolved = resolved_artifacts.iter().find(|candidate| {
         candidate.artifact_id == artifact_id
             && version_id
@@ -85,36 +105,38 @@ fn resolved_artifact_input_source(
 
     match (resolved.content_type, &resolved.attachment.source) {
         (InputContentType::Image, AttachmentDataSource::Path { path }) => {
-            Some(CodexInputSource::LocalImage { path: path.clone() })
+            Some(CLIRuntimeInputSource::LocalImage { path: path.clone() })
         }
         (InputContentType::Image, AttachmentDataSource::Url { url }) => {
-            Some(CodexInputSource::ImageUrl { url: url.clone() })
+            Some(CLIRuntimeInputSource::ImageUrl { url: url.clone() })
         }
-        (_, AttachmentDataSource::Path { path }) => Some(CodexInputSource::FileReference {
-            location: CodexFileReferenceLocation::Path(path.clone()),
+        (_, AttachmentDataSource::Path { path }) => Some(CLIRuntimeInputSource::FileReference {
+            location: CLIRuntimeFileReferenceLocation::Path(path.clone()),
             name,
             mime_type,
             size_bytes,
             sha256,
         }),
-        (_, AttachmentDataSource::Url { url }) => Some(CodexInputSource::FileReference {
-            location: CodexFileReferenceLocation::Url(url.clone()),
+        (_, AttachmentDataSource::Url { url }) => Some(CLIRuntimeInputSource::FileReference {
+            location: CLIRuntimeFileReferenceLocation::Url(url.clone()),
             name,
             mime_type,
             size_bytes,
             sha256,
         }),
         (_, AttachmentDataSource::Reference { reference }) => {
-            Some(CodexInputSource::FileReference {
-                location: CodexFileReferenceLocation::Reference(reference.clone()),
+            Some(CLIRuntimeInputSource::FileReference {
+                location: CLIRuntimeFileReferenceLocation::Reference(reference.clone()),
                 name,
                 mime_type,
                 size_bytes,
                 sha256,
             })
         }
-        (_, AttachmentDataSource::Bytes { .. }) => Some(CodexInputSource::FileReference {
-            location: CodexFileReferenceLocation::Reference(format!("artifact://{artifact_id}")),
+        (_, AttachmentDataSource::Bytes { .. }) => Some(CLIRuntimeInputSource::FileReference {
+            location: CLIRuntimeFileReferenceLocation::Reference(format!(
+                "artifact://{artifact_id}"
+            )),
             name,
             mime_type,
             size_bytes,
@@ -155,7 +177,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_text_input_maps_from_pioneer_user_input() {
+    fn cli_runtime_text_input_maps_from_pioneer_user_input() {
         let mapping = map_codex_turn_input_from_pioneer(
             &[UserInput::Text {
                 text: "hello".to_owned(),
@@ -169,7 +191,7 @@ mod tests {
         assert_eq!(
             mapping.input,
             vec![
-                pioneer_cli_agent_runtime::codex_input::CodexTurnInputItem::Text {
+                pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Text {
                     text: "hello".to_owned(),
                 }
             ]
@@ -177,7 +199,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_local_image_maps_from_pioneer_user_input() {
+    fn cli_runtime_local_image_maps_from_pioneer_user_input() {
         let mapping = map_codex_turn_input_from_pioneer(
             &[UserInput::LocalImage {
                 path: "/tmp/screenshot.png".to_owned(),
@@ -189,7 +211,7 @@ mod tests {
         assert_eq!(
             mapping.input,
             vec![
-                pioneer_cli_agent_runtime::codex_input::CodexTurnInputItem::LocalImage {
+                pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::LocalImage {
                     path: "/tmp/screenshot.png".to_owned(),
                 }
             ]
@@ -206,7 +228,7 @@ mod tests {
         )
         .expect("file input should map");
 
-        let pioneer_cli_agent_runtime::codex_input::CodexTurnInputItem::Text { text } =
+        let pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Text { text } =
             &mapping.input[0]
         else {
             panic!("file should map as text reference");
@@ -217,7 +239,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_image_artifact_maps_to_materialized_local_image() {
+    fn cli_runtime_image_artifact_maps_to_materialized_local_image() {
         let mapping = map_codex_turn_input_from_pioneer(
             &[UserInput::Artifact {
                 artifact_id: "art_img".to_owned(),
@@ -235,7 +257,7 @@ mod tests {
         assert_eq!(
             mapping.input,
             vec![
-                pioneer_cli_agent_runtime::codex_input::CodexTurnInputItem::LocalImage {
+                pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::LocalImage {
                     path: "/tmp/materialized/screenshot.png".to_owned(),
                 }
             ]
@@ -258,7 +280,7 @@ mod tests {
         )
         .expect("file artifact should map");
 
-        let pioneer_cli_agent_runtime::codex_input::CodexTurnInputItem::Text { text } =
+        let pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Text { text } =
             &mapping.input[0]
         else {
             panic!("file artifact should map as text reference");

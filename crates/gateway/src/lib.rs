@@ -1,7 +1,7 @@
 //! Gateway runtime orchestration.
 //!
 //! The gateway owns the top-level execution-backend decision: existing API
-//! providers continue through `pioneer-agent`, while future `CLIAgentRuntime`
+//! providers continue through `pioneer-agent`, while local `CLIAgentRuntime`
 //! executions are routed through `pioneer-cli-agent-runtime`.
 
 mod artifact_prompt_refs;
@@ -591,7 +591,7 @@ fn build_cli_runtime_manager(
     runtime_home: &Path,
     config: &AppConfig,
 ) -> Result<Option<Arc<crate::cli_runtime::manager::CLIAgentRuntimeManager>>> {
-    crate::cli_runtime::codex_session::codex_cli_runtime_manager(
+    crate::cli_runtime::codex_session::cli_runtime_manager(
         runtime_home.to_path_buf(),
         Duration::from_secs(config.gateway.cli_agent_runtime.idle_session_ttl_secs),
     )

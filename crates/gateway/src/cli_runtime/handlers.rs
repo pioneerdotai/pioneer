@@ -1,11 +1,18 @@
 use super::*;
-use crate::cli_runtime::config::codex_account_probe_config_from_instance;
+use crate::cli_runtime::config::{
+    claude_account_probe_config_from_instance, codex_account_probe_config_from_instance,
+};
 use crate::cli_runtime::manager::{
     CLIAgentRuntimeCodexEventReceivers, CLIAgentRuntimeSession, CLIAgentRuntimeSessionHandle,
     CLIAgentRuntimeSessionKey, CLIAgentRuntimeThreadForkRequest,
     CLIAgentRuntimeThreadNameSetRequest, CLIAgentRuntimeTurnSteerRequest,
 };
 use anyhow::Context as AnyhowContext;
+use pioneer_cli_agent_runtime::claude::{
+    ClaudeAccountProbeSnapshot, ClaudeAccountProbeStatus, ClaudeAccountSnapshot,
+    ClaudeModelListSnapshot, ClaudeModelSnapshot, ClaudeProbe, ClaudeProbeDiagnostic,
+    ClaudeProbeDiagnosticLevel,
+};
 use pioneer_cli_agent_runtime::codex::{
     CodexAccountProbeSnapshot, CodexAccountProbeStatus, CodexAccountSnapshot,
     CodexCommandApprovalDecision, CodexCommandApprovalRequest, CodexFileChangeApprovalDecision,
@@ -18,7 +25,7 @@ use pioneer_cli_agent_runtime::codex::{
     decode_codex_user_input_request,
 };
 use pioneer_cli_agent_runtime::event::{
-    RuntimeEvent, RuntimeEventMappingOptions, map_codex_notification_event,
+    RuntimeEvent, RuntimeEventMappingOptions, RuntimeRequestResolved, map_codex_notification_event,
     map_codex_server_request_event,
 };
 use pioneer_config::{
@@ -247,6 +254,13 @@ impl MessageProcessor {
                             .await;
                     runtime_model_list_from_codex_probe(probe, &instance.custom_models)
                 }
+                GatewayCliAgentRuntimeKindConfig::Claude => runtime_model_list_from_claude_probe(
+                    ClaudeProbe::model_list(
+                        claude_account_probe_config_from_instance(&instance),
+                        &instance.custom_models,
+                    )
+                    .await,
+                ),
             }
         } else {
             RuntimeModelListResult {
@@ -598,15 +612,19 @@ impl MessageProcessor {
             .await;
             return;
         }
-        if binding.runtime_kind != "codex" {
+        let supports_fork = cli_runtime_capabilities_for_stored_kind(binding.runtime_kind.as_str())
+            .is_some_and(|capabilities| capabilities.supports_fork);
+        if !supports_fork {
             self.send_error(
                 connection_id,
                 JsonRpcErrorResponse::new(
                     Some(request_id),
                     INVALID_REQUEST_CODE,
                     format!(
-                        "CLI runtime fork is only supported for Codex threads; thread `{}` is bound to `{}`",
-                        params.source_thread_id, binding.runtime_kind
+                        "CLI runtime fork is not supported for `{}` threads; thread `{}` is bound to `{}`",
+                        binding.runtime_kind.as_str(),
+                        params.source_thread_id,
+                        binding.runtime_kind.as_str()
                     ),
                 ),
             )
@@ -961,15 +979,19 @@ impl MessageProcessor {
             .await;
             return;
         }
-        if turn_binding.runtime_kind != "codex" {
+        let supports_steer =
+            cli_runtime_capabilities_for_stored_kind(turn_binding.runtime_kind.as_str())
+                .is_some_and(|capabilities| capabilities.supports_steer);
+        if !supports_steer {
             self.send_error(
                 connection_id,
                 JsonRpcErrorResponse::new(
                     Some(request_id),
                     INVALID_REQUEST_CODE,
                     format!(
-                        "CLI runtime turn steering is only supported for Codex turns; turn `{}` is bound to `{}`",
-                        params.turn_id, turn_binding.runtime_kind
+                        "CLI runtime turn steering is not supported for `{}` turns; turn `{}` is bound to `{}`",
+                        turn_binding.runtime_kind.as_str(),
+                        params.turn_id, turn_binding.runtime_kind.as_str()
                     ),
                 ),
             )
@@ -999,7 +1021,7 @@ impl MessageProcessor {
                     Some(request_id),
                     INVALID_REQUEST_CODE,
                     format!(
-                        "turn `{}` does not have an active Codex native turn id",
+                        "turn `{}` does not have an active CLI runtime native turn id",
                         params.turn_id
                     ),
                 ),
@@ -1169,6 +1191,23 @@ impl MessageProcessor {
                         snapshot,
                     )
                 }
+                unsupported_kind => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!(
+                                "CLI runtime login management is not supported for `{}` runtimes",
+                                cli_runtime_protocol_kind_label(cli_runtime_kind_from_config(
+                                    unsupported_kind
+                                ))
+                            ),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
             }
         } else {
             CLIRuntimeLoginStartResponse {
@@ -1227,6 +1266,23 @@ impl MessageProcessor {
                     )
                     .await
                     .cancelled
+                }
+                unsupported_kind => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!(
+                                "CLI runtime login management is not supported for `{}` runtimes",
+                                cli_runtime_protocol_kind_label(cli_runtime_kind_from_config(
+                                    unsupported_kind
+                                ))
+                            ),
+                        ),
+                    )
+                    .await;
+                    return;
                 }
             }
         } else {
@@ -1792,10 +1848,43 @@ impl MessageProcessor {
         session: Arc<dyn CLIAgentRuntimeSession>,
         debug_native_events: bool,
     ) {
+        if let Some(receivers) = session.take_event_receivers() {
+            self.spawn_cli_runtime_event_pump(key.clone(), receivers, debug_native_events);
+        }
         let Some(receivers) = session.take_codex_event_receivers() else {
             return;
         };
         self.spawn_codex_event_pumps(key.clone(), receivers, debug_native_events);
+    }
+
+    fn spawn_cli_runtime_event_pump(
+        &self,
+        key: CLIAgentRuntimeSessionKey,
+        receivers: crate::cli_runtime::manager::CLIAgentRuntimeEventReceivers,
+        debug_native_events: bool,
+    ) {
+        let processor = self.clone();
+        tokio::spawn(async move {
+            let mut events = receivers.events;
+            let runtime_kind = receivers.runtime_kind;
+            while let Some(event) = events.recv().await {
+                processor
+                    .persist_cli_runtime_canonical_event(
+                        &key,
+                        runtime_kind.as_str(),
+                        &event,
+                        debug_native_events,
+                    )
+                    .await;
+                processor.handle_cli_runtime_event(&key, event).await;
+            }
+            debug!(
+                workspace_id = key.workspace_id.as_str(),
+                runtime_id = key.runtime_id.as_str(),
+                thread_id = key.thread_id.as_str(),
+                "CLI runtime canonical event pump closed"
+            );
+        });
     }
 
     fn spawn_codex_event_pumps(
@@ -1824,7 +1913,7 @@ impl MessageProcessor {
                     .await;
                 let event = map_codex_notification_event(&notification, options);
                 notification_processor
-                    .handle_cli_runtime_codex_event(&notification_key, event)
+                    .handle_cli_runtime_timeline_event(&notification_key, event)
                     .await;
             }
             debug!(
@@ -1966,7 +2055,73 @@ impl MessageProcessor {
         }
     }
 
-    pub(super) async fn handle_cli_runtime_codex_event(
+    async fn persist_cli_runtime_canonical_event(
+        &self,
+        key: &CLIAgentRuntimeSessionKey,
+        runtime_kind: &str,
+        event: &RuntimeEvent,
+        include_payload: bool,
+    ) {
+        let native_thread_id = cli_runtime_native_thread_id_for_event(event).map(str::to_owned);
+        let native_turn_id = cli_runtime_native_turn_id_for_event(event).map(str::to_owned);
+        let native_item_id = cli_runtime_native_item_id_for_event(event).map(str::to_owned);
+        let turn_id = self
+            .cli_runtime_pioneer_turn_id_for_native_turn(
+                key,
+                native_thread_id.as_deref(),
+                native_turn_id.as_deref(),
+            )
+            .await;
+        let payload = if include_payload {
+            serde_json::to_value(event).unwrap_or_else(|_| json!({ "event": "unserializable" }))
+        } else {
+            json!({
+                "event": cli_runtime_event_log_label(event),
+                "nativeItemId": native_item_id,
+            })
+        };
+        let payload_redacted_json = match pioneer_crud::serialize_cli_runtime_json(&payload) {
+            Ok(payload) => payload,
+            Err(error) => {
+                warn!(
+                    workspace_id = key.workspace_id.as_str(),
+                    runtime_id = key.runtime_id.as_str(),
+                    thread_id = key.thread_id.as_str(),
+                    error = %format!("{error:#}"),
+                    "failed to serialize CLI runtime canonical event"
+                );
+                return;
+            }
+        };
+        if let Err(error) = self
+            .crud_store
+            .append_cli_runtime_native_event(NewCliRuntimeNativeEvent {
+                id: generate_id(24),
+                runtime_id: key.runtime_id.clone(),
+                runtime_kind: runtime_kind.to_owned(),
+                workspace_id: Some(key.workspace_id.clone()),
+                thread_id: Some(key.thread_id.clone()),
+                turn_id,
+                native_thread_id,
+                native_turn_id,
+                native_method: cli_runtime_event_log_label(event),
+                payload_redacted_json,
+                sequence: now_timestamp_millis(),
+                created_at: chrono::Utc::now().fixed_offset(),
+            })
+            .await
+        {
+            warn!(
+                workspace_id = key.workspace_id.as_str(),
+                runtime_id = key.runtime_id.as_str(),
+                thread_id = key.thread_id.as_str(),
+                error = %format!("{error:#}"),
+                "failed to persist CLI runtime canonical event"
+            );
+        }
+    }
+
+    pub(super) async fn handle_cli_runtime_timeline_event(
         &self,
         key: &CLIAgentRuntimeSessionKey,
         event: RuntimeEvent,
@@ -1984,7 +2139,7 @@ impl MessageProcessor {
             else {
                 return;
             };
-            self.process_bound_cli_runtime_codex_event(key, turn_binding, event)
+            self.process_bound_cli_runtime_event(key, turn_binding, event)
                 .await;
             return;
         };
@@ -1996,7 +2151,7 @@ impl MessageProcessor {
                 runtime_id = key.runtime_id.as_str(),
                 thread_id = key.thread_id.as_str(),
                 native_turn_id = native_turn_id.as_str(),
-                "ignored Codex event without native thread id"
+                "ignored CLI runtime event without native thread id"
             );
             return;
         };
@@ -2021,11 +2176,11 @@ impl MessageProcessor {
                     thread_id = key.thread_id.as_str(),
                     native_thread_id,
                     native_turn_id = native_turn_id.as_str(),
-                    "ignored Codex event without matching Pioneer turn binding"
+                    "ignored CLI runtime event without matching Pioneer turn binding"
                 );
                 return;
             }
-            self.buffer_cli_runtime_codex_event_until_turn_binding(
+            self.buffer_cli_runtime_event_until_turn_binding(
                 key,
                 native_thread_id.as_str(),
                 native_turn_id.as_str(),
@@ -2037,16 +2192,256 @@ impl MessageProcessor {
                 runtime_id = key.runtime_id.as_str(),
                 thread_id = key.thread_id.as_str(),
                 native_turn_id = native_turn_id.as_str(),
-                "buffering Codex event before Pioneer turn binding is available"
+                "buffering CLI runtime event before Pioneer turn binding is available"
             );
             return;
         };
 
-        self.process_bound_cli_runtime_codex_event(key, turn_binding, event)
+        self.process_bound_cli_runtime_event(key, turn_binding, event)
             .await;
     }
 
-    async fn process_bound_cli_runtime_codex_event(
+    pub(super) async fn handle_cli_runtime_event(
+        &self,
+        key: &CLIAgentRuntimeSessionKey,
+        event: RuntimeEvent,
+    ) {
+        match event {
+            RuntimeEvent::RequestOpened(request) => {
+                self.handle_cli_runtime_request_opened_event(key, request)
+                    .await;
+            }
+            RuntimeEvent::RequestResolved(resolved) => {
+                self.handle_cli_runtime_request_resolved_event(key, resolved)
+                    .await;
+            }
+            other => self.handle_cli_runtime_timeline_event(key, other).await,
+        }
+    }
+
+    async fn handle_cli_runtime_request_opened_event(
+        &self,
+        key: &CLIAgentRuntimeSessionKey,
+        request: pioneer_cli_agent_runtime::event::RuntimeRequestOpened,
+    ) {
+        let Some(turn_binding) = self
+            .cli_runtime_turn_binding_for_native_turn_option(
+                key,
+                request.native_thread_id.as_deref(),
+                request.native_turn_id.as_deref(),
+            )
+            .await
+        else {
+            if let (Some(native_thread_id), Some(native_turn_id)) = (
+                request.native_thread_id.clone(),
+                request.native_turn_id.clone(),
+            ) {
+                self.buffer_cli_runtime_event_until_turn_binding(
+                    key,
+                    native_thread_id.as_str(),
+                    native_turn_id.as_str(),
+                    RuntimeEvent::RequestOpened(request),
+                )
+                .await;
+                debug!(
+                    workspace_id = key.workspace_id.as_str(),
+                    runtime_id = key.runtime_id.as_str(),
+                    thread_id = key.thread_id.as_str(),
+                    native_thread_id,
+                    native_turn_id,
+                    "buffering CLI runtime request before Pioneer turn binding is available"
+                );
+                return;
+            }
+            warn!(
+                workspace_id = key.workspace_id.as_str(),
+                runtime_id = key.runtime_id.as_str(),
+                thread_id = key.thread_id.as_str(),
+                native_thread_id = request.native_thread_id.as_deref(),
+                native_turn_id = request.native_turn_id.as_deref(),
+                native_request_id = request.native_request_id.as_str(),
+                "ignored CLI runtime request without matching Pioneer turn binding"
+            );
+            return;
+        };
+        self.open_bound_cli_runtime_request(key, turn_binding, request)
+            .await;
+    }
+
+    async fn handle_cli_runtime_request_resolved_event(
+        &self,
+        key: &CLIAgentRuntimeSessionKey,
+        resolved: RuntimeRequestResolved,
+    ) {
+        let pending_requests = match self
+            .crud_store
+            .list_cli_runtime_pending_requests(pioneer_crud::CliRuntimePendingRequestListFilter {
+                workspace_id: Some(key.workspace_id.clone()),
+                runtime_id: Some(key.runtime_id.clone()),
+                thread_id: Some(key.thread_id.clone()),
+                status: Some(StoredCliRuntimePendingRequestStatus::Pending),
+                limit: None,
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(requests) => requests,
+            Err(error) => {
+                warn!(
+                    workspace_id = key.workspace_id.as_str(),
+                    runtime_id = key.runtime_id.as_str(),
+                    thread_id = key.thread_id.as_str(),
+                    native_request_id = resolved.native_request_id.as_str(),
+                    error = %format!("{error:#}"),
+                    "failed to list pending CLI runtime requests for native cancellation"
+                );
+                return;
+            }
+        };
+
+        let Some(request) = pending_requests.into_iter().find(|request| {
+            cli_runtime_pending_request_from_record(request)
+                .native_request_id
+                .as_deref()
+                == Some(resolved.native_request_id.as_str())
+        }) else {
+            debug!(
+                workspace_id = key.workspace_id.as_str(),
+                runtime_id = key.runtime_id.as_str(),
+                thread_id = key.thread_id.as_str(),
+                native_request_id = resolved.native_request_id.as_str(),
+                "ignored CLI runtime native request resolution without matching pending request"
+            );
+            return;
+        };
+
+        let resolution = CLIRuntimeRequestResolution::Cancelled;
+        let response_json = match pioneer_crud::serialize_cli_runtime_json(&resolution) {
+            Ok(response_json) => Some(response_json),
+            Err(error) => {
+                warn!(
+                    workspace_id = key.workspace_id.as_str(),
+                    runtime_id = key.runtime_id.as_str(),
+                    thread_id = key.thread_id.as_str(),
+                    request_id = request.request_id.as_str(),
+                    native_request_id = resolved.native_request_id.as_str(),
+                    error = %format!("{error:#}"),
+                    "failed to serialize cancelled CLI runtime request resolution"
+                );
+                return;
+            }
+        };
+        let now = cli_runtime_request_timestamp();
+        let cancelled = match self
+            .crud_store
+            .cancel_cli_runtime_pending_request(request.request_id.as_str(), response_json, now)
+            .await
+        {
+            Ok(cancelled) => cancelled,
+            Err(error) => {
+                warn!(
+                    workspace_id = key.workspace_id.as_str(),
+                    runtime_id = key.runtime_id.as_str(),
+                    thread_id = key.thread_id.as_str(),
+                    request_id = request.request_id.as_str(),
+                    native_request_id = resolved.native_request_id.as_str(),
+                    error = %format!("{error:#}"),
+                    "failed to cancel CLI runtime pending request after native resolution"
+                );
+                return;
+            }
+        };
+
+        if let Some(cancelled) = cancelled {
+            self.emit_cli_runtime_request_resolved(cancelled.clone(), resolution.clone())
+                .await;
+            if cancelled.request_kind
+                == cli_runtime_request_kind_as_str(CLIRuntimeRequestKind::FileChangeApproval)
+            {
+                self.emit_cli_runtime_file_change_approval_timeline_update(
+                    &cancelled,
+                    file_change_approval_timeline_status_for_resolution(&resolution),
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn open_bound_cli_runtime_request(
+        &self,
+        key: &CLIAgentRuntimeSessionKey,
+        turn_binding: pioneer_crud::CliRuntimeTurnBindingRecord,
+        request: pioneer_cli_agent_runtime::event::RuntimeRequestOpened,
+    ) {
+        if !self
+            .cli_runtime_turn_binding_accepts_native_activity(
+                key,
+                &turn_binding,
+                request.native_thread_id.as_deref(),
+                request.request_kind.as_str(),
+            )
+            .await
+        {
+            return;
+        }
+        let request_kind = cli_runtime_request_kind_from_stored(request.request_kind.as_str());
+        if request_kind == CLIRuntimeRequestKind::Other {
+            debug!(
+                workspace_id = key.workspace_id.as_str(),
+                runtime_id = key.runtime_id.as_str(),
+                thread_id = key.thread_id.as_str(),
+                native_request_id = request.native_request_id.as_str(),
+                request_kind = request.request_kind.as_str(),
+                "ignored unsupported CLI runtime request kind"
+            );
+            return;
+        }
+        let payload = cli_runtime_pending_request_from_runtime_event(&request, request_kind);
+        let payload_json = match pioneer_crud::serialize_cli_runtime_json(&payload) {
+            Ok(payload_json) => payload_json,
+            Err(error) => {
+                warn!(
+                    workspace_id = key.workspace_id.as_str(),
+                    runtime_id = key.runtime_id.as_str(),
+                    thread_id = key.thread_id.as_str(),
+                    native_request_id = request.native_request_id.as_str(),
+                    error = %format!("{error:#}"),
+                    "failed to serialize CLI runtime pending request"
+                );
+                return;
+            }
+        };
+        let now = cli_runtime_request_timestamp();
+        if let Err(error) = self
+            .open_cli_runtime_pending_request(NewCliRuntimePendingRequest {
+                request_id: format!("cli_req_{}", generate_id(21)),
+                runtime_id: key.runtime_id.clone(),
+                runtime_kind: turn_binding.runtime_kind,
+                workspace_id: key.workspace_id.clone(),
+                thread_id: key.thread_id.clone(),
+                turn_id: Some(turn_binding.turn_id),
+                native_thread_id: request.native_thread_id,
+                native_turn_id: request.native_turn_id,
+                native_item_id: request.native_item_id,
+                request_kind: cli_runtime_request_kind_as_str(request_kind).to_owned(),
+                payload_json,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+        {
+            warn!(
+                workspace_id = key.workspace_id.as_str(),
+                runtime_id = key.runtime_id.as_str(),
+                thread_id = key.thread_id.as_str(),
+                native_request_id = request.native_request_id.as_str(),
+                error = %format!("{error:#}"),
+                "failed to open CLI runtime pending request"
+            );
+        }
+    }
+
+    async fn process_bound_cli_runtime_event(
         &self,
         key: &CLIAgentRuntimeSessionKey,
         turn_binding: pioneer_crud::CliRuntimeTurnBindingRecord,
@@ -2072,7 +2467,7 @@ impl MessageProcessor {
                 native_turn_id,
                 event = %event_label,
                 binding_status = turn_binding.status.as_str(),
-                "ignored Codex CLI runtime event for non-active Pioneer turn"
+                "ignored CLI runtime event for non-active Pioneer turn"
             );
             return;
         }
@@ -2098,7 +2493,7 @@ impl MessageProcessor {
         }
     }
 
-    pub(super) async fn flush_cli_runtime_codex_events_for_native_turn(
+    pub(super) async fn flush_cli_runtime_events_for_native_turn(
         &self,
         key: &CLIAgentRuntimeSessionKey,
         native_thread_id: &str,
@@ -2184,14 +2579,18 @@ impl MessageProcessor {
                         native_turn_id,
                         received_at_unix_ms = pending_event.received_at_unix_ms,
                         received_sequence = pending_event.received_sequence,
-                        "flushing buffered Codex CLI runtime event"
+                        "flushing buffered CLI runtime event"
                     );
-                    self.process_bound_cli_runtime_codex_event(
-                        key,
-                        turn_binding.clone(),
-                        pending_event.event,
-                    )
-                    .await;
+                    match pending_event.event {
+                        RuntimeEvent::RequestOpened(request) => {
+                            self.open_bound_cli_runtime_request(key, turn_binding.clone(), request)
+                                .await;
+                        }
+                        event => {
+                            self.process_bound_cli_runtime_event(key, turn_binding.clone(), event)
+                                .await;
+                        }
+                    }
                 }
                 PendingTurnActivity::ServerRequest(pending_request) => {
                     debug!(
@@ -2203,7 +2602,7 @@ impl MessageProcessor {
                         method = pending_request.request.method.as_str(),
                         received_at_unix_ms = pending_request.received_at_unix_ms,
                         received_sequence = pending_request.received_sequence,
-                        "flushing buffered Codex CLI runtime server request"
+                        "flushing buffered CLI runtime server request"
                     );
                     self.handle_cli_runtime_codex_server_request(
                         key,
@@ -2570,7 +2969,7 @@ impl MessageProcessor {
                 native_thread_id = native_thread_id.as_str(),
                 native_turn_id = native_turn_id.as_str(),
                 event_count,
-                "discarded unbound Codex native turn events after TTL"
+                "discarded unbound CLI runtime native turn events after TTL"
             );
         }
     }
@@ -2617,12 +3016,12 @@ impl MessageProcessor {
                 native_thread_id = native_thread_id.as_str(),
                 native_turn_id = native_turn_id.as_str(),
                 request_count,
-                "discarded unbound Codex native turn server requests after TTL"
+                "discarded unbound CLI runtime native turn server requests after TTL"
             );
         }
     }
 
-    async fn buffer_cli_runtime_codex_event_until_turn_binding(
+    async fn buffer_cli_runtime_event_until_turn_binding(
         &self,
         key: &CLIAgentRuntimeSessionKey,
         native_thread_id: &str,
@@ -3200,12 +3599,12 @@ impl MessageProcessor {
         turn_id: &str,
         native_turn_id: &str,
     ) {
-        let item_id = format!("codex_steer_{}", generate_id(16));
+        let item_id = format!("cli_runtime_steer_{}", generate_id(16));
         let item = TurnItem::SystemEvent {
             id: item_id.clone(),
             level: SystemEventLevel::Info,
-            message: "Codex steering accepted".to_owned(),
-            code: Some("codex_turn_steer".to_owned()),
+            message: "CLI runtime steering accepted".to_owned(),
+            code: Some("cli_runtime_turn_steer".to_owned()),
             details: Some(json!({
                 "status": "accepted",
                 "nativeTurnId": native_turn_id,
@@ -3258,7 +3657,7 @@ impl MessageProcessor {
                 return;
             }
         };
-        if binding.workspace_id != workspace_id || binding.runtime_kind != "codex" {
+        if binding.workspace_id != workspace_id {
             return;
         }
         let Some(manager) = self.cli_runtime_manager.as_ref() else {
@@ -3295,6 +3694,15 @@ impl MessageProcessor {
             );
             return;
         };
+        if !handle.session().supports_thread_name_sync() {
+            debug!(
+                workspace_id,
+                thread_id,
+                runtime_id = binding.runtime_id.as_str(),
+                "skipping CLI runtime thread name sync because runtime does not support it"
+            );
+            return;
+        }
         if let Err(error) = handle
             .session()
             .set_thread_name(CLIAgentRuntimeThreadNameSetRequest {
@@ -3980,26 +4388,42 @@ impl MessageProcessor {
         native_response_session: Option<CLIAgentRuntimeSessionHandle>,
     ) -> anyhow::Result<()> {
         let (response, should_interrupt) =
-            match cli_runtime_request_kind_from_stored(request.request_kind.as_str()) {
-                CLIRuntimeRequestKind::CommandApproval => {
-                    let decision = codex_command_approval_decision_from_resolution(resolution)?;
-                    (
-                        codex_command_approval_response(decision.clone()),
-                        decision == CodexCommandApprovalDecision::Cancel,
-                    )
+            match cli_runtime_kind_config_from_stored_kind(request.runtime_kind.as_str()) {
+                Some(GatewayCliAgentRuntimeKindConfig::Claude) => {
+                    claude_permission_response_from_resolution(request, resolution)?
                 }
-                CLIRuntimeRequestKind::FileChangeApproval => {
-                    let decision = codex_file_change_approval_decision_from_resolution(resolution)?;
-                    (
-                        codex_file_change_approval_response(decision.clone()),
-                        decision == CodexFileChangeApprovalDecision::Cancel,
-                    )
+                Some(GatewayCliAgentRuntimeKindConfig::Codex) => {
+                    match cli_runtime_request_kind_from_stored(request.request_kind.as_str()) {
+                        CLIRuntimeRequestKind::CommandApproval => {
+                            let decision =
+                                codex_command_approval_decision_from_resolution(resolution)?;
+                            (
+                                codex_command_approval_response(decision.clone()),
+                                decision == CodexCommandApprovalDecision::Cancel,
+                            )
+                        }
+                        CLIRuntimeRequestKind::FileChangeApproval => {
+                            let decision =
+                                codex_file_change_approval_decision_from_resolution(resolution)?;
+                            (
+                                codex_file_change_approval_response(decision.clone()),
+                                decision == CodexFileChangeApprovalDecision::Cancel,
+                            )
+                        }
+                        CLIRuntimeRequestKind::UserInput => (
+                            codex_user_input_response_from_resolution(request, resolution)?,
+                            false,
+                        ),
+                        CLIRuntimeRequestKind::Other => return Ok(()),
+                    }
                 }
-                CLIRuntimeRequestKind::UserInput => (
-                    codex_user_input_response_from_resolution(request, resolution)?,
-                    false,
-                ),
-                CLIRuntimeRequestKind::Other => return Ok(()),
+                None => {
+                    anyhow::bail!(
+                        "unsupported CLI runtime kind `{}` for request `{}`",
+                        request.runtime_kind,
+                        request.request_id
+                    );
+                }
             };
         let native_request_id = cli_runtime_native_request_id_json_from_record(request)?;
         let Some(handle) = native_response_session else {
@@ -4254,6 +4678,12 @@ impl MessageProcessor {
                         .await;
                 apply_codex_account_probe_to_summary(summary, probe)
             }
+            GatewayCliAgentRuntimeKindConfig::Claude => {
+                let probe =
+                    ClaudeProbe::account_read(claude_account_probe_config_from_instance(&instance))
+                        .await;
+                apply_claude_account_probe_to_summary(summary, probe)
+            }
         }
     }
 
@@ -4491,10 +4921,34 @@ fn normalize_cli_runtime_optional_field(
 fn cli_runtime_summaries_from_instances(
     instances: Vec<EffectiveGatewayCliAgentRuntimeInstanceConfig>,
 ) -> Vec<RuntimeSummary> {
-    instances
+    let mut summaries = instances
         .into_iter()
         .map(cli_runtime_summary_from_instance)
-        .collect()
+        .collect::<Vec<_>>();
+    sort_cli_runtime_summary_display_order(summaries.as_mut_slice());
+    summaries
+}
+
+fn sort_cli_runtime_summary_display_order(summaries: &mut [RuntimeSummary]) {
+    summaries.sort_by(|left, right| {
+        let left_order = cli_runtime_default_display_order(left.runtime_id.as_str());
+        let right_order = cli_runtime_default_display_order(right.runtime_id.as_str());
+        left_order.cmp(&right_order).then_with(|| {
+            if left_order == usize::MAX {
+                std::cmp::Ordering::Equal
+            } else {
+                left.runtime_id.cmp(&right.runtime_id)
+            }
+        })
+    });
+}
+
+fn cli_runtime_default_display_order(runtime_id: &str) -> usize {
+    match runtime_id {
+        "codex" => 0,
+        "claude" => 1,
+        _ => usize::MAX,
+    }
 }
 
 fn cli_runtime_summary_from_instance(
@@ -4539,6 +4993,28 @@ fn cli_runtime_summary_from_instance(
 fn cli_runtime_kind_from_config(kind: GatewayCliAgentRuntimeKindConfig) -> CLIAgentRuntimeKind {
     match kind {
         GatewayCliAgentRuntimeKindConfig::Codex => CLIAgentRuntimeKind::Codex,
+        GatewayCliAgentRuntimeKindConfig::Claude => CLIAgentRuntimeKind::Claude,
+    }
+}
+
+fn cli_runtime_protocol_kind_label(kind: CLIAgentRuntimeKind) -> &'static str {
+    match kind {
+        CLIAgentRuntimeKind::Codex => "codex",
+        CLIAgentRuntimeKind::Claude => "claude",
+    }
+}
+
+fn cli_runtime_capabilities_for_stored_kind(kind: &str) -> Option<RuntimeCapabilities> {
+    cli_runtime_kind_config_from_stored_kind(kind).map(cli_runtime_capabilities_for_kind)
+}
+
+fn cli_runtime_kind_config_from_stored_kind(
+    kind: &str,
+) -> Option<GatewayCliAgentRuntimeKindConfig> {
+    match kind {
+        "codex" => Some(GatewayCliAgentRuntimeKindConfig::Codex),
+        "claude" => Some(GatewayCliAgentRuntimeKindConfig::Claude),
+        _ => None,
     }
 }
 
@@ -4567,7 +5043,69 @@ fn cli_runtime_capabilities_for_kind(
             supports_auth_management: true,
             supports_generated_schema_probe: true,
         },
+        GatewayCliAgentRuntimeKindConfig::Claude => RuntimeCapabilities {
+            supports_threads: true,
+            supports_resume: false,
+            supports_fork: false,
+            supports_steer: false,
+            supports_interrupt: true,
+            supports_approvals: true,
+            supports_file_change_approvals: true,
+            supports_command_approvals: true,
+            supports_user_input_requests: false,
+            supports_model_list: true,
+            supports_apps: false,
+            supports_review: false,
+            supports_compaction: false,
+            supports_goal: false,
+            supports_diff_updates: false,
+            supports_history_read: true,
+            supports_thread_archive: false,
+            supports_auth_management: false,
+            supports_generated_schema_probe: false,
+        },
     }
+}
+
+fn apply_claude_account_probe_to_summary(
+    mut summary: RuntimeSummary,
+    probe: ClaudeAccountProbeSnapshot,
+) -> RuntimeSummary {
+    summary.status = match probe.status {
+        ClaudeAccountProbeStatus::Ready => RuntimeStatus::Ready,
+        ClaudeAccountProbeStatus::NeedsAuth => RuntimeStatus::NeedsAuth,
+        ClaudeAccountProbeStatus::MissingBinary => RuntimeStatus::MissingBinary {
+            binary_path: summary.binary_path.clone(),
+        },
+        ClaudeAccountProbeStatus::SpawnFailed => RuntimeStatus::SpawnFailed {
+            message: probe
+                .message
+                .clone()
+                .unwrap_or_else(|| "failed to spawn Claude CLI".to_owned()),
+        },
+        ClaudeAccountProbeStatus::UnsupportedVersion => RuntimeStatus::UnsupportedVersion {
+            version: probe.version.clone(),
+            minimum_version: Some("2.0.0".to_owned()),
+        },
+        ClaudeAccountProbeStatus::Error => RuntimeStatus::Error {
+            message: probe
+                .message
+                .clone()
+                .unwrap_or_else(|| "Claude CLI probe failed".to_owned()),
+        },
+    };
+    summary.version = probe.version.clone();
+    summary.account = probe
+        .account
+        .as_ref()
+        .map(runtime_account_from_claude_account);
+    summary.diagnostics = probe
+        .diagnostics
+        .iter()
+        .map(runtime_diagnostic_from_claude_probe)
+        .collect();
+    summary.recent_stderr = sanitize_runtime_diagnostic_lines(probe.stderr);
+    summary
 }
 
 fn apply_codex_account_probe_to_summary(
@@ -4635,12 +5173,35 @@ fn runtime_account_from_codex_account(account: &CodexAccountSnapshot) -> Runtime
     }
 }
 
+fn runtime_account_from_claude_account(account: &ClaudeAccountSnapshot) -> RuntimeAccountSnapshot {
+    RuntimeAccountSnapshot {
+        authenticated: account.authenticated,
+        account_id: None,
+        email: account.email.clone(),
+        display_name: None,
+        plan: account.plan.clone(),
+        auth_method: None,
+    }
+}
+
 fn runtime_diagnostic_from_codex_probe(diagnostic: &CodexProbeDiagnostic) -> RuntimeDiagnostic {
     RuntimeDiagnostic {
         level: match diagnostic.level {
             CodexProbeDiagnosticLevel::Info => RuntimeDiagnosticLevel::Info,
             CodexProbeDiagnosticLevel::Warning => RuntimeDiagnosticLevel::Warning,
             CodexProbeDiagnosticLevel::Error => RuntimeDiagnosticLevel::Error,
+        },
+        code: sanitize_runtime_diagnostic_line(diagnostic.code.as_str()),
+        message: sanitize_runtime_diagnostic_line(diagnostic.message.as_str()),
+    }
+}
+
+fn runtime_diagnostic_from_claude_probe(diagnostic: &ClaudeProbeDiagnostic) -> RuntimeDiagnostic {
+    RuntimeDiagnostic {
+        level: match diagnostic.level {
+            ClaudeProbeDiagnosticLevel::Info => RuntimeDiagnosticLevel::Info,
+            ClaudeProbeDiagnosticLevel::Warning => RuntimeDiagnosticLevel::Warning,
+            ClaudeProbeDiagnosticLevel::Error => RuntimeDiagnosticLevel::Error,
         },
         code: sanitize_runtime_diagnostic_line(diagnostic.code.as_str()),
         message: sanitize_runtime_diagnostic_line(diagnostic.message.as_str()),
@@ -4710,7 +5271,42 @@ fn runtime_model_list_from_codex_probe(
     }
 }
 
+fn runtime_model_list_from_claude_probe(probe: ClaudeModelListSnapshot) -> RuntimeModelListResult {
+    let diagnostics = probe
+        .diagnostics
+        .iter()
+        .map(runtime_diagnostic_from_claude_probe)
+        .collect::<Vec<_>>();
+    RuntimeModelListResult {
+        models: probe
+            .models
+            .into_iter()
+            .map(runtime_model_from_claude_model)
+            .collect(),
+        diagnostics,
+        error_message: probe.error_message,
+    }
+}
+
 fn runtime_model_from_codex_model(model: CodexModelSnapshot) -> RuntimeModelInfo {
+    RuntimeModelInfo {
+        id: model.id,
+        name: model.name,
+        description: model.description,
+        family: model.family,
+        is_custom: false,
+        active: model.active,
+        effort_options: model.effort_options,
+        input_modalities: model.input_modalities,
+        output_modalities: model.output_modalities,
+        supports_reasoning: model.supports_reasoning,
+        supports_vision: model.supports_vision,
+        max_input_tokens: model.max_input_tokens,
+        max_output_tokens: model.max_output_tokens,
+    }
+}
+
+fn runtime_model_from_claude_model(model: ClaudeModelSnapshot) -> RuntimeModelInfo {
     RuntimeModelInfo {
         id: model.id,
         name: model.name,
@@ -4746,7 +5342,7 @@ fn runtime_models_with_custom_models(
             id: model_id.to_owned(),
             name: Some(model_id.to_owned()),
             description: Some(
-                "Configured custom Codex model; capability metadata was not reported by app-server"
+                "Configured custom CLI runtime model; capability metadata was not reported by the runtime"
                     .to_owned(),
             ),
             family: None,
@@ -4873,6 +5469,61 @@ fn cli_runtime_command_approval_pending_request(
             "itemId": request.native_item_id,
             "raw": request.raw,
         })),
+    }
+}
+
+fn cli_runtime_pending_request_from_runtime_event(
+    request: &pioneer_cli_agent_runtime::event::RuntimeRequestOpened,
+    kind: CLIRuntimeRequestKind,
+) -> CLIRuntimePendingRequest {
+    let payload = request
+        .payload_redacted
+        .clone()
+        .unwrap_or_else(|| json!({}));
+    let title = payload
+        .get("title")
+        .and_then(JsonValue::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            payload
+                .get("displayName")
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            payload
+                .get("command")
+                .and_then(JsonValue::as_str)
+                .map(|command| format!("Run `{command}`"))
+        })
+        .or_else(|| match kind {
+            CLIRuntimeRequestKind::FileChangeApproval => Some("Review file changes".to_owned()),
+            CLIRuntimeRequestKind::CommandApproval => Some("Approve command".to_owned()),
+            CLIRuntimeRequestKind::UserInput => Some("User input required".to_owned()),
+            CLIRuntimeRequestKind::Other => None,
+        });
+    let message = payload
+        .get("description")
+        .and_then(JsonValue::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            payload
+                .get("reason")
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            payload
+                .get("command")
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned)
+        });
+    CLIRuntimePendingRequest {
+        kind,
+        title,
+        message,
+        native_request_id: Some(request.native_request_id.clone()),
+        payload: Some(payload),
     }
 }
 
@@ -5042,6 +5693,21 @@ fn validate_cli_runtime_native_request_resolution(
     record: &CliRuntimePendingRequestRecord,
     resolution: &CLIRuntimeRequestResolution,
 ) -> anyhow::Result<()> {
+    match cli_runtime_kind_config_from_stored_kind(record.runtime_kind.as_str()) {
+        Some(GatewayCliAgentRuntimeKindConfig::Claude) => {
+            let _ = claude_permission_response_from_resolution(record, resolution)?;
+            return Ok(());
+        }
+        Some(GatewayCliAgentRuntimeKindConfig::Codex) => {}
+        None => {
+            anyhow::bail!(
+                "unsupported CLI runtime kind `{}` for request `{}`",
+                record.runtime_kind,
+                record.request_id
+            );
+        }
+    }
+
     match cli_runtime_request_kind_from_stored(record.request_kind.as_str()) {
         CLIRuntimeRequestKind::CommandApproval => {
             let _ = codex_command_approval_decision_from_resolution(resolution)?;
@@ -5178,6 +5844,48 @@ fn codex_file_change_approval_decision_from_resolution(
             })
         }
     }
+}
+
+fn claude_permission_response_from_resolution(
+    request: &CliRuntimePendingRequestRecord,
+    resolution: &CLIRuntimeRequestResolution,
+) -> anyhow::Result<(JsonValue, bool)> {
+    let payload = cli_runtime_pending_request_from_record(request)
+        .payload
+        .unwrap_or(JsonValue::Null);
+    let original_input = payload.get("input").cloned().unwrap_or(JsonValue::Null);
+    let response = match resolution {
+        CLIRuntimeRequestResolution::Approved | CLIRuntimeRequestResolution::Answered { .. } => {
+            json!({
+                "behavior": "allow",
+                "updatedInput": original_input,
+            })
+        }
+        CLIRuntimeRequestResolution::Denied { reason } => {
+            json!({
+                "behavior": "deny",
+                "message": reason.clone().unwrap_or_else(|| "Denied by user".to_owned()),
+            })
+        }
+        CLIRuntimeRequestResolution::Cancelled | CLIRuntimeRequestResolution::Expired => {
+            json!({
+                "behavior": "deny",
+                "message": "Cancelled",
+                "interrupt": true,
+            })
+        }
+        CLIRuntimeRequestResolution::Error { message } => {
+            json!({
+                "behavior": "deny",
+                "message": message.clone(),
+            })
+        }
+    };
+    let should_interrupt = matches!(
+        resolution,
+        CLIRuntimeRequestResolution::Cancelled | CLIRuntimeRequestResolution::Expired
+    );
+    Ok((response, should_interrupt))
 }
 
 fn codex_file_change_approval_decision_from_value(
@@ -5430,12 +6138,24 @@ fn cli_runtime_native_turn_id_for_event(event: &RuntimeEvent) -> Option<&str> {
         RuntimeEvent::ReviewModeChanged(event) => event.native_turn_id.as_deref(),
         RuntimeEvent::Error(event) => event.native_turn_id.as_deref(),
         RuntimeEvent::Raw(event) => event.native_turn_id.as_deref(),
+        RuntimeEvent::RequestOpened(event) => event.native_turn_id.as_deref(),
         RuntimeEvent::SessionStateChanged(_)
         | RuntimeEvent::ThreadStateChanged(_)
-        | RuntimeEvent::RequestOpened(_)
         | RuntimeEvent::RequestResolved(_)
         | RuntimeEvent::AccountUpdated(_)
         | RuntimeEvent::AppListUpdated(_) => None,
+    }
+}
+
+fn cli_runtime_native_item_id_for_event(event: &RuntimeEvent) -> Option<&str> {
+    match event {
+        RuntimeEvent::ItemStarted(event) => Some(event.native_item_id.as_str()),
+        RuntimeEvent::ItemDelta(event) => Some(event.native_item_id.as_str()),
+        RuntimeEvent::ItemCompleted(event) => Some(event.native_item_id.as_str()),
+        RuntimeEvent::ItemUpdated(event) => Some(event.native_item_id.as_str()),
+        RuntimeEvent::RequestOpened(event) => event.native_item_id.as_deref(),
+        RuntimeEvent::Raw(event) => event.native_item_id.as_deref(),
+        _ => None,
     }
 }
 
@@ -5585,6 +6305,47 @@ mod tests {
         assert_eq!(summaries[0].diagnostics[0].code, "cli_runtime.unprobed");
         assert!(summaries[0].capabilities.supports_threads);
         assert!(summaries[0].capabilities.supports_model_list);
+    }
+
+    #[test]
+    fn cli_runtime_catalog_uses_product_display_order() {
+        let mut claude = effective_instance("claude", true);
+        claude.kind = GatewayCliAgentRuntimeKindConfig::Claude;
+        claude.display_name = "Claude CLI".to_owned();
+
+        let summaries = cli_runtime_summaries_from_instances(vec![
+            effective_instance("custom_b", true),
+            claude,
+            effective_instance("codex", true),
+            effective_instance("custom_a", true),
+        ]);
+
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|summary| summary.runtime_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["codex", "claude", "custom_b", "custom_a"]
+        );
+    }
+
+    #[test]
+    fn cli_runtime_capability_matrix_matches_runtime_contracts() {
+        let codex = cli_runtime_capabilities_for_kind(GatewayCliAgentRuntimeKindConfig::Codex);
+        assert!(codex.supports_resume);
+        assert!(codex.supports_fork);
+        assert!(codex.supports_steer);
+        assert!(codex.supports_auth_management);
+
+        let claude = cli_runtime_capabilities_for_kind(GatewayCliAgentRuntimeKindConfig::Claude);
+        assert!(claude.supports_threads);
+        assert!(claude.supports_model_list);
+        assert!(claude.supports_interrupt);
+        assert!(claude.supports_approvals);
+        assert!(!claude.supports_resume);
+        assert!(!claude.supports_fork);
+        assert!(!claude.supports_steer);
+        assert!(!claude.supports_auth_management);
     }
 
     #[test]

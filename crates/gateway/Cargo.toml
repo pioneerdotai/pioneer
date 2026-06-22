@@ -12,6 +12,7 @@ computer-use = ["pioneer-tools/computer-use"]
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+base64.workspace = true
 pioneer-agent.workspace = true
 pioneer-artifacts.workspace = true
 pioneer-cli-agent-runtime.workspace = true
@@ -47,6 +48,7 @@ reqwest.workspace = true
 markdown.workspace = true
 chrono.workspace = true
 schemars.workspace = true
+mime_guess.workspace = true
 sea-orm = { workspace = true, features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
 tiktoken-rs.workspace = true
 flate2.workspace = true

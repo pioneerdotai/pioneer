@@ -11,8 +11,9 @@ use gpui_component::{
     *,
 };
 use pioneer_client::providers::cli_runtime_settings::{
-    CLIRuntimeProviderDraft, CLIRuntimeProviderDraftField, CLIRuntimeProviderDraftMode,
-    CLIRuntimeProviderSettingsRejection, cli_runtime_provider_settings_rejection_message,
+    self as cli_provider_settings, CLIRuntimeProviderDraft, CLIRuntimeProviderDraftField,
+    CLIRuntimeProviderDraftMode, CLIRuntimeProviderSettingsRejection,
+    cli_runtime_provider_settings_rejection_message,
 };
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -198,26 +199,36 @@ impl PioneerDesktop {
             state
         });
         let display_name_input_state = cx.new(|cx| {
-            let mut state = InputState::new(window, cx)
-                .placeholder(t!("providers.cli.dialog.display_name_placeholder").to_string());
+            let mut state = InputState::new(window, cx).placeholder(
+                cli_provider_settings::cli_runtime_provider_default_display_name(draft.kind)
+                    .to_owned(),
+            );
             state.set_value(draft.display_name.clone(), window, cx);
             state
         });
         let binary_input_state = cx.new(|cx| {
-            let mut state = InputState::new(window, cx)
-                .placeholder(t!("providers.cli.dialog.binary_placeholder").to_string());
+            let mut state = InputState::new(window, cx).placeholder(
+                cli_provider_settings::cli_runtime_provider_default_binary_path(draft.kind)
+                    .to_owned(),
+            );
             state.set_value(draft.binary_path.clone(), window, cx);
             state
         });
         let home_input_state = cx.new(|cx| {
-            let mut state = InputState::new(window, cx)
-                .placeholder(t!("providers.cli.dialog.home_placeholder").to_string());
+            let mut state = InputState::new(window, cx).placeholder(
+                cli_provider_settings::cli_runtime_provider_default_home_path(draft.kind)
+                    .to_owned(),
+            );
             state.set_value(draft.home_path.clone(), window, cx);
             state
         });
         let shadow_home_input_state = cx.new(|cx| {
-            let mut state = InputState::new(window, cx)
-                .placeholder(t!("providers.cli.dialog.shadow_home_placeholder").to_string());
+            let mut state = InputState::new(window, cx).placeholder(
+                cli_provider_settings::cli_runtime_provider_default_shadow_home_placeholder(
+                    draft.kind,
+                )
+                .to_owned(),
+            );
             state.set_value(draft.shadow_home_path.clone(), window, cx);
             state
         });

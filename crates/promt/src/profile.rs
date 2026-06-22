@@ -7,5 +7,6 @@ pub enum PromptProfile {
     AssistantFull,
     AssistantMinimal,
     AssistantNone,
-    CliRuntimeCodex,
+    #[serde(alias = "cli_runtime_codex")]
+    CliRuntime,
 }

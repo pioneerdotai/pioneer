@@ -184,21 +184,6 @@ impl TimeoutSupervisor {
         }
     }
 
-    pub fn deadlines_for(
-        &self,
-        item_type: TurnItemType,
-        started_at_unix: i64,
-    ) -> TurnItemAttemptDeadlines {
-        let policy = self.policy_registry.policy_for(item_type);
-        let (lease_expires_at, idle_deadline_at, hard_deadline_at) =
-            policy.deadlines(started_at_unix);
-        TurnItemAttemptDeadlines {
-            lease_expires_at_unix: Some(lease_expires_at),
-            idle_deadline_at_unix: Some(idle_deadline_at),
-            hard_deadline_at_unix: Some(hard_deadline_at),
-        }
-    }
-
     pub fn deadlines_for_item(
         &self,
         item: &TurnItem,
@@ -221,7 +206,14 @@ impl TimeoutSupervisor {
             .await?;
         let mut backfilled = 0usize;
         for candidate in candidates {
-            let deadlines = self.deadlines_for(candidate.item_type, candidate.started_at_unix);
+            let deadlines = self
+                .deadlines_for_stored_item(
+                    candidate.turn_id.as_str(),
+                    candidate.item_id.as_str(),
+                    candidate.item_type,
+                    candidate.started_at_unix,
+                )
+                .await?;
             let configured = self
                 .crud_store
                 .configure_turn_item_attempt_deadlines(
@@ -247,16 +239,17 @@ impl TimeoutSupervisor {
         item_type: TurnItemType,
         now_unix: i64,
     ) -> Result<()> {
-        let policy = self.policy_registry.policy_for(item_type);
-        let (lease_expires_at, idle_deadline_at, _) = policy.deadlines(now_unix);
+        let deadlines = self
+            .deadlines_for_stored_item(turn_id, item_id, item_type, now_unix)
+            .await?;
         let _ = self
             .crud_store
             .heartbeat_turn_item_attempt(
                 turn_id,
                 item_id,
                 now_unix,
-                Some(lease_expires_at),
-                Some(idle_deadline_at),
+                deadlines.lease_expires_at_unix,
+                deadlines.idle_deadline_at_unix,
             )
             .await?;
         Ok(())
@@ -293,7 +286,14 @@ impl TimeoutSupervisor {
             .await?;
         let mut renewed = 0usize;
         for attempt in attempts {
-            let deadlines = self.deadlines_for(attempt.item_type, now_unix);
+            let deadlines = self
+                .deadlines_for_stored_item(
+                    attempt.turn_id.as_str(),
+                    attempt.item_id.as_str(),
+                    attempt.item_type,
+                    now_unix,
+                )
+                .await?;
             if self
                 .crud_store
                 .configure_turn_item_attempt_deadlines(
@@ -310,6 +310,26 @@ impl TimeoutSupervisor {
             }
         }
         Ok(renewed)
+    }
+
+    async fn deadlines_for_stored_item(
+        &self,
+        turn_id: &str,
+        item_id: &str,
+        fallback_item_type: TurnItemType,
+        started_at_unix: i64,
+    ) -> Result<TurnItemAttemptDeadlines> {
+        let policy = match self.crud_store.get_turn_item(turn_id, item_id).await? {
+            Some(item) => self.policy_registry.policy_for_item(&item),
+            None => self.policy_registry.policy_for(fallback_item_type),
+        };
+        let (lease_expires_at, idle_deadline_at, hard_deadline_at) =
+            policy.deadlines(started_at_unix);
+        Ok(TurnItemAttemptDeadlines {
+            lease_expires_at_unix: Some(lease_expires_at),
+            idle_deadline_at_unix: Some(idle_deadline_at),
+            hard_deadline_at_unix: Some(hard_deadline_at),
+        })
     }
 }
 

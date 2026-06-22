@@ -29,6 +29,7 @@ pub enum CLIRuntimeProviderDraftField {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct CLIRuntimeProviderDraft {
     pub mode: CLIRuntimeProviderDraftMode,
+    pub kind: CLIAgentRuntimeKind,
     pub id: String,
     pub display_name: String,
     pub enabled: bool,
@@ -60,15 +61,20 @@ pub enum CLIRuntimeProviderSettingsPlan {
 }
 
 impl CLIRuntimeProviderDraft {
-    pub fn create(current: Option<&GatewaySettingsSnapshot>) -> Self {
-        let id = next_available_cli_runtime_id(current, "codex");
+    pub fn create_for_kind(
+        current: Option<&GatewaySettingsSnapshot>,
+        kind: CLIAgentRuntimeKind,
+    ) -> Self {
+        let defaults = cli_runtime_provider_kind_defaults(kind);
+        let id = next_available_cli_runtime_id(current, defaults.id_base);
         Self {
             mode: CLIRuntimeProviderDraftMode::Create,
-            display_name: next_available_cli_runtime_display_name(current, "Codex CLI"),
+            kind,
+            display_name: next_available_cli_runtime_display_name(current, defaults.display_name),
             id,
             enabled: true,
-            binary_path: "codex".to_owned(),
-            home_path: "~/.codex".to_owned(),
+            binary_path: defaults.binary_path.to_owned(),
+            home_path: defaults.home_path.to_owned(),
             shadow_home_path: String::new(),
         }
     }
@@ -78,6 +84,7 @@ impl CLIRuntimeProviderDraft {
             mode: CLIRuntimeProviderDraftMode::Edit {
                 original_id: instance.id.clone(),
             },
+            kind: instance.kind,
             id: instance.id.clone(),
             display_name: instance.display_name.clone(),
             enabled: instance.enabled,
@@ -96,6 +103,7 @@ impl CLIRuntimeProviderDraft {
             mode: CLIRuntimeProviderDraftMode::Duplicate {
                 source_id: instance.id.clone(),
             },
+            kind: instance.kind,
             id,
             display_name: next_available_cli_runtime_display_name(
                 current,
@@ -150,13 +158,6 @@ pub fn plan_cli_runtime_provider_enabled_update(
     let mut instances = current.cli_runtimes.instances.clone();
     for instance in &mut instances {
         if instance.id == runtime_id {
-            if instance.kind != CLIAgentRuntimeKind::Codex {
-                return CLIRuntimeProviderSettingsPlan::Reject(
-                    CLIRuntimeProviderSettingsRejection::UnsupportedKind {
-                        kind: instance.kind,
-                    },
-                );
-            }
             instance.enabled = enabled;
             found = true;
             break;
@@ -214,7 +215,7 @@ pub fn cli_runtime_provider_settings_rejection_message(
             "Shadow home must differ from home".to_owned()
         }
         CLIRuntimeProviderSettingsRejection::UnsupportedKind { kind } => {
-            format!("CLI provider kind `{kind:?}` is not editable here yet")
+            format!("CLI provider kind cannot be changed from `{kind:?}` while editing")
         }
     }
 }
@@ -239,7 +240,7 @@ fn cli_runtime_provider_instances_with_draft(
                     runtime_id: original_id.clone(),
                 });
             };
-            if instances[index].kind != CLIAgentRuntimeKind::Codex {
+            if instances[index].kind != replacement.kind {
                 return Err(CLIRuntimeProviderSettingsRejection::UnsupportedKind {
                     kind: instances[index].kind,
                 });
@@ -291,7 +292,7 @@ fn cli_runtime_provider_instance_from_draft(
 
     Ok(GatewayCliRuntimeInstanceSettings {
         id,
-        kind: CLIAgentRuntimeKind::Codex,
+        kind: draft.kind,
         display_name,
         enabled: draft.enabled,
         binary_path,
@@ -448,7 +449,7 @@ fn is_disallowed_settings_text_char(ch: char) -> bool {
 
 fn next_available_cli_runtime_id(current: Option<&GatewaySettingsSnapshot>, base: &str) -> String {
     let normalized_base =
-        normalize_cli_runtime_provider_id(base).unwrap_or_else(|_| "codex".to_owned());
+        normalize_cli_runtime_provider_id(base).unwrap_or_else(|_| "cli_runtime".to_owned());
     let Some(current) = current else {
         return normalized_base;
     };
@@ -479,7 +480,7 @@ fn next_available_cli_runtime_display_name(
     base: &str,
 ) -> String {
     let base = base.trim();
-    let base = if base.is_empty() { "Codex CLI" } else { base };
+    let base = if base.is_empty() { "CLI Runtime" } else { base };
     let Some(current) = current else {
         return base.to_owned();
     };
@@ -499,6 +500,62 @@ fn next_available_cli_runtime_display_name(
         }
     }
     format!("{} {}", base, current.cli_runtimes.instances.len() + 1)
+}
+
+#[derive(Clone, Copy)]
+struct CLIRuntimeProviderKindDefaults {
+    id_base: &'static str,
+    kind_label: &'static str,
+    display_name: &'static str,
+    binary_path: &'static str,
+    home_path: &'static str,
+    shadow_home_placeholder: &'static str,
+}
+
+pub fn cli_runtime_provider_default_display_name(kind: CLIAgentRuntimeKind) -> &'static str {
+    cli_runtime_provider_kind_defaults(kind).display_name
+}
+
+pub fn cli_runtime_provider_default_binary_path(kind: CLIAgentRuntimeKind) -> &'static str {
+    cli_runtime_provider_kind_defaults(kind).binary_path
+}
+
+pub fn cli_runtime_provider_default_home_path(kind: CLIAgentRuntimeKind) -> &'static str {
+    cli_runtime_provider_kind_defaults(kind).home_path
+}
+
+pub fn cli_runtime_provider_kind_label(kind: CLIAgentRuntimeKind) -> &'static str {
+    cli_runtime_provider_kind_defaults(kind).kind_label
+}
+
+pub fn cli_runtime_provider_default_shadow_home_placeholder(
+    kind: CLIAgentRuntimeKind,
+) -> &'static str {
+    cli_runtime_provider_kind_defaults(kind).shadow_home_placeholder
+}
+
+pub const CLI_RUNTIME_PROVIDER_SUPPORTED_KINDS: [CLIAgentRuntimeKind; 2] =
+    [CLIAgentRuntimeKind::Codex, CLIAgentRuntimeKind::Claude];
+
+fn cli_runtime_provider_kind_defaults(kind: CLIAgentRuntimeKind) -> CLIRuntimeProviderKindDefaults {
+    match kind {
+        CLIAgentRuntimeKind::Codex => CLIRuntimeProviderKindDefaults {
+            id_base: "codex",
+            kind_label: "Codex",
+            display_name: "Codex CLI",
+            binary_path: "codex",
+            home_path: "~/.codex",
+            shadow_home_placeholder: "~/.pioneer/codex-work",
+        },
+        CLIAgentRuntimeKind::Claude => CLIRuntimeProviderKindDefaults {
+            id_base: "claude",
+            kind_label: "Claude",
+            display_name: "Claude CLI",
+            binary_path: "claude",
+            home_path: "~/.claude",
+            shadow_home_placeholder: "~/.pioneer/claude-work",
+        },
+    }
 }
 
 fn cli_runtime_display_name_from_id(id: &str) -> String {
@@ -546,9 +603,24 @@ mod tests {
     }
 
     #[test]
+    fn create_draft_for_kind_uses_runtime_specific_defaults() {
+        let current = snapshot(vec![codex_instance("codex", "Codex CLI")]);
+        let draft =
+            CLIRuntimeProviderDraft::create_for_kind(Some(&current), CLIAgentRuntimeKind::Claude);
+
+        assert_eq!(draft.kind, CLIAgentRuntimeKind::Claude);
+        assert_eq!(draft.id, "claude");
+        assert_eq!(draft.display_name, "Claude CLI");
+        assert_eq!(draft.binary_path, "claude");
+        assert_eq!(draft.home_path, "~/.claude");
+        assert!(draft.shadow_home_path.is_empty());
+    }
+
+    #[test]
     fn create_draft_plan_builds_gateway_settings_update() {
         let current = snapshot(vec![codex_instance("codex", "Codex CLI")]);
-        let mut draft = CLIRuntimeProviderDraft::create(Some(&current));
+        let mut draft =
+            CLIRuntimeProviderDraft::create_for_kind(Some(&current), CLIAgentRuntimeKind::Codex);
         assert_eq!(draft.id, "codex_2");
         assert_eq!(draft.display_name, "Codex CLI 2");
         draft.display_name = "Codex Work".to_owned();
@@ -610,7 +682,8 @@ mod tests {
     #[test]
     fn draft_plan_rejects_duplicate_id_display_name_and_invalid_paths() {
         let current = snapshot(vec![codex_instance("codex", "Codex CLI")]);
-        let mut draft = CLIRuntimeProviderDraft::create(Some(&current));
+        let mut draft =
+            CLIRuntimeProviderDraft::create_for_kind(Some(&current), CLIAgentRuntimeKind::Codex);
         draft.id = "codex".to_owned();
         assert!(matches!(
             plan_cli_runtime_provider_draft_update(Some(&current), &draft),

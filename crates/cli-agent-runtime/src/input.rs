@@ -3,12 +3,12 @@ use std::error::Error;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CodexInputMappingRequest {
-    pub inputs: Vec<CodexInputSource>,
+pub struct CLIRuntimeInputMappingRequest {
+    pub inputs: Vec<CLIRuntimeInputSource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CodexInputSource {
+pub enum CLIRuntimeInputSource {
     Text {
         text: String,
     },
@@ -19,7 +19,7 @@ pub enum CodexInputSource {
         path: String,
     },
     FileReference {
-        location: CodexFileReferenceLocation,
+        location: CLIRuntimeFileReferenceLocation,
         name: Option<String>,
         mime_type: Option<String>,
         size_bytes: Option<u64>,
@@ -28,30 +28,30 @@ pub enum CodexInputSource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CodexFileReferenceLocation {
+pub enum CLIRuntimeFileReferenceLocation {
     Path(String),
     Url(String),
     Reference(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CodexTurnInputMapping {
-    pub input: Vec<CodexTurnInputItem>,
+pub struct CLIRuntimeTurnInputMapping {
+    pub input: Vec<CLIRuntimeTurnInputItem>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub diagnostics: Vec<CodexInputMappingDiagnostic>,
+    pub diagnostics: Vec<CLIRuntimeInputMappingDiagnostic>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "camelCase")]
-pub enum CodexTurnInputItem {
+pub enum CLIRuntimeTurnInputItem {
     Text { text: String },
     Image { url: String },
     LocalImage { path: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CodexInputMappingDiagnostic {
-    pub level: CodexInputMappingDiagnosticLevel,
+pub struct CLIRuntimeInputMappingDiagnostic {
+    pub level: CLIRuntimeInputMappingDiagnosticLevel,
     pub code: String,
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -60,88 +60,102 @@ pub struct CodexInputMappingDiagnostic {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum CodexInputMappingDiagnosticLevel {
+pub enum CLIRuntimeInputMappingDiagnosticLevel {
     Info,
     Error,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CodexInputMappingError {
-    diagnostics: Vec<CodexInputMappingDiagnostic>,
+pub struct CLIRuntimeInputMappingError {
+    diagnostics: Vec<CLIRuntimeInputMappingDiagnostic>,
 }
 
-impl CodexInputMappingError {
-    pub fn diagnostics(&self) -> &[CodexInputMappingDiagnostic] {
+impl CLIRuntimeInputMappingError {
+    pub fn diagnostics(&self) -> &[CLIRuntimeInputMappingDiagnostic] {
         self.diagnostics.as_slice()
     }
 }
 
-impl fmt::Display for CodexInputMappingError {
+impl fmt::Display for CLIRuntimeInputMappingError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let messages = self
             .diagnostics
             .iter()
-            .filter(|diagnostic| diagnostic.level == CodexInputMappingDiagnosticLevel::Error)
+            .filter(|diagnostic| diagnostic.level == CLIRuntimeInputMappingDiagnosticLevel::Error)
             .map(|diagnostic| diagnostic.message.as_str())
             .collect::<Vec<_>>();
         if messages.is_empty() {
-            formatter.write_str("Codex input mapping failed")
+            formatter.write_str("CLI runtime input mapping failed")
         } else {
             write!(
                 formatter,
-                "Codex input mapping failed: {}",
+                "CLI runtime input mapping failed: {}",
                 messages.join("; ")
             )
         }
     }
 }
 
-impl Error for CodexInputMappingError {}
+impl Error for CLIRuntimeInputMappingError {}
 
-pub fn map_codex_turn_input(
-    request: CodexInputMappingRequest,
-) -> Result<CodexTurnInputMapping, CodexInputMappingError> {
+pub fn map_cli_runtime_turn_input(
+    request: CLIRuntimeInputMappingRequest,
+) -> Result<CLIRuntimeTurnInputMapping, CLIRuntimeInputMappingError> {
+    map_cli_runtime_turn_input_for_runtime(request, "CLI runtime")
+}
+
+pub fn map_cli_runtime_turn_input_for_runtime(
+    request: CLIRuntimeInputMappingRequest,
+    runtime_label: &str,
+) -> Result<CLIRuntimeTurnInputMapping, CLIRuntimeInputMappingError> {
     let mut input = Vec::with_capacity(request.inputs.len());
     let mut diagnostics = Vec::new();
+    let runtime_label = normalized(runtime_label).unwrap_or("CLI runtime");
 
     for (input_index, item) in request.inputs.into_iter().enumerate() {
         match item {
-            CodexInputSource::Text { text } => {
-                input.push(CodexTurnInputItem::Text { text });
+            CLIRuntimeInputSource::Text { text } => {
+                input.push(CLIRuntimeTurnInputItem::Text { text });
             }
-            CodexInputSource::ImageUrl { url } => {
-                input.push(CodexTurnInputItem::Image { url });
-                diagnostics.push(CodexInputMappingDiagnostic {
-                    level: CodexInputMappingDiagnosticLevel::Info,
-                    code: "codex_input.image_url_mapped".to_owned(),
-                    message: "Mapped image URL input to native Codex image input.".to_owned(),
+            CLIRuntimeInputSource::ImageUrl { url } => {
+                input.push(CLIRuntimeTurnInputItem::Image { url });
+                diagnostics.push(CLIRuntimeInputMappingDiagnostic {
+                    level: CLIRuntimeInputMappingDiagnosticLevel::Info,
+                    code: "cli_runtime_input.image_url_mapped".to_owned(),
+                    message: "Mapped image URL input to native CLI image input.".to_owned(),
                     input_index: Some(input_index),
                 });
             }
-            CodexInputSource::LocalImage { path } => {
-                input.push(CodexTurnInputItem::LocalImage { path });
-                diagnostics.push(CodexInputMappingDiagnostic {
-                    level: CodexInputMappingDiagnosticLevel::Info,
-                    code: "codex_input.local_image_mapped".to_owned(),
-                    message: "Mapped local image input to native Codex localImage input."
-                        .to_owned(),
+            CLIRuntimeInputSource::LocalImage { path } => {
+                input.push(CLIRuntimeTurnInputItem::LocalImage { path });
+                diagnostics.push(CLIRuntimeInputMappingDiagnostic {
+                    level: CLIRuntimeInputMappingDiagnosticLevel::Info,
+                    code: "cli_runtime_input.local_image_mapped".to_owned(),
+                    message: "Mapped local image input to native CLI localImage input.".to_owned(),
                     input_index: Some(input_index),
                 });
             }
-            CodexInputSource::FileReference {
+            CLIRuntimeInputSource::FileReference {
                 location,
                 name,
                 mime_type,
                 size_bytes,
                 sha256,
             } => {
-                input.push(CodexTurnInputItem::Text {
-                    text: render_file_reference_text(location, name, mime_type, size_bytes, sha256),
+                input.push(CLIRuntimeTurnInputItem::Text {
+                    text: render_file_reference_text(
+                        &runtime_label,
+                        location,
+                        name,
+                        mime_type,
+                        size_bytes,
+                        sha256,
+                    ),
                 });
-                diagnostics.push(CodexInputMappingDiagnostic {
-                    level: CodexInputMappingDiagnosticLevel::Info,
-                    code: "codex_input.file_reference_mapped".to_owned(),
-                    message: "Mapped file attachment to a Codex-readable file reference."
+                diagnostics.push(CLIRuntimeInputMappingDiagnostic {
+                    level: CLIRuntimeInputMappingDiagnosticLevel::Info,
+                    code: "cli_runtime_input.file_reference_mapped".to_owned(),
+                    message: "Mapped file attachment to a CLI runtime-readable file reference."
                         .to_owned(),
                     input_index: Some(input_index),
                 });
@@ -149,18 +163,19 @@ pub fn map_codex_turn_input(
         }
     }
 
-    Ok(CodexTurnInputMapping { input, diagnostics })
+    Ok(CLIRuntimeTurnInputMapping { input, diagnostics })
 }
 
 fn render_file_reference_text(
-    location: CodexFileReferenceLocation,
+    runtime_label: &str,
+    location: CLIRuntimeFileReferenceLocation,
     name: Option<String>,
     mime_type: Option<String>,
     size_bytes: Option<u64>,
     sha256: Option<String>,
 ) -> String {
     let mut lines = vec![
-        "Attached file available to Codex.".to_owned(),
+        format!("Attached file available to {runtime_label}."),
         "Use the file path or URL below when the user's request requires inspecting the attachment."
             .to_owned(),
         String::new(),
@@ -180,9 +195,9 @@ fn render_file_reference_text(
     }
 
     match location {
-        CodexFileReferenceLocation::Path(path) => lines.push(format!("Path: {path}")),
-        CodexFileReferenceLocation::Url(url) => lines.push(format!("URL: {url}")),
-        CodexFileReferenceLocation::Reference(reference) => {
+        CLIRuntimeFileReferenceLocation::Path(path) => lines.push(format!("Path: {path}")),
+        CLIRuntimeFileReferenceLocation::Url(url) => lines.push(format!("URL: {url}")),
+        CLIRuntimeFileReferenceLocation::Reference(reference) => {
             lines.push(format!("Reference: {reference}"))
         }
     }
@@ -201,8 +216,8 @@ mod tests {
 
     #[test]
     fn maps_text_input() {
-        let mapping = map_codex_turn_input(CodexInputMappingRequest {
-            inputs: vec![CodexInputSource::Text {
+        let mapping = map_cli_runtime_turn_input(CLIRuntimeInputMappingRequest {
+            inputs: vec![CLIRuntimeInputSource::Text {
                 text: "hello".to_owned(),
             }],
         })
@@ -210,7 +225,7 @@ mod tests {
 
         assert_eq!(
             mapping.input,
-            vec![CodexTurnInputItem::Text {
+            vec![CLIRuntimeTurnInputItem::Text {
                 text: "hello".to_owned(),
             }]
         );
@@ -218,13 +233,13 @@ mod tests {
     }
 
     #[test]
-    fn maps_image_inputs_to_native_codex_items() {
-        let mapping = map_codex_turn_input(CodexInputMappingRequest {
+    fn maps_image_inputs_to_native_cli_items() {
+        let mapping = map_cli_runtime_turn_input(CLIRuntimeInputMappingRequest {
             inputs: vec![
-                CodexInputSource::ImageUrl {
+                CLIRuntimeInputSource::ImageUrl {
                     url: "https://example.test/image.png".to_owned(),
                 },
-                CodexInputSource::LocalImage {
+                CLIRuntimeInputSource::LocalImage {
                     path: "/tmp/image.png".to_owned(),
                 },
             ],
@@ -234,10 +249,10 @@ mod tests {
         assert_eq!(
             mapping.input,
             vec![
-                CodexTurnInputItem::Image {
+                CLIRuntimeTurnInputItem::Image {
                     url: "https://example.test/image.png".to_owned(),
                 },
-                CodexTurnInputItem::LocalImage {
+                CLIRuntimeTurnInputItem::LocalImage {
                     path: "/tmp/image.png".to_owned(),
                 },
             ]
@@ -247,9 +262,9 @@ mod tests {
 
     #[test]
     fn maps_file_reference_to_text_input() {
-        let mapping = map_codex_turn_input(CodexInputMappingRequest {
-            inputs: vec![CodexInputSource::FileReference {
-                location: CodexFileReferenceLocation::Path("/tmp/report.pdf".to_owned()),
+        let mapping = map_cli_runtime_turn_input(CLIRuntimeInputMappingRequest {
+            inputs: vec![CLIRuntimeInputSource::FileReference {
+                location: CLIRuntimeFileReferenceLocation::Path("/tmp/report.pdf".to_owned()),
                 name: Some("report.pdf".to_owned()),
                 mime_type: Some("application/pdf".to_owned()),
                 size_bytes: Some(42),
@@ -258,10 +273,10 @@ mod tests {
         })
         .expect("file reference should map");
 
-        let CodexTurnInputItem::Text { text } = &mapping.input[0] else {
+        let CLIRuntimeTurnInputItem::Text { text } = &mapping.input[0] else {
             panic!("file reference should become text");
         };
-        assert!(text.contains("Attached file available to Codex."));
+        assert!(text.contains("Attached file available to CLI runtime."));
         assert!(text.contains("Name: report.pdf"));
         assert!(text.contains("MIME type: application/pdf"));
         assert!(text.contains("Path: /tmp/report.pdf"));
@@ -269,13 +284,13 @@ mod tests {
             mapping
                 .diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.code == "codex_input.file_reference_mapped")
+                .any(|diagnostic| diagnostic.code == "cli_runtime_input.file_reference_mapped")
         );
     }
 
     #[test]
     fn serializes_local_image_as_app_server_camel_case() {
-        let value = serde_json::to_value(CodexTurnInputItem::LocalImage {
+        let value = serde_json::to_value(CLIRuntimeTurnInputItem::LocalImage {
             path: "/tmp/image.png".to_owned(),
         })
         .expect("serialize local image");

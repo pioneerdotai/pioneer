@@ -70,6 +70,7 @@ impl<'de> Deserialize<'de> for GatewaySettings {
         };
         settings.migrate_legacy_active_recall_model();
         settings.migrate_default_codex_cli_display_name();
+        settings.migrate_default_claude_cli_runtime_instance();
         Ok(settings)
     }
 }
@@ -613,6 +614,45 @@ impl GatewaySettings {
         self.migrated |= migrated;
         migrated
     }
+
+    fn migrate_default_claude_cli_runtime_instance(&mut self) -> bool {
+        let Some(cli_runtimes) = &mut self.cli_runtimes else {
+            return false;
+        };
+        if !cli_runtime_settings_look_like_legacy_default_codex_only(cli_runtimes) {
+            return false;
+        }
+
+        cli_runtimes
+            .instances
+            .push(GatewayCliRuntimeInstanceSettingsOverride {
+                id: "claude".to_owned(),
+                kind: GatewayCliAgentRuntimeKindConfig::Claude,
+                display_name: "Claude CLI".to_owned(),
+                enabled: true,
+                binary_path: "claude".to_owned(),
+                home_path: "~/.claude".to_owned(),
+                shadow_home_path: None,
+            });
+        self.migrated = true;
+        true
+    }
+}
+
+fn cli_runtime_settings_look_like_legacy_default_codex_only(
+    cli_runtimes: &GatewayCliRuntimeSettingsOverride,
+) -> bool {
+    let [instance] = cli_runtimes.instances.as_slice() else {
+        return false;
+    };
+
+    instance.id == "codex"
+        && instance.kind == GatewayCliAgentRuntimeKindConfig::Codex
+        && instance.enabled
+        && instance.binary_path == "codex"
+        && instance.home_path == "~/.codex"
+        && instance.shadow_home_path.is_none()
+        && (instance.display_name == "Codex" || instance.display_name == "Codex CLI")
 }
 
 impl GatewayMemorySettings {
@@ -1093,7 +1133,6 @@ impl GatewayCliRuntimeSettingsOverride {
             });
         }
 
-        normalized_instances.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(Self {
             instances: normalized_instances,
         })
@@ -1159,6 +1198,7 @@ fn cli_runtime_kind_to_protocol(
 ) -> pioneer_protocol::CLIAgentRuntimeKind {
     match kind {
         GatewayCliAgentRuntimeKindConfig::Codex => pioneer_protocol::CLIAgentRuntimeKind::Codex,
+        GatewayCliAgentRuntimeKindConfig::Claude => pioneer_protocol::CLIAgentRuntimeKind::Claude,
     }
 }
 
@@ -1168,7 +1208,7 @@ fn cli_runtime_kind_from_protocol(
     match kind {
         pioneer_protocol::CLIAgentRuntimeKind::Codex => Ok(GatewayCliAgentRuntimeKindConfig::Codex),
         pioneer_protocol::CLIAgentRuntimeKind::Claude => {
-            bail!("CLI runtime kind `claude` is not supported by gateway settings yet")
+            Ok(GatewayCliAgentRuntimeKindConfig::Claude)
         }
     }
 }
@@ -1411,6 +1451,7 @@ pub fn save_gateway_settings(path: &Path, settings: &GatewaySettings) -> Result<
     let mut settings = settings.clone();
     settings.migrate_legacy_active_recall_model();
     settings.migrate_default_codex_cli_display_name();
+    settings.migrate_default_claude_cli_runtime_instance();
     let content =
         toml::to_string_pretty(&settings).context("failed to serialize gateway settings")?;
     write_settings_file(path, content.as_str())
@@ -2017,7 +2058,7 @@ backend = "keystore"
         .expect("gateway settings should parse");
         let mut config = gateway_config_with_keepawake(false);
         config.cli_agent_runtime.enabled = true;
-        assert_eq!(config.effective_cli_agent_runtime_instances().len(), 1);
+        assert_eq!(config.effective_cli_agent_runtime_instances().len(), 2);
 
         let snapshot = settings.snapshot(&config);
         assert!(snapshot.cli_runtimes.instances.is_empty());
@@ -2036,7 +2077,7 @@ backend = "keystore"
     }
 
     #[test]
-    fn gateway_settings_without_cli_runtimes_exposes_default_codex_runtime() {
+    fn gateway_settings_without_cli_runtimes_exposes_default_cli_runtimes() {
         let settings = toml::from_str::<super::GatewaySettings>(
             r#"
 version = 1
@@ -2051,15 +2092,19 @@ backend = "keystore"
         assert!(config.effective_cli_agent_runtime_instances().is_empty());
 
         let snapshot = settings.snapshot(&config);
-        assert_eq!(snapshot.cli_runtimes.instances.len(), 1);
+        assert_eq!(snapshot.cli_runtimes.instances.len(), 2);
         assert_eq!(snapshot.cli_runtimes.instances[0].id, "codex");
         assert!(snapshot.cli_runtimes.instances[0].enabled);
+        assert_eq!(snapshot.cli_runtimes.instances[1].id, "claude");
+        assert!(snapshot.cli_runtimes.instances[1].enabled);
 
         let applied = settings.apply_to_gateway_config(config);
         let instances = applied.effective_cli_agent_runtime_instances();
-        assert_eq!(instances.len(), 1);
+        assert_eq!(instances.len(), 2);
         assert_eq!(instances[0].id, "codex");
         assert!(instances[0].enabled);
+        assert_eq!(instances[1].id, "claude");
+        assert!(instances[1].enabled);
     }
 
     #[test]
@@ -2098,17 +2143,123 @@ home_path = "~/.codex-work"
             .expect("settings should load and migrate");
         let snapshot = settings.snapshot(&gateway_config_with_keepawake(false));
 
-        assert_eq!(snapshot.cli_runtimes.instances[0].id, "codex");
-        assert_eq!(snapshot.cli_runtimes.instances[0].display_name, "Codex CLI");
-        assert_eq!(snapshot.cli_runtimes.instances[1].id, "codex_work");
-        assert_eq!(
-            snapshot.cli_runtimes.instances[1].display_name,
-            "Codex Work"
-        );
+        let codex = snapshot
+            .cli_runtimes
+            .instances
+            .iter()
+            .find(|instance| instance.id == "codex")
+            .expect("default Codex CLI runtime should exist");
+        assert_eq!(codex.display_name, "Codex CLI");
+        let codex_work = snapshot
+            .cli_runtimes
+            .instances
+            .iter()
+            .find(|instance| instance.id == "codex_work")
+            .expect("custom Codex CLI runtime should exist");
+        assert_eq!(codex_work.display_name, "Codex Work");
 
         let content = fs::read_to_string(&path).expect("read migrated settings");
         assert!(content.contains("display_name = \"Codex CLI\""));
         assert!(content.contains("display_name = \"Codex Work\""));
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn gateway_settings_migrates_default_claude_cli_runtime_instance() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let path = temp_dir.join("gateway-settings.toml");
+        fs::write(
+            &path,
+            r#"
+version = 1
+
+[secrets]
+backend = "keystore"
+
+[[cli_runtimes.instances]]
+id = "codex"
+kind = "codex"
+display_name = "Codex CLI"
+enabled = true
+binary_path = "codex"
+home_path = "~/.codex"
+"#,
+        )
+        .expect("write settings");
+
+        let settings = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
+            .expect("settings should load and migrate");
+        let snapshot = settings.snapshot(&gateway_config_with_keepawake(false));
+
+        assert_eq!(snapshot.cli_runtimes.instances.len(), 2);
+        assert!(
+            snapshot
+                .cli_runtimes
+                .instances
+                .iter()
+                .any(|instance| instance.id == "codex")
+        );
+        let claude = snapshot
+            .cli_runtimes
+            .instances
+            .iter()
+            .find(|instance| instance.id == "claude")
+            .expect("default Claude CLI runtime should be migrated");
+        assert_eq!(claude.display_name, "Claude CLI");
+        assert!(claude.enabled);
+
+        let content = fs::read_to_string(&path).expect("read migrated settings");
+        assert!(content.contains("id = \"codex\""));
+        assert!(content.contains("id = \"claude\""));
+        assert!(content.contains("display_name = \"Claude CLI\""));
+        assert!(content.contains("binary_path = \"claude\""));
+        assert!(content.contains("home_path = \"~/.claude\""));
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn gateway_settings_does_not_add_default_claude_to_custom_cli_runtime_list() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let path = temp_dir.join("gateway-settings.toml");
+        fs::write(
+            &path,
+            r#"
+version = 1
+
+[secrets]
+backend = "keystore"
+
+[[cli_runtimes.instances]]
+id = "codex_work"
+kind = "codex"
+display_name = "Codex Work"
+enabled = true
+binary_path = "codex"
+home_path = "~/.codex"
+"#,
+        )
+        .expect("write settings");
+
+        let settings = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
+            .expect("settings should load without default Claude migration");
+        let snapshot = settings.snapshot(&gateway_config_with_keepawake(false));
+
+        assert_eq!(snapshot.cli_runtimes.instances.len(), 1);
+        assert_eq!(snapshot.cli_runtimes.instances[0].id, "codex_work");
+        assert!(
+            !snapshot
+                .cli_runtimes
+                .instances
+                .iter()
+                .any(|instance| instance.id == "claude")
+        );
+
+        let content = fs::read_to_string(&path).expect("read settings");
+        assert!(!content.contains("id = \"claude\""));
 
         let _ = fs::remove_dir_all(temp_dir);
     }

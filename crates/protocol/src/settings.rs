@@ -156,7 +156,10 @@ pub struct GatewayCliRuntimeSettings {
 impl Default for GatewayCliRuntimeSettings {
     fn default() -> Self {
         Self {
-            instances: vec![GatewayCliRuntimeInstanceSettings::default_codex()],
+            instances: vec![
+                GatewayCliRuntimeInstanceSettings::default_codex(),
+                GatewayCliRuntimeInstanceSettings::default_claude(),
+            ],
         }
     }
 }
@@ -182,6 +185,18 @@ impl GatewayCliRuntimeInstanceSettings {
             enabled: true,
             binary_path: "codex".to_owned(),
             home_path: "~/.codex".to_owned(),
+            shadow_home_path: None,
+        }
+    }
+
+    pub fn default_claude() -> Self {
+        Self {
+            id: "claude".to_owned(),
+            kind: CLIAgentRuntimeKind::Claude,
+            display_name: "Claude CLI".to_owned(),
+            enabled: true,
+            binary_path: "claude".to_owned(),
+            home_path: "~/.claude".to_owned(),
             shadow_home_path: None,
         }
     }
@@ -458,10 +473,10 @@ mod tests {
     }
 
     #[test]
-    fn cli_runtime_settings_default_to_enabled_codex() {
+    fn cli_runtime_settings_default_to_enabled_cli_runtimes() {
         let settings = GatewayCliRuntimeSettings::default();
 
-        assert_eq!(settings.instances.len(), 1);
+        assert_eq!(settings.instances.len(), 2);
         assert_eq!(settings.instances[0].id, "codex");
         assert_eq!(settings.instances[0].kind, CLIAgentRuntimeKind::Codex);
         assert_eq!(settings.instances[0].display_name, "Codex CLI");
@@ -469,6 +484,13 @@ mod tests {
         assert_eq!(settings.instances[0].binary_path, "codex");
         assert_eq!(settings.instances[0].home_path, "~/.codex");
         assert!(settings.instances[0].shadow_home_path.is_none());
+        assert_eq!(settings.instances[1].id, "claude");
+        assert_eq!(settings.instances[1].kind, CLIAgentRuntimeKind::Claude);
+        assert_eq!(settings.instances[1].display_name, "Claude CLI");
+        assert!(settings.instances[1].enabled);
+        assert_eq!(settings.instances[1].binary_path, "claude");
+        assert_eq!(settings.instances[1].home_path, "~/.claude");
+        assert!(settings.instances[1].shadow_home_path.is_none());
     }
 
     #[test]

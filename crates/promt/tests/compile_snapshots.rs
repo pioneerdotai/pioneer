@@ -110,7 +110,7 @@ fn compile_continuation_prompt(profile: PromptProfile) -> CompiledPromptBundle {
         PromptProfile::AssistantFull => "continuation_full",
         PromptProfile::AssistantMinimal => "continuation_minimal",
         PromptProfile::AssistantNone => "continuation_none",
-        PromptProfile::CliRuntimeCodex => "continuation_cli_runtime_codex",
+        PromptProfile::CliRuntime => "continuation_cli_runtime",
     });
     write_fixture_files(&root);
 

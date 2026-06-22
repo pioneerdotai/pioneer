@@ -1,14 +1,15 @@
 #![allow(dead_code)]
-// The manager is introduced before Codex turn execution is wired in later WP steps.
+// Owns reusable CLI runtime sessions across provider kinds.
 
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use pioneer_cli_agent_runtime::codex::{
     CodexJsonlRpcClientDiagnostic, CodexJsonlRpcNotificationEvent, CodexJsonlRpcServerRequest,
-    CodexThreadOpenSnapshot, CodexThreadStartParams, CodexTurnStartParams, CodexTurnStartSnapshot,
 };
+use pioneer_cli_agent_runtime::event::RuntimeEvent;
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, mpsc};
@@ -89,6 +90,7 @@ pub(crate) struct CLIAgentRuntimeTurnSteerResult {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CLIAgentRuntimeSessionStartOptions {
+    pub cwd: Option<PathBuf>,
     pub app_server_args: Vec<String>,
     pub env: BTreeMap<String, String>,
 }
@@ -99,6 +101,48 @@ pub(crate) struct CLIAgentRuntimeCodexEventReceivers {
     pub diagnostics: mpsc::Receiver<CodexJsonlRpcClientDiagnostic>,
 }
 
+pub(crate) struct CLIAgentRuntimeEventReceivers {
+    pub runtime_kind: String,
+    pub events: mpsc::Receiver<RuntimeEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CLIAgentRuntimeThreadOpenParams {
+    pub cwd: String,
+    pub model: Option<String>,
+    pub approval_policy: Option<String>,
+    pub sandbox: Option<JsonValue>,
+    pub service_tier: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CLIAgentRuntimeThreadOpenSnapshot {
+    pub native_thread_id: String,
+    pub cwd: Option<String>,
+    pub model: Option<String>,
+    pub raw: JsonValue,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CLIAgentRuntimeTurnStartParams {
+    pub native_thread_id: String,
+    pub input: JsonValue,
+    pub cwd: Option<String>,
+    pub model: Option<String>,
+    pub approval_policy: Option<String>,
+    pub sandbox: Option<JsonValue>,
+    pub effort: Option<String>,
+    pub personality: Option<String>,
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CLIAgentRuntimeTurnStartSnapshot {
+    pub native_thread_id: String,
+    pub native_turn_id: String,
+    pub raw: JsonValue,
+}
+
 #[async_trait]
 pub(crate) trait CLIAgentRuntimeSession: Send + Sync {
     async fn close(&self) -> Result<()>;
@@ -107,32 +151,40 @@ pub(crate) trait CLIAgentRuntimeSession: Send + Sync {
         None
     }
 
-    async fn start_codex_thread(
-        &self,
-        params: CodexThreadStartParams,
-        timeout: Duration,
-    ) -> Result<CodexThreadOpenSnapshot> {
-        let _ = (params, timeout);
-        bail!("CLI runtime session does not support Codex thread start");
+    fn take_event_receivers(&self) -> Option<CLIAgentRuntimeEventReceivers> {
+        None
     }
 
-    async fn resume_codex_thread(
+    fn supports_thread_name_sync(&self) -> bool {
+        false
+    }
+
+    async fn start_thread(
+        &self,
+        params: CLIAgentRuntimeThreadOpenParams,
+        timeout: Duration,
+    ) -> Result<CLIAgentRuntimeThreadOpenSnapshot> {
+        let _ = (params, timeout);
+        bail!("CLI runtime session does not support thread start");
+    }
+
+    async fn resume_thread(
         &self,
         native_thread_id: &str,
-        params: CodexThreadStartParams,
+        params: CLIAgentRuntimeThreadOpenParams,
         timeout: Duration,
-    ) -> Result<CodexThreadOpenSnapshot> {
+    ) -> Result<CLIAgentRuntimeThreadOpenSnapshot> {
         let _ = (native_thread_id, params, timeout);
-        bail!("CLI runtime session does not support Codex thread resume");
+        bail!("CLI runtime session does not support thread resume");
     }
 
-    async fn start_codex_turn(
+    async fn start_turn(
         &self,
-        params: CodexTurnStartParams,
+        params: CLIAgentRuntimeTurnStartParams,
         timeout: Duration,
-    ) -> Result<CodexTurnStartSnapshot> {
+    ) -> Result<CLIAgentRuntimeTurnStartSnapshot> {
         let _ = (params, timeout);
-        bail!("CLI runtime session does not support Codex turn start");
+        bail!("CLI runtime session does not support turn start");
     }
 
     async fn respond_to_request(
@@ -581,10 +633,12 @@ mod tests {
         let manager = manager_with_factory(factory.clone());
         let key = key("thread-a");
         let options_a = CLIAgentRuntimeSessionStartOptions {
+            cwd: None,
             app_server_args: vec!["-c".to_owned(), "model=\"gpt-5-codex\"".to_owned()],
             env: Default::default(),
         };
         let options_b = CLIAgentRuntimeSessionStartOptions {
+            cwd: None,
             app_server_args: vec!["-c".to_owned(), "model=\"gpt-5\"".to_owned()],
             env: Default::default(),
         };

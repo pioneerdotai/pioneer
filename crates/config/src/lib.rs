@@ -783,6 +783,7 @@ struct GatewayCliAgentRuntimeInstanceConfigWire {
 pub enum GatewayCliAgentRuntimeKindConfig {
     #[default]
     Codex,
+    Claude,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -878,17 +879,27 @@ impl GatewayConfig {
     ) -> Vec<EffectiveGatewayCliAgentRuntimeInstanceConfig> {
         if self.cli_agent_runtimes.is_empty() {
             if self.cli_agent_runtime.enabled {
-                return vec![default_codex_cli_agent_runtime_instance(
-                    &self.cli_agent_runtime,
-                )];
+                return default_cli_agent_runtime_instances(&self.cli_agent_runtime);
             }
             return Vec::new();
         }
 
-        self.cli_agent_runtimes
+        let mut instances = self
+            .cli_agent_runtimes
             .values()
             .map(|instance| effective_cli_agent_runtime_instance(instance, &self.cli_agent_runtime))
-            .collect()
+            .collect::<Vec<_>>();
+        if self.cli_agent_runtime.enabled {
+            for default_instance in default_cli_agent_runtime_instances(&self.cli_agent_runtime) {
+                if !instances
+                    .iter()
+                    .any(|instance| instance.id == default_instance.id)
+                {
+                    instances.push(default_instance);
+                }
+            }
+        }
+        instances
     }
 }
 
@@ -1848,6 +1859,37 @@ fn default_codex_cli_agent_runtime_instance(
     }
 }
 
+fn default_claude_cli_agent_runtime_instance(
+    defaults: &GatewayCliAgentRuntimeConfig,
+) -> EffectiveGatewayCliAgentRuntimeInstanceConfig {
+    EffectiveGatewayCliAgentRuntimeInstanceConfig {
+        id: "claude".to_owned(),
+        kind: GatewayCliAgentRuntimeKindConfig::Claude,
+        display_name: "Claude CLI".to_owned(),
+        enabled: defaults.enabled,
+        binary_path: "claude".to_owned(),
+        home_path: "~/.claude".to_owned(),
+        shadow_home_path: None,
+        custom_models: Vec::new(),
+        app_server_args: Vec::new(),
+        startup_probe_timeout_ms: defaults.startup_timeout_ms,
+        request_timeout_ms: defaults.request_timeout_ms,
+        idle_session_ttl_secs: defaults.idle_session_ttl_secs,
+        event_channel_capacity: defaults.event_channel_capacity,
+        stderr_ring_lines: defaults.stderr_ring_lines,
+        debug_native_events: defaults.debug_native_events,
+    }
+}
+
+fn default_cli_agent_runtime_instances(
+    defaults: &GatewayCliAgentRuntimeConfig,
+) -> Vec<EffectiveGatewayCliAgentRuntimeInstanceConfig> {
+    vec![
+        default_codex_cli_agent_runtime_instance(defaults),
+        default_claude_cli_agent_runtime_instance(defaults),
+    ]
+}
+
 fn effective_cli_agent_runtime_instance(
     instance: &GatewayCliAgentRuntimeInstanceConfig,
     defaults: &GatewayCliAgentRuntimeConfig,
@@ -1896,12 +1938,14 @@ fn effective_cli_agent_runtime_instance(
 fn default_cli_agent_runtime_binary_path(kind: GatewayCliAgentRuntimeKindConfig) -> String {
     match kind {
         GatewayCliAgentRuntimeKindConfig::Codex => "codex".to_owned(),
+        GatewayCliAgentRuntimeKindConfig::Claude => "claude".to_owned(),
     }
 }
 
 fn default_cli_agent_runtime_home_path(kind: GatewayCliAgentRuntimeKindConfig) -> String {
     match kind {
         GatewayCliAgentRuntimeKindConfig::Codex => "~/.codex".to_owned(),
+        GatewayCliAgentRuntimeKindConfig::Claude => "~/.claude".to_owned(),
     }
 }
 
@@ -2879,7 +2923,7 @@ debug_native_events = true
     }
 
     #[test]
-    fn gateway_cli_agent_runtime_default_codex_instance_loads_when_feature_enabled() {
+    fn gateway_cli_agent_runtime_default_instances_load_when_feature_enabled() {
         let workspace_override = unique_temp_file_path("gateway-cli-agent-runtime-default-codex");
         write_file(
             &workspace_override,
@@ -2893,10 +2937,10 @@ request_timeout_ms = 60000
 
         let config =
             load_config_from_sources(DEFAULT_CONFIG_TOML, vec![workspace_override.clone()])
-                .expect("load config with default codex runtime enabled");
+                .expect("load config with default CLI runtimes enabled");
         let instances = config.gateway.effective_cli_agent_runtime_instances();
 
-        assert_eq!(instances.len(), 1);
+        assert_eq!(instances.len(), 2);
         assert_eq!(instances[0].id, "codex");
         assert_eq!(instances[0].kind, GatewayCliAgentRuntimeKindConfig::Codex);
         assert_eq!(instances[0].display_name, "Codex CLI");
@@ -2905,6 +2949,14 @@ request_timeout_ms = 60000
         assert_eq!(instances[0].home_path, "~/.codex");
         assert_eq!(instances[0].startup_probe_timeout_ms, 15_000);
         assert_eq!(instances[0].request_timeout_ms, 60_000);
+        assert_eq!(instances[1].id, "claude");
+        assert_eq!(instances[1].kind, GatewayCliAgentRuntimeKindConfig::Claude);
+        assert_eq!(instances[1].display_name, "Claude CLI");
+        assert!(instances[1].enabled);
+        assert_eq!(instances[1].binary_path, "claude");
+        assert_eq!(instances[1].home_path, "~/.claude");
+        assert_eq!(instances[1].startup_probe_timeout_ms, 15_000);
+        assert_eq!(instances[1].request_timeout_ms, 60_000);
 
         let _ = fs::remove_file(workspace_override);
     }
@@ -2940,7 +2992,7 @@ request_timeout_ms = 45000
         assert_eq!(config.gateway.cli_agent_runtimes.instances.len(), 1);
 
         let instances = config.gateway.effective_cli_agent_runtime_instances();
-        assert_eq!(instances.len(), 1);
+        assert_eq!(instances.len(), 3);
         let instance = &instances[0];
         assert_eq!(instance.id, "codex_personal");
         assert_eq!(instance.kind, GatewayCliAgentRuntimeKindConfig::Codex);
@@ -2957,6 +3009,8 @@ request_timeout_ms = 45000
         assert_eq!(instance.startup_probe_timeout_ms, 5_000);
         assert_eq!(instance.request_timeout_ms, 45_000);
         assert_eq!(instance.idle_session_ttl_secs, 1_800);
+        assert_eq!(instances[1].id, "codex");
+        assert_eq!(instances[2].id, "claude");
 
         let _ = fs::remove_file(workspace_override);
     }
@@ -2992,7 +3046,7 @@ request_timeout_ms = 0
                 .expect("load config with multiple codex runtime instances");
         let instances = config.gateway.effective_cli_agent_runtime_instances();
 
-        assert_eq!(instances.len(), 2);
+        assert_eq!(instances.len(), 4);
         assert_eq!(instances[0].id, "codex_personal");
         assert_eq!(instances[0].display_name, "Codex Personal");
         assert!(instances[0].enabled);
@@ -3003,6 +3057,8 @@ request_timeout_ms = 0
         assert!(!instances[1].enabled);
         assert_eq!(instances[1].home_path, "~/.codex-work");
         assert_eq!(instances[1].request_timeout_ms, 120_000);
+        assert_eq!(instances[2].id, "codex");
+        assert_eq!(instances[3].id, "claude");
 
         let _ = fs::remove_file(workspace_override);
     }

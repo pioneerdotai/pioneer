@@ -26,6 +26,7 @@ pub struct CLIAgentProcessSpawnConfig {
     pub home_path: Option<String>,
     pub home_dir: Option<PathBuf>,
     pub env: BTreeMap<String, String>,
+    pub env_remove: Vec<String>,
     pub stderr_ring_lines: usize,
     pub process_group: bool,
 }
@@ -39,6 +40,7 @@ impl CLIAgentProcessSpawnConfig {
             home_path: Some(home_path.into()),
             home_dir: None,
             env: BTreeMap::new(),
+            env_remove: Vec::new(),
             stderr_ring_lines: DEFAULT_STDERR_RING_LINES,
             process_group: true,
         }
@@ -56,6 +58,11 @@ impl CLIAgentProcessSpawnConfig {
 
     pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env.insert(key.into(), value.into());
+        self
+    }
+
+    pub fn with_env_removed(mut self, key: impl Into<String>) -> Self {
+        self.env_remove.push(key.into());
         self
     }
 
@@ -80,6 +87,12 @@ impl CLIAgentProcessSpawnConfig {
             validate_env_value(value)?;
             env.insert(key.clone(), value.clone());
         }
+        let mut env_remove = Vec::new();
+        for key in &self.env_remove {
+            validate_env_key(key)?;
+            env.remove(key);
+            env_remove.push(key.clone());
+        }
 
         if let Some(home_path) = self.home_path.as_deref() {
             let expanded = expand_home_path(home_path, self.home_dir.as_deref())?;
@@ -94,6 +107,7 @@ impl CLIAgentProcessSpawnConfig {
             args: self.args.clone(),
             cwd: self.cwd.clone(),
             env,
+            env_remove,
             stderr_ring_lines: self.stderr_ring_lines.max(1),
             process_group: self.process_group,
         })
@@ -106,6 +120,7 @@ pub struct PreparedCLIAgentCommand {
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub env: BTreeMap<String, String>,
+    pub env_remove: Vec<String>,
     pub stderr_ring_lines: usize,
     pub process_group: bool,
 }
@@ -258,6 +273,9 @@ pub fn spawn_prepared_cli_agent_process(
     command.stderr(Stdio::piped());
     if let Some(cwd) = prepared.cwd.as_deref() {
         command.current_dir(cwd);
+    }
+    for key in &prepared.env_remove {
+        command.env_remove(key);
     }
     command.envs(
         prepared

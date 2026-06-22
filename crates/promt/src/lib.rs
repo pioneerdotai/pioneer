@@ -18,7 +18,7 @@ pub use bundle::{
     PromptSourceStatus,
 };
 pub use cli_runtime_context::{
-    CliRuntimeCodexContextInput, CliRuntimeContextText, compile_cli_runtime_codex_context_bundle,
+    CliRuntimeContextInput, CliRuntimeContextText, compile_cli_runtime_context_bundle,
 };
 pub use compile::compile_prompt;
 pub use diagnostics::{PromptDiagnostic, PromptDiagnosticCode};

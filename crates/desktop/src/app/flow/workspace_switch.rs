@@ -28,6 +28,9 @@ impl PioneerDesktop {
         if reduction.selected.refresh_thread_list {
             self.refresh_thread_list(cx);
         }
+        self.providers.clear_for_workspace_switch();
+        self.refresh_configured_providers(cx);
+        self.refresh_cli_providers_auto(cx);
         if reduction.refresh_workspace_bound_screens {
             self.refresh_workspace_bound_screens_after_switch(cx);
         }
@@ -189,9 +192,7 @@ impl PioneerDesktop {
                 }
             }
             MainContentView::Providers => {
-                self.providers.clear_for_workspace_switch();
-                self.refresh_configured_providers(cx);
-                self.refresh_cli_providers_auto(cx);
+                self.sync_provider_sidebar_tree_state(cx);
             }
             _ => {}
         }

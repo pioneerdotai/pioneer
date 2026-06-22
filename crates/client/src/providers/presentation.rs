@@ -88,18 +88,34 @@ pub fn filter_model_selector_models(
                 .map(|name| name.to_lowercase().contains(query.as_str()))
                 .unwrap_or(false);
             let id_match = model.id.to_lowercase().contains(query.as_str());
-            name_match || id_match
+            let description_match = model
+                .description
+                .as_deref()
+                .map(|description| description.to_lowercase().contains(query.as_str()))
+                .unwrap_or(false);
+            name_match || id_match || description_match
         })
         .cloned()
         .collect()
 }
 
 pub fn model_selector_model_display_name(model: &ProviderModelInfo) -> String {
-    model.name.clone().unwrap_or_else(|| model.id.clone())
+    model
+        .name
+        .as_deref()
+        .and_then(non_empty_trimmed)
+        .map(str::to_owned)
+        .unwrap_or_else(|| model.id.clone())
 }
 
-pub fn model_selector_model_has_name(model: &ProviderModelInfo) -> bool {
-    model.name.is_some()
+pub fn model_selector_model_secondary_text(model: &ProviderModelInfo) -> Option<String> {
+    if let Some(description) = model.description.as_deref().and_then(non_empty_trimmed) {
+        return Some(description.to_owned());
+    }
+
+    let id = non_empty_trimmed(model.id.as_str())?;
+    let display_name = model_selector_model_display_name(model);
+    (!id.eq_ignore_ascii_case(display_name.trim())).then(|| id.to_owned())
 }
 
 pub fn resolve_provider_model_display_name(
@@ -147,6 +163,11 @@ fn normalize_selector_query(query: &str) -> String {
     query.trim().to_lowercase()
 }
 
+fn non_empty_trimmed(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,32 +206,51 @@ mod tests {
     }
 
     #[test]
-    fn model_selector_filters_models_by_name_or_id() {
+    fn model_selector_filters_models_by_name_id_or_description() {
+        let mut described = model("claude-opus", Some("Opus"));
+        described.description = Some("Opus 4.8 with 1M context".to_owned());
         let rows = filter_model_selector_models(
             &[
                 model("gpt-5.4", Some("GPT 5.4")),
                 model("anthropic/claude", Some("Claude Sonnet")),
+                described,
             ],
             " CLAUDE ",
         );
 
-        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].id, "anthropic/claude");
 
         let rows = filter_model_selector_models(&[model("o4-mini", None)], "mini");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "o4-mini");
+
+        let mut described = model("opus", Some("Opus"));
+        described.description = Some("Opus 4.8 with 1M context".to_owned());
+        let rows = filter_model_selector_models(&[described], "1m context");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "opus");
     }
 
     #[test]
-    fn model_selector_model_display_name_uses_name_then_id() {
-        let named = model("gpt-5.4", Some("GPT 5.4"));
+    fn model_selector_model_text_uses_description_then_distinct_id() {
+        let mut named = model("gpt-5.4", Some("GPT 5.4"));
+        named.description = Some("Flagship model".to_owned());
         assert_eq!(model_selector_model_display_name(&named), "GPT 5.4");
-        assert!(model_selector_model_has_name(&named));
+        assert_eq!(
+            model_selector_model_secondary_text(&named),
+            Some("Flagship model".to_owned())
+        );
+
+        let named_without_description = model("o4-mini", Some("O4 Mini"));
+        assert_eq!(
+            model_selector_model_secondary_text(&named_without_description),
+            Some("o4-mini".to_owned())
+        );
 
         let unnamed = model("o4-mini", None);
         assert_eq!(model_selector_model_display_name(&unnamed), "o4-mini");
-        assert!(!model_selector_model_has_name(&unnamed));
+        assert_eq!(model_selector_model_secondary_text(&unnamed), None);
     }
 
     #[test]
