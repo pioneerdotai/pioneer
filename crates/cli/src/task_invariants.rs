@@ -3,6 +3,8 @@ use pioneer_tasks::TaskRuntimeInvariantScanner;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::usage_error;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TaskInvariantCommand {
     db_path: PathBuf,
@@ -50,34 +52,45 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<TaskInvariantCommand>
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--db" => {
-                let value = args
-                    .next()
-                    .context("`task-invariants --db` requires a SQLite database path")?;
+                let value = args.next().ok_or_else(|| {
+                    usage_error("`task-invariants --db` requires a SQLite database path")
+                })?;
                 db_path = Some(PathBuf::from(value));
             }
             "--json" => {
                 json_output = true;
             }
             "--stale-turn-after-seconds" => {
-                let value = args
-                    .next()
-                    .context("`--stale-turn-after-seconds` requires an integer value")?;
-                let parsed = value.parse::<i64>().with_context(|| {
-                    format!("invalid `--stale-turn-after-seconds` value `{value}`")
+                let value = args.next().ok_or_else(|| {
+                    usage_error("`--stale-turn-after-seconds` requires an integer value")
+                })?;
+                let parsed = value.parse::<i64>().map_err(|_| {
+                    usage_error(format!(
+                        "invalid `--stale-turn-after-seconds` value `{value}`"
+                    ))
                 })?;
                 if parsed < 0 {
-                    bail!("`--stale-turn-after-seconds` must be non-negative");
+                    return Err(usage_error(
+                        "`--stale-turn-after-seconds` must be non-negative",
+                    ));
                 }
                 stale_turn_after_seconds = Some(parsed);
             }
-            "--help" | "-h" => bail!(
-                "Usage: pioneer task-invariants --db <path> [--json] [--stale-turn-after-seconds <seconds>]"
-            ),
-            other => bail!("unexpected argument for task-invariants: {other}"),
+            "--help" | "-h" => {
+                return Err(usage_error(
+                    "Usage: pioneer task-invariants --db <path> [--json] [--stale-turn-after-seconds <seconds>]",
+                ));
+            }
+            other => {
+                return Err(usage_error(format!(
+                    "unexpected argument for task-invariants: {other}"
+                )));
+            }
         }
     }
 
-    let db_path = db_path.context("missing required `task-invariants --db <path>`")?;
+    let db_path =
+        db_path.ok_or_else(|| usage_error("missing required `task-invariants --db <path>`"))?;
     Ok(TaskInvariantCommand {
         db_path,
         json_output,

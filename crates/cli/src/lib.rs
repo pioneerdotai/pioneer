@@ -3,10 +3,11 @@ mod secrets;
 mod service;
 mod task_invariants;
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use pioneer_config::InstallManagedBy;
 use serde_json::json;
 use std::env;
+use std::fmt;
 use tracing::error;
 
 pub fn main_entry() {
@@ -15,16 +16,46 @@ pub fn main_entry() {
     pioneer_observability::init_tracing(sentry_guard.is_some());
 
     if let Err(error) = run() {
-        pioneer_observability::capture_anyhow(&error);
-        error!(error = %format!("{error:#}"), "pioneer command failed");
+        if is_usage_error(&error) {
+            eprintln!("{error:#}");
+        } else {
+            pioneer_observability::capture_anyhow(&error);
+            error!(error = %format!("{error:#}"), "pioneer command failed");
+        }
         drop(sentry_guard);
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<()> {
-    let mut args = env::args().skip(1);
+#[derive(Debug)]
+pub(crate) struct CliUsageError {
+    message: String,
+}
 
+impl fmt::Display for CliUsageError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.message.as_str())
+    }
+}
+
+impl std::error::Error for CliUsageError {}
+
+pub(crate) fn usage_error(message: impl Into<String>) -> anyhow::Error {
+    CliUsageError {
+        message: message.into(),
+    }
+    .into()
+}
+
+fn is_usage_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<CliUsageError>().is_some()
+}
+
+fn run() -> Result<()> {
+    run_with_args(env::args().skip(1))
+}
+
+fn run_with_args(mut args: impl Iterator<Item = String>) -> Result<()> {
     match args.next().as_deref() {
         Some("install") => {
             let (options, json_output) =
@@ -87,13 +118,16 @@ fn run() -> Result<()> {
             print_help();
             Ok(())
         }
-        Some(command) => bail!("unknown command: {command}\n\n{}", help_text()),
+        Some(command) => Err(usage_error(format!(
+            "unknown command: {command}\n\n{}",
+            help_text()
+        ))),
     }
 }
 
 fn ensure_no_extra_args(mut args: impl Iterator<Item = String>) -> Result<()> {
     if let Some(extra) = args.next() {
-        bail!("unexpected argument: {extra}");
+        return Err(usage_error(format!("unexpected argument: {extra}")));
     }
     Ok(())
 }
@@ -105,7 +139,9 @@ fn parse_optional_json_flag(mut args: impl Iterator<Item = String>) -> Result<bo
             ensure_no_extra_args(args)?;
             Ok(true)
         }
-        Some(flag) => bail!("unexpected argument: {flag}; expected `--json`"),
+        Some(flag) => Err(usage_error(format!(
+            "unexpected argument: {flag}; expected `--json`"
+        ))),
     }
 }
 
@@ -127,38 +163,40 @@ fn parse_install_options(
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--source" => {
-                let value = args
-                    .next()
-                    .context("`--source` requires a value: local|release|channel")?;
+                let value = args.next().ok_or_else(|| {
+                    usage_error("`--source` requires a value: local|release|channel")
+                })?;
                 source_kind = Some(value.trim().to_ascii_lowercase());
             }
             "--asset" => {
                 let value = args
                     .next()
-                    .context("`--asset` requires a file path value")?;
+                    .ok_or_else(|| usage_error("`--asset` requires a file path value"))?;
                 asset_path = Some(std::path::PathBuf::from(value));
             }
             "--checksums" => {
                 let value = args
                     .next()
-                    .context("`--checksums` requires a file path value")?;
+                    .ok_or_else(|| usage_error("`--checksums` requires a file path value"))?;
                 checksums_path = Some(std::path::PathBuf::from(value));
             }
             "--channel" => {
-                let value = args
-                    .next()
-                    .context("`--channel` requires a value: stable|beta|canary")?;
+                let value = args.next().ok_or_else(|| {
+                    usage_error("`--channel` requires a value: stable|beta|canary")
+                })?;
                 channel = parse_release_channel(value.as_str())?;
                 channel_explicit = true;
             }
             "--version" => {
-                let value = args.next().context("`--version` requires a value")?;
+                let value = args
+                    .next()
+                    .ok_or_else(|| usage_error("`--version` requires a value"))?;
                 version = Some(value);
             }
             "--managed-by" => {
-                let value = args
-                    .next()
-                    .context("`--managed-by` requires a value: script|desktop|manual|unknown")?;
+                let value = args.next().ok_or_else(|| {
+                    usage_error("`--managed-by` requires a value: script|desktop|manual|unknown")
+                })?;
                 managed_by = parse_managed_by_flag(value.as_str())?;
             }
             "--no-start" => {
@@ -170,19 +208,23 @@ fn parse_install_options(
             "--json" => {
                 json_output = true;
             }
-            flag => bail!(
-                "unexpected argument for install/update: {flag}\n\n{}",
-                help_text()
-            ),
+            flag => {
+                return Err(usage_error(format!(
+                    "unexpected argument for install/update: {flag}\n\n{}",
+                    help_text()
+                )));
+            }
         }
     }
 
     let source = match source_kind.as_deref() {
         Some("local") => {
-            let asset_path =
-                asset_path.context("missing required `--asset <path>` for --source local")?;
-            let checksums_path = checksums_path
-                .context("missing required `--checksums <path>` for --source local")?;
+            let asset_path = asset_path.ok_or_else(|| {
+                usage_error("missing required `--asset <path>` for --source local")
+            })?;
+            let checksums_path = checksums_path.ok_or_else(|| {
+                usage_error("missing required `--checksums <path>` for --source local")
+            })?;
             installer::InstallSourceSpec::Local {
                 asset_path,
                 checksums_path,
@@ -190,31 +232,44 @@ fn parse_install_options(
         }
         Some("release") => {
             if asset_path.is_some() || checksums_path.is_some() {
-                bail!("`--asset/--checksums` cannot be used with `--source release`");
+                return Err(usage_error(
+                    "`--asset/--checksums` cannot be used with `--source release`",
+                ));
             }
             installer::InstallSourceSpec::Release { channel, version }
         }
         Some("channel") => {
             if asset_path.is_some() || checksums_path.is_some() {
-                bail!("`--asset/--checksums` cannot be used with `--source channel`");
+                return Err(usage_error(
+                    "`--asset/--checksums` cannot be used with `--source channel`",
+                ));
             }
             if !channel_explicit {
-                bail!("`--source channel` requires explicit `--channel stable|beta|canary`");
+                return Err(usage_error(
+                    "`--source channel` requires explicit `--channel stable|beta|canary`",
+                ));
             }
             if version.is_some() {
-                bail!("`--version` cannot be used with `--source channel`");
+                return Err(usage_error(
+                    "`--version` cannot be used with `--source channel`",
+                ));
             }
             installer::InstallSourceSpec::Release {
                 channel,
                 version: None,
             }
         }
-        Some(other) => bail!("invalid value for --source: {other}; expected local|release|channel"),
+        Some(other) => {
+            return Err(usage_error(format!(
+                "invalid value for --source: {other}; expected local|release|channel"
+            )));
+        }
         None => {
             if asset_path.is_some() || checksums_path.is_some() {
-                let asset_path = asset_path.context("missing required `--asset <path>`")?;
-                let checksums_path =
-                    checksums_path.context("missing required `--checksums <path>`")?;
+                let asset_path =
+                    asset_path.ok_or_else(|| usage_error("missing required `--asset <path>`"))?;
+                let checksums_path = checksums_path
+                    .ok_or_else(|| usage_error("missing required `--checksums <path>`"))?;
                 installer::InstallSourceSpec::Local {
                     asset_path,
                     checksums_path,
@@ -242,10 +297,10 @@ fn parse_release_channel(value: &str) -> Result<installer::ReleaseChannel> {
         "stable" => Ok(installer::ReleaseChannel::Stable),
         "beta" => Ok(installer::ReleaseChannel::Beta),
         "canary" => Ok(installer::ReleaseChannel::Canary),
-        _ => bail!(
+        _ => Err(usage_error(format!(
             "invalid value for --channel: {}; expected stable|beta|canary",
             value
-        ),
+        ))),
     }
 }
 
@@ -255,10 +310,10 @@ fn parse_managed_by_flag(value: &str) -> Result<InstallManagedBy> {
         "desktop" => Ok(InstallManagedBy::Desktop),
         "manual" => Ok(InstallManagedBy::Manual),
         "unknown" => Ok(InstallManagedBy::Unknown),
-        _ => bail!(
+        _ => Err(usage_error(format!(
             "invalid value for --managed-by: {}; expected script|desktop|manual|unknown",
             value
-        ),
+        ))),
     }
 }
 
@@ -454,4 +509,55 @@ fn binary_display_name() -> String {
         })
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "pioneer".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args<'a>(values: &'a [&'a str]) -> impl Iterator<Item = String> + 'a {
+        values.iter().map(|value| (*value).to_owned())
+    }
+
+    #[test]
+    fn unknown_command_is_usage_error() {
+        for command in ["/load", "/install", "-install"] {
+            let error = run_with_args(args(&[command])).expect_err("unknown command should fail");
+
+            assert!(is_usage_error(&error), "{command} should be a usage error");
+            assert!(format!("{error:#}").contains(format!("unknown command: {command}").as_str()));
+        }
+    }
+
+    #[test]
+    fn unexpected_argument_is_usage_error() {
+        let error = parse_optional_json_flag(args(&["--verbose"]))
+            .expect_err("unexpected flag should fail");
+
+        assert!(is_usage_error(&error));
+        assert!(format!("{error:#}").contains("expected `--json`"));
+    }
+
+    #[test]
+    fn invalid_install_option_is_usage_error() {
+        let error = parse_install_options(
+            installer::InstallCommand::Install,
+            args(&["--channel", "nightly"]),
+        )
+        .expect_err("invalid channel should fail");
+
+        assert!(is_usage_error(&error));
+        assert!(format!("{error:#}").contains("invalid value for --channel"));
+    }
+
+    #[test]
+    fn subcommand_parse_failures_are_usage_errors() {
+        let error = run_with_args(args(&["secrets", "unknown"]))
+            .expect_err("unknown secrets command should fail");
+        assert!(is_usage_error(&error));
+
+        let error = run_with_args(args(&["task-invariants", "--json"]))
+            .expect_err("missing task-invariants db should fail");
+        assert!(is_usage_error(&error));
+    }
 }

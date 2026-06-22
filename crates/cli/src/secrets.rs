@@ -1,12 +1,13 @@
 use std::fmt::Write as _;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use pioneer_gateway::{
     McpSecretGarbageCollectionReport, SecretPermissionHealthReport, SecretPermissionHealthStatus,
     SecretsStatusReport, SuperuserJwtRotationReport,
 };
 
 use crate::service;
+use crate::usage_error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SecretsCommand {
@@ -39,12 +40,15 @@ pub(crate) fn parse_secrets_command(
         Some("status") => parse_status_command(args),
         Some("garbage-collection") => parse_garbage_collection_command(args),
         Some("rotate-jwt-token") => parse_rotate_jwt_token_command(args),
-        Some("help") | Some("--help") | Some("-h") => bail!("{}", secrets_help_text()),
-        Some(command) => bail!(
+        Some("help") | Some("--help") | Some("-h") => Err(usage_error(secrets_help_text())),
+        Some(command) => Err(usage_error(format!(
             "unknown secrets command: {command}\n\n{}",
             secrets_help_text()
-        ),
-        None => bail!("missing secrets command\n\n{}", secrets_help_text()),
+        ))),
+        None => Err(usage_error(format!(
+            "missing secrets command\n\n{}",
+            secrets_help_text()
+        ))),
     }
 }
 
@@ -53,7 +57,11 @@ fn parse_status_command(args: impl Iterator<Item = String>) -> Result<SecretsCom
     for arg in args {
         match arg.as_str() {
             "--json" => json = true,
-            flag => bail!("unexpected argument for secrets status: {flag}"),
+            flag => {
+                return Err(usage_error(format!(
+                    "unexpected argument for secrets status: {flag}"
+                )));
+            }
         }
     }
     Ok(SecretsCommand::Status { json })
@@ -66,7 +74,11 @@ fn parse_garbage_collection_command(args: impl Iterator<Item = String>) -> Resul
         match arg.as_str() {
             "--dry-run" => dry_run = true,
             "--json" => json = true,
-            flag => bail!("unexpected argument for secrets garbage-collection: {flag}"),
+            flag => {
+                return Err(usage_error(format!(
+                    "unexpected argument for secrets garbage-collection: {flag}"
+                )));
+            }
         }
     }
     Ok(SecretsCommand::Gc { dry_run, json })
@@ -76,17 +88,25 @@ fn parse_rotate_jwt_token_command(
     mut args: impl Iterator<Item = String>,
 ) -> Result<SecretsCommand> {
     let Some(target) = args.next() else {
-        bail!("secrets rotate-jwt-token requires a target: superuser");
+        return Err(usage_error(
+            "secrets rotate-jwt-token requires a target: superuser",
+        ));
     };
     if target.as_str() != "superuser" {
-        bail!("unsupported jwt token rotation target: {target}; expected superuser");
+        return Err(usage_error(format!(
+            "unsupported jwt token rotation target: {target}; expected superuser"
+        )));
     }
 
     let mut json = false;
     for arg in args {
         match arg.as_str() {
             "--json" => json = true,
-            flag => bail!("unexpected argument for secrets rotate-jwt-token: {flag}"),
+            flag => {
+                return Err(usage_error(format!(
+                    "unexpected argument for secrets rotate-jwt-token: {flag}"
+                )));
+            }
         }
     }
 
