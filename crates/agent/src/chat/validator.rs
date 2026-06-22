@@ -114,10 +114,17 @@ fn looks_like_raw_tool_call_markup(text: &str) -> bool {
 }
 
 fn looks_like_sanitized_dsml_tool_call_markup(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    let compact = lower
+    let compact = text
         .chars()
-        .filter(|ch| !ch.is_whitespace())
+        .filter_map(|ch| {
+            if ch.is_whitespace() {
+                None
+            } else if ch == '\u{FF5C}' {
+                Some('|')
+            } else {
+                Some(ch.to_ascii_lowercase())
+            }
+        })
         .collect::<String>();
     let Some(tool_calls_start) = compact.find("<||dsml||tool_calls") else {
         return false;
@@ -261,6 +268,14 @@ mod tests {
              < | | DSML | | parameter name=\"timeout_ms\" string=\"false\">120000</| | DSML | | parameter>\n\
              </| | DSML | | invoke>\n\
              </| | DSML | | tool_calls>"
+        ));
+        assert!(looks_like_raw_tool_call_markup(
+            "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}tool_calls>\n\
+             <\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}invoke name=\"web_search\">\n\
+             <\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}parameter name=\"q\" string=\"true\">Austrian GP 2026 F1 schedule</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}parameter>\n\
+             <\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}parameter name=\"region\" string=\"true\">ru-ru</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}parameter>\n\
+             </\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}invoke>\n\
+             </\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}tool_calls>"
         ));
     }
 
