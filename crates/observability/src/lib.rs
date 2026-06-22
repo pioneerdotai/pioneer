@@ -501,6 +501,14 @@ mod tests {
                 "Failed to run the control channel: Failed to read cmd: Connection reset by peer (os error 54). Retry in 507.880488ms...",
             ),
         ));
+        assert!(should_demote_rathole_client_control_channel_retry(
+            &tracing::Level::ERROR,
+            "rathole::client",
+            None,
+            Some(
+                "Failed to run the control channel: Failed to read cmd: early eof. Retry in 470.57167ms...",
+            ),
+        ));
     }
 
     #[test]
