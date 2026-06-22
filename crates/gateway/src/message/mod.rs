@@ -126,8 +126,8 @@ use pioneer_protocol::{
 };
 use pioneer_provider::{ChatMessage, ProviderRegistry};
 use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, is_anyhow_sqlite_transient_open,
-    retry_with_backoff,
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS,
+    is_anyhow_sqlite_transient_access, retry_with_backoff,
 };
 use pioneer_tasks::{TaskRuntime, TaskRuntimeConfig};
 use serde::Serialize;
@@ -171,14 +171,14 @@ where
 const RESILIENCE_WORKER_POLL_INTERVAL_SECONDS: u64 = 2;
 const RESILIENCE_WORKER_TRANSIENT_STORAGE_BACKOFF_SECONDS: u64 = 60;
 
-async fn retry_transient_storage_open<T, F, Fut>(operation: F) -> anyhow::Result<T>
+async fn retry_transient_storage_access<T, F, Fut>(operation: F) -> anyhow::Result<T>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = anyhow::Result<T>>,
 {
     retry_with_backoff(
         operation,
-        is_anyhow_sqlite_transient_open,
+        is_anyhow_sqlite_transient_access,
         DEFAULT_LOCK_RETRY_ATTEMPTS,
         Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
     )
@@ -189,7 +189,7 @@ fn record_transient_storage_poll_error(
     error: &anyhow::Error,
     transient_storage_poll_failed: &mut bool,
 ) {
-    if is_anyhow_sqlite_transient_open(error) {
+    if is_anyhow_sqlite_transient_access(error) {
         *transient_storage_poll_failed = true;
     }
 }
@@ -872,7 +872,7 @@ impl MessageProcessor {
                     next_skill_upload_cleanup = now.saturating_add(60);
                 }
 
-                match retry_transient_storage_open(|| {
+                match retry_transient_storage_access(|| {
                     this.poll_timeouts_respecting_human_wait(now, 64)
                 })
                 .await
@@ -894,7 +894,7 @@ impl MessageProcessor {
                     continue;
                 }
 
-                match retry_transient_storage_open(|| {
+                match retry_transient_storage_access(|| {
                     this.recovery_coordinator.run_ready_jobs(now, 64)
                 })
                 .await
@@ -916,7 +916,7 @@ impl MessageProcessor {
                     continue;
                 }
 
-                match retry_transient_storage_open(|| {
+                match retry_transient_storage_access(|| {
                     this.crud_store.replay_due_turn_event_projections(now, 64)
                 })
                 .await
@@ -974,7 +974,8 @@ impl MessageProcessor {
                 }
 
                 if let Err(error) =
-                    retry_transient_storage_open(|| this.process_due_task_deliveries(now, 64)).await
+                    retry_transient_storage_access(|| this.process_due_task_deliveries(now, 64))
+                        .await
                 {
                     record_transient_storage_poll_error(&error, &mut transient_storage_poll_failed);
                     error!(error = %format!("{error:#}"), "task delivery worker poll failed");

@@ -107,6 +107,20 @@ pub fn is_anyhow_sqlite_transient_open(error: &anyhow::Error) -> bool {
     is_sqlite_transient_open_message(format!("{error:#}").as_str())
 }
 
+pub fn is_sqlite_pool_timeout_message(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("connection pool timed out")
+        || normalized.contains("failed to acquire connection from pool")
+}
+
+pub fn is_anyhow_sqlite_pool_timeout(error: &anyhow::Error) -> bool {
+    is_sqlite_pool_timeout_message(format!("{error:#}").as_str())
+}
+
+pub fn is_anyhow_sqlite_transient_access(error: &anyhow::Error) -> bool {
+    is_anyhow_sqlite_transient_open(error) || is_anyhow_sqlite_pool_timeout(error)
+}
+
 pub async fn apply_sqlite_pragmas(connection: &DatabaseConnection) -> Result<()> {
     connection
         .query_one_raw(Statement::from_string(
@@ -181,7 +195,9 @@ fn is_disallowed_component(component: Component<'_>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_sqlite_lock_message, is_sqlite_transient_open_message};
+    use super::{
+        is_sqlite_lock_message, is_sqlite_pool_timeout_message, is_sqlite_transient_open_message,
+    };
 
     #[test]
     fn detects_sqlite_transient_open_errors() {
@@ -195,6 +211,20 @@ mod tests {
     fn transient_open_errors_do_not_match_lock_only_predicate() {
         assert!(!is_sqlite_lock_message(
             "Query Error: error returned from database: (code: 14) unable to open database file"
+        ));
+    }
+
+    #[test]
+    fn detects_sqlite_pool_acquire_timeouts() {
+        assert!(is_sqlite_pool_timeout_message(
+            "failed to query expired running attempts: Failed to acquire connection from pool: Connection pool timed out: Connection pool timed out",
+        ));
+    }
+
+    #[test]
+    fn pool_acquire_timeouts_do_not_match_lock_only_predicate() {
+        assert!(!is_sqlite_lock_message(
+            "Failed to acquire connection from pool: Connection pool timed out"
         ));
     }
 }
