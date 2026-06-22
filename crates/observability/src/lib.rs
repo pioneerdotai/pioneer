@@ -141,6 +141,11 @@ where
         event.metadata().target(),
         fields.log_target.as_deref(),
         fields.message.as_deref(),
+    ) || should_demote_rathole_client_control_channel_retry(
+        event.metadata().level(),
+        event.metadata().target(),
+        fields.log_target.as_deref(),
+        fields.message.as_deref(),
     ) {
         return EventMapping::Breadcrumb(breadcrumb_from_event(
             event,
@@ -210,6 +215,26 @@ fn should_demote_gpui_asset_cache_http_not_found(
     *level == tracing::Level::ERROR
         && effective_event_target(target, log_target) == "gpui::asset_cache"
         && message.is_some_and(is_gpui_asset_cache_http_not_found)
+}
+
+fn should_demote_rathole_client_control_channel_retry(
+    level: &tracing::Level,
+    target: &str,
+    log_target: Option<&str>,
+    message: Option<&str>,
+) -> bool {
+    *level == tracing::Level::ERROR
+        && effective_event_target(target, log_target) == "rathole::client"
+        && message.is_some_and(is_rathole_client_control_channel_retry)
+}
+
+fn is_rathole_client_control_channel_retry(message: &str) -> bool {
+    message.starts_with("Failed to run the control channel:")
+        && message.contains(". Retry in ")
+        && !message.contains("Incorrect token")
+        && !message.contains("Authentication failed")
+        && !message.contains("Service not exist")
+        && !message.contains("Service does not exist")
 }
 
 fn is_gpui_asset_cache_http_not_found(message: &str) -> bool {
@@ -310,6 +335,7 @@ fn non_empty(value: &str) -> Option<&str> {
 mod tests {
     use super::{
         sentry_event_filter, should_demote_gpui_asset_cache_http_not_found,
+        should_demote_rathole_client_control_channel_retry,
         should_demote_rmcp_transport_worker_failure,
         should_demote_tantivy_reader_commit_reload_not_found,
     };
@@ -461,6 +487,42 @@ mod tests {
             None,
             Some(
                 "Failed to load asset: unexpected http status for https://example.com/favicon.ico: 404 Not Found, body: not found",
+            ),
+        ));
+    }
+
+    #[test]
+    fn demotes_rathole_client_control_channel_network_retry() {
+        assert!(should_demote_rathole_client_control_channel_retry(
+            &tracing::Level::ERROR,
+            "rathole::client",
+            None,
+            Some(
+                "Failed to run the control channel: Failed to read cmd: Connection reset by peer (os error 54). Retry in 507.880488ms...",
+            ),
+        ));
+    }
+
+    #[test]
+    fn keeps_rathole_client_control_channel_auth_failure_as_event() {
+        assert!(!should_demote_rathole_client_control_channel_retry(
+            &tracing::Level::ERROR,
+            "rathole::client",
+            None,
+            Some(
+                "Failed to run the control channel: Authentication failed: pioneer_gateway: Incorrect token. Retry in 1s...",
+            ),
+        ));
+    }
+
+    #[test]
+    fn keeps_rathole_client_control_channel_retry_from_other_targets_as_event() {
+        assert!(!should_demote_rathole_client_control_channel_retry(
+            &tracing::Level::ERROR,
+            "pioneer_gateway",
+            None,
+            Some(
+                "Failed to run the control channel: Failed to read cmd: Connection reset by peer (os error 54). Retry in 507.880488ms...",
             ),
         ));
     }
