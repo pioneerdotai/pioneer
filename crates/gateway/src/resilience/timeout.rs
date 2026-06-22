@@ -1,9 +1,12 @@
 use anyhow::Result;
 use pioneer_crud::{CrudStore, TimeoutCandidate, TurnItemAttemptDeadlines};
-use pioneer_protocol::TurnItemType;
+use pioneer_protocol::{TurnItem, TurnItemType};
 use pioneer_provider::ProviderTimeoutPolicy;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+const CLI_CONTEXT_COMPACTION_TIMEOUT_SECS: u64 = 5 * 60;
+const CLI_CONTEXT_COMPACTION_HARD_TIMEOUT_SECS: u64 = 10 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimeoutPolicy {
@@ -153,6 +156,18 @@ impl TimeoutPolicyRegistry {
                 hard_secs: 120,
             })
     }
+
+    pub fn policy_for_item(&self, item: &TurnItem) -> TimeoutPolicy {
+        if is_cli_native_context_compaction_item(item) {
+            return TimeoutPolicy {
+                lease_secs: CLI_CONTEXT_COMPACTION_TIMEOUT_SECS,
+                idle_secs: CLI_CONTEXT_COMPACTION_TIMEOUT_SECS,
+                hard_secs: CLI_CONTEXT_COMPACTION_HARD_TIMEOUT_SECS,
+            };
+        }
+
+        self.policy_for(item.item_type())
+    }
 }
 
 #[derive(Clone)]
@@ -175,6 +190,21 @@ impl TimeoutSupervisor {
         started_at_unix: i64,
     ) -> TurnItemAttemptDeadlines {
         let policy = self.policy_registry.policy_for(item_type);
+        let (lease_expires_at, idle_deadline_at, hard_deadline_at) =
+            policy.deadlines(started_at_unix);
+        TurnItemAttemptDeadlines {
+            lease_expires_at_unix: Some(lease_expires_at),
+            idle_deadline_at_unix: Some(idle_deadline_at),
+            hard_deadline_at_unix: Some(hard_deadline_at),
+        }
+    }
+
+    pub fn deadlines_for_item(
+        &self,
+        item: &TurnItem,
+        started_at_unix: i64,
+    ) -> TurnItemAttemptDeadlines {
+        let policy = self.policy_registry.policy_for_item(item);
         let (lease_expires_at, idle_deadline_at, hard_deadline_at) =
             policy.deadlines(started_at_unix);
         TurnItemAttemptDeadlines {
@@ -283,6 +313,22 @@ impl TimeoutSupervisor {
     }
 }
 
+fn is_cli_native_context_compaction_item(item: &TurnItem) -> bool {
+    let TurnItem::SystemEvent { code, details, .. } = item else {
+        return false;
+    };
+
+    if code.as_deref() != Some("agent_context_compaction") {
+        return false;
+    }
+
+    details
+        .as_ref()
+        .and_then(|details| details.get("nativeItemKind"))
+        .and_then(|value| value.as_str())
+        == Some("contextCompaction")
+}
+
 fn saturating_add_secs(base: i64, seconds: u64) -> i64 {
     base.saturating_add(i64::try_from(seconds).unwrap_or(i64::MAX))
 }
@@ -290,7 +336,7 @@ fn saturating_add_secs(base: i64, seconds: u64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pioneer_protocol::TurnItemType;
+    use pioneer_protocol::{SystemEventLevel, TurnItem, TurnItemType};
 
     #[test]
     fn provider_timeout_policy_extends_agent_message_idle_deadlines() {
@@ -315,5 +361,46 @@ mod tests {
 
         assert_eq!(reasoning.idle_secs, 75);
         assert_eq!(reasoning.hard_secs, 1020);
+    }
+
+    #[test]
+    fn cli_native_context_compaction_uses_extended_timeout() {
+        let registry = TimeoutPolicyRegistry::default();
+        let item = TurnItem::SystemEvent {
+            id: "context-compaction".to_owned(),
+            level: SystemEventLevel::Info,
+            message: "Context compaction started".to_owned(),
+            code: Some("agent_context_compaction".to_owned()),
+            details: Some(serde_json::json!({
+                "nativeItemKind": "contextCompaction",
+                "status": "started"
+            })),
+        };
+
+        let policy = registry.policy_for_item(&item);
+        let (lease_expires_at, idle_deadline_at, hard_deadline_at) = policy.deadlines(1_000);
+
+        assert_eq!(lease_expires_at, 1_300);
+        assert_eq!(idle_deadline_at, 1_300);
+        assert_eq!(hard_deadline_at, 1_600);
+    }
+
+    #[test]
+    fn ordinary_system_event_keeps_default_timeout() {
+        let registry = TimeoutPolicyRegistry::default();
+        let item = TurnItem::SystemEvent {
+            id: "ordinary-event".to_owned(),
+            level: SystemEventLevel::Info,
+            message: "Regular event".to_owned(),
+            code: Some("agent_runtime_item".to_owned()),
+            details: None,
+        };
+
+        let policy = registry.policy_for_item(&item);
+        let (lease_expires_at, idle_deadline_at, hard_deadline_at) = policy.deadlines(1_000);
+
+        assert_eq!(lease_expires_at, 1_030);
+        assert_eq!(idle_deadline_at, 1_030);
+        assert_eq!(hard_deadline_at, 1_120);
     }
 }

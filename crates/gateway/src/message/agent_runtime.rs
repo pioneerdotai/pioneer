@@ -1126,10 +1126,9 @@ impl MessageProcessor {
                 let turn_id = notification.turn_id.clone();
                 let event_timestamp = now_timestamp_secs();
                 let item_id = notification.item.item_id().to_owned();
-                let item_type = notification.item.item_type();
                 let deadlines = self
                     .timeout_supervisor
-                    .deadlines_for(item_type, event_timestamp);
+                    .deadlines_for_item(&notification.item, event_timestamp);
                 if let Err(error) = message_future(
                     self.crud_store
                         .materialize_item_started_with_attempt_deadlines(
@@ -1165,7 +1164,7 @@ impl MessageProcessor {
                     thread_id = notification.thread_id,
                     turn_id = notification.turn_id,
                     item_id,
-                    item_type = ?item_type,
+                    item_type = ?notification.item.item_type(),
                     "registered item attempt deadlines during item/started projection"
                 );
             }
