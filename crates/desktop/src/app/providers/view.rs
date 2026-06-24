@@ -914,7 +914,7 @@ impl PioneerDesktop {
 fn cli_runtime_provider_logo(kind: CLIAgentRuntimeKind) -> (&'static str, &'static str) {
     match kind {
         CLIAgentRuntimeKind::Codex => ("openai", "logos/providers/openai.svg"),
-        CLIAgentRuntimeKind::Claude => ("anthropic", "logos/providers/anthropic.svg"),
+        CLIAgentRuntimeKind::Claude => ("claude", "logos/providers/claude.svg"),
     }
 }
 
