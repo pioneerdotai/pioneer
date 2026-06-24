@@ -182,6 +182,10 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
         Ok(())
     }
 
+    fn supports_thread_name_sync(&self) -> bool {
+        true
+    }
+
     async fn start_thread(
         &self,
         params: CLIAgentRuntimeThreadOpenParams,
