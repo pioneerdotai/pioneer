@@ -33,6 +33,7 @@ pub struct Model {
     pub history_json: String,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text", nullable)]
     pub reasoning_effort: Option<String>,
 }
 

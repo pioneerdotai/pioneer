@@ -24,6 +24,7 @@ pub struct Model {
     pub updated_at: DateTimeWithTimeZone,
     pub turn_kind: String,
     pub origin: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub reasoning_effort: Option<String>,
 }
 
