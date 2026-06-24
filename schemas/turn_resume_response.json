@@ -229,7 +229,7 @@
         "assistant_full",
         "assistant_minimal",
         "assistant_none",
-        "cli_runtime_codex"
+        "cli_runtime"
       ]
     },
     "Turn": {

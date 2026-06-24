@@ -699,7 +699,7 @@ fn claude_model_from_initialize_model(value: &JsonValue) -> Option<ClaudeModelSn
             values
                 .iter()
                 .filter_map(JsonValue::as_str)
-                .map(str::to_owned)
+                .filter_map(normalize_reasoning_effort)
                 .collect::<Vec<_>>()
         })
         .filter(|values| !values.is_empty())
@@ -739,6 +739,26 @@ fn claude_model_from_initialize_model(value: &JsonValue) -> Option<ClaudeModelSn
         max_input_tokens: None,
         max_output_tokens: None,
     })
+}
+
+fn normalize_reasoning_effort(value: &str) -> Option<String> {
+    let compact = value
+        .trim()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+
+    match compact.as_str() {
+        "none" | "off" | "disabled" => Some("none".to_owned()),
+        "minimal" | "min" => Some("minimal".to_owned()),
+        "low" => Some("low".to_owned()),
+        "medium" | "med" => Some("medium".to_owned()),
+        "high" => Some("high".to_owned()),
+        "xhigh" | "extrahigh" | "xtrahigh" => Some("xhigh".to_owned()),
+        "max" | "maximum" => Some("max".to_owned()),
+        _ => None,
+    }
 }
 
 fn stderr_lines(bytes: &[u8]) -> Vec<String> {
@@ -822,5 +842,57 @@ pub fn redact_claude_native_payload(value: JsonValue) -> JsonValue {
                 .collect(),
         ),
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn claude_model_parser_preserves_camel_case_effort_metadata() {
+        let model = claude_model_from_initialize_model(&json!({
+            "value": "claude-sonnet-4-6",
+            "displayName": "Claude Sonnet 4.6",
+            "supportsEffort": true,
+            "supportedEffortLevels": ["low", "medium", "high", "max"]
+        }))
+        .expect("model metadata");
+
+        assert_eq!(model.id, "claude-sonnet-4-6");
+        assert_eq!(model.name.as_deref(), Some("Claude Sonnet 4.6"));
+        assert_eq!(model.effort_options, vec!["low", "medium", "high", "max"]);
+        assert_eq!(model.supports_reasoning, Some(true));
+    }
+
+    #[test]
+    fn claude_model_parser_preserves_snake_case_effort_metadata() {
+        let model = claude_model_from_initialize_model(&json!({
+            "id": "claude-opus-4-8",
+            "display_name": "Claude Opus 4.8",
+            "supports_effort": true,
+            "supported_effort_levels": ["low", "medium", "high", "extra-high", "maximum"]
+        }))
+        .expect("model metadata");
+
+        assert_eq!(model.id, "claude-opus-4-8");
+        assert_eq!(
+            model.effort_options,
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(model.supports_reasoning, Some(true));
+    }
+
+    #[test]
+    fn claude_model_parser_defaults_effort_levels_when_only_support_flag_exists() {
+        let model = claude_model_from_initialize_model(&json!({
+            "id": "claude-custom",
+            "supportsEffort": true
+        }))
+        .expect("model metadata");
+
+        assert_eq!(model.effort_options, vec!["low", "medium", "high", "max"]);
+        assert_eq!(model.supports_reasoning, Some(true));
     }
 }

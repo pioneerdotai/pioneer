@@ -11,6 +11,7 @@ fn legacy_api_provider_turn_start_fixture_decodes_without_execution_backend() {
     assert_eq!(params.thread_id, "thr_legacy_api");
     assert_eq!(params.turn_id, "turn_legacy_api");
     assert!(params.execution_backend.is_none());
+    assert!(params.reasoning.is_none());
     assert!(params.cli_runtime_options.is_none());
     assert!(matches!(
         params.input.first(),

@@ -171,6 +171,7 @@ impl MessageProcessor {
                 sandbox_policy: None,
                 mode: None,
                 execution_backend: None,
+                reasoning: None,
                 cli_runtime_options: None,
             })
             .await?;

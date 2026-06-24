@@ -10,7 +10,8 @@ use pioneer_protocol::{
     CLIRuntimeListModelsResponse, CLIRuntimeListParams, CLIRuntimeListResponse,
     CLIRuntimeRefreshParams, CLIRuntimeRefreshResponse, GatewayCliRuntimeSettings,
     ProviderListModelsParams, ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
-    ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits, ProviderSummary,
+    ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits,
+    ProviderModelReasoningCapabilities, ProviderSummary, ReasoningCapabilitySource,
     RuntimeModelInfo, RuntimeStatus, RuntimeSummary,
 };
 use std::collections::HashSet;
@@ -815,6 +816,18 @@ fn provider_model_from_runtime_model(
     provider_key: &str,
     model: RuntimeModelInfo,
 ) -> ProviderModelInfo {
+    let supports_reasoning = model
+        .supports_reasoning
+        .or_else(|| (!model.effort_options.is_empty()).then_some(true));
+    let reasoning = supports_reasoning.map(|supported| ProviderModelReasoningCapabilities {
+        supported: Some(supported),
+        effort_options: model.effort_options.clone(),
+        default_effort: None,
+        mandatory: None,
+        supports_token_budget: None,
+        source: Some(ReasoningCapabilitySource::CliMetadata),
+    });
+
     ProviderModelInfo {
         id: model.id,
         name: model.name,
@@ -832,7 +845,8 @@ fn provider_model_from_runtime_model(
             tool_calling: None,
             json_output: None,
             streaming: Some(true),
-            thinking: model.supports_reasoning,
+            thinking: supports_reasoning,
+            reasoning,
             fine_tuning: None,
             input_modalities: (!model.input_modalities.is_empty())
                 .then_some(model.input_modalities),
@@ -1275,7 +1289,7 @@ mod tests {
                     effort_options: vec!["low".to_owned(), "high".to_owned()],
                     input_modalities: vec!["text".to_owned()],
                     output_modalities: vec!["text".to_owned()],
-                    supports_reasoning: Some(true),
+                    supports_reasoning: None,
                     supports_vision: Some(false),
                     max_input_tokens: Some(128_000),
                     max_output_tokens: Some(16_000),
@@ -1294,6 +1308,20 @@ mod tests {
         );
         assert_eq!(response.models[0].name.as_deref(), Some("GPT 5.4"));
         assert_eq!(response.models[0].capabilities.thinking, Some(true));
+        let reasoning = response.models[0]
+            .capabilities
+            .reasoning
+            .as_ref()
+            .expect("CLI reasoning metadata should be preserved");
+        assert_eq!(reasoning.supported, Some(true));
+        assert_eq!(
+            reasoning.effort_options,
+            vec!["low".to_owned(), "high".to_owned()]
+        );
+        assert_eq!(
+            reasoning.source,
+            Some(ReasoningCapabilitySource::CliMetadata)
+        );
     }
 
     #[test]

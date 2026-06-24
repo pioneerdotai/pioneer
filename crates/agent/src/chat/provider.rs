@@ -1031,6 +1031,26 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_reasoning_parameter_preserves_provider_error_text() {
+        let message = "provider error: unrecognized request argument: reasoning_effort".to_owned();
+
+        let ChatTurnError::ProviderFailure { failure, .. } = provider_failure_error(
+            "reasoning_item",
+            TurnItemType::Reasoning,
+            "openai",
+            "gpt-5.5",
+            ProviderTransportKind::NonStream,
+            ProviderFailureStage::Connect,
+            message.clone(),
+        ) else {
+            panic!("expected provider failure");
+        };
+
+        assert_eq!(failure.class, ProviderFailureClass::UnsupportedParameter);
+        assert_eq!(failure.message.as_deref(), Some(message.as_str()));
+    }
+
+    #[test]
     fn context_length_maps_to_context_too_large() {
         assert_eq!(
             classify_provider_failure_class(

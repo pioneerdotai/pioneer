@@ -8,6 +8,7 @@ pub mod attachments;
 pub mod factory;
 mod http;
 pub mod providers;
+pub mod reasoning_registry;
 pub mod registry;
 pub mod tools;
 pub mod traits;

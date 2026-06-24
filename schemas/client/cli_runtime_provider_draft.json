@@ -18,6 +18,9 @@
     "id": {
       "type": "string"
     },
+    "kind": {
+      "$ref": "#/$defs/CLIAgentRuntimeKind"
+    },
     "mode": {
       "$ref": "#/$defs/CLIRuntimeProviderDraftMode"
     },
@@ -27,6 +30,7 @@
   },
   "required": [
     "mode",
+    "kind",
     "id",
     "display_name",
     "enabled",
@@ -35,6 +39,13 @@
     "shadow_home_path"
   ],
   "$defs": {
+    "CLIAgentRuntimeKind": {
+      "type": "string",
+      "enum": [
+        "codex",
+        "claude"
+      ]
+    },
     "CLIRuntimeProviderDraftMode": {
       "oneOf": [
         {

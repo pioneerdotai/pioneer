@@ -59,6 +59,7 @@ pub struct PreparedComposerTurnSubmitContext {
     pub turn_model_provider: Option<String>,
     pub selected_mode: Option<ThreadMode>,
     pub execution_backend: Option<AgentExecutionBackend>,
+    pub selected_reasoning_effort: Option<String>,
     pub cli_runtime_options: Option<TurnCLIRuntimeOptions>,
     pub updated_at_unix: i64,
 }
@@ -212,6 +213,19 @@ pub fn reduce_prepared_composer_turn_submit_success(
         turn_id: context.turn_id.clone(),
         pending_request_id: context.pending_request_id.clone(),
     };
+    let reasoning =
+        turn_start::turn_reasoning_selection_from_effort(context.selected_reasoning_effort.clone());
+    let cli_runtime_options = if matches!(
+        &context.execution_backend,
+        Some(AgentExecutionBackend::CLIAgentRuntime { .. })
+    ) {
+        cli_runtime_options_with_reasoning_effort(
+            context.cli_runtime_options,
+            context.selected_reasoning_effort,
+        )
+    } else {
+        context.cli_runtime_options
+    };
 
     PreparedComposerTurnSubmitReduction {
         composer_upload_in_progress: false,
@@ -242,10 +256,33 @@ pub fn reduce_prepared_composer_turn_submit_success(
             model_provider: context.turn_model_provider,
             mode: context.selected_mode,
             execution_backend: context.execution_backend,
-            cli_runtime_options: context.cli_runtime_options,
+            reasoning,
+            cli_runtime_options,
         },
         send_context,
     }
+}
+
+fn cli_runtime_options_with_reasoning_effort(
+    options: Option<TurnCLIRuntimeOptions>,
+    selected_reasoning_effort: Option<String>,
+) -> Option<TurnCLIRuntimeOptions> {
+    let Some(effort) = turn_start::turn_reasoning_selection_from_effort(selected_reasoning_effort)
+        .map(|selection| selection.effort)
+    else {
+        return options;
+    };
+
+    let mut options = options.unwrap_or(TurnCLIRuntimeOptions {
+        approval_policy: None,
+        sandbox: None,
+        effort: None,
+        personality: None,
+        summary: None,
+        steer_if_active: None,
+    });
+    options.effort = Some(effort);
+    Some(options)
 }
 
 pub fn reduce_prepare_composer_turn_failure(
@@ -868,6 +905,7 @@ mod tests {
                 turn_model_provider: Some("openai".to_owned()),
                 selected_mode: Some(ThreadMode::Agent),
                 execution_backend: None,
+                selected_reasoning_effort: None,
                 cli_runtime_options: None,
                 updated_at_unix: 42,
             },
@@ -939,6 +977,85 @@ mod tests {
         assert_eq!(reduction.send_context.thread_id, "thread_a");
         assert_eq!(reduction.send_context.turn_id, "turn_a");
         assert_eq!(reduction.send_context.pending_request_id, "pending_a");
+    }
+
+    #[test]
+    fn prepared_composer_submit_success_plans_api_reasoning_effort() {
+        let prepared = build_prepared_composer_turn("hello".to_owned(), Vec::new(), Vec::new());
+
+        let reduction = reduce_prepared_composer_turn_submit_success(
+            PreparedComposerTurnSubmitContext {
+                thread_id: "thread_a".to_owned(),
+                turn_id: "turn_a".to_owned(),
+                pending_request_id: "pending_a".to_owned(),
+                selected_model: Some("gpt-5".to_owned()),
+                selected_provider: Some("openai".to_owned()),
+                turn_model_provider: Some("openai".to_owned()),
+                selected_mode: Some(ThreadMode::Agent),
+                execution_backend: None,
+                selected_reasoning_effort: Some(" high ".to_owned()),
+                cli_runtime_options: None,
+                updated_at_unix: 42,
+            },
+            prepared,
+        );
+
+        assert_eq!(
+            reduction
+                .turn_start_params_plan
+                .reasoning
+                .as_ref()
+                .map(|selection| selection.effort.as_str()),
+            Some("high")
+        );
+        assert!(
+            reduction
+                .turn_start_params_plan
+                .cli_runtime_options
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn prepared_composer_submit_success_plans_cli_reasoning_effort() {
+        let prepared = build_prepared_composer_turn("hello".to_owned(), Vec::new(), Vec::new());
+
+        let reduction = reduce_prepared_composer_turn_submit_success(
+            PreparedComposerTurnSubmitContext {
+                thread_id: "thread_a".to_owned(),
+                turn_id: "turn_a".to_owned(),
+                pending_request_id: "pending_a".to_owned(),
+                selected_model: Some("gpt-5".to_owned()),
+                selected_provider: Some("cli_runtime:codex".to_owned()),
+                turn_model_provider: None,
+                selected_mode: Some(ThreadMode::Agent),
+                execution_backend: Some(AgentExecutionBackend::CLIAgentRuntime {
+                    runtime_id: "codex".to_owned(),
+                    runtime_kind: pioneer_protocol::CLIAgentRuntimeKind::Codex,
+                }),
+                selected_reasoning_effort: Some("high".to_owned()),
+                cli_runtime_options: None,
+                updated_at_unix: 42,
+            },
+            prepared,
+        );
+
+        assert_eq!(
+            reduction
+                .turn_start_params_plan
+                .reasoning
+                .as_ref()
+                .map(|selection| selection.effort.as_str()),
+            Some("high")
+        );
+        assert_eq!(
+            reduction
+                .turn_start_params_plan
+                .cli_runtime_options
+                .as_ref()
+                .and_then(|options| options.effort.as_deref()),
+            Some("high")
+        );
     }
 
     #[test]

@@ -1,0 +1,284 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ReasoningEffortRowsRequest",
+  "type": "object",
+  "properties": {
+    "model": {
+      "$ref": "#/$defs/ProviderModelInfo"
+    },
+    "selected_effort": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "model"
+  ],
+  "$defs": {
+    "ProviderModelCapabilities": {
+      "type": "object",
+      "properties": {
+        "fine_tuning": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "input_modalities": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "json_output": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "output_modalities": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "reasoning": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderModelReasoningCapabilities"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "streaming": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "thinking": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "tool_calling": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "vision": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "ProviderModelInfo": {
+      "type": "object",
+      "properties": {
+        "active": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "capabilities": {
+          "$ref": "#/$defs/ProviderModelCapabilities"
+        },
+        "created": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "family": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "lifecycle_status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limits": {
+          "$ref": "#/$defs/ProviderModelLimits"
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "owned_by": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pricing": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderModelPricing"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "provider": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "provider",
+        "limits",
+        "capabilities"
+      ]
+    },
+    "ProviderModelLimits": {
+      "type": "object",
+      "properties": {
+        "context_window": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_input_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_output_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      }
+    },
+    "ProviderModelPricing": {
+      "type": "object",
+      "properties": {
+        "image": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "input_token": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "output_token": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "request": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      }
+    },
+    "ProviderModelReasoningCapabilities": {
+      "type": "object",
+      "properties": {
+        "default_effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effort_options": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "mandatory": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "source": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReasoningCapabilitySource"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "supported": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "supports_token_budget": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "ReasoningCapabilitySource": {
+      "type": "string",
+      "enum": [
+        "provider_metadata",
+        "cli_metadata",
+        "static_registry",
+        "config_override",
+        "unknown"
+      ]
+    }
+  }
+}

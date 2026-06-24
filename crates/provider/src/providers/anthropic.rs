@@ -2,10 +2,11 @@ use crate::attachments::{
     PreparedAttachmentSource, PreparedProviderMessages, attachment_bytes,
     ensure_no_unrendered_attachments, prepare_messages_for_provider,
 };
+use crate::reasoning_registry;
 use crate::types::{
     ChatRequest, ChatResponse, InputContentType, InputTypeSupport, ProviderCapabilities,
-    ProviderInputCapabilities, ProviderTimeoutPolicy, ProviderToolCall, Role, StreamChunk,
-    TokenUsage, ToolChoice, ToolDefinition,
+    ProviderInputCapabilities, ProviderTimeoutPolicy, ProviderToolCall, ReasoningConfig, Role,
+    StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -44,8 +45,15 @@ struct ApiChatRequest {
     tools: Option<Vec<AnthropicToolDefinition>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<AnthropicToolChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<AnthropicOutputConfig>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct AnthropicOutputConfig {
+    effort: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -355,6 +363,15 @@ impl AnthropicProvider {
         }
     }
 
+    fn output_config(reasoning: Option<ReasoningConfig>) -> Option<AnthropicOutputConfig> {
+        match reasoning {
+            Some(ReasoningConfig::Effort(effort)) => Some(AnthropicOutputConfig {
+                effort: effort.as_str().to_owned(),
+            }),
+            Some(ReasoningConfig::Disabled) | None => None,
+        }
+    }
+
     fn messages_url(&self) -> String {
         format!("{}/v1/messages", self.base_url)
     }
@@ -446,6 +463,7 @@ impl crate::traits::Provider for AnthropicProvider {
                 .as_ref()
                 .map(|tools| Self::convert_tools(tools)),
             tool_choice: request.tool_choice.map(Self::convert_tool_choice),
+            output_config: Self::output_config(request.reasoning),
             stream: false,
         };
 
@@ -546,6 +564,7 @@ impl crate::traits::Provider for AnthropicProvider {
                 .as_ref()
                 .map(|tools| Self::convert_tools(tools)),
             tool_choice: request.tool_choice.map(Self::convert_tool_choice),
+            output_config: Self::output_config(request.reasoning),
             stream: true,
         };
 
@@ -732,36 +751,40 @@ impl crate::traits::Provider for AnthropicProvider {
         Ok(api_response
             .data
             .into_iter()
-            .map(|m| {
-                let created = m.created_at.as_ref().and_then(|s| {
-                    chrono::DateTime::parse_from_rfc3339(s)
-                        .ok()
-                        .map(|dt| dt.timestamp())
-                });
-
-                ProviderModelInfo {
-                    id: m.id.clone(),
-                    name: m.display_name,
-                    description: None,
-                    created,
-                    provider: "anthropic".to_owned(),
-                    owned_by: Some("anthropic".to_owned()),
-                    limits: ProviderModelLimits {
-                        max_input_tokens: m.max_input_tokens,
-                        max_output_tokens: m.max_tokens,
-                        context_window: match (m.max_input_tokens, m.max_tokens) {
-                            (Some(i), Some(o)) => Some(i + o),
-                            _ => None,
-                        },
-                    },
-                    capabilities: ProviderModelCapabilities::default(),
-                    pricing: None,
-                    active: Some(true),
-                    family: None,
-                    lifecycle_status: None,
-                }
-            })
+            .map(provider_model_from_anthropic_model_entry)
             .collect())
+    }
+}
+
+fn provider_model_from_anthropic_model_entry(m: AnthropicModelEntry) -> ProviderModelInfo {
+    let created = m.created_at.as_ref().and_then(|s| {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .ok()
+            .map(|dt| dt.timestamp())
+    });
+    let mut capabilities = ProviderModelCapabilities::default();
+    reasoning_registry::apply_reasoning_capabilities("anthropic", m.id.as_str(), &mut capabilities);
+
+    ProviderModelInfo {
+        id: m.id.clone(),
+        name: m.display_name,
+        description: None,
+        created,
+        provider: "anthropic".to_owned(),
+        owned_by: Some("anthropic".to_owned()),
+        limits: ProviderModelLimits {
+            max_input_tokens: m.max_input_tokens,
+            max_output_tokens: m.max_tokens,
+            context_window: match (m.max_input_tokens, m.max_tokens) {
+                (Some(i), Some(o)) => Some(i + o),
+                _ => None,
+            },
+        },
+        capabilities,
+        pricing: None,
+        active: Some(true),
+        family: None,
+        lifecycle_status: None,
     }
 }
 
@@ -770,7 +793,7 @@ mod tests {
     use super::*;
     use crate::attachments::prepare_messages_for_provider;
     use crate::traits::Provider;
-    use crate::types::{ChatMessage, CompiledPromptPayload};
+    use crate::types::{ChatMessage, CompiledPromptPayload, ReasoningConfig, ReasoningEffort};
 
     fn render_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<ApiMessage>) {
         let provider = AnthropicProvider::new("test-key");
@@ -801,6 +824,82 @@ mod tests {
             provider.messages_url(),
             "https://api.anthropic.com/v1/messages"
         );
+    }
+
+    #[test]
+    fn anthropic_reasoning_registry_exposes_supported_opus_efforts() {
+        let reasoning =
+            reasoning_registry::reasoning_capabilities_for_model("anthropic", "claude-opus-4-8")
+                .expect("opus 4.8 reasoning metadata");
+
+        assert_eq!(reasoning.supported, Some(true));
+        assert_eq!(
+            reasoning.effort_options,
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(reasoning.default_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn anthropic_reasoning_registry_exposes_supported_sonnet_efforts() {
+        let reasoning =
+            reasoning_registry::reasoning_capabilities_for_model("anthropic", "claude-sonnet-4-6")
+                .expect("sonnet 4.6 reasoning metadata");
+
+        assert_eq!(reasoning.supported, Some(true));
+        assert_eq!(
+            reasoning.effort_options,
+            vec!["low", "medium", "high", "max"]
+        );
+    }
+
+    #[test]
+    fn anthropic_reasoning_registry_leaves_unknown_models_unset() {
+        assert!(
+            reasoning_registry::reasoning_capabilities_for_model("anthropic", "claude-sonnet-3-7")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn anthropic_model_list_fixture_normalizes_reasoning_capabilities() {
+        let response: ModelsListResponse = serde_json::from_str(
+            r#"{
+                "data": [
+                    {
+                        "id": "claude-opus-4-8",
+                        "display_name": "Claude Opus 4.8",
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "max_input_tokens": 200000,
+                        "max_tokens": 64000
+                    },
+                    {
+                        "id": "claude-sonnet-3-7",
+                        "display_name": "Claude Sonnet 3.7"
+                    }
+                ]
+            }"#,
+        )
+        .expect("fixture response");
+        let models = response
+            .data
+            .into_iter()
+            .map(provider_model_from_anthropic_model_entry)
+            .collect::<Vec<_>>();
+
+        let reasoning = models[0]
+            .capabilities
+            .reasoning
+            .as_ref()
+            .expect("supported reasoning model");
+        assert_eq!(
+            reasoning.effort_options,
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(models[0].capabilities.thinking, Some(true));
+        assert_eq!(models[0].limits.context_window, Some(264000));
+
+        assert!(models[1].capabilities.reasoning.is_none());
     }
 
     #[test]
@@ -903,6 +1002,7 @@ mod tests {
             system: Some("Be helpful".into()),
             tools: None,
             tool_choice: None,
+            output_config: None,
             stream: false,
         };
 
@@ -913,6 +1013,7 @@ mod tests {
         assert!(json.contains("\"max_tokens\":8192"));
         assert!(json.contains("\"temperature\":0.7"));
         assert!(json.contains("\"system\":\"Be helpful\""));
+        assert!(!json.contains("\"output_config\""));
         // stream=false should be omitted via skip_serializing_if
         assert!(!json.contains("\"stream\""));
     }
@@ -932,6 +1033,7 @@ mod tests {
             system: None,
             tools: None,
             tool_choice: None,
+            output_config: None,
             stream: true,
         };
 
@@ -940,6 +1042,41 @@ mod tests {
         assert!(json.contains("\"stream\":true"));
         assert!(!json.contains("\"temperature\""));
         assert!(!json.contains("\"system\""));
+    }
+
+    #[test]
+    fn api_request_serializes_reasoning_effort_under_output_config() {
+        assert!(AnthropicProvider::output_config(Some(ReasoningConfig::disabled())).is_none());
+        assert_eq!(
+            AnthropicProvider::output_config(Some(ReasoningConfig::effort(ReasoningEffort::None)))
+                .expect("explicit none effort should serialize")
+                .effort,
+            "none"
+        );
+
+        let request = ApiChatRequest {
+            model: "claude-sonnet-4-20250514".into(),
+            messages: vec![ApiMessage {
+                role: "user".into(),
+                content: vec![ApiMessageContentBlock::Text {
+                    text: "Hello".into(),
+                }],
+            }],
+            max_tokens: 8192,
+            temperature: None,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            output_config: AnthropicProvider::output_config(Some(ReasoningConfig::effort(
+                ReasoningEffort::High,
+            ))),
+            stream: false,
+        };
+
+        let json = serde_json::to_value(&request).unwrap();
+
+        assert_eq!(json["output_config"]["effort"], "high");
+        assert!(json.get("thinking").is_none());
     }
 
     #[test]

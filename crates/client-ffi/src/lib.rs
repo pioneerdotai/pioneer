@@ -67,8 +67,10 @@ use pioneer_client::{
             runtime_id_from_cli_runtime_provider_key,
         },
         presentation::{
-            ProviderModelDisplayKey, ProviderModelDisplayResolution, provider_model_display_key,
-            provider_model_display_models_params, resolve_provider_model_display_from_response,
+            ProviderModelDisplayKey, ProviderModelDisplayResolution, ReasoningEffortRowsRequest,
+            ReasoningEffortRowsResponse, provider_model_display_key,
+            provider_model_display_models_params, reasoning_effort_rows_from_request,
+            resolve_provider_model_display_from_response,
         },
     },
     runtime::ClientRuntime,
@@ -524,6 +526,15 @@ impl ClientFfiRuntime {
         ))
     }
 
+    fn reasoning_effort_rows(
+        &self,
+        input_json: &str,
+    ) -> Result<ReasoningEffortRowsResponse, String> {
+        let request = serde_json::from_str::<ReasoningEffortRowsRequest>(input_json)
+            .map_err(|error| format!("invalid reasoning effort rows request: {error}"))?;
+        Ok(reasoning_effort_rows_from_request(request))
+    }
+
     fn composer_attachment_from_path(
         &self,
         input_json: &str,
@@ -939,6 +950,10 @@ ffi_client_json_method!(
 ffi_client_json_method!(
     pioneer_client_ffi_provider_model_display,
     provider_model_display
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_reasoning_effort_rows,
+    reasoning_effort_rows
 );
 ffi_client_json_method!(
     pioneer_client_ffi_composer_attachment_from_path,

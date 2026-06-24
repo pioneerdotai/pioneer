@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::time::Duration;
 
+pub use pioneer_protocol::ReasoningEffort;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -599,29 +601,6 @@ impl ReasoningConfig {
 
     pub const fn effort(effort: ReasoningEffort) -> Self {
         Self::Effort(effort)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReasoningEffort {
-    XHigh,
-    High,
-    Medium,
-    Low,
-    Minimal,
-    None,
-}
-
-impl ReasoningEffort {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::XHigh => "xhigh",
-            Self::High => "high",
-            Self::Medium => "medium",
-            Self::Low => "low",
-            Self::Minimal => "minimal",
-            Self::None => "none",
-        }
     }
 }
 

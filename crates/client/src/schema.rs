@@ -133,6 +133,10 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             crate::composer::model_selection::ComposerModelSelection
         ),
         schema_doc!(
+            "composer_model_selection_state.json",
+            crate::composer::model_selection::ComposerModelSelectionState
+        ),
+        schema_doc!(
             "composer_model_selection_candidate.json",
             crate::composer::model_selection::ComposerModelSelectionCandidate
         ),
@@ -143,6 +147,18 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "provider_model_display_resolution.json",
             crate::providers::presentation::ProviderModelDisplayResolution
+        ),
+        schema_doc!(
+            "reasoning_effort_row.json",
+            crate::providers::presentation::ReasoningEffortRow
+        ),
+        schema_doc!(
+            "reasoning_effort_rows_request.json",
+            crate::providers::presentation::ReasoningEffortRowsRequest
+        ),
+        schema_doc!(
+            "reasoning_effort_rows_response.json",
+            crate::providers::presentation::ReasoningEffortRowsResponse
         ),
         schema_doc!(
             "gateway_connection_state.json",
@@ -379,6 +395,10 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             pioneer_protocol::TurnCLIRuntimeOptions
         ),
         schema_doc!(
+            "turn_reasoning_selection.json",
+            pioneer_protocol::TurnReasoningSelection
+        ),
+        schema_doc!(
             "cli_runtime_get_params.json",
             pioneer_protocol::CLIRuntimeGetParams
         ),
@@ -602,7 +622,15 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             "provider_model_info.json",
             pioneer_protocol::ProviderModelInfo
         ),
+        schema_doc!(
+            "provider_model_reasoning_capabilities.json",
+            pioneer_protocol::ProviderModelReasoningCapabilities
+        ),
         schema_doc!("provider_summary.json", pioneer_protocol::ProviderSummary),
+        schema_doc!(
+            "reasoning_capability_source.json",
+            pioneer_protocol::ReasoningCapabilitySource
+        ),
         schema_doc!(
             "runtime_account_snapshot.json",
             pioneer_protocol::RuntimeAccountSnapshot

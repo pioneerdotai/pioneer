@@ -27,6 +27,31 @@ pub enum ProviderModelDisplayState {
     Missing,
 }
 
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReasoningEffortRow {
+    pub effort: String,
+    pub label: String,
+    pub selected: bool,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReasoningEffortRowsRequest {
+    pub model: ProviderModelInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_effort: Option<String>,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReasoningEffortRowsResponse {
+    pub rows: Vec<ReasoningEffortRow>,
+}
+
 pub fn provider_model_display_key(
     workspace_id: Option<&str>,
     provider: Option<&str>,
@@ -159,6 +184,99 @@ pub fn model_selector_selected_model_display_state(
         .unwrap_or(ProviderModelDisplayState::Missing)
 }
 
+pub fn normalize_reasoning_effort(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let compact = trimmed
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    pioneer_protocol::ReasoningEffort::canonical_value(compact.as_str())
+        .map(str::to_owned)
+        .or_else(|| (!compact.is_empty()).then_some(compact))
+}
+
+pub fn reasoning_effort_display_label(value: &str) -> String {
+    match normalize_reasoning_effort(value).as_deref() {
+        Some("none") => "None".to_owned(),
+        Some("minimal") => "Minimal".to_owned(),
+        Some("low") => "Low".to_owned(),
+        Some("medium") => "Medium".to_owned(),
+        Some("high") => "High".to_owned(),
+        Some("xhigh") => "Extra High".to_owned(),
+        Some("max") => "Max".to_owned(),
+        Some(_) => title_case_effort_label(value),
+        None => String::new(),
+    }
+}
+
+pub fn ordered_reasoning_effort_options(options: &[String]) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for option in options {
+        let Some(effort) =
+            pioneer_protocol::ReasoningEffort::canonical_value(option.as_str()).map(str::to_owned)
+        else {
+            continue;
+        };
+        if !normalized.contains(&effort) {
+            normalized.push(effort);
+        }
+    }
+
+    if known_efforts_are_in_order(normalized.as_slice()) {
+        return normalized;
+    }
+
+    normalized.sort_by(|lhs, rhs| {
+        match (
+            reasoning_effort_known_rank(lhs),
+            reasoning_effort_known_rank(rhs),
+        ) {
+            (Some(lhs_rank), Some(rhs_rank)) => lhs_rank.cmp(&rhs_rank),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => lhs.cmp(rhs),
+        }
+    });
+    normalized
+}
+
+pub fn reasoning_effort_rows_for_model(
+    model: &ProviderModelInfo,
+    selected_effort: Option<&str>,
+) -> Vec<ReasoningEffortRow> {
+    let Some(reasoning) = model.capabilities.reasoning.as_ref() else {
+        return Vec::new();
+    };
+    if reasoning.supported != Some(true) || reasoning.effort_options.is_empty() {
+        return Vec::new();
+    }
+
+    let selected_effort =
+        selected_effort.and_then(pioneer_protocol::ReasoningEffort::canonical_value);
+    ordered_reasoning_effort_options(reasoning.effort_options.as_slice())
+        .into_iter()
+        .filter(|effort| reasoning.mandatory != Some(true) || effort != "none")
+        .map(|effort| ReasoningEffortRow {
+            label: reasoning_effort_display_label(effort.as_str()),
+            selected: selected_effort == Some(effort.as_str()),
+            effort,
+        })
+        .collect()
+}
+
+pub fn reasoning_effort_rows_from_request(
+    request: ReasoningEffortRowsRequest,
+) -> ReasoningEffortRowsResponse {
+    ReasoningEffortRowsResponse {
+        rows: reasoning_effort_rows_for_model(&request.model, request.selected_effort.as_deref()),
+    }
+}
+
 fn normalize_selector_query(query: &str) -> String {
     query.trim().to_lowercase()
 }
@@ -168,10 +286,57 @@ fn non_empty_trimmed(value: &str) -> Option<&str> {
     (!trimmed.is_empty()).then_some(trimmed)
 }
 
+fn reasoning_effort_known_rank(value: &str) -> Option<u8> {
+    match value {
+        "none" => Some(0),
+        "minimal" => Some(1),
+        "low" => Some(2),
+        "medium" => Some(3),
+        "high" => Some(4),
+        "xhigh" => Some(5),
+        "max" => Some(6),
+        _ => None,
+    }
+}
+
+fn known_efforts_are_in_order(options: &[String]) -> bool {
+    let mut previous_rank = None;
+    for option in options {
+        let Some(rank) = reasoning_effort_known_rank(option.as_str()) else {
+            continue;
+        };
+        if previous_rank.is_some_and(|previous| rank < previous) {
+            return false;
+        }
+        previous_rank = Some(rank);
+    }
+    true
+}
+
+fn title_case_effort_label(value: &str) -> String {
+    value
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            let Some(first) = chars.next() else {
+                return String::new();
+            };
+            let mut label = first.to_uppercase().collect::<String>();
+            label.push_str(chars.as_str().to_ascii_lowercase().as_str());
+            label
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pioneer_protocol::{ProviderModelCapabilities, ProviderModelLimits, ProviderModelPricing};
+    use pioneer_protocol::{
+        ProviderModelCapabilities, ProviderModelLimits, ProviderModelPricing,
+        ProviderModelReasoningCapabilities,
+    };
 
     fn provider(name: &str) -> ProviderSummary {
         ProviderSummary {
@@ -194,6 +359,27 @@ mod tests {
             family: None,
             lifecycle_status: None,
         }
+    }
+
+    fn reasoning_model(options: Vec<&str>, supported: Option<bool>) -> ProviderModelInfo {
+        let mut model = model("gpt-5", Some("GPT 5"));
+        model.capabilities.reasoning = Some(ProviderModelReasoningCapabilities {
+            supported,
+            effort_options: options.into_iter().map(str::to_owned).collect(),
+            default_effort: None,
+            mandatory: None,
+            supports_token_budget: None,
+            source: None,
+        });
+        model
+    }
+
+    fn mandatory_reasoning_model(options: Vec<&str>) -> ProviderModelInfo {
+        let mut model = reasoning_model(options, Some(true));
+        if let Some(reasoning) = model.capabilities.reasoning.as_mut() {
+            reasoning.mandatory = Some(true);
+        }
+        model
     }
 
     #[test]
@@ -324,6 +510,120 @@ mod tests {
         assert_eq!(
             model_selector_selected_model_display_state(None, &[model("gpt-5", None)], false),
             ProviderModelDisplayState::Missing
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_normalization_and_labels_cover_known_aliases() {
+        assert_eq!(
+            normalize_reasoning_effort(" Extra High "),
+            Some("xhigh".to_owned())
+        );
+        assert_eq!(
+            normalize_reasoning_effort("x-high"),
+            Some("xhigh".to_owned())
+        );
+        assert_eq!(
+            normalize_reasoning_effort("MAXIMUM"),
+            Some("max".to_owned())
+        );
+        assert_eq!(normalize_reasoning_effort(" "), None);
+        assert_eq!(reasoning_effort_display_label("xhigh"), "Extra High");
+        assert_eq!(reasoning_effort_display_label("max"), "Max");
+        assert_eq!(reasoning_effort_display_label("turbo-high"), "Turbo High");
+    }
+
+    #[test]
+    fn reasoning_effort_order_preserves_ordered_provider_values() {
+        assert_eq!(
+            ordered_reasoning_effort_options(&[
+                "low".to_owned(),
+                "medium".to_owned(),
+                "high".to_owned()
+            ]),
+            vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()]
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_order_sorts_unordered_known_values() {
+        assert_eq!(
+            ordered_reasoning_effort_options(&[
+                "high".to_owned(),
+                "low".to_owned(),
+                "x-high".to_owned(),
+                "low".to_owned()
+            ]),
+            vec!["low".to_owned(), "high".to_owned(), "xhigh".to_owned()]
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_order_drops_unknown_provider_values() {
+        assert_eq!(
+            ordered_reasoning_effort_options(&[
+                "low".to_owned(),
+                "turbo-high".to_owned(),
+                "maximum".to_owned(),
+            ]),
+            vec!["low".to_owned(), "max".to_owned()]
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_rows_require_supported_model_and_options() {
+        assert!(reasoning_effort_rows_for_model(&model("gpt-5", None), None).is_empty());
+        assert!(
+            reasoning_effort_rows_for_model(&reasoning_model(vec!["low"], Some(false)), None)
+                .is_empty()
+        );
+        assert!(
+            reasoning_effort_rows_for_model(&reasoning_model(Vec::new(), Some(true)), None)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_rows_mark_selected_effort() {
+        let rows = reasoning_effort_rows_for_model(
+            &reasoning_model(vec!["low", "high", "x-high"], Some(true)),
+            Some("extra high"),
+        );
+
+        assert_eq!(
+            rows,
+            vec![
+                ReasoningEffortRow {
+                    effort: "low".to_owned(),
+                    label: "Low".to_owned(),
+                    selected: false,
+                },
+                ReasoningEffortRow {
+                    effort: "high".to_owned(),
+                    label: "High".to_owned(),
+                    selected: false,
+                },
+                ReasoningEffortRow {
+                    effort: "xhigh".to_owned(),
+                    label: "Extra High".to_owned(),
+                    selected: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_rows_hide_none_for_mandatory_reasoning_models() {
+        let rows =
+            reasoning_effort_rows_for_model(&mandatory_reasoning_model(vec!["none", "low"]), None);
+
+        assert_eq!(
+            rows,
+            vec![ReasoningEffortRow {
+                effort: "low".to_owned(),
+                label: "Low".to_owned(),
+                selected: false,
+            }]
         );
     }
 }

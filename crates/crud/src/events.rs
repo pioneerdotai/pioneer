@@ -20,6 +20,8 @@ pub struct TurnStartedEventPayload {
     pub sandbox_mode: SandboxMode,
     pub turn: Turn,
     pub input: Vec<UserInput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

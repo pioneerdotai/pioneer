@@ -145,6 +145,7 @@ impl MessageProcessor {
                             json_output: m.capabilities.json_output,
                             streaming: m.capabilities.streaming,
                             thinking: m.capabilities.thinking,
+                            reasoning: m.capabilities.reasoning,
                             fine_tuning: m.capabilities.fine_tuning,
                             input_modalities: m.capabilities.input_modalities,
                             output_modalities: m.capabilities.output_modalities,

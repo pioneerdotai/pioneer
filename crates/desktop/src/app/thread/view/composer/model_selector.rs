@@ -9,7 +9,9 @@ use gpui_component::{
     spinner::Spinner,
     *,
 };
-use pioneer_client::providers::presentation::ProviderModelDisplayState;
+use pioneer_client::providers::presentation::{
+    self as provider_presentation, ProviderModelDisplayState,
+};
 use std::rc::Rc;
 
 impl PioneerDesktop {
@@ -21,6 +23,15 @@ impl PioneerDesktop {
             ProviderModelDisplayState::Missing => {
                 t!("chat.composer.model.select_label").to_string()
             }
+        };
+        let effort_label = match &display_state {
+            ProviderModelDisplayState::Label(_) => self
+                .composer_selected_reasoning_effort
+                .as_deref()
+                .and_then(pioneer_protocol::ReasoningEffort::canonical_value)
+                .map(provider_presentation::reasoning_effort_display_label)
+                .filter(|label| !label.is_empty()),
+            ProviderModelDisplayState::Loading | ProviderModelDisplayState::Missing => None,
         };
         let loading = matches!(display_state, ProviderModelDisplayState::Loading);
 
@@ -42,14 +53,32 @@ impl PioneerDesktop {
                     })
                     .when(!loading, |this| {
                         this.child(
-                            div()
-                                .text_ellipsis()
+                            h_flex()
+                                .min_w_0()
                                 .max_w(px(350.))
-                                .overflow_hidden()
-                                .child(display_label),
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .text_ellipsis()
+                                        .overflow_hidden()
+                                        .child(display_label),
+                                )
+                                .when_some(effort_label, |row, effort_label| {
+                                    row.child(
+                                        div()
+                                            .flex_none()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(effort_label),
+                                    )
+                                }),
                         )
                     })
-                    .child(Icon::new(IconName::ChevronDown).size_3())
+                    .child(
+                        div()
+                            .flex_none()
+                            .child(Icon::new(IconName::ChevronDown).size_3()),
+                    )
                     .font_medium(),
             )
             .on_click(cx.listener(|view, _, window, cx| {
@@ -65,6 +94,7 @@ impl PioneerDesktop {
                 title: t!("chat.composer.model.dialog_title").to_string(),
                 selected_provider: self.composer_selected_provider.clone(),
                 selected_model: self.composer_selected_model.clone(),
+                selected_reasoning_effort: self.composer_selected_reasoning_effort.clone(),
                 workspace_id,
                 ws_sender: self.gateway.ws_command_sender.clone(),
                 on_save: Rc::new(
@@ -72,6 +102,9 @@ impl PioneerDesktop {
                         view.set_composer_model_selection_from_user(
                             selection.provider,
                             selection.model,
+                        );
+                        view.set_composer_reasoning_effort_from_user(
+                            selection.selected_reasoning_effort,
                         );
                         true
                     },

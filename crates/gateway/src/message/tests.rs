@@ -10625,6 +10625,7 @@ async fn direct_durable_execution_window_lifecycle_updates_rows() {
             sandbox_policy: None,
             mode: None,
             execution_backend: None,
+            reasoning: None,
             cli_runtime_options: None,
         })
         .await
@@ -11203,6 +11204,7 @@ async fn setup_execution_window_terminal_turn(
             sandbox_policy: None,
             mode: None,
             execution_backend: None,
+            reasoning: None,
             cli_runtime_options: None,
         })
         .await

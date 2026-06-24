@@ -20,6 +20,12 @@
         "string",
         "null"
       ]
+    },
+    "selected_reasoning_effort": {
+      "type": [
+        "string",
+        "null"
+      ]
     }
   },
   "required": [

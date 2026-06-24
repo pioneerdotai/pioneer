@@ -395,13 +395,29 @@ impl ClaudeStreamClient {
         native_thread_id: String,
         native_turn_id: String,
         model: Option<String>,
-        _effort: Option<String>,
+        effort: Option<String>,
         input: JsonValue,
         timeout: Duration,
     ) -> Result<()> {
         if let Some(model) = model.filter(|model| !model.trim().is_empty()) {
             self.send_control_request(json!({ "subtype": "set_model", "model": model }), timeout)
                 .await?;
+        }
+        if let Some(effort) = effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|effort| !effort.is_empty())
+        {
+            self.send_control_request(
+                json!({
+                    "subtype": "apply_flag_settings",
+                    "settings": {
+                        "effortLevel": effort,
+                    },
+                }),
+                timeout,
+            )
+            .await?;
         }
         {
             let mut state = self.state.lock().await;
@@ -1359,6 +1375,61 @@ fn new_runtime_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+    use std::process::Stdio;
+
+    async fn fake_claude_stream_client(
+        log_path: &Path,
+    ) -> (Arc<ClaudeStreamClient>, tokio::process::Child) {
+        let script = r#"
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$LOG"
+  case "$line" in
+    *'"type":"control_request"'*)
+      request_id=$(printf '%s\n' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+      if [ -n "$request_id" ]; then
+        printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$request_id"
+      fi
+      ;;
+  esac
+done
+"#;
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .env("LOG", log_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn fake Claude stream process");
+        let stdin = child.stdin.take().expect("fake Claude stdin");
+        let stdout = child.stdout.take().expect("fake Claude stdout");
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let client = Arc::new(ClaudeStreamClient::new(stdin, event_tx));
+        client.spawn_reader(stdout);
+        (client, child)
+    }
+
+    async fn wait_logged_json_lines(log_path: &Path, expected_min: usize) -> Vec<JsonValue> {
+        for _ in 0..50 {
+            let lines = std::fs::read_to_string(log_path)
+                .unwrap_or_default()
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("logged line should be JSON"))
+                .collect::<Vec<_>>();
+            if lines.len() >= expected_min {
+                return lines;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        std::fs::read_to_string(log_path)
+            .expect("read fake Claude log")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("logged line should be JSON"))
+            .collect()
+    }
 
     #[test]
     fn claude_prompt_from_input_encodes_local_images_as_image_blocks() {
@@ -1404,5 +1475,70 @@ mod tests {
                 },
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn claude_start_turn_sends_effort_control_request() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let log_path = temp_dir.path().join("claude-jsonl.log");
+        let (client, mut child) = fake_claude_stream_client(log_path.as_path()).await;
+
+        client
+            .start_turn(
+                "claude-thread".to_owned(),
+                "claude-turn".to_owned(),
+                Some("sonnet".to_owned()),
+                Some("medium".to_owned()),
+                json!([{ "type": "text", "text": "Run tests" }]),
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("start turn should send effort and prompt");
+
+        let lines = wait_logged_json_lines(log_path.as_path(), 3).await;
+        assert_eq!(lines[0]["type"], "control_request");
+        assert_eq!(lines[0]["request"]["subtype"], "set_model");
+        assert_eq!(lines[0]["request"]["model"], "sonnet");
+        assert_eq!(lines[1]["type"], "control_request");
+        assert_eq!(lines[1]["request"]["subtype"], "apply_flag_settings");
+        assert_eq!(
+            lines[1]["request"]["settings"]["effortLevel"],
+            json!("medium")
+        );
+        assert_eq!(lines[2]["type"], "user");
+        assert!(!serde_json::to_string(&lines[2]).unwrap().contains("medium"));
+
+        let _ = child.kill().await;
+    }
+
+    #[tokio::test]
+    async fn claude_start_turn_omits_effort_control_request_when_not_selected() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let log_path = temp_dir.path().join("claude-jsonl.log");
+        let (client, mut child) = fake_claude_stream_client(log_path.as_path()).await;
+
+        client
+            .start_turn(
+                "claude-thread".to_owned(),
+                "claude-turn".to_owned(),
+                Some("sonnet".to_owned()),
+                None,
+                json!([{ "type": "text", "text": "Run tests" }]),
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("start turn should send prompt");
+
+        let lines = wait_logged_json_lines(log_path.as_path(), 2).await;
+        assert_eq!(lines[0]["type"], "control_request");
+        assert_eq!(lines[0]["request"]["subtype"], "set_model");
+        assert_eq!(lines[1]["type"], "user");
+        assert!(
+            lines
+                .iter()
+                .all(|line| line["request"]["subtype"] != "apply_flag_settings")
+        );
+
+        let _ = child.kill().await;
     }
 }

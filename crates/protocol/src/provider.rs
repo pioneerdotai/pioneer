@@ -47,6 +47,32 @@ pub struct ProviderModelLimits {
     pub context_window: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningCapabilitySource {
+    ProviderMetadata,
+    CliMetadata,
+    StaticRegistry,
+    ConfigOverride,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ProviderModelReasoningCapabilities {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supported: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effort_options: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mandatory: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_token_budget: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<ReasoningCapabilitySource>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ProviderModelCapabilities {
     pub vision: Option<bool>,
@@ -54,6 +80,8 @@ pub struct ProviderModelCapabilities {
     pub json_output: Option<bool>,
     pub streaming: Option<bool>,
     pub thinking: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ProviderModelReasoningCapabilities>,
     pub fine_tuning: Option<bool>,
     pub input_modalities: Option<Vec<String>>,
     pub output_modalities: Option<Vec<String>>,
@@ -100,4 +128,64 @@ pub struct ProviderDeleteApiKeyParams {
 pub struct ProviderDeleteApiKeyResponse {
     pub provider: String,
     pub deleted: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn provider_model_capabilities_round_trips_reasoning_metadata() {
+        let capabilities: ProviderModelCapabilities = serde_json::from_value(json!({
+            "thinking": true,
+            "reasoning": {
+                "supported": true,
+                "effort_options": ["low", "high"],
+                "default_effort": "medium",
+                "mandatory": false,
+                "supports_token_budget": true,
+                "source": "provider_metadata"
+            }
+        }))
+        .expect("capabilities should decode");
+
+        assert_eq!(capabilities.thinking, Some(true));
+        assert_eq!(
+            capabilities.reasoning,
+            Some(ProviderModelReasoningCapabilities {
+                supported: Some(true),
+                effort_options: vec!["low".to_owned(), "high".to_owned()],
+                default_effort: Some("medium".to_owned()),
+                mandatory: Some(false),
+                supports_token_budget: Some(true),
+                source: Some(ReasoningCapabilitySource::ProviderMetadata),
+            })
+        );
+
+        let encoded = serde_json::to_value(capabilities).expect("capabilities should encode");
+        assert_eq!(encoded["thinking"], json!(true));
+        assert_eq!(
+            encoded["reasoning"],
+            json!({
+                "supported": true,
+                "effort_options": ["low", "high"],
+                "default_effort": "medium",
+                "mandatory": false,
+                "supports_token_budget": true,
+                "source": "provider_metadata"
+            })
+        );
+    }
+
+    #[test]
+    fn provider_model_capabilities_decode_without_reasoning_metadata() {
+        let capabilities: ProviderModelCapabilities = serde_json::from_value(json!({
+            "thinking": false
+        }))
+        .expect("legacy capabilities should decode");
+
+        assert_eq!(capabilities.thinking, Some(false));
+        assert!(capabilities.reasoning.is_none());
+    }
 }

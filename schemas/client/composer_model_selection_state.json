@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ComposerModelSelectionState",
+  "type": "object",
+  "properties": {
+    "manually_selected": {
+      "type": "boolean"
+    },
+    "selected_model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "selected_provider": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "selected_reasoning_effort": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "manually_selected"
+  ]
+}

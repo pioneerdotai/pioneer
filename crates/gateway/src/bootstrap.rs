@@ -305,6 +305,7 @@ mod tests {
                     mode_json: r#""Agent""#.to_owned(),
                     model: "model-a".to_owned(),
                     provider_name: "provider-a".to_owned(),
+                    reasoning_effort: None,
                     hook_runtime_context_json: r#"{"mode":"agent","actor_kind":"agent"}"#
                         .to_owned(),
                     workspace_skill_policies_json: "[]".to_owned(),

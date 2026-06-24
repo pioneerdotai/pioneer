@@ -3,8 +3,8 @@
 use crate::conversation::events::ConversationEvent;
 use pioneer_protocol::{
     AgentExecutionBackend, REQUEST_ID_LEN, Thread, ThreadMode, TurnCLIRuntimeOptions,
-    TurnCapability, TurnStartParams, TurnStartResponse, UserInput, UserMessageAttachment,
-    generate_id,
+    TurnCapability, TurnReasoningSelection, TurnStartParams, TurnStartResponse, UserInput,
+    UserMessageAttachment, generate_id,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -33,6 +33,7 @@ pub struct TurnStartParamsPlan {
     pub model_provider: Option<String>,
     pub mode: Option<ThreadMode>,
     pub execution_backend: Option<AgentExecutionBackend>,
+    pub reasoning: Option<TurnReasoningSelection>,
     pub cli_runtime_options: Option<TurnCLIRuntimeOptions>,
 }
 
@@ -90,8 +91,16 @@ pub fn turn_start_params_from_plan(plan: TurnStartParamsPlan) -> TurnStartParams
         sandbox_policy: None,
         mode: plan.mode,
         execution_backend: plan.execution_backend,
+        reasoning: plan.reasoning,
         cli_runtime_options: plan.cli_runtime_options,
     }
+}
+
+pub fn turn_reasoning_selection_from_effort(
+    effort: Option<String>,
+) -> Option<TurnReasoningSelection> {
+    let effort = effort?.trim().to_owned();
+    (!effort.is_empty()).then_some(TurnReasoningSelection { effort })
 }
 
 pub fn now_unix_seconds() -> i64 {
@@ -249,6 +258,7 @@ mod tests {
             model_provider: Some("openai".to_owned()),
             mode: Some(ThreadMode::Agent),
             execution_backend: None,
+            reasoning: None,
             cli_runtime_options: None,
         });
 
@@ -261,7 +271,32 @@ mod tests {
         assert_eq!(params.mode, Some(ThreadMode::Agent));
         assert_eq!(params.sandbox_policy, None);
         assert_eq!(params.execution_backend, None);
+        assert_eq!(params.reasoning, None);
         assert_eq!(params.cli_runtime_options, None);
+    }
+
+    #[test]
+    fn turn_start_params_from_plan_preserves_reasoning_selection() {
+        let params = turn_start_params_from_plan(TurnStartParamsPlan {
+            thread_id: "thread".to_owned(),
+            turn_id: "turn".to_owned(),
+            input: Vec::new(),
+            capabilities: Vec::new(),
+            model: Some("gpt-5.4".to_owned()),
+            model_provider: Some("openai".to_owned()),
+            mode: None,
+            execution_backend: None,
+            reasoning: turn_reasoning_selection_from_effort(Some(" high ".to_owned())),
+            cli_runtime_options: None,
+        });
+
+        assert_eq!(
+            params
+                .reasoning
+                .as_ref()
+                .map(|selection| selection.effort.as_str()),
+            Some("high")
+        );
     }
 
     #[test]

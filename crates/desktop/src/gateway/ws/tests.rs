@@ -11,8 +11,9 @@ use pioneer_client::composer::{
 use pioneer_client::gateway::types::GatewayEndpointKind;
 use pioneer_client::transport::ws::event_connection_id;
 use pioneer_protocol::{
-    GatewayNotification, ThreadStartParams, ThreadUnsubscribeStatus, TurnStartParams, TurnStatus,
-    UserInput, constants::events, generate_id,
+    AgentExecutionBackend, CLIAgentRuntimeKind, GatewayNotification, ThreadStartParams,
+    ThreadUnsubscribeStatus, TurnCLIRuntimeOptions, TurnReasoningSelection, TurnStartParams,
+    TurnStatus, UserInput, constants::events, generate_id,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -509,6 +510,7 @@ fn turn_start_request_receives_response_and_started_notification() {
             sandbox_policy: None,
             mode: None,
             execution_backend: None,
+            reasoning: None,
             cli_runtime_options: None,
         })
         .expect("turn/start should succeed");
@@ -534,6 +536,120 @@ fn turn_start_request_receives_response_and_started_notification() {
             ..
         }
     ));
+
+    let _ = sender.shutdown();
+    server.stop();
+}
+
+#[test]
+fn turn_start_request_sends_reasoning_effort() {
+    let (mut server, requests) = TestWsServer::spawn_recording("127.0.0.1:0");
+    let client = GatewayWsClient::new();
+    let sender = client.command_sender();
+
+    let _connection_id = sender
+        .connect_and_wait(connect_spec(
+            "remote-turn-reasoning",
+            "Remote Turn Reasoning",
+            server.address.as_str(),
+        ))
+        .expect("expected connect_and_wait to succeed");
+
+    let _response = sender
+        .turn_start(TurnStartParams {
+            thread_id: "thr_test_thread_123456".to_owned(),
+            turn_id: "turn_test_reasoning".to_owned(),
+            input: vec![UserInput::Text {
+                text: "Hello".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            capabilities: Vec::new(),
+            model: Some("gpt-5".to_owned()),
+            model_provider: Some("openai".to_owned()),
+            sandbox_policy: None,
+            mode: None,
+            execution_backend: None,
+            reasoning: Some(TurnReasoningSelection {
+                effort: "high".to_owned(),
+            }),
+            cli_runtime_options: None,
+        })
+        .expect("turn/start should succeed");
+
+    let request = wait_for_recorded_request(&requests, "turn/start", Duration::from_secs(2));
+    assert_eq!(
+        request
+            .pointer("/params/reasoning/effort")
+            .and_then(serde_json::Value::as_str),
+        Some("high")
+    );
+    assert!(match request.pointer("/params/cli_runtime_options") {
+        Some(value) => value.is_null(),
+        None => true,
+    });
+
+    let _ = sender.shutdown();
+    server.stop();
+}
+
+#[test]
+fn turn_start_request_sends_cli_runtime_effort_options() {
+    let (mut server, requests) = TestWsServer::spawn_recording("127.0.0.1:0");
+    let client = GatewayWsClient::new();
+    let sender = client.command_sender();
+
+    let _connection_id = sender
+        .connect_and_wait(connect_spec(
+            "remote-turn-cli-effort",
+            "Remote Turn CLI Effort",
+            server.address.as_str(),
+        ))
+        .expect("expected connect_and_wait to succeed");
+
+    let _response = sender
+        .turn_start(TurnStartParams {
+            thread_id: "thr_test_thread_123456".to_owned(),
+            turn_id: "turn_test_cli_effort".to_owned(),
+            input: vec![UserInput::Text {
+                text: "Hello".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            capabilities: Vec::new(),
+            model: Some("gpt-5".to_owned()),
+            model_provider: None,
+            sandbox_policy: None,
+            mode: None,
+            execution_backend: Some(AgentExecutionBackend::CLIAgentRuntime {
+                runtime_id: "codex".to_owned(),
+                runtime_kind: CLIAgentRuntimeKind::Codex,
+            }),
+            reasoning: Some(TurnReasoningSelection {
+                effort: "high".to_owned(),
+            }),
+            cli_runtime_options: Some(TurnCLIRuntimeOptions {
+                approval_policy: None,
+                sandbox: None,
+                effort: Some("high".to_owned()),
+                personality: None,
+                summary: None,
+                steer_if_active: None,
+            }),
+        })
+        .expect("turn/start should succeed");
+
+    let request = wait_for_recorded_request(&requests, "turn/start", Duration::from_secs(2));
+    assert_eq!(
+        request
+            .pointer("/params/reasoning/effort")
+            .and_then(serde_json::Value::as_str),
+        Some("high")
+    );
+    assert_eq!(
+        request
+            .pointer("/params/cli_runtime_options/effort")
+            .and_then(serde_json::Value::as_str),
+        Some("high")
+    );
 
     let _ = sender.shutdown();
     server.stop();
@@ -799,6 +915,30 @@ fn wait_for_thread_started_ids(
     thread_ids
 }
 
+fn wait_for_recorded_request(
+    requests: &mpsc::Receiver<serde_json::Value>,
+    method: &str,
+    timeout: Duration,
+) -> serde_json::Value {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let now = Instant::now();
+        assert!(now < deadline, "timed out waiting for recorded {method}");
+        let remaining = deadline.saturating_duration_since(now);
+        match requests.recv_timeout(remaining.min(Duration::from_millis(50))) {
+            Ok(request) => {
+                if request.get("method").and_then(serde_json::Value::as_str) == Some(method) {
+                    return request;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("recorded request channel closed before {method}");
+            }
+        }
+    }
+}
+
 fn artifact_download_fixture() -> &'static [u8] {
     b"hello artifact download"
 }
@@ -836,6 +976,21 @@ struct TestWsServer {
 
 impl TestWsServer {
     fn spawn(bind_addr: &str) -> Self {
+        Self::spawn_with_request_tx(bind_addr, None)
+    }
+
+    fn spawn_recording(bind_addr: &str) -> (Self, mpsc::Receiver<serde_json::Value>) {
+        let (request_tx, request_rx) = mpsc::channel();
+        (
+            Self::spawn_with_request_tx(bind_addr, Some(request_tx)),
+            request_rx,
+        )
+    }
+
+    fn spawn_with_request_tx(
+        bind_addr: &str,
+        request_tx: Option<mpsc::Sender<serde_json::Value>>,
+    ) -> Self {
         let (address_tx, address_rx) = mpsc::channel();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let bind_addr = bind_addr.to_owned();
@@ -862,6 +1017,7 @@ impl TestWsServer {
                                 let Ok((stream, _)) = accepted else {
                                     break;
                                 };
+                                let request_tx = request_tx.clone();
                                 tokio::spawn(async move {
                                     let Ok(ws) = accept_async(stream).await else {
                                         return;
@@ -946,6 +1102,9 @@ impl TestWsServer {
                                                     Ok(value) => value,
                                                     Err(_) => continue,
                                                 };
+                                                if let Some(request_tx) = request_tx.as_ref() {
+                                                    let _ = request_tx.send(request.clone());
+                                                }
 
                                                 let Some(request_id) = request
                                                     .get("id")

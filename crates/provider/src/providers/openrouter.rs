@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use pioneer_protocol::{
     ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits, ProviderModelPricing,
+    ProviderModelReasoningCapabilities, ReasoningCapabilitySource,
 };
 
 const BASE_URL: &str = "https://openrouter.ai/api/v1";
@@ -295,6 +296,22 @@ struct OpenRouterModelEntry {
     max_completion_tokens: Option<u64>,
     #[serde(default)]
     pricing: Option<OpenRouterPricing>,
+    #[serde(default)]
+    reasoning: Option<OpenRouterReasoningMetadata>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenRouterReasoningMetadata {
+    #[serde(default)]
+    supported_efforts: Option<Vec<String>>,
+    #[serde(default)]
+    default_effort: Option<String>,
+    #[serde(default)]
+    default_enabled: Option<bool>,
+    #[serde(default)]
+    mandatory: Option<bool>,
+    #[serde(default)]
+    supports_max_tokens: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -368,12 +385,10 @@ impl OpenRouterProvider {
 
     fn reasoning_options(
         request_reasoning: Option<ReasoningConfig>,
-        default_effort: Option<ReasoningEffort>,
     ) -> Option<ApiReasoningOptions> {
         let effort = match request_reasoning {
-            Some(ReasoningConfig::Disabled) => ReasoningEffort::None,
             Some(ReasoningConfig::Effort(effort)) => effort,
-            None => default_effort?,
+            Some(ReasoningConfig::Disabled) | None => return None,
         };
 
         Some(ApiReasoningOptions {
@@ -673,7 +688,7 @@ impl crate::traits::Provider for OpenRouterProvider {
         )?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let rendered_messages = Self::convert_messages(&prepared)?;
-        let reasoning = Self::reasoning_options(request.reasoning, None);
+        let reasoning = Self::reasoning_options(request.reasoning);
 
         let api_request = ApiChatRequest {
             model: request.model,
@@ -761,7 +776,7 @@ impl crate::traits::Provider for OpenRouterProvider {
         )?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let rendered_messages = Self::convert_messages(&prepared)?;
-        let reasoning = Self::reasoning_options(request.reasoning, Some(ReasoningEffort::Medium));
+        let reasoning = Self::reasoning_options(request.reasoning);
 
         let api_request = ApiChatRequest {
             model: request.model,
@@ -926,38 +941,92 @@ impl crate::traits::Provider for OpenRouterProvider {
         Ok(api_response
             .data
             .into_iter()
-            .map(|m| {
-                let pricing = m.pricing.map(|p| {
-                    let parse = |s: &Option<String>| s.as_ref().and_then(|v| v.parse::<f64>().ok());
-                    ProviderModelPricing {
-                        input_token: parse(&p.prompt),
-                        output_token: parse(&p.completion),
-                        image: parse(&p.image),
-                        request: parse(&p.request),
-                    }
-                });
-
-                ProviderModelInfo {
-                    id: m.id.clone(),
-                    name: m.name,
-                    description: m.description,
-                    created: m.created,
-                    provider: "openrouter".to_owned(),
-                    owned_by: m.id.split('/').next().map(|s| s.to_owned()),
-                    limits: ProviderModelLimits {
-                        max_input_tokens: m.context_length,
-                        max_output_tokens: m.max_completion_tokens,
-                        context_window: m.context_length,
-                    },
-                    capabilities: ProviderModelCapabilities::default(),
-                    pricing,
-                    active: Some(true),
-                    family: None,
-                    lifecycle_status: None,
-                }
-            })
+            .map(provider_model_from_openrouter_model_entry)
             .collect())
     }
+}
+
+const OPENROUTER_GATEWAY_REASONING_EFFORTS: &[&str] =
+    &["max", "xhigh", "high", "medium", "low", "minimal", "none"];
+
+fn provider_model_from_openrouter_model_entry(m: OpenRouterModelEntry) -> ProviderModelInfo {
+    let pricing = m.pricing.map(|p| {
+        let parse = |s: &Option<String>| s.as_ref().and_then(|v| v.parse::<f64>().ok());
+        ProviderModelPricing {
+            input_token: parse(&p.prompt),
+            output_token: parse(&p.completion),
+            image: parse(&p.image),
+            request: parse(&p.request),
+        }
+    });
+    let reasoning = m.reasoning.and_then(openrouter_reasoning_capabilities);
+    let mut capabilities = ProviderModelCapabilities::default();
+    if let Some(reasoning) = reasoning {
+        capabilities.thinking = reasoning.supported;
+        capabilities.reasoning = Some(reasoning);
+    }
+
+    ProviderModelInfo {
+        id: m.id.clone(),
+        name: m.name,
+        description: m.description,
+        created: m.created,
+        provider: "openrouter".to_owned(),
+        owned_by: m.id.split('/').next().map(|s| s.to_owned()),
+        limits: ProviderModelLimits {
+            max_input_tokens: m.context_length,
+            max_output_tokens: m.max_completion_tokens,
+            context_window: m.context_length,
+        },
+        capabilities,
+        pricing,
+        active: Some(true),
+        family: None,
+        lifecycle_status: None,
+    }
+}
+
+fn openrouter_reasoning_capabilities(
+    metadata: OpenRouterReasoningMetadata,
+) -> Option<ProviderModelReasoningCapabilities> {
+    let effort_options = metadata
+        .supported_efforts
+        .map(|efforts| {
+            efforts
+                .into_iter()
+                .filter_map(|effort| {
+                    ReasoningEffort::canonical_value(effort.as_str()).map(str::to_owned)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| {
+            OPENROUTER_GATEWAY_REASONING_EFFORTS
+                .iter()
+                .map(|effort| (*effort).to_owned())
+                .collect()
+        });
+    let default_effort = metadata
+        .default_effort
+        .as_deref()
+        .and_then(ReasoningEffort::canonical_value)
+        .map(str::to_owned);
+    if effort_options.is_empty()
+        && default_effort.is_none()
+        && metadata.default_enabled != Some(true)
+        && metadata.mandatory != Some(true)
+        && metadata.supports_max_tokens != Some(true)
+    {
+        return None;
+    }
+
+    Some(ProviderModelReasoningCapabilities {
+        supported: Some(true),
+        effort_options,
+        default_effort,
+        mandatory: metadata.mandatory,
+        supports_token_budget: metadata.supports_max_tokens,
+        source: Some(ReasoningCapabilitySource::ProviderMetadata),
+    })
 }
 
 #[cfg(test)]
@@ -965,7 +1034,92 @@ mod tests {
     use super::*;
     use crate::attachments::prepare_messages_for_provider;
     use crate::traits::Provider;
-    use crate::types::{AttachmentDataSource, ChatMessage, MessageAttachment, MessageContentPart};
+    use crate::types::{
+        AttachmentDataSource, ChatMessage, MessageAttachment, MessageContentPart, ReasoningConfig,
+        ReasoningEffort,
+    };
+
+    fn model_from_json(json: &str) -> ProviderModelInfo {
+        let response: ModelsListResponse = serde_json::from_str(json).expect("models response");
+        provider_model_from_openrouter_model_entry(
+            response.data.into_iter().next().expect("fixture model"),
+        )
+    }
+
+    #[test]
+    fn model_reasoning_metadata_maps_supported_efforts_array() {
+        let model = model_from_json(
+            r#"{
+                "data": [{
+                    "id": "google/gemini-3.5-flash",
+                    "reasoning": {
+                        "supported_efforts": ["maximum", "extra-high", "medium", "low", "minimal"],
+                        "default_effort": "Extra High",
+                        "default_enabled": true,
+                        "mandatory": true,
+                        "supports_max_tokens": false
+                    }
+                }]
+            }"#,
+        );
+
+        let reasoning = model.capabilities.reasoning.expect("reasoning metadata");
+        assert_eq!(
+            reasoning.effort_options,
+            vec!["max", "xhigh", "medium", "low", "minimal"]
+        );
+        assert_eq!(reasoning.default_effort.as_deref(), Some("xhigh"));
+        assert_eq!(reasoning.mandatory, Some(true));
+        assert_eq!(reasoning.supports_token_budget, Some(false));
+        assert_eq!(
+            reasoning.source,
+            Some(ReasoningCapabilitySource::ProviderMetadata)
+        );
+    }
+
+    #[test]
+    fn model_reasoning_metadata_null_efforts_uses_gateway_values() {
+        let model = model_from_json(
+            r#"{
+                "data": [{
+                    "id": "anthropic/claude",
+                    "reasoning": {
+                        "supported_efforts": null,
+                        "supports_max_tokens": true
+                    }
+                }]
+            }"#,
+        );
+
+        let reasoning = model.capabilities.reasoning.expect("reasoning metadata");
+        assert_eq!(
+            reasoning.effort_options,
+            vec!["max", "xhigh", "high", "medium", "low", "minimal", "none"]
+        );
+        assert_eq!(reasoning.supports_token_budget, Some(true));
+    }
+
+    #[test]
+    fn model_without_reasoning_metadata_leaves_capability_unset() {
+        let model = model_from_json(
+            r#"{
+                "data": [{
+                    "id": "openai/gpt-4o",
+                    "pricing": { "prompt": "0.1", "completion": "0.2" }
+                }]
+            }"#,
+        );
+
+        assert!(model.capabilities.reasoning.is_none());
+        assert!(model.capabilities.thinking.is_none());
+        assert_eq!(
+            model
+                .pricing
+                .as_ref()
+                .and_then(|pricing| pricing.input_token),
+            Some(0.1)
+        );
+    }
 
     #[test]
     fn creates_with_api_key() {
@@ -1166,12 +1320,14 @@ mod tests {
     }
 
     #[test]
-    fn disabled_reasoning_overrides_stream_default_effort() {
-        let reasoning = OpenRouterProvider::reasoning_options(
-            Some(ReasoningConfig::disabled()),
-            Some(ReasoningEffort::Medium),
-        )
-        .expect("disabled reasoning should serialize explicit none effort");
+    fn reasoning_options_omit_absent_or_disabled_effort_and_serialize_explicit_none() {
+        assert!(OpenRouterProvider::reasoning_options(None).is_none());
+        assert!(OpenRouterProvider::reasoning_options(Some(ReasoningConfig::disabled())).is_none());
+
+        let reasoning = OpenRouterProvider::reasoning_options(Some(ReasoningConfig::effort(
+            ReasoningEffort::None,
+        )))
+        .expect("explicit none reasoning effort should serialize");
 
         assert_eq!(reasoning.effort, "none");
     }

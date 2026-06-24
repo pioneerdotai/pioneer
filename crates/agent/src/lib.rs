@@ -26,6 +26,7 @@ use pioneer_protocol::{
 };
 use pioneer_provider::{
     ChatMessage, InputContentType, MessageAttachment, ProviderRegistry, ProviderTimeoutPolicy,
+    ReasoningConfig, ReasoningEffort,
 };
 #[cfg(test)]
 use pioneer_skills::SkillAuditEvent;
@@ -1404,6 +1405,7 @@ pub struct RestoredRecoveryTurnRequest {
     pub hook_runtime_context: AgentTurnHookRuntimeContext,
     pub model: String,
     pub provider_name: String,
+    pub reasoning: Option<ReasoningConfig>,
     pub workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
     pub input: Vec<UserInput>,
     pub capabilities: Vec<TurnCapability>,
@@ -1419,6 +1421,20 @@ struct TurnExecutionOptions {
     continue_generation_hint: bool,
 }
 
+fn reasoning_config_from_effort(
+    effort: Option<&str>,
+) -> Result<Option<ReasoningConfig>, AgentStartError> {
+    let Some(effort) = effort else {
+        return Ok(None);
+    };
+    ReasoningEffort::from_str(effort)
+        .map(ReasoningConfig::effort)
+        .map(Some)
+        .ok_or_else(|| {
+            AgentStartError::Internal(format!("unsupported reasoning effort `{effort}`"))
+        })
+}
+
 #[derive(Debug, Clone)]
 struct ActiveTurnRequest {
     turn_id: String,
@@ -1427,6 +1443,7 @@ struct ActiveTurnRequest {
     hook_runtime_context: AgentTurnHookRuntimeContext,
     model: String,
     provider_name: String,
+    reasoning: Option<ReasoningConfig>,
     workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
     input: Vec<UserInput>,
     capabilities: Vec<TurnCapability>,
@@ -1478,6 +1495,7 @@ enum AgentCommand {
         hook_runtime_context: AgentTurnHookRuntimeContext,
         model: String,
         provider_name: String,
+        reasoning: Option<ReasoningConfig>,
         workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
         input: Vec<UserInput>,
         capabilities: Vec<TurnCapability>,
@@ -1939,7 +1957,41 @@ impl AgentManager {
         runtime_environment: HashMap<String, String>,
         history: Vec<ChatMessage>,
     ) -> Result<(), AgentStartError> {
-        self.start_turn_with_hook_context(
+        self.start_turn_with_resolved_artifacts_environment_and_reasoning(
+            thread_id,
+            turn_id,
+            mode,
+            model,
+            provider_name,
+            workspace_skill_policies,
+            input,
+            capabilities,
+            resolved_artifacts,
+            runtime_environment,
+            history,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_turn_with_resolved_artifacts_environment_and_reasoning(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        mode: ThreadMode,
+        model: &str,
+        provider_name: &str,
+        workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
+        input: Vec<UserInput>,
+        capabilities: Vec<TurnCapability>,
+        resolved_artifacts: Vec<ResolvedArtifactInput>,
+        runtime_environment: HashMap<String, String>,
+        history: Vec<ChatMessage>,
+        reasoning_effort: Option<&str>,
+    ) -> Result<(), AgentStartError> {
+        let reasoning = reasoning_config_from_effort(reasoning_effort)?;
+        self.start_turn_with_hook_context_and_execution_checkpoint_and_reasoning(
             thread_id,
             turn_id,
             mode,
@@ -1952,6 +2004,8 @@ impl AgentManager {
             resolved_artifacts,
             runtime_environment,
             history,
+            None,
+            reasoning,
         )
         .await
     }
@@ -2007,6 +2061,43 @@ impl AgentManager {
         history: Vec<ChatMessage>,
         execution_checkpoint_context: Option<ExecutionCheckpointContext>,
     ) -> Result<(), AgentStartError> {
+        self.start_turn_with_hook_context_and_execution_checkpoint_and_reasoning(
+            thread_id,
+            turn_id,
+            mode,
+            hook_runtime_context,
+            model,
+            provider_name,
+            workspace_skill_policies,
+            input,
+            capabilities,
+            resolved_artifacts,
+            runtime_environment,
+            history,
+            execution_checkpoint_context,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_turn_with_hook_context_and_execution_checkpoint_and_reasoning(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        mode: ThreadMode,
+        hook_runtime_context: AgentTurnHookRuntimeContext,
+        model: &str,
+        provider_name: &str,
+        workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
+        input: Vec<UserInput>,
+        capabilities: Vec<TurnCapability>,
+        resolved_artifacts: Vec<ResolvedArtifactInput>,
+        runtime_environment: HashMap<String, String>,
+        history: Vec<ChatMessage>,
+        execution_checkpoint_context: Option<ExecutionCheckpointContext>,
+        reasoning: Option<ReasoningConfig>,
+    ) -> Result<(), AgentStartError> {
         let command_tx = {
             let state = self.state.read().await;
             let Some(thread) = state.threads.get(thread_id) else {
@@ -2024,6 +2115,7 @@ impl AgentManager {
                 hook_runtime_context,
                 model: model.to_owned(),
                 provider_name: provider_name.to_owned(),
+                reasoning,
                 workspace_skill_policies,
                 input,
                 capabilities,

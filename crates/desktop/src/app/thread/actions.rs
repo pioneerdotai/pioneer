@@ -210,6 +210,7 @@ impl PioneerDesktop {
         let selected_mode = self.composer_turn_mode;
         let selected_model = self.composer_selected_model.clone();
         let selected_provider = self.composer_selected_provider.clone();
+        let selected_reasoning_effort = self.composer_selected_reasoning_effort.clone();
         let selected_cli_runtime_backend =
             match provider_list::resolve_cli_runtime_execution_backend(
                 selected_provider.as_deref(),
@@ -334,6 +335,7 @@ impl PioneerDesktop {
                                     turn_model_provider: turn_model_provider.clone(),
                                     selected_mode: Some(selected_mode),
                                     execution_backend: selected_cli_runtime_backend.clone(),
+                                    selected_reasoning_effort: selected_reasoning_effort.clone(),
                                     cli_runtime_options: None,
                                     updated_at_unix: turn_start::now_unix_seconds(),
                                 },

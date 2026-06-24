@@ -55,6 +55,7 @@ pub async fn upsert_turn<C: ConnectionTrait>(
     thread_id: &str,
     turn_model: &Turn,
     prompt_manifest: Option<&TurnPromptManifestColumns>,
+    reasoning_effort: Option<&str>,
     created_at: DateTimeWithTimeZone,
     updated_at: DateTimeWithTimeZone,
 ) -> Result<()> {
@@ -81,6 +82,7 @@ pub async fn upsert_turn<C: ConnectionTrait>(
         prompt_fingerprint_full: Set(
             prompt_manifest.map(|manifest| manifest.prompt_fingerprint_full.clone())
         ),
+        reasoning_effort: Set(reasoning_effort.map(str::to_owned)),
         created_at: Set(created_at),
         updated_at: Set(updated_at),
     })

@@ -4,8 +4,9 @@ use pioneer_agent::{
     WorkspaceSkillPolicy,
 };
 use pioneer_crud::{NewTurnRuntimeSnapshot, TurnRuntimeSnapshotRecord};
+use pioneer_protocol::ReasoningEffort;
 use pioneer_protocol::{ThreadMode, TurnCapability, UserInput};
-use pioneer_provider::ChatMessage;
+use pioneer_provider::{ChatMessage, ReasoningConfig};
 use pioneer_skills::SkillPolicyKey;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::HashMap;
@@ -29,6 +30,7 @@ pub(crate) fn new_turn_runtime_snapshot(
     hook_runtime_context: &AgentTurnHookRuntimeContext,
     model: &str,
     provider_name: &str,
+    reasoning_effort: Option<&str>,
     workspace_skill_policies: &HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
     input: &[UserInput],
     capabilities: &[TurnCapability],
@@ -44,6 +46,7 @@ pub(crate) fn new_turn_runtime_snapshot(
         mode_json: to_snapshot_json(&mode, "thread mode")?,
         model: model.to_owned(),
         provider_name: provider_name.to_owned(),
+        reasoning_effort: reasoning_effort.map(str::to_owned),
         hook_runtime_context_json: to_snapshot_json(hook_runtime_context, "hook runtime context")?,
         workspace_skill_policies_json: to_snapshot_json(
             &stored_workspace_skill_policies(workspace_skill_policies),
@@ -72,6 +75,11 @@ pub(crate) fn restored_recovery_turn_request_from_snapshot(
         )?,
         model: snapshot.model.clone(),
         provider_name: snapshot.provider_name.clone(),
+        reasoning: snapshot
+            .reasoning_effort
+            .as_deref()
+            .map(reasoning_config_from_snapshot_effort)
+            .transpose()?,
         workspace_skill_policies: restore_workspace_skill_policies(
             &snapshot.workspace_skill_policies_json,
         )?,
@@ -87,6 +95,12 @@ pub(crate) fn restored_recovery_turn_request_from_snapshot(
         )?,
         history: from_snapshot_json(&snapshot.history_json, "conversation history")?,
     })
+}
+
+fn reasoning_config_from_snapshot_effort(effort: &str) -> Result<ReasoningConfig> {
+    ReasoningEffort::from_str(effort)
+        .map(ReasoningConfig::effort)
+        .with_context(|| format!("unsupported reasoning effort `{effort}` in runtime snapshot"))
 }
 
 fn stored_workspace_skill_policies(

@@ -99,6 +99,7 @@ mod tests {
             hook_runtime_context: crate::AgentTurnHookRuntimeContext::default(),
             model: "test-model".to_owned(),
             provider_name: "test-provider".to_owned(),
+            reasoning: None,
             workspace_skill_policies:
                 HashMap::<pioneer_skills::SkillPolicyKey, WorkspaceSkillPolicy>::new(),
             input: vec![UserInput::Text {
@@ -161,6 +162,7 @@ mod tests {
             hook_runtime_context: crate::AgentTurnHookRuntimeContext::default(),
             model: "test-model".to_owned(),
             provider_name: "test-provider".to_owned(),
+            reasoning: None,
             workspace_skill_policies:
                 HashMap::<pioneer_skills::SkillPolicyKey, WorkspaceSkillPolicy>::new(),
             input: vec![UserInput::Text {
@@ -279,6 +281,7 @@ mod tests {
             hook_runtime_context: crate::AgentTurnHookRuntimeContext::default(),
             model: "test-model".to_owned(),
             provider_name: "test-provider".to_owned(),
+            reasoning: None,
             workspace_skill_policies:
                 HashMap::<pioneer_skills::SkillPolicyKey, WorkspaceSkillPolicy>::new(),
             input: vec![

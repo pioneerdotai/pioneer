@@ -335,7 +335,63 @@ pub struct TurnStartParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_backend: Option<AgentExecutionBackend>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<TurnReasoningSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cli_runtime_options: Option<TurnCLIRuntimeOptions>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnReasoningSelection {
+    pub effort: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    Max,
+    XHigh,
+    High,
+    Medium,
+    Low,
+    Minimal,
+    None,
+}
+
+impl ReasoningEffort {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Max => "max",
+            Self::XHigh => "xhigh",
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+            Self::Minimal => "minimal",
+            Self::None => "none",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        let compact = value
+            .trim()
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect::<String>();
+
+        match compact.as_str() {
+            "max" | "maximum" => Some(Self::Max),
+            "xhigh" | "extrahigh" | "xtrahigh" => Some(Self::XHigh),
+            "high" => Some(Self::High),
+            "medium" | "med" => Some(Self::Medium),
+            "low" => Some(Self::Low),
+            "minimal" | "min" => Some(Self::Minimal),
+            "none" | "off" | "disabled" => Some(Self::None),
+            _ => None,
+        }
+    }
+
+    pub fn canonical_value(value: &str) -> Option<&'static str> {
+        Self::from_str(value).map(Self::as_str)
+    }
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
@@ -3597,6 +3653,7 @@ mod tests {
             Some(UserInput::Text { text, .. }) if text == "hello"
         ));
         assert!(params.execution_backend.is_none());
+        assert!(params.reasoning.is_none());
         assert!(params.cli_runtime_options.is_none());
     }
 
@@ -3627,6 +3684,75 @@ mod tests {
                 "provider": "openai"
             })
         );
+    }
+
+    #[test]
+    fn turn_start_params_round_trips_reasoning_selection() {
+        let params: TurnStartParams = serde_json::from_value(json!({
+            "thread_id": "thr_123",
+            "turn_id": "turn_123",
+            "reasoning": {
+                "effort": "high"
+            }
+        }))
+        .expect("params should decode");
+
+        assert_eq!(
+            params.reasoning,
+            Some(TurnReasoningSelection {
+                effort: "high".to_owned()
+            })
+        );
+
+        let encoded = serde_json::to_value(params).expect("params should encode");
+        assert_eq!(
+            encoded["reasoning"],
+            json!({
+                "effort": "high"
+            })
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_parse_and_as_str_cover_canonical_values() {
+        for (raw, effort, canonical) in [
+            ("max", ReasoningEffort::Max, "max"),
+            ("xhigh", ReasoningEffort::XHigh, "xhigh"),
+            ("high", ReasoningEffort::High, "high"),
+            ("medium", ReasoningEffort::Medium, "medium"),
+            ("low", ReasoningEffort::Low, "low"),
+            ("minimal", ReasoningEffort::Minimal, "minimal"),
+            ("none", ReasoningEffort::None, "none"),
+        ] {
+            assert_eq!(ReasoningEffort::from_str(raw), Some(effort));
+            assert_eq!(effort.as_str(), canonical);
+        }
+    }
+
+    #[test]
+    fn reasoning_effort_parse_accepts_documented_aliases_and_rejects_unknown() {
+        assert_eq!(
+            ReasoningEffort::from_str("extra_high"),
+            Some(ReasoningEffort::XHigh)
+        );
+        assert_eq!(
+            ReasoningEffort::from_str("extra-high"),
+            Some(ReasoningEffort::XHigh)
+        );
+        assert_eq!(
+            ReasoningEffort::from_str("Extra High"),
+            Some(ReasoningEffort::XHigh)
+        );
+        assert_eq!(
+            ReasoningEffort::from_str("maximum"),
+            Some(ReasoningEffort::Max)
+        );
+        assert_eq!(
+            ReasoningEffort::from_str("off"),
+            Some(ReasoningEffort::None)
+        );
+        assert_eq!(ReasoningEffort::canonical_value("x-high"), Some("xhigh"));
+        assert_eq!(ReasoningEffort::from_str("turbo"), None);
     }
 
     #[test]
@@ -3728,6 +3854,7 @@ mod tests {
             sandbox_policy: None,
             mode: None,
             execution_backend: None,
+            reasoning: None,
             cli_runtime_options: None,
         };
 
@@ -3810,6 +3937,7 @@ mod tests {
             sandbox_policy: None,
             mode: None,
             execution_backend: None,
+            reasoning: None,
             cli_runtime_options: None,
         };
 

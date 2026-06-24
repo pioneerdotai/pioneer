@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ReasoningEffortRow",
+  "type": "object",
+  "properties": {
+    "effort": {
+      "type": "string"
+    },
+    "label": {
+      "type": "string"
+    },
+    "selected": {
+      "type": "boolean"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "effort",
+    "label",
+    "selected"
+  ]
+}

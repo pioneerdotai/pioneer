@@ -33,6 +33,7 @@ pub struct Model {
     pub history_json: String,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    pub reasoning_effort: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

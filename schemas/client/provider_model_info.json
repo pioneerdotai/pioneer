@@ -109,6 +109,16 @@
             "type": "string"
           }
         },
+        "reasoning": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderModelReasoningCapabilities"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "streaming": {
           "type": [
             "boolean",
@@ -196,6 +206,61 @@
           "format": "double"
         }
       }
+    },
+    "ProviderModelReasoningCapabilities": {
+      "type": "object",
+      "properties": {
+        "default_effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effort_options": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "mandatory": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "source": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReasoningCapabilitySource"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "supported": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "supports_token_budget": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "ReasoningCapabilitySource": {
+      "type": "string",
+      "enum": [
+        "provider_metadata",
+        "cli_metadata",
+        "static_registry",
+        "config_override",
+        "unknown"
+      ]
     }
   }
 }

@@ -3,12 +3,13 @@ use crate::{
         PreparedAttachmentSource, PreparedProviderMessages, attachment_bytes, attachment_data_url,
         ensure_no_unrendered_attachments, prepare_messages_for_provider,
     },
+    reasoning_registry,
     tools::call::{StreamToolCallAccumulator, StreamToolCallDelta, StreamToolFunctionDelta},
     tools::parse::{parse_embedded_tool_payload, parse_tool_calls},
     types::{
         ChatRequest, ChatResponse, InputContentType, InputTypeSupport, ProviderCapabilities,
-        ProviderInputCapabilities, ProviderTimeoutPolicy, Role, StreamChunk, TokenUsage,
-        ToolChoice, ToolDefinition,
+        ProviderInputCapabilities, ProviderTimeoutPolicy, ReasoningConfig, Role, StreamChunk,
+        TokenUsage, ToolChoice, ToolDefinition,
     },
 };
 use anyhow::{Result, anyhow};
@@ -48,6 +49,8 @@ struct ApiChatRequest {
     tool_choice: Option<ApiToolChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
     stream: bool,
 }
 
@@ -595,6 +598,13 @@ impl AzureOpenAiProvider {
     }
 }
 
+fn reasoning_effort_for_azure_openai_request(reasoning: Option<ReasoningConfig>) -> Option<String> {
+    match reasoning {
+        Some(ReasoningConfig::Effort(effort)) => Some(effort.as_str().to_owned()),
+        Some(ReasoningConfig::Disabled) | None => None,
+    }
+}
+
 #[async_trait]
 impl crate::traits::Provider for AzureOpenAiProvider {
     fn name(&self) -> &str {
@@ -638,6 +648,7 @@ impl crate::traits::Provider for AzureOpenAiProvider {
                 .map(|tools| Self::convert_tools(tools)),
             tool_choice: request.tool_choice.map(Self::convert_tool_choice),
             parallel_tool_calls: request.parallel_tool_calls,
+            reasoning_effort: reasoning_effort_for_azure_openai_request(request.reasoning),
             stream: false,
         };
 
@@ -719,6 +730,7 @@ impl crate::traits::Provider for AzureOpenAiProvider {
                 .map(|tools| Self::convert_tools(tools)),
             tool_choice: request.tool_choice.map(Self::convert_tool_choice),
             parallel_tool_calls: request.parallel_tool_calls,
+            reasoning_effort: reasoning_effort_for_azure_openai_request(request.reasoning),
             stream: true,
         };
 
@@ -869,21 +881,40 @@ impl crate::traits::Provider for AzureOpenAiProvider {
         Ok(api_response
             .data
             .into_iter()
-            .map(|m| ProviderModelInfo {
-                id: m.id.clone(),
-                name: None,
-                description: None,
-                created: m.created,
-                provider: "azure_openai".to_owned(),
-                owned_by: m.owned_by,
-                limits: ProviderModelLimits::default(),
-                capabilities: ProviderModelCapabilities::default(),
-                pricing: None,
-                active: Some(true),
-                family: None,
-                lifecycle_status: None,
+            .map(|m| {
+                let mut capabilities = ProviderModelCapabilities::default();
+                apply_azure_openai_reasoning_capabilities(m.id.as_str(), &mut capabilities);
+
+                ProviderModelInfo {
+                    id: m.id.clone(),
+                    name: None,
+                    description: None,
+                    created: m.created,
+                    provider: "azure_openai".to_owned(),
+                    owned_by: m.owned_by,
+                    limits: ProviderModelLimits::default(),
+                    capabilities,
+                    pricing: None,
+                    active: Some(true),
+                    family: None,
+                    lifecycle_status: None,
+                }
             })
             .collect())
+    }
+}
+
+fn apply_azure_openai_reasoning_capabilities(
+    model_or_deployment_id: &str,
+    capabilities: &mut ProviderModelCapabilities,
+) {
+    // Azure deployments can be arbitrary aliases. Until a deployment->base-model
+    // mapping exists, only ids that already match OpenAI base model ids are safe.
+    if let Some(reasoning) =
+        reasoning_registry::reasoning_capabilities_for_model("openai", model_or_deployment_id)
+    {
+        capabilities.thinking = reasoning.supported;
+        capabilities.reasoning = Some(reasoning);
     }
 }
 
@@ -892,7 +923,10 @@ mod tests {
     use super::*;
     use crate::attachments::prepare_messages_for_provider;
     use crate::traits::Provider;
-    use crate::types::{AttachmentDataSource, ChatMessage, MessageAttachment, MessageContentPart};
+    use crate::types::{
+        AttachmentDataSource, ChatMessage, MessageAttachment, MessageContentPart, ReasoningConfig,
+        ReasoningEffort,
+    };
 
     #[test]
     fn creates_with_defaults() {
@@ -907,6 +941,31 @@ mod tests {
     fn creates_with_custom_api_version() {
         let provider = AzureOpenAiProvider::with_api_version("key", "res", "deploy", "2025-01-01");
         assert_eq!(provider.api_version, "2025-01-01");
+    }
+
+    #[test]
+    fn azure_openai_reasoning_uses_known_base_model_ids() {
+        let mut capabilities = ProviderModelCapabilities::default();
+        apply_azure_openai_reasoning_capabilities("gpt-5.4", &mut capabilities);
+
+        let reasoning = capabilities
+            .reasoning
+            .expect("known base model should have reasoning metadata");
+        assert_eq!(reasoning.supported, Some(true));
+        assert_eq!(
+            reasoning.effort_options,
+            vec!["none", "low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(capabilities.thinking, Some(true));
+    }
+
+    #[test]
+    fn azure_openai_reasoning_leaves_unknown_deployment_alias_unset() {
+        let mut capabilities = ProviderModelCapabilities::default();
+        apply_azure_openai_reasoning_capabilities("prod-chat-deployment", &mut capabilities);
+
+        assert!(capabilities.reasoning.is_none());
+        assert!(capabilities.thinking.is_none());
     }
 
     #[test]
@@ -1001,5 +1060,43 @@ mod tests {
         let caps = provider.capabilities();
         assert!(caps.streaming);
         assert!(caps.vision);
+    }
+
+    #[test]
+    fn api_request_serializes_reasoning_effort_only_when_selected() {
+        let request = ApiChatRequest {
+            messages: Vec::new(),
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning_effort: Some("high".to_owned()),
+            stream: false,
+        };
+
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["reasoning_effort"], "high");
+
+        let request_without_reasoning = ApiChatRequest {
+            reasoning_effort: None,
+            ..request
+        };
+        let json = serde_json::to_value(&request_without_reasoning).unwrap();
+        assert!(json.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn reasoning_effort_mapping_omits_disabled_and_serializes_explicit_none() {
+        assert_eq!(
+            reasoning_effort_for_azure_openai_request(Some(ReasoningConfig::disabled())),
+            None
+        );
+        assert_eq!(
+            reasoning_effort_for_azure_openai_request(Some(ReasoningConfig::effort(
+                ReasoningEffort::None
+            ))),
+            Some("none".to_owned())
+        );
     }
 }

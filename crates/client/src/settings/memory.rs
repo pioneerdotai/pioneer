@@ -190,6 +190,7 @@ mod tests {
             gateway_memory_model_selection_from_model_selector(ModelSelectorSelection {
                 provider: Some("openai".to_owned()),
                 model: Some("gpt-5.4".to_owned()),
+                selected_reasoning_effort: None,
             }),
             GatewayMemoryModelSelection::custom("openai", "gpt-5.4")
         );
@@ -198,6 +199,7 @@ mod tests {
             gateway_memory_model_selection_from_model_selector(ModelSelectorSelection {
                 provider: Some("openai".to_owned()),
                 model: Some(" ".to_owned()),
+                selected_reasoning_effort: None,
             }),
             GatewayMemoryModelSelection::thread()
         );

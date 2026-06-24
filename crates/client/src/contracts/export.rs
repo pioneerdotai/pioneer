@@ -529,6 +529,13 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Stable
         ),
         contract_type!(
+            "composer_model_selection_state.json",
+            crate::composer::model_selection::ComposerModelSelectionState,
+            Domain::Composer,
+            Kind::SelectorDto,
+            Stability::Stable
+        ),
+        contract_type!(
             "composer_model_selection_candidate.json",
             crate::composer::model_selection::ComposerModelSelectionCandidate,
             Domain::Composer,
@@ -963,6 +970,27 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Stable
         ),
         contract_type!(
+            "reasoning_effort_row.json",
+            crate::providers::presentation::ReasoningEffortRow,
+            Domain::Providers,
+            Kind::SelectorDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "reasoning_effort_rows_request.json",
+            crate::providers::presentation::ReasoningEffortRowsRequest,
+            Domain::Providers,
+            Kind::SelectorDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "reasoning_effort_rows_response.json",
+            crate::providers::presentation::ReasoningEffortRowsResponse,
+            Domain::Providers,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
             "provider_list_models_params.json",
             pioneer_protocol::ProviderListModelsParams,
             Domain::Providers,
@@ -1014,6 +1042,20 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
         contract_type!(
             "provider_model_info.json",
             pioneer_protocol::ProviderModelInfo,
+            Domain::Providers,
+            Kind::SelectorDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "provider_model_reasoning_capabilities.json",
+            pioneer_protocol::ProviderModelReasoningCapabilities,
+            Domain::Providers,
+            Kind::SelectorDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "reasoning_capability_source.json",
+            pioneer_protocol::ReasoningCapabilitySource,
             Domain::Providers,
             Kind::SelectorDto,
             Stability::Stable
@@ -1472,6 +1514,13 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Domain::Providers,
             Kind::Command,
             Stability::Provisional
+        ),
+        contract_type!(
+            "turn_reasoning_selection.json",
+            pioneer_protocol::TurnReasoningSelection,
+            Domain::Composer,
+            Kind::Command,
+            Stability::Stable
         ),
         contract_type!(
             "turn_work_group_row.json",

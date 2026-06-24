@@ -93,6 +93,8 @@ pub struct ClientActiveThreadSendTextRequest {
     #[serde(default)]
     pub selected_provider: Option<String>,
     #[serde(default)]
+    pub selected_reasoning_effort: Option<String>,
+    #[serde(default)]
     pub selected_mode: Option<ThreadMode>,
     #[serde(default)]
     pub attachments: Vec<ComposerAttachment>,
@@ -298,6 +300,7 @@ impl ClientFfiActiveThreadState {
             text,
             selected_model,
             selected_provider,
+            selected_reasoning_effort,
             selected_mode,
             attachments,
             capabilities,
@@ -386,6 +389,7 @@ impl ClientFfiActiveThreadState {
                 turn_model_provider,
                 selected_mode: Some(selection.selected_mode),
                 execution_backend: selected_cli_runtime_backend,
+                selected_reasoning_effort,
                 cli_runtime_options: None,
                 updated_at_unix: now_unix_seconds(),
             },

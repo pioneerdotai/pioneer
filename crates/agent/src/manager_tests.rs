@@ -37,7 +37,7 @@ use pioneer_provider::providers::EchoProvider;
 use pioneer_provider::{
     AttachmentDataSource, ChatRequest, ChatResponse, InputTypeSupport, MessageContentPart,
     Provider, ProviderCapabilities, ProviderInputCapabilities, ProviderRegistry, ProviderToolCall,
-    Role, StreamChunk,
+    ReasoningConfig, ReasoningEffort, Role, StreamChunk,
 };
 use pioneer_skills::{SkillAuditAction, SkillAuditDecision, SkillTrustLevel};
 use pioneer_tools::{
@@ -4045,6 +4045,114 @@ async fn phase_07_chat_mode_does_not_call_turn_hooks() {
     let requests = provider.snapshot_requests();
     assert_eq!(requests.len(), 1);
     assert!(requests[0].compiled_prompt.is_none());
+}
+
+#[tokio::test]
+async fn chat_mode_request_includes_selected_reasoning_effort() {
+    let provider = Arc::new(CaptureStandardProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "capture-standard",
+        provider.clone(),
+    ));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let thread_id = "thr_reasoning_chat";
+    let turn_id = "turn_reasoning_chat";
+    manager
+        .ensure_thread(thread_id, "ws_reasoning_chat")
+        .await
+        .expect("thread should be created");
+    let mut events = subscribe_agent_events(&manager, thread_id).await;
+
+    manager
+        .start_turn_with_resolved_artifacts_environment_and_reasoning(
+            thread_id,
+            turn_id,
+            ThreadMode::Chat,
+            "test-model",
+            "capture-standard",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "reasoning chat".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            Vec::new(),
+            Some("xhigh"),
+        )
+        .await
+        .expect("turn should start");
+
+    let observed = recv_events_until_terminal(&mut events).await;
+    assert_turn_completed(&observed);
+
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].reasoning,
+        Some(ReasoningConfig::effort(ReasoningEffort::XHigh))
+    );
+}
+
+#[tokio::test]
+async fn agent_tool_loop_requests_include_selected_reasoning_effort_each_round() {
+    let provider = Arc::new(SequencedToolProvider::new(
+        vec![ProviderToolCall {
+            id: "call_reasoning_list_dir".to_owned(),
+            name: "list_dir".to_owned(),
+            arguments: serde_json::json!({"path": ".", "depth": 0, "limit": 1}).to_string(),
+        }],
+        "final after tool",
+    ));
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "sequenced-tools",
+        provider.clone(),
+    ));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let thread_id = "thr_reasoning_tool_loop";
+    let turn_id = "turn_reasoning_tool_loop";
+    manager
+        .ensure_thread(thread_id, "ws_reasoning_tool_loop")
+        .await
+        .expect("thread should be created");
+    let mut events = subscribe_agent_events(&manager, thread_id).await;
+
+    manager
+        .start_turn_with_resolved_artifacts_environment_and_reasoning(
+            thread_id,
+            turn_id,
+            ThreadMode::Agent,
+            "test-model",
+            "sequenced-tools",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "list files with reasoning".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            Vec::new(),
+            Some("medium"),
+        )
+        .await
+        .expect("turn should start");
+
+    let observed = recv_events_until_terminal(&mut events).await;
+    assert_turn_completed(&observed);
+
+    let requests = provider.snapshot_requests();
+    assert!(
+        requests.len() >= 2,
+        "tool loop should capture at least two main provider rounds"
+    );
+    for request in requests {
+        assert_eq!(
+            request.reasoning,
+            Some(ReasoningConfig::effort(ReasoningEffort::Medium))
+        );
+    }
 }
 
 #[tokio::test]

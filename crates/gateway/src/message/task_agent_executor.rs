@@ -260,6 +260,7 @@ impl TaskAgentExecutor {
                 sandbox_policy: None,
                 mode: Some(ThreadMode::Agent),
                 execution_backend: None,
+                reasoning: None,
                 cli_runtime_options: None,
             })
             .await
@@ -354,6 +355,7 @@ impl TaskAgentExecutor {
                 &hook_runtime_context,
                 &thread_outcome.started_notification.thread.model,
                 &thread_outcome.started_notification.thread.model_provider,
+                None,
                 &workspace_skill_policies,
                 turn_outcome.materialization.input.as_slice(),
                 turn_outcome.materialization.capabilities.as_slice(),
@@ -616,6 +618,7 @@ impl TaskAgentExecutor {
                 sandbox_policy: None,
                 mode: Some(ThreadMode::Agent),
                 execution_backend: None,
+                reasoning: None,
                 cli_runtime_options: None,
             })
             .await
@@ -766,6 +769,7 @@ impl TaskAgentExecutor {
                 &hook_runtime_context,
                 &thread_outcome.started_notification.thread.model,
                 &thread_outcome.started_notification.thread.model_provider,
+                None,
                 &workspace_skill_policies,
                 turn_outcome.materialization.input.as_slice(),
                 turn_outcome.materialization.capabilities.as_slice(),
@@ -1010,6 +1014,7 @@ impl TaskAgentExecutor {
                 sandbox_policy: None,
                 mode: Some(ThreadMode::Agent),
                 execution_backend: None,
+                reasoning: None,
                 cli_runtime_options: None,
             })
             .await
@@ -1097,6 +1102,7 @@ impl TaskAgentExecutor {
                 &hook_runtime_context,
                 &thread_outcome.started_notification.thread.model,
                 &thread_outcome.started_notification.thread.model_provider,
+                None,
                 &workspace_skill_policies,
                 turn_outcome.materialization.input.as_slice(),
                 turn_outcome.materialization.capabilities.as_slice(),
@@ -1687,6 +1693,7 @@ impl TaskAgentExecutor {
                 sandbox_policy: None,
                 mode: Some(ThreadMode::Agent),
                 execution_backend: None,
+                reasoning: None,
                 cli_runtime_options: None,
             })
             .await
@@ -1757,6 +1764,7 @@ impl TaskAgentExecutor {
                 &hook_runtime_context,
                 &thread_outcome.started_notification.thread.model,
                 &thread_outcome.started_notification.thread.model_provider,
+                None,
                 &workspace_skill_policies,
                 turn_outcome.materialization.input.as_slice(),
                 turn_outcome.materialization.capabilities.as_slice(),

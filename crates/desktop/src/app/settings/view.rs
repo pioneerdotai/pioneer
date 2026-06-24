@@ -479,6 +479,7 @@ impl PioneerDesktop {
                                                         selected_provider: selected_provider
                                                             .clone(),
                                                         selected_model: selected_model.clone(),
+                                                        selected_reasoning_effort: None,
                                                         workspace_id,
                                                         ws_sender: view
                                                             .gateway
@@ -939,6 +940,7 @@ impl PioneerDesktop {
                                                 .to_string(),
                                                 selected_provider: selected_provider.clone(),
                                                 selected_model: selected_model.clone(),
+                                                selected_reasoning_effort: None,
                                                 workspace_id,
                                                 ws_sender: view.gateway.ws_command_sender.clone(),
                                                 on_save: Rc::new(

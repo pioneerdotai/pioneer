@@ -6,12 +6,13 @@ use crate::{
         lookup_uploaded_reference_with_artifact, model_family_for_model,
         prepare_messages_for_provider, runtime, store_uploaded_reference,
     },
+    reasoning_registry,
     tools::call::{StreamToolCallAccumulator, StreamToolCallDelta, StreamToolFunctionDelta},
     tools::parse::{parse_embedded_tool_payload, parse_tool_calls},
     types::{
         ChatRequest, ChatResponse, InputContentType, InputTypeSupport, ProviderCapabilities,
-        ProviderInputCapabilities, ProviderTimeoutPolicy, Role, StreamChunk, TokenUsage,
-        ToolChoice, ToolDefinition,
+        ProviderInputCapabilities, ProviderTimeoutPolicy, ReasoningConfig, Role, StreamChunk,
+        TokenUsage, ToolChoice, ToolDefinition,
     },
 };
 use anyhow::{Result, anyhow};
@@ -51,6 +52,8 @@ struct ApiChatRequest {
     tool_choice: Option<ApiToolChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
     stream: bool,
 }
 
@@ -693,6 +696,13 @@ impl OpenAiProvider {
     }
 }
 
+fn reasoning_effort_for_openai_request(reasoning: Option<ReasoningConfig>) -> Option<String> {
+    match reasoning {
+        Some(ReasoningConfig::Effort(effort)) => Some(effort.as_str().to_owned()),
+        Some(ReasoningConfig::Disabled) | None => None,
+    }
+}
+
 #[async_trait]
 impl crate::traits::Provider for OpenAiProvider {
     fn name(&self) -> &str {
@@ -741,6 +751,7 @@ impl crate::traits::Provider for OpenAiProvider {
                 .map(|tools| Self::convert_tools(tools)),
             tool_choice: request.tool_choice.map(Self::convert_tool_choice),
             parallel_tool_calls: request.parallel_tool_calls,
+            reasoning_effort: reasoning_effort_for_openai_request(request.reasoning),
             stream: false,
         };
 
@@ -828,6 +839,7 @@ impl crate::traits::Provider for OpenAiProvider {
                 .map(|tools| Self::convert_tools(tools)),
             tool_choice: request.tool_choice.map(Self::convert_tool_choice),
             parallel_tool_calls: request.parallel_tool_calls,
+            reasoning_effort: reasoning_effort_for_openai_request(request.reasoning),
             stream: true,
         };
 
@@ -977,21 +989,28 @@ impl crate::traits::Provider for OpenAiProvider {
         Ok(api_response
             .data
             .into_iter()
-            .map(|m| ProviderModelInfo {
-                id: m.id.clone(),
-                name: None,
-                description: None,
-                created: m.created,
-                provider: "openai".to_owned(),
-                owned_by: m.owned_by,
-                limits: ProviderModelLimits::default(),
-                capabilities: ProviderModelCapabilities::default(),
-                pricing: None,
-                active: Some(true),
-                family: None,
-                lifecycle_status: None,
-            })
+            .map(provider_model_from_openai_model_entry)
             .collect())
+    }
+}
+
+fn provider_model_from_openai_model_entry(m: ApiModelEntry) -> ProviderModelInfo {
+    let mut capabilities = ProviderModelCapabilities::default();
+    reasoning_registry::apply_reasoning_capabilities("openai", m.id.as_str(), &mut capabilities);
+
+    ProviderModelInfo {
+        id: m.id.clone(),
+        name: None,
+        description: None,
+        created: m.created,
+        provider: "openai".to_owned(),
+        owned_by: m.owned_by,
+        limits: ProviderModelLimits::default(),
+        capabilities,
+        pricing: None,
+        active: Some(true),
+        family: None,
+        lifecycle_status: None,
     }
 }
 
@@ -1002,6 +1021,7 @@ mod tests {
     use crate::traits::Provider;
     use crate::types::{
         AttachmentDataSource, ChatMessage, MessageAttachment, MessageContentPart, ProviderToolCall,
+        ReasoningConfig, ReasoningEffort,
     };
 
     #[test]
@@ -1039,6 +1059,74 @@ mod tests {
             provider.chat_completions_url(),
             "http://localhost:3000/chat/completions"
         );
+    }
+
+    #[test]
+    fn openai_reasoning_registry_exposes_documented_gpt_5_5_efforts() {
+        let reasoning = reasoning_registry::reasoning_capabilities_for_model("openai", "gpt-5.5")
+            .expect("gpt-5.5 reasoning metadata");
+
+        assert_eq!(reasoning.supported, Some(true));
+        assert_eq!(
+            reasoning.effort_options,
+            vec!["none", "low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(reasoning.default_effort.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn openai_reasoning_registry_matches_documented_gpt_5_4_family() {
+        let reasoning =
+            reasoning_registry::reasoning_capabilities_for_model("openai", "gpt-5.4-mini")
+                .expect("gpt-5.4 mini reasoning metadata");
+
+        assert_eq!(reasoning.supported, Some(true));
+        assert_eq!(
+            reasoning.effort_options,
+            vec!["none", "low", "medium", "high", "xhigh"]
+        );
+    }
+
+    #[test]
+    fn openai_reasoning_registry_leaves_unknown_models_unset() {
+        assert!(
+            reasoning_registry::reasoning_capabilities_for_model("openai", "custom-model")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn openai_model_list_fixture_normalizes_reasoning_capabilities() {
+        let response: ModelsListResponse = serde_json::from_str(
+            r#"{
+                "data": [
+                    { "id": "gpt-5.5", "created": 1, "owned_by": "openai" },
+                    { "id": "custom-model", "created": 2, "owned_by": "user" }
+                ]
+            }"#,
+        )
+        .expect("fixture response");
+        let models = response
+            .data
+            .into_iter()
+            .map(provider_model_from_openai_model_entry)
+            .collect::<Vec<_>>();
+
+        let known = &models[0];
+        let reasoning = known
+            .capabilities
+            .reasoning
+            .as_ref()
+            .expect("known reasoning model");
+        assert_eq!(reasoning.supported, Some(true));
+        assert_eq!(
+            reasoning.effort_options,
+            vec!["none", "low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(known.capabilities.thinking, Some(true));
+
+        assert!(models[1].capabilities.reasoning.is_none());
+        assert!(models[1].capabilities.thinking.is_none());
     }
 
     #[test]
@@ -1168,6 +1256,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             parallel_tool_calls: None,
+            reasoning_effort: None,
             stream: false,
         };
 
@@ -1190,6 +1279,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             parallel_tool_calls: None,
+            reasoning_effort: None,
             stream: true,
         };
 
@@ -1198,6 +1288,45 @@ mod tests {
         assert!(json.contains("\"max_tokens\":1024"));
         assert!(json.contains("\"stream\":true"));
         assert!(!json.contains("temperature"));
+    }
+
+    #[test]
+    fn api_request_serializes_reasoning_effort_only_when_selected() {
+        let request = ApiChatRequest {
+            model: "gpt-5.4".into(),
+            messages: vec![],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning_effort: Some("high".to_owned()),
+            stream: false,
+        };
+
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["reasoning_effort"], "high");
+
+        let request_without_reasoning = ApiChatRequest {
+            reasoning_effort: None,
+            ..request
+        };
+        let json = serde_json::to_value(&request_without_reasoning).unwrap();
+        assert!(json.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn reasoning_effort_mapping_omits_disabled_and_serializes_explicit_none() {
+        assert_eq!(
+            reasoning_effort_for_openai_request(Some(ReasoningConfig::disabled())),
+            None
+        );
+        assert_eq!(
+            reasoning_effort_for_openai_request(Some(ReasoningConfig::effort(
+                ReasoningEffort::None
+            ))),
+            Some("none".to_owned())
+        );
     }
 
     #[test]

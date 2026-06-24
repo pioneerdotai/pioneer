@@ -1,5 +1,10 @@
 use super::agent_runtime::TurnFailureRecoveryKind;
 use super::*;
+use crate::cli_runtime::config::{
+    claude_account_probe_config_from_instance, codex_account_probe_config_from_instance,
+};
+use pioneer_cli_agent_runtime::claude::{ClaudeModelSnapshot, ClaudeProbe};
+use pioneer_cli_agent_runtime::codex::{CodexModelListProbeStatus, CodexModelSnapshot, CodexProbe};
 use pioneer_protocol::{
     AgentExecutionBackend, CLIAgentRuntimeKind, TaskAttachmentMode, TaskEvent, TaskEventPayload,
     TaskGetResponse, TaskRunThreadBindingKind, TaskRunTurn, TaskThreadLineage, ThreadLineage,
@@ -64,6 +69,15 @@ impl MessageProcessor {
             .await;
             return;
         }
+        let requested_reasoning_effort = requested_reasoning_effort(&params);
+        if let Some(effort) = requested_reasoning_effort.as_deref() {
+            debug!(
+                effort,
+                turn_id = params.turn_id.as_str(),
+                thread_id = params.thread_id.as_str(),
+                "turn/start requested reasoning effort"
+            );
+        }
         if let Some(backend) = params.execution_backend.clone() {
             match backend {
                 AgentExecutionBackend::CLIAgentRuntime {
@@ -111,6 +125,30 @@ impl MessageProcessor {
                 return;
             }
         };
+        if let Err(message) = self
+            .validate_turn_reasoning_effort(
+                outcome.started_notification.workspace_id.as_str(),
+                ReasoningModelLookupBackend::ApiProvider {
+                    provider: outcome.materialization.thread.model_provider.as_str(),
+                },
+                outcome.materialization.thread.model.as_str(),
+                requested_reasoning_effort.as_deref(),
+            )
+            .await
+        {
+            self.thread_manager
+                .rollback_turn_start(outcome.rollback_context.clone())
+                .await;
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
+            )
+            .await;
+            return;
+        }
+        let effective_reasoning_effort = requested_reasoning_effort
+            .as_deref()
+            .map(normalized_reasoning_effort_for_comparison);
         if let Err(error) = self
             .validate_artifact_user_inputs(
                 outcome.started_notification.workspace_id.as_str(),
@@ -132,12 +170,16 @@ impl MessageProcessor {
             .await;
             return;
         }
-        if let Err(error) = message_future(self.crud_store.materialize_turn_start(
-            &outcome.materialization.thread,
-            outcome.materialization.sandbox_mode,
-            &outcome.materialization.turn,
-            &outcome.materialization.input,
-        ))
+        if let Err(error) = message_future(
+            self.crud_store
+                .materialize_turn_start_with_reasoning_effort(
+                    &outcome.materialization.thread,
+                    outcome.materialization.sandbox_mode,
+                    &outcome.materialization.turn,
+                    &outcome.materialization.input,
+                    effective_reasoning_effort.as_deref(),
+                ),
+        )
         .await
         {
             self.thread_manager
@@ -284,6 +326,7 @@ impl MessageProcessor {
                 &hook_runtime_context,
                 &outcome.materialization.thread.model,
                 &outcome.materialization.thread.model_provider,
+                effective_reasoning_effort.as_deref(),
                 &workspace_skill_policies,
                 outcome.materialization.input.as_slice(),
                 outcome.materialization.capabilities.as_slice(),
@@ -313,7 +356,7 @@ impl MessageProcessor {
         }
         if let Err(error) = self
             .agent_manager
-            .start_turn_with_resolved_artifacts_and_environment(
+            .start_turn_with_resolved_artifacts_environment_and_reasoning(
                 outcome.started_notification.thread_id.as_str(),
                 outcome.started_notification.turn.id.as_str(),
                 outcome.materialization.thread.mode,
@@ -325,6 +368,7 @@ impl MessageProcessor {
                 resolved_artifacts,
                 runtime_environment,
                 history,
+                effective_reasoning_effort.as_deref(),
             )
             .await
         {
@@ -566,10 +610,25 @@ impl MessageProcessor {
             .map(|policy| policy.0.clone());
         let effective_approval_policy = cli_runtime_approval_policy(&params);
         let sandbox_policy_value = cli_runtime_sandbox_policy_value(&params);
-        let cli_runtime_effort = params
-            .cli_runtime_options
-            .as_ref()
-            .and_then(|options| options.effort.clone());
+        let requested_reasoning_effort = requested_reasoning_effort(&params);
+        let cli_runtime_effort = cli_runtime_effort(&params);
+        // Transition rule: CLI turns may carry the legacy runtime effort, the
+        // top-level reasoning effort, or both when they agree. New clients use
+        // the top-level field; the native runtime still receives one value.
+        let effective_cli_runtime_effort = match effective_cli_runtime_effort(
+            requested_reasoning_effort.as_deref(),
+            cli_runtime_effort.as_deref(),
+        ) {
+            Ok(effort) => effort,
+            Err(message) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
+                )
+                .await;
+                return;
+            }
+        };
         let cli_runtime_personality = params
             .cli_runtime_options
             .as_ref()
@@ -594,12 +653,38 @@ impl MessageProcessor {
                 return;
             }
         };
-        if let Err(error) = message_future(self.crud_store.materialize_turn_start(
-            &outcome.materialization.thread,
-            outcome.materialization.sandbox_mode,
-            &outcome.materialization.turn,
-            &outcome.materialization.input,
-        ))
+        if let Err(message) = self
+            .validate_turn_reasoning_effort(
+                outcome.started_notification.workspace_id.as_str(),
+                ReasoningModelLookupBackend::CliRuntime {
+                    runtime_id: runtime_id.as_str(),
+                    runtime_kind,
+                },
+                outcome.materialization.thread.model.as_str(),
+                effective_cli_runtime_effort.as_deref(),
+            )
+            .await
+        {
+            self.thread_manager
+                .rollback_turn_start(outcome.rollback_context.clone())
+                .await;
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
+            )
+            .await;
+            return;
+        }
+        if let Err(error) = message_future(
+            self.crud_store
+                .materialize_turn_start_with_reasoning_effort(
+                    &outcome.materialization.thread,
+                    outcome.materialization.sandbox_mode,
+                    &outcome.materialization.turn,
+                    &outcome.materialization.input,
+                    effective_cli_runtime_effort.as_deref(),
+                ),
+        )
         .await
         {
             self.thread_manager
@@ -833,7 +918,7 @@ impl MessageProcessor {
                     approval_policy: Some(effective_approval_policy),
                     sandbox: sandbox_policy_value,
                     model: Some(outcome.materialization.thread.model.clone()),
-                    effort: cli_runtime_effort,
+                    effort: effective_cli_runtime_effort,
                     personality: cli_runtime_personality,
                     summary: cli_runtime_summary,
                 },
@@ -2275,12 +2360,584 @@ impl MessageProcessor {
         }))
     }
 
+    async fn lookup_reasoning_model_capabilities(
+        &self,
+        workspace_id: &str,
+        backend: ReasoningModelLookupBackend<'_>,
+        model_id: &str,
+    ) -> Option<ProviderModelInfo> {
+        let model_id = model_id.trim();
+        if model_id.is_empty() {
+            debug!(
+                workspace_id,
+                "skipping reasoning model capability lookup because model id is empty"
+            );
+            return None;
+        }
+
+        let model = match backend {
+            ReasoningModelLookupBackend::ApiProvider { provider } => {
+                self.lookup_api_provider_model_for_reasoning(workspace_id, provider, model_id)
+                    .await
+            }
+            ReasoningModelLookupBackend::CliRuntime {
+                runtime_id,
+                runtime_kind,
+            } => {
+                self.lookup_cli_runtime_model_for_reasoning(
+                    workspace_id,
+                    runtime_id,
+                    runtime_kind,
+                    model_id,
+                )
+                .await
+            }
+        };
+
+        match model
+            .as_ref()
+            .and_then(|model| model.capabilities.reasoning.as_ref())
+        {
+            Some(reasoning) => {
+                debug!(
+                    workspace_id,
+                    model_id,
+                    supported = ?reasoning.supported,
+                    efforts = ?reasoning.effort_options,
+                    source = reasoning_capability_source_label(reasoning.source),
+                    "resolved reasoning model capability metadata"
+                );
+            }
+            None if model.is_some() => {
+                debug!(
+                    workspace_id,
+                    model_id,
+                    source = reasoning_capability_source_label(None),
+                    "resolved model but reasoning capability metadata is missing"
+                );
+            }
+            None => {
+                debug!(
+                    workspace_id,
+                    model_id,
+                    source = reasoning_capability_source_label(None),
+                    "reasoning model capability metadata is unavailable"
+                );
+            }
+        }
+
+        model
+    }
+
+    async fn validate_turn_reasoning_effort(
+        &self,
+        workspace_id: &str,
+        backend: ReasoningModelLookupBackend<'_>,
+        model_id: &str,
+        effort: Option<&str>,
+    ) -> Result<(), String> {
+        let Some(effort) = effort.map(str::trim).filter(|effort| !effort.is_empty()) else {
+            return Ok(());
+        };
+        let backend_label = reasoning_model_lookup_backend_label(backend);
+        let model = self
+            .lookup_reasoning_model_capabilities(workspace_id, backend, model_id)
+            .await;
+
+        let result = validate_reasoning_effort_for_model(
+            backend_label.as_str(),
+            model_id,
+            effort,
+            model.as_ref(),
+        );
+        let capability_source = reasoning_capability_source_for_model(model.as_ref());
+        let supported_efforts = reasoning_effort_options_for_model(model.as_ref());
+        match &result {
+            Ok(()) => {
+                debug!(
+                    workspace_id,
+                    backend = backend_label.as_str(),
+                    model_id,
+                    effort,
+                    capability_source,
+                    supported_efforts = ?supported_efforts,
+                    "accepted reasoning effort selection"
+                );
+            }
+            Err(message) => {
+                debug!(
+                    workspace_id,
+                    backend = backend_label.as_str(),
+                    model_id,
+                    effort,
+                    capability_source,
+                    supported_efforts = ?supported_efforts,
+                    error = message.as_str(),
+                    "rejected reasoning effort selection"
+                );
+            }
+        }
+        result
+    }
+
+    async fn lookup_api_provider_model_for_reasoning(
+        &self,
+        workspace_id: &str,
+        provider_id: &str,
+        model_id: &str,
+    ) -> Option<ProviderModelInfo> {
+        let provider = match self
+            .provider_registry
+            .get_or_create_for_workspace(workspace_id, provider_id)
+        {
+            Ok(provider) => provider,
+            Err(error) => {
+                debug!(
+                    workspace_id,
+                    provider = provider_id,
+                    model_id,
+                    error = %format!("{error:#}"),
+                    "failed to create provider for reasoning capability lookup"
+                );
+                return None;
+            }
+        };
+
+        match provider.list_models().await {
+            Ok(models) => models
+                .into_iter()
+                .find(|model| model.id == model_id)
+                .or_else(|| {
+                    debug!(
+                        workspace_id,
+                        provider = provider_id,
+                        model_id,
+                        "provider model list did not contain selected model for reasoning lookup"
+                    );
+                    None
+                }),
+            Err(error) => {
+                debug!(
+                    workspace_id,
+                    provider = provider_id,
+                    model_id,
+                    error = %format!("{error:#}"),
+                    "failed to list provider models for reasoning capability lookup"
+                );
+                None
+            }
+        }
+    }
+
+    async fn lookup_cli_runtime_model_for_reasoning(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        runtime_kind: CLIAgentRuntimeKind,
+        model_id: &str,
+    ) -> Option<ProviderModelInfo> {
+        let instances = match self.load_cli_runtime_instances() {
+            Ok(instances) => instances,
+            Err(error) => {
+                debug!(
+                    workspace_id,
+                    runtime_id,
+                    model_id,
+                    error = %format!("{error:#}"),
+                    "failed to load CLI runtime config for reasoning capability lookup"
+                );
+                return None;
+            }
+        };
+
+        let Some(instance) = instances
+            .into_iter()
+            .find(|instance| instance.id == runtime_id)
+        else {
+            debug!(
+                workspace_id,
+                runtime_id, model_id, "CLI runtime not found for reasoning capability lookup"
+            );
+            return None;
+        };
+
+        if !cli_runtime_kind_matches_config(runtime_kind, instance.kind) {
+            debug!(
+                workspace_id,
+                runtime_id,
+                requested_kind = cli_runtime_protocol_kind_label(runtime_kind),
+                configured_kind = cli_runtime_config_kind_label(instance.kind),
+                model_id,
+                "CLI runtime kind mismatch for reasoning capability lookup"
+            );
+            return None;
+        }
+
+        let mut models = if instance.enabled {
+            match instance.kind {
+                pioneer_config::GatewayCliAgentRuntimeKindConfig::Codex => {
+                    let probe =
+                        CodexProbe::model_list(codex_account_probe_config_from_instance(&instance))
+                            .await;
+                    if probe.status == CodexModelListProbeStatus::Ready {
+                        probe
+                            .models
+                            .into_iter()
+                            .map(runtime_model_from_codex_snapshot_for_reasoning_lookup)
+                            .collect::<Vec<_>>()
+                    } else {
+                        debug!(
+                            workspace_id,
+                            runtime_id,
+                            model_id,
+                            status = ?probe.status,
+                            "Codex CLI model metadata is unavailable for reasoning lookup"
+                        );
+                        Vec::new()
+                    }
+                }
+                pioneer_config::GatewayCliAgentRuntimeKindConfig::Claude => {
+                    let probe = ClaudeProbe::model_list(
+                        claude_account_probe_config_from_instance(&instance),
+                        &instance.custom_models,
+                    )
+                    .await;
+                    if let Some(error_message) = probe.error_message.as_deref() {
+                        debug!(
+                            workspace_id,
+                            runtime_id,
+                            model_id,
+                            error = error_message,
+                            "Claude CLI model metadata returned diagnostics for reasoning lookup"
+                        );
+                    }
+                    probe
+                        .models
+                        .into_iter()
+                        .map(runtime_model_from_claude_snapshot_for_reasoning_lookup)
+                        .collect::<Vec<_>>()
+                }
+            }
+        } else {
+            debug!(
+                workspace_id,
+                runtime_id, model_id, "CLI runtime is disabled for reasoning capability lookup"
+            );
+            Vec::new()
+        };
+        append_cli_runtime_custom_models_for_reasoning_lookup(&mut models, &instance.custom_models);
+
+        models
+            .into_iter()
+            .find(|model| model.id == model_id)
+            .map(|model| {
+                provider_model_from_runtime_model_for_reasoning_lookup(
+                    cli_runtime_provider_key(runtime_id).as_str(),
+                    model,
+                )
+            })
+            .or_else(|| {
+                debug!(
+                    workspace_id,
+                    runtime_id,
+                    model_id,
+                    "CLI runtime model list did not contain selected model for reasoning lookup"
+                );
+                None
+            })
+    }
+
     #[cfg(test)]
     pub(super) async fn compose_turn_timeline_for_test(
         &self,
         params: TurnTimelineParams,
     ) -> anyhow::Result<Option<TurnTimelineResponse>> {
         self.compose_turn_timeline(params).await
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ReasoningModelLookupBackend<'a> {
+    ApiProvider {
+        provider: &'a str,
+    },
+    CliRuntime {
+        runtime_id: &'a str,
+        runtime_kind: CLIAgentRuntimeKind,
+    },
+}
+
+fn reasoning_model_lookup_backend_label(backend: ReasoningModelLookupBackend<'_>) -> String {
+    match backend {
+        ReasoningModelLookupBackend::ApiProvider { provider } => {
+            format!("provider `{provider}`")
+        }
+        ReasoningModelLookupBackend::CliRuntime { runtime_id, .. } => {
+            format!("CLI runtime `{runtime_id}`")
+        }
+    }
+}
+
+fn reasoning_capability_source_label(source: Option<ReasoningCapabilitySource>) -> &'static str {
+    match source {
+        Some(ReasoningCapabilitySource::ProviderMetadata) => "provider_metadata",
+        Some(ReasoningCapabilitySource::CliMetadata) => "cli_metadata",
+        Some(ReasoningCapabilitySource::StaticRegistry) => "static_registry",
+        Some(ReasoningCapabilitySource::ConfigOverride) => "config_override",
+        Some(ReasoningCapabilitySource::Unknown) | None => "unknown",
+    }
+}
+
+fn reasoning_capability_source_for_model(model: Option<&ProviderModelInfo>) -> &'static str {
+    reasoning_capability_source_label(
+        model
+            .and_then(|model| model.capabilities.reasoning.as_ref())
+            .and_then(|reasoning| reasoning.source),
+    )
+}
+
+fn reasoning_effort_options_for_model(model: Option<&ProviderModelInfo>) -> Option<&[String]> {
+    model
+        .and_then(|model| model.capabilities.reasoning.as_ref())
+        .map(|reasoning| reasoning.effort_options.as_slice())
+}
+
+fn supported_efforts_for_error(reasoning: &ProviderModelReasoningCapabilities) -> String {
+    let mut effort_options = Vec::new();
+    for effort in &reasoning.effort_options {
+        let Some(effort) = pioneer_protocol::ReasoningEffort::canonical_value(effort.as_str())
+        else {
+            continue;
+        };
+        if reasoning.mandatory == Some(true) && effort == "none" {
+            continue;
+        }
+        if !effort_options.contains(&effort) {
+            effort_options.push(effort);
+        }
+    }
+
+    if effort_options.is_empty() {
+        "unknown".to_owned()
+    } else {
+        effort_options.join(", ")
+    }
+}
+
+fn validate_reasoning_effort_for_model(
+    backend_label: &str,
+    model_id: &str,
+    effort: &str,
+    model: Option<&ProviderModelInfo>,
+) -> Result<(), String> {
+    let normalized_effort =
+        pioneer_protocol::ReasoningEffort::canonical_value(effort).ok_or_else(|| {
+            format!(
+                "reasoning effort `{effort}` is not recognized by Pioneer for {backend_label} model `{model_id}`"
+            )
+        })?;
+    let Some(model) = model else {
+        return Err(format!(
+            "reasoning effort `{effort}` cannot be used with {backend_label} model `{model_id}` because model capability metadata is unavailable; capability source: unknown"
+        ));
+    };
+
+    let Some(reasoning) = model.capabilities.reasoning.as_ref() else {
+        return Err(format!(
+            "reasoning effort `{effort}` cannot be used with {backend_label} model `{model_id}` because reasoning capability metadata is missing; capability source: unknown"
+        ));
+    };
+    let capability_source = reasoning_capability_source_label(reasoning.source);
+
+    if reasoning.supported == Some(false) {
+        return Err(format!(
+            "reasoning effort `{effort}` is not supported by {backend_label} model `{model_id}`; supported efforts: {}; capability source: {capability_source}",
+            supported_efforts_for_error(reasoning)
+        ));
+    }
+
+    if reasoning.effort_options.is_empty() {
+        return Err(format!(
+            "reasoning effort `{effort}` cannot be used with {backend_label} model `{model_id}` because supported reasoning efforts are unknown; capability source: {capability_source}"
+        ));
+    }
+
+    if reasoning.mandatory == Some(true) && normalized_effort == "none" {
+        return Err(format!(
+            "reasoning effort `{effort}` is not supported by {backend_label} model `{model_id}`; supported efforts: {}; capability source: {capability_source}",
+            supported_efforts_for_error(reasoning)
+        ));
+    }
+
+    if !reasoning
+        .effort_options
+        .iter()
+        .filter_map(|supported_effort| {
+            let supported_effort =
+                pioneer_protocol::ReasoningEffort::canonical_value(supported_effort.as_str())?;
+            if reasoning.mandatory == Some(true) && supported_effort == "none" {
+                return None;
+            }
+            Some(supported_effort)
+        })
+        .any(|supported_effort| supported_effort == normalized_effort)
+    {
+        return Err(format!(
+            "reasoning effort `{effort}` is not supported by {backend_label} model `{model_id}`; supported efforts: {}; capability source: {capability_source}",
+            supported_efforts_for_error(reasoning)
+        ));
+    }
+
+    Ok(())
+}
+
+fn effective_cli_runtime_effort(
+    requested_reasoning_effort: Option<&str>,
+    cli_runtime_effort: Option<&str>,
+) -> Result<Option<String>, String> {
+    let requested_reasoning_effort =
+        requested_reasoning_effort.map(normalized_reasoning_effort_for_comparison);
+    let cli_runtime_effort = cli_runtime_effort.map(normalized_reasoning_effort_for_comparison);
+
+    match (
+        requested_reasoning_effort.as_deref(),
+        cli_runtime_effort.as_deref(),
+    ) {
+        (Some(requested), Some(cli)) if requested != cli => Err(format!(
+            "CLI runtime reasoning effort conflict: top-level reasoning effort `{requested}` does not match cli_runtime_options effort `{cli}`"
+        )),
+        (Some(requested), _) => Ok(Some(requested.to_owned())),
+        (None, Some(cli)) => Ok(Some(cli.to_owned())),
+        (None, None) => Ok(None),
+    }
+}
+
+fn normalized_reasoning_effort_for_comparison(value: &str) -> String {
+    pioneer_protocol::ReasoningEffort::canonical_value(value)
+        .map(str::to_owned)
+        .unwrap_or_else(|| value.trim().to_owned())
+}
+
+fn runtime_model_from_codex_snapshot_for_reasoning_lookup(
+    model: CodexModelSnapshot,
+) -> RuntimeModelInfo {
+    RuntimeModelInfo {
+        id: model.id,
+        name: model.name,
+        description: model.description,
+        family: model.family,
+        is_custom: false,
+        active: model.active,
+        effort_options: model.effort_options,
+        input_modalities: model.input_modalities,
+        output_modalities: model.output_modalities,
+        supports_reasoning: model.supports_reasoning,
+        supports_vision: model.supports_vision,
+        max_input_tokens: model.max_input_tokens,
+        max_output_tokens: model.max_output_tokens,
+    }
+}
+
+fn runtime_model_from_claude_snapshot_for_reasoning_lookup(
+    model: ClaudeModelSnapshot,
+) -> RuntimeModelInfo {
+    RuntimeModelInfo {
+        id: model.id,
+        name: model.name,
+        description: model.description,
+        family: model.family,
+        is_custom: false,
+        active: model.active,
+        effort_options: model.effort_options,
+        input_modalities: model.input_modalities,
+        output_modalities: model.output_modalities,
+        supports_reasoning: model.supports_reasoning,
+        supports_vision: model.supports_vision,
+        max_input_tokens: model.max_input_tokens,
+        max_output_tokens: model.max_output_tokens,
+    }
+}
+
+fn append_cli_runtime_custom_models_for_reasoning_lookup(
+    models: &mut Vec<RuntimeModelInfo>,
+    custom_models: &[String],
+) {
+    let mut seen = models
+        .iter()
+        .map(|model| model.id.clone())
+        .collect::<HashSet<_>>();
+    for raw_model in custom_models {
+        let model_id = raw_model.trim();
+        if model_id.is_empty() || !seen.insert(model_id.to_owned()) {
+            continue;
+        }
+
+        models.push(RuntimeModelInfo {
+            id: model_id.to_owned(),
+            name: Some(model_id.to_owned()),
+            description: Some(
+                "Configured custom CLI runtime model; capability metadata was not reported by the runtime"
+                    .to_owned(),
+            ),
+            family: None,
+            is_custom: true,
+            active: None,
+            effort_options: Vec::new(),
+            input_modalities: Vec::new(),
+            output_modalities: Vec::new(),
+            supports_reasoning: None,
+            supports_vision: None,
+            max_input_tokens: None,
+            max_output_tokens: None,
+        });
+    }
+}
+
+fn provider_model_from_runtime_model_for_reasoning_lookup(
+    provider_key: &str,
+    model: RuntimeModelInfo,
+) -> ProviderModelInfo {
+    let supports_reasoning = model
+        .supports_reasoning
+        .or_else(|| (!model.effort_options.is_empty()).then_some(true));
+    let reasoning = supports_reasoning.map(|supported| ProviderModelReasoningCapabilities {
+        supported: Some(supported),
+        effort_options: model.effort_options.clone(),
+        default_effort: None,
+        mandatory: None,
+        supports_token_budget: None,
+        source: Some(ReasoningCapabilitySource::CliMetadata),
+    });
+
+    ProviderModelInfo {
+        id: model.id,
+        name: model.name,
+        description: model.description,
+        created: None,
+        provider: provider_key.to_owned(),
+        owned_by: None,
+        limits: ProviderModelLimits {
+            max_input_tokens: model.max_input_tokens,
+            max_output_tokens: model.max_output_tokens,
+            context_window: model.max_input_tokens,
+        },
+        capabilities: ProviderModelCapabilities {
+            vision: model.supports_vision,
+            tool_calling: None,
+            json_output: None,
+            streaming: Some(true),
+            thinking: supports_reasoning,
+            reasoning,
+            fine_tuning: None,
+            input_modalities: (!model.input_modalities.is_empty())
+                .then_some(model.input_modalities),
+            output_modalities: (!model.output_modalities.is_empty())
+                .then_some(model.output_modalities),
+        },
+        pricing: None,
+        active: model.active,
+        family: model.family,
+        lifecycle_status: None,
     }
 }
 
@@ -2696,6 +3353,20 @@ fn cli_runtime_approval_policy(params: &TurnStartParams) -> String {
         .to_owned()
 }
 
+fn requested_reasoning_effort(params: &TurnStartParams) -> Option<String> {
+    params
+        .reasoning
+        .as_ref()
+        .map(|reasoning| reasoning.effort.clone())
+}
+
+fn cli_runtime_effort(params: &TurnStartParams) -> Option<String> {
+    params
+        .cli_runtime_options
+        .as_ref()
+        .and_then(|options| options.effort.clone())
+}
+
 fn cli_runtime_sandbox_policy_value(params: &TurnStartParams) -> Option<JsonValue> {
     params
         .cli_runtime_options
@@ -2792,6 +3463,265 @@ fn cli_runtime_binding_timestamp() -> sea_orm::entity::prelude::DateTimeWithTime
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reasoning_test_model(
+        reasoning: Option<ProviderModelReasoningCapabilities>,
+    ) -> ProviderModelInfo {
+        ProviderModelInfo {
+            id: "model-a".to_owned(),
+            name: None,
+            description: None,
+            created: None,
+            provider: "provider-a".to_owned(),
+            owned_by: None,
+            limits: ProviderModelLimits {
+                max_input_tokens: None,
+                max_output_tokens: None,
+                context_window: None,
+            },
+            capabilities: ProviderModelCapabilities {
+                vision: None,
+                tool_calling: None,
+                json_output: None,
+                streaming: None,
+                thinking: None,
+                reasoning,
+                fine_tuning: None,
+                input_modalities: None,
+                output_modalities: None,
+            },
+            pricing: None,
+            active: None,
+            family: None,
+            lifecycle_status: None,
+        }
+    }
+
+    fn reasoning_capabilities(
+        supported: Option<bool>,
+        effort_options: &[&str],
+    ) -> ProviderModelReasoningCapabilities {
+        ProviderModelReasoningCapabilities {
+            supported,
+            effort_options: effort_options
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+            default_effort: None,
+            mandatory: None,
+            supports_token_budget: None,
+            source: Some(ReasoningCapabilitySource::StaticRegistry),
+        }
+    }
+
+    #[test]
+    fn reasoning_effort_validation_rejects_missing_or_unknown_metadata() {
+        let missing =
+            validate_reasoning_effort_for_model("provider `openai`", "unknown-model", "high", None)
+                .expect_err("missing model metadata should reject selected effort");
+        assert!(missing.contains("metadata is unavailable"));
+
+        let model_without_reasoning = reasoning_test_model(None);
+        let absent = validate_reasoning_effort_for_model(
+            "provider `openai`",
+            "model-a",
+            "high",
+            Some(&model_without_reasoning),
+        )
+        .expect_err("missing reasoning capability should reject selected effort");
+        assert!(absent.contains("reasoning capability metadata is missing"));
+
+        let model_without_efforts =
+            reasoning_test_model(Some(reasoning_capabilities(Some(true), &[])));
+        let unknown = validate_reasoning_effort_for_model(
+            "provider `openai`",
+            "model-a",
+            "high",
+            Some(&model_without_efforts),
+        )
+        .expect_err("empty effort list should reject selected effort");
+        assert!(unknown.contains("supported reasoning efforts are unknown"));
+    }
+
+    #[test]
+    fn reasoning_effort_validation_rejects_unsupported_model_or_value() {
+        let unsupported_model =
+            reasoning_test_model(Some(reasoning_capabilities(Some(false), &["low", "high"])));
+        let error = validate_reasoning_effort_for_model(
+            "provider `openai`",
+            "model-a",
+            "high",
+            Some(&unsupported_model),
+        )
+        .expect_err("unsupported model should reject selected effort");
+        assert!(error.contains("is not supported"));
+
+        let unsupported_value =
+            reasoning_test_model(Some(reasoning_capabilities(Some(true), &["low", "medium"])));
+        let error = validate_reasoning_effort_for_model(
+            "provider `openai`",
+            "model-a",
+            "high",
+            Some(&unsupported_value),
+        )
+        .expect_err("unsupported value should reject selected effort");
+        assert!(error.contains("supported efforts: low, medium"));
+    }
+
+    #[test]
+    fn reasoning_effort_validation_error_includes_debuggable_context() {
+        let model =
+            reasoning_test_model(Some(reasoning_capabilities(Some(true), &["low", "medium"])));
+
+        let error = validate_reasoning_effort_for_model(
+            "provider `openai`",
+            "model-a",
+            "high",
+            Some(&model),
+        )
+        .expect_err("unsupported value should reject selected effort");
+
+        assert_eq!(
+            error,
+            "reasoning effort `high` is not supported by provider `openai` model `model-a`; supported efforts: low, medium; capability source: static_registry"
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_validation_accepts_known_effort() {
+        let model = reasoning_test_model(Some(reasoning_capabilities(
+            Some(true),
+            &["low", "medium", "high"],
+        )));
+
+        validate_reasoning_effort_for_model("provider `openai`", "model-a", "medium", Some(&model))
+            .expect("known effort should pass validation");
+    }
+
+    #[test]
+    fn reasoning_effort_validation_accepts_known_aliases() {
+        let model = reasoning_test_model(Some(reasoning_capabilities(
+            Some(true),
+            &["low", "extra-high", "maximum"],
+        )));
+
+        validate_reasoning_effort_for_model("provider `openai`", "model-a", "xhigh", Some(&model))
+            .expect("canonical effort should match provider alias");
+        validate_reasoning_effort_for_model("provider `openai`", "model-a", "max", Some(&model))
+            .expect("canonical max should match provider alias");
+    }
+
+    #[test]
+    fn reasoning_effort_validation_rejects_unknown_provider_effort_values() {
+        let model = reasoning_test_model(Some(reasoning_capabilities(
+            Some(true),
+            &["low", "turbo-high"],
+        )));
+
+        validate_reasoning_effort_for_model("provider `openai`", "model-a", "low", Some(&model))
+            .expect("known effort should pass validation");
+        let error = validate_reasoning_effort_for_model(
+            "provider `openai`",
+            "model-a",
+            "turbo-high",
+            Some(&model),
+        )
+        .expect_err("unknown effort should be rejected even if metadata reports it");
+
+        assert_eq!(
+            error,
+            "reasoning effort `turbo-high` is not recognized by Pioneer for provider `openai` model `model-a`"
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_validation_rejects_none_for_mandatory_reasoning() {
+        let mut model = reasoning_test_model(Some(reasoning_capabilities(
+            Some(true),
+            &["none", "low", "medium"],
+        )));
+        model
+            .capabilities
+            .reasoning
+            .as_mut()
+            .expect("reasoning capabilities")
+            .mandatory = Some(true);
+
+        let error = validate_reasoning_effort_for_model(
+            "provider `openrouter`",
+            "model-a",
+            "none",
+            Some(&model),
+        )
+        .expect_err("mandatory reasoning should reject none");
+
+        assert!(error.contains("supported efforts: low, medium"));
+    }
+
+    #[test]
+    fn effective_cli_runtime_effort_accepts_legacy_top_level_or_matching_values() {
+        assert_eq!(
+            effective_cli_runtime_effort(None, Some("high")).expect("legacy effort"),
+            Some("high".to_owned())
+        );
+        assert_eq!(
+            effective_cli_runtime_effort(Some("medium"), None).expect("top-level effort"),
+            Some("medium".to_owned())
+        );
+        assert_eq!(
+            effective_cli_runtime_effort(Some("low"), Some("low")).expect("matching efforts"),
+            Some("low".to_owned())
+        );
+        assert_eq!(
+            effective_cli_runtime_effort(Some("Extra High"), Some("xhigh"))
+                .expect("matching alias efforts"),
+            Some("xhigh".to_owned())
+        );
+        assert_eq!(
+            effective_cli_runtime_effort(None, None).expect("no effort"),
+            None
+        );
+    }
+
+    #[test]
+    fn effective_cli_runtime_effort_rejects_conflicting_values() {
+        let error = effective_cli_runtime_effort(Some("high"), Some("low"))
+            .expect_err("conflicting CLI efforts should reject");
+        assert!(error.contains("top-level reasoning effort `high`"));
+        assert!(error.contains("cli_runtime_options effort `low`"));
+    }
+
+    #[test]
+    fn runtime_model_reasoning_lookup_infers_legacy_thinking_from_efforts() {
+        let model = provider_model_from_runtime_model_for_reasoning_lookup(
+            "cli_runtime:codex",
+            RuntimeModelInfo {
+                id: "gpt-5".to_owned(),
+                name: Some("GPT 5".to_owned()),
+                description: None,
+                family: None,
+                is_custom: false,
+                active: Some(true),
+                effort_options: vec!["low".to_owned(), "high".to_owned()],
+                input_modalities: Vec::new(),
+                output_modalities: Vec::new(),
+                supports_reasoning: None,
+                supports_vision: None,
+                max_input_tokens: None,
+                max_output_tokens: None,
+            },
+        );
+
+        assert_eq!(model.capabilities.thinking, Some(true));
+        assert_eq!(
+            model
+                .capabilities
+                .reasoning
+                .as_ref()
+                .and_then(|reasoning| reasoning.supported),
+            Some(true)
+        );
+    }
 
     #[test]
     fn turn_item_timeline_origin_uses_created_at_not_sequence() {

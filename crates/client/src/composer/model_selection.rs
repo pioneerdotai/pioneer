@@ -24,6 +24,8 @@ pub struct ComposerModelSelectionCandidate {
 pub struct ComposerModelSelectionState {
     pub selected_provider: Option<String>,
     pub selected_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_reasoning_effort: Option<String>,
     pub manually_selected: bool,
 }
 
@@ -32,6 +34,8 @@ pub struct ComposerModelSelectionState {
 pub struct ModelSelectorSelection {
     pub provider: Option<String>,
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_reasoning_effort: Option<String>,
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -39,6 +43,8 @@ pub struct ModelSelectorSelection {
 pub struct ModelProviderSelectionUpdate {
     pub selected_provider: Option<String>,
     pub selected_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_reasoning_effort: Option<String>,
     pub clear_models: bool,
     pub loading_models: bool,
 }
@@ -62,9 +68,19 @@ impl ComposerModelSelectionState {
         selected_model: Option<String>,
         manually_selected: bool,
     ) -> Self {
+        Self::new_with_reasoning_effort(selected_provider, selected_model, None, manually_selected)
+    }
+
+    pub fn new_with_reasoning_effort(
+        selected_provider: Option<String>,
+        selected_model: Option<String>,
+        selected_reasoning_effort: Option<String>,
+        manually_selected: bool,
+    ) -> Self {
         Self {
             selected_provider,
             selected_model,
+            selected_reasoning_effort,
             manually_selected,
         }
     }
@@ -74,13 +90,43 @@ impl ComposerModelSelectionState {
         selected_provider: Option<String>,
         selected_model: Option<String>,
     ) -> bool {
+        self.set_model_selection_from_user(selected_provider, selected_model)
+    }
+
+    pub fn set_model_selection_from_user(
+        &mut self,
+        selected_provider: Option<String>,
+        selected_model: Option<String>,
+    ) -> bool {
+        let selection_changed =
+            self.selected_provider != selected_provider || self.selected_model != selected_model;
         let changed = self.selected_provider != selected_provider
             || self.selected_model != selected_model
             || !self.manually_selected;
         self.selected_provider = selected_provider;
         self.selected_model = selected_model;
+        if selection_changed {
+            self.selected_reasoning_effort = None;
+        }
         self.manually_selected = true;
         changed
+    }
+
+    pub fn select_provider_from_user(&mut self, selected_provider: Option<String>) -> bool {
+        self.set_model_selection_from_user(selected_provider, None)
+    }
+
+    pub fn select_model_from_user(&mut self, selected_model: Option<String>) -> bool {
+        self.set_model_selection_from_user(self.selected_provider.clone(), selected_model)
+    }
+
+    pub fn set_reasoning_effort_from_user(&mut self, effort: Option<String>) -> bool {
+        if self.selected_reasoning_effort == effort {
+            return false;
+        }
+
+        self.selected_reasoning_effort = effort;
+        true
     }
 
     pub fn sync_resolved_selection(&mut self, selection: Option<ComposerModelSelection>) -> bool {
@@ -108,6 +154,9 @@ impl ComposerModelSelectionState {
             self.selected_provider != selected_provider || self.selected_model != selected_model;
         self.selected_provider = selected_provider;
         self.selected_model = selected_model;
+        if changed {
+            self.selected_reasoning_effort = None;
+        }
         changed
     }
 
@@ -122,6 +171,17 @@ impl ComposerModelSelectionState {
         (
             self.selected_provider,
             self.selected_model,
+            self.manually_selected,
+        )
+    }
+
+    pub fn into_parts_with_reasoning_effort(
+        self,
+    ) -> (Option<String>, Option<String>, Option<String>, bool) {
+        (
+            self.selected_provider,
+            self.selected_model,
+            self.selected_reasoning_effort,
             self.manually_selected,
         )
     }
@@ -210,6 +270,7 @@ pub fn select_model_provider(provider_name: String) -> ModelProviderSelectionUpd
     ModelProviderSelectionUpdate {
         selected_provider: Some(provider_name),
         selected_model: None,
+        selected_reasoning_effort: None,
         clear_models: true,
         loading_models: true,
     }
@@ -420,6 +481,93 @@ mod tests {
     }
 
     #[test]
+    fn provider_change_clears_model_and_reasoning_effort() {
+        let mut state = ComposerModelSelectionState::new_with_reasoning_effort(
+            Some("openai".to_owned()),
+            Some("gpt-5.4".to_owned()),
+            Some("high".to_owned()),
+            true,
+        );
+
+        assert!(state.select_provider_from_user(Some("anthropic".to_owned())));
+
+        assert_eq!(state.selected_provider.as_deref(), Some("anthropic"));
+        assert!(state.selected_model.is_none());
+        assert!(state.selected_reasoning_effort.is_none());
+        assert!(state.manually_selected);
+    }
+
+    #[test]
+    fn model_change_clears_reasoning_effort() {
+        let mut state = ComposerModelSelectionState::new_with_reasoning_effort(
+            Some("openai".to_owned()),
+            Some("gpt-5.4".to_owned()),
+            Some("high".to_owned()),
+            true,
+        );
+
+        assert!(state.select_model_from_user(Some("gpt-5.5".to_owned())));
+
+        assert_eq!(state.selected_provider.as_deref(), Some("openai"));
+        assert_eq!(state.selected_model.as_deref(), Some("gpt-5.5"));
+        assert!(state.selected_reasoning_effort.is_none());
+    }
+
+    #[test]
+    fn unchanged_provider_and_model_preserve_reasoning_effort() {
+        let mut state = ComposerModelSelectionState::new_with_reasoning_effort(
+            Some("openai".to_owned()),
+            Some("gpt-5.4".to_owned()),
+            Some("high".to_owned()),
+            true,
+        );
+
+        assert!(
+            !state.set_model_selection_from_user(
+                Some("openai".to_owned()),
+                Some("gpt-5.4".to_owned())
+            )
+        );
+
+        assert_eq!(state.selected_reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn resolved_selection_sync_clears_effort_only_when_model_selection_changes() {
+        let mut state = ComposerModelSelectionState::new_with_reasoning_effort(
+            Some("openai".to_owned()),
+            Some("gpt-5.4".to_owned()),
+            Some("high".to_owned()),
+            false,
+        );
+
+        assert!(!state.sync_resolved_selection(selection("openai", "gpt-5.4")));
+        assert_eq!(state.selected_reasoning_effort.as_deref(), Some("high"));
+
+        assert!(state.sync_resolved_selection(selection("openai", "gpt-5.5")));
+        assert_eq!(state.selected_provider.as_deref(), Some("openai"));
+        assert_eq!(state.selected_model.as_deref(), Some("gpt-5.5"));
+        assert!(state.selected_reasoning_effort.is_none());
+    }
+
+    #[test]
+    fn reset_to_resolved_selection_clears_effort_when_model_selection_changes() {
+        let mut state = ComposerModelSelectionState::new_with_reasoning_effort(
+            Some("openai".to_owned()),
+            Some("gpt-5.4".to_owned()),
+            Some("high".to_owned()),
+            true,
+        );
+
+        assert!(state.reset_to_resolved_selection(selection("anthropic", "claude")));
+
+        assert!(!state.manually_selected);
+        assert_eq!(state.selected_provider.as_deref(), Some("anthropic"));
+        assert_eq!(state.selected_model.as_deref(), Some("claude"));
+        assert!(state.selected_reasoning_effort.is_none());
+    }
+
+    #[test]
     fn set_composer_turn_mode_reports_changes() {
         let mut mode = default_composer_turn_mode();
 
@@ -438,6 +586,7 @@ mod tests {
 
         assert_eq!(update.selected_provider.as_deref(), Some("openai"));
         assert_eq!(update.selected_model, None);
+        assert_eq!(update.selected_reasoning_effort, None);
         assert!(update.clear_models);
         assert!(update.loading_models);
     }

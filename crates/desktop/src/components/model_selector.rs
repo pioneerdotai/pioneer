@@ -40,6 +40,7 @@ pub(crate) struct ModelSelectorDialogOptions {
     pub(crate) title: String,
     pub(crate) selected_provider: Option<String>,
     pub(crate) selected_model: Option<String>,
+    pub(crate) selected_reasoning_effort: Option<String>,
     pub(crate) workspace_id: String,
     pub(crate) ws_sender: GatewayWsCommandSender,
     pub(crate) on_save: ModelSelectorSaveCallback,
@@ -53,12 +54,15 @@ struct ModelSelectorDialogState {
     workspace_id: String,
     on_save: ModelSelectorSaveCallback,
     selector: Rc<RefCell<ProviderModelSelectorState>>,
+    selected_reasoning_effort: Rc<RefCell<Option<String>>>,
     provider_search_input: Entity<InputState>,
     model_search_input: Entity<InputState>,
     provider_scroll_handle: ScrollHandle,
+    reasoning_scroll_handle: ScrollHandle,
     model_scroll_handle: VirtualListScrollHandle,
     provider_trigger_width_px: Rc<RefCell<f32>>,
     model_trigger_width_px: Rc<RefCell<f32>>,
+    reasoning_trigger_width_px: Rc<RefCell<f32>>,
     model_row_layout_cache: Rc<RefCell<HashMap<String, CachedModelRowLayout>>>,
 }
 
@@ -180,9 +184,11 @@ impl PioneerDesktop {
                 .placeholder(t!("chat.composer.model.model_placeholder").to_string())
         });
         let provider_scroll_handle = ScrollHandle::new();
+        let reasoning_scroll_handle = ScrollHandle::new();
         let model_scroll_handle = VirtualListScrollHandle::new();
         let provider_trigger_width_px = Rc::new(RefCell::new(SELECTOR_POPOVER_FALLBACK_WIDTH));
         let model_trigger_width_px = Rc::new(RefCell::new(SELECTOR_POPOVER_FALLBACK_WIDTH));
+        let reasoning_trigger_width_px = Rc::new(RefCell::new(SELECTOR_POPOVER_FALLBACK_WIDTH));
         let model_row_layout_cache = Rc::new(RefCell::new(HashMap::new()));
 
         let state = ModelSelectorDialogState {
@@ -192,12 +198,15 @@ impl PioneerDesktop {
             workspace_id: options.workspace_id,
             on_save: options.on_save,
             selector,
+            selected_reasoning_effort: Rc::new(RefCell::new(options.selected_reasoning_effort)),
             provider_search_input,
             model_search_input,
             provider_scroll_handle,
+            reasoning_scroll_handle,
             model_scroll_handle,
             provider_trigger_width_px,
             model_trigger_width_px,
+            reasoning_trigger_width_px,
             model_row_layout_cache,
         };
 
@@ -295,6 +304,7 @@ impl PioneerDesktop {
     ) {
         let selector = state.selector.clone();
         let model_row_layout_cache = state.model_row_layout_cache.clone();
+        let dialog_state = state.clone();
         let ws_sender = state.ws_sender.clone();
         let desktop_entity = state.desktop_entity.clone();
         let workspace_id = state.workspace_id.clone();
@@ -337,6 +347,7 @@ impl PioneerDesktop {
                                 .apply_provider_models_success(response)
                             {
                                 model_row_layout_cache.borrow_mut().clear();
+                                Self::clear_invalid_dialog_reasoning_effort(&dialog_state);
                             }
                         }
                         Err(error) => {
@@ -397,20 +408,26 @@ impl PioneerDesktop {
                         ]
                     }
                 })
-                .child(
-                    v_flex().w_full().pt_4().pb_5().child(
-                        v_form()
-                            .child(Self::render_provider_selector_section(
-                                state.clone(),
-                                provider_trigger_label,
-                            ))
-                            .child(Self::render_model_selector_section(
-                                state.clone(),
-                                model_trigger_label,
-                                model_trigger_loading,
-                            )),
-                    ),
-                )
+                .child(v_flex().w_full().pt_4().pb_5().child({
+                    let form = v_form()
+                        .child(Self::render_provider_selector_section(
+                            state.clone(),
+                            provider_trigger_label,
+                        ))
+                        .child(Self::render_model_selector_section(
+                            state.clone(),
+                            model_trigger_label,
+                            model_trigger_loading,
+                        ));
+
+                    if let Some(reasoning_section) =
+                        Self::render_reasoning_effort_selector_section(state.clone())
+                    {
+                        form.child(reasoning_section)
+                    } else {
+                        form
+                    }
+                }))
         });
     }
 
@@ -419,8 +436,17 @@ impl PioneerDesktop {
     ) -> Rc<dyn Fn(&mut App) -> bool> {
         Rc::new(move |cx| {
             let (provider, model) = state.selector.borrow().selection_parts();
+            let selected_reasoning_effort = state.selected_reasoning_effort.borrow().clone();
             state.desktop_entity.update(cx, |view, cx| {
-                let saved = (state.on_save)(view, ModelSelectorSelection { provider, model }, cx);
+                let saved = (state.on_save)(
+                    view,
+                    ModelSelectorSelection {
+                        provider,
+                        model,
+                        selected_reasoning_effort,
+                    },
+                    cx,
+                );
                 cx.notify();
                 saved
             })
@@ -460,6 +486,50 @@ impl PioneerDesktop {
             ),
             provider_presentation::ProviderModelDisplayState::Loading
         )
+    }
+
+    fn reasoning_effort_rows(
+        state: &ModelSelectorDialogState,
+    ) -> Vec<provider_presentation::ReasoningEffortRow> {
+        let selector = state.selector.borrow();
+        let Some(selected_model) = selector.selected_model() else {
+            return Vec::new();
+        };
+        let Some(model) = selector
+            .models()
+            .iter()
+            .find(|model| model.id.as_str() == selected_model)
+        else {
+            return Vec::new();
+        };
+        let selected_effort = state.selected_reasoning_effort.borrow();
+        provider_presentation::reasoning_effort_rows_for_model(model, selected_effort.as_deref())
+    }
+
+    fn reasoning_effort_trigger_label(
+        rows: &[provider_presentation::ReasoningEffortRow],
+    ) -> String {
+        rows.iter()
+            .find(|row| row.selected)
+            .map(|row| row.label.clone())
+            .unwrap_or_else(|| t!("chat.composer.model.reasoning_default").to_string())
+    }
+
+    fn clear_dialog_reasoning_effort(state: &ModelSelectorDialogState) {
+        *state.selected_reasoning_effort.borrow_mut() = None;
+    }
+
+    fn clear_invalid_dialog_reasoning_effort(state: &ModelSelectorDialogState) {
+        if state.selected_reasoning_effort.borrow().is_none() {
+            return;
+        }
+
+        if !Self::reasoning_effort_rows(state)
+            .iter()
+            .any(|row| row.selected)
+        {
+            Self::clear_dialog_reasoning_effort(state);
+        }
     }
 
     fn render_provider_selector_section(
@@ -643,6 +713,7 @@ impl PioneerDesktop {
         cx: &mut App,
     ) {
         let provider_name = state.selector.borrow_mut().select_provider(provider_name);
+        Self::clear_dialog_reasoning_effort(&state);
         state.model_row_layout_cache.borrow_mut().clear();
 
         let _ = popover_entity.update(cx, |state, cx| {
@@ -705,6 +776,170 @@ impl PioneerDesktop {
                         .size_full(),
                     ),
             )
+    }
+
+    fn render_reasoning_effort_selector_section(state: ModelSelectorDialogState) -> Option<Field> {
+        let rows = Self::reasoning_effort_rows(&state);
+        if rows.is_empty() {
+            return None;
+        }
+
+        let reasoning_trigger_width_px = state.reasoning_trigger_width_px.clone();
+        let desktop_entity = state.desktop_entity.clone();
+        let trigger_label = Self::reasoning_effort_trigger_label(rows.as_slice());
+
+        Some(
+            field()
+                .label(t!("chat.composer.model.reasoning_label").to_string())
+                .child(
+                    div()
+                        .w_full()
+                        .relative()
+                        .child(
+                            Popover::new("model-reasoning-effort-popover")
+                                .anchor(Corner::TopLeft)
+                                .p_0()
+                                .trigger(SelectorPopoverTrigger::new(
+                                    "model-reasoning-effort-trigger",
+                                    trigger_label,
+                                    IconName::ChevronsUpDown,
+                                ))
+                                .content(move |_, _, popover_cx| {
+                                    Self::render_reasoning_effort_popover_content(
+                                        state.clone(),
+                                        popover_cx,
+                                    )
+                                }),
+                        )
+                        .child(
+                            canvas(
+                                move |bounds, _, cx| {
+                                    let measured_width = bounds.size.width.max(px(1.)).as_f32();
+                                    let mut cached_width = reasoning_trigger_width_px.borrow_mut();
+                                    if (measured_width - *cached_width).abs() > 1.0 {
+                                        *cached_width = measured_width;
+                                        let _ = desktop_entity.update(cx, |_view, cx| {
+                                            cx.notify();
+                                        });
+                                    }
+                                },
+                                |_, _, _, _| {},
+                            )
+                            .absolute()
+                            .size_full(),
+                        ),
+                ),
+        )
+    }
+
+    fn render_reasoning_effort_popover_content(
+        state: ModelSelectorDialogState,
+        popover_cx: &mut Context<PopoverState>,
+    ) -> AnyElement {
+        let popover_entity: Entity<PopoverState> = popover_cx.entity();
+        let theme = popover_cx.theme();
+        let foreground = theme.foreground;
+        let muted_bg = theme.muted;
+        let ghost_hover = if theme.mode.is_dark() {
+            theme.secondary.lighten(0.2).opacity(0.8)
+        } else {
+            theme.secondary.darken(0.1).opacity(0.8)
+        };
+        let ghost_active = if theme.mode.is_dark() {
+            theme.secondary.lighten(0.3).opacity(0.8)
+        } else {
+            theme.secondary.darken(0.2).opacity(0.8)
+        };
+        let popover_width =
+            px((*state.reasoning_trigger_width_px.borrow()).max(SELECTOR_POPOVER_FALLBACK_WIDTH));
+        let rows = Self::reasoning_effort_rows(&state);
+
+        let mut list = v_flex()
+            .id("reasoning-effort-popover-list")
+            .max_h(px(200.))
+            .overflow_y_scroll()
+            .track_scroll(&state.reasoning_scroll_handle);
+        let default_selected = state.selected_reasoning_effort.borrow().is_none();
+        let default_state = state.clone();
+        let default_popover_entity = popover_entity.clone();
+
+        list = list.child(
+            div()
+                .id("reasoning-effort-opt-default")
+                .w_full()
+                .cursor_pointer()
+                .px_2()
+                .py_1p5()
+                .text_sm()
+                .text_color(foreground)
+                .when(default_selected, |d| d.bg(muted_bg))
+                .hover(move |d| d.bg(ghost_hover))
+                .active(move |d| d.bg(ghost_active))
+                .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
+                    window.prevent_default();
+                })
+                .on_click(move |_, window, cx| {
+                    Self::clear_dialog_reasoning_effort(&default_state);
+                    let _ = default_popover_entity.update(cx, |popover, cx| {
+                        popover.dismiss(window, cx);
+                    });
+                    let _ = default_state.desktop_entity.update(cx, |_, cx| cx.notify());
+                })
+                .child(t!("chat.composer.model.reasoning_default").to_string()),
+        );
+
+        for row in rows {
+            let row_state = state.clone();
+            let popover_entity = popover_entity.clone();
+            let effort = row.effort.clone();
+            let id: SharedString = format!("reasoning-effort-opt-{}", row.effort).into();
+
+            list = list.child(
+                div()
+                    .id(id)
+                    .w_full()
+                    .cursor_pointer()
+                    .px_2()
+                    .py_1p5()
+                    .text_sm()
+                    .text_color(foreground)
+                    .when(row.selected, |d| d.bg(muted_bg))
+                    .hover(move |d| d.bg(ghost_hover))
+                    .active(move |d| d.bg(ghost_active))
+                    .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
+                        window.prevent_default();
+                    })
+                    .on_click(move |_, window, cx| {
+                        if Self::reasoning_effort_rows(&row_state)
+                            .iter()
+                            .any(|row| row.effort == effort)
+                        {
+                            *row_state.selected_reasoning_effort.borrow_mut() =
+                                Some(effort.clone());
+                        }
+                        let _ = popover_entity.update(cx, |popover, cx| {
+                            popover.dismiss(window, cx);
+                        });
+                        let _ = row_state.desktop_entity.update(cx, |_, cx| cx.notify());
+                    })
+                    .child(row.label),
+            );
+        }
+
+        v_flex()
+            .w(popover_width)
+            .child(
+                div().relative().child(list).child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .child(Scrollbar::vertical(&state.reasoning_scroll_handle)),
+                ),
+            )
+            .into_any_element()
     }
 
     fn render_model_popover_content(
@@ -972,13 +1207,19 @@ impl PioneerDesktop {
                 window.prevent_default();
             })
             .on_click(move |_, window, cx| {
+                let model_changed =
+                    state.selector.borrow().selected_model() != Some(model_id.as_str());
                 state
                     .selector
                     .borrow_mut()
                     .set_selected_model(model_id.clone());
+                if model_changed {
+                    Self::clear_dialog_reasoning_effort(&state);
+                }
                 let _ = popover_entity.update(cx, |popover, cx| {
                     popover.dismiss(window, cx);
                 });
+                let _ = state.desktop_entity.update(cx, |_, cx| cx.notify());
             })
             .child(
                 v_flex()

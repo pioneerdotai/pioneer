@@ -2,10 +2,11 @@ use crate::attachments::{
     PreparedAttachmentSource, PreparedProviderMessages, attachment_bytes,
     ensure_no_unrendered_attachments, prepare_messages_for_provider,
 };
+use crate::reasoning_registry;
 use crate::types::{
     ChatRequest, ChatResponse, InputContentType, InputTypeSupport, ProviderCapabilities,
-    ProviderInputCapabilities, ProviderTimeoutPolicy, ProviderToolCall, Role, StreamChunk,
-    TokenUsage, ToolChoice,
+    ProviderInputCapabilities, ProviderTimeoutPolicy, ProviderToolCall, ReasoningConfig,
+    ReasoningEffort, Role, StreamChunk, TokenUsage, ToolChoice,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -16,7 +17,10 @@ use futures_util::stream::BoxStream;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use pioneer_protocol::{ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits};
+use pioneer_protocol::{
+    ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits,
+    ProviderModelReasoningCapabilities, ReasoningCapabilitySource,
+};
 
 const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 
@@ -133,6 +137,17 @@ struct ApiGenerationConfig {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_config: Option<ApiThinkingConfig>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiThinkingConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_level: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_budget: Option<i32>,
 }
 
 // ── Gemini API response types ───────────────────────────────────────────────
@@ -184,6 +199,10 @@ struct GeminiModelEntry {
     output_token_limit: Option<u64>,
     #[serde(default)]
     supported_generation_methods: Option<Vec<String>>,
+    #[serde(default, alias = "supportedThinkingLevels")]
+    thinking_levels: Option<Vec<String>>,
+    #[serde(default, alias = "defaultThinkingLevel")]
+    default_thinking_level: Option<String>,
 }
 
 // ── Implementation ──────────────────────────────────────────────────────────
@@ -224,6 +243,11 @@ impl GeminiProvider {
 
     #[cfg(test)]
     fn build_request(request: &ChatRequest) -> ApiGenerateRequest {
+        Self::build_request_result(request).expect("gemini request rendering should succeed")
+    }
+
+    #[cfg(test)]
+    fn build_request_result(request: &ChatRequest) -> Result<ApiGenerateRequest> {
         let provider = GeminiProvider::new("test-key");
         let capabilities = <GeminiProvider as crate::traits::Provider>::capabilities(&provider);
         let prepared = prepare_messages_for_provider(
@@ -235,7 +259,6 @@ impl GeminiProvider {
         )
         .expect("prepare_messages_for_provider should succeed");
         Self::build_request_from_prepared(request, &prepared)
-            .expect("gemini request rendering should succeed")
     }
 
     fn attachment_part(attachment: &crate::attachments::PreparedAttachment) -> Result<ApiPart> {
@@ -372,10 +395,15 @@ impl GeminiProvider {
             })
         };
 
-        let generation_config = if request.temperature.is_some() || request.max_tokens.is_some() {
+        let thinking_config = Self::thinking_config(request.reasoning)?;
+        let generation_config = if request.temperature.is_some()
+            || request.max_tokens.is_some()
+            || thinking_config.is_some()
+        {
             Some(ApiGenerationConfig {
                 temperature: request.temperature,
                 max_output_tokens: request.max_tokens,
+                thinking_config,
             })
         } else {
             None
@@ -428,6 +456,38 @@ impl GeminiProvider {
             tools,
             tool_config,
         })
+    }
+
+    fn thinking_config(reasoning: Option<ReasoningConfig>) -> Result<Option<ApiThinkingConfig>> {
+        let Some(reasoning) = reasoning else {
+            return Ok(None);
+        };
+
+        let level = match reasoning {
+            ReasoningConfig::Effort(
+                effort @ (ReasoningEffort::Minimal
+                | ReasoningEffort::Low
+                | ReasoningEffort::Medium
+                | ReasoningEffort::High),
+            ) => effort.as_str(),
+            ReasoningConfig::Disabled => return Ok(None),
+            ReasoningConfig::Effort(ReasoningEffort::None) => {
+                return Err(anyhow!(
+                    "Gemini generateContent does not support reasoning effort `none` through thinkingConfig"
+                ));
+            }
+            ReasoningConfig::Effort(effort @ (ReasoningEffort::XHigh | ReasoningEffort::Max)) => {
+                return Err(anyhow!(
+                    "Gemini generateContent does not support reasoning effort `{}` through thinkingConfig",
+                    effort.as_str()
+                ));
+            }
+        };
+
+        Ok(Some(ApiThinkingConfig {
+            thinking_level: Some(level.to_owned()),
+            thinking_budget: None,
+        }))
     }
 
     fn extract_text(response: &ApiGenerateResponse) -> Option<String> {
@@ -687,53 +747,95 @@ impl crate::traits::Provider for GeminiProvider {
         Ok(api_response
             .models
             .into_iter()
-            .map(|m| {
-                let id = m
-                    .name
-                    .as_deref()
-                    .unwrap_or("")
-                    .strip_prefix("models/")
-                    .unwrap_or(m.name.as_deref().unwrap_or(""))
-                    .to_owned();
-
-                let supports_streaming = m
-                    .supported_generation_methods
-                    .as_ref()
-                    .is_some_and(|methods| methods.iter().any(|m| m == "streamGenerateContent"));
-
-                ProviderModelInfo {
-                    id,
-                    name: m.display_name,
-                    description: m.description,
-                    created: None,
-                    provider: "gemini".to_owned(),
-                    owned_by: Some("google".to_owned()),
-                    limits: ProviderModelLimits {
-                        max_input_tokens: m.input_token_limit,
-                        max_output_tokens: m.output_token_limit,
-                        context_window: match (m.input_token_limit, m.output_token_limit) {
-                            (Some(i), Some(o)) => Some(i + o),
-                            _ => None,
-                        },
-                    },
-                    capabilities: ProviderModelCapabilities {
-                        streaming: Some(supports_streaming),
-                        ..ProviderModelCapabilities::default()
-                    },
-                    pricing: None,
-                    active: Some(true),
-                    family: None,
-                    lifecycle_status: None,
-                }
-            })
+            .map(provider_model_from_gemini_model_entry)
             .collect())
+    }
+}
+
+fn provider_model_from_gemini_model_entry(m: GeminiModelEntry) -> ProviderModelInfo {
+    let id = m
+        .name
+        .as_deref()
+        .unwrap_or("")
+        .strip_prefix("models/")
+        .unwrap_or(m.name.as_deref().unwrap_or(""))
+        .to_owned();
+
+    let supports_streaming = m
+        .supported_generation_methods
+        .as_ref()
+        .is_some_and(|methods| methods.iter().any(|m| m == "streamGenerateContent"));
+    let reasoning = gemini_reasoning_capabilities_for_model_entry(id.as_str(), &m);
+
+    ProviderModelInfo {
+        id,
+        name: m.display_name,
+        description: m.description,
+        created: None,
+        provider: "gemini".to_owned(),
+        owned_by: Some("google".to_owned()),
+        limits: ProviderModelLimits {
+            max_input_tokens: m.input_token_limit,
+            max_output_tokens: m.output_token_limit,
+            context_window: match (m.input_token_limit, m.output_token_limit) {
+                (Some(i), Some(o)) => Some(i + o),
+                _ => None,
+            },
+        },
+        capabilities: ProviderModelCapabilities {
+            streaming: Some(supports_streaming),
+            thinking: reasoning.as_ref().and_then(|reasoning| reasoning.supported),
+            reasoning,
+            ..ProviderModelCapabilities::default()
+        },
+        pricing: None,
+        active: Some(true),
+        family: None,
+        lifecycle_status: None,
+    }
+}
+
+fn gemini_reasoning_capabilities_for_model_entry(
+    model_id: &str,
+    entry: &GeminiModelEntry,
+) -> Option<ProviderModelReasoningCapabilities> {
+    if let Some(levels) = entry.thinking_levels.as_ref() {
+        let effort_options = levels
+            .iter()
+            .filter_map(|level| canonical_gemini_thinking_level(level))
+            .collect::<Vec<_>>();
+        if !effort_options.is_empty() {
+            return Some(ProviderModelReasoningCapabilities {
+                supported: Some(true),
+                effort_options,
+                default_effort: entry
+                    .default_thinking_level
+                    .as_deref()
+                    .and_then(canonical_gemini_thinking_level),
+                mandatory: None,
+                supports_token_budget: None,
+                source: Some(ReasoningCapabilitySource::ProviderMetadata),
+            });
+        }
+    }
+
+    reasoning_registry::reasoning_capabilities_for_model("gemini", model_id)
+}
+
+fn canonical_gemini_thinking_level(level: &str) -> Option<String> {
+    match level.trim().to_ascii_lowercase().as_str() {
+        "minimal" => Some("minimal".to_owned()),
+        "low" => Some("low".to_owned()),
+        "medium" => Some("medium".to_owned()),
+        "high" => Some("high".to_owned()),
+        _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ChatMessage, CompiledPromptPayload};
+    use crate::types::{ChatMessage, CompiledPromptPayload, ReasoningConfig, ReasoningEffort};
 
     #[test]
     fn creates_with_api_key() {
@@ -759,6 +861,110 @@ mod tests {
             url,
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:streamGenerateContent?alt=sse&key=my-key"
         );
+    }
+
+    #[test]
+    fn gemini_reasoning_registry_exposes_documented_gemini_3_flash_levels() {
+        let reasoning = reasoning_registry::reasoning_capabilities_for_model(
+            "gemini",
+            "gemini-3-flash-preview",
+        )
+        .expect("gemini 3 flash thinking metadata");
+
+        assert_eq!(
+            reasoning.effort_options,
+            vec!["minimal", "low", "medium", "high"]
+        );
+        assert_eq!(reasoning.default_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn gemini_reasoning_registry_exposes_documented_2_5_levels() {
+        let reasoning =
+            reasoning_registry::reasoning_capabilities_for_model("gemini", "gemini-2.5-flash")
+                .expect("gemini 2.5 flash thinking metadata");
+
+        assert_eq!(reasoning.effort_options, vec!["low", "medium", "high"]);
+    }
+
+    #[test]
+    fn gemini_reasoning_metadata_from_model_entry_overrides_registry() {
+        let entry = GeminiModelEntry {
+            name: Some("models/custom-thinking".to_owned()),
+            display_name: None,
+            description: None,
+            input_token_limit: None,
+            output_token_limit: None,
+            supported_generation_methods: None,
+            thinking_levels: Some(vec!["low".to_owned(), "high".to_owned()]),
+            default_thinking_level: Some("low".to_owned()),
+        };
+
+        let reasoning = gemini_reasoning_capabilities_for_model_entry("custom-thinking", &entry)
+            .expect("provider metadata reasoning");
+        assert_eq!(reasoning.effort_options, vec!["low", "high"]);
+        assert_eq!(reasoning.default_effort.as_deref(), Some("low"));
+        assert_eq!(
+            reasoning.source,
+            Some(ReasoningCapabilitySource::ProviderMetadata)
+        );
+    }
+
+    #[test]
+    fn gemini_reasoning_registry_leaves_unknown_models_unset() {
+        let entry = GeminiModelEntry {
+            name: Some("models/gemini-unknown".to_owned()),
+            display_name: None,
+            description: None,
+            input_token_limit: None,
+            output_token_limit: None,
+            supported_generation_methods: None,
+            thinking_levels: None,
+            default_thinking_level: None,
+        };
+
+        assert!(gemini_reasoning_capabilities_for_model_entry("gemini-unknown", &entry).is_none());
+    }
+
+    #[test]
+    fn gemini_model_list_fixture_normalizes_reasoning_capabilities() {
+        let response: GeminiModelsListResponse = serde_json::from_str(
+            r#"{
+                "models": [
+                    {
+                        "name": "models/gemini-3-flash-preview",
+                        "displayName": "Gemini 3 Flash Preview",
+                        "inputTokenLimit": 1000,
+                        "outputTokenLimit": 2000,
+                        "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]
+                    },
+                    {
+                        "name": "models/gemini-unknown",
+                        "displayName": "Gemini Unknown"
+                    }
+                ]
+            }"#,
+        )
+        .expect("fixture response");
+        let models = response
+            .models
+            .into_iter()
+            .map(provider_model_from_gemini_model_entry)
+            .collect::<Vec<_>>();
+
+        let reasoning = models[0]
+            .capabilities
+            .reasoning
+            .as_ref()
+            .expect("documented thinking model");
+        assert_eq!(
+            reasoning.effort_options,
+            vec!["minimal", "low", "medium", "high"]
+        );
+        assert_eq!(models[0].capabilities.streaming, Some(true));
+        assert_eq!(models[0].limits.context_window, Some(3000));
+
+        assert!(models[1].capabilities.reasoning.is_none());
     }
 
     #[test]
@@ -797,6 +1003,7 @@ mod tests {
         let config = api_req.generation_config.unwrap();
         assert_eq!(config.temperature, Some(0.7));
         assert_eq!(config.max_output_tokens, Some(1024));
+        assert!(config.thinking_config.is_none());
     }
 
     #[test]
@@ -905,6 +1112,75 @@ mod tests {
         assert!(json.contains("\"temperature\":0.7"));
         assert!(json.contains("\"role\":\"user\""));
         assert!(!json.contains("\"maxOutputTokens\""));
+        assert!(!json.contains("\"thinkingConfig\""));
+    }
+
+    #[test]
+    fn api_request_serializes_reasoning_effort_as_thinking_config() {
+        let request = ChatRequest {
+            model: "gemini-3-flash-preview".into(),
+            messages: vec![ChatMessage::user("Hello")],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: Some(ReasoningConfig::effort(ReasoningEffort::Medium)),
+            compiled_prompt: None,
+        };
+
+        let api_req = GeminiProvider::build_request(&request);
+        let json = serde_json::to_value(&api_req).unwrap();
+
+        assert_eq!(
+            json["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "medium"
+        );
+        assert!(
+            json["generationConfig"]["thinkingConfig"]
+                .get("thinkingBudget")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn build_request_omits_thinking_config_for_disabled_reasoning() {
+        let request = ChatRequest {
+            model: "gemini-3-flash-preview".into(),
+            messages: vec![ChatMessage::user("Hello")],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: Some(ReasoningConfig::disabled()),
+            compiled_prompt: None,
+        };
+
+        let api_req = GeminiProvider::build_request(&request);
+        let json = serde_json::to_value(&api_req).unwrap();
+
+        assert!(json["generationConfig"].get("thinkingConfig").is_none());
+    }
+
+    #[test]
+    fn build_request_rejects_unsupported_reasoning_effort() {
+        let request = ChatRequest {
+            model: "gemini-3-flash-preview".into(),
+            messages: vec![ChatMessage::user("Hello")],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: Some(ReasoningConfig::effort(ReasoningEffort::XHigh)),
+            compiled_prompt: None,
+        };
+
+        let err = GeminiProvider::build_request_result(&request)
+            .expect_err("xhigh should not be serialized for Gemini thinkingConfig");
+
+        assert!(err.to_string().contains("xhigh"));
     }
 
     #[test]

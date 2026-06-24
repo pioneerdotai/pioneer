@@ -327,6 +327,14 @@
                 "home_path": "~/.codex",
                 "id": "codex",
                 "kind": "codex"
+              },
+              {
+                "binary_path": "claude",
+                "display_name": "Claude CLI",
+                "enabled": true,
+                "home_path": "~/.claude",
+                "id": "claude",
+                "kind": "claude"
               }
             ]
           }

@@ -857,6 +857,30 @@ impl OpenAiCompatibleProvider {
         }
     }
 
+    fn build_chat_request(&self, request: ChatRequest, stream: bool) -> Result<ApiChatRequest> {
+        let capabilities =
+            <OpenAiCompatibleProvider as crate::traits::Provider>::capabilities(self);
+        let prepared = prepare_messages_for_provider(
+            self.name.as_str(),
+            &capabilities,
+            request.rendered_messages_with_compiled_prompt().as_slice(),
+        )?;
+        ensure_no_unrendered_attachments(self.name.as_str(), &prepared)?;
+        Ok(ApiChatRequest {
+            model: request.model,
+            messages: self.convert_messages(&prepared)?,
+            temperature: request.temperature,
+            max_tokens: request.max_tokens,
+            tools: request
+                .tools
+                .as_ref()
+                .map(|tools| Self::convert_tools(tools)),
+            tool_choice: request.tool_choice.map(Self::convert_tool_choice),
+            parallel_tool_calls: request.parallel_tool_calls,
+            stream,
+        })
+    }
+
     async fn api_error(&self, response: reqwest::Response) -> anyhow::Error {
         let status = response.status();
         let body = response
@@ -885,25 +909,7 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
-        let prepared = prepare_messages_for_provider(
-            self.name(),
-            &self.capabilities(),
-            request.rendered_messages_with_compiled_prompt().as_slice(),
-        )?;
-        ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let api_request = ApiChatRequest {
-            model: request.model,
-            messages: self.convert_messages(&prepared)?,
-            temperature: request.temperature,
-            max_tokens: request.max_tokens,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            tool_choice: request.tool_choice.map(Self::convert_tool_choice),
-            parallel_tool_calls: request.parallel_tool_calls,
-            stream: false,
-        };
+        let api_request = self.build_chat_request(request, false)?;
 
         let request_builder = self
             .authorized_post(&self.chat_completions_url())
@@ -966,25 +972,7 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
         &self,
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
-        let prepared = prepare_messages_for_provider(
-            self.name(),
-            &self.capabilities(),
-            request.rendered_messages_with_compiled_prompt().as_slice(),
-        )?;
-        ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let api_request = ApiChatRequest {
-            model: request.model,
-            messages: self.convert_messages(&prepared)?,
-            temperature: request.temperature,
-            max_tokens: request.max_tokens,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            tool_choice: request.tool_choice.map(Self::convert_tool_choice),
-            parallel_tool_calls: request.parallel_tool_calls,
-            stream: true,
-        };
+        let api_request = self.build_chat_request(request, true)?;
 
         let request_builder = self
             .authorized_post(&self.chat_completions_url())
@@ -1159,7 +1147,7 @@ mod tests {
     use crate::traits::Provider;
     use crate::types::{
         AttachmentDataSource, InputTypeSupport, MessageAttachment, MessageContentPart,
-        ProviderInputCapabilities, ProviderToolCall,
+        ProviderInputCapabilities, ProviderToolCall, ReasoningConfig, ReasoningEffort,
     };
 
     fn prepared_for(
@@ -1537,6 +1525,32 @@ mod tests {
         assert!(json.contains("\"temperature\":0.7"));
         assert!(json.contains("\"stream\":false"));
         assert!(!json.contains("max_tokens"));
+    }
+
+    #[test]
+    fn compatible_request_omits_reasoning_fields_even_when_selected() {
+        let provider = test_provider();
+        let request = ChatRequest {
+            model: "custom-compatible-model".to_owned(),
+            messages: vec![ChatMessage::user("Hello")],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: Some(ReasoningConfig::effort(ReasoningEffort::High)),
+            compiled_prompt: None,
+        };
+
+        let api_request = provider
+            .build_chat_request(request, false)
+            .expect("compatible request should render");
+        let json = serde_json::to_value(&api_request).unwrap();
+
+        assert!(json.get("reasoning_effort").is_none());
+        assert!(json.get("reasoning").is_none());
+        assert!(json.get("output_config").is_none());
+        assert!(json.get("thinkingConfig").is_none());
     }
 
     #[test]

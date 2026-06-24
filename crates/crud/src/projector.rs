@@ -212,6 +212,7 @@ impl TurnProjector {
             payload.thread.id.as_str(),
             &payload.turn,
             None,
+            payload.reasoning_effort.as_deref(),
             thread_updated_at,
             thread_updated_at,
         )
@@ -259,6 +260,7 @@ impl TurnProjector {
             turn_model.id.as_str(),
             thread_id,
             turn_model,
+            None,
             None,
             updated_at,
             updated_at,

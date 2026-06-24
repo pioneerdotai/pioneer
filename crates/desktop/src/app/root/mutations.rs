@@ -342,6 +342,7 @@ impl PioneerDesktop {
             &mut self.thread_tree_selected_node_id,
             &mut self.turn_timeline_refresh,
         );
+        self.clear_composer_reasoning_effort();
         self.composer_model_display_cache.clear();
         self.composer_model_display_loading_key = None;
         self.cli_runtime_pending_requests = Default::default();

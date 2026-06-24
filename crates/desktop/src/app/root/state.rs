@@ -96,6 +96,7 @@ impl PioneerDesktop {
             composer_turn_mode: default_composer_turn_mode(),
             composer_selected_provider: None,
             composer_selected_model: None,
+            composer_selected_reasoning_effort: None,
             composer_model_selection_manually_selected: false,
             composer_model_display_cache: HashMap::new(),
             composer_model_display_loading_key: None,

@@ -3955,11 +3955,31 @@ impl CrudStore {
         turn_model: &Turn,
         input: &[UserInput],
     ) -> Result<()> {
+        self.materialize_turn_start_with_reasoning_effort(
+            thread_model,
+            sandbox_mode,
+            turn_model,
+            input,
+            None,
+        )
+        .await
+    }
+
+    /// Persists the full turn/start write-set plus explicit reasoning effort.
+    pub async fn materialize_turn_start_with_reasoning_effort(
+        &self,
+        thread_model: &Thread,
+        sandbox_mode: SandboxMode,
+        turn_model: &Turn,
+        input: &[UserInput],
+        reasoning_effort: Option<&str>,
+    ) -> Result<()> {
         let event = TurnEventPayload::TurnStarted(TurnStartedEventPayload {
             thread: thread_model.clone(),
             sandbox_mode,
             turn: turn_model.clone(),
             input: input.to_vec(),
+            reasoning_effort: reasoning_effort.map(str::to_owned),
         });
 
         self.materialize_turn_event(event, thread_model.updated_at)
@@ -10928,6 +10948,7 @@ mod tests {
             mode_json: r#""Agent""#.to_owned(),
             model: "model-a".to_owned(),
             provider_name: "provider-a".to_owned(),
+            reasoning_effort: None,
             hook_runtime_context_json: r#"{"mode":"agent","actor_kind":"agent"}"#.to_owned(),
             workspace_skill_policies_json: "[]".to_owned(),
             input_json: r#"[{"type":"text","text":"hello","textElements":[]}]"#.to_owned(),
@@ -10949,6 +10970,7 @@ mod tests {
         let mut replacement = snapshot;
         replacement.model = "model-b".to_owned();
         replacement.provider_name = "provider-b".to_owned();
+        replacement.reasoning_effort = Some("max".to_owned());
         replacement.runtime_environment_json =
             r#"{"PIONEER_ARTIFACT_OUTPUT_DIR":"/tmp/b"}"#.to_owned();
         replacement.created_at = updated_at;
@@ -10960,6 +10982,7 @@ mod tests {
             .expect("snapshot update should succeed");
         assert_eq!(updated.model, "model-b");
         assert_eq!(updated.provider_name, "provider-b");
+        assert_eq!(updated.reasoning_effort.as_deref(), Some("max"));
         assert_eq!(updated.created_at, created_at);
         assert_eq!(updated.updated_at, updated_at);
 
@@ -10972,6 +10995,7 @@ mod tests {
             fetched.runtime_environment_json,
             updated.runtime_environment_json
         );
+        assert_eq!(fetched.reasoning_effort.as_deref(), Some("max"));
 
         assert_eq!(
             store
@@ -11032,6 +11056,7 @@ mod tests {
                     mode_json: r#""Agent""#.to_owned(),
                     model: "model-a".to_owned(),
                     provider_name: "provider-a".to_owned(),
+                    reasoning_effort: None,
                     hook_runtime_context_json: r#"{"mode":"agent","actor_kind":"agent"}"#
                         .to_owned(),
                     workspace_skill_policies_json: "[]".to_owned(),
@@ -15994,6 +16019,63 @@ mod tests {
             .expect("must query persisted turn")
             .expect("persisted turn should exist");
         assert_eq!(persisted_turn.prompt_manifest_json, "{}");
+        assert_eq!(persisted_turn.reasoning_effort, None);
+    }
+
+    #[tokio::test]
+    async fn materialize_turn_start_persists_explicit_reasoning_effort() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+
+        let store = CrudStore::new(connection.clone());
+        let timestamp = 1_700_000_000;
+        let thread = Thread {
+            workspace_id: "ws_reasoning_effort".to_owned(),
+            id: "thr_reasoning_effort".to_owned(),
+            name: None,
+            preview: String::new(),
+            mode: ThreadMode::Agent,
+            model: "gpt-5.4".to_owned(),
+            model_provider: "openai".to_owned(),
+            created_at: timestamp,
+            updated_at: timestamp,
+            status: ThreadStatus::Active,
+            origin_kind: ThreadOriginKind::User,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            turns: Vec::new(),
+        };
+        let turn = Turn {
+            id: "turn_reasoning_effort".to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
+            error: None,
+            prompt_manifest: None,
+        };
+
+        store
+            .materialize_turn_start_with_reasoning_effort(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                Some("high"),
+            )
+            .await
+            .expect("turn start with reasoning effort should persist");
+
+        let persisted_turn = pioneer_entity::turn::Entity::find_by_id(turn.id.clone())
+            .one(&connection)
+            .await
+            .expect("must query persisted turn")
+            .expect("persisted turn should exist");
+        assert_eq!(persisted_turn.reasoning_effort.as_deref(), Some("high"));
     }
 
     #[tokio::test]

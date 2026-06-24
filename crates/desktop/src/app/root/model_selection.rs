@@ -32,11 +32,25 @@ impl PioneerDesktop {
         let mut state = self.composer_model_selection_state();
         state.reset_to_resolved_selection(selection);
         self.apply_composer_model_selection_state(state);
+        self.clear_composer_reasoning_effort();
     }
 
     pub(in crate::app) fn has_complete_composer_model_selection(&self) -> bool {
         self.composer_model_selection_state()
             .has_complete_selection()
+    }
+
+    pub(in crate::app) fn set_composer_reasoning_effort_from_user(
+        &mut self,
+        effort: Option<String>,
+    ) {
+        let mut state = self.composer_model_selection_state();
+        state.set_reasoning_effort_from_user(effort);
+        self.apply_composer_model_selection_state(state);
+    }
+
+    pub(in crate::app) fn clear_composer_reasoning_effort(&mut self) {
+        self.composer_selected_reasoning_effort = None;
     }
 
     pub(in crate::app) fn composer_model_display_state(
@@ -86,17 +100,20 @@ impl PioneerDesktop {
     }
 
     fn composer_model_selection_state(&self) -> ComposerModelSelectionState {
-        ComposerModelSelectionState::new(
+        ComposerModelSelectionState::new_with_reasoning_effort(
             self.composer_selected_provider.clone(),
             self.composer_selected_model.clone(),
+            self.composer_selected_reasoning_effort.clone(),
             self.composer_model_selection_manually_selected,
         )
     }
 
     fn apply_composer_model_selection_state(&mut self, state: ComposerModelSelectionState) {
-        let (provider, model, manually_selected) = state.into_parts();
+        let (provider, model, reasoning_effort, manually_selected) =
+            state.into_parts_with_reasoning_effort();
         self.composer_selected_provider = provider;
         self.composer_selected_model = model;
+        self.composer_selected_reasoning_effort = reasoning_effort;
         self.composer_model_selection_manually_selected = manually_selected;
         if self.composer_selected_provider_is_cli_runtime() {
             self.composer_capabilities.clear();

@@ -2,10 +2,11 @@ use crate::attachments::{
     PreparedAttachmentSource, PreparedProviderMessages, attachment_bytes,
     ensure_no_unrendered_attachments, prepare_messages_for_provider,
 };
+use crate::reasoning_registry;
 use crate::types::{
     ChatRequest, ChatResponse, InputContentType, InputTypeSupport, ProviderCapabilities,
-    ProviderInputCapabilities, ProviderTimeoutPolicy, ProviderToolCall, Role, StreamChunk,
-    TokenUsage, ToolChoice, ToolDefinition,
+    ProviderInputCapabilities, ProviderTimeoutPolicy, ProviderToolCall, ReasoningConfig, Role,
+    StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -35,6 +36,8 @@ struct BedrockRequest {
     inference_config: Option<BedrockInferenceConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_config: Option<BedrockToolConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    additional_model_request_fields: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -653,6 +656,58 @@ impl BedrockProvider {
         BedrockToolConfig { tools, tool_choice }
     }
 
+    fn build_request(
+        request: &ChatRequest,
+        prepared: &PreparedProviderMessages,
+    ) -> Result<BedrockRequest> {
+        let (messages, system) = Self::convert_messages(prepared)?;
+
+        let inference_config = if request.temperature.is_some() || request.max_tokens.is_some() {
+            Some(BedrockInferenceConfig {
+                temperature: request.temperature,
+                max_tokens: request.max_tokens,
+            })
+        } else {
+            None
+        };
+
+        Ok(BedrockRequest {
+            messages,
+            system,
+            inference_config,
+            tool_config: request
+                .tools
+                .as_ref()
+                .map(|tools| Self::convert_tool_config(tools, request.tool_choice.clone())),
+            additional_model_request_fields: Self::additional_model_request_fields(
+                request.model.as_str(),
+                request.reasoning,
+            ),
+        })
+    }
+
+    fn additional_model_request_fields(
+        model_id: &str,
+        reasoning: Option<ReasoningConfig>,
+    ) -> Option<serde_json::Value> {
+        if !Self::is_anthropic_claude_model(model_id) {
+            return None;
+        }
+
+        match reasoning {
+            Some(ReasoningConfig::Effort(effort)) => Some(serde_json::json!({
+                "output_config": {
+                    "effort": effort.as_str(),
+                },
+            })),
+            Some(ReasoningConfig::Disabled) | None => None,
+        }
+    }
+
+    fn is_anthropic_claude_model(model_id: &str) -> bool {
+        model_id.contains("anthropic.claude")
+    }
+
     /// Get the current UTC datetime in the format required by SigV4.
     fn amz_datetime() -> String {
         // Use a simple approach: read system time and format manually.
@@ -760,26 +815,7 @@ impl crate::traits::Provider for BedrockProvider {
                 .as_slice(),
         )?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let (messages, system) = Self::convert_messages(&prepared)?;
-
-        let inference_config = if request.temperature.is_some() || request.max_tokens.is_some() {
-            Some(BedrockInferenceConfig {
-                temperature: request.temperature,
-                max_tokens: request.max_tokens,
-            })
-        } else {
-            None
-        };
-
-        let bedrock_request = BedrockRequest {
-            messages,
-            system,
-            inference_config,
-            tool_config: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tool_config(tools, request.tool_choice.clone())),
-        };
+        let bedrock_request = Self::build_request(&request, &prepared)?;
 
         let body = serde_json::to_vec(&bedrock_request)?;
         let url_str = self.converse_url(&request.model);
@@ -935,35 +971,44 @@ impl crate::traits::Provider for BedrockProvider {
         Ok(api_response
             .model_summaries
             .into_iter()
-            .map(|m| {
-                let lifecycle_status = m.model_lifecycle.and_then(|lc| lc.status);
-
-                let has_vision = m
-                    .input_modalities
-                    .as_ref()
-                    .is_some_and(|mods| mods.iter().any(|m| m == "IMAGE"));
-
-                ProviderModelInfo {
-                    id: m.model_id.clone().unwrap_or_default(),
-                    name: m.model_name,
-                    description: None,
-                    created: None,
-                    provider: "bedrock".to_owned(),
-                    owned_by: m.provider_name,
-                    limits: ProviderModelLimits::default(),
-                    capabilities: ProviderModelCapabilities {
-                        vision: Some(has_vision),
-                        input_modalities: m.input_modalities,
-                        output_modalities: m.output_modalities,
-                        ..ProviderModelCapabilities::default()
-                    },
-                    pricing: None,
-                    active: lifecycle_status.as_deref().map(|s| s == "ACTIVE"),
-                    family: None,
-                    lifecycle_status,
-                }
-            })
+            .map(provider_model_from_bedrock_model_summary)
             .collect())
+    }
+}
+
+fn provider_model_from_bedrock_model_summary(m: BedrockModelSummary) -> ProviderModelInfo {
+    let lifecycle_status = m.model_lifecycle.and_then(|lc| lc.status);
+
+    let has_vision = m
+        .input_modalities
+        .as_ref()
+        .is_some_and(|mods| mods.iter().any(|m| m == "IMAGE"));
+    let model_id = m.model_id.clone().unwrap_or_default();
+    let mut capabilities = ProviderModelCapabilities {
+        vision: Some(has_vision),
+        input_modalities: m.input_modalities,
+        output_modalities: m.output_modalities,
+        ..ProviderModelCapabilities::default()
+    };
+    reasoning_registry::apply_reasoning_capabilities(
+        "bedrock",
+        model_id.as_str(),
+        &mut capabilities,
+    );
+
+    ProviderModelInfo {
+        id: model_id,
+        name: m.model_name,
+        description: None,
+        created: None,
+        provider: "bedrock".to_owned(),
+        owned_by: m.provider_name,
+        limits: ProviderModelLimits::default(),
+        capabilities,
+        pricing: None,
+        active: lifecycle_status.as_deref().map(|s| s == "ACTIVE"),
+        family: None,
+        lifecycle_status,
     }
 }
 
@@ -972,7 +1017,9 @@ mod tests {
     use super::*;
     use crate::attachments::prepare_messages_for_provider;
     use crate::traits::Provider;
-    use crate::types::{ChatMessage, ChatRequest, CompiledPromptPayload};
+    use crate::types::{
+        ChatMessage, ChatRequest, CompiledPromptPayload, ReasoningConfig, ReasoningEffort,
+    };
     use std::sync::{Mutex, OnceLock};
 
     fn bedrock_env_lock() -> &'static Mutex<()> {
@@ -1001,6 +1048,78 @@ mod tests {
         assert_eq!(provider.secret_access_key, "SECRET");
         assert_eq!(provider.region, "eu-west-1");
         assert_eq!(provider.session_token.as_deref(), Some("TOKEN"));
+    }
+
+    #[test]
+    fn bedrock_reasoning_registry_exposes_aws_documented_claude_opus_4_5() {
+        let reasoning = reasoning_registry::reasoning_capabilities_for_model(
+            "bedrock",
+            "anthropic.claude-opus-4-5",
+        )
+        .expect("bedrock opus 4.5 effort metadata");
+
+        assert_eq!(reasoning.supported, Some(true));
+        assert_eq!(reasoning.effort_options, vec!["low", "medium", "high"]);
+        assert_eq!(reasoning.default_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn bedrock_reasoning_registry_leaves_older_claude_unset() {
+        assert!(
+            reasoning_registry::reasoning_capabilities_for_model(
+                "bedrock",
+                "anthropic.claude-3-7-sonnet"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn bedrock_reasoning_registry_leaves_non_anthropic_models_unset() {
+        assert!(
+            reasoning_registry::reasoning_capabilities_for_model("bedrock", "amazon.nova-pro-v1:0")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn bedrock_model_list_fixture_normalizes_reasoning_capabilities() {
+        let response: BedrockModelsResponse = serde_json::from_str(
+            r#"{
+                "modelSummaries": [
+                    {
+                        "modelId": "anthropic.claude-opus-4-5",
+                        "modelName": "Claude Opus 4.5",
+                        "providerName": "Anthropic",
+                        "inputModalities": ["TEXT", "IMAGE"],
+                        "outputModalities": ["TEXT"],
+                        "modelLifecycle": { "status": "ACTIVE" }
+                    },
+                    {
+                        "modelId": "amazon.nova-pro-v1:0",
+                        "modelName": "Nova Pro",
+                        "providerName": "Amazon"
+                    }
+                ]
+            }"#,
+        )
+        .expect("fixture response");
+        let models = response
+            .model_summaries
+            .into_iter()
+            .map(provider_model_from_bedrock_model_summary)
+            .collect::<Vec<_>>();
+
+        let reasoning = models[0]
+            .capabilities
+            .reasoning
+            .as_ref()
+            .expect("bedrock claude reasoning model");
+        assert_eq!(reasoning.effort_options, vec!["low", "medium", "high"]);
+        assert_eq!(models[0].capabilities.vision, Some(true));
+        assert_eq!(models[0].active, Some(true));
+
+        assert!(models[1].capabilities.reasoning.is_none());
     }
 
     #[test]
@@ -1175,6 +1294,7 @@ mod tests {
                 max_tokens: Some(8192),
             }),
             tool_config: None,
+            additional_model_request_fields: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -1204,12 +1324,87 @@ mod tests {
             system: vec![],
             inference_config: None,
             tool_config: None,
+            additional_model_request_fields: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
 
         assert!(!json.contains("\"system\""));
         assert!(!json.contains("\"inferenceConfig\""));
+    }
+
+    #[test]
+    fn bedrock_claude_request_serializes_reasoning_effort_in_additional_fields() {
+        let request = ChatRequest {
+            model: "anthropic.claude-opus-4-5".to_owned(),
+            messages: vec![ChatMessage::user("Hello")],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: Some(ReasoningConfig::effort(ReasoningEffort::High)),
+            compiled_prompt: None,
+        };
+        let rendered = request.rendered_messages_with_compiled_sections();
+        let prepared = prepared_for(rendered.as_slice());
+
+        let bedrock_request = BedrockProvider::build_request(&request, &prepared).unwrap();
+        let json = serde_json::to_value(&bedrock_request).unwrap();
+
+        assert_eq!(
+            json["additionalModelRequestFields"]["output_config"]["effort"],
+            "high"
+        );
+        assert!(
+            json["additionalModelRequestFields"]
+                .get("thinking")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn bedrock_claude_request_omits_reasoning_extension_for_disabled_reasoning() {
+        let request = ChatRequest {
+            model: "anthropic.claude-opus-4-5".to_owned(),
+            messages: vec![ChatMessage::user("Hello")],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: Some(ReasoningConfig::disabled()),
+            compiled_prompt: None,
+        };
+        let rendered = request.rendered_messages_with_compiled_sections();
+        let prepared = prepared_for(rendered.as_slice());
+
+        let bedrock_request = BedrockProvider::build_request(&request, &prepared).unwrap();
+        let json = serde_json::to_value(&bedrock_request).unwrap();
+
+        assert!(json.get("additionalModelRequestFields").is_none());
+    }
+
+    #[test]
+    fn bedrock_non_claude_request_omits_reasoning_extension() {
+        let request = ChatRequest {
+            model: "amazon.nova-pro-v1:0".to_owned(),
+            messages: vec![ChatMessage::user("Hello")],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: Some(ReasoningConfig::effort(ReasoningEffort::High)),
+            compiled_prompt: None,
+        };
+        let rendered = request.rendered_messages_with_compiled_sections();
+        let prepared = prepared_for(rendered.as_slice());
+
+        let bedrock_request = BedrockProvider::build_request(&request, &prepared).unwrap();
+        let json = serde_json::to_value(&bedrock_request).unwrap();
+
+        assert!(json.get("additionalModelRequestFields").is_none());
     }
 
     #[test]

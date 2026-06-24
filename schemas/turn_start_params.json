@@ -58,6 +58,16 @@
         "null"
       ]
     },
+    "reasoning": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TurnReasoningSelection"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "sandbox_policy": {
       "anyOf": [
         {
@@ -333,6 +343,17 @@
             "scopeKind"
           ]
         }
+      ]
+    },
+    "TurnReasoningSelection": {
+      "type": "object",
+      "properties": {
+        "effort": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "effort"
       ]
     },
     "UserInput": {

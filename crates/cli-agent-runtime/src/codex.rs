@@ -2236,12 +2236,27 @@ impl CodexReasoningEffort {
                 reasoning_effort, ..
             } => reasoning_effort?,
         };
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_owned())
-        }
+        normalize_reasoning_effort(value.as_str())
+    }
+}
+
+fn normalize_reasoning_effort(value: &str) -> Option<String> {
+    let compact = value
+        .trim()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+
+    match compact.as_str() {
+        "none" | "off" | "disabled" => Some("none".to_owned()),
+        "minimal" | "min" => Some("minimal".to_owned()),
+        "low" => Some("low".to_owned()),
+        "medium" | "med" => Some("medium".to_owned()),
+        "high" => Some("high".to_owned()),
+        "xhigh" | "extrahigh" | "xtrahigh" => Some("xhigh".to_owned()),
+        "max" | "maximum" => Some("max".to_owned()),
+        _ => None,
     }
 }
 
@@ -3321,6 +3336,24 @@ while read line; do :; done
         assert_eq!(models[0].max_output_tokens, Some(8192));
     }
 
+    #[test]
+    fn codex_model_entry_supports_string_and_object_reasoning_efforts() {
+        let model: CodexModelListModel = serde_json::from_value(json!({
+            "id": "gpt-5.4",
+            "supportedReasoningEfforts": [
+                "low",
+                { "reasoningEffort": "Extra High" },
+                { "id": "maximum" },
+                " "
+            ]
+        }))
+        .expect("model metadata should decode");
+
+        let snapshot = model.into_snapshot().expect("model snapshot");
+        assert_eq!(snapshot.effort_options, vec!["low", "xhigh", "max"]);
+        assert_eq!(snapshot.supports_reasoning, Some(true));
+    }
+
     #[tokio::test]
     async fn codex_model_list_multiple_pages_follow_cursor() {
         let (rpc, mut server_reader, mut server_writer) = client_pair();
@@ -4377,6 +4410,61 @@ while read line; do :; done
                 "summary": "concise"
             })
         );
+        fake.write_result_response(
+            request["id"].clone(),
+            json!({
+                "turn": {
+                    "id": "codex-turn-started",
+                    "status": "inProgress"
+                }
+            }),
+        )
+        .await;
+
+        let snapshot = turn_start
+            .await
+            .expect("turn start task should join")
+            .expect("turn start should succeed");
+        assert_eq!(snapshot.native_thread_id, "codex-thread-existing");
+        assert_eq!(snapshot.native_turn_id, "codex-turn-started");
+    }
+
+    #[tokio::test]
+    async fn codex_turn_start_omits_effort_when_not_selected() {
+        let mut fake = FakeCodexAppServer::new();
+        let client = fake.client.clone();
+        let turn_start = tokio::spawn(async move {
+            client
+                .turn_start(
+                    CodexTurnStartParams {
+                        thread_id: "codex-thread-existing".to_owned(),
+                        input: vec![CLIRuntimeTurnInputItem::Text {
+                            text: "Run tests".to_owned(),
+                        }],
+                        cwd: None,
+                        approval_policy: None,
+                        sandbox_policy: None,
+                        model: Some("gpt-5".to_owned()),
+                        effort: None,
+                        personality: None,
+                        summary: None,
+                    },
+                    Duration::from_secs(2),
+                )
+                .await
+        });
+
+        let request = fake.read_message().await;
+        assert_eq!(request["method"], json!("turn/start"));
+        assert_eq!(
+            request["params"],
+            json!({
+                "threadId": "codex-thread-existing",
+                "input": [{"type": "text", "text": "Run tests"}],
+                "model": "gpt-5"
+            })
+        );
+        assert!(request["params"].get("effort").is_none());
         fake.write_result_response(
             request["id"].clone(),
             json!({

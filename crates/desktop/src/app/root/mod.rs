@@ -213,6 +213,7 @@ pub struct PioneerDesktop {
     pub(super) composer_turn_mode: ThreadMode,
     pub(super) composer_selected_provider: Option<String>,
     pub(super) composer_selected_model: Option<String>,
+    pub(super) composer_selected_reasoning_effort: Option<String>,
     pub(super) composer_model_selection_manually_selected: bool,
     pub(super) composer_model_display_cache: HashMap<ProviderModelDisplayKey, Option<String>>,
     pub(super) composer_model_display_loading_key: Option<ProviderModelDisplayKey>,
