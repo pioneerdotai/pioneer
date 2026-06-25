@@ -7485,7 +7485,7 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 
 [[package]]
 name = "pioneer-agent"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7509,7 +7509,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-artifacts"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7535,7 +7535,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-cli"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
@@ -7558,7 +7558,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-cli-agent-runtime"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "anyhow",
  "libc",
@@ -7571,7 +7571,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-client"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -7594,7 +7594,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-client-ffi"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "anyhow",
  "pioneer-client",
@@ -7608,7 +7608,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-config"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "anyhow",
  "config",
@@ -7619,7 +7619,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-crud"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7639,7 +7639,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -7675,7 +7675,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-entity"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "sea-orm",
  "serde",
@@ -7683,7 +7683,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-gateway"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7736,7 +7736,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-hooks"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "async-trait",
  "futures-timer",
@@ -7751,7 +7751,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-keystore"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "db-keystore",
  "keyring-core",
@@ -7764,7 +7764,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-mcp"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7785,7 +7785,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-memory"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7808,7 +7808,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-migration"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "anyhow",
  "pioneer-entity",
@@ -7819,7 +7819,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-observability"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "anyhow",
  "dotenvy",
@@ -7830,7 +7830,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-promt"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7848,7 +7848,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-protocol"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "hex",
  "nanoid",
@@ -7860,7 +7860,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-provider"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7883,7 +7883,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-skills"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "anyhow",
  "hex",
@@ -7899,7 +7899,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-sqlite"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "anyhow",
  "sea-orm",
@@ -7908,7 +7908,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-tasks"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7929,7 +7929,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-tools"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7957,7 +7957,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-tunnel"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "anyhow",
  "pioneer-config",
@@ -9833,9 +9833,9 @@ checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "sentry"
-version = "0.48.2"
+version = "0.48.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "931a20b0da02350676e3d6d3c9028d58eaa448cf42a866712eec5845a505421e"
+checksum = "1975064d9f3d9d87a7c8f0371f7fac10d876906ca3e39faad72e61c263ff9b87"
 dependencies = [
  "cfg_aliases 0.2.1",
  "httpdate",
@@ -9853,9 +9853,9 @@ dependencies = [
 
 [[package]]
 name = "sentry-anyhow"
-version = "0.48.2"
+version = "0.48.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b8bb4a03e7cf5562ea7ff658b2a254c06d2e09b2ec7383dfd5fc7025d40227b"
+checksum = "9c3447b3aa5676e005779b26b3a0cab8928bb356d8cfd32ad63f6051824cc366"
 dependencies = [
  "anyhow",
  "sentry-backtrace",
@@ -9864,9 +9864,9 @@ dependencies = [
 
 [[package]]
 name = "sentry-backtrace"
-version = "0.48.2"
+version = "0.48.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "911ee36abf5b7fa335fccd5f54361ba9c16baea5f0c3bb361a687b6c195c21cf"
+checksum = "134f552b6b147f77aeee46ece875d67a8bfc1d56fe3860d78446ed4c25bb5f9f"
 dependencies = [
  "backtrace",
  "regex",
@@ -9875,9 +9875,9 @@ dependencies = [
 
 [[package]]
 name = "sentry-contexts"
-version = "0.48.2"
+version = "0.48.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b9d7d469e9e22741c17ca23fb8b42d79861590eb7cf330f3da34fc1e4bc1bc6"
+checksum = "98482b938fb1f31ecd23506fb7f08b2ba20d60b9cc72581b1205a9acd31d32fa"
 dependencies = [
  "hostname",
  "libc",
@@ -9889,9 +9889,9 @@ dependencies = [
 
 [[package]]
 name = "sentry-core"
-version = "0.48.2"
+version = "0.48.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "545dc562b6758d646ac19e1407f4ebc26d452111386743e03323464bc48bb2e0"
+checksum = "7cff96247f4dc36867511d108709e703eb354143e7893319d763d2dd1edb4f48"
 dependencies = [
  "rand 0.9.4",
  "sentry-types",
@@ -9902,9 +9902,9 @@ dependencies = [
 
 [[package]]
 name = "sentry-panic"
-version = "0.48.2"
+version = "0.48.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "772d9de150c8ca910c835353c85f434457348fdd21208f9b3da3574202b1dc5d"
+checksum = "61de3f4a1fc77d4c57e8bacd8ef064c26aaa88ea5b2541a761d37c7c3703b9a9"
 dependencies = [
  "sentry-backtrace",
  "sentry-core",
@@ -9912,9 +9912,9 @@ dependencies = [
 
 [[package]]
 name = "sentry-tracing"
-version = "0.48.2"
+version = "0.48.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c51ec9620a4d398dcdf7ee90effbf8d8691cfa24e91978bfa8565cac039d4980"
+checksum = "bc59b27dae3bb495e37e6d62d252214840a2e7e1875531ee9fa2953df8985537"
 dependencies = [
  "bitflags 2.13.0",
  "sentry-backtrace",
@@ -9925,9 +9925,9 @@ dependencies = [
 
 [[package]]
 name = "sentry-types"
-version = "0.48.2"
+version = "0.48.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "041359745a44dd2e14fe21b7510fe7ca8b5beffce6636a0b52e5bc7d5f736887"
+checksum = "8d7e78132ccfb4a1c777b959fb2944d1f6d5145bffe6be2a98ee6b25d244f72c"
 dependencies = [
  "debugid",
  "hex",
