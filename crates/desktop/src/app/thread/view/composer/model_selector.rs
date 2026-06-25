@@ -65,12 +65,7 @@ impl PioneerDesktop {
                                         .child(display_label),
                                 )
                                 .when_some(effort_label, |row, effort_label| {
-                                    row.child(
-                                        div()
-                                            .flex_none()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(effort_label),
-                                    )
+                                    row.child(div().flex_none().opacity(0.6).child(effort_label))
                                 }),
                         )
                     })
