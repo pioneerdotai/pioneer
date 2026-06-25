@@ -80,6 +80,7 @@ mod tests {
             mode: ThreadMode::Agent,
             model: "gpt-5".to_owned(),
             model_provider: "openai".to_owned(),
+            reasoning_effort: None,
             created_at: 1,
             updated_at: 1,
             status: ThreadStatus::Idle,

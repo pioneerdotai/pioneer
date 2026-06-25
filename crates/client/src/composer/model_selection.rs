@@ -7,6 +7,8 @@ use pioneer_protocol::{Thread, ThreadMode};
 pub struct ComposerModelSelection {
     pub provider: String,
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_reasoning_effort: Option<String>,
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -51,14 +53,25 @@ pub struct ModelProviderSelectionUpdate {
 
 impl ComposerModelSelection {
     pub fn from_thread(thread: &Thread) -> Option<Self> {
-        composer_model_selection_from_parts(
+        composer_model_selection_from_parts_with_reasoning_effort(
             Some(thread.model_provider.as_str()),
             Some(thread.model.as_str()),
+            thread.reasoning_effort.as_deref(),
         )
     }
 
     pub fn into_parts(self) -> (Option<String>, Option<String>) {
         (Some(self.provider), Some(self.model))
+    }
+
+    pub fn into_parts_with_reasoning_effort(
+        self,
+    ) -> (Option<String>, Option<String>, Option<String>) {
+        (
+            Some(self.provider),
+            Some(self.model),
+            self.selected_reasoning_effort,
+        )
     }
 }
 
@@ -147,16 +160,15 @@ impl ComposerModelSelectionState {
     }
 
     pub fn apply_resolved_selection(&mut self, selection: Option<ComposerModelSelection>) -> bool {
-        let (selected_provider, selected_model) = selection
-            .map(ComposerModelSelection::into_parts)
-            .unwrap_or((None, None));
-        let changed =
-            self.selected_provider != selected_provider || self.selected_model != selected_model;
+        let (selected_provider, selected_model, selected_reasoning_effort) = selection
+            .map(ComposerModelSelection::into_parts_with_reasoning_effort)
+            .unwrap_or((None, None, None));
+        let changed = self.selected_provider != selected_provider
+            || self.selected_model != selected_model
+            || self.selected_reasoning_effort != selected_reasoning_effort;
         self.selected_provider = selected_provider;
         self.selected_model = selected_model;
-        if changed {
-            self.selected_reasoning_effort = None;
-        }
+        self.selected_reasoning_effort = selected_reasoning_effort;
         changed
     }
 
@@ -191,8 +203,20 @@ pub fn composer_model_selection_from_parts(
     provider: Option<&str>,
     model: Option<&str>,
 ) -> Option<ComposerModelSelection> {
+    composer_model_selection_from_parts_with_reasoning_effort(provider, model, None)
+}
+
+pub fn composer_model_selection_from_parts_with_reasoning_effort(
+    provider: Option<&str>,
+    model: Option<&str>,
+    selected_reasoning_effort: Option<&str>,
+) -> Option<ComposerModelSelection> {
     let provider = provider?.trim();
     let model = model?.trim();
+    let selected_reasoning_effort = selected_reasoning_effort
+        .map(str::trim)
+        .filter(|effort| !effort.is_empty())
+        .map(str::to_owned);
 
     if provider.is_empty() || model.is_empty() {
         return None;
@@ -201,6 +225,7 @@ pub fn composer_model_selection_from_parts(
     Some(ComposerModelSelection {
         provider: provider.to_owned(),
         model: model.to_owned(),
+        selected_reasoning_effort,
     })
 }
 
@@ -282,9 +307,18 @@ mod tests {
     use pioneer_protocol::{ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus};
 
     fn selection(provider: &str, model: &str) -> Option<ComposerModelSelection> {
+        selection_with_effort(provider, model, None)
+    }
+
+    fn selection_with_effort(
+        provider: &str,
+        model: &str,
+        selected_reasoning_effort: Option<&str>,
+    ) -> Option<ComposerModelSelection> {
         Some(ComposerModelSelection {
             provider: provider.to_owned(),
             model: model.to_owned(),
+            selected_reasoning_effort: selected_reasoning_effort.map(str::to_owned),
         })
     }
 
@@ -296,16 +330,40 @@ mod tests {
         provider: &str,
         model: &str,
     ) -> ComposerModelSelectionCandidate {
+        candidate_with_effort(
+            thread_id,
+            workspace_id,
+            updated_at,
+            has_turns,
+            provider,
+            model,
+            None,
+        )
+    }
+
+    fn candidate_with_effort(
+        thread_id: &str,
+        workspace_id: &str,
+        updated_at: i64,
+        has_turns: bool,
+        provider: &str,
+        model: &str,
+        selected_reasoning_effort: Option<&str>,
+    ) -> ComposerModelSelectionCandidate {
         ComposerModelSelectionCandidate {
             thread_id: thread_id.to_owned(),
             workspace_id: workspace_id.to_owned(),
             updated_at,
             has_turns,
-            selection: selection(provider, model),
+            selection: selection_with_effort(provider, model, selected_reasoning_effort),
         }
     }
 
-    fn thread(provider: &str, model: &str) -> Thread {
+    fn thread_with_effort(
+        provider: &str,
+        model: &str,
+        selected_reasoning_effort: Option<&str>,
+    ) -> Thread {
         Thread {
             workspace_id: "ws".to_owned(),
             id: "thread".to_owned(),
@@ -314,6 +372,7 @@ mod tests {
             mode: ThreadMode::Agent,
             model: model.to_owned(),
             model_provider: provider.to_owned(),
+            reasoning_effort: selected_reasoning_effort.map(str::to_owned),
             created_at: 1,
             updated_at: 1,
             status: ThreadStatus::Active,
@@ -340,6 +399,31 @@ mod tests {
     }
 
     #[test]
+    fn active_thread_with_turns_restores_reasoning_effort() {
+        let resolved = resolve_composer_model_selection(
+            Some("thread_a"),
+            Some("ws"),
+            vec![
+                candidate_with_effort(
+                    "thread_a",
+                    "ws",
+                    10,
+                    true,
+                    "openai",
+                    "gpt-5.4",
+                    Some("high"),
+                ),
+                candidate("thread_b", "ws", 20, true, "anthropic", "claude-sonnet-4.5"),
+            ],
+        );
+
+        assert_eq!(
+            resolved,
+            selection_with_effort("openai", "gpt-5.4", Some("high"))
+        );
+    }
+
+    #[test]
     fn empty_active_thread_uses_latest_workspace_turn() {
         let resolved = resolve_composer_model_selection(
             Some("thread_empty"),
@@ -359,6 +443,40 @@ mod tests {
         );
 
         assert_eq!(resolved, selection("openrouter", "anthropic/claude"));
+    }
+
+    #[test]
+    fn empty_active_thread_restores_latest_workspace_turn_reasoning_effort() {
+        let resolved = resolve_composer_model_selection(
+            Some("thread_empty"),
+            Some("ws"),
+            vec![
+                candidate("thread_empty", "ws", 30, false, "openai", "default"),
+                candidate_with_effort(
+                    "thread_old",
+                    "ws",
+                    10,
+                    true,
+                    "openai",
+                    "gpt-5.4",
+                    Some("low"),
+                ),
+                candidate_with_effort(
+                    "thread_new",
+                    "ws",
+                    20,
+                    true,
+                    "openrouter",
+                    "anthropic/claude",
+                    Some("high"),
+                ),
+            ],
+        );
+
+        assert_eq!(
+            resolved,
+            selection_with_effort("openrouter", "anthropic/claude", Some("high"))
+        );
     }
 
     #[test]
@@ -452,10 +570,14 @@ mod tests {
     }
 
     #[test]
-    fn model_selection_from_thread_uses_thread_provider_and_model() {
+    fn model_selection_from_thread_uses_thread_provider_model_and_reasoning_effort() {
         assert_eq!(
-            ComposerModelSelection::from_thread(&thread(" openai ", " gpt-5.4 ")),
-            selection("openai", "gpt-5.4")
+            ComposerModelSelection::from_thread(&thread_with_effort(
+                " openai ",
+                " gpt-5.4 ",
+                Some(" high ")
+            )),
+            selection_with_effort("openai", "gpt-5.4", Some("high"))
         );
     }
 
@@ -471,10 +593,15 @@ mod tests {
         assert_eq!(state.selected_provider.as_deref(), Some("openai"));
         assert_eq!(state.selected_model.as_deref(), Some("gpt-5.4"));
 
-        assert!(state.reset_to_resolved_selection(selection("anthropic", "claude")));
+        assert!(state.reset_to_resolved_selection(selection_with_effort(
+            "anthropic",
+            "claude",
+            Some("high")
+        )));
         assert!(!state.manually_selected);
         assert_eq!(state.selected_provider.as_deref(), Some("anthropic"));
         assert_eq!(state.selected_model.as_deref(), Some("claude"));
+        assert_eq!(state.selected_reasoning_effort.as_deref(), Some("high"));
 
         assert!(state.sync_resolved_selection(None));
         assert!(!state.has_complete_selection());
@@ -533,25 +660,42 @@ mod tests {
     }
 
     #[test]
-    fn resolved_selection_sync_clears_effort_only_when_model_selection_changes() {
+    fn resolved_selection_sync_restores_and_clears_reasoning_effort() {
         let mut state = ComposerModelSelectionState::new_with_reasoning_effort(
             Some("openai".to_owned()),
             Some("gpt-5.4".to_owned()),
-            Some("high".to_owned()),
+            None,
             false,
         );
 
-        assert!(!state.sync_resolved_selection(selection("openai", "gpt-5.4")));
+        assert!(state.sync_resolved_selection(selection_with_effort(
+            "openai",
+            "gpt-5.4",
+            Some("high")
+        )));
         assert_eq!(state.selected_reasoning_effort.as_deref(), Some("high"));
 
-        assert!(state.sync_resolved_selection(selection("openai", "gpt-5.5")));
+        assert!(!state.sync_resolved_selection(selection_with_effort(
+            "openai",
+            "gpt-5.4",
+            Some("high")
+        )));
+
+        assert!(state.sync_resolved_selection(selection("openai", "gpt-5.4")));
+        assert!(state.selected_reasoning_effort.is_none());
+
+        assert!(state.sync_resolved_selection(selection_with_effort(
+            "openai",
+            "gpt-5.5",
+            Some("max")
+        )));
         assert_eq!(state.selected_provider.as_deref(), Some("openai"));
         assert_eq!(state.selected_model.as_deref(), Some("gpt-5.5"));
-        assert!(state.selected_reasoning_effort.is_none());
+        assert_eq!(state.selected_reasoning_effort.as_deref(), Some("max"));
     }
 
     #[test]
-    fn reset_to_resolved_selection_clears_effort_when_model_selection_changes() {
+    fn reset_to_resolved_selection_restores_reasoning_effort_when_model_selection_changes() {
         let mut state = ComposerModelSelectionState::new_with_reasoning_effort(
             Some("openai".to_owned()),
             Some("gpt-5.4".to_owned()),
@@ -559,12 +703,16 @@ mod tests {
             true,
         );
 
-        assert!(state.reset_to_resolved_selection(selection("anthropic", "claude")));
+        assert!(state.reset_to_resolved_selection(selection_with_effort(
+            "anthropic",
+            "claude",
+            Some("max")
+        )));
 
         assert!(!state.manually_selected);
         assert_eq!(state.selected_provider.as_deref(), Some("anthropic"));
         assert_eq!(state.selected_model.as_deref(), Some("claude"));
-        assert!(state.selected_reasoning_effort.is_none());
+        assert_eq!(state.selected_reasoning_effort.as_deref(), Some("max"));
     }
 
     #[test]

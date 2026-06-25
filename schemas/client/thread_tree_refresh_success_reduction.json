@@ -332,6 +332,12 @@
         "preview": {
           "type": "string"
         },
+        "reasoning_effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "sidebar_visibility": {
           "$ref": "#/$defs/ThreadSidebarVisibility",
           "default": "visible"

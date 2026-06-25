@@ -50,6 +50,7 @@ pub struct TurnStartRollbackContext {
     pub previous_mode: ThreadMode,
     pub previous_model: String,
     pub previous_model_provider: String,
+    pub previous_reasoning_effort: Option<String>,
     pub previous_sandbox_mode: SandboxMode,
 }
 
@@ -309,6 +310,7 @@ impl ThreadManager {
                         mode,
                         model: model.clone(),
                         model_provider: model_provider.clone(),
+                        reasoning_effort: None,
                         created_at: now,
                         updated_at: now,
                         status: ThreadStatus::Idle,
@@ -472,7 +474,14 @@ impl ThreadManager {
         let previous_mode = entry.thread.mode;
         let previous_model = entry.thread.model.clone();
         let previous_model_provider = entry.thread.model_provider.clone();
+        let previous_reasoning_effort = entry.thread.reasoning_effort.clone();
         let previous_sandbox_mode = entry.sandbox_mode;
+        let requested_reasoning_effort = params
+            .reasoning
+            .as_ref()
+            .map(|reasoning| reasoning.effort.trim())
+            .filter(|effort| !effort.is_empty())
+            .map(str::to_owned);
 
         if let Some(mode) = requested_mode {
             entry.thread.mode = mode;
@@ -483,6 +492,7 @@ impl ThreadManager {
         if let Some(model_provider) = requested_model_provider {
             entry.thread.model_provider = model_provider;
         }
+        entry.thread.reasoning_effort = requested_reasoning_effort;
         if let Some(sandbox_mode) = requested_sandbox_mode {
             entry.sandbox_mode = sandbox_mode;
         }
@@ -538,6 +548,7 @@ impl ThreadManager {
             previous_mode,
             previous_model,
             previous_model_provider,
+            previous_reasoning_effort,
             previous_sandbox_mode,
         };
 
@@ -563,6 +574,7 @@ impl ThreadManager {
         entry.thread.mode = context.previous_mode;
         entry.thread.model = context.previous_model;
         entry.thread.model_provider = context.previous_model_provider;
+        entry.thread.reasoning_effort = context.previous_reasoning_effort;
         entry.sandbox_mode = context.previous_sandbox_mode;
     }
 
@@ -875,7 +887,8 @@ mod tests {
     use super::ThreadManager;
     use pioneer_protocol::{
         Thread, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStartParams,
-        ThreadStatus, ThreadUnsubscribeStatus, TurnStartParams, TurnStatus, UserInput,
+        ThreadStatus, ThreadUnsubscribeStatus, TurnReasoningSelection, TurnStartParams, TurnStatus,
+        UserInput,
     };
 
     fn start_params(thread_id: &str) -> ThreadStartParams {
@@ -983,6 +996,7 @@ mod tests {
             mode: ThreadMode::Chat,
             model: "o4-mini".to_owned(),
             model_provider: "openai".to_owned(),
+            reasoning_effort: None,
             created_at: seed_updated_at - 10,
             updated_at: seed_updated_at,
             status: ThreadStatus::Idle,
@@ -1297,7 +1311,9 @@ mod tests {
                     sandbox_policy: None,
                     mode: None,
                     execution_backend: None,
-                    reasoning: None,
+                    reasoning: Some(TurnReasoningSelection {
+                        effort: "high".to_owned(),
+                    }),
                     cli_runtime_options: None,
                 },
             )
@@ -1308,6 +1324,14 @@ mod tests {
         assert_eq!(
             turn_outcome.materialization.thread.model_provider,
             "custom-provider"
+        );
+        assert_eq!(
+            turn_outcome
+                .materialization
+                .thread
+                .reasoning_effort
+                .as_deref(),
+            Some("high")
         );
     }
 
@@ -1369,7 +1393,9 @@ mod tests {
                     sandbox_policy: None,
                     mode: None,
                     execution_backend: None,
-                    reasoning: None,
+                    reasoning: Some(TurnReasoningSelection {
+                        effort: "high".to_owned(),
+                    }),
                     cli_runtime_options: None,
                 },
             )
@@ -1380,6 +1406,14 @@ mod tests {
         assert_eq!(
             turn_outcome.materialization.thread.model_provider,
             "custom-provider"
+        );
+        assert_eq!(
+            turn_outcome
+                .materialization
+                .thread
+                .reasoning_effort
+                .as_deref(),
+            Some("high")
         );
 
         manager
@@ -1412,6 +1446,13 @@ mod tests {
         assert_eq!(
             second_turn_outcome.materialization.thread.model_provider,
             "openai"
+        );
+        assert!(
+            second_turn_outcome
+                .materialization
+                .thread
+                .reasoning_effort
+                .is_none()
         );
 
         manager

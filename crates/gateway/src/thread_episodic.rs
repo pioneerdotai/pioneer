@@ -4951,6 +4951,7 @@ mod tests {
             mode: ThreadMode::Agent,
             model: "test-model".to_owned(),
             model_provider: "test-provider".to_owned(),
+            reasoning_effort: None,
             created_at: timestamp,
             updated_at: timestamp,
             status: ThreadStatus::Active,

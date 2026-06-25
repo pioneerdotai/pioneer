@@ -422,6 +422,7 @@ impl ClientFfiActiveThreadState {
                     thread,
                     thread_snapshot_update.selected_model.as_deref(),
                     thread_snapshot_update.selected_provider.as_deref(),
+                    thread_snapshot_update.selected_reasoning_effort.as_deref(),
                     thread_snapshot_update.user_text.as_str(),
                     thread_snapshot_update.updated_at_unix,
                 );
@@ -1012,9 +1013,11 @@ fn resolve_turn_selection(
     let requested_provider = non_empty_string(requested_provider);
     let requested_model = non_empty_string(requested_model);
     let requested_selection = match (requested_provider, requested_model) {
-        (Some(provider), Some(model)) => {
-            Some(composer_model_selection::ComposerModelSelection { provider, model })
-        }
+        (Some(provider), Some(model)) => Some(composer_model_selection::ComposerModelSelection {
+            provider,
+            model,
+            selected_reasoning_effort: None,
+        }),
         (None, None) => None,
         _ => {
             return Err(anyhow::anyhow!(

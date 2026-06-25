@@ -42,6 +42,12 @@
         },
         "provider": {
           "type": "string"
+        },
+        "selected_reasoning_effort": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [

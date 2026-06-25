@@ -474,6 +474,8 @@ pub struct Thread {
     pub mode: ThreadMode,
     pub model: String,
     pub model_provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
     pub status: ThreadStatus,

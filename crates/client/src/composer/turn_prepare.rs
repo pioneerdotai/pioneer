@@ -68,6 +68,7 @@ pub struct PreparedComposerTurnSubmitContext {
 pub struct PreparedComposerThreadSnapshotUpdate {
     pub selected_model: Option<String>,
     pub selected_provider: Option<String>,
+    pub selected_reasoning_effort: Option<String>,
     pub user_text: String,
     pub updated_at_unix: i64,
 }
@@ -213,15 +214,16 @@ pub fn reduce_prepared_composer_turn_submit_success(
         turn_id: context.turn_id.clone(),
         pending_request_id: context.pending_request_id.clone(),
     };
+    let selected_reasoning_effort = context.selected_reasoning_effort.clone();
     let reasoning =
-        turn_start::turn_reasoning_selection_from_effort(context.selected_reasoning_effort.clone());
+        turn_start::turn_reasoning_selection_from_effort(selected_reasoning_effort.clone());
     let cli_runtime_options = if matches!(
         &context.execution_backend,
         Some(AgentExecutionBackend::CLIAgentRuntime { .. })
     ) {
         cli_runtime_options_with_reasoning_effort(
             context.cli_runtime_options,
-            context.selected_reasoning_effort,
+            selected_reasoning_effort.clone(),
         )
     } else {
         context.cli_runtime_options
@@ -236,6 +238,7 @@ pub fn reduce_prepared_composer_turn_submit_success(
         thread_snapshot_update: PreparedComposerThreadSnapshotUpdate {
             selected_model: context.selected_model.clone(),
             selected_provider: context.selected_provider.clone(),
+            selected_reasoning_effort,
             user_text: prepared.user_text.clone(),
             updated_at_unix: context.updated_at_unix,
         },

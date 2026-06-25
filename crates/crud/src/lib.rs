@@ -7150,8 +7150,13 @@ impl CrudStore {
         let Some(model) = thread::find_thread_by_id(&self.connection, thread_id).await? else {
             return Ok(None);
         };
+        let Some(mut thread) = thread_from_db_model(model) else {
+            return Ok(None);
+        };
 
-        Ok(thread_from_db_model(model))
+        self.attach_latest_thread_turn_snapshot(&mut thread).await?;
+
+        Ok(Some(thread))
     }
 
     pub async fn upsert_thread_model(&self, thread_model: &Thread) -> Result<()> {
@@ -7181,17 +7186,28 @@ impl CrudStore {
                 continue;
             };
 
-            if let Some(turn_model) =
-                turn::find_latest_turn_for_thread(&self.connection, thread.id.as_str()).await?
-                && let Some(turn) = thread_snapshot_turn_from_db_model(turn_model)
-            {
-                thread.turns.push(turn);
-            }
+            self.attach_latest_thread_turn_snapshot(&mut thread).await?;
 
             threads.push(thread);
         }
 
         Ok(threads)
+    }
+
+    async fn attach_latest_thread_turn_snapshot(&self, thread: &mut Thread) -> Result<()> {
+        let Some(turn_model) =
+            turn::find_latest_turn_for_thread(&self.connection, thread.id.as_str()).await?
+        else {
+            return Ok(());
+        };
+
+        let reasoning_effort = turn_model.reasoning_effort.clone();
+        if let Some(turn) = thread_snapshot_turn_from_db_model(turn_model) {
+            thread.reasoning_effort = reasoning_effort;
+            thread.turns.push(turn);
+        }
+
+        Ok(())
     }
 
     pub async fn list_thread_folders(&self, workspace_id: &str) -> Result<Vec<ThreadFolder>> {
@@ -10372,6 +10388,7 @@ fn thread_from_db_model(model: pioneer_entity::thread::Model) -> Option<Thread> 
         mode,
         model: model.model,
         model_provider: model.model_provider,
+        reasoning_effort: None,
         created_at: model.created_at.timestamp(),
         updated_at: model.updated_at.timestamp(),
         status,
@@ -10925,6 +10942,7 @@ mod tests {
             mode: ThreadMode::Agent,
             model: "gpt-5.4".to_owned(),
             model_provider: "openai".to_owned(),
+            reasoning_effort: None,
             created_at: timestamp,
             updated_at: timestamp,
             status: ThreadStatus::Active,
@@ -13336,6 +13354,7 @@ mod tests {
             mode: ThreadMode::Agent,
             model: "gpt-5.4".to_owned(),
             model_provider: "openai".to_owned(),
+            reasoning_effort: None,
             created_at: timestamp,
             updated_at: timestamp,
             status: ThreadStatus::Active,
@@ -14953,6 +14972,7 @@ mod tests {
             mode: ThreadMode::Agent,
             model: "gpt-5.4".to_owned(),
             model_provider: "openai".to_owned(),
+            reasoning_effort: None,
             created_at: timestamp,
             updated_at: timestamp,
             status: ThreadStatus::Active,
@@ -15149,6 +15169,7 @@ mod tests {
             mode: ThreadMode::Agent,
             model: "gpt-5.4".to_owned(),
             model_provider: "openai".to_owned(),
+            reasoning_effort: None,
             created_at: timestamp,
             updated_at: timestamp,
             status: ThreadStatus::Active,
@@ -15394,6 +15415,7 @@ mod tests {
             mode: ThreadMode::Agent,
             model: "gpt-5.4".to_owned(),
             model_provider: "openai".to_owned(),
+            reasoning_effort: None,
             created_at: timestamp,
             updated_at: timestamp,
             status: ThreadStatus::Active,
@@ -15975,6 +15997,7 @@ mod tests {
             mode: ThreadMode::Agent,
             model: "gpt-5.4".to_owned(),
             model_provider: "openai".to_owned(),
+            reasoning_effort: None,
             created_at: timestamp,
             updated_at: timestamp,
             status: ThreadStatus::Active,
@@ -16041,6 +16064,7 @@ mod tests {
             mode: ThreadMode::Agent,
             model: "gpt-5.4".to_owned(),
             model_provider: "openai".to_owned(),
+            reasoning_effort: None,
             created_at: timestamp,
             updated_at: timestamp,
             status: ThreadStatus::Active,
@@ -16097,6 +16121,7 @@ mod tests {
             mode: ThreadMode::Agent,
             model: "gpt-5.4".to_owned(),
             model_provider: "openai".to_owned(),
+            reasoning_effort: None,
             created_at: timestamp,
             updated_at: timestamp,
             status: ThreadStatus::Active,
@@ -16168,6 +16193,7 @@ mod tests {
             mode: ThreadMode::Agent,
             model: "gpt-5.4".to_owned(),
             model_provider: "openai".to_owned(),
+            reasoning_effort: None,
             created_at: first_timestamp,
             updated_at: first_timestamp,
             status: ThreadStatus::Active,
@@ -16186,7 +16212,13 @@ mod tests {
             prompt_manifest: None,
         };
         store
-            .materialize_turn_start(&first_thread, SandboxMode::FullAccess, &first_turn, &[])
+            .materialize_turn_start_with_reasoning_effort(
+                &first_thread,
+                SandboxMode::FullAccess,
+                &first_turn,
+                &[],
+                Some("low"),
+            )
             .await
             .expect("first turn start should persist");
 
@@ -16205,7 +16237,13 @@ mod tests {
             prompt_manifest: None,
         };
         store
-            .materialize_turn_start(&second_thread, SandboxMode::FullAccess, &second_turn, &[])
+            .materialize_turn_start_with_reasoning_effort(
+                &second_thread,
+                SandboxMode::FullAccess,
+                &second_turn,
+                &[],
+                Some("high"),
+            )
             .await
             .expect("second turn start should persist");
 
@@ -16220,8 +16258,18 @@ mod tests {
 
         assert_eq!(listed.model, "o3");
         assert_eq!(listed.model_provider, "custom-provider");
+        assert_eq!(listed.reasoning_effort.as_deref(), Some("high"));
         assert_eq!(listed.turns.len(), 1);
         assert_eq!(listed.turns[0].id, second_turn.id);
+
+        let fetched = store
+            .get_thread_model(thread_id)
+            .await
+            .expect("get thread model should succeed")
+            .expect("thread should exist");
+        assert_eq!(fetched.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(fetched.turns.len(), 1);
+        assert_eq!(fetched.turns[0].id, second_turn.id);
     }
 
     #[tokio::test]
@@ -16243,6 +16291,7 @@ mod tests {
             mode: ThreadMode::Agent,
             model: "gpt-5.4".to_owned(),
             model_provider: "openai".to_owned(),
+            reasoning_effort: None,
             created_at: timestamp,
             updated_at: timestamp,
             status: ThreadStatus::Active,

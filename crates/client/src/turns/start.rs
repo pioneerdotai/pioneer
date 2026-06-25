@@ -147,6 +147,7 @@ pub fn apply_prepared_turn_to_thread_snapshot(
     thread: &mut Thread,
     selected_model: Option<&str>,
     selected_provider: Option<&str>,
+    selected_reasoning_effort: Option<&str>,
     user_text: &str,
     updated_at_unix: i64,
 ) {
@@ -154,6 +155,10 @@ pub fn apply_prepared_turn_to_thread_snapshot(
         thread.model = model.to_owned();
         thread.model_provider = provider.to_owned();
     }
+    thread.reasoning_effort = selected_reasoning_effort
+        .map(str::trim)
+        .filter(|effort| !effort.is_empty())
+        .map(str::to_owned);
     if thread.preview.trim().is_empty() {
         thread.preview = user_text.to_owned();
     }
@@ -309,6 +314,7 @@ mod tests {
             mode: ThreadMode::Chat,
             model: "old-model".to_owned(),
             model_provider: "old-provider".to_owned(),
+            reasoning_effort: None,
             created_at: 10,
             updated_at: 10,
             status: pioneer_protocol::ThreadStatus::Idle,
@@ -323,12 +329,14 @@ mod tests {
             &mut thread,
             Some("new-model"),
             Some("new-provider"),
+            Some(" high "),
             "hello",
             42,
         );
 
         assert_eq!(thread.model, "new-model");
         assert_eq!(thread.model_provider, "new-provider");
+        assert_eq!(thread.reasoning_effort.as_deref(), Some("high"));
         assert_eq!(thread.preview, "hello");
         assert_eq!(thread.updated_at, 42);
     }
@@ -343,6 +351,7 @@ mod tests {
             mode: ThreadMode::Chat,
             model: "old-model".to_owned(),
             model_provider: "old-provider".to_owned(),
+            reasoning_effort: None,
             created_at: 10,
             updated_at: 10,
             status: pioneer_protocol::ThreadStatus::Idle,
@@ -353,10 +362,18 @@ mod tests {
             turns: Vec::new(),
         };
 
-        apply_prepared_turn_to_thread_snapshot(&mut thread, Some("new-model"), None, "hello", 42);
+        apply_prepared_turn_to_thread_snapshot(
+            &mut thread,
+            Some("new-model"),
+            None,
+            None,
+            "hello",
+            42,
+        );
 
         assert_eq!(thread.model, "old-model");
         assert_eq!(thread.model_provider, "old-provider");
+        assert!(thread.reasoning_effort.is_none());
         assert_eq!(thread.preview, "existing");
         assert_eq!(thread.updated_at, 42);
     }

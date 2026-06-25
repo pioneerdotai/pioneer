@@ -364,6 +364,10 @@ impl PioneerDesktop {
                                         .thread_snapshot_update
                                         .selected_provider
                                         .as_deref(),
+                                    reduction
+                                        .thread_snapshot_update
+                                        .selected_reasoning_effort
+                                        .as_deref(),
                                     reduction.thread_snapshot_update.user_text.as_str(),
                                     reduction.thread_snapshot_update.updated_at_unix,
                                 );

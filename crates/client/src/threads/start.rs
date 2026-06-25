@@ -347,6 +347,7 @@ mod tests {
             mode: ThreadMode::Chat,
             model: "gpt-5".to_owned(),
             model_provider: "openai".to_owned(),
+            reasoning_effort: None,
             created_at: 1,
             updated_at: 2,
             status: ThreadStatus::Idle,
