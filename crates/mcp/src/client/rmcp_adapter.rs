@@ -316,10 +316,9 @@ async fn collect_catalog(
 ) -> Result<CollectedCatalog, McpRuntimeError> {
     let peer = client.peer();
     let mut optional_errors = Vec::new();
-    let peer_info = peer.peer_info().cloned();
+    let peer_info = peer.peer_info();
     let server_info = peer_info
-        .as_ref()
-        .cloned()
+        .as_deref()
         .map(serde_json::to_value)
         .transpose()
         .map_err(|error| McpRuntimeError::failed(format!("failed to encode server info: {error}")))?
