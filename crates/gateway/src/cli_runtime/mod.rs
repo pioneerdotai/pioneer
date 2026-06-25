@@ -1,5 +1,6 @@
 pub(crate) mod claude_session;
 pub(crate) mod codex_session;
+pub(crate) mod command_heartbeat;
 pub(crate) mod config;
 pub(crate) mod context;
 pub(crate) mod input_mapping;

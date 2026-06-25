@@ -354,6 +354,7 @@ pub(crate) fn test_config() -> AppConfig {
             thread_episodic: Default::default(),
             hooks: Default::default(),
             artifacts: GatewayArtifactsConfig::default(),
+            resilience: Default::default(),
             provider: GatewayProviderConfig::default(),
             database: GatewayDatabaseConfig {
                 file_name: "gateway.db".to_owned(),

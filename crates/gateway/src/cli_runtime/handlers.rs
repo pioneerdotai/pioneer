@@ -1884,6 +1884,9 @@ impl MessageProcessor {
                 thread_id = key.thread_id.as_str(),
                 "CLI runtime canonical event pump closed"
             );
+            processor
+                .remove_cli_runtime_command_items_for_session(&key)
+                .await;
         });
     }
 
@@ -1922,6 +1925,9 @@ impl MessageProcessor {
                 thread_id = notification_key.thread_id.as_str(),
                 "Codex CLI runtime notification pump closed"
             );
+            notification_processor
+                .remove_cli_runtime_command_items_for_session(&notification_key)
+                .await;
         });
 
         let request_processor = self.clone();
@@ -2483,6 +2489,8 @@ impl MessageProcessor {
         for progress in projected.progress {
             self.handle_progress_agent_event(progress).await;
         }
+        self.update_cli_runtime_command_item_registry(key, &turn_binding, &event)
+            .await;
         if let Some(status) = cli_runtime_turn_status_for_terminal_event(&event) {
             self.cleanup_cli_runtime_terminal_turn_status(
                 &turn_binding,

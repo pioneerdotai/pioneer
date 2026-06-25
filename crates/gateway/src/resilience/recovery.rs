@@ -3,6 +3,7 @@ use pioneer_agent::{
     AgentControlError, AgentManager, ExecutionCheckpointContext, RecoveryAttemptRequest,
     RestoredRecoveryTurnRequest, RetainedToolLlmContext,
 };
+use pioneer_config::GatewayCommandExecutionTimeoutConfig;
 use pioneer_crud::{
     BlockedTurnRecoveryResumeOutcome, ClaimedRecoveryActivation, CrudStore, RecoveryJobRecord,
     TimeoutCandidate,
@@ -123,7 +124,8 @@ impl Default for RecoveryPolicyRegistry {
                 action: RetryAttempt,
                 max_attempts: 3,
                 base_backoff_secs: 2,
-                max_wall_clock_secs: 300,
+                max_wall_clock_secs: GatewayCommandExecutionTimeoutConfig::default()
+                    .recovery_max_wall_clock_secs,
                 no_progress_limit: 3,
             },
         );
@@ -404,6 +406,21 @@ impl Default for RecoveryPolicyRegistry {
             by_item_type,
             by_provider_failure_class,
         }
+    }
+}
+
+impl RecoveryPolicyRegistry {
+    pub fn with_command_execution_timeout_config(
+        command_execution_config: GatewayCommandExecutionTimeoutConfig,
+    ) -> Self {
+        let mut registry = Self::default();
+        if let Some(policy) = registry
+            .by_item_type
+            .get_mut(&TurnItemType::CommandExecution)
+        {
+            policy.max_wall_clock_secs = command_execution_config.recovery_max_wall_clock_secs;
+        }
+        registry
     }
 }
 
@@ -2750,6 +2767,22 @@ mod tests {
     use sea_orm::Database;
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    #[test]
+    fn command_execution_recovery_wall_clock_uses_config() {
+        let registry = RecoveryPolicyRegistry::with_command_execution_timeout_config(
+            pioneer_config::GatewayCommandExecutionTimeoutConfig {
+                lease_secs: 60,
+                idle_secs: 120,
+                hard_secs: 300,
+                recovery_max_wall_clock_secs: 900,
+            },
+        );
+
+        let policy = registry.policy_for_item_type(TurnItemType::CommandExecution);
+
+        assert_eq!(policy.max_wall_clock_secs, 900);
+    }
 
     fn test_tool_loop_config() -> ToolLoopConfig {
         ToolLoopConfig {

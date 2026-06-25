@@ -70,9 +70,9 @@ use crate::bootstrap::bootstrap as run_bootstrap;
 use crate::database::initialize as initialize_database;
 use crate::mcp_secrets::garbage_collection_orphan_mcp_secrets;
 use crate::memory_runtime::GatewayMemoryRuntime;
-use crate::message::MessageProcessor;
 use crate::message::now_timestamp_secs;
 use crate::message::{ContextBudget, SummaryConfig};
+use crate::message::{MessageProcessor, MessageProcessorResilienceConfig};
 use crate::secrets::GatewaySecrets;
 use crate::session::SessionManager;
 use crate::thread::ThreadManager;
@@ -449,6 +449,10 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         config.gateway.artifacts.clone(),
         task_runtime_config,
         thread_episodic_runtime_config_from_gateway_config(&config.gateway.thread_episodic),
+        MessageProcessorResilienceConfig {
+            command_execution_timeout: config.gateway.resilience.command_execution,
+            cli_runtime_command_heartbeat: config.gateway.cli_agent_runtime.command_heartbeat,
+        },
     );
     if let Some(cli_runtime_manager) = cli_runtime_manager {
         message_processor = message_processor.with_cli_runtime_manager(cli_runtime_manager);

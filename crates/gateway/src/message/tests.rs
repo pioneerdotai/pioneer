@@ -2177,6 +2177,7 @@ fn review_enabled_processor(
         pioneer_config::GatewayArtifactsConfig::default(),
         review_enabled_task_runtime_config(),
         crate::thread_episodic::ThreadEpisodicRuntimeConfig::default(),
+        super::MessageProcessorResilienceConfig::default(),
     ))
 }
 
@@ -15627,6 +15628,71 @@ async fn cli_runtime_request_response_renews_running_attempt_deadlines() {
             .iter()
             .all(|candidate| candidate.item_id != "codex-item-command"),
         "responding to human approval should renew running item deadlines instead of immediately timing out"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_active_command_heartbeat_renews_silent_command_deadlines() {
+    let (processor, _connection_id, _rx, workspace_id, crud_store, _cli_session) =
+        cli_runtime_approval_processor().await;
+    let now = chrono::Utc::now().timestamp();
+    crud_store
+        .materialize_item_started_with_attempt_deadlines(
+            ItemStartedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: "thread_cli_command_approval".to_owned(),
+                turn_id: "codex-turn-command".to_owned(),
+                item: command_execution_item("codex-item-command"),
+            },
+            now.saturating_sub(120),
+            TurnItemAttemptDeadlines {
+                lease_expires_at_unix: Some(now.saturating_sub(10)),
+                idle_deadline_at_unix: Some(now.saturating_sub(10)),
+                hard_deadline_at_unix: Some(now.saturating_add(6 * 60 * 60)),
+            },
+        )
+        .await
+        .expect("silent CLI command attempt should materialize");
+
+    let key = CLIAgentRuntimeSessionKey::new(
+        workspace_id.as_str(),
+        "codex",
+        "thread_cli_command_approval",
+    )
+    .expect("session key should build");
+    let binding = crud_store
+        .get_cli_runtime_turn_binding("codex-turn-command")
+        .await
+        .expect("turn binding should load")
+        .expect("turn binding should exist");
+    processor
+        .register_cli_runtime_command_item(
+            &key,
+            &binding,
+            "codex-item-command",
+            Some("codex-thread-command".to_owned()),
+            "codex-turn-command".to_owned(),
+        )
+        .await;
+
+    let heartbeat_now = now
+        .saturating_add(processor.cli_runtime_command_heartbeats.interval_secs())
+        .saturating_add(2);
+    assert_eq!(
+        processor
+            .heartbeat_due_cli_runtime_command_items(heartbeat_now)
+            .await,
+        1
+    );
+    let candidates = crud_store
+        .list_timeout_candidates(heartbeat_now, 64)
+        .await
+        .expect("timeout candidates should query after heartbeat");
+    assert!(
+        candidates
+            .iter()
+            .all(|candidate| candidate.item_id != "codex-item-command"),
+        "active CLI command heartbeat should renew silent command idle deadlines"
     );
 }
 

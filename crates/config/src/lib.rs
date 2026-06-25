@@ -67,6 +67,8 @@ pub struct GatewayConfig {
     pub hooks: GatewayHooksConfig,
     #[serde(default)]
     pub artifacts: GatewayArtifactsConfig,
+    #[serde(default)]
+    pub resilience: GatewayResilienceConfig,
     pub auth: GatewayAuthConfig,
 }
 
@@ -225,6 +227,70 @@ impl Default for GatewayArtifactsConfig {
             readable_copy_ttl_secs: default_gateway_artifacts_readable_copy_ttl_secs(),
             quota_warn_at_percent: default_gateway_artifacts_quota_warn_at_percent(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct GatewayResilienceConfig {
+    #[serde(default)]
+    pub command_execution: GatewayCommandExecutionTimeoutConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct GatewayCommandExecutionTimeoutConfig {
+    pub lease_secs: u64,
+    pub idle_secs: u64,
+    pub hard_secs: u64,
+    pub recovery_max_wall_clock_secs: u64,
+}
+
+impl Default for GatewayCommandExecutionTimeoutConfig {
+    fn default() -> Self {
+        Self {
+            lease_secs: default_command_execution_lease_timeout_secs(),
+            idle_secs: default_command_execution_idle_timeout_secs(),
+            hard_secs: default_command_execution_hard_timeout_secs(),
+            recovery_max_wall_clock_secs: default_command_execution_recovery_max_wall_clock_secs(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+struct GatewayCommandExecutionTimeoutConfigWire {
+    #[serde(default = "default_command_execution_lease_timeout_secs")]
+    lease_secs: u64,
+    #[serde(default = "default_command_execution_idle_timeout_secs")]
+    idle_secs: u64,
+    #[serde(default = "default_command_execution_hard_timeout_secs")]
+    hard_secs: u64,
+    #[serde(default = "default_command_execution_recovery_max_wall_clock_secs")]
+    recovery_max_wall_clock_secs: u64,
+}
+
+impl<'de> Deserialize<'de> for GatewayCommandExecutionTimeoutConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = GatewayCommandExecutionTimeoutConfigWire::deserialize(deserializer)?;
+        Ok(Self {
+            lease_secs: non_zero_or_default(
+                wire.lease_secs,
+                default_command_execution_lease_timeout_secs(),
+            ),
+            idle_secs: non_zero_or_default(
+                wire.idle_secs,
+                default_command_execution_idle_timeout_secs(),
+            ),
+            hard_secs: non_zero_or_default(
+                wire.hard_secs,
+                default_command_execution_hard_timeout_secs(),
+            ),
+            recovery_max_wall_clock_secs: non_zero_or_default(
+                wire.recovery_max_wall_clock_secs,
+                default_command_execution_recovery_max_wall_clock_secs(),
+            ),
+        })
     }
 }
 
@@ -635,6 +701,42 @@ pub struct GatewayCliAgentRuntimeConfig {
     pub stderr_ring_lines: usize,
     #[serde(default)]
     pub debug_native_events: bool,
+    #[serde(default)]
+    pub command_heartbeat: GatewayCliAgentRuntimeCommandHeartbeatConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct GatewayCliAgentRuntimeCommandHeartbeatConfig {
+    pub interval_secs: u64,
+}
+
+impl Default for GatewayCliAgentRuntimeCommandHeartbeatConfig {
+    fn default() -> Self {
+        Self {
+            interval_secs: default_cli_agent_runtime_command_heartbeat_interval_secs(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+struct GatewayCliAgentRuntimeCommandHeartbeatConfigWire {
+    #[serde(default = "default_cli_agent_runtime_command_heartbeat_interval_secs")]
+    interval_secs: u64,
+}
+
+impl<'de> Deserialize<'de> for GatewayCliAgentRuntimeCommandHeartbeatConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = GatewayCliAgentRuntimeCommandHeartbeatConfigWire::deserialize(deserializer)?;
+        Ok(Self {
+            interval_secs: non_zero_or_default(
+                wire.interval_secs,
+                default_cli_agent_runtime_command_heartbeat_interval_secs(),
+            ),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -818,6 +920,7 @@ impl Default for GatewayCliAgentRuntimeConfig {
             event_channel_capacity: default_cli_agent_runtime_event_channel_capacity(),
             stderr_ring_lines: default_cli_agent_runtime_stderr_ring_lines(),
             debug_native_events: false,
+            command_heartbeat: GatewayCliAgentRuntimeCommandHeartbeatConfig::default(),
         }
     }
 }
@@ -838,6 +941,8 @@ struct GatewayCliAgentRuntimeConfigWire {
     stderr_ring_lines: usize,
     #[serde(default)]
     debug_native_events: bool,
+    #[serde(default)]
+    command_heartbeat: GatewayCliAgentRuntimeCommandHeartbeatConfig,
 }
 
 impl<'de> Deserialize<'de> for GatewayCliAgentRuntimeConfig {
@@ -869,6 +974,7 @@ impl<'de> Deserialize<'de> for GatewayCliAgentRuntimeConfig {
                 default_cli_agent_runtime_stderr_ring_lines(),
             ),
             debug_native_events: wire.debug_native_events,
+            command_heartbeat: wire.command_heartbeat,
         })
     }
 }
@@ -1829,6 +1935,26 @@ const fn default_cli_agent_runtime_stderr_ring_lines() -> usize {
     200
 }
 
+const fn default_cli_agent_runtime_command_heartbeat_interval_secs() -> u64 {
+    60
+}
+
+const fn default_command_execution_lease_timeout_secs() -> u64 {
+    10 * 60
+}
+
+const fn default_command_execution_idle_timeout_secs() -> u64 {
+    30 * 60
+}
+
+const fn default_command_execution_hard_timeout_secs() -> u64 {
+    60 * 60
+}
+
+const fn default_command_execution_recovery_max_wall_clock_secs() -> u64 {
+    60 * 60
+}
+
 const fn non_zero_or_default(value: u64, default_value: u64) -> u64 {
     if value == 0 { default_value } else { value }
 }
@@ -2696,8 +2822,9 @@ fn user_config_directory_name() -> &'static str {
 mod tests {
     use super::{
         DEFAULT_CONFIG_TOML, GatewayCliAgentRuntimeConfig, GatewayCliAgentRuntimeKindConfig,
-        GatewayMemoryConfig, GatewayMemoryModelSelectionConfig, InstallManagedBy, InstallState,
-        load_config_from_sources, load_install_state, save_install_state,
+        GatewayMemoryConfig, GatewayMemoryModelSelectionConfig, GatewayResilienceConfig,
+        InstallManagedBy, InstallState, load_config_from_sources, load_install_state,
+        save_install_state,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -3074,6 +3201,9 @@ request_timeout_ms = 0
 event_channel_capacity = 0
 stderr_ring_lines = 0
 debug_native_events = true
+
+[command_heartbeat]
+interval_secs = 0
 "#,
         )
         .expect("cli agent runtime config should deserialize with normalized limits");
@@ -3085,6 +3215,26 @@ debug_native_events = true
         assert_eq!(config.event_channel_capacity, 2_048);
         assert_eq!(config.stderr_ring_lines, 200);
         assert!(config.debug_native_events);
+        assert_eq!(config.command_heartbeat.interval_secs, 60);
+    }
+
+    #[test]
+    fn gateway_resilience_config_normalizes_zero_command_execution_timeouts() {
+        let config = toml::from_str::<GatewayResilienceConfig>(
+            r#"
+[command_execution]
+lease_secs = 0
+idle_secs = 0
+hard_secs = 0
+recovery_max_wall_clock_secs = 0
+"#,
+        )
+        .expect("gateway resilience config should deserialize with normalized timeouts");
+
+        assert_eq!(config.command_execution.lease_secs, 600);
+        assert_eq!(config.command_execution.idle_secs, 1_800);
+        assert_eq!(config.command_execution.hard_secs, 3_600);
+        assert_eq!(config.command_execution.recovery_max_wall_clock_secs, 3_600);
     }
 
     #[test]

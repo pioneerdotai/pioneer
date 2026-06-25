@@ -50,7 +50,10 @@ use pioneer_artifacts::{
     ArtifactRegistrationContext, ArtifactRegistrationSource, ArtifactService, ArtifactToolState,
     BindArtifactRequest, LocalArtifactBlobStore,
 };
-use pioneer_config::{GatewayArtifactsConfig, GatewayHookRecoveryConfig};
+use pioneer_config::{
+    GatewayArtifactsConfig, GatewayCliAgentRuntimeCommandHeartbeatConfig,
+    GatewayCommandExecutionTimeoutConfig, GatewayHookRecoveryConfig,
+};
 use pioneer_crud::{
     CliRuntimePendingRequestRecord,
     CliRuntimePendingRequestStatus as StoredCliRuntimePendingRequestStatus, ConversationEntry,
@@ -147,7 +150,8 @@ use pioneer_cli_agent_runtime::event::RuntimeEvent;
 use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, warn};
 
-use crate::cli_runtime::manager::CLIAgentRuntimeManager;
+use crate::cli_runtime::command_heartbeat::CliRuntimeCommandHeartbeatTracker;
+use crate::cli_runtime::manager::{CLIAgentRuntimeManager, CLIAgentRuntimeSessionKey};
 use crate::mcp_service::McpService;
 use crate::memory_runtime::GatewayMemoryRuntime;
 use crate::resilience::{
@@ -171,6 +175,21 @@ where
 
 const RESILIENCE_WORKER_POLL_INTERVAL_SECONDS: u64 = 2;
 const RESILIENCE_WORKER_TRANSIENT_STORAGE_BACKOFF_SECONDS: u64 = 60;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MessageProcessorResilienceConfig {
+    pub command_execution_timeout: GatewayCommandExecutionTimeoutConfig,
+    pub cli_runtime_command_heartbeat: GatewayCliAgentRuntimeCommandHeartbeatConfig,
+}
+
+impl Default for MessageProcessorResilienceConfig {
+    fn default() -> Self {
+        Self {
+            command_execution_timeout: GatewayCommandExecutionTimeoutConfig::default(),
+            cli_runtime_command_heartbeat: GatewayCliAgentRuntimeCommandHeartbeatConfig::default(),
+        }
+    }
+}
 
 async fn retry_transient_storage_access<T, F, Fut>(operation: F) -> anyhow::Result<T>
 where
@@ -256,6 +275,7 @@ pub struct MessageProcessor {
     cli_runtime_pending_turn_server_requests:
         Arc<Mutex<HashMap<CLIRuntimePendingTurnEventKey, Vec<CLIRuntimePendingTurnServerRequest>>>>,
     cli_runtime_pending_turn_activity_sequence: Arc<AtomicU64>,
+    cli_runtime_command_heartbeats: CliRuntimeCommandHeartbeatTracker,
     turn_llm_context_sequences: Arc<Mutex<HashMap<String, i64>>>,
     artifact_tool_states: Arc<Mutex<HashMap<String, Arc<ArtifactToolState>>>>,
     artifact_output_dirs: Arc<Mutex<HashMap<String, String>>>,
@@ -354,6 +374,7 @@ impl MessageProcessor {
             artifacts_config,
             TaskRuntimeConfig::default(),
             ThreadEpisodicRuntimeConfig::default(),
+            MessageProcessorResilienceConfig::default(),
         )
     }
 
@@ -372,6 +393,7 @@ impl MessageProcessor {
         artifacts_config: GatewayArtifactsConfig,
         task_runtime_config: TaskRuntimeConfig,
         thread_episodic_runtime_config: ThreadEpisodicRuntimeConfig,
+        resilience_config: MessageProcessorResilienceConfig,
     ) -> Self {
         let now_snapshot = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         {
@@ -400,16 +422,24 @@ impl MessageProcessor {
         ));
         let timeout_supervisor = Arc::new(TimeoutSupervisor::new(
             crud_store.clone(),
-            TimeoutPolicyRegistry::with_provider_timeout_policy(
+            TimeoutPolicyRegistry::with_provider_and_command_execution_timeout_policy(
                 normalized_tool_loop_config.provider,
+                resilience_config.command_execution_timeout,
             ),
         ));
         let recovery_coordinator = Arc::new(RecoveryCoordinator::new(
             crud_store.clone(),
             agent_manager.clone(),
             provider_registry.clone(),
-            RecoveryPolicyRegistry::default(),
+            RecoveryPolicyRegistry::with_command_execution_timeout_config(
+                resilience_config.command_execution_timeout,
+            ),
         ));
+        let cli_runtime_command_heartbeats = CliRuntimeCommandHeartbeatTracker::new(
+            resilience_config
+                .cli_runtime_command_heartbeat
+                .interval_secs,
+        );
         let artifact_service = Arc::new(ArtifactService::new_with_policies(
             crud_store.clone(),
             Arc::new(LocalArtifactBlobStore::new(runtime_home.clone())),
@@ -465,6 +495,7 @@ impl MessageProcessor {
             cli_runtime_pending_turn_events: Arc::new(Mutex::new(HashMap::new())),
             cli_runtime_pending_turn_server_requests: Arc::new(Mutex::new(HashMap::new())),
             cli_runtime_pending_turn_activity_sequence: Arc::new(AtomicU64::new(0)),
+            cli_runtime_command_heartbeats,
             turn_llm_context_sequences: Arc::new(Mutex::new(HashMap::new())),
             artifact_tool_states: Arc::new(Mutex::new(HashMap::new())),
             artifact_output_dirs: Arc::new(Mutex::new(HashMap::new())),
@@ -987,12 +1018,121 @@ impl MessageProcessor {
 
                 this.fail_stale_cli_runtime_turns(now_timestamp_millis())
                     .await;
+                this.heartbeat_due_cli_runtime_command_items(now).await;
 
                 sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)).await;
             }
         });
 
         *guard = Some(handle);
+    }
+
+    async fn update_cli_runtime_command_item_registry(
+        &self,
+        key: &CLIAgentRuntimeSessionKey,
+        turn_binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+        event: &RuntimeEvent,
+    ) {
+        self.cli_runtime_command_heartbeats
+            .update_from_runtime_event(key, turn_binding, event, now_timestamp_secs())
+            .await;
+    }
+
+    #[cfg(test)]
+    async fn register_cli_runtime_command_item(
+        &self,
+        key: &CLIAgentRuntimeSessionKey,
+        turn_binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+        item_id: &str,
+        native_thread_id: Option<String>,
+        native_turn_id: String,
+    ) {
+        self.cli_runtime_command_heartbeats
+            .register(
+                key,
+                turn_binding,
+                item_id,
+                native_thread_id,
+                native_turn_id,
+                now_timestamp_secs(),
+            )
+            .await;
+    }
+
+    async fn remove_cli_runtime_command_items_for_session(&self, key: &CLIAgentRuntimeSessionKey) {
+        self.cli_runtime_command_heartbeats
+            .remove_session(key)
+            .await;
+    }
+
+    async fn heartbeat_due_cli_runtime_command_items(&self, now_unix: i64) -> usize {
+        let due = self
+            .cli_runtime_command_heartbeats
+            .due_items(now_unix)
+            .await;
+        let mut heartbeated = 0usize;
+        for item in due {
+            let key = item.key.clone();
+            let active_binding = match self
+                .crud_store
+                .get_cli_runtime_turn_binding(key.turn_id.as_str())
+                .await
+            {
+                Ok(Some(binding)) => item.matches_active_turn_binding(&binding),
+                Ok(None) => false,
+                Err(error) => {
+                    warn!(
+                        workspace_id = key.workspace_id.as_str(),
+                        runtime_id = key.runtime_id.as_str(),
+                        thread_id = key.thread_id.as_str(),
+                        turn_id = key.turn_id.as_str(),
+                        item_id = key.item_id.as_str(),
+                        error = %format!("{error:#}"),
+                        "failed to validate CLI runtime command heartbeat binding"
+                    );
+                    self.cli_runtime_command_heartbeats
+                        .mark_attempt_failed(&key, now_unix)
+                        .await;
+                    continue;
+                }
+            };
+
+            if !active_binding {
+                self.cli_runtime_command_heartbeats.remove_key(&key).await;
+                continue;
+            }
+
+            if let Err(error) = self
+                .timeout_supervisor
+                .heartbeat_item_attempt(
+                    key.turn_id.as_str(),
+                    key.item_id.as_str(),
+                    TurnItemType::CommandExecution,
+                    now_unix,
+                )
+                .await
+            {
+                warn!(
+                    workspace_id = key.workspace_id.as_str(),
+                    runtime_id = key.runtime_id.as_str(),
+                    thread_id = key.thread_id.as_str(),
+                    turn_id = key.turn_id.as_str(),
+                    item_id = key.item_id.as_str(),
+                    error = %format!("{error:#}"),
+                    "failed to heartbeat active CLI runtime command item"
+                );
+                self.cli_runtime_command_heartbeats
+                    .mark_attempt_failed(&key, now_unix)
+                    .await;
+                continue;
+            }
+            self.cli_runtime_command_heartbeats
+                .mark_heartbeat_succeeded(&key, now_unix)
+                .await;
+            heartbeated = heartbeated.saturating_add(1);
+        }
+
+        heartbeated
     }
 
     pub async fn start_hook_recovery_worker(self: &Arc<Self>) {
@@ -1770,6 +1910,11 @@ impl MessageProcessor {
             cli_runtime_pending_turn_events: Arc::new(Mutex::new(HashMap::new())),
             cli_runtime_pending_turn_server_requests: Arc::new(Mutex::new(HashMap::new())),
             cli_runtime_pending_turn_activity_sequence: Arc::new(AtomicU64::new(0)),
+            cli_runtime_command_heartbeats: CliRuntimeCommandHeartbeatTracker::new(
+                MessageProcessorResilienceConfig::default()
+                    .cli_runtime_command_heartbeat
+                    .interval_secs,
+            ),
             turn_llm_context_sequences: Arc::new(Mutex::new(HashMap::new())),
             artifact_tool_states: Arc::new(Mutex::new(HashMap::new())),
             artifact_output_dirs: Arc::new(Mutex::new(HashMap::new())),

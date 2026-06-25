@@ -40,6 +40,12 @@ output_dir_ttl_secs = 86400
 readable_copy_ttl_secs = 86400
 quota_warn_at_percent = 80
 
+[gateway.resilience.command_execution]
+lease_secs = 600
+idle_secs = 1800
+hard_secs = 3600
+recovery_max_wall_clock_secs = 3600
+
 [gateway.tasks.review]
 enabled = true
 allow_task_create_review_policy = false
@@ -177,6 +183,9 @@ request_timeout_ms = 120000
 event_channel_capacity = 2048
 stderr_ring_lines = 200
 debug_native_events = false
+
+[gateway.cli_agent_runtime.command_heartbeat]
+interval_secs = 60
 
 [gateway.remote_access]
 runtime_dir = "remote-access"

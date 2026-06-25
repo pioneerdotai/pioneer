@@ -2663,6 +2663,7 @@ model = "legacy-model"
             thread_episodic: GatewayThreadEpisodicConfig::default(),
             hooks: Default::default(),
             artifacts: GatewayArtifactsConfig::default(),
+            resilience: Default::default(),
             auth: GatewayAuthConfig {
                 jwt_issuer: "pioneer".to_owned(),
                 jwt_audience: "pioneer-clients".to_owned(),

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use pioneer_config::GatewayCommandExecutionTimeoutConfig;
 use pioneer_crud::{CrudStore, TimeoutCandidate, TurnItemAttemptDeadlines};
 use pioneer_protocol::{TurnItem, TurnItemType};
 use pioneer_provider::ProviderTimeoutPolicy;
@@ -22,6 +23,16 @@ impl TimeoutPolicy {
             saturating_add_secs(now_unix, self.idle_secs),
             saturating_add_secs(now_unix, self.hard_secs),
         )
+    }
+}
+
+impl From<GatewayCommandExecutionTimeoutConfig> for TimeoutPolicy {
+    fn from(config: GatewayCommandExecutionTimeoutConfig) -> Self {
+        Self {
+            lease_secs: config.lease_secs,
+            idle_secs: config.idle_secs,
+            hard_secs: config.hard_secs,
+        }
     }
 }
 
@@ -68,11 +79,7 @@ impl Default for TimeoutPolicyRegistry {
         );
         by_item_type.insert(
             CommandExecution,
-            TimeoutPolicy {
-                lease_secs: 120,
-                idle_secs: 90,
-                hard_secs: 10 * 60,
-            },
+            TimeoutPolicy::from(GatewayCommandExecutionTimeoutConfig::default()),
         );
         by_item_type.insert(
             FileChange,
@@ -119,10 +126,25 @@ impl Default for TimeoutPolicyRegistry {
 }
 
 impl TimeoutPolicyRegistry {
+    #[cfg(test)]
     pub fn with_provider_timeout_policy(provider_policy: ProviderTimeoutPolicy) -> Self {
+        Self::with_provider_and_command_execution_timeout_policy(
+            provider_policy,
+            GatewayCommandExecutionTimeoutConfig::default(),
+        )
+    }
+
+    pub fn with_provider_and_command_execution_timeout_policy(
+        provider_policy: ProviderTimeoutPolicy,
+        command_execution_config: GatewayCommandExecutionTimeoutConfig,
+    ) -> Self {
         use TurnItemType::{AgentMessage, Reasoning};
 
         let mut registry = Self::default();
+        registry.by_item_type.insert(
+            TurnItemType::CommandExecution,
+            TimeoutPolicy::from(command_execution_config),
+        );
         let provider_idle_secs = provider_policy
             .first_chunk_timeout
             .as_secs()
@@ -381,6 +403,20 @@ mod tests {
 
         assert_eq!(reasoning.idle_secs, 75);
         assert_eq!(reasoning.hard_secs, 1020);
+    }
+
+    #[test]
+    fn command_execution_defaults_allow_hour_long_shell_commands() {
+        let registry = TimeoutPolicyRegistry::default();
+        let policy = registry.policy_for(TurnItemType::CommandExecution);
+        let (lease_expires_at, idle_deadline_at, hard_deadline_at) = policy.deadlines(1_000);
+
+        assert_eq!(policy.lease_secs, 10 * 60);
+        assert_eq!(policy.idle_secs, 30 * 60);
+        assert_eq!(policy.hard_secs, 60 * 60);
+        assert_eq!(lease_expires_at, 1_600);
+        assert_eq!(idle_deadline_at, 2_800);
+        assert_eq!(hard_deadline_at, 4_600);
     }
 
     #[test]

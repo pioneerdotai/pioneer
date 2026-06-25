@@ -434,6 +434,7 @@ mod tests {
                 thread_episodic: Default::default(),
                 hooks: Default::default(),
                 artifacts: GatewayArtifactsConfig::default(),
+                resilience: Default::default(),
                 auth: GatewayAuthConfig {
                     jwt_issuer: "pioneer".to_owned(),
                     jwt_audience: "pioneer-clients".to_owned(),
