@@ -6286,21 +6286,12 @@ async fn task_revise_rpc_rejects_candidate_and_dispatches_same_thread_revision()
 
 #[test]
 fn task_revise_dispatch_failure_blocks_revision_turn_and_run() {
-    std::thread::Builder::new()
-        .name("task_revision_dispatch_blocked_test".to_owned())
-        .stack_size(16 * 1024 * 1024)
-        .spawn(|| {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .thread_stack_size(16 * 1024 * 1024)
-                .enable_all()
-                .build()
-                .expect("test runtime should build");
-            runtime.block_on(task_revise_dispatch_failure_blocks_revision_turn_and_run_impl());
-        })
-        .expect("test thread should spawn")
-        .join()
-        .expect("test thread should complete");
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("test runtime should build")
+        .block_on(task_revise_dispatch_failure_blocks_revision_turn_and_run_impl());
 }
 
 async fn task_revise_dispatch_failure_blocks_revision_turn_and_run_impl() {
@@ -18284,7 +18275,6 @@ where
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_name(name)
-        .thread_stack_size(8 * 1024 * 1024)
         .enable_all()
         .build()
         .expect("test runtime should build")

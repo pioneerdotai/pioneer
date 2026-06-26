@@ -32,247 +32,186 @@ fn cli_runtime_execution_disabled_message() -> String {
 }
 
 impl MessageProcessor {
-    pub(super) async fn turn_start(
-        &self,
+    pub(super) fn turn_start<'a>(
+        &'a self,
         connection_id: ConnectionId,
         request_id: RequestId,
         params: TurnStartParams,
-    ) {
-        if params.thread_id.trim().is_empty() {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_PARAMS_CODE,
-                    format!(
-                        "invalid params for `{}`: `thread_id` is required",
-                        methods::TURN_START
+    ) -> MessageFuture<'a, ()> {
+        message_future(async move {
+            if params.thread_id.trim().is_empty() {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_PARAMS_CODE,
+                        format!(
+                            "invalid params for `{}`: `thread_id` is required",
+                            methods::TURN_START
+                        ),
                     ),
-                ),
-            )
-            .await;
-            return;
-        }
+                )
+                .await;
+                return;
+            }
 
-        if params.turn_id.trim().is_empty() {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_PARAMS_CODE,
-                    format!(
-                        "invalid params for `{}`: `turn_id` is required",
-                        methods::TURN_START
+            if params.turn_id.trim().is_empty() {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_PARAMS_CODE,
+                        format!(
+                            "invalid params for `{}`: `turn_id` is required",
+                            methods::TURN_START
+                        ),
                     ),
-                ),
-            )
-            .await;
-            return;
-        }
-        let requested_reasoning_effort = requested_reasoning_effort(&params);
-        if let Some(effort) = requested_reasoning_effort.as_deref() {
-            debug!(
-                effort,
-                turn_id = params.turn_id.as_str(),
-                thread_id = params.thread_id.as_str(),
-                "turn/start requested reasoning effort"
-            );
-        }
-        if let Some(backend) = params.execution_backend.clone() {
-            match backend {
-                AgentExecutionBackend::CLIAgentRuntime {
-                    runtime_id,
-                    runtime_kind,
-                } => {
-                    self.turn_start_cli_runtime(
-                        connection_id,
-                        request_id,
-                        params,
+                )
+                .await;
+                return;
+            }
+            let requested_reasoning_effort = requested_reasoning_effort(&params);
+            if let Some(effort) = requested_reasoning_effort.as_deref() {
+                debug!(
+                    effort,
+                    turn_id = params.turn_id.as_str(),
+                    thread_id = params.thread_id.as_str(),
+                    "turn/start requested reasoning effort"
+                );
+            }
+            if let Some(backend) = params.execution_backend.clone() {
+                match backend {
+                    AgentExecutionBackend::CLIAgentRuntime {
                         runtime_id,
                         runtime_kind,
-                    )
-                    .await;
-                    return;
+                    } => {
+                        self.turn_start_cli_runtime(
+                            connection_id,
+                            request_id,
+                            params,
+                            runtime_id,
+                            runtime_kind,
+                        )
+                        .await;
+                        return;
+                    }
+                    AgentExecutionBackend::ACPAgentRuntime { runtime_id } => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request_id),
+                                INVALID_REQUEST_CODE,
+                                format!("ACP agent runtime `{runtime_id}` is not supported yet"),
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                    AgentExecutionBackend::ApiProvider { .. } => {}
                 }
-                AgentExecutionBackend::ACPAgentRuntime { runtime_id } => {
+            }
+
+            let outcome = match self.thread_manager.turn_start(connection_id, params).await {
+                Ok(outcome) => outcome,
+                Err(error) => {
                     self.send_error(
                         connection_id,
                         JsonRpcErrorResponse::new(
                             Some(request_id),
                             INVALID_REQUEST_CODE,
-                            format!("ACP agent runtime `{runtime_id}` is not supported yet"),
+                            format!("failed to start turn: {error:#}"),
                         ),
                     )
                     .await;
                     return;
                 }
-                AgentExecutionBackend::ApiProvider { .. } => {}
+            };
+            if let Err(message) = self
+                .validate_turn_reasoning_effort(
+                    outcome.started_notification.workspace_id.as_str(),
+                    ReasoningModelLookupBackend::ApiProvider {
+                        provider: outcome.materialization.thread.model_provider.as_str(),
+                    },
+                    outcome.materialization.thread.model.as_str(),
+                    requested_reasoning_effort.as_deref(),
+                )
+                .await
+            {
+                self.thread_manager
+                    .rollback_turn_start(outcome.rollback_context.clone())
+                    .await;
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
+                )
+                .await;
+                return;
             }
-        }
-
-        let outcome = match self.thread_manager.turn_start(connection_id, params).await {
-            Ok(outcome) => outcome,
-            Err(error) => {
+            let effective_reasoning_effort = requested_reasoning_effort
+                .as_deref()
+                .map(normalized_reasoning_effort_for_comparison);
+            if let Err(error) = self
+                .validate_artifact_user_inputs(
+                    outcome.started_notification.workspace_id.as_str(),
+                    outcome.materialization.input.as_slice(),
+                )
+                .await
+            {
+                self.thread_manager
+                    .rollback_turn_start(outcome.rollback_context.clone())
+                    .await;
                 self.send_error(
                     connection_id,
                     JsonRpcErrorResponse::new(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
-                        format!("failed to start turn: {error:#}"),
+                        format!("failed to validate artifact input: {error:#}"),
                     ),
                 )
                 .await;
                 return;
             }
-        };
-        if let Err(message) = self
-            .validate_turn_reasoning_effort(
-                outcome.started_notification.workspace_id.as_str(),
-                ReasoningModelLookupBackend::ApiProvider {
-                    provider: outcome.materialization.thread.model_provider.as_str(),
-                },
-                outcome.materialization.thread.model.as_str(),
-                requested_reasoning_effort.as_deref(),
+            if let Err(error) = message_future(
+                self.crud_store
+                    .materialize_turn_start_with_reasoning_effort(
+                        &outcome.materialization.thread,
+                        outcome.materialization.sandbox_mode,
+                        &outcome.materialization.turn,
+                        &outcome.materialization.input,
+                        effective_reasoning_effort.as_deref(),
+                    ),
             )
             .await
-        {
-            self.thread_manager
-                .rollback_turn_start(outcome.rollback_context.clone())
-                .await;
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
-            )
-            .await;
-            return;
-        }
-        let effective_reasoning_effort = requested_reasoning_effort
-            .as_deref()
-            .map(normalized_reasoning_effort_for_comparison);
-        if let Err(error) = self
-            .validate_artifact_user_inputs(
-                outcome.started_notification.workspace_id.as_str(),
-                outcome.materialization.input.as_slice(),
-            )
-            .await
-        {
-            self.thread_manager
-                .rollback_turn_start(outcome.rollback_context.clone())
-                .await;
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    format!("failed to validate artifact input: {error:#}"),
-                ),
-            )
-            .await;
-            return;
-        }
-        if let Err(error) = message_future(
-            self.crud_store
-                .materialize_turn_start_with_reasoning_effort(
-                    &outcome.materialization.thread,
-                    outcome.materialization.sandbox_mode,
-                    &outcome.materialization.turn,
-                    &outcome.materialization.input,
-                    effective_reasoning_effort.as_deref(),
-                ),
-        )
-        .await
-        {
-            self.thread_manager
-                .rollback_turn_start(outcome.rollback_context.clone())
-                .await;
+            {
+                self.thread_manager
+                    .rollback_turn_start(outcome.rollback_context.clone())
+                    .await;
 
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    format!("failed to persist turn/start state: {error:#}"),
-                ),
-            )
-            .await;
-            return;
-        }
-        self.ensure_hook_runtime_with_run_store().await;
-        if let Err(error) = self
-            .agent_manager
-            .ensure_thread(
-                outcome.started_notification.thread_id.as_str(),
-                outcome.started_notification.workspace_id.as_str(),
-            )
-            .await
-        {
-            self.report_turn_failure(
-                outcome.started_notification.thread_id.clone(),
-                outcome.started_notification.turn.id.clone(),
-                TurnFailureRecoveryKind::TurnStart,
-                format!("failed to prepare agent thread runtime: {error}"),
-            )
-            .await;
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to persist turn/start state: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+            self.ensure_hook_runtime_with_run_store().await;
+            if let Err(error) = self
+                .agent_manager
+                .ensure_thread(
+                    outcome.started_notification.thread_id.as_str(),
+                    outcome.started_notification.workspace_id.as_str(),
+                )
+                .await
+            {
+                self.report_turn_failure(
+                    outcome.started_notification.thread_id.clone(),
+                    outcome.started_notification.turn.id.clone(),
+                    TurnFailureRecoveryKind::TurnStart,
                     format!("failed to prepare agent thread runtime: {error}"),
-                ),
-            )
-            .await;
-            return;
-        }
-        self.ensure_agent_listener_task(outcome.started_notification.thread_id.as_str())
-            .await;
-        let history = self
-            .load_conversation_history_for_workspace(
-                outcome.started_notification.workspace_id.as_str(),
-                outcome.started_notification.thread_id.as_str(),
-                outcome.started_notification.turn.id.as_str(),
-            )
-            .await;
-        let workspace_skill_policies = match self
-            .crud_store
-            .list_workspace_skill_policies(outcome.started_notification.workspace_id.as_str())
-            .await
-        {
-            Ok(records) => records
-                .into_iter()
-                .map(|record| {
-                    (
-                        pioneer_skills::SkillPolicyKey::new(record.skill_slug, record.source_kind),
-                        pioneer_agent::WorkspaceSkillPolicy {
-                            enabled: record.enabled,
-                            allow_implicit_invocation: record.allow_implicit_invocation,
-                        },
-                    )
-                })
-                .collect::<std::collections::HashMap<_, _>>(),
-            Err(error) => {
-                warn!(
-                    workspace_id = outcome.started_notification.workspace_id,
-                    error = %format!("{error:#}"),
-                    "failed to load workspace skill policies; continuing with defaults"
-                );
-                std::collections::HashMap::new()
-            }
-        };
-        let resolved_artifacts = match self
-            .resolve_provider_artifact_inputs(
-                outcome.started_notification.workspace_id.as_str(),
-                outcome.materialization.input.as_slice(),
-            )
-            .await
-        {
-            Ok(resolved_artifacts) => resolved_artifacts,
-            Err(error) => {
-                self.report_turn_failure(
-                    outcome.started_notification.thread_id.clone(),
-                    outcome.started_notification.turn.id.clone(),
-                    TurnFailureRecoveryKind::TurnStart,
-                    format!("failed to resolve artifact input for provider: {error:#}"),
                 )
                 .await;
                 self.send_error(
@@ -280,28 +219,132 @@ impl MessageProcessor {
                     JsonRpcErrorResponse::new(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
+                        format!("failed to prepare agent thread runtime: {error}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+            self.ensure_agent_listener_task(outcome.started_notification.thread_id.as_str())
+                .await;
+            let history = self
+                .load_conversation_history_for_workspace(
+                    outcome.started_notification.workspace_id.as_str(),
+                    outcome.started_notification.thread_id.as_str(),
+                    outcome.started_notification.turn.id.as_str(),
+                )
+                .await;
+            let workspace_skill_policies = match self
+                .crud_store
+                .list_workspace_skill_policies(outcome.started_notification.workspace_id.as_str())
+                .await
+            {
+                Ok(records) => records
+                    .into_iter()
+                    .map(|record| {
+                        (
+                            pioneer_skills::SkillPolicyKey::new(
+                                record.skill_slug,
+                                record.source_kind,
+                            ),
+                            pioneer_agent::WorkspaceSkillPolicy {
+                                enabled: record.enabled,
+                                allow_implicit_invocation: record.allow_implicit_invocation,
+                            },
+                        )
+                    })
+                    .collect::<std::collections::HashMap<_, _>>(),
+                Err(error) => {
+                    warn!(
+                        workspace_id = outcome.started_notification.workspace_id,
+                        error = %format!("{error:#}"),
+                        "failed to load workspace skill policies; continuing with defaults"
+                    );
+                    std::collections::HashMap::new()
+                }
+            };
+            let resolved_artifacts = match self
+                .resolve_provider_artifact_inputs(
+                    outcome.started_notification.workspace_id.as_str(),
+                    outcome.materialization.input.as_slice(),
+                )
+                .await
+            {
+                Ok(resolved_artifacts) => resolved_artifacts,
+                Err(error) => {
+                    self.report_turn_failure(
+                        outcome.started_notification.thread_id.clone(),
+                        outcome.started_notification.turn.id.clone(),
+                        TurnFailureRecoveryKind::TurnStart,
                         format!("failed to resolve artifact input for provider: {error:#}"),
-                    ),
+                    )
+                    .await;
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!("failed to resolve artifact input for provider: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let runtime_environment = match self
+                .create_artifact_output_environment(
+                    outcome.started_notification.workspace_id.as_str(),
+                    outcome.started_notification.thread_id.as_str(),
+                    outcome.started_notification.turn.id.as_str(),
                 )
-                .await;
-                return;
-            }
-        };
-        let runtime_environment = match self
-            .create_artifact_output_environment(
-                outcome.started_notification.workspace_id.as_str(),
-                outcome.started_notification.thread_id.as_str(),
-                outcome.started_notification.turn.id.as_str(),
-            )
-            .await
-        {
-            Ok(runtime_environment) => runtime_environment.into_iter().collect(),
-            Err(error) => {
+                .await
+            {
+                Ok(runtime_environment) => runtime_environment.into_iter().collect(),
+                Err(error) => {
+                    self.report_turn_failure(
+                        outcome.started_notification.thread_id.clone(),
+                        outcome.started_notification.turn.id.clone(),
+                        TurnFailureRecoveryKind::TurnStart,
+                        format!("failed to prepare artifact output directory: {error:#}"),
+                    )
+                    .await;
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!("failed to prepare artifact output directory: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let hook_runtime_context = pioneer_agent::AgentTurnHookRuntimeContext::default();
+            if let Err(error) = self
+                .persist_turn_runtime_snapshot(
+                    outcome.started_notification.thread_id.as_str(),
+                    outcome.started_notification.workspace_id.as_str(),
+                    outcome.started_notification.turn.id.as_str(),
+                    outcome.materialization.thread.mode,
+                    &hook_runtime_context,
+                    &outcome.materialization.thread.model,
+                    &outcome.materialization.thread.model_provider,
+                    effective_reasoning_effort.as_deref(),
+                    &workspace_skill_policies,
+                    outcome.materialization.input.as_slice(),
+                    outcome.materialization.capabilities.as_slice(),
+                    resolved_artifacts.as_slice(),
+                    &runtime_environment,
+                    history.as_slice(),
+                )
+                .await
+            {
                 self.report_turn_failure(
                     outcome.started_notification.thread_id.clone(),
                     outcome.started_notification.turn.id.clone(),
                     TurnFailureRecoveryKind::TurnStart,
-                    format!("failed to prepare artifact output directory: {error:#}"),
+                    format!("failed to persist turn runtime snapshot: {error:#}"),
                 )
                 .await;
                 self.send_error(
@@ -309,115 +352,78 @@ impl MessageProcessor {
                     JsonRpcErrorResponse::new(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
-                        format!("failed to prepare artifact output directory: {error:#}"),
+                        format!("failed to persist turn runtime snapshot: {error:#}"),
                     ),
                 )
                 .await;
                 return;
             }
-        };
-        let hook_runtime_context = pioneer_agent::AgentTurnHookRuntimeContext::default();
-        if let Err(error) = self
-            .persist_turn_runtime_snapshot(
-                outcome.started_notification.thread_id.as_str(),
-                outcome.started_notification.workspace_id.as_str(),
-                outcome.started_notification.turn.id.as_str(),
-                outcome.materialization.thread.mode,
-                &hook_runtime_context,
-                &outcome.materialization.thread.model,
-                &outcome.materialization.thread.model_provider,
-                effective_reasoning_effort.as_deref(),
-                &workspace_skill_policies,
-                outcome.materialization.input.as_slice(),
-                outcome.materialization.capabilities.as_slice(),
-                resolved_artifacts.as_slice(),
-                &runtime_environment,
-                history.as_slice(),
-            )
-            .await
-        {
-            self.report_turn_failure(
-                outcome.started_notification.thread_id.clone(),
-                outcome.started_notification.turn.id.clone(),
-                TurnFailureRecoveryKind::TurnStart,
-                format!("failed to persist turn runtime snapshot: {error:#}"),
-            )
-            .await;
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    format!("failed to persist turn runtime snapshot: {error:#}"),
-                ),
-            )
-            .await;
-            return;
-        }
-        if let Err(error) = self
-            .agent_manager
-            .start_turn_with_resolved_artifacts_environment_and_reasoning(
-                outcome.started_notification.thread_id.as_str(),
-                outcome.started_notification.turn.id.as_str(),
-                outcome.materialization.thread.mode,
-                &outcome.materialization.thread.model,
-                &outcome.materialization.thread.model_provider,
-                workspace_skill_policies,
-                outcome.materialization.input.clone(),
-                outcome.materialization.capabilities.clone(),
-                resolved_artifacts,
-                runtime_environment,
-                history,
-                effective_reasoning_effort.as_deref(),
-            )
-            .await
-        {
-            self.report_turn_failure(
-                outcome.started_notification.thread_id.clone(),
-                outcome.started_notification.turn.id.clone(),
-                TurnFailureRecoveryKind::TurnDispatch,
-                format!("failed to dispatch turn to agent runtime: {error}"),
-            )
-            .await;
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    format!("failed to dispatch turn: {error}"),
-                ),
-            )
-            .await;
-            return;
-        }
+            if let Err(error) = self
+                .agent_manager
+                .start_turn_with_resolved_artifacts_environment_and_reasoning(
+                    outcome.started_notification.thread_id.as_str(),
+                    outcome.started_notification.turn.id.as_str(),
+                    outcome.materialization.thread.mode,
+                    &outcome.materialization.thread.model,
+                    &outcome.materialization.thread.model_provider,
+                    workspace_skill_policies,
+                    outcome.materialization.input.clone(),
+                    outcome.materialization.capabilities.clone(),
+                    resolved_artifacts,
+                    runtime_environment,
+                    history,
+                    effective_reasoning_effort.as_deref(),
+                )
+                .await
+            {
+                self.report_turn_failure(
+                    outcome.started_notification.thread_id.clone(),
+                    outcome.started_notification.turn.id.clone(),
+                    TurnFailureRecoveryKind::TurnDispatch,
+                    format!("failed to dispatch turn to agent runtime: {error}"),
+                )
+                .await;
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to dispatch turn: {error}"),
+                    ),
+                )
+                .await;
+                return;
+            }
 
-        self.finish_turn_start_success(connection_id, request_id, &outcome)
-            .await;
+            self.finish_turn_start_success(connection_id, request_id, &outcome)
+                .await;
+        })
     }
 
-    async fn turn_start_cli_runtime(
-        &self,
+    fn turn_start_cli_runtime<'a>(
+        &'a self,
         connection_id: ConnectionId,
         request_id: RequestId,
         mut params: TurnStartParams,
         runtime_id: String,
         runtime_kind: CLIAgentRuntimeKind,
-    ) {
-        let Some(runtime_config) = self
-            .validate_cli_runtime_turn_start_backend(
-                connection_id,
-                request_id.clone(),
-                runtime_id.as_str(),
-                runtime_kind,
-            )
-            .await
-        else {
-            return;
-        };
-        params.model_provider = Some(cli_runtime_provider_key(runtime_id.as_str()));
+    ) -> MessageFuture<'a, ()> {
+        message_future(async move {
+            let Some(runtime_config) = self
+                .validate_cli_runtime_turn_start_backend(
+                    connection_id,
+                    request_id.clone(),
+                    runtime_id.as_str(),
+                    runtime_kind,
+                )
+                .await
+            else {
+                return;
+            };
+            params.model_provider = Some(cli_runtime_provider_key(runtime_id.as_str()));
 
-        if !params.capabilities.is_empty() {
-            self.send_error(
+            if !params.capabilities.is_empty() {
+                self.send_error(
                 connection_id,
                 JsonRpcErrorResponse::new(
                     Some(request_id),
@@ -426,14 +432,14 @@ impl MessageProcessor {
                 ),
             )
             .await;
-            return;
-        }
-        if let Some(input_kind) = params
-            .input
-            .iter()
-            .find_map(cli_runtime_forbidden_input_kind)
-        {
-            self.send_error(
+                return;
+            }
+            if let Some(input_kind) = params
+                .input
+                .iter()
+                .find_map(cli_runtime_forbidden_input_kind)
+            {
+                self.send_error(
                 connection_id,
                 JsonRpcErrorResponse::new(
                     Some(request_id),
@@ -444,183 +450,238 @@ impl MessageProcessor {
                 ),
             )
             .await;
-            return;
-        }
+                return;
+            }
 
-        let Some(thread) = self
-            .thread_manager
-            .thread_get(params.thread_id.trim())
-            .await
-        else {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    format!("thread `{}` is not loaded", params.thread_id.trim()),
-                ),
-            )
-            .await;
-            return;
-        };
-        let Some(manager) = self.cli_runtime_manager.as_ref() else {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    "CLI runtime manager is not available for turn start".to_owned(),
-                ),
-            )
-            .await;
-            return;
-        };
-        let session_key = match crate::cli_runtime::manager::CLIAgentRuntimeSessionKey::new(
-            thread.workspace_id.as_str(),
-            runtime_id.as_str(),
-            thread.id.as_str(),
-        ) {
-            Ok(session_key) => session_key,
-            Err(error) => {
+            let Some(thread) = self
+                .thread_manager
+                .thread_get(params.thread_id.trim())
+                .await
+            else {
                 self.send_error(
                     connection_id,
                     JsonRpcErrorResponse::new(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
-                        format!("invalid CLI runtime session key: {error:#}"),
+                        format!("thread `{}` is not loaded", params.thread_id.trim()),
                     ),
                 )
                 .await;
                 return;
-            }
-        };
-        match self
-            .cli_runtime_turn_start_blocker_for_thread(&session_key)
-            .await
-        {
-            Ok(Some(message)) => {
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
-                )
-                .await;
-                return;
-            }
-            Ok(None) => {}
-            Err(error) => {
+            };
+            let Some(manager) = self.cli_runtime_manager.as_ref() else {
                 self.send_error(
                     connection_id,
                     JsonRpcErrorResponse::new(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
-                        format!("failed to check active CLI runtime turns: {error:#}"),
+                        "CLI runtime manager is not available for turn start".to_owned(),
                     ),
                 )
                 .await;
                 return;
-            }
-        }
-        if let Err(error) = self
-            .validate_artifact_user_inputs(thread.workspace_id.as_str(), params.input.as_slice())
-            .await
-        {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    format!("failed to validate CLI runtime artifact input: {error:#}"),
-                ),
-            )
-            .await;
-            return;
-        }
-        let resolved_artifacts = match self
-            .resolve_provider_artifact_inputs(thread.workspace_id.as_str(), params.input.as_slice())
-            .await
-        {
-            Ok(resolved_artifacts) => resolved_artifacts,
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to materialize CLI runtime artifact input: {error:#}"),
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
-        let mut input_mapping = match match runtime_kind {
-            CLIAgentRuntimeKind::Codex => {
-                crate::cli_runtime::input_mapping::map_codex_turn_input_from_pioneer(
-                    params.input.as_slice(),
-                    resolved_artifacts.as_slice(),
-                )
-            }
-            CLIAgentRuntimeKind::Claude => {
-                crate::cli_runtime::input_mapping::map_claude_turn_input_from_pioneer(
-                    params.input.as_slice(),
-                    resolved_artifacts.as_slice(),
-                )
-            }
-        } {
-            Ok(input_mapping) => input_mapping,
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("{error}"),
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
-        let sandbox_json = match params
-            .cli_runtime_options
-            .as_ref()
-            .and_then(|options| options.sandbox.as_ref())
-        {
-            Some(sandbox) => match pioneer_crud::serialize_cli_runtime_json(&sandbox.0) {
-                Ok(sandbox_json) => Some(sandbox_json),
+            };
+            let session_key = match crate::cli_runtime::manager::CLIAgentRuntimeSessionKey::new(
+                thread.workspace_id.as_str(),
+                runtime_id.as_str(),
+                thread.id.as_str(),
+            ) {
+                Ok(session_key) => session_key,
                 Err(error) => {
                     self.send_error(
                         connection_id,
                         JsonRpcErrorResponse::new(
                             Some(request_id),
                             INVALID_REQUEST_CODE,
-                            format!("failed to serialize CLI runtime sandbox policy: {error:#}"),
+                            format!("invalid CLI runtime session key: {error:#}"),
                         ),
                     )
                     .await;
                     return;
                 }
-            },
-            None => None,
-        };
-        let approval_policy = params
-            .cli_runtime_options
-            .as_ref()
-            .and_then(|options| options.approval_policy.as_ref())
-            .map(|policy| policy.0.clone());
-        let effective_approval_policy = cli_runtime_approval_policy(&params);
-        let sandbox_policy_value = cli_runtime_sandbox_policy_value(&params);
-        let requested_reasoning_effort = requested_reasoning_effort(&params);
-        let cli_runtime_effort = cli_runtime_effort(&params);
-        // Transition rule: CLI turns may carry the legacy runtime effort, the
-        // top-level reasoning effort, or both when they agree. New clients use
-        // the top-level field; the native runtime still receives one value.
-        let effective_cli_runtime_effort = match effective_cli_runtime_effort(
-            requested_reasoning_effort.as_deref(),
-            cli_runtime_effort.as_deref(),
-        ) {
-            Ok(effort) => effort,
-            Err(message) => {
+            };
+            match self
+                .cli_runtime_turn_start_blocker_for_thread(&session_key)
+                .await
+            {
+                Ok(Some(message)) => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
+                    )
+                    .await;
+                    return;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!("failed to check active CLI runtime turns: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            }
+            if let Err(error) = self
+                .validate_artifact_user_inputs(
+                    thread.workspace_id.as_str(),
+                    params.input.as_slice(),
+                )
+                .await
+            {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to validate CLI runtime artifact input: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+            let resolved_artifacts = match self
+                .resolve_provider_artifact_inputs(
+                    thread.workspace_id.as_str(),
+                    params.input.as_slice(),
+                )
+                .await
+            {
+                Ok(resolved_artifacts) => resolved_artifacts,
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!("failed to materialize CLI runtime artifact input: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let mut input_mapping = match match runtime_kind {
+                CLIAgentRuntimeKind::Codex => {
+                    crate::cli_runtime::input_mapping::map_codex_turn_input_from_pioneer(
+                        params.input.as_slice(),
+                        resolved_artifacts.as_slice(),
+                    )
+                }
+                CLIAgentRuntimeKind::Claude => {
+                    crate::cli_runtime::input_mapping::map_claude_turn_input_from_pioneer(
+                        params.input.as_slice(),
+                        resolved_artifacts.as_slice(),
+                    )
+                }
+            } {
+                Ok(input_mapping) => input_mapping,
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!("{error}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let sandbox_json = match params
+                .cli_runtime_options
+                .as_ref()
+                .and_then(|options| options.sandbox.as_ref())
+            {
+                Some(sandbox) => match pioneer_crud::serialize_cli_runtime_json(&sandbox.0) {
+                    Ok(sandbox_json) => Some(sandbox_json),
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request_id),
+                                INVALID_REQUEST_CODE,
+                                format!(
+                                    "failed to serialize CLI runtime sandbox policy: {error:#}"
+                                ),
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                },
+                None => None,
+            };
+            let approval_policy = params
+                .cli_runtime_options
+                .as_ref()
+                .and_then(|options| options.approval_policy.as_ref())
+                .map(|policy| policy.0.clone());
+            let effective_approval_policy = cli_runtime_approval_policy(&params);
+            let sandbox_policy_value = cli_runtime_sandbox_policy_value(&params);
+            let requested_reasoning_effort = requested_reasoning_effort(&params);
+            let cli_runtime_effort = cli_runtime_effort(&params);
+            // Transition rule: CLI turns may carry the legacy runtime effort, the
+            // top-level reasoning effort, or both when they agree. New clients use
+            // the top-level field; the native runtime still receives one value.
+            let effective_cli_runtime_effort = match effective_cli_runtime_effort(
+                requested_reasoning_effort.as_deref(),
+                cli_runtime_effort.as_deref(),
+            ) {
+                Ok(effort) => effort,
+                Err(message) => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let cli_runtime_personality = params
+                .cli_runtime_options
+                .as_ref()
+                .and_then(|options| options.personality.clone());
+            let cli_runtime_summary = params
+                .cli_runtime_options
+                .as_ref()
+                .and_then(|options| options.summary.clone());
+
+            let outcome = match self.thread_manager.turn_start(connection_id, params).await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!("failed to start CLI runtime turn: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            if let Err(message) = self
+                .validate_turn_reasoning_effort(
+                    outcome.started_notification.workspace_id.as_str(),
+                    ReasoningModelLookupBackend::CliRuntime {
+                        runtime_id: runtime_id.as_str(),
+                        runtime_kind,
+                    },
+                    outcome.materialization.thread.model.as_str(),
+                    effective_cli_runtime_effort.as_deref(),
+                )
+                .await
+            {
+                self.thread_manager
+                    .rollback_turn_start(outcome.rollback_context.clone())
+                    .await;
                 self.send_error(
                     connection_id,
                     JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
@@ -628,203 +689,74 @@ impl MessageProcessor {
                 .await;
                 return;
             }
-        };
-        let cli_runtime_personality = params
-            .cli_runtime_options
-            .as_ref()
-            .and_then(|options| options.personality.clone());
-        let cli_runtime_summary = params
-            .cli_runtime_options
-            .as_ref()
-            .and_then(|options| options.summary.clone());
-
-        let outcome = match self.thread_manager.turn_start(connection_id, params).await {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to start CLI runtime turn: {error:#}"),
+            if let Err(error) = message_future(
+                self.crud_store
+                    .materialize_turn_start_with_reasoning_effort(
+                        &outcome.materialization.thread,
+                        outcome.materialization.sandbox_mode,
+                        &outcome.materialization.turn,
+                        &outcome.materialization.input,
+                        effective_cli_runtime_effort.as_deref(),
                     ),
-                )
-                .await;
-                return;
-            }
-        };
-        if let Err(message) = self
-            .validate_turn_reasoning_effort(
-                outcome.started_notification.workspace_id.as_str(),
-                ReasoningModelLookupBackend::CliRuntime {
-                    runtime_id: runtime_id.as_str(),
-                    runtime_kind,
-                },
-                outcome.materialization.thread.model.as_str(),
-                effective_cli_runtime_effort.as_deref(),
-            )
-            .await
-        {
-            self.thread_manager
-                .rollback_turn_start(outcome.rollback_context.clone())
-                .await;
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
-            )
-            .await;
-            return;
-        }
-        if let Err(error) = message_future(
-            self.crud_store
-                .materialize_turn_start_with_reasoning_effort(
-                    &outcome.materialization.thread,
-                    outcome.materialization.sandbox_mode,
-                    &outcome.materialization.turn,
-                    &outcome.materialization.input,
-                    effective_cli_runtime_effort.as_deref(),
-                ),
-        )
-        .await
-        {
-            self.thread_manager
-                .rollback_turn_start(outcome.rollback_context.clone())
-                .await;
-
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    format!("failed to persist CLI runtime turn/start state: {error:#}"),
-                ),
-            )
-            .await;
-            return;
-        }
-        self.ensure_hook_runtime_with_run_store().await;
-        let context_bundle = match self
-            .compile_cli_runtime_context_bundle_for_turn(
-                runtime_id.as_str(),
-                runtime_kind,
-                &outcome,
-            )
-            .await
-        {
-            Ok(context_bundle) => context_bundle,
-            Err(error) => {
-                self.mark_turn_blocked(
-                    outcome.started_notification.thread_id.clone(),
-                    outcome.started_notification.turn.id.clone(),
-                    format!("failed to compile CLI runtime context bundle: {error:#}"),
-                )
-                .await;
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to compile CLI runtime context bundle: {error:#}"),
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
-        crate::cli_runtime::context::prepend_cli_runtime_context_input(
-            &mut input_mapping,
-            &context_bundle,
-            cli_runtime_context_label(runtime_kind),
-        );
-        let native_cwd = match crate::cli_runtime::config::current_process_cwd() {
-            Ok(cwd) => cwd,
-            Err(error) => {
-                self.mark_turn_blocked(
-                    outcome.started_notification.thread_id.clone(),
-                    outcome.started_notification.turn.id.clone(),
-                    format!("failed to resolve CLI runtime cwd: {error:#}"),
-                )
-                .await;
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id.clone()),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to resolve CLI runtime cwd: {error:#}"),
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
-        let session_handle = match manager
-            .get_or_start_with_options(
-                session_key.clone(),
-                crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
-                    cwd: Some(std::path::PathBuf::from(native_cwd.as_str())),
-                    ..Default::default()
-                },
-            )
-            .await
-        {
-            Ok(handle) => handle,
-            Err(error) => {
-                self.mark_turn_blocked(
-                    outcome.started_notification.thread_id.clone(),
-                    outcome.started_notification.turn.id.clone(),
-                    format!("failed to start CLI runtime session: {error:#}"),
-                )
-                .await;
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id.clone()),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to start CLI runtime session: {error:#}"),
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
-        let cli_session = session_handle.session();
-        self.ensure_cli_runtime_session_event_pumps(
-            &session_key,
-            cli_session.clone(),
-            runtime_config.debug_native_events,
-        )
-        .await;
-        let native_thread =
-            match crate::cli_runtime::thread_binding::open_cli_runtime_thread_binding(
-                self.crud_store.as_ref(),
-                &cli_session,
-                crate::cli_runtime::thread_binding::CLIAgentRuntimeThreadBindingOpenRequest {
-                    workspace_id: outcome.started_notification.workspace_id.clone(),
-                    thread_id: outcome.started_notification.thread_id.clone(),
-                    runtime_id: runtime_id.clone(),
-                    runtime_kind: cli_runtime_protocol_kind_label(runtime_kind).to_owned(),
-                    cwd: native_cwd,
-                    model: Some(outcome.materialization.thread.model.clone()),
-                    approval_policy: Some(effective_approval_policy.clone()),
-                    sandbox: Some(serde_json::json!(cli_runtime_thread_sandbox_label(
-                        sandbox_policy_value.as_ref()
-                    ))),
-                    service_tier: None,
-                    resume_existing: cli_runtime_supports_durable_thread_resume(runtime_kind),
-                    request_timeout: std::time::Duration::from_millis(
-                        runtime_config.request_timeout_ms,
-                    ),
-                    opened_at: chrono::Utc::now().fixed_offset(),
-                },
             )
             .await
             {
-                Ok(opened) => opened,
+                self.thread_manager
+                    .rollback_turn_start(outcome.rollback_context.clone())
+                    .await;
+
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to persist CLI runtime turn/start state: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+            self.ensure_hook_runtime_with_run_store().await;
+            let context_bundle = match self
+                .compile_cli_runtime_context_bundle_for_turn(
+                    runtime_id.as_str(),
+                    runtime_kind,
+                    &outcome,
+                )
+                .await
+            {
+                Ok(context_bundle) => context_bundle,
                 Err(error) => {
                     self.mark_turn_blocked(
                         outcome.started_notification.thread_id.clone(),
                         outcome.started_notification.turn.id.clone(),
-                        format!("failed to open CLI runtime thread: {error:#}"),
+                        format!("failed to compile CLI runtime context bundle: {error:#}"),
+                    )
+                    .await;
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!("failed to compile CLI runtime context bundle: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            crate::cli_runtime::context::prepend_cli_runtime_context_input(
+                &mut input_mapping,
+                &context_bundle,
+                cli_runtime_context_label(runtime_kind),
+            );
+            let native_cwd = match crate::cli_runtime::config::current_process_cwd() {
+                Ok(cwd) => cwd,
+                Err(error) => {
+                    self.mark_turn_blocked(
+                        outcome.started_notification.thread_id.clone(),
+                        outcome.started_notification.turn.id.clone(),
+                        format!("failed to resolve CLI runtime cwd: {error:#}"),
                     )
                     .await;
                     self.send_error(
@@ -832,69 +764,132 @@ impl MessageProcessor {
                         JsonRpcErrorResponse::new(
                             Some(request_id.clone()),
                             INVALID_REQUEST_CODE,
-                            format!("failed to open CLI runtime thread: {error:#}"),
+                            format!("failed to resolve CLI runtime cwd: {error:#}"),
                         ),
                     )
                     .await;
                     return;
                 }
             };
-        let input_mapping_json = match pioneer_crud::serialize_cli_runtime_json(&input_mapping) {
-            Ok(input_mapping_json) => input_mapping_json,
-            Err(error) => {
-                self.mark_turn_blocked(
-                    outcome.started_notification.thread_id.clone(),
-                    outcome.started_notification.turn.id.clone(),
-                    format!("failed to serialize CLI runtime input mapping: {error:#}"),
+            let session_handle = match manager
+                .get_or_start_with_options(
+                    session_key.clone(),
+                    crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
+                        cwd: Some(std::path::PathBuf::from(native_cwd.as_str())),
+                        ..Default::default()
+                    },
                 )
-                .await;
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id.clone()),
-                        INVALID_REQUEST_CODE,
+                .await
+            {
+                Ok(handle) => handle,
+                Err(error) => {
+                    self.mark_turn_blocked(
+                        outcome.started_notification.thread_id.clone(),
+                        outcome.started_notification.turn.id.clone(),
+                        format!("failed to start CLI runtime session: {error:#}"),
+                    )
+                    .await;
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id.clone()),
+                            INVALID_REQUEST_CODE,
+                            format!("failed to start CLI runtime session: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let cli_session = session_handle.session();
+            self.ensure_cli_runtime_session_event_pumps(
+                &session_key,
+                cli_session.clone(),
+                runtime_config.debug_native_events,
+            )
+            .await;
+            let native_thread =
+                match crate::cli_runtime::thread_binding::open_cli_runtime_thread_binding(
+                    self.crud_store.as_ref(),
+                    &cli_session,
+                    crate::cli_runtime::thread_binding::CLIAgentRuntimeThreadBindingOpenRequest {
+                        workspace_id: outcome.started_notification.workspace_id.clone(),
+                        thread_id: outcome.started_notification.thread_id.clone(),
+                        runtime_id: runtime_id.clone(),
+                        runtime_kind: cli_runtime_protocol_kind_label(runtime_kind).to_owned(),
+                        cwd: native_cwd,
+                        model: Some(outcome.materialization.thread.model.clone()),
+                        approval_policy: Some(effective_approval_policy.clone()),
+                        sandbox: Some(serde_json::json!(cli_runtime_thread_sandbox_label(
+                            sandbox_policy_value.as_ref()
+                        ))),
+                        service_tier: None,
+                        resume_existing: cli_runtime_supports_durable_thread_resume(runtime_kind),
+                        request_timeout: std::time::Duration::from_millis(
+                            runtime_config.request_timeout_ms,
+                        ),
+                        opened_at: chrono::Utc::now().fixed_offset(),
+                    },
+                )
+                .await
+                {
+                    Ok(opened) => opened,
+                    Err(error) => {
+                        self.mark_turn_blocked(
+                            outcome.started_notification.thread_id.clone(),
+                            outcome.started_notification.turn.id.clone(),
+                            format!("failed to open CLI runtime thread: {error:#}"),
+                        )
+                        .await;
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request_id.clone()),
+                                INVALID_REQUEST_CODE,
+                                format!("failed to open CLI runtime thread: {error:#}"),
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                };
+            let input_mapping_json = match pioneer_crud::serialize_cli_runtime_json(&input_mapping)
+            {
+                Ok(input_mapping_json) => input_mapping_json,
+                Err(error) => {
+                    self.mark_turn_blocked(
+                        outcome.started_notification.thread_id.clone(),
+                        outcome.started_notification.turn.id.clone(),
                         format!("failed to serialize CLI runtime input mapping: {error:#}"),
-                    ),
+                    )
+                    .await;
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id.clone()),
+                            INVALID_REQUEST_CODE,
+                            format!("failed to serialize CLI runtime input mapping: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            if let Err(error) = self
+                .persist_cli_runtime_input_mapping_if_thread_bound(
+                    runtime_id.as_str(),
+                    runtime_kind,
+                    input_mapping_json,
+                    sandbox_json,
+                    approval_policy,
+                    &outcome,
                 )
-                .await;
-                return;
-            }
-        };
-        if let Err(error) = self
-            .persist_cli_runtime_input_mapping_if_thread_bound(
-                runtime_id.as_str(),
-                runtime_kind,
-                input_mapping_json,
-                sandbox_json,
-                approval_policy,
-                &outcome,
-            )
-            .await
-        {
-            self.mark_turn_blocked(
-                outcome.started_notification.thread_id.clone(),
-                outcome.started_notification.turn.id.clone(),
-                format!("failed to persist CLI runtime input mapping: {error:#}"),
-            )
-            .await;
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id.clone()),
-                    INVALID_REQUEST_CODE,
+                .await
+            {
+                self.mark_turn_blocked(
+                    outcome.started_notification.thread_id.clone(),
+                    outcome.started_notification.turn.id.clone(),
                     format!("failed to persist CLI runtime input mapping: {error:#}"),
-                ),
-            )
-            .await;
-            return;
-        }
-        let native_turn_input = match serde_json::to_value(&input_mapping.input) {
-            Ok(input) => input,
-            Err(error) => {
-                self.mark_turn_blocked(
-                    outcome.started_notification.thread_id.clone(),
-                    outcome.started_notification.turn.id.clone(),
-                    format!("failed to encode CLI runtime turn input: {error:#}"),
                 )
                 .await;
                 self.send_error(
@@ -902,52 +897,72 @@ impl MessageProcessor {
                     JsonRpcErrorResponse::new(
                         Some(request_id.clone()),
                         INVALID_REQUEST_CODE,
+                        format!("failed to persist CLI runtime input mapping: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+            let native_turn_input = match serde_json::to_value(&input_mapping.input) {
+                Ok(input) => input,
+                Err(error) => {
+                    self.mark_turn_blocked(
+                        outcome.started_notification.thread_id.clone(),
+                        outcome.started_notification.turn.id.clone(),
                         format!("failed to encode CLI runtime turn input: {error:#}"),
-                    ),
+                    )
+                    .await;
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id.clone()),
+                            INVALID_REQUEST_CODE,
+                            format!("failed to encode CLI runtime turn input: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let native_turn = match cli_session
+                .start_turn(
+                    crate::cli_runtime::manager::CLIAgentRuntimeTurnStartParams {
+                        native_thread_id: native_thread.binding.native_thread_id.clone(),
+                        input: native_turn_input,
+                        cwd: native_thread.binding.native_cwd.clone(),
+                        approval_policy: Some(effective_approval_policy),
+                        sandbox: sandbox_policy_value,
+                        model: Some(outcome.materialization.thread.model.clone()),
+                        effort: effective_cli_runtime_effort,
+                        personality: cli_runtime_personality,
+                        summary: cli_runtime_summary,
+                    },
+                    std::time::Duration::from_millis(runtime_config.request_timeout_ms),
                 )
-                .await;
-                return;
-            }
-        };
-        let native_turn = match cli_session
-            .start_turn(
-                crate::cli_runtime::manager::CLIAgentRuntimeTurnStartParams {
-                    native_thread_id: native_thread.binding.native_thread_id.clone(),
-                    input: native_turn_input,
-                    cwd: native_thread.binding.native_cwd.clone(),
-                    approval_policy: Some(effective_approval_policy),
-                    sandbox: sandbox_policy_value,
-                    model: Some(outcome.materialization.thread.model.clone()),
-                    effort: effective_cli_runtime_effort,
-                    personality: cli_runtime_personality,
-                    summary: cli_runtime_summary,
-                },
-                std::time::Duration::from_millis(runtime_config.request_timeout_ms),
-            )
-            .await
-        {
-            Ok(native_turn) => native_turn,
-            Err(error) => {
-                self.mark_turn_blocked(
-                    outcome.started_notification.thread_id.clone(),
-                    outcome.started_notification.turn.id.clone(),
-                    format!("failed to start CLI runtime turn: {error:#}"),
-                )
-                .await;
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id.clone()),
-                        INVALID_REQUEST_CODE,
+                .await
+            {
+                Ok(native_turn) => native_turn,
+                Err(error) => {
+                    self.mark_turn_blocked(
+                        outcome.started_notification.thread_id.clone(),
+                        outcome.started_notification.turn.id.clone(),
                         format!("failed to start CLI runtime turn: {error:#}"),
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
-        let native_turn_id = native_turn.native_turn_id.clone();
-        if let Err(error) =
+                    )
+                    .await;
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id.clone()),
+                            INVALID_REQUEST_CODE,
+                            format!("failed to start CLI runtime turn: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let native_turn_id = native_turn.native_turn_id.clone();
+            if let Err(error) =
             crate::cli_runtime::turn_binding::persist_cli_runtime_turn_binding_after_native_start(
                 self.crud_store.as_ref(),
                 crate::cli_runtime::turn_binding::CLIAgentRuntimeNativeTurnStarted {
@@ -976,39 +991,40 @@ impl MessageProcessor {
             .await;
             return;
         }
-        self.flush_cli_runtime_events_for_native_turn(
-            &session_key,
-            native_thread.binding.native_thread_id.as_str(),
-            native_turn_id.as_str(),
-        )
-        .await;
-        if let Err(error) = self
-            .persist_cli_runtime_prompt_manifest(
-                outcome.started_notification.thread_id.as_str(),
-                outcome.started_notification.turn.id.as_str(),
-                &context_bundle,
-            )
-            .await
-        {
-            self.mark_turn_blocked(
-                outcome.started_notification.thread_id.clone(),
-                outcome.started_notification.turn.id.clone(),
-                format!("failed to persist CLI runtime prompt manifest: {error:#}"),
+            self.flush_cli_runtime_events_for_native_turn(
+                &session_key,
+                native_thread.binding.native_thread_id.as_str(),
+                native_turn_id.as_str(),
             )
             .await;
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id.clone()),
-                    INVALID_REQUEST_CODE,
+            if let Err(error) = self
+                .persist_cli_runtime_prompt_manifest(
+                    outcome.started_notification.thread_id.as_str(),
+                    outcome.started_notification.turn.id.as_str(),
+                    &context_bundle,
+                )
+                .await
+            {
+                self.mark_turn_blocked(
+                    outcome.started_notification.thread_id.clone(),
+                    outcome.started_notification.turn.id.clone(),
                     format!("failed to persist CLI runtime prompt manifest: {error:#}"),
-                ),
-            )
-            .await;
-            return;
-        }
-        self.finish_turn_start_success(connection_id, request_id, &outcome)
-            .await;
+                )
+                .await;
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id.clone()),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to persist CLI runtime prompt manifest: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+            self.finish_turn_start_success(connection_id, request_id, &outcome)
+                .await;
+        })
     }
 
     async fn validate_cli_runtime_turn_start_backend(

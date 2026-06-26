@@ -433,89 +433,73 @@ impl MessageProcessor {
     // Native archive/unarchive is intentionally not mirrored here. Pioneer remains
     // the owner of sidebar visibility and archival state until a dedicated product
     // decision wires native Codex archive semantics explicitly.
-    pub(super) async fn cli_runtime_thread_fork(
-        &self,
+    pub(super) fn cli_runtime_thread_fork<'a>(
+        &'a self,
         connection_id: ConnectionId,
         request_id: RequestId,
         params: CLIRuntimeThreadForkParams,
-    ) {
-        let Some(workspace_id) = self
-            .validate_cli_runtime_workspace(
-                connection_id,
-                request_id.clone(),
-                methods::CLI_RUNTIME_THREAD_FORK,
-                params.workspace_id.clone(),
-            )
-            .await
-        else {
-            return;
-        };
-        let params = match validate_cli_runtime_thread_fork_params(params) {
-            Ok(params) => params,
-            Err(error) => {
+    ) -> MessageFuture<'a, ()> {
+        message_future(async move {
+            let Some(workspace_id) = self
+                .validate_cli_runtime_workspace(
+                    connection_id,
+                    request_id.clone(),
+                    methods::CLI_RUNTIME_THREAD_FORK,
+                    params.workspace_id.clone(),
+                )
+                .await
+            else {
+                return;
+            };
+            let params = match validate_cli_runtime_thread_fork_params(params) {
+                Ok(params) => params,
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(Some(request_id), INVALID_PARAMS_CODE, error),
+                    )
+                    .await;
+                    return;
+                }
+            };
+
+            let Some(source_thread) = self
+                .thread_manager
+                .thread_get(params.source_thread_id.as_str())
+                .await
+            else {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(Some(request_id), INVALID_PARAMS_CODE, error),
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("thread `{}` is not loaded", params.source_thread_id),
+                    ),
+                )
+                .await;
+                return;
+            };
+            if source_thread.workspace_id != workspace_id {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_PARAMS_CODE,
+                        format!(
+                            "thread `{}` belongs to workspace `{}`",
+                            params.source_thread_id, source_thread.workspace_id
+                        ),
+                    ),
                 )
                 .await;
                 return;
             }
-        };
-
-        let Some(source_thread) = self
-            .thread_manager
-            .thread_get(params.source_thread_id.as_str())
-            .await
-        else {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    format!("thread `{}` is not loaded", params.source_thread_id),
-                ),
-            )
-            .await;
-            return;
-        };
-        if source_thread.workspace_id != workspace_id {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_PARAMS_CODE,
-                    format!(
-                        "thread `{}` belongs to workspace `{}`",
-                        params.source_thread_id, source_thread.workspace_id
-                    ),
-                ),
-            )
-            .await;
-            return;
-        }
-        if self
-            .thread_manager
-            .thread_get(params.fork_thread_id.as_str())
-            .await
-            .is_some()
-        {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_PARAMS_CODE,
-                    format!("thread `{}` already exists", params.fork_thread_id),
-                ),
-            )
-            .await;
-            return;
-        }
-        match self
-            .crud_store
-            .get_thread_model(params.fork_thread_id.as_str())
-            .await
-        {
-            Ok(Some(_)) => {
+            if self
+                .thread_manager
+                .thread_get(params.fork_thread_id.as_str())
+                .await
+                .is_some()
+            {
                 self.send_error(
                     connection_id,
                     JsonRpcErrorResponse::new(
@@ -527,95 +511,113 @@ impl MessageProcessor {
                 .await;
                 return;
             }
-            Ok(None) => {}
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!(
-                            "failed to check fork thread `{}` in storage: {error:#}",
-                            params.fork_thread_id
+            match self
+                .crud_store
+                .get_thread_model(params.fork_thread_id.as_str())
+                .await
+            {
+                Ok(Some(_)) => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_PARAMS_CODE,
+                            format!("thread `{}` already exists", params.fork_thread_id),
                         ),
-                    ),
-                )
-                .await;
-                return;
+                    )
+                    .await;
+                    return;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!(
+                                "failed to check fork thread `{}` in storage: {error:#}",
+                                params.fork_thread_id
+                            ),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
             }
-        }
 
-        let binding = match self
-            .crud_store
-            .get_cli_runtime_thread_binding(params.source_thread_id.as_str())
-            .await
-        {
-            Ok(Some(binding)) => binding,
-            Ok(None) => {
+            let binding = match self
+                .crud_store
+                .get_cli_runtime_thread_binding(params.source_thread_id.as_str())
+                .await
+            {
+                Ok(Some(binding)) => binding,
+                Ok(None) => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!(
+                                "thread `{}` is not bound to a CLI runtime",
+                                params.source_thread_id
+                            ),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!(
+                                "failed to load CLI runtime binding for thread `{}`: {error:#}",
+                                params.source_thread_id
+                            ),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            if binding.workspace_id != workspace_id {
                 self.send_error(
                     connection_id,
                     JsonRpcErrorResponse::new(
                         Some(request_id),
-                        INVALID_REQUEST_CODE,
+                        INVALID_PARAMS_CODE,
                         format!(
-                            "thread `{}` is not bound to a CLI runtime",
-                            params.source_thread_id
+                            "CLI runtime binding for thread `{}` belongs to workspace `{}`",
+                            params.source_thread_id, binding.workspace_id
                         ),
                     ),
                 )
                 .await;
                 return;
             }
-            Err(error) => {
+            if binding.runtime_id != params.runtime_id {
                 self.send_error(
                     connection_id,
                     JsonRpcErrorResponse::new(
                         Some(request_id),
-                        INVALID_REQUEST_CODE,
+                        INVALID_PARAMS_CODE,
                         format!(
-                            "failed to load CLI runtime binding for thread `{}`: {error:#}",
-                            params.source_thread_id
+                            "thread `{}` is bound to CLI runtime `{}`",
+                            params.source_thread_id, binding.runtime_id
                         ),
                     ),
                 )
                 .await;
                 return;
             }
-        };
-        if binding.workspace_id != workspace_id {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_PARAMS_CODE,
-                    format!(
-                        "CLI runtime binding for thread `{}` belongs to workspace `{}`",
-                        params.source_thread_id, binding.workspace_id
-                    ),
-                ),
-            )
-            .await;
-            return;
-        }
-        if binding.runtime_id != params.runtime_id {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_PARAMS_CODE,
-                    format!(
-                        "thread `{}` is bound to CLI runtime `{}`",
-                        params.source_thread_id, binding.runtime_id
-                    ),
-                ),
-            )
-            .await;
-            return;
-        }
-        let supports_fork = cli_runtime_capabilities_for_stored_kind(binding.runtime_kind.as_str())
-            .is_some_and(|capabilities| capabilities.supports_fork);
-        if !supports_fork {
-            self.send_error(
+            let supports_fork =
+                cli_runtime_capabilities_for_stored_kind(binding.runtime_kind.as_str())
+                    .is_some_and(|capabilities| capabilities.supports_fork);
+            if !supports_fork {
+                self.send_error(
                 connection_id,
                 JsonRpcErrorResponse::new(
                     Some(request_id),
@@ -629,361 +631,365 @@ impl MessageProcessor {
                 ),
             )
             .await;
-            return;
-        }
+                return;
+            }
 
-        let Some(manager) = self.cli_runtime_manager.as_ref() else {
-            self.send_error(
+            let Some(manager) = self.cli_runtime_manager.as_ref() else {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        "CLI runtime manager is not available for thread fork".to_owned(),
+                    ),
+                )
+                .await;
+                return;
+            };
+            let key = match CLIAgentRuntimeSessionKey::new(
+                workspace_id.as_str(),
+                params.runtime_id.as_str(),
+                params.source_thread_id.as_str(),
+            ) {
+                Ok(key) => key,
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_PARAMS_CODE,
+                            format!("invalid CLI runtime fork key: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let handle = match manager.get_or_start(key).await {
+                Ok(handle) => handle,
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!("failed to start CLI runtime session for fork: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let fork = match handle
+                .session()
+                .fork_thread(CLIAgentRuntimeThreadForkRequest {
+                    native_thread_id: binding.native_thread_id.clone(),
+                })
+                .await
+            {
+                Ok(fork) => fork,
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!("failed to fork CLI runtime thread: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+
+            let outcome = match self
+                .thread_manager
+                .thread_start(
+                    connection_id,
+                    workspace_id.clone(),
+                    ThreadStartParams {
+                        thread_id: params.fork_thread_id.clone(),
+                        workspace_id: workspace_id.clone(),
+                        name: params.name.clone().or_else(|| source_thread.name.clone()),
+                        model: Some(source_thread.model.clone()),
+                        model_provider: Some(source_thread.model_provider.clone()),
+                        sandbox: None,
+                        mode: Some(source_thread.mode),
+                        origin_kind: Some(ThreadOriginKind::User),
+                        sidebar_visibility: Some(ThreadSidebarVisibility::Visible),
+                        agent_nickname: source_thread.agent_nickname.clone(),
+                        agent_role: source_thread.agent_role.clone(),
+                    },
+                )
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!("failed to create fork thread: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+
+            if let Err(error) = self
+                .crud_store
+                .upsert_thread_model(&outcome.response.thread)
+                .await
+            {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to persist fork thread: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+
+            let now = chrono::Utc::now().fixed_offset();
+            let resume_cursor_json = match pioneer_crud::serialize_cli_runtime_json(&json!({
+                "threadId": fork.native_thread_id.as_str(),
+                "forkedFromThreadId": binding.native_thread_id.as_str(),
+            })) {
+                Ok(resume_cursor_json) => resume_cursor_json,
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!("failed to encode fork CLI runtime cursor: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            if let Err(error) = self
+                .crud_store
+                .upsert_cli_runtime_thread_binding(NewCliRuntimeThreadBinding {
+                    thread_id: params.fork_thread_id.clone(),
+                    workspace_id: workspace_id.clone(),
+                    runtime_id: params.runtime_id.clone(),
+                    runtime_kind: binding.runtime_kind.clone(),
+                    native_thread_id: fork.native_thread_id.clone(),
+                    native_session_id: None,
+                    native_root_thread_id: binding
+                        .native_root_thread_id
+                        .clone()
+                        .or_else(|| Some(binding.native_thread_id.clone())),
+                    native_cwd: fork.native_cwd.clone().or(binding.native_cwd.clone()),
+                    native_model: fork.native_model.clone().or(binding.native_model.clone()),
+                    resume_cursor_json,
+                    status: "active".to_owned(),
+                    created_at: now,
+                    updated_at: now,
+                })
+                .await
+            {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to persist fork CLI runtime binding: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+
+            self.send_cli_runtime_response(
                 connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    "CLI runtime manager is not available for thread fork".to_owned(),
-                ),
+                request_id,
+                methods::CLI_RUNTIME_THREAD_FORK,
+                &CLIRuntimeThreadForkResponse {
+                    workspace_id: workspace_id.clone(),
+                    runtime_id: params.runtime_id,
+                    source_thread_id: params.source_thread_id,
+                    thread: outcome.response.thread.clone(),
+                    native_thread_id: fork.native_thread_id,
+                    raw: fork.raw,
+                },
             )
             .await;
-            return;
-        };
-        let key = match CLIAgentRuntimeSessionKey::new(
-            workspace_id.as_str(),
-            params.runtime_id.as_str(),
-            params.source_thread_id.as_str(),
-        ) {
-            Ok(key) => key,
-            Err(error) => {
+
+            let notification = match JsonRpcNotification::from_params(
+                events::THREAD_STARTED,
+                &outcome.started_notification,
+            ) {
+                Ok(notification) => notification,
+                Err(error) => {
+                    error!(error = %error, "failed to encode fork thread/started notification");
+                    return;
+                }
+            };
+            match serde_json::to_string(&notification) {
+                Ok(payload) => {
+                    for notification_connection_id in outcome.started_notification_connection_ids {
+                        if let Err(error) = self
+                            .session_manager
+                            .send_text(notification_connection_id, payload.clone())
+                            .await
+                        {
+                            warn!(
+                                connection_id = notification_connection_id,
+                                error = %format!("{error:#}"),
+                                "failed to send fork thread/started notification"
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    error!(error = %error, "failed to serialize fork thread/started notification");
+                }
+            }
+            self.notify_thread_tree_changed(workspace_id).await;
+        })
+    }
+
+    pub(super) fn cli_runtime_turn_steer<'a>(
+        &'a self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        params: CLIRuntimeTurnSteerParams,
+    ) -> MessageFuture<'a, ()> {
+        message_future(async move {
+            let Some(workspace_id) = self
+                .validate_cli_runtime_workspace(
+                    connection_id,
+                    request_id.clone(),
+                    methods::CLI_RUNTIME_TURN_STEER,
+                    params.workspace_id.clone(),
+                )
+                .await
+            else {
+                return;
+            };
+            let params = match validate_cli_runtime_turn_steer_params(params) {
+                Ok(params) => params,
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(Some(request_id), INVALID_PARAMS_CODE, error),
+                    )
+                    .await;
+                    return;
+                }
+            };
+
+            let Some(thread) = self
+                .thread_manager
+                .thread_get(params.thread_id.as_str())
+                .await
+            else {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("thread `{}` is not loaded", params.thread_id),
+                    ),
+                )
+                .await;
+                return;
+            };
+            if thread.workspace_id != workspace_id {
                 self.send_error(
                     connection_id,
                     JsonRpcErrorResponse::new(
                         Some(request_id),
                         INVALID_PARAMS_CODE,
-                        format!("invalid CLI runtime fork key: {error:#}"),
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
-        let handle = match manager.get_or_start(key).await {
-            Ok(handle) => handle,
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to start CLI runtime session for fork: {error:#}"),
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
-        let fork = match handle
-            .session()
-            .fork_thread(CLIAgentRuntimeThreadForkRequest {
-                native_thread_id: binding.native_thread_id.clone(),
-            })
-            .await
-        {
-            Ok(fork) => fork,
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to fork CLI runtime thread: {error:#}"),
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
-
-        let outcome = match self
-            .thread_manager
-            .thread_start(
-                connection_id,
-                workspace_id.clone(),
-                ThreadStartParams {
-                    thread_id: params.fork_thread_id.clone(),
-                    workspace_id: workspace_id.clone(),
-                    name: params.name.clone().or_else(|| source_thread.name.clone()),
-                    model: Some(source_thread.model.clone()),
-                    model_provider: Some(source_thread.model_provider.clone()),
-                    sandbox: None,
-                    mode: Some(source_thread.mode),
-                    origin_kind: Some(ThreadOriginKind::User),
-                    sidebar_visibility: Some(ThreadSidebarVisibility::Visible),
-                    agent_nickname: source_thread.agent_nickname.clone(),
-                    agent_role: source_thread.agent_role.clone(),
-                },
-            )
-            .await
-        {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to create fork thread: {error:#}"),
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
-
-        if let Err(error) = self
-            .crud_store
-            .upsert_thread_model(&outcome.response.thread)
-            .await
-        {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    format!("failed to persist fork thread: {error:#}"),
-                ),
-            )
-            .await;
-            return;
-        }
-
-        let now = chrono::Utc::now().fixed_offset();
-        let resume_cursor_json = match pioneer_crud::serialize_cli_runtime_json(&json!({
-            "threadId": fork.native_thread_id.as_str(),
-            "forkedFromThreadId": binding.native_thread_id.as_str(),
-        })) {
-            Ok(resume_cursor_json) => resume_cursor_json,
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to encode fork CLI runtime cursor: {error:#}"),
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
-        if let Err(error) = self
-            .crud_store
-            .upsert_cli_runtime_thread_binding(NewCliRuntimeThreadBinding {
-                thread_id: params.fork_thread_id.clone(),
-                workspace_id: workspace_id.clone(),
-                runtime_id: params.runtime_id.clone(),
-                runtime_kind: binding.runtime_kind.clone(),
-                native_thread_id: fork.native_thread_id.clone(),
-                native_session_id: None,
-                native_root_thread_id: binding
-                    .native_root_thread_id
-                    .clone()
-                    .or_else(|| Some(binding.native_thread_id.clone())),
-                native_cwd: fork.native_cwd.clone().or(binding.native_cwd.clone()),
-                native_model: fork.native_model.clone().or(binding.native_model.clone()),
-                resume_cursor_json,
-                status: "active".to_owned(),
-                created_at: now,
-                updated_at: now,
-            })
-            .await
-        {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    format!("failed to persist fork CLI runtime binding: {error:#}"),
-                ),
-            )
-            .await;
-            return;
-        }
-
-        self.send_cli_runtime_response(
-            connection_id,
-            request_id,
-            methods::CLI_RUNTIME_THREAD_FORK,
-            &CLIRuntimeThreadForkResponse {
-                workspace_id: workspace_id.clone(),
-                runtime_id: params.runtime_id,
-                source_thread_id: params.source_thread_id,
-                thread: outcome.response.thread.clone(),
-                native_thread_id: fork.native_thread_id,
-                raw: fork.raw,
-            },
-        )
-        .await;
-
-        let notification = match JsonRpcNotification::from_params(
-            events::THREAD_STARTED,
-            &outcome.started_notification,
-        ) {
-            Ok(notification) => notification,
-            Err(error) => {
-                error!(error = %error, "failed to encode fork thread/started notification");
-                return;
-            }
-        };
-        match serde_json::to_string(&notification) {
-            Ok(payload) => {
-                for notification_connection_id in outcome.started_notification_connection_ids {
-                    if let Err(error) = self
-                        .session_manager
-                        .send_text(notification_connection_id, payload.clone())
-                        .await
-                    {
-                        warn!(
-                            connection_id = notification_connection_id,
-                            error = %format!("{error:#}"),
-                            "failed to send fork thread/started notification"
-                        );
-                    }
-                }
-            }
-            Err(error) => {
-                error!(error = %error, "failed to serialize fork thread/started notification");
-            }
-        }
-        self.notify_thread_tree_changed(workspace_id).await;
-    }
-
-    pub(super) async fn cli_runtime_turn_steer(
-        &self,
-        connection_id: ConnectionId,
-        request_id: RequestId,
-        params: CLIRuntimeTurnSteerParams,
-    ) {
-        let Some(workspace_id) = self
-            .validate_cli_runtime_workspace(
-                connection_id,
-                request_id.clone(),
-                methods::CLI_RUNTIME_TURN_STEER,
-                params.workspace_id.clone(),
-            )
-            .await
-        else {
-            return;
-        };
-        let params = match validate_cli_runtime_turn_steer_params(params) {
-            Ok(params) => params,
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(Some(request_id), INVALID_PARAMS_CODE, error),
-                )
-                .await;
-                return;
-            }
-        };
-
-        let Some(thread) = self
-            .thread_manager
-            .thread_get(params.thread_id.as_str())
-            .await
-        else {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    format!("thread `{}` is not loaded", params.thread_id),
-                ),
-            )
-            .await;
-            return;
-        };
-        if thread.workspace_id != workspace_id {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_PARAMS_CODE,
-                    format!(
-                        "thread `{}` belongs to workspace `{}`",
-                        params.thread_id, thread.workspace_id
-                    ),
-                ),
-            )
-            .await;
-            return;
-        }
-
-        let turn_binding = match self
-            .crud_store
-            .get_cli_runtime_turn_binding(params.turn_id.as_str())
-            .await
-        {
-            Ok(Some(binding)) => binding,
-            Ok(None) => {
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("turn `{}` is not bound to a CLI runtime", params.turn_id),
-                    ),
-                )
-                .await;
-                return;
-            }
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
                         format!(
-                            "failed to load CLI runtime turn binding for `{}`: {error:#}",
-                            params.turn_id
+                            "thread `{}` belongs to workspace `{}`",
+                            params.thread_id, thread.workspace_id
                         ),
                     ),
                 )
                 .await;
                 return;
             }
-        };
-        if turn_binding.workspace_id != workspace_id || turn_binding.thread_id != params.thread_id {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_PARAMS_CODE,
-                    format!(
-                        "turn `{}` belongs to workspace/thread `{}/{}`",
-                        params.turn_id, turn_binding.workspace_id, turn_binding.thread_id
+
+            let turn_binding = match self
+                .crud_store
+                .get_cli_runtime_turn_binding(params.turn_id.as_str())
+                .await
+            {
+                Ok(Some(binding)) => binding,
+                Ok(None) => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!("turn `{}` is not bound to a CLI runtime", params.turn_id),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!(
+                                "failed to load CLI runtime turn binding for `{}`: {error:#}",
+                                params.turn_id
+                            ),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            if turn_binding.workspace_id != workspace_id
+                || turn_binding.thread_id != params.thread_id
+            {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_PARAMS_CODE,
+                        format!(
+                            "turn `{}` belongs to workspace/thread `{}/{}`",
+                            params.turn_id, turn_binding.workspace_id, turn_binding.thread_id
+                        ),
                     ),
-                ),
-            )
-            .await;
-            return;
-        }
-        if turn_binding.runtime_id != params.runtime_id {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_PARAMS_CODE,
-                    format!(
-                        "turn `{}` is bound to CLI runtime `{}`",
-                        params.turn_id, turn_binding.runtime_id
+                )
+                .await;
+                return;
+            }
+            if turn_binding.runtime_id != params.runtime_id {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_PARAMS_CODE,
+                        format!(
+                            "turn `{}` is bound to CLI runtime `{}`",
+                            params.turn_id, turn_binding.runtime_id
+                        ),
                     ),
-                ),
-            )
-            .await;
-            return;
-        }
-        let supports_steer =
-            cli_runtime_capabilities_for_stored_kind(turn_binding.runtime_kind.as_str())
-                .is_some_and(|capabilities| capabilities.supports_steer);
-        if !supports_steer {
-            self.send_error(
+                )
+                .await;
+                return;
+            }
+            let supports_steer =
+                cli_runtime_capabilities_for_stored_kind(turn_binding.runtime_kind.as_str())
+                    .is_some_and(|capabilities| capabilities.supports_steer);
+            if !supports_steer {
+                self.send_error(
                 connection_id,
                 JsonRpcErrorResponse::new(
                     Some(request_id),
@@ -996,130 +1002,132 @@ impl MessageProcessor {
                 ),
             )
             .await;
-            return;
-        }
-        if turn_binding.status != crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING
-        {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    format!(
-                        "turn `{}` is not running and cannot be steered",
-                        params.turn_id
-                    ),
-                ),
-            )
-            .await;
-            return;
-        }
-        let Some(native_turn_id) = turn_binding.native_turn_id.clone() else {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    format!(
-                        "turn `{}` does not have an active CLI runtime native turn id",
-                        params.turn_id
-                    ),
-                ),
-            )
-            .await;
-            return;
-        };
-
-        let Some(manager) = self.cli_runtime_manager.as_ref() else {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    "CLI runtime manager is not available for turn steering".to_owned(),
-                ),
-            )
-            .await;
-            return;
-        };
-        let key = match CLIAgentRuntimeSessionKey::new(
-            workspace_id.as_str(),
-            params.runtime_id.as_str(),
-            params.thread_id.as_str(),
-        ) {
-            Ok(key) => key,
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_PARAMS_CODE,
-                        format!("invalid CLI runtime steering key: {error:#}"),
-                    ),
-                )
-                .await;
                 return;
             }
-        };
-        let Some(handle) = manager.existing_session(&key).await else {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    "CLI runtime session is not active for turn steering".to_owned(),
-                ),
-            )
-            .await;
-            return;
-        };
-        let steer = match handle
-            .session()
-            .steer_turn(CLIAgentRuntimeTurnSteerRequest {
-                native_thread_id: turn_binding.native_thread_id.clone(),
-                native_turn_id: native_turn_id.clone(),
-                message: params.message.clone(),
-            })
-            .await
-        {
-            Ok(steer) => steer,
-            Err(error) => {
+            if turn_binding.status
+                != crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING
+            {
                 self.send_error(
                     connection_id,
                     JsonRpcErrorResponse::new(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
-                        format!("failed to steer CLI runtime turn: {error:#}"),
+                        format!(
+                            "turn `{}` is not running and cannot be steered",
+                            params.turn_id
+                        ),
                     ),
                 )
                 .await;
                 return;
             }
-        };
+            let Some(native_turn_id) = turn_binding.native_turn_id.clone() else {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!(
+                            "turn `{}` does not have an active CLI runtime native turn id",
+                            params.turn_id
+                        ),
+                    ),
+                )
+                .await;
+                return;
+            };
 
-        self.emit_cli_runtime_steer_accepted_timeline_event(
-            workspace_id.as_str(),
-            params.thread_id.as_str(),
-            params.turn_id.as_str(),
-            steer.native_turn_id.as_str(),
-        )
-        .await;
+            let Some(manager) = self.cli_runtime_manager.as_ref() else {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        "CLI runtime manager is not available for turn steering".to_owned(),
+                    ),
+                )
+                .await;
+                return;
+            };
+            let key = match CLIAgentRuntimeSessionKey::new(
+                workspace_id.as_str(),
+                params.runtime_id.as_str(),
+                params.thread_id.as_str(),
+            ) {
+                Ok(key) => key,
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_PARAMS_CODE,
+                            format!("invalid CLI runtime steering key: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let Some(handle) = manager.existing_session(&key).await else {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        "CLI runtime session is not active for turn steering".to_owned(),
+                    ),
+                )
+                .await;
+                return;
+            };
+            let steer = match handle
+                .session()
+                .steer_turn(CLIAgentRuntimeTurnSteerRequest {
+                    native_thread_id: turn_binding.native_thread_id.clone(),
+                    native_turn_id: native_turn_id.clone(),
+                    message: params.message.clone(),
+                })
+                .await
+            {
+                Ok(steer) => steer,
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!("failed to steer CLI runtime turn: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
 
-        self.send_cli_runtime_response(
-            connection_id,
-            request_id,
-            methods::CLI_RUNTIME_TURN_STEER,
-            &CLIRuntimeTurnSteerResponse {
-                workspace_id,
-                runtime_id: params.runtime_id,
-                thread_id: params.thread_id,
-                turn_id: params.turn_id,
-                native_thread_id: steer.native_thread_id,
-                native_turn_id: steer.native_turn_id,
-                raw: steer.raw,
-            },
-        )
-        .await;
+            self.emit_cli_runtime_steer_accepted_timeline_event(
+                workspace_id.as_str(),
+                params.thread_id.as_str(),
+                params.turn_id.as_str(),
+                steer.native_turn_id.as_str(),
+            )
+            .await;
+
+            self.send_cli_runtime_response(
+                connection_id,
+                request_id,
+                methods::CLI_RUNTIME_TURN_STEER,
+                &CLIRuntimeTurnSteerResponse {
+                    workspace_id,
+                    runtime_id: params.runtime_id,
+                    thread_id: params.thread_id,
+                    turn_id: params.turn_id,
+                    native_thread_id: steer.native_thread_id,
+                    native_turn_id: steer.native_turn_id,
+                    raw: steer.raw,
+                },
+            )
+            .await;
+        })
     }
 
     pub(super) async fn cli_runtime_review_start(
