@@ -36,6 +36,7 @@ pub mod thread;
 pub mod thread_agents_doc;
 pub mod thread_episodic;
 pub mod thread_lineage;
+pub mod thread_timeline_projection;
 pub mod thread_tree;
 pub mod turn;
 pub mod turn_event;

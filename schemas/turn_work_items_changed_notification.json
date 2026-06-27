@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnWorkItemsChangedNotification",
+  "type": "object",
+  "properties": {
+    "afterCursor": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TimelineCursor"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "beforeCursor": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TimelineCursor"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "changedWorkItemIds": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "reason": {
+      "$ref": "#/$defs/TimelineChangeReason"
+    },
+    "removedWorkItemIds": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "threadId": {
+      "type": "string"
+    },
+    "turnId": {
+      "type": "string"
+    },
+    "workspaceId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspaceId",
+    "threadId",
+    "turnId",
+    "reason"
+  ],
+  "$defs": {
+    "TimelineChangeReason": {
+      "type": "string",
+      "enum": [
+        "backfill",
+        "live_event",
+        "state_changed",
+        "page_invalidated"
+      ]
+    },
+    "TimelineCursor": {
+      "type": "object",
+      "properties": {
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "value"
+      ]
+    }
+  }
+}

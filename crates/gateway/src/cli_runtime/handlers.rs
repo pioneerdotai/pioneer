@@ -4518,6 +4518,8 @@ impl MessageProcessor {
             &notification,
         )
         .await;
+        self.notify_semantic_timeline_pending_request_changed(&request)
+            .await;
     }
 
     pub(super) async fn emit_cli_runtime_request_resolved(
@@ -4533,6 +4535,8 @@ impl MessageProcessor {
             &notification,
         )
         .await;
+        self.notify_semantic_timeline_pending_request_changed(&request)
+            .await;
     }
 
     async fn validate_cli_runtime_workspace(

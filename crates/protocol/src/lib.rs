@@ -17,6 +17,7 @@ mod task;
 mod thread;
 mod thread_agents_doc;
 mod thread_episodic;
+mod timeline;
 mod turn;
 mod workspace;
 
@@ -191,12 +192,12 @@ pub use thread::{
     SandboxMode, SandboxPolicy, Thread, ThreadClosedNotification, ThreadFolder,
     ThreadFolderCreateParams, ThreadFolderCreateResponse, ThreadFolderDeleteParams,
     ThreadFolderDeleteResponse, ThreadFolderMoveParams, ThreadFolderMoveResponse, ThreadGetParams,
-    ThreadGetResponse, ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadHistoryParams,
-    ThreadHistoryResponse, ThreadMode, ThreadMoveParams, ThreadMoveResponse, ThreadOriginKind,
-    ThreadPlacement, ThreadSidebarVisibility, ThreadStartParams, ThreadStartResponse,
-    ThreadStartedNotification, ThreadStatus, ThreadTreeChangedNotification, ThreadTreeParams,
-    ThreadTreeResponse, ThreadUnsubscribeParams, ThreadUnsubscribeResponse,
-    ThreadUnsubscribeStatus, ThreadUpdateParams, ThreadUpdateResponse, ThreadUpdatedNotification,
+    ThreadGetResponse, ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadMode, ThreadMoveParams,
+    ThreadMoveResponse, ThreadOriginKind, ThreadPlacement, ThreadSidebarVisibility,
+    ThreadStartParams, ThreadStartResponse, ThreadStartedNotification, ThreadStatus,
+    ThreadTreeChangedNotification, ThreadTreeParams, ThreadTreeResponse, ThreadUnsubscribeParams,
+    ThreadUnsubscribeResponse, ThreadUnsubscribeStatus, ThreadUpdateParams, ThreadUpdateResponse,
+    ThreadUpdatedNotification,
 };
 pub use thread_agents_doc::{
     ThreadAgentsDocArchiveParams, ThreadAgentsDocArchiveResponse,
@@ -214,6 +215,13 @@ pub use thread_episodic::{
     ThreadEpisodicSearchMode, ThreadEpisodicSourceActorRole, ThreadEpisodicSourceContext,
     ThreadEpisodicSourceProvenance, ThreadEpisodicThreadId, ThreadEpisodicTurnId,
     ThreadEpisodicVisibility, ThreadEpisodicWorkspaceId,
+};
+pub use timeline::{
+    ThreadTimelineBlocksChangedNotification, ThreadTimelinePageParams, ThreadTimelinePageResponse,
+    TimelineBlock, TimelineBlockKind, TimelineChangeReason, TimelineCursor, TimelinePageAnchor,
+    TimelinePageInfo, TurnWorkBlock, TurnWorkItem, TurnWorkItemStatus,
+    TurnWorkItemsChangedNotification, TurnWorkPageParams, TurnWorkPageResponse,
+    TurnWorkPresentation, TurnWorkState, TurnWorkStateChangedNotification,
 };
 pub use turn::{
     AgentExecutionBackend, AgentMessagePhase, ByteRange, CLIAgentRuntimeApprovalPolicy,
@@ -237,25 +245,23 @@ pub use turn::{
     PromptManifestProfile, ProviderFailureClass, ProviderFailureDetails, ProviderFailureStage,
     ProviderTransportKind, ReasoningEffort, RecoveryAction, RecoveryJobStatus,
     RecoveryOutputPolicy, RecoveryTrigger, StaticStrictObligationCollector, StorageOutputPolicy,
-    StrictObligationCollector, SystemEventLevel, TextElement, TimelineItem, TimelineLane,
-    TimelineOrigin, TimelineOriginKind, TimelineOutputPolicy, TimelinePayload, ToolCallStatus,
-    ToolDisplayPayload, ToolErrorClass, ToolLoopBudgetAction, ToolLoopBudgetLimitKind,
-    ToolMetadata, ToolMetadataRawKind, ToolMetadataValue, ToolObservation, ToolOutcome,
-    ToolOutcomeStatus, ToolOutputPolicySnapshot, ToolOutputSummary, ToolRecoveryIdempotencyMode,
-    ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass, ToolRecoveryView, ToolRetryBudgetKind,
-    ToolRetryBudgetUsage, ToolRetryErrorClass, ToolRetryExhaustionKind, ToolRetryResolution,
-    ToolStoragePayload, Turn, TurnBlockedNotification, TurnBlockedResumeMetadata,
-    TurnCLIRuntimeOptions, TurnCancelParams, TurnCancelResponse, TurnCapability,
-    TurnCapabilityKind, TurnCompletedNotification, TurnExecutionWindowBlockedNotification,
-    TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
-    TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification,
-    TurnFailedNotification, TurnGetParams, TurnGetResponse, TurnItem, TurnItemAttemptStatus,
-    TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType, TurnItemsParams,
-    TurnItemsResponse, TurnKind, TurnMcpServerCapabilitySummary, TurnMcpToolCapabilitySummary,
-    TurnOrigin, TurnReasoningSelection, TurnResumeParams, TurnResumeResponse,
-    TurnSkillCapabilitySummary, TurnStartParams, TurnStartResponse, TurnStartedNotification,
-    TurnStatus, TurnStatusChangedNotification, TurnTimelineChangedNotification,
-    TurnTimelineChangedReason, TurnTimelineParams, TurnTimelineResponse,
+    StrictObligationCollector, SystemEventLevel, TextElement, TimelineLane, TimelineOrigin,
+    TimelineOriginKind, TimelineOutputPolicy, ToolCallStatus, ToolDisplayPayload, ToolErrorClass,
+    ToolLoopBudgetAction, ToolLoopBudgetLimitKind, ToolMetadata, ToolMetadataRawKind,
+    ToolMetadataValue, ToolObservation, ToolOutcome, ToolOutcomeStatus, ToolOutputPolicySnapshot,
+    ToolOutputSummary, ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot,
+    ToolRecoveryRetryClass, ToolRecoveryView, ToolRetryBudgetKind, ToolRetryBudgetUsage,
+    ToolRetryErrorClass, ToolRetryExhaustionKind, ToolRetryResolution, ToolStoragePayload, Turn,
+    TurnBlockedNotification, TurnBlockedResumeMetadata, TurnCLIRuntimeOptions, TurnCancelParams,
+    TurnCancelResponse, TurnCapability, TurnCapabilityKind, TurnCompletedNotification,
+    TurnExecutionWindowBlockedNotification, TurnExecutionWindowCheckpointedNotification,
+    TurnExecutionWindowContinuedNotification, TurnExecutionWindowExhaustedNotification,
+    TurnExecutionWindowStartedNotification, TurnFailedNotification, TurnGetParams, TurnGetResponse,
+    TurnItem, TurnItemAttemptStatus, TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason,
+    TurnItemType, TurnItemsParams, TurnItemsResponse, TurnKind, TurnMcpServerCapabilitySummary,
+    TurnMcpToolCapabilitySummary, TurnOrigin, TurnReasoningSelection, TurnResumeParams,
+    TurnResumeResponse, TurnSkillCapabilitySummary, TurnStartParams, TurnStartResponse,
+    TurnStartedNotification, TurnStatus, TurnStatusChangedNotification,
     TurnToolLoopBudgetExceededNotification, UserInput, UserMessageAttachment, WebFetchLink,
     WebSearchResultItem, build_execution_checkpoint_original_request_summary,
     build_execution_checkpoint_payload, build_execution_checkpoint_provider_budget_summary,

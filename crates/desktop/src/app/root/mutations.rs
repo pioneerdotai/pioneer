@@ -284,20 +284,6 @@ impl PioneerDesktop {
         thread_tree::take_thread_tree_refresh_request(&mut self.thread_list_refresh_requested)
     }
 
-    pub(in crate::app) fn set_thread_history_loading(&mut self, thread_id: &str, loading: bool) {
-        let Some(coordinator) = self.thread_coordinator_mut(thread_id) else {
-            return;
-        };
-        coordinator.history_loading = loading;
-    }
-
-    pub(in crate::app) fn mark_thread_history_loaded(&mut self, thread_id: &str, loaded: bool) {
-        let Some(coordinator) = self.thread_coordinator_mut(thread_id) else {
-            return;
-        };
-        coordinator.history_loaded = loaded;
-    }
-
     pub(in crate::app) fn remove_thread_conversation(&mut self, thread_id: &str) {
         let workspace_id = self.thread_workspace_id(thread_id).map(str::to_owned);
         client_state_reducers::remove_thread_scoped_entries(
@@ -308,8 +294,15 @@ impl PioneerDesktop {
             &mut self.thread_draft_attachments,
             &mut self.thread_draft_capabilities,
             &mut self.thread_placements,
-            &mut self.turn_timeline_refresh,
         );
+        if pioneer_client::timeline::semantic::remove_thread_semantic_timeline(
+            &mut self.semantic_timelines,
+            thread_id,
+        ) {
+            self.semantic_timeline_revision = self.semantic_timeline_revision.saturating_add(1);
+        }
+        self.semantic_timeline_in_flight
+            .retain(|key| !semantic_request_key_matches_thread(key, thread_id));
         if let Some(workspace_id) = workspace_id {
             self.cli_runtime_pending_requests.apply(
                 pioneer_client::cli_runtime::approvals::reduce_cli_runtime_thread_closed_cleanup(
@@ -340,8 +333,10 @@ impl PioneerDesktop {
             &mut self.thread_agents_doc_summaries,
             &mut self.thread_folder_expanded,
             &mut self.thread_tree_selected_node_id,
-            &mut self.turn_timeline_refresh,
         );
+        self.semantic_timelines = Default::default();
+        self.semantic_timeline_revision = self.semantic_timeline_revision.saturating_add(1);
+        self.semantic_timeline_in_flight.clear();
         self.clear_composer_reasoning_effort();
         self.composer_model_display_cache.clear();
         self.composer_model_display_loading_key = None;
@@ -434,5 +429,33 @@ impl PioneerDesktop {
             .fold(false, |changed, coordinator| {
                 coordinator.conversation.tick() || changed
             })
+    }
+}
+
+fn semantic_request_key_matches_thread(key: &SemanticTimelineRequestKey, thread_id: &str) -> bool {
+    match key {
+        SemanticTimelineRequestKey::ThreadNewest {
+            thread_id: request_thread_id,
+        }
+        | SemanticTimelineRequestKey::ThreadBefore {
+            thread_id: request_thread_id,
+            ..
+        }
+        | SemanticTimelineRequestKey::ThreadAfter {
+            thread_id: request_thread_id,
+            ..
+        }
+        | SemanticTimelineRequestKey::TurnWorkInitial {
+            thread_id: request_thread_id,
+            ..
+        }
+        | SemanticTimelineRequestKey::TurnWorkBefore {
+            thread_id: request_thread_id,
+            ..
+        }
+        | SemanticTimelineRequestKey::TurnWorkAfter {
+            thread_id: request_thread_id,
+            ..
+        } => request_thread_id == thread_id,
     }
 }

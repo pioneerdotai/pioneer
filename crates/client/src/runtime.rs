@@ -17,7 +17,7 @@ use crate::{
         McpServerCatalogChangedReduction, McpServerStatusChangedReduction, SkillsRefreshReduction,
         ThreadArtifactsRefreshReduction, ThreadClosedReduction, ThreadStartedContext,
         ThreadStartedReduction, ThreadUpdatedReduction, TurnLifecycleReduction,
-        TurnTimelineRefreshReduction, WorkspacePreferenceReduction, WorkspaceRefreshReduction,
+        WorkspacePreferenceReduction, WorkspaceRefreshReduction,
         apply_workspace_changed_to_catalog, reduce_artifact_created_notification,
         reduce_artifact_deleted_notification, reduce_artifact_updated_notification,
         reduce_cli_runtime_account_updated_notification,
@@ -44,13 +44,13 @@ use crate::{
         reduce_turn_execution_window_continued_notification,
         reduce_turn_execution_window_exhausted_notification,
         reduce_turn_execution_window_started_notification, reduce_turn_failed_notification,
-        reduce_turn_started_notification, reduce_turn_timeline_changed_notification,
-        reduce_turn_tool_loop_budget_exceeded_notification,
+        reduce_turn_started_notification, reduce_turn_tool_loop_budget_exceeded_notification,
         reduce_workspace_preference_after_catalog_change,
     },
     state::reducers::{
         GatewayConnectionEvent, GatewayConnectionReduction, reduce_gateway_connection_event,
     },
+    timeline::semantic::SemanticTimelineLiveUpdate,
     transport::ws::{
         GatewayWsClient, GatewayWsCommandSender, GatewayWsEvent, should_apply_ws_event,
     },
@@ -123,12 +123,12 @@ pub enum ClientRuntimeNotification {
     ThreadArtifactsRefresh(ThreadArtifactsRefreshReduction),
     ArtifactThreadRefresh(ArtifactThreadRefreshReduction),
     ArtifactDeletedRefresh(ArtifactDeletedRefreshReduction),
-    TurnTimelineRefresh(TurnTimelineRefreshReduction),
     CLIRuntimeRefresh(CLIRuntimeRefreshReduction),
     CLIRuntimePendingRequests {
         refresh: CLIRuntimeRefreshReduction,
         reduction: CLIRuntimePendingRequestsReduction,
     },
+    SemanticTimeline(SemanticTimelineLiveUpdate),
     GatewayRemoteAccessStatusChanged(GatewayRemoteAccessStatusChangedNotification),
     WorkspaceChanged {
         notification: WorkspaceChangedNotification,
@@ -547,11 +547,6 @@ pub fn reduce_gateway_notification(
                 ),
             ))
         }
-        GatewayNotification::TurnTimelineChanged(notification) => {
-            Some(ClientRuntimeNotification::TurnTimelineRefresh(
-                reduce_turn_timeline_changed_notification(notification),
-            ))
-        }
         GatewayNotification::WorkspaceChanged(notification) => {
             let mut workspaces = context.workspaces.to_vec();
             apply_workspace_changed_to_catalog(&mut workspaces, &notification);
@@ -607,6 +602,21 @@ pub fn reduce_gateway_notification(
         GatewayNotification::GatewayRemoteAccessStatusChanged(notification) => Some(
             ClientRuntimeNotification::GatewayRemoteAccessStatusChanged(notification),
         ),
+        GatewayNotification::ThreadTimelineBlocksChanged(notification) => {
+            Some(ClientRuntimeNotification::SemanticTimeline(
+                SemanticTimelineLiveUpdate::ThreadTimelineBlocksChanged(notification),
+            ))
+        }
+        GatewayNotification::TurnWorkItemsChanged(notification) => {
+            Some(ClientRuntimeNotification::SemanticTimeline(
+                SemanticTimelineLiveUpdate::TurnWorkItemsChanged(notification),
+            ))
+        }
+        GatewayNotification::TurnWorkStateChanged(notification) => {
+            Some(ClientRuntimeNotification::SemanticTimeline(
+                SemanticTimelineLiveUpdate::TurnWorkStateChanged(notification),
+            ))
+        }
         GatewayNotification::ContextCompressing(_)
         | GatewayNotification::ContextCompressed(_)
         | GatewayNotification::Unknown(_)
@@ -661,8 +671,8 @@ mod tests {
     use pioneer_protocol::{
         GatewayRemoteAccessErrorKind, GatewayRemoteAccessState,
         GatewayRemoteAccessStatusChangedNotification, GatewayRemoteAccessStatusSnapshot,
-        SkillsChangedNotification, UnknownGatewayNotification, Workspace, WorkspaceChangeKind,
-        WorkspaceChangedNotification,
+        SkillsChangedNotification, ThreadTimelineBlocksChangedNotification, TimelineChangeReason,
+        UnknownGatewayNotification, Workspace, WorkspaceChangeKind, WorkspaceChangedNotification,
     };
     use serde_json::json;
     use std::time::Duration;
@@ -964,6 +974,33 @@ mod tests {
         };
         assert_eq!(reduction.workspace_id, "ws_a");
         assert!(reduction.queue_skills_refresh);
+    }
+
+    #[test]
+    fn runtime_routes_semantic_timeline_notifications() {
+        let notification = GatewayNotification::ThreadTimelineBlocksChanged(
+            ThreadTimelineBlocksChangedNotification {
+                workspace_id: "ws_a".to_owned(),
+                thread_id: "thread_a".to_owned(),
+                changed_block_ids: vec!["block_a".to_owned()],
+                removed_block_ids: Vec::new(),
+                before_cursor: None,
+                after_cursor: None,
+                reason: TimelineChangeReason::LiveEvent,
+            },
+        );
+
+        let reduced =
+            reduce_gateway_notification(notification, ClientRuntimeNotificationContext::default());
+
+        let Some(ClientRuntimeNotification::SemanticTimeline(
+            SemanticTimelineLiveUpdate::ThreadTimelineBlocksChanged(notification),
+        )) = reduced
+        else {
+            panic!("expected semantic timeline reduction");
+        };
+        assert_eq!(notification.thread_id, "thread_a");
+        assert_eq!(notification.changed_block_ids, vec!["block_a"]);
     }
 
     #[test]

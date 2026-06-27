@@ -41,7 +41,10 @@ use pioneer_crud::{
     NewCliRuntimePendingRequest, NewCliRuntimeThreadBinding, NewCliRuntimeTurnBinding,
     ThreadAgentsDocSaveReason, TurnItemAttemptDeadlines, global_agent_memory_scope_key,
 };
-use pioneer_entity::{thread, thread_sandox_policy, turn, turn_input, turn_status_history};
+use pioneer_entity::{
+    thread, thread_sandox_policy, thread_timeline_block, turn, turn_input, turn_item,
+    turn_status_history, turn_work_item_projection, turn_work_projection,
+};
 use pioneer_hooks::{
     HookAwaitPolicy, HookCapabilities, HookCapability, HookContribution, HookDiagnosticCode,
     HookDiagnosticMessage, HookDomain, HookError, HookExecutionPolicy, HookFailurePolicy,
@@ -61,56 +64,56 @@ use pioneer_protocol::{
     CLIRuntimeThreadForkResponse, CLIRuntimeTurnSteerResponse, ExecutionWindowExhaustionReason,
     ExecutionWindowStatus, INVALID_REQUEST_CODE, ItemCompletedNotification, ItemDeltaNotification,
     ItemDeltaStream, ItemStartedNotification, ItemToolRetryScheduledNotification,
-    JsonRpcErrorResponse, JsonRpcNotification, JsonRpcResponse, McpChangedAction,
-    McpChangedNotification, McpInstallResponse, McpInstallResultStatus, McpInstallStatus,
-    McpListResponse, McpPolicySetResponse, McpRuntimeState, McpScopeKind, McpServerDetailsResponse,
-    McpServerStatus, McpSourceKind, McpTransportSummary, McpTurnBindingSummary,
-    McpUninstallResponse, MemoryActor, MemoryActorKind, MemoryCandidateDecision,
-    MemoryCandidateStatus, MemoryCandidatesDecideParams, MemoryCandidatesDecideResponse,
-    MemoryCandidatesListParams, MemoryCandidatesListResponse, MemoryCategory, MemoryChangeKind,
-    MemoryChangedNotification, MemoryForgetParams, MemoryForgetResponse, MemoryForgetTarget,
-    MemoryForgottenNotification, MemoryGetParams, MemoryGetResponse, MemoryListParams,
-    MemoryListResponse, MemoryRememberParams, MemoryRememberResponse, MemoryScope, MemoryScopeKind,
-    MemorySearchParams, MemorySearchResponse, MemorySensitivity, PromptManifest,
-    PromptManifestDiagnostic, PromptManifestDiagnosticCode, PromptManifestHookContributionKind,
-    PromptManifestHookPhase, PromptManifestHookSource, PromptManifestHookSourceEntry,
-    PromptManifestHookTruncation, PromptManifestProfile, ProviderDeleteApiKeyParams,
-    ProviderDeleteApiKeyResponse, ProviderFailureClass, ProviderFailureDetails,
-    ProviderFailureStage, ProviderListParams, ProviderListResponse, ProviderSetApiKeyParams,
-    ProviderSetApiKeyResponse, ProviderTransportKind, RecoveryAction, RecoveryJobStatus,
-    RecoveryTrigger, SandboxMode, SkillArchiveFormat, SkillAuditEvent as ProtocolSkillAuditEvent,
-    SkillListResponse, SkillsChangedNotification, SkillsHealthResponse, SkillsInstallResponse,
-    SkillsPolicySetResponse, SkillsUninstallResponse, SkillsUpdateResponse,
-    SkillsUploadAbortResponse, SkillsUploadChunkHeader, SkillsUploadFinishResponse,
-    SkillsUploadStartResponse, TaskAcceptResponse, TaskAgendaResponse, TaskAgentPrompt,
-    TaskAgentResultContract, TaskAgentResultFormat, TaskAgentReviewMode, TaskAgentReviewPolicy,
-    TaskAgentSpecInput, TaskAgentToolPolicy, TaskAgentWriteMode, TaskAttachmentMode,
-    TaskCompletionBehavior, TaskCreateParams, TaskDeliveriesParams, TaskDeliveriesResponse,
-    TaskDeliveryFormat, TaskDeliveryMode, TaskDeliveryPolicy, TaskDeliveryStatus, TaskEventPayload,
-    TaskExecutorKind, TaskLifecyclePolicy, TaskOwnerKind, TaskParentTerminalAction,
-    TaskPauseResponse, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
-    TaskResultReviewDecision, TaskResultReviewEventKind, TaskResultReviewResolutionStrategy,
-    TaskResultReviewerKind, TaskResumeResponse, TaskRetryBackoffKind, TaskRetryPolicy,
-    TaskReviseParams, TaskReviseResponse, TaskRun, TaskRunExecutionStatus, TaskRunStatus,
-    TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind,
-    TaskRunTurnStatus, TaskStatus, TaskThreadLineage, TaskTriggerInput, TaskTriggerKind,
-    TaskTriggerSpec, TaskTriggerStatus, TaskTurnItem, TaskValue, TaskWaitParams,
-    TaskWriteLockStatus, Thread, ThreadAgentsDocArchiveResponse, ThreadAgentsDocGetResponse,
-    ThreadAgentsDocResolveForThreadResponse, ThreadAgentsDocSaveResponse, ThreadAgentsDocStatus,
-    ThreadClosedNotification, ThreadFolderCreateResponse, ThreadFolderDeleteResponse,
-    ThreadFolderMoveResponse, ThreadHistoryEventPayload, ThreadHistoryResponse, ThreadMode,
-    ThreadMoveResponse, ThreadOriginKind, ThreadSidebarVisibility, ThreadStartParams,
-    ThreadStartResponse, ThreadStatus, ThreadTreeResponse, ThreadUnsubscribeResponse,
-    ThreadUnsubscribeStatus, ThreadUpdateResponse, TimelineOriginKind, ToolCallStatus,
-    ToolDisplayPayload, ToolMetadata, ToolOutputPolicySnapshot, ToolOutputSummary, ToolResultView,
-    ToolStoragePayload, Turn, TurnAcceptedCapability, TurnCancelResponse,
+    JsonRpcErrorResponse, JsonRpcNotification, JsonRpcResponse, METHOD_NOT_FOUND_CODE,
+    McpChangedAction, McpChangedNotification, McpInstallResponse, McpInstallResultStatus,
+    McpInstallStatus, McpListResponse, McpPolicySetResponse, McpRuntimeState, McpScopeKind,
+    McpServerDetailsResponse, McpServerStatus, McpSourceKind, McpTransportSummary,
+    McpTurnBindingSummary, McpUninstallResponse, MemoryActor, MemoryActorKind,
+    MemoryCandidateDecision, MemoryCandidateStatus, MemoryCandidatesDecideParams,
+    MemoryCandidatesDecideResponse, MemoryCandidatesListParams, MemoryCandidatesListResponse,
+    MemoryCategory, MemoryChangeKind, MemoryChangedNotification, MemoryForgetParams,
+    MemoryForgetResponse, MemoryForgetTarget, MemoryForgottenNotification, MemoryGetParams,
+    MemoryGetResponse, MemoryListParams, MemoryListResponse, MemoryRememberParams,
+    MemoryRememberResponse, MemoryScope, MemoryScopeKind, MemorySearchParams, MemorySearchResponse,
+    MemorySensitivity, PromptManifest, PromptManifestDiagnostic, PromptManifestDiagnosticCode,
+    PromptManifestHookContributionKind, PromptManifestHookPhase, PromptManifestHookSource,
+    PromptManifestHookSourceEntry, PromptManifestHookTruncation, PromptManifestProfile,
+    ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse, ProviderFailureClass,
+    ProviderFailureDetails, ProviderFailureStage, ProviderListParams, ProviderListResponse,
+    ProviderSetApiKeyParams, ProviderSetApiKeyResponse, ProviderTransportKind, RecoveryAction,
+    RecoveryJobStatus, RecoveryTrigger, SandboxMode, SkillArchiveFormat,
+    SkillAuditEvent as ProtocolSkillAuditEvent, SkillListResponse, SkillsChangedNotification,
+    SkillsHealthResponse, SkillsInstallResponse, SkillsPolicySetResponse, SkillsUninstallResponse,
+    SkillsUpdateResponse, SkillsUploadAbortResponse, SkillsUploadChunkHeader,
+    SkillsUploadFinishResponse, SkillsUploadStartResponse, TaskAcceptResponse, TaskAgendaResponse,
+    TaskAgentPrompt, TaskAgentResultContract, TaskAgentResultFormat, TaskAgentReviewMode,
+    TaskAgentReviewPolicy, TaskAgentSpecInput, TaskAgentToolPolicy, TaskAgentWriteMode,
+    TaskAttachmentMode, TaskCompletionBehavior, TaskCreateParams, TaskDeliveriesParams,
+    TaskDeliveriesResponse, TaskDeliveryFormat, TaskDeliveryMode, TaskDeliveryPolicy,
+    TaskDeliveryStatus, TaskEventPayload, TaskExecutorKind, TaskLifecyclePolicy, TaskOwnerKind,
+    TaskParentTerminalAction, TaskPauseResponse, TaskResult, TaskResultCandidate,
+    TaskResultCandidateStatus, TaskResultReviewDecision, TaskResultReviewEventKind,
+    TaskResultReviewResolutionStrategy, TaskResultReviewerKind, TaskResumeResponse,
+    TaskRetryBackoffKind, TaskRetryPolicy, TaskReviseParams, TaskReviseResponse, TaskRun,
+    TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind,
+    TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskStatus, TaskThreadLineage,
+    TaskTriggerInput, TaskTriggerKind, TaskTriggerSpec, TaskTriggerStatus, TaskTurnItem, TaskValue,
+    TaskWaitParams, TaskWriteLockStatus, Thread, ThreadAgentsDocArchiveResponse,
+    ThreadAgentsDocGetResponse, ThreadAgentsDocResolveForThreadResponse,
+    ThreadAgentsDocSaveResponse, ThreadAgentsDocStatus, ThreadClosedNotification,
+    ThreadFolderCreateResponse, ThreadFolderDeleteResponse, ThreadFolderMoveResponse,
+    ThreadHistoryEventPayload, ThreadMode, ThreadMoveResponse, ThreadOriginKind,
+    ThreadSidebarVisibility, ThreadStartParams, ThreadStartResponse, ThreadStatus,
+    ThreadTreeResponse, ThreadUnsubscribeResponse, ThreadUnsubscribeStatus, ThreadUpdateResponse,
+    ToolCallStatus, ToolDisplayPayload, ToolMetadata, ToolOutputPolicySnapshot, ToolOutputSummary,
+    ToolResultView, ToolStoragePayload, Turn, TurnAcceptedCapability, TurnCancelResponse,
     TurnCapabilityAcceptedReason, TurnCapabilityKind, TurnCapabilityRejectedReason,
     TurnCompletedNotification, TurnFailedNotification, TurnGetResponse, TurnItem,
     TurnItemEventPayload, TurnItemType, TurnKind, TurnOrigin, TurnRejectedCapability,
-    TurnSkillBinding, TurnStartResponse, TurnStatus, TurnTimelineParams, TurnTimelineResponse,
-    UserInput, UserMessageAttachment, WorkspaceChangeKind, WorkspaceChangedNotification,
-    WorkspaceCreateResponse, WorkspaceDefaultResponse, WorkspaceListResponse,
-    WorkspaceSelectResponse, WorkspaceUpdateResponse, constants::events,
+    TurnSkillBinding, TurnStartResponse, TurnStatus, UserInput, UserMessageAttachment,
+    WorkspaceChangeKind, WorkspaceChangedNotification, WorkspaceCreateResponse,
+    WorkspaceDefaultResponse, WorkspaceListResponse, WorkspaceSelectResponse,
+    WorkspaceUpdateResponse, constants::events,
 };
 use pioneer_provider::providers::EchoProvider;
 use pioneer_provider::{
@@ -122,14 +125,18 @@ use pioneer_tools::{
     BuiltinTools, ComputerUseToolsConfig, RawToolCall, ToolError, ToolLoopBudgetConfig,
     ToolRetryBudgetConfig, WebToolsConfig, build_tools,
 };
+use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, Query};
-use sea_orm::{ColumnTrait, ConnectionTrait, Database, EntityTrait, QueryFilter};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, Database, DatabaseTransaction, EntityTrait, QueryFilter, Set,
+    TransactionTrait,
+};
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex as TokioMutex, Notify, mpsc};
@@ -8146,52 +8153,6 @@ async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn() {
         .expect("creation turn should still exist");
     assert_eq!(old_creation_turn.turn_kind, TurnKind::Conversation);
     assert_eq!(old_creation_turn.status, TurnStatus::Completed);
-
-    let creation_timeline = processor
-        .compose_turn_timeline_for_test(TurnTimelineParams {
-            thread_id: parent_thread_id.to_owned(),
-            turn_id: creation_turn_id.to_owned(),
-            compose_tasks: true,
-            include_collapsed_task_events: true,
-            max_child_items_per_task: None,
-        })
-        .await
-        .expect("creation turn/timeline should compose")
-        .expect("creation turn/timeline should exist");
-    assert!(
-        creation_timeline.items.iter().all(|item| {
-            item.origin.kind != TimelineOriginKind::ChildTurn
-                && item.origin.run_id.as_deref() != Some(run.id.as_str())
-        }),
-        "creation turn timeline must not compose future scheduled run activity"
-    );
-
-    let occurrence_timeline = processor
-        .compose_turn_timeline_for_test(TurnTimelineParams {
-            thread_id: parent_thread_id.to_owned(),
-            turn_id: run.id.clone(),
-            compose_tasks: true,
-            include_collapsed_task_events: true,
-            max_child_items_per_task: None,
-        })
-        .await
-        .expect("occurrence turn/timeline should compose")
-        .expect("occurrence turn/timeline should exist");
-    assert!(
-        occurrence_timeline
-            .items
-            .iter()
-            .any(|item| item.origin.kind == TimelineOriginKind::TaskEvent
-                && item.origin.run_id.as_deref() == Some(run.id.as_str())),
-        "occurrence turn timeline should include the scheduled run lifecycle"
-    );
-    assert!(
-        occurrence_timeline
-            .items
-            .iter()
-            .any(|item| item.origin.kind == TimelineOriginKind::ChildTurn),
-        "occurrence turn timeline should include scheduled child turn activity"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8595,11 +8556,11 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
 }
 
 #[test]
-fn task_create_tool_persists_anchor_and_composed_timeline() {
+fn task_create_tool_persists_anchor_and_rejects_legacy_timeline() {
     run_gateway_message_test(
-        "task_create_tool_persists_anchor_and_composed_timeline",
+        "task_create_tool_persists_anchor_and_rejects_legacy_timeline",
         || async {
-            task_create_tool_persists_anchor_and_composed_timeline_impl().await;
+            task_create_tool_persists_anchor_and_rejects_legacy_timeline_impl().await;
         },
     );
 }
@@ -8698,7 +8659,7 @@ async fn task_create_tool_idempotency_key_deduplicates_parallel_mutations_impl()
     );
 }
 
-async fn task_create_tool_persists_anchor_and_composed_timeline_impl() {
+async fn task_create_tool_persists_anchor_and_rejects_legacy_timeline_impl() {
     let (tx, mut rx) = mpsc::channel(128);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = session_manager.register_connection(tx).await;
@@ -8829,30 +8790,8 @@ async fn task_create_tool_persists_anchor_and_composed_timeline_impl() {
     processor
         .process_request(connection_id, &timeline_request.to_string())
         .await;
-    let timeline_response = recv_response_by_id(&mut rx, "turntimelinephase4001").await;
-    let timeline: TurnTimelineResponse = serde_json::from_value(timeline_response.result)
-        .expect("turn/timeline response should decode");
-    assert!(timeline.items.iter().any(|item| {
-        item.origin.kind == TimelineOriginKind::ParentTurn
-            && matches!(
-                item.payload,
-                pioneer_protocol::TimelinePayload::TurnItemEvent { .. }
-            )
-    }));
-    assert!(
-        timeline
-            .items
-            .iter()
-            .any(|item| item.origin.kind == TimelineOriginKind::TaskEvent),
-        "composed timeline should include task lifecycle events"
-    );
-    assert!(
-        timeline
-            .items
-            .iter()
-            .any(|item| item.origin.kind == TimelineOriginKind::ChildTurn),
-        "composed timeline should include child turn events"
-    );
+    let timeline_error = recv_error_by_id(&mut rx, "turntimelinephase4001").await;
+    assert_eq!(timeline_error.error.code, METHOD_NOT_FOUND_CODE);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -18600,12 +18539,12 @@ fn thread_agents_doc_rpc_rejects_large_content_and_version_conflicts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn thread_history_returns_materialized_history() {
+async fn thread_history_is_not_a_reachable_timeline_api() {
     let (tx, mut rx) = mpsc::channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = session_manager.register_connection(tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
-    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let (workspace_manager, crud_store, _workspace_id) = setup_workspace_manager().await;
     let processor = MessageProcessor::new(
         thread_manager,
         test_provider(),
@@ -18617,38 +18556,6 @@ async fn thread_history_returns_materialized_history() {
         test_context_budget(),
         test_tool_loop_config(),
     );
-
-    let thread_start_request = json!({
-        "jsonrpc": "2.0",
-        "id": "aaaaaaaaaaaaaaaaaaaaa",
-        "method": "thread/start",
-        "params": {
-            "thread_id": "thr_000000000000000032",
-            "workspace_id": workspace_id
-        }
-    });
-    processor
-        .process_request(connection_id, &thread_start_request.to_string())
-        .await;
-    let _ = recv_response_by_id(&mut rx, "aaaaaaaaaaaaaaaaaaaaa").await;
-    let _ = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
-
-    let turn_start_request = json!({
-        "jsonrpc": "2.0",
-        "id": "bbbbbbbbbbbbbbbbbbbbb",
-        "method": "turn/start",
-        "params": {
-            "thread_id": "thr_000000000000000032",
-            "turn_id": "turn_000000000000000032",
-            "input": [{"type": "text", "text": "history message"}]
-        }
-    });
-    processor
-        .process_request(connection_id, &turn_start_request.to_string())
-        .await;
-    let _ = recv_response_by_id(&mut rx, "bbbbbbbbbbbbbbbbbbbbb").await;
-    let _ = recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
-    let _ = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
 
     let thread_history_request = json!({
         "jsonrpc": "2.0",
@@ -18663,58 +18570,11 @@ async fn thread_history_returns_materialized_history() {
         .process_request(connection_id, &thread_history_request.to_string())
         .await;
 
-    let response = recv_response_by_id(&mut rx, "ccccccccccccccccccccc").await;
-    let history: ThreadHistoryResponse =
-        serde_json::from_value(response.result).expect("thread/history result should decode");
-
-    let has_turn_started = history.events.iter().any(|event| {
-        matches!(
-            &event.payload,
-            ThreadHistoryEventPayload::TurnStarted { turn, input, .. }
-                if turn.id == "turn_000000000000000032"
-                    && input.iter().any(|value| matches!(
-                        value,
-                        UserInput::Text { text, .. } if text == "history message"
-                    ))
-        )
-    });
-    let has_agent_item_completed = history.events.iter().any(|event| {
-        matches!(
-            &event.payload,
-            ThreadHistoryEventPayload::ItemCompleted { item, .. }
-                if matches!(item, pioneer_protocol::TurnItem::AgentMessage { text, .. } if text == "history message")
-        )
-    });
-    let has_reasoning_item = history.events.iter().any(|event| {
-        matches!(
-            &event.payload,
-            ThreadHistoryEventPayload::ItemStarted { item, .. }
-                if matches!(item, pioneer_protocol::TurnItem::Reasoning { .. })
-        )
-    });
-    let has_user_item = history.events.iter().any(|event| {
-        matches!(
-            &event.payload,
-            ThreadHistoryEventPayload::ItemCompleted { item, .. }
-                if matches!(item, pioneer_protocol::TurnItem::UserMessage { text, .. } if text == "history message")
-        )
-    });
-
+    let response = recv_error_by_id(&mut rx, "ccccccccccccccccccccc").await;
+    assert_eq!(response.error.code, METHOD_NOT_FOUND_CODE);
     assert!(
-        has_turn_started,
-        "thread/history must include turn/started with original user input"
-    );
-    assert!(
-        has_agent_item_completed,
-        "thread/history must include completed assistant item"
-    );
-    assert!(
-        has_reasoning_item,
-        "thread/history must include reasoning item events"
-    );
-    assert!(
-        has_user_item,
-        "thread/history must include user message item events"
+        response.error.message.contains("thread/history"),
+        "error should identify removed raw timeline method"
     );
 }
 
@@ -18810,6 +18670,1978 @@ async fn turn_items_returns_stream_events_for_resume() {
         !turn_items.events.is_empty(),
         "turn/items should return at least one item stream event"
     );
+}
+
+struct SemanticTimelineQueryHarness {
+    processor: MessageProcessor,
+    connection_id: ConnectionId,
+    rx: mpsc::Receiver<Message>,
+    sandbox_thread_id: String,
+    sandbox_turn_id: String,
+    site_thread_id: String,
+    site_turn_id: String,
+    synthetic_large_thread_id: String,
+    synthetic_large_turn_id: String,
+    synthetic_long_thread_id: String,
+}
+
+struct LiveSemanticTimelineHarness {
+    processor: MessageProcessor,
+    connection_id: ConnectionId,
+    rx: mpsc::Receiver<Message>,
+    workspace_id: String,
+    thread_id: String,
+    turn_id: String,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_timeline_page_returns_semantic_blocks_without_work_flood() {
+    let mut harness = setup_semantic_timeline_query_harness().await;
+    let request_id = generate_test_request_id("semantic", "top");
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "thread/timeline/page",
+        "params": {
+            "threadId": harness.sandbox_thread_id,
+            "anchor": { "kind": "newest" },
+            "limit": 10
+        }
+    });
+
+    harness
+        .processor
+        .process_request(harness.connection_id, &request.to_string())
+        .await;
+    let response = recv_response_by_id(&mut harness.rx, request_id.as_str()).await;
+    let page: pioneer_protocol::ThreadTimelinePageResponse =
+        serde_json::from_value(response.result).expect("thread/timeline/page should decode");
+
+    assert_eq!(page.thread_id, harness.sandbox_thread_id);
+    assert!(
+        page.blocks.len() <= 3,
+        "top-level semantic page must not return raw work rows: {} blocks",
+        page.blocks.len()
+    );
+    assert!(page.blocks.iter().any(|block| {
+        matches!(
+            &block.kind,
+            pioneer_protocol::TimelineBlockKind::UserMessage { text, .. }
+                if text.contains("Sandboxing")
+        )
+    }));
+
+    let work = page
+        .blocks
+        .iter()
+        .find_map(|block| match &block.kind {
+            pioneer_protocol::TimelineBlockKind::TurnWork { work } => Some(work),
+            _ => None,
+        })
+        .expect("sandboxing page should contain work block");
+    assert_eq!(work.turn_id, harness.sandbox_turn_id);
+    assert_eq!(
+        work.presentation,
+        pioneer_protocol::TurnWorkPresentation::ExpandedLive
+    );
+    assert_eq!(work.state, pioneer_protocol::TurnWorkState::Running);
+    assert!(work.visible_work_count >= 25);
+    assert!(work.hidden_work_count >= 1);
+
+    let payload = serde_json::to_string(&page).expect("page should serialize");
+    assert!(
+        payload.matches("semantic_cmd_").count() <= 2,
+        "top-level page leaked work item flood: {payload}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_timeline_page_returns_collapsed_work_and_final_markdown() {
+    let mut harness = setup_semantic_timeline_query_harness().await;
+    let request_id = generate_test_request_id("semantic", "site");
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "thread/timeline/page",
+        "params": {
+            "threadId": harness.site_thread_id,
+            "anchor": { "kind": "oldest" },
+            "limit": 10
+        }
+    });
+
+    harness
+        .processor
+        .process_request(harness.connection_id, &request.to_string())
+        .await;
+    let response = recv_response_by_id(&mut harness.rx, request_id.as_str()).await;
+    let page: pioneer_protocol::ThreadTimelinePageResponse =
+        serde_json::from_value(response.result).expect("thread/timeline/page should decode");
+
+    assert_eq!(page.blocks.len(), 3);
+    assert!(matches!(
+        &page.blocks[0].kind,
+        pioneer_protocol::TimelineBlockKind::UserMessage { text, .. }
+            if text.contains("Сайт")
+    ));
+    let work = match &page.blocks[1].kind {
+        pioneer_protocol::TimelineBlockKind::TurnWork { work } => work,
+        other => panic!("second block should be turn work, got {other:?}"),
+    };
+    assert_eq!(work.turn_id, harness.site_turn_id);
+    assert_eq!(
+        work.presentation,
+        pioneer_protocol::TurnWorkPresentation::CollapsedAfterFinal
+    );
+    assert_eq!(work.state, pioneer_protocol::TurnWorkState::Blocked);
+
+    let assistant = match &page.blocks[2].kind {
+        pioneer_protocol::TimelineBlockKind::AssistantMessage { text, markdown, .. } => {
+            (text, markdown)
+        }
+        other => panic!("third block should be assistant message, got {other:?}"),
+    };
+    assert!(assistant.0.contains("Final **markdown**"));
+    assert!(
+        assistant
+            .1
+            .as_ref()
+            .is_some_and(|markdown| !markdown.blocks.is_empty()),
+        "final assistant markdown AST must be present"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_work_page_is_bounded_and_filters_hidden_rows() {
+    let mut harness = setup_semantic_timeline_query_harness().await;
+    let first_request_id = generate_test_request_id("semantic", "worka");
+    let first_request = json!({
+        "jsonrpc": "2.0",
+        "id": first_request_id,
+        "method": "turn/work/page",
+        "params": {
+            "threadId": harness.sandbox_thread_id,
+            "turnId": harness.sandbox_turn_id,
+            "anchor": { "kind": "oldest" },
+            "limit": 5
+        }
+    });
+
+    harness
+        .processor
+        .process_request(harness.connection_id, &first_request.to_string())
+        .await;
+    let first_response = recv_response_by_id(&mut harness.rx, first_request_id.as_str()).await;
+    let first_page: pioneer_protocol::TurnWorkPageResponse =
+        serde_json::from_value(first_response.result).expect("turn/work/page should decode");
+
+    assert_eq!(first_page.items.len(), 5);
+    assert!(first_page.page.has_more_after);
+    assert!(first_page.work.visible_work_count > first_page.items.len() as u64);
+    assert_eq!(
+        first_page.work.first_work_item_id.as_deref(),
+        first_page
+            .items
+            .first()
+            .map(|item| item.work_item_id.as_str()),
+        "work block first cursor must point at the first visible work row"
+    );
+    assert!(
+        first_page
+            .items
+            .iter()
+            .all(|item| { !matches!(item.item, pioneer_protocol::TurnItem::SystemEvent { .. }) })
+    );
+    let first_payload = serde_json::to_string(&first_page).expect("work page should serialize");
+    assert!(
+        !first_payload.contains("thread/tokenUsage/updated"),
+        "hidden internal system event leaked into visible work page"
+    );
+
+    let second_request_id = generate_test_request_id("semantic", "workb");
+    let second_request = json!({
+        "jsonrpc": "2.0",
+        "id": second_request_id,
+        "method": "turn/work/page",
+        "params": {
+            "threadId": harness.sandbox_thread_id,
+            "turnId": harness.sandbox_turn_id,
+            "anchor": {
+                "kind": "after",
+                "cursor": first_page.page.after_cursor.expect("first page should have after cursor")
+            },
+            "limit": 5
+        }
+    });
+    harness
+        .processor
+        .process_request(harness.connection_id, &second_request.to_string())
+        .await;
+    let second_response = recv_response_by_id(&mut harness.rx, second_request_id.as_str()).await;
+    let second_page: pioneer_protocol::TurnWorkPageResponse =
+        serde_json::from_value(second_response.result).expect("turn/work/page should decode");
+    assert_eq!(second_page.items.len(), 5);
+    assert_ne!(
+        first_page.items[0].work_item_id,
+        second_page.items[0].work_item_id
+    );
+
+    let newest_request_id = generate_test_request_id("semantic", "workc");
+    let newest_request = json!({
+        "jsonrpc": "2.0",
+        "id": newest_request_id,
+        "method": "turn/work/page",
+        "params": {
+            "threadId": harness.sandbox_thread_id,
+            "turnId": harness.sandbox_turn_id,
+            "anchor": { "kind": "newest" },
+            "limit": 3
+        }
+    });
+    harness
+        .processor
+        .process_request(harness.connection_id, &newest_request.to_string())
+        .await;
+    let newest_response = recv_response_by_id(&mut harness.rx, newest_request_id.as_str()).await;
+    let newest_page: pioneer_protocol::TurnWorkPageResponse =
+        serde_json::from_value(newest_response.result).expect("turn/work/page should decode");
+    assert_eq!(
+        newest_page.work.last_work_item_id.as_deref(),
+        newest_page
+            .items
+            .last()
+            .map(|item| item.work_item_id.as_str()),
+        "work block last cursor must point at the last visible row by order key"
+    );
+    assert!(
+        newest_page
+            .items
+            .iter()
+            .any(|item| item.status == pioneer_protocol::TurnWorkItemStatus::Running),
+        "newest work page should preserve running command state"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn synthetic_large_turn_work_page_remains_bounded() {
+    let mut harness = setup_semantic_timeline_query_harness_with_synthetic().await;
+    let large_thread_id = harness.synthetic_large_thread_id.clone();
+    let large_turn_id = harness.synthetic_large_turn_id.clone();
+
+    let top_level_started = Instant::now();
+    let top_level_page = request_semantic_thread_timeline_page(
+        &mut harness,
+        "large-top",
+        large_thread_id.clone(),
+        json!({ "kind": "newest" }),
+        10,
+    )
+    .await;
+    let top_level_elapsed = top_level_started.elapsed();
+    assert!(
+        top_level_elapsed < Duration::from_secs(5),
+        "large turn top-level query should stay bounded, took {top_level_elapsed:?}"
+    );
+    assert_eq!(top_level_page.thread_id, harness.synthetic_large_thread_id);
+    assert!(
+        top_level_page.blocks.len() <= 3,
+        "top-level page must not include raw work rows: {} blocks",
+        top_level_page.blocks.len()
+    );
+    assert!(!top_level_page.page.has_more_after);
+
+    let work = top_level_page
+        .blocks
+        .iter()
+        .find_map(|block| match &block.kind {
+            pioneer_protocol::TimelineBlockKind::TurnWork { work } => Some(work),
+            _ => None,
+        })
+        .expect("synthetic large top-level page should contain work block");
+    assert_eq!(work.turn_id, large_turn_id);
+    assert_eq!(work.work_count, 70_000);
+    assert_eq!(work.visible_work_count, 69_300);
+    assert_eq!(work.hidden_work_count, 700);
+    assert_eq!(
+        work.presentation,
+        pioneer_protocol::TurnWorkPresentation::ExpandedLive
+    );
+    assert_eq!(work.state, pioneer_protocol::TurnWorkState::Running);
+
+    let top_level_payload =
+        serde_json::to_string(&top_level_page).expect("top-level page should serialize");
+    assert!(
+        top_level_payload.len() < 64 * 1024,
+        "large turn top-level payload should stay small, got {} bytes",
+        top_level_payload.len()
+    );
+    assert!(
+        !top_level_payload.contains("\"kind\":\"command_execution\"")
+            && !top_level_payload.contains("\"arguments\":{\"command\"")
+            && !top_level_payload.contains("\"command\":[\"echo\",\"hello\"]"),
+        "top-level semantic page leaked raw synthetic work item payloads"
+    );
+
+    let work_started = Instant::now();
+    let work_page = request_semantic_turn_work_page(
+        &mut harness,
+        "large-work",
+        large_thread_id,
+        large_turn_id,
+        json!({ "kind": "oldest" }),
+        100,
+    )
+    .await;
+    let work_elapsed = work_started.elapsed();
+    assert!(
+        work_elapsed < Duration::from_secs(5),
+        "large turn work query should stay bounded, took {work_elapsed:?}"
+    );
+    assert_eq!(work_page.items.len(), 100);
+    assert_eq!(work_page.work.work_count, 70_000);
+    assert_eq!(work_page.work.visible_work_count, 69_300);
+    assert_eq!(work_page.work.hidden_work_count, 700);
+    assert!(!work_page.page.has_more_before);
+    assert!(work_page.page.has_more_after);
+    assert!(
+        work_page.items.iter().all(|item| {
+            item.status == pioneer_protocol::TurnWorkItemStatus::Completed
+                && item.item_type == TurnItemType::CommandExecution
+                && !matches!(item.item, pioneer_protocol::TurnItem::SystemEvent { .. })
+        }),
+        "turn/work/page must return only visible work items"
+    );
+
+    let work_payload = serde_json::to_string(&work_page).expect("work page should serialize");
+    assert!(
+        work_payload.len() < 512 * 1024,
+        "large turn work payload should stay bounded, got {} bytes",
+        work_payload.len()
+    );
+    assert!(
+        !work_payload.contains("thread/tokenUsage/updated"),
+        "hidden synthetic system events leaked into turn/work/page"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn synthetic_long_thread_timeline_page_remains_bounded() {
+    let mut harness = setup_semantic_timeline_query_harness_with_synthetic().await;
+    let long_thread_id = harness.synthetic_long_thread_id.clone();
+
+    let newest_started = Instant::now();
+    let newest_page = request_semantic_thread_timeline_page(
+        &mut harness,
+        "long-newest",
+        long_thread_id.clone(),
+        json!({ "kind": "newest" }),
+        20,
+    )
+    .await;
+    let newest_elapsed = newest_started.elapsed();
+    assert!(
+        newest_elapsed < Duration::from_secs(5),
+        "1,000-turn newest query should stay bounded, took {newest_elapsed:?}"
+    );
+    assert_eq!(newest_page.thread_id, harness.synthetic_long_thread_id);
+    assert_eq!(newest_page.blocks.len(), 20);
+    assert!(newest_page.page.has_more_before);
+    assert!(!newest_page.page.has_more_after);
+    assert!(
+        newest_page.blocks.iter().any(|block| matches!(
+            block.kind,
+            pioneer_protocol::TimelineBlockKind::TurnWork { .. }
+        )),
+        "newest page should include semantic work summary blocks"
+    );
+
+    let newest_payload =
+        serde_json::to_string(&newest_page).expect("long thread page should serialize");
+    assert!(
+        newest_payload.len() < 256 * 1024,
+        "1,000-turn top-level payload should stay bounded, got {} bytes",
+        newest_payload.len()
+    );
+    assert!(
+        !newest_payload.contains("\"kind\":\"command_execution\"")
+            && !newest_payload.contains("\"arguments\":{\"command\"")
+            && !newest_payload.contains("\"command\":[\"echo\",\"hello\"]"),
+        "top-level long-thread page leaked raw work item payloads"
+    );
+
+    let before_cursor = newest_page
+        .page
+        .before_cursor
+        .expect("newest page should expose before cursor for older blocks");
+    let before_page = request_semantic_thread_timeline_page(
+        &mut harness,
+        "long-before",
+        long_thread_id,
+        json!({
+            "kind": "before",
+            "cursor": before_cursor
+        }),
+        20,
+    )
+    .await;
+    assert_eq!(before_page.blocks.len(), 20);
+    assert!(before_page.page.has_more_before);
+    assert!(before_page.page.has_more_after);
+    assert_ne!(
+        newest_page.blocks[0].block_id, before_page.blocks[0].block_id,
+        "cursor pagination should move to a different bounded block window"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn semantic_timeline_large_payloads_stay_websocket_safe_at_max_limits() {
+    let mut harness = setup_semantic_timeline_query_harness_with_synthetic().await;
+    let large_thread_id = harness.synthetic_large_thread_id.clone();
+    let large_turn_id = harness.synthetic_large_turn_id.clone();
+    let long_thread_id = harness.synthetic_long_thread_id.clone();
+
+    let (large_top_payload, large_top_page) = request_semantic_thread_timeline_raw_page(
+        &mut harness,
+        "payload-large-top",
+        large_thread_id.clone(),
+        json!({ "kind": "oldest" }),
+        100,
+    )
+    .await;
+    assert!(
+        large_top_payload.len() < SEMANTIC_THREAD_TIMELINE_WS_SAFE_BYTES,
+        "large turn top-level websocket payload should stay bounded, got {} bytes",
+        large_top_payload.len()
+    );
+    assert!(large_top_page.blocks.len() <= 3);
+    assert!(
+        !large_top_payload.contains("\"kind\":\"command_execution\"")
+            && !large_top_payload.contains("\"arguments\":{\"command\"")
+            && !large_top_payload.contains("\"command\":[\"echo\",\"hello\"]"),
+        "top-level payload leaked raw large-turn work item payloads"
+    );
+
+    let (large_work_payload, large_work_page) = request_semantic_turn_work_raw_page(
+        &mut harness,
+        "payload-large-work",
+        large_thread_id,
+        large_turn_id,
+        json!({ "kind": "oldest" }),
+        200,
+    )
+    .await;
+    assert!(
+        large_work_payload.len() < SEMANTIC_TURN_WORK_WS_SAFE_BYTES,
+        "large turn work websocket payload should stay bounded, got {} bytes",
+        large_work_payload.len()
+    );
+    assert_eq!(large_work_page.items.len(), 200);
+    assert_eq!(large_work_page.work.work_count, 70_000);
+    assert!(large_work_page.page.has_more_after);
+    assert!(
+        large_work_page
+            .items
+            .iter()
+            .all(|item| item.item_type == TurnItemType::CommandExecution),
+        "hidden system event flood must not create visible work items"
+    );
+    assert!(
+        !large_work_payload.contains("thread/tokenUsage/updated"),
+        "hidden system event flood leaked into websocket payload"
+    );
+
+    let (long_thread_payload, long_thread_page) = request_semantic_thread_timeline_raw_page(
+        &mut harness,
+        "payload-long-top",
+        long_thread_id,
+        json!({ "kind": "newest" }),
+        100,
+    )
+    .await;
+    assert!(
+        long_thread_payload.len() < SEMANTIC_THREAD_TIMELINE_WS_SAFE_BYTES,
+        "1,000-turn websocket payload should stay bounded, got {} bytes",
+        long_thread_payload.len()
+    );
+    assert_eq!(long_thread_page.blocks.len(), 100);
+    assert!(long_thread_page.page.has_more_before);
+    assert!(
+        !long_thread_payload.contains("\"kind\":\"command_execution\"")
+            && !long_thread_payload.contains("\"arguments\":{\"command\"")
+            && !long_thread_payload.contains("\"command\":[\"echo\",\"hello\"]"),
+        "long-thread top-level payload leaked raw work item payloads"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn semantic_timeline_rejects_excessive_limits_before_payload_growth() {
+    let mut harness = setup_semantic_timeline_query_harness_with_synthetic().await;
+    let large_thread_id = harness.synthetic_large_thread_id.clone();
+    let large_turn_id = harness.synthetic_large_turn_id.clone();
+    let long_thread_id = harness.synthetic_long_thread_id.clone();
+
+    let (thread_payload, thread_error) = request_semantic_jsonrpc_error(
+        &mut harness,
+        "limit-thread",
+        "thread/timeline/page",
+        json!({
+            "threadId": long_thread_id,
+            "anchor": { "kind": "newest" },
+            "limit": 101
+        }),
+    )
+    .await;
+    assert_eq!(
+        thread_error.error.code,
+        pioneer_protocol::INVALID_PARAMS_CODE
+    );
+    assert!(
+        thread_error
+            .error
+            .message
+            .contains("`limit` must be <= 100"),
+        "unexpected thread/timeline/page limit error: {}",
+        thread_error.error.message
+    );
+    assert!(
+        thread_payload.len() < 8 * 1024,
+        "limit error payload should stay small, got {} bytes",
+        thread_payload.len()
+    );
+
+    let (work_payload, work_error) = request_semantic_jsonrpc_error(
+        &mut harness,
+        "limit-work",
+        "turn/work/page",
+        json!({
+            "threadId": large_thread_id,
+            "turnId": large_turn_id,
+            "anchor": { "kind": "oldest" },
+            "limit": 201
+        }),
+    )
+    .await;
+    assert_eq!(work_error.error.code, pioneer_protocol::INVALID_PARAMS_CODE);
+    assert!(
+        work_error.error.message.contains("`limit` must be <= 200"),
+        "unexpected turn/work/page limit error: {}",
+        work_error.error.message
+    );
+    assert!(
+        work_payload.len() < 8 * 1024,
+        "limit error payload should stay small, got {} bytes",
+        work_payload.len()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_semantic_timeline_projects_running_item_without_backfill() {
+    let mut harness = setup_live_semantic_timeline_harness("running").await;
+    let item_id = "semantic_live_running_cmd";
+    let item = command_execution_item(item_id);
+
+    harness
+        .processor
+        .handle_durable_agent_event(AgentDurableEvent::ItemStarted {
+            notification: ItemStartedNotification {
+                workspace_id: harness.workspace_id.clone(),
+                thread_id: harness.thread_id.clone(),
+                turn_id: harness.turn_id.clone(),
+                item,
+            },
+        })
+        .await;
+
+    let _item_started = recv_notification_by_method(&mut harness.rx, events::ITEM_STARTED).await;
+    let blocks_changed =
+        recv_notification_by_method(&mut harness.rx, events::THREAD_TIMELINE_BLOCKS_CHANGED).await;
+    let blocks_changed: pioneer_protocol::ThreadTimelineBlocksChangedNotification =
+        serde_json::from_value(
+            blocks_changed
+                .params
+                .expect("timeline blocks notification should include params"),
+        )
+        .expect("timeline blocks notification should decode");
+    assert_eq!(blocks_changed.thread_id, harness.thread_id);
+    assert_eq!(
+        blocks_changed.changed_block_ids,
+        vec![pioneer_crud::work_block_id(harness.turn_id.as_str())]
+    );
+    assert!(blocks_changed.removed_block_ids.is_empty());
+
+    let items_changed =
+        recv_notification_by_method(&mut harness.rx, events::TURN_WORK_ITEMS_CHANGED).await;
+    let items_changed: pioneer_protocol::TurnWorkItemsChangedNotification = serde_json::from_value(
+        items_changed
+            .params
+            .expect("work items notification should include params"),
+    )
+    .expect("work items notification should decode");
+    assert_eq!(items_changed.thread_id, harness.thread_id);
+    assert_eq!(items_changed.turn_id, harness.turn_id);
+    assert_eq!(
+        items_changed.changed_work_item_ids,
+        vec![pioneer_crud::work_item_projection_id(
+            harness.turn_id.as_str(),
+            item_id
+        )]
+    );
+    assert!(items_changed.removed_work_item_ids.is_empty());
+
+    let state_changed =
+        recv_notification_by_method(&mut harness.rx, events::TURN_WORK_STATE_CHANGED).await;
+    let state_changed: pioneer_protocol::TurnWorkStateChangedNotification = serde_json::from_value(
+        state_changed
+            .params
+            .expect("work state notification should include params"),
+    )
+    .expect("work state notification should decode");
+    assert_eq!(state_changed.thread_id, harness.thread_id);
+    assert_eq!(state_changed.turn_id, harness.turn_id);
+    assert_eq!(
+        state_changed.work.presentation,
+        pioneer_protocol::TurnWorkPresentation::ExpandedLive
+    );
+    assert_eq!(
+        state_changed.work.state,
+        pioneer_protocol::TurnWorkState::Running
+    );
+    assert_eq!(state_changed.work.visible_work_count, 1);
+
+    let page = request_live_thread_timeline_page(&mut harness, "running-page").await;
+    let work = page
+        .blocks
+        .iter()
+        .find_map(|block| match &block.kind {
+            pioneer_protocol::TimelineBlockKind::TurnWork { work } => Some(work),
+            _ => None,
+        })
+        .expect("live top-level page should contain turn work");
+    assert_eq!(
+        work.presentation,
+        pioneer_protocol::TurnWorkPresentation::ExpandedLive
+    );
+    assert_eq!(work.state, pioneer_protocol::TurnWorkState::Running);
+    assert_eq!(work.visible_work_count, 1);
+
+    let work_page = request_live_turn_work_page(&mut harness, "running-work", 10).await;
+    assert_eq!(work_page.items.len(), 1);
+    assert_eq!(work_page.items[0].item_id, item_id);
+    assert_eq!(
+        work_page.items[0].status,
+        pioneer_protocol::TurnWorkItemStatus::Running
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_semantic_timeline_final_answer_collapses_work_without_work_flood() {
+    let mut harness = setup_live_semantic_timeline_harness("final").await;
+    let command_id = "semantic_live_final_cmd";
+
+    harness
+        .processor
+        .handle_durable_agent_event(AgentDurableEvent::ItemStarted {
+            notification: ItemStartedNotification {
+                workspace_id: harness.workspace_id.clone(),
+                thread_id: harness.thread_id.clone(),
+                turn_id: harness.turn_id.clone(),
+                item: command_execution_item(command_id),
+            },
+        })
+        .await;
+    harness
+        .processor
+        .handle_durable_agent_event(AgentDurableEvent::ItemCompleted {
+            notification: ItemCompletedNotification {
+                workspace_id: harness.workspace_id.clone(),
+                thread_id: harness.thread_id.clone(),
+                turn_id: harness.turn_id.clone(),
+                item: completed_command_execution_item(command_id),
+            },
+        })
+        .await;
+
+    let final_item_id = "semantic_live_final_answer";
+    harness
+        .processor
+        .handle_durable_agent_event(AgentDurableEvent::ItemCompleted {
+            notification: ItemCompletedNotification {
+                workspace_id: harness.workspace_id.clone(),
+                thread_id: harness.thread_id.clone(),
+                turn_id: harness.turn_id.clone(),
+                item: TurnItem::AgentMessage {
+                    id: final_item_id.to_owned(),
+                    text: "Live final **markdown**\n\n- done".to_owned(),
+                    phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+        })
+        .await;
+    harness
+        .processor
+        .handle_durable_agent_event(AgentDurableEvent::TurnCompleted {
+            thread_id: harness.thread_id.clone(),
+            turn_id: harness.turn_id.clone(),
+            recovery: None,
+        })
+        .await;
+
+    let page = request_live_thread_timeline_page(&mut harness, "final-page").await;
+    assert_eq!(
+        page.blocks.len(),
+        3,
+        "final answer must create one top-level assistant block, not flood work rows"
+    );
+    let work = match &page.blocks[1].kind {
+        pioneer_protocol::TimelineBlockKind::TurnWork { work } => work,
+        other => panic!("second block should be turn work, got {other:?}"),
+    };
+    assert_eq!(
+        work.presentation,
+        pioneer_protocol::TurnWorkPresentation::CollapsedAfterFinal
+    );
+    assert_eq!(work.state, pioneer_protocol::TurnWorkState::Completed);
+    assert_eq!(work.visible_work_count, 1);
+
+    let assistant = match &page.blocks[2].kind {
+        pioneer_protocol::TimelineBlockKind::AssistantMessage {
+            item_id,
+            text,
+            markdown,
+        } => (item_id, text, markdown),
+        other => panic!("third block should be assistant message, got {other:?}"),
+    };
+    assert_eq!(assistant.0, final_item_id);
+    assert!(assistant.1.contains("Live final **markdown**"));
+    assert!(
+        assistant
+            .2
+            .as_ref()
+            .is_some_and(|markdown| !markdown.blocks.is_empty()),
+        "live final assistant markdown AST must be present"
+    );
+
+    let work_page = request_live_turn_work_page(&mut harness, "final-work", 10).await;
+    assert_eq!(work_page.items.len(), 1);
+    assert_eq!(work_page.items[0].item_id, command_id);
+    assert!(
+        work_page
+            .items
+            .iter()
+            .all(|item| item.item_id != final_item_id),
+        "final assistant message must not remain in turn work items"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_semantic_timeline_pending_request_projects_approval_block() {
+    let mut harness = setup_live_semantic_timeline_harness("approval").await;
+    let now = chrono::Utc::now().fixed_offset();
+    let request_id = "semantic_live_approval_req";
+    let pending_payload = CLIRuntimePendingRequest {
+        kind: CLIRuntimeRequestKind::CommandApproval,
+        title: Some("Run command".to_owned()),
+        message: Some("Approve semantic live command".to_owned()),
+        native_request_id: Some("semantic-native-approval".to_owned()),
+        payload: Some(json!({
+            "command": "echo approval"
+        })),
+    };
+
+    harness
+        .processor
+        .open_cli_runtime_pending_request(NewCliRuntimePendingRequest {
+            request_id: request_id.to_owned(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            workspace_id: harness.workspace_id.clone(),
+            thread_id: harness.thread_id.clone(),
+            turn_id: Some(harness.turn_id.clone()),
+            native_thread_id: Some("semantic-native-thread".to_owned()),
+            native_turn_id: Some("semantic-native-turn".to_owned()),
+            native_item_id: Some("semantic-native-item".to_owned()),
+            request_kind: "command_approval".to_owned(),
+            payload_json: pioneer_crud::serialize_cli_runtime_json(&pending_payload)
+                .expect("pending request payload should serialize"),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("pending request should open");
+
+    let blocks_changed =
+        recv_notification_by_method(&mut harness.rx, events::THREAD_TIMELINE_BLOCKS_CHANGED).await;
+    let blocks_changed: pioneer_protocol::ThreadTimelineBlocksChangedNotification =
+        serde_json::from_value(
+            blocks_changed
+                .params
+                .expect("timeline blocks notification should include params"),
+        )
+        .expect("timeline blocks notification should decode");
+    assert_eq!(
+        blocks_changed.changed_block_ids,
+        vec![
+            pioneer_crud::approval_block_id(harness.turn_id.as_str(), request_id),
+            pioneer_crud::work_block_id(harness.turn_id.as_str()),
+        ]
+    );
+
+    let state_changed =
+        recv_notification_by_method(&mut harness.rx, events::TURN_WORK_STATE_CHANGED).await;
+    let state_changed: pioneer_protocol::TurnWorkStateChangedNotification = serde_json::from_value(
+        state_changed
+            .params
+            .expect("work state notification should include params"),
+    )
+    .expect("work state notification should decode");
+    assert_eq!(
+        state_changed.work.state,
+        pioneer_protocol::TurnWorkState::WaitingForApproval
+    );
+
+    let page = request_live_thread_timeline_page(&mut harness, "approval-page").await;
+    let approval = page
+        .blocks
+        .iter()
+        .find_map(|block| match &block.kind {
+            pioneer_protocol::TimelineBlockKind::PendingRequest {
+                request_id,
+                request_kind,
+                status,
+                title,
+                message,
+            } => Some((request_id, request_kind, status, title, message)),
+            _ => None,
+        })
+        .expect("top-level page should contain approval block");
+    assert_eq!(approval.0, request_id);
+    assert_eq!(
+        *approval.1,
+        pioneer_protocol::CLIRuntimeRequestKind::CommandApproval
+    );
+    assert_eq!(
+        *approval.2,
+        pioneer_protocol::CLIRuntimePendingRequestStatus::Pending
+    );
+    assert_eq!(approval.3.as_deref(), Some("Run command"));
+    assert_eq!(approval.4.as_deref(), Some("Approve semantic live command"));
+
+    let work = page
+        .blocks
+        .iter()
+        .find_map(|block| match &block.kind {
+            pioneer_protocol::TimelineBlockKind::TurnWork { work } => Some(work),
+            _ => None,
+        })
+        .expect("approval page should contain turn work block");
+    assert_eq!(
+        work.state,
+        pioneer_protocol::TurnWorkState::WaitingForApproval
+    );
+}
+
+async fn setup_semantic_timeline_query_harness() -> SemanticTimelineQueryHarness {
+    setup_semantic_timeline_query_harness_inner(false).await
+}
+
+async fn setup_semantic_timeline_query_harness_with_synthetic() -> SemanticTimelineQueryHarness {
+    setup_semantic_timeline_query_harness_inner(true).await
+}
+
+async fn setup_semantic_timeline_query_harness_inner(
+    include_synthetic: bool,
+) -> SemanticTimelineQueryHarness {
+    let (tx, rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let now = super::now_timestamp_secs();
+
+    let sandbox_thread_id = "thr_semantic_sandbox".to_owned();
+    let sandbox_turn_id = "turn_semantic_sandbox".to_owned();
+    materialize_semantic_sandbox_fixture(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        sandbox_thread_id.as_str(),
+        sandbox_turn_id.as_str(),
+        now,
+    )
+    .await;
+
+    let site_thread_id = "thr_semantic_site".to_owned();
+    let site_turn_id = "turn_semantic_site".to_owned();
+    materialize_semantic_site_fixture(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        site_thread_id.as_str(),
+        site_turn_id.as_str(),
+        now + 1_000,
+    )
+    .await;
+
+    let summary = crate::migrations::backfill_timeline_pagination_once(crud_store.as_ref(), 16)
+        .await
+        .expect("semantic timeline backfill should succeed for fixture");
+    assert!(
+        !summary.skipped,
+        "fixture backfill should build projection rows"
+    );
+
+    let mut synthetic_large_thread_id = String::new();
+    let mut synthetic_large_turn_id = String::new();
+    let mut synthetic_long_thread_id = String::new();
+    if include_synthetic {
+        synthetic_large_thread_id = "thr_semantic_synthetic_large".to_owned();
+        synthetic_large_turn_id = "turn_semantic_synthetic_large".to_owned();
+        materialize_synthetic_large_turn_fixture(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            synthetic_large_thread_id.as_str(),
+            synthetic_large_turn_id.as_str(),
+            now + 2_000,
+        )
+        .await;
+
+        synthetic_long_thread_id = "thr_semantic_synthetic_long".to_owned();
+        materialize_synthetic_long_thread_fixture(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            synthetic_long_thread_id.as_str(),
+            now + 3_000,
+        )
+        .await;
+    }
+
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+
+    SemanticTimelineQueryHarness {
+        processor,
+        connection_id,
+        rx,
+        sandbox_thread_id,
+        sandbox_turn_id,
+        site_thread_id,
+        site_turn_id,
+        synthetic_large_thread_id,
+        synthetic_large_turn_id,
+        synthetic_long_thread_id,
+    }
+}
+
+async fn setup_live_semantic_timeline_harness(case_id: &str) -> LiveSemanticTimelineHarness {
+    let (tx, rx) = mpsc::channel(64);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let thread_id = format!("thr_semantic_live_{case_id}");
+    let turn_id = format!("turn_semantic_live_{case_id}");
+
+    let thread_start = thread_manager
+        .system_thread_start_seeded(
+            workspace_id.clone(),
+            ThreadStartParams {
+                thread_id: thread_id.clone(),
+                workspace_id: workspace_id.clone(),
+                name: Some(format!("semantic live {case_id}")),
+                model: Some("gpt-5.5".to_owned()),
+                model_provider: Some("openai".to_owned()),
+                sandbox: Some(SandboxMode::FullAccess),
+                mode: Some(ThreadMode::Agent),
+                origin_kind: None,
+                sidebar_visibility: None,
+                agent_nickname: None,
+                agent_role: None,
+            },
+            None,
+            Some(SandboxMode::FullAccess),
+        )
+        .await
+        .expect("live semantic thread should start in thread manager");
+    assert!(
+        thread_manager
+            .subscribe_connection(thread_id.as_str(), connection_id)
+            .await,
+        "live semantic connection should subscribe to the thread"
+    );
+    thread_manager
+        .system_turn_start(pioneer_protocol::TurnStartParams {
+            thread_id: thread_id.clone(),
+            turn_id: turn_id.clone(),
+            input: vec![UserInput::Text {
+                text: format!("semantic live {case_id} input"),
+                text_elements: Vec::new(),
+            }],
+            capabilities: Vec::new(),
+            model: None,
+            model_provider: None,
+            sandbox_policy: None,
+            mode: None,
+            execution_backend: None,
+            reasoning: None,
+            cli_runtime_options: None,
+        })
+        .await
+        .expect("live semantic turn should start in thread manager");
+
+    crud_store
+        .materialize_turn_start(
+            &thread_start.started_notification.thread,
+            SandboxMode::FullAccess,
+            &Turn {
+                id: turn_id.clone(),
+                status: TurnStatus::InProgress,
+                turn_kind: Default::default(),
+                origin: Default::default(),
+                error: None,
+                prompt_manifest: None,
+            },
+            &[UserInput::Text {
+                text: format!("semantic live {case_id} input"),
+                text_elements: Vec::new(),
+            }],
+        )
+        .await
+        .expect("live semantic turn start should persist");
+
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+
+    LiveSemanticTimelineHarness {
+        processor,
+        connection_id,
+        rx,
+        workspace_id,
+        thread_id,
+        turn_id,
+    }
+}
+
+async fn request_semantic_thread_timeline_page(
+    harness: &mut SemanticTimelineQueryHarness,
+    suffix: &str,
+    thread_id: String,
+    anchor: JsonValue,
+    limit: u32,
+) -> pioneer_protocol::ThreadTimelinePageResponse {
+    let request_id = generate_test_request_id("semantic", suffix);
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "thread/timeline/page",
+        "params": {
+            "threadId": thread_id,
+            "anchor": anchor,
+            "limit": limit
+        }
+    });
+    harness
+        .processor
+        .process_request(harness.connection_id, &request.to_string())
+        .await;
+    let response = recv_response_by_id(&mut harness.rx, request_id.as_str()).await;
+    serde_json::from_value(response.result).expect("thread/timeline/page should decode")
+}
+
+async fn request_semantic_turn_work_page(
+    harness: &mut SemanticTimelineQueryHarness,
+    suffix: &str,
+    thread_id: String,
+    turn_id: String,
+    anchor: JsonValue,
+    limit: u32,
+) -> pioneer_protocol::TurnWorkPageResponse {
+    let request_id = generate_test_request_id("semantic", suffix);
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "turn/work/page",
+        "params": {
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "anchor": anchor,
+            "limit": limit
+        }
+    });
+    harness
+        .processor
+        .process_request(harness.connection_id, &request.to_string())
+        .await;
+    let response = recv_response_by_id(&mut harness.rx, request_id.as_str()).await;
+    serde_json::from_value(response.result).expect("turn/work/page should decode")
+}
+
+async fn request_semantic_thread_timeline_raw_page(
+    harness: &mut SemanticTimelineQueryHarness,
+    suffix: &str,
+    thread_id: String,
+    anchor: JsonValue,
+    limit: u32,
+) -> (String, pioneer_protocol::ThreadTimelinePageResponse) {
+    let request_id = generate_test_request_id("semantic", suffix);
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "thread/timeline/page",
+        "params": {
+            "threadId": thread_id,
+            "anchor": anchor,
+            "limit": limit
+        }
+    });
+    harness
+        .processor
+        .process_request(harness.connection_id, &request.to_string())
+        .await;
+    let payload = recv_jsonrpc_payload_by_id(&mut harness.rx, request_id.as_str()).await;
+    let response: JsonRpcResponse = serde_json::from_str(payload.as_str())
+        .expect("thread/timeline/page response should decode");
+    let page = serde_json::from_value(response.result).expect("thread/timeline/page should decode");
+    (payload, page)
+}
+
+async fn request_semantic_turn_work_raw_page(
+    harness: &mut SemanticTimelineQueryHarness,
+    suffix: &str,
+    thread_id: String,
+    turn_id: String,
+    anchor: JsonValue,
+    limit: u32,
+) -> (String, pioneer_protocol::TurnWorkPageResponse) {
+    let request_id = generate_test_request_id("semantic", suffix);
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "turn/work/page",
+        "params": {
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "anchor": anchor,
+            "limit": limit
+        }
+    });
+    harness
+        .processor
+        .process_request(harness.connection_id, &request.to_string())
+        .await;
+    let payload = recv_jsonrpc_payload_by_id(&mut harness.rx, request_id.as_str()).await;
+    let response: JsonRpcResponse =
+        serde_json::from_str(payload.as_str()).expect("turn/work/page response should decode");
+    let page = serde_json::from_value(response.result).expect("turn/work/page should decode");
+    (payload, page)
+}
+
+async fn request_semantic_jsonrpc_error(
+    harness: &mut SemanticTimelineQueryHarness,
+    suffix: &str,
+    method: &str,
+    params: JsonValue,
+) -> (String, JsonRpcErrorResponse) {
+    let request_id = generate_test_request_id("semantic", suffix);
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": method,
+        "params": params
+    });
+    harness
+        .processor
+        .process_request(harness.connection_id, &request.to_string())
+        .await;
+    let payload = recv_jsonrpc_payload_by_id(&mut harness.rx, request_id.as_str()).await;
+    let error: JsonRpcErrorResponse =
+        serde_json::from_str(payload.as_str()).expect("JSON-RPC error should decode");
+    (payload, error)
+}
+
+async fn request_live_thread_timeline_page(
+    harness: &mut LiveSemanticTimelineHarness,
+    suffix: &str,
+) -> pioneer_protocol::ThreadTimelinePageResponse {
+    let request_id = generate_test_request_id("semlive", suffix);
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "thread/timeline/page",
+        "params": {
+            "threadId": harness.thread_id,
+            "anchor": { "kind": "oldest" },
+            "limit": 20
+        }
+    });
+    harness
+        .processor
+        .process_request(harness.connection_id, &request.to_string())
+        .await;
+    let response = recv_response_by_id(&mut harness.rx, request_id.as_str()).await;
+    serde_json::from_value(response.result).expect("thread/timeline/page should decode")
+}
+
+async fn request_live_turn_work_page(
+    harness: &mut LiveSemanticTimelineHarness,
+    suffix: &str,
+    limit: u32,
+) -> pioneer_protocol::TurnWorkPageResponse {
+    let request_id = generate_test_request_id("semlive", suffix);
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "turn/work/page",
+        "params": {
+            "threadId": harness.thread_id,
+            "turnId": harness.turn_id,
+            "anchor": { "kind": "oldest" },
+            "limit": limit
+        }
+    });
+    harness
+        .processor
+        .process_request(harness.connection_id, &request.to_string())
+        .await;
+    let response = recv_response_by_id(&mut harness.rx, request_id.as_str()).await;
+    serde_json::from_value(response.result).expect("turn/work/page should decode")
+}
+
+async fn materialize_semantic_sandbox_fixture(
+    store: &CrudStore,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    timestamp: i64,
+) {
+    let thread = semantic_fixture_thread(workspace_id, thread_id, Some("Sandboxing"), timestamp);
+    let turn = semantic_fixture_turn(turn_id, TurnStatus::InProgress);
+    store
+        .materialize_turn_start(
+            &thread,
+            SandboxMode::FullAccess,
+            &turn,
+            &[UserInput::Text {
+                text: "Sandboxing long running work".to_owned(),
+                text_elements: Vec::new(),
+            }],
+        )
+        .await
+        .expect("sandbox turn start should persist");
+
+    for index in 0..25 {
+        if index == 24 {
+            store
+                .materialize_item_completed(
+                    ItemCompletedNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item: completed_command_execution_item("semantic_out_of_order_a"),
+                    },
+                    timestamp + 75,
+                )
+                .await
+                .expect("out-of-order semantic item A should persist");
+            store
+                .materialize_item_completed(
+                    ItemCompletedNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item: completed_command_execution_item("semantic_out_of_order_b"),
+                    },
+                    timestamp + 50,
+                )
+                .await
+                .expect("out-of-order semantic item B should persist");
+        }
+
+        let item_id = format!("semantic_cmd_{index:02}");
+        let started = command_execution_item(item_id.as_str());
+        store
+            .materialize_item_started(
+                ItemStartedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: started,
+                },
+                timestamp + 1 + i64::from(index),
+            )
+            .await
+            .expect("sandbox work item start should persist");
+
+        if index < 24 {
+            store
+                .materialize_item_completed(
+                    ItemCompletedNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item: completed_command_execution_item(item_id.as_str()),
+                    },
+                    timestamp + 100 + i64::from(index),
+                )
+                .await
+                .expect("sandbox work item completion should persist");
+        }
+    }
+
+    store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: workspace_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                item: pioneer_protocol::TurnItem::SystemEvent {
+                    id: "semantic_hidden_token".to_owned(),
+                    level: pioneer_protocol::SystemEventLevel::Info,
+                    message: "Runtime event: thread/tokenUsage/updated".to_owned(),
+                    code: Some("thread/tokenUsage/updated".to_owned()),
+                    details: Some(json!({"event": "thread/tokenUsage/updated"})),
+                },
+            },
+            timestamp + 200,
+        )
+        .await
+        .expect("hidden system event should persist");
+}
+
+async fn materialize_semantic_site_fixture(
+    store: &CrudStore,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    timestamp: i64,
+) {
+    let thread = semantic_fixture_thread(workspace_id, thread_id, Some("Сайт"), timestamp);
+    let turn = semantic_fixture_turn(turn_id, TurnStatus::InProgress);
+    store
+        .materialize_turn_start(
+            &thread,
+            SandboxMode::FullAccess,
+            &turn,
+            &[UserInput::Text {
+                text: "Сайт: build marketing page".to_owned(),
+                text_elements: Vec::new(),
+            }],
+        )
+        .await
+        .expect("site turn start should persist");
+
+    let command_id = "semantic_site_cmd";
+    store
+        .materialize_item_started(
+            ItemStartedNotification {
+                workspace_id: workspace_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                item: command_execution_item(command_id),
+            },
+            timestamp + 1,
+        )
+        .await
+        .expect("site command start should persist");
+    store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: workspace_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                item: completed_command_execution_item(command_id),
+            },
+            timestamp + 2,
+        )
+        .await
+        .expect("site command completion should persist");
+
+    store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: workspace_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                item: pioneer_protocol::TurnItem::AgentMessage {
+                    id: "semantic_site_final".to_owned(),
+                    text: "Final **markdown**\n\n- item".to_owned(),
+                    phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            timestamp + 3,
+        )
+        .await
+        .expect("site final answer should persist");
+
+    store
+        .update_turn_status(
+            thread_id,
+            turn_id,
+            TurnStatus::Blocked,
+            Some("fixture blocked after final"),
+            timestamp + 4,
+        )
+        .await
+        .expect("site turn status should update");
+}
+
+const SYNTHETIC_LARGE_WORK_ITEM_COUNT: usize = 70_000;
+const SYNTHETIC_LARGE_HIDDEN_EVERY: usize = 100;
+const SYNTHETIC_LONG_TURN_COUNT: usize = 1_000;
+const SYNTHETIC_INSERT_CHUNK_SIZE: usize = 200;
+const SEMANTIC_THREAD_TIMELINE_WS_SAFE_BYTES: usize = 512 * 1024;
+const SEMANTIC_TURN_WORK_WS_SAFE_BYTES: usize = 1024 * 1024;
+
+async fn materialize_synthetic_large_turn_fixture(
+    store: &CrudStore,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    timestamp: i64,
+) {
+    let thread = semantic_fixture_thread(
+        workspace_id,
+        thread_id,
+        Some("Synthetic 70k work turn"),
+        timestamp,
+    );
+    let turn = semantic_fixture_turn(turn_id, TurnStatus::InProgress);
+    store
+        .materialize_turn_start(
+            &thread,
+            SandboxMode::FullAccess,
+            &turn,
+            &[UserInput::Text {
+                text: "Synthetic large running turn".to_owned(),
+                text_elements: Vec::new(),
+            }],
+        )
+        .await
+        .expect("synthetic large turn start should persist");
+
+    let connection = store.database_connection();
+    let transaction = connection
+        .begin()
+        .await
+        .expect("synthetic large transaction should begin");
+    clear_synthetic_semantic_projection(&transaction, thread_id).await;
+
+    let base_ms = timestamp.saturating_mul(1_000);
+    let started_at = semantic_fixture_datetime_millis(base_ms);
+    let updated_at = semantic_fixture_datetime_millis(
+        base_ms.saturating_add(SYNTHETIC_LARGE_WORK_ITEM_COUNT as i64),
+    );
+    let first_visible_item_id = synthetic_large_visible_item_id(1);
+    let last_visible_item_id = synthetic_large_visible_item_id(SYNTHETIC_LARGE_WORK_ITEM_COUNT - 1);
+    let first_work_item_id =
+        pioneer_crud::work_item_projection_id(turn_id, first_visible_item_id.as_str());
+    let last_work_item_id =
+        pioneer_crud::work_item_projection_id(turn_id, last_visible_item_id.as_str());
+
+    thread_timeline_block::Entity::insert_many(vec![
+        synthetic_user_timeline_block(
+            workspace_id,
+            thread_id,
+            turn_id,
+            semantic_block_sort_key(base_ms, turn_id, 0, "user"),
+            started_at,
+        ),
+        synthetic_work_timeline_block(
+            workspace_id,
+            thread_id,
+            turn_id,
+            semantic_block_sort_key(base_ms, turn_id, 100, "work"),
+            Some(started_at),
+            None,
+            updated_at,
+        ),
+    ])
+    .exec(&transaction)
+    .await
+    .expect("synthetic large timeline blocks should insert");
+
+    turn_work_projection::Entity::insert(turn_work_projection::ActiveModel {
+        turn_id: Set(turn_id.to_owned()),
+        workspace_id: Set(workspace_id.to_owned()),
+        thread_id: Set(thread_id.to_owned()),
+        presentation: Set("expanded_live".to_owned()),
+        state: Set("running".to_owned()),
+        work_count: Set(SYNTHETIC_LARGE_WORK_ITEM_COUNT as i64),
+        visible_work_count: Set((SYNTHETIC_LARGE_WORK_ITEM_COUNT
+            - (SYNTHETIC_LARGE_WORK_ITEM_COUNT / SYNTHETIC_LARGE_HIDDEN_EVERY))
+            as i64),
+        hidden_work_count: Set(
+            (SYNTHETIC_LARGE_WORK_ITEM_COUNT / SYNTHETIC_LARGE_HIDDEN_EVERY) as i64,
+        ),
+        first_work_item_id: Set(Some(first_work_item_id)),
+        last_work_item_id: Set(Some(last_work_item_id)),
+        started_at: Set(Some(started_at)),
+        completed_at: Set(None),
+        elapsed_ms: Set(Some(SYNTHETIC_LARGE_WORK_ITEM_COUNT as i64)),
+        source_high_watermark: Set(SYNTHETIC_LARGE_WORK_ITEM_COUNT as i64),
+        metadata_json: Set(json!({ "synthetic": "large_turn" }).to_string()),
+        created_at: Set(started_at),
+        updated_at: Set(updated_at),
+    })
+    .exec(&transaction)
+    .await
+    .expect("synthetic large work projection should insert");
+
+    for chunk_start in (0..SYNTHETIC_LARGE_WORK_ITEM_COUNT).step_by(SYNTHETIC_INSERT_CHUNK_SIZE) {
+        let chunk_end =
+            (chunk_start + SYNTHETIC_INSERT_CHUNK_SIZE).min(SYNTHETIC_LARGE_WORK_ITEM_COUNT);
+        let mut item_rows = Vec::with_capacity(chunk_end - chunk_start);
+        let mut projection_rows = Vec::with_capacity(chunk_end - chunk_start);
+
+        for index in chunk_start..chunk_end {
+            let hidden = index % SYNTHETIC_LARGE_HIDDEN_EVERY == 0;
+            let item_id = if hidden {
+                synthetic_large_hidden_item_id(index)
+            } else {
+                synthetic_large_visible_item_id(index)
+            };
+            let item = if hidden {
+                synthetic_hidden_system_event(item_id.as_str())
+            } else {
+                completed_command_execution_item(item_id.as_str())
+            };
+            let item_type = if hidden {
+                "system_event"
+            } else {
+                "command_execution"
+            };
+            let visibility = if hidden {
+                pioneer_crud::WORK_VISIBILITY_HIDDEN
+            } else {
+                pioneer_crud::WORK_VISIBILITY_VISIBLE
+            };
+            let classification = if hidden {
+                "internal_token_usage"
+            } else {
+                "command_execution"
+            };
+            let occurred_at = semantic_fixture_datetime_millis(base_ms + index as i64);
+
+            item_rows.push(turn_item::ActiveModel {
+                id: Set(format!("ti:{turn_id}:{index:05}")),
+                turn_id: Set(turn_id.to_owned()),
+                item_id: Set(item_id.clone()),
+                item_type: Set(item_type.to_owned()),
+                status: Set(Some("completed".to_owned())),
+                payload: Set(serde_json::to_string(&item)
+                    .expect("synthetic turn item payload should serialize")),
+                active_attempt_number: Set(0),
+                active_attempt_status: Set(None),
+                active_attempt_id: Set(None),
+                last_heartbeat_at: Set(None),
+                lease_expires_at: Set(None),
+                created_at: Set(occurred_at),
+                updated_at: Set(occurred_at),
+            });
+            projection_rows.push(turn_work_item_projection::ActiveModel {
+                work_item_id: Set(pioneer_crud::work_item_projection_id(
+                    turn_id,
+                    item_id.as_str(),
+                )),
+                workspace_id: Set(workspace_id.to_owned()),
+                thread_id: Set(thread_id.to_owned()),
+                turn_id: Set(turn_id.to_owned()),
+                item_id: Set(item_id.clone()),
+                source_event_id: Set(Some(format!("evt:{turn_id}:{index:05}"))),
+                source_sequence: Set(index as i64),
+                order_key: Set(semantic_work_order_key(index, item_id.as_str())),
+                item_type: Set(item_type.to_owned()),
+                visibility: Set(visibility.to_owned()),
+                classification: Set(classification.to_owned()),
+                status: Set("completed".to_owned()),
+                started_at: Set(Some(occurred_at)),
+                completed_at: Set(Some(occurred_at)),
+                metadata_json: Set(json!({
+                    "synthetic": "large_turn",
+                    "hidden": hidden,
+                })
+                .to_string()),
+                created_at: Set(occurred_at),
+                updated_at: Set(occurred_at),
+            });
+        }
+
+        turn_item::Entity::insert_many(item_rows)
+            .exec(&transaction)
+            .await
+            .expect("synthetic large turn items should insert");
+        turn_work_item_projection::Entity::insert_many(projection_rows)
+            .exec(&transaction)
+            .await
+            .expect("synthetic large work item projections should insert");
+    }
+
+    transaction
+        .commit()
+        .await
+        .expect("synthetic large transaction should commit");
+}
+
+async fn materialize_synthetic_long_thread_fixture(
+    store: &CrudStore,
+    workspace_id: &str,
+    thread_id: &str,
+    timestamp: i64,
+) {
+    let thread = semantic_fixture_thread(
+        workspace_id,
+        thread_id,
+        Some("Synthetic 1,000-turn thread"),
+        timestamp,
+    );
+    for index in 0..SYNTHETIC_LONG_TURN_COUNT {
+        let turn_id = synthetic_long_turn_id(index);
+        let turn = semantic_fixture_turn(turn_id.as_str(), TurnStatus::Completed);
+        store
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[UserInput::Text {
+                    text: format!("Synthetic long thread turn {index}"),
+                    text_elements: Vec::new(),
+                }],
+            )
+            .await
+            .expect("synthetic long turn start should persist");
+    }
+
+    let connection = store.database_connection();
+    let transaction = connection
+        .begin()
+        .await
+        .expect("synthetic long transaction should begin");
+    clear_synthetic_semantic_projection(&transaction, thread_id).await;
+
+    for chunk_start in (0..SYNTHETIC_LONG_TURN_COUNT).step_by(SYNTHETIC_INSERT_CHUNK_SIZE) {
+        let chunk_end = (chunk_start + SYNTHETIC_INSERT_CHUNK_SIZE).min(SYNTHETIC_LONG_TURN_COUNT);
+        let mut block_rows = Vec::with_capacity((chunk_end - chunk_start) * 2);
+        let mut work_rows = Vec::with_capacity(chunk_end - chunk_start);
+        let mut item_rows = Vec::with_capacity(chunk_end - chunk_start);
+        let mut projection_rows = Vec::with_capacity(chunk_end - chunk_start);
+
+        for index in chunk_start..chunk_end {
+            let turn_id = synthetic_long_turn_id(index);
+            let item_id = synthetic_long_item_id(index);
+            let work_item_id =
+                pioneer_crud::work_item_projection_id(turn_id.as_str(), item_id.as_str());
+            let turn_ms = timestamp
+                .saturating_mul(1_000)
+                .saturating_add((index as i64).saturating_mul(1_000));
+            let started_at = semantic_fixture_datetime_millis(turn_ms);
+            let completed_at = semantic_fixture_datetime_millis(turn_ms + 500);
+
+            block_rows.push(synthetic_user_timeline_block(
+                workspace_id,
+                thread_id,
+                turn_id.as_str(),
+                semantic_block_sort_key(turn_ms, turn_id.as_str(), 0, "user"),
+                started_at,
+            ));
+            block_rows.push(synthetic_work_timeline_block(
+                workspace_id,
+                thread_id,
+                turn_id.as_str(),
+                semantic_block_sort_key(turn_ms, turn_id.as_str(), 100, "work"),
+                Some(started_at),
+                Some(completed_at),
+                completed_at,
+            ));
+            work_rows.push(turn_work_projection::ActiveModel {
+                turn_id: Set(turn_id.clone()),
+                workspace_id: Set(workspace_id.to_owned()),
+                thread_id: Set(thread_id.to_owned()),
+                presentation: Set("expanded_terminal_no_final".to_owned()),
+                state: Set("completed".to_owned()),
+                work_count: Set(1),
+                visible_work_count: Set(1),
+                hidden_work_count: Set(0),
+                first_work_item_id: Set(Some(work_item_id.clone())),
+                last_work_item_id: Set(Some(work_item_id.clone())),
+                started_at: Set(Some(started_at)),
+                completed_at: Set(Some(completed_at)),
+                elapsed_ms: Set(Some(500)),
+                source_high_watermark: Set(1),
+                metadata_json: Set(json!({
+                    "synthetic": "long_thread",
+                    "turnIndex": index,
+                })
+                .to_string()),
+                created_at: Set(started_at),
+                updated_at: Set(completed_at),
+            });
+
+            let item = completed_command_execution_item(item_id.as_str());
+            item_rows.push(turn_item::ActiveModel {
+                id: Set(format!("ti:{turn_id}:{item_id}")),
+                turn_id: Set(turn_id.clone()),
+                item_id: Set(item_id.clone()),
+                item_type: Set("command_execution".to_owned()),
+                status: Set(Some("completed".to_owned())),
+                payload: Set(serde_json::to_string(&item)
+                    .expect("synthetic long turn item payload should serialize")),
+                active_attempt_number: Set(0),
+                active_attempt_status: Set(None),
+                active_attempt_id: Set(None),
+                last_heartbeat_at: Set(None),
+                lease_expires_at: Set(None),
+                created_at: Set(started_at),
+                updated_at: Set(completed_at),
+            });
+            projection_rows.push(turn_work_item_projection::ActiveModel {
+                work_item_id: Set(work_item_id),
+                workspace_id: Set(workspace_id.to_owned()),
+                thread_id: Set(thread_id.to_owned()),
+                turn_id: Set(turn_id.clone()),
+                item_id: Set(item_id.clone()),
+                source_event_id: Set(Some(format!("evt:{turn_id}:0"))),
+                source_sequence: Set(0),
+                order_key: Set(semantic_work_order_key(0, item_id.as_str())),
+                item_type: Set("command_execution".to_owned()),
+                visibility: Set(pioneer_crud::WORK_VISIBILITY_VISIBLE.to_owned()),
+                classification: Set("command_execution".to_owned()),
+                status: Set("completed".to_owned()),
+                started_at: Set(Some(started_at)),
+                completed_at: Set(Some(completed_at)),
+                metadata_json: Set(json!({
+                    "synthetic": "long_thread",
+                    "turnIndex": index,
+                })
+                .to_string()),
+                created_at: Set(started_at),
+                updated_at: Set(completed_at),
+            });
+        }
+
+        thread_timeline_block::Entity::insert_many(block_rows)
+            .exec(&transaction)
+            .await
+            .expect("synthetic long timeline blocks should insert");
+        turn_work_projection::Entity::insert_many(work_rows)
+            .exec(&transaction)
+            .await
+            .expect("synthetic long work projections should insert");
+        turn_item::Entity::insert_many(item_rows)
+            .exec(&transaction)
+            .await
+            .expect("synthetic long turn items should insert");
+        turn_work_item_projection::Entity::insert_many(projection_rows)
+            .exec(&transaction)
+            .await
+            .expect("synthetic long work item projections should insert");
+    }
+
+    transaction
+        .commit()
+        .await
+        .expect("synthetic long transaction should commit");
+}
+
+async fn clear_synthetic_semantic_projection(db: &DatabaseTransaction, thread_id: &str) {
+    thread_timeline_block::Entity::delete_many()
+        .filter(thread_timeline_block::Column::ThreadId.eq(thread_id.to_owned()))
+        .exec(db)
+        .await
+        .expect("synthetic timeline blocks should clear");
+    turn_work_item_projection::Entity::delete_many()
+        .filter(turn_work_item_projection::Column::ThreadId.eq(thread_id.to_owned()))
+        .exec(db)
+        .await
+        .expect("synthetic work item projections should clear");
+    turn_work_projection::Entity::delete_many()
+        .filter(turn_work_projection::Column::ThreadId.eq(thread_id.to_owned()))
+        .exec(db)
+        .await
+        .expect("synthetic work projections should clear");
+}
+
+fn synthetic_user_timeline_block(
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    sort_key: String,
+    created_at: DateTimeWithTimeZone,
+) -> thread_timeline_block::ActiveModel {
+    thread_timeline_block::ActiveModel {
+        block_id: Set(pioneer_crud::user_block_id(turn_id)),
+        workspace_id: Set(workspace_id.to_owned()),
+        thread_id: Set(thread_id.to_owned()),
+        turn_id: Set(Some(turn_id.to_owned())),
+        block_kind: Set(pioneer_crud::BLOCK_KIND_USER_MESSAGE.to_owned()),
+        sort_key: Set(sort_key),
+        source_kind: Set(Some("turn_input".to_owned())),
+        source_key: Set(Some(turn_id.to_owned())),
+        started_at: Set(Some(created_at)),
+        completed_at: Set(Some(created_at)),
+        metadata_json: Set(json!({
+            "turnId": turn_id,
+            "synthetic": true,
+        })
+        .to_string()),
+        created_at: Set(created_at),
+        updated_at: Set(created_at),
+    }
+}
+
+fn synthetic_work_timeline_block(
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    sort_key: String,
+    started_at: Option<DateTimeWithTimeZone>,
+    completed_at: Option<DateTimeWithTimeZone>,
+    updated_at: DateTimeWithTimeZone,
+) -> thread_timeline_block::ActiveModel {
+    thread_timeline_block::ActiveModel {
+        block_id: Set(pioneer_crud::work_block_id(turn_id)),
+        workspace_id: Set(workspace_id.to_owned()),
+        thread_id: Set(thread_id.to_owned()),
+        turn_id: Set(Some(turn_id.to_owned())),
+        block_kind: Set(pioneer_crud::BLOCK_KIND_TURN_WORK.to_owned()),
+        sort_key: Set(sort_key),
+        source_kind: Set(Some("turn_work".to_owned())),
+        source_key: Set(Some(turn_id.to_owned())),
+        started_at: Set(started_at),
+        completed_at: Set(completed_at),
+        metadata_json: Set(json!({
+            "turnId": turn_id,
+            "synthetic": true,
+        })
+        .to_string()),
+        created_at: Set(started_at.unwrap_or(updated_at)),
+        updated_at: Set(updated_at),
+    }
+}
+
+fn semantic_fixture_datetime_millis(timestamp_millis: i64) -> DateTimeWithTimeZone {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(timestamp_millis)
+        .expect("synthetic timestamp should be valid")
+        .fixed_offset()
+}
+
+fn semantic_block_sort_key(
+    timestamp_millis: i64,
+    turn_id: &str,
+    rank: u16,
+    suffix: &str,
+) -> String {
+    format!("{timestamp_millis:020}:{turn_id}:{rank:03}:{suffix}")
+}
+
+fn semantic_work_order_key(sequence: usize, item_id: &str) -> String {
+    format!("{sequence:020}:{item_id}")
+}
+
+fn synthetic_large_visible_item_id(index: usize) -> String {
+    format!("synthetic_large_cmd_{index:05}")
+}
+
+fn synthetic_large_hidden_item_id(index: usize) -> String {
+    format!("synthetic_large_hidden_{index:05}")
+}
+
+fn synthetic_long_turn_id(index: usize) -> String {
+    format!("turn_semantic_synthetic_long_{index:04}")
+}
+
+fn synthetic_long_item_id(index: usize) -> String {
+    format!("synthetic_long_cmd_{index:04}")
+}
+
+fn synthetic_hidden_system_event(item_id: &str) -> TurnItem {
+    TurnItem::SystemEvent {
+        id: item_id.to_owned(),
+        level: pioneer_protocol::SystemEventLevel::Info,
+        message: "Runtime event: thread/tokenUsage/updated".to_owned(),
+        code: Some("thread/tokenUsage/updated".to_owned()),
+        details: Some(json!({
+            "event": "thread/tokenUsage/updated",
+            "synthetic": true,
+        })),
+    }
+}
+
+fn semantic_fixture_thread(
+    workspace_id: &str,
+    thread_id: &str,
+    name: Option<&str>,
+    timestamp: i64,
+) -> Thread {
+    Thread {
+        workspace_id: workspace_id.to_owned(),
+        id: thread_id.to_owned(),
+        name: name.map(str::to_owned),
+        preview: String::new(),
+        mode: ThreadMode::Agent,
+        model: "gpt-5.5".to_owned(),
+        model_provider: "openai".to_owned(),
+        reasoning_effort: None,
+        created_at: timestamp,
+        updated_at: timestamp,
+        status: ThreadStatus::Active,
+        origin_kind: ThreadOriginKind::User,
+        sidebar_visibility: ThreadSidebarVisibility::Visible,
+        agent_nickname: None,
+        agent_role: None,
+        turns: Vec::new(),
+    }
+}
+
+fn semantic_fixture_turn(turn_id: &str, status: TurnStatus) -> Turn {
+    Turn {
+        id: turn_id.to_owned(),
+        status,
+        turn_kind: Default::default(),
+        origin: Default::default(),
+        error: None,
+        prompt_manifest: None,
+    }
+}
+
+fn completed_command_execution_item(item_id: &str) -> TurnItem {
+    let mut item = command_execution_item(item_id);
+    if let TurnItem::CommandExecution {
+        status,
+        display,
+        storage,
+        success,
+        ..
+    } = &mut item
+    {
+        *status = ToolCallStatus::Completed;
+        *success = Some(true);
+        if let ToolDisplayPayload::Shell { exit_code, .. } = display {
+            *exit_code = Some(0);
+        }
+        if let ToolStoragePayload::Shell { exit_code, .. } = storage {
+            *exit_code = Some(0);
+        }
+    }
+    item
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -27610,6 +29442,19 @@ async fn recv_text_timeout_context(
         Message::Text(payload) => payload.to_string(),
         other => panic!("expected text websocket message for {context}, got {other:?}"),
     }
+}
+
+async fn recv_jsonrpc_payload_by_id(rx: &mut mpsc::Receiver<Message>, request_id: &str) -> String {
+    for _ in 0..200 {
+        let payload = recv_text_timeout(rx, Duration::from_secs(2)).await;
+        let value: serde_json::Value =
+            serde_json::from_str(&payload).expect("json-rpc payload should decode");
+        if value.get("id").and_then(serde_json::Value::as_str) == Some(request_id) {
+            return payload;
+        }
+    }
+
+    panic!("timed out waiting for JSON-RPC payload id `{request_id}`");
 }
 
 async fn recv_response_by_id(

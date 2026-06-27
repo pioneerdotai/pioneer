@@ -16,9 +16,6 @@ pub(super) struct ParentTimelineTarget {
     workspace_id: String,
     parent_thread_id: String,
     parent_turn_id: String,
-    task_id: String,
-    run_id: String,
-    child_thread_id: String,
     child_turn_id: String,
 }
 
@@ -455,9 +452,6 @@ impl MessageProcessor {
                             workspace_id,
                             parent_thread_id,
                             parent_turn_id,
-                            task_id: task_run_turn.task_id,
-                            run_id: task_run_turn.run_id,
-                            child_thread_id: task_run_turn.thread_id,
                             child_turn_id: task_run_turn.turn_id,
                         };
                         self.parent_timeline_targets
@@ -544,47 +538,6 @@ impl MessageProcessor {
             .lock()
             .await
             .insert(thread_id.to_owned(), handle);
-    }
-
-    pub(super) fn enrich_thread_history_markdown(
-        events: &mut [pioneer_protocol::ThreadHistoryEvent],
-    ) {
-        let mut buffers: HashMap<String, String> = HashMap::new();
-
-        for event in events {
-            match &mut event.payload {
-                pioneer_protocol::ThreadHistoryEventPayload::ItemStarted { item, .. } => {
-                    let (item_id, text) = Self::normalize_item_markdown(item);
-                    buffers.insert(item_id, text);
-                }
-                pioneer_protocol::ThreadHistoryEventPayload::ItemDelta {
-                    item_id,
-                    delta,
-                    markdown,
-                    markdown_version,
-                    ..
-                } => {
-                    let full_text = {
-                        let text = buffers.entry(item_id.clone()).or_default();
-                        text.push_str(delta.as_str());
-                        text.clone()
-                    };
-
-                    if markdown.is_none() {
-                        *markdown = Some(markdown::parse_markdown_document(full_text.as_str()));
-                    }
-                    if markdown.is_some() && markdown_version.is_none() {
-                        *markdown_version = Some(MARKDOWN_AST_VERSION);
-                    }
-                }
-                pioneer_protocol::ThreadHistoryEventPayload::ItemCompleted { item, .. }
-                | pioneer_protocol::ThreadHistoryEventPayload::ItemUpdated { item, .. } => {
-                    let (item_id, _) = Self::normalize_item_markdown(item);
-                    buffers.remove(item_id.as_str());
-                }
-                _ => {}
-            }
-        }
     }
 
     pub(super) fn enrich_turn_item_events_markdown(events: &mut [TurnItemEvent]) {
@@ -1153,11 +1106,18 @@ impl MessageProcessor {
                     &notification,
                 )
                 .await;
+                self.notify_semantic_timeline_item_changed(
+                    notification.workspace_id.as_str(),
+                    notification.thread_id.as_str(),
+                    notification.turn_id.as_str(),
+                    &notification.item,
+                    Some("in_progress"),
+                )
+                .await;
                 self.notify_parent_timeline_changed_for_child_turn(
                     notification.thread_id.as_str(),
                     notification.turn_id.as_str(),
                     Some(notification.workspace_id.as_str()),
-                    TurnTimelineChangedReason::ChildTurnChanged,
                 )
                 .await;
                 debug!(
@@ -1198,11 +1158,18 @@ impl MessageProcessor {
                     &notification,
                 )
                 .await;
+                self.notify_semantic_timeline_item_changed(
+                    notification.workspace_id.as_str(),
+                    notification.thread_id.as_str(),
+                    notification.turn_id.as_str(),
+                    &notification.item,
+                    None,
+                )
+                .await;
                 self.notify_parent_timeline_changed_for_child_turn(
                     notification.thread_id.as_str(),
                     notification.turn_id.as_str(),
                     Some(notification.workspace_id.as_str()),
-                    TurnTimelineChangedReason::ChildTurnChanged,
                 )
                 .await;
             }
@@ -1229,11 +1196,17 @@ impl MessageProcessor {
                     &notification,
                 )
                 .await;
+                self.notify_semantic_timeline_work_item_id_changed(
+                    notification.workspace_id.as_str(),
+                    notification.thread_id.as_str(),
+                    notification.turn_id.as_str(),
+                    notification.item_id.as_str(),
+                )
+                .await;
                 self.notify_parent_timeline_changed_for_child_turn(
                     notification.thread_id.as_str(),
                     notification.turn_id.as_str(),
                     Some(notification.workspace_id.as_str()),
-                    TurnTimelineChangedReason::ChildTurnChanged,
                 )
                 .await;
             }
@@ -1260,11 +1233,17 @@ impl MessageProcessor {
                     &notification,
                 )
                 .await;
+                self.notify_semantic_timeline_work_item_id_changed(
+                    notification.workspace_id.as_str(),
+                    notification.thread_id.as_str(),
+                    notification.turn_id.as_str(),
+                    notification.item_id.as_str(),
+                )
+                .await;
                 self.notify_parent_timeline_changed_for_child_turn(
                     notification.thread_id.as_str(),
                     notification.turn_id.as_str(),
                     Some(notification.workspace_id.as_str()),
-                    TurnTimelineChangedReason::ChildTurnChanged,
                 )
                 .await;
             }
@@ -1291,11 +1270,17 @@ impl MessageProcessor {
                     &notification,
                 )
                 .await;
+                self.notify_semantic_timeline_work_item_id_changed(
+                    notification.workspace_id.as_str(),
+                    notification.thread_id.as_str(),
+                    notification.turn_id.as_str(),
+                    notification.item_id.as_str(),
+                )
+                .await;
                 self.notify_parent_timeline_changed_for_child_turn(
                     notification.thread_id.as_str(),
                     notification.turn_id.as_str(),
                     Some(notification.workspace_id.as_str()),
-                    TurnTimelineChangedReason::ChildTurnChanged,
                 )
                 .await;
             }
@@ -1329,7 +1314,6 @@ impl MessageProcessor {
                     notification.thread_id.as_str(),
                     notification.turn_id.as_str(),
                     Some(notification.workspace_id.as_str()),
-                    TurnTimelineChangedReason::ChildTurnChanged,
                 )
                 .await;
             }
@@ -2088,7 +2072,6 @@ impl MessageProcessor {
                     notification.thread_id.as_str(),
                     notification.turn_id.as_str(),
                     Some(notification.workspace_id.as_str()),
-                    TurnTimelineChangedReason::ChildTurnChanged,
                 )
                 .await;
 
@@ -2681,6 +2664,14 @@ impl MessageProcessor {
                             &completed,
                         )
                         .await;
+                        self.notify_semantic_timeline_item_changed(
+                            completed.workspace_id.as_str(),
+                            completed.thread_id.as_str(),
+                            completed.turn_id.as_str(),
+                            &completed.item,
+                            None,
+                        )
+                        .await;
                     }
                     Err(error) => {
                         warn!(
@@ -3148,6 +3139,13 @@ impl MessageProcessor {
             &notification,
         )
         .await;
+        self.notify_semantic_timeline_work_item_id_changed(
+            notification.workspace_id.as_str(),
+            notification.thread_id.as_str(),
+            notification.turn_id.as_str(),
+            notification.item_id.as_str(),
+        )
+        .await;
     }
 
     async fn persist_and_send_item_recovery_opened(
@@ -3175,6 +3173,13 @@ impl MessageProcessor {
             notification.thread_id.as_str(),
             events::ITEM_RECOVERY_OPENED,
             &notification,
+        )
+        .await;
+        self.notify_semantic_timeline_work_item_id_changed(
+            notification.workspace_id.as_str(),
+            notification.thread_id.as_str(),
+            notification.turn_id.as_str(),
+            notification.item_id.as_str(),
         )
         .await;
     }
@@ -3206,6 +3211,13 @@ impl MessageProcessor {
             &notification,
         )
         .await;
+        self.notify_semantic_timeline_work_item_id_changed(
+            notification.workspace_id.as_str(),
+            notification.thread_id.as_str(),
+            notification.turn_id.as_str(),
+            notification.item_id.as_str(),
+        )
+        .await;
     }
 
     async fn persist_and_send_item_retry_scheduled(
@@ -3233,6 +3245,13 @@ impl MessageProcessor {
             notification.thread_id.as_str(),
             events::ITEM_RETRY_SCHEDULED,
             &notification,
+        )
+        .await;
+        self.notify_semantic_timeline_work_item_id_changed(
+            notification.workspace_id.as_str(),
+            notification.thread_id.as_str(),
+            notification.turn_id.as_str(),
+            notification.item_id.as_str(),
         )
         .await;
     }
@@ -3264,6 +3283,13 @@ impl MessageProcessor {
             &notification,
         )
         .await;
+        self.notify_semantic_timeline_work_item_id_changed(
+            notification.workspace_id.as_str(),
+            notification.thread_id.as_str(),
+            notification.turn_id.as_str(),
+            notification.item_id.as_str(),
+        )
+        .await;
     }
 
     async fn persist_and_send_item_recovery_succeeded(
@@ -3293,6 +3319,13 @@ impl MessageProcessor {
             &notification,
         )
         .await;
+        self.notify_semantic_timeline_work_item_id_changed(
+            notification.workspace_id.as_str(),
+            notification.thread_id.as_str(),
+            notification.turn_id.as_str(),
+            notification.item_id.as_str(),
+        )
+        .await;
     }
 
     async fn persist_and_send_item_recovery_exhausted(
@@ -3320,6 +3353,13 @@ impl MessageProcessor {
             notification.thread_id.as_str(),
             events::ITEM_RECOVERY_EXHAUSTED,
             &notification,
+        )
+        .await;
+        self.notify_semantic_timeline_work_item_id_changed(
+            notification.workspace_id.as_str(),
+            notification.thread_id.as_str(),
+            notification.turn_id.as_str(),
+            notification.item_id.as_str(),
         )
         .await;
     }
@@ -3383,7 +3423,6 @@ impl MessageProcessor {
         child_thread_id: &str,
         child_turn_id: &str,
         workspace_id: Option<&str>,
-        reason: TurnTimelineChangedReason,
     ) -> MessageFuture<'static, ()> {
         let processor = self.clone();
         let child_thread_id = child_thread_id.to_owned();
@@ -3402,21 +3441,11 @@ impl MessageProcessor {
                     return;
                 };
 
-                let notification = TurnTimelineChangedNotification {
-                    workspace_id: target.workspace_id,
-                    thread_id: target.parent_thread_id,
-                    turn_id: target.parent_turn_id,
-                    task_id: Some(target.task_id),
-                    run_id: Some(target.run_id),
-                    child_thread_id: Some(target.child_thread_id),
-                    child_turn_id: Some(target.child_turn_id),
-                    reason,
-                };
                 processor
-                    .send_notification_to_thread_subscribers(
-                        notification.thread_id.as_str(),
-                        events::TURN_TIMELINE_CHANGED,
-                        &notification,
+                    .notify_semantic_timeline_turn_state_changed(
+                        target.workspace_id.as_str(),
+                        target.parent_thread_id.as_str(),
+                        target.parent_turn_id.as_str(),
                     )
                     .await;
             });
@@ -3617,11 +3646,16 @@ impl MessageProcessor {
             finish_outcome.connection_ids,
         )
         .await;
+        self.notify_semantic_timeline_turn_state_changed(
+            turn_completed.workspace_id.as_str(),
+            turn_completed.thread_id.as_str(),
+            turn_completed.turn.id.as_str(),
+        )
+        .await;
         self.notify_parent_timeline_changed_for_child_turn(
             turn_completed.thread_id.as_str(),
             turn_completed.turn.id.as_str(),
             Some(turn_completed.workspace_id.as_str()),
-            TurnTimelineChangedReason::ChildTurnChanged,
         )
         .await;
 
@@ -3937,11 +3971,16 @@ impl MessageProcessor {
             finish_outcome.connection_ids,
         )
         .await;
+        self.notify_semantic_timeline_turn_state_changed(
+            turn_blocked.workspace_id.as_str(),
+            turn_blocked.thread_id.as_str(),
+            turn_blocked.turn.id.as_str(),
+        )
+        .await;
         self.notify_parent_timeline_changed_for_child_turn(
             turn_blocked.thread_id.as_str(),
             turn_blocked.turn.id.as_str(),
             Some(turn_blocked.workspace_id.as_str()),
-            TurnTimelineChangedReason::ChildTurnChanged,
         )
         .await;
 
@@ -4095,11 +4134,16 @@ impl MessageProcessor {
             &turn_blocked,
         )
         .await;
+        self.notify_semantic_timeline_turn_state_changed(
+            turn_blocked.workspace_id.as_str(),
+            turn_blocked.thread_id.as_str(),
+            turn_blocked.turn.id.as_str(),
+        )
+        .await;
         self.notify_parent_timeline_changed_for_child_turn(
             turn_blocked.thread_id.as_str(),
             turn_blocked.turn.id.as_str(),
             Some(turn_blocked.workspace_id.as_str()),
-            TurnTimelineChangedReason::ChildTurnChanged,
         )
         .await;
 
@@ -4386,11 +4430,16 @@ impl MessageProcessor {
             finish_outcome.connection_ids,
         )
         .await;
+        self.notify_semantic_timeline_turn_state_changed(
+            turn_failed.workspace_id.as_str(),
+            turn_failed.thread_id.as_str(),
+            turn_failed.turn.id.as_str(),
+        )
+        .await;
         self.notify_parent_timeline_changed_for_child_turn(
             turn_failed.thread_id.as_str(),
             turn_failed.turn.id.as_str(),
             Some(turn_failed.workspace_id.as_str()),
-            TurnTimelineChangedReason::ChildTurnChanged,
         )
         .await;
 
@@ -4571,11 +4620,16 @@ impl MessageProcessor {
             finish_outcome.connection_ids,
         )
         .await;
+        self.notify_semantic_timeline_turn_state_changed(
+            turn_failed.workspace_id.as_str(),
+            turn_failed.thread_id.as_str(),
+            turn_failed.turn.id.as_str(),
+        )
+        .await;
         self.notify_parent_timeline_changed_for_child_turn(
             turn_failed.thread_id.as_str(),
             turn_failed.turn.id.as_str(),
             Some(turn_failed.workspace_id.as_str()),
-            TurnTimelineChangedReason::ChildTurnChanged,
         )
         .await;
 
@@ -4657,6 +4711,14 @@ impl MessageProcessor {
         } else {
             self.send_notification_to_thread_subscribers(thread_id, events::ITEM_STARTED, &started)
                 .await;
+            self.notify_semantic_timeline_item_changed(
+                started.workspace_id.as_str(),
+                started.thread_id.as_str(),
+                started.turn_id.as_str(),
+                &started.item,
+                Some("in_progress"),
+            )
+            .await;
         }
 
         let completed = pioneer_protocol::ItemCompletedNotification {
@@ -4685,6 +4747,14 @@ impl MessageProcessor {
         self.ingest_committed_thread_item(&completed).await;
         self.send_notification_to_thread_subscribers(thread_id, events::ITEM_COMPLETED, &completed)
             .await;
+        self.notify_semantic_timeline_item_changed(
+            completed.workspace_id.as_str(),
+            completed.thread_id.as_str(),
+            completed.turn_id.as_str(),
+            &completed.item,
+            None,
+        )
+        .await;
     }
 
     pub(super) fn spawn_initial_thread_title_task(

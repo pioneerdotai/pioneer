@@ -2301,6 +2301,15 @@ async fn ensure_task_run_occurrence_anchor(
     processor
         .send_notification_to_thread_subscribers(parent_thread_id, events::ITEM_STARTED, &started)
         .await;
+    processor
+        .notify_semantic_timeline_item_changed(
+            started.workspace_id.as_str(),
+            started.thread_id.as_str(),
+            started.turn_id.as_str(),
+            &started.item,
+            Some("in_progress"),
+        )
+        .await;
 
     let completed = ItemCompletedNotification {
         workspace_id: task_response.task.workspace_id.clone(),
@@ -2320,6 +2329,15 @@ async fn ensure_task_run_occurrence_anchor(
             parent_thread_id,
             events::ITEM_COMPLETED,
             &completed,
+        )
+        .await;
+    processor
+        .notify_semantic_timeline_item_changed(
+            completed.workspace_id.as_str(),
+            completed.thread_id.as_str(),
+            completed.turn_id.as_str(),
+            &completed.item,
+            None,
         )
         .await;
     Ok(())
@@ -2413,6 +2431,13 @@ async fn mark_task_run_occurrence_turn_terminal(
                     &notification,
                 )
                 .await;
+            processor
+                .notify_semantic_timeline_turn_state_changed(
+                    notification.workspace_id.as_str(),
+                    notification.thread_id.as_str(),
+                    notification.turn.id.as_str(),
+                )
+                .await;
         }
         TurnStatus::Failed | TurnStatus::Interrupted => {
             let notification = TurnFailedNotification {
@@ -2429,6 +2454,13 @@ async fn mark_task_run_occurrence_turn_terminal(
                     parent_thread_id,
                     events::TURN_FAILED,
                     &notification,
+                )
+                .await;
+            processor
+                .notify_semantic_timeline_turn_state_changed(
+                    notification.workspace_id.as_str(),
+                    notification.thread_id.as_str(),
+                    notification.turn.id.as_str(),
                 )
                 .await;
         }
@@ -2448,6 +2480,13 @@ async fn mark_task_run_occurrence_turn_terminal(
                     parent_thread_id,
                     events::TURN_BLOCKED,
                     &notification,
+                )
+                .await;
+            processor
+                .notify_semantic_timeline_turn_state_changed(
+                    notification.workspace_id.as_str(),
+                    notification.thread_id.as_str(),
+                    notification.turn.id.as_str(),
                 )
                 .await;
         }

@@ -11,6 +11,7 @@ mod gateway;
 #[cfg(feature = "schema")]
 pub mod schema;
 mod threads;
+mod timeline;
 mod workspaces;
 
 use active_thread::{
@@ -88,6 +89,7 @@ use pioneer_protocol::{
     ProviderListModelsParams, ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
     ThreadAgentsDocArchiveParams, ThreadAgentsDocArchiveResponse, ThreadAgentsDocGetParams,
     ThreadAgentsDocGetResponse, ThreadAgentsDocSaveParams, ThreadAgentsDocSaveResponse,
+    ThreadTimelinePageParams, ThreadTimelinePageResponse, TurnWorkPageParams, TurnWorkPageResponse,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -101,6 +103,7 @@ use threads::{
     ClientThreadTreeLevel, ClientThreadTreeQueryData, ThreadTreeLevelRequest,
     ThreadTreeRefreshRequest, client_thread_tree_level, refresh_thread_tree,
 };
+use timeline::{thread_timeline_page, turn_work_page};
 use workspaces::{
     WorkspaceCreateRequest, WorkspaceCreateResult, WorkspaceRenameRequest, WorkspaceRenameResult,
     WorkspaceSwitchRequest, WorkspaceSwitchResult, create_workspace, rename_workspace,
@@ -150,6 +153,23 @@ enum FfiResponse<T> {
         message: String,
         code: Option<String>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ClientFfiError {
+    message: String,
+    code: &'static str,
+}
+
+impl ClientFfiError {
+    pub(crate) const GENERIC_CODE: &'static str = "pioneer_client_ffi_error";
+
+    pub(crate) fn new(message: impl Into<String>, code: &'static str) -> Self {
+        Self {
+            message: message.into(),
+            code,
+        }
+    }
 }
 
 impl PioneerClientFfi {
@@ -679,6 +699,32 @@ impl ClientFfiRuntime {
         Ok(client_thread_tree_level(request))
     }
 
+    fn thread_timeline_page(
+        &self,
+        input_json: &str,
+    ) -> Result<ThreadTimelinePageResponse, ClientFfiError> {
+        let params =
+            serde_json::from_str::<ThreadTimelinePageParams>(input_json).map_err(|error| {
+                ClientFfiError::new(
+                    format!("invalid thread timeline page params: {error}"),
+                    timeline::TIMELINE_ERROR_VALIDATION,
+                )
+            })?;
+
+        thread_timeline_page(&self.client_runtime.ws_command_sender(), params)
+    }
+
+    fn turn_work_page(&self, input_json: &str) -> Result<TurnWorkPageResponse, ClientFfiError> {
+        let params = serde_json::from_str::<TurnWorkPageParams>(input_json).map_err(|error| {
+            ClientFfiError::new(
+                format!("invalid turn work page params: {error}"),
+                timeline::TIMELINE_ERROR_VALIDATION,
+            )
+        })?;
+
+        turn_work_page(&self.client_runtime.ws_command_sender(), params)
+    }
+
     fn agents_doc_get(&self, input_json: &str) -> Result<ThreadAgentsDocGetResponse, String> {
         let request = serde_json::from_str::<ThreadAgentsDocGetParams>(input_json)
             .map_err(|error| format!("invalid agents doc get request: {error}"))?;
@@ -795,6 +841,30 @@ impl ClientFfiRuntime {
     }
 }
 
+fn ffi_client_json_typed_response<T, F>(
+    ptr: *mut PioneerClientFfi,
+    input_json: *const c_char,
+    operation_name: &'static str,
+    operation: F,
+) -> *mut c_char
+where
+    T: Serialize,
+    F: FnOnce(&ClientFfiRuntime, &str) -> Result<T, ClientFfiError>,
+{
+    let client = match unsafe { ffi_ref(ptr) } {
+        Ok(client) => client,
+        Err(error) => return into_c_string(to_json_response::<()>(Err(error))),
+    };
+    let input_json = match unsafe { read_c_string(input_json) } {
+        Ok(input_json) => input_json,
+        Err(error) => return into_c_string(to_json_response::<()>(Err(error))),
+    };
+
+    into_ffi_typed_response_with_diagnostics(&client.runtime.diagnostics, operation_name, || {
+        operation(&client.runtime, input_json.as_str())
+    })
+}
+
 fn ffi_client_json_response<T, F>(
     ptr: *mut PioneerClientFfi,
     input_json: *const c_char,
@@ -846,6 +916,23 @@ macro_rules! ffi_client_json_method {
             input_json: *const c_char,
         ) -> *mut c_char {
             ffi_client_json_response(
+                ptr,
+                input_json,
+                stringify!($runtime_method),
+                |runtime, input_json| runtime.$runtime_method(input_json),
+            )
+        }
+    };
+}
+
+macro_rules! ffi_client_json_typed_method {
+    ($export_name:ident, $runtime_method:ident) => {
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn $export_name(
+            ptr: *mut PioneerClientFfi,
+            input_json: *const c_char,
+        ) -> *mut c_char {
+            ffi_client_json_typed_response(
                 ptr,
                 input_json,
                 stringify!($runtime_method),
@@ -998,6 +1085,11 @@ ffi_client_json_method!(
 );
 ffi_client_json_method!(pioneer_client_ffi_thread_tree_refresh, thread_tree_refresh);
 ffi_client_json_method!(pioneer_client_ffi_thread_tree_level, thread_tree_level);
+ffi_client_json_typed_method!(
+    pioneer_client_ffi_thread_timeline_page,
+    thread_timeline_page
+);
+ffi_client_json_typed_method!(pioneer_client_ffi_turn_work_page, turn_work_page);
 ffi_client_json_method!(pioneer_client_ffi_agents_doc_get, agents_doc_get);
 ffi_client_json_method!(pioneer_client_ffi_agents_doc_save, agents_doc_save);
 ffi_client_json_method!(pioneer_client_ffi_agents_doc_archive, agents_doc_archive);
@@ -1109,6 +1201,16 @@ fn to_json_response<T: Serialize>(result: Result<T, String>) -> String {
     }
 }
 
+fn to_json_typed_response<T: Serialize>(result: Result<T, ClientFfiError>) -> String {
+    match result {
+        Ok(value) => serialize_json_response(serde_json::to_string(&FfiResponse::Ok { value })),
+        Err(error) => serialize_json_response(serde_json::to_string(&FfiResponse::<()>::Error {
+            message: error.message,
+            code: Some(error.code.to_owned()),
+        })),
+    }
+}
+
 fn to_json_error_response(message: String, code: &'static str) -> String {
     serialize_json_response(serde_json::to_string(&FfiResponse::<()>::Error {
         message,
@@ -1149,6 +1251,22 @@ where
     ))
 }
 
+fn into_ffi_typed_response_with_diagnostics<T, F>(
+    diagnostics: &ClientFfiDiagnostics,
+    operation_name: &'static str,
+    operation: F,
+) -> *mut c_char
+where
+    T: Serialize,
+    F: FnOnce() -> Result<T, ClientFfiError>,
+{
+    into_c_string(ffi_typed_response_json_with_diagnostics(
+        diagnostics,
+        operation_name,
+        operation,
+    ))
+}
+
 fn ffi_response_json<T, F>(operation: F) -> String
 where
     T: Serialize,
@@ -1159,6 +1277,29 @@ where
             format!("panic in pioneer client ffi: {}", panic_message(payload)),
             "pioneer_client_ffi_panic",
         )
+    })
+}
+
+fn ffi_typed_response_json_with_diagnostics<T, F>(
+    diagnostics: &ClientFfiDiagnostics,
+    operation_name: &'static str,
+    operation: F,
+) -> String
+where
+    T: Serialize,
+    F: FnOnce() -> Result<T, ClientFfiError>,
+{
+    catch_unwind(AssertUnwindSafe(|| {
+        let response = operation();
+        if let Err(error) = &response {
+            diagnostics.record_error(operation_name, error.message.clone(), error.code);
+        }
+        to_json_typed_response(response)
+    }))
+    .unwrap_or_else(|payload| {
+        let message = format!("panic in pioneer client ffi: {}", panic_message(payload));
+        diagnostics.record_error(operation_name, message.clone(), "pioneer_client_ffi_panic");
+        to_json_error_response(message, "pioneer_client_ffi_panic")
     })
 }
 

@@ -1,0 +1,459 @@
+use crate::app::root::{GatewayConnectionState, PioneerDesktop};
+use gpui::{AppContext, AsyncApp, Context, WeakEntity};
+use pioneer_client::timeline::semantic::{
+    self, DEFAULT_PREFETCH_THRESHOLD_ROWS, DEFAULT_TOP_LEVEL_PAGE_LIMIT,
+    DEFAULT_TURN_WORK_PAGE_LIMIT, SemanticTimelineRequestAction, SemanticTimelineRequestKey,
+    SemanticTimelineRowId, SemanticTimelineRows, SemanticTimelineVisibleRow, TimelineRequestStatus,
+    TopLevelPageMergeMode, WorkPageMergeMode,
+};
+use pioneer_protocol::{
+    ThreadTimelinePageParams, ThreadTimelinePageResponse, TimelinePageAnchor, TurnWorkPageParams,
+    TurnWorkPageResponse,
+};
+use std::collections::HashMap;
+use tracing::warn;
+
+use super::{TimelineRenderRow, semantic_adapter::SEMANTIC_TURN_WORK_GROUP_PREFIX};
+
+enum SemanticTimelinePageResult {
+    Thread {
+        page: ThreadTimelinePageResponse,
+        merge_mode: TopLevelPageMergeMode,
+    },
+    TurnWork {
+        page: TurnWorkPageResponse,
+        merge_mode: WorkPageMergeMode,
+    },
+}
+
+impl PioneerDesktop {
+    pub(crate) fn request_semantic_thread_newest_page(
+        &mut self,
+        thread_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.execute_semantic_timeline_action(
+            SemanticTimelineRequestAction::ThreadTimelinePage {
+                key: SemanticTimelineRequestKey::ThreadNewest {
+                    thread_id: thread_id.clone(),
+                },
+                params: ThreadTimelinePageParams {
+                    thread_id,
+                    anchor: TimelinePageAnchor::Newest,
+                    limit: Some(DEFAULT_TOP_LEVEL_PAGE_LIMIT),
+                },
+            },
+            cx,
+        );
+    }
+
+    pub(crate) fn request_semantic_turn_work_newest_page(
+        &mut self,
+        thread_id: String,
+        turn_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.execute_semantic_timeline_action(
+            SemanticTimelineRequestAction::TurnWorkPage {
+                key: SemanticTimelineRequestKey::TurnWorkInitial {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                },
+                params: TurnWorkPageParams {
+                    thread_id,
+                    turn_id,
+                    anchor: TimelinePageAnchor::Newest,
+                    limit: Some(DEFAULT_TURN_WORK_PAGE_LIMIT),
+                },
+            },
+            cx,
+        );
+    }
+
+    pub(super) fn request_semantic_timeline_prefetch_for_visible_rows(
+        &mut self,
+        thread_id: &str,
+        rows: &[TimelineRenderRow],
+        semantic_row_ids: &HashMap<String, SemanticTimelineRowId>,
+        semantic_rows: &SemanticTimelineRows,
+        visible_indices: &[usize],
+        cx: &mut Context<Self>,
+    ) {
+        if visible_indices.is_empty() {
+            return;
+        }
+        if semantic_rows.thread_id != thread_id {
+            return;
+        }
+
+        let visible_rows = visible_indices
+            .iter()
+            .filter_map(|index| {
+                let row = rows.get(*index)?;
+                let row_id = semantic_row_ids.get(row.key())?.clone();
+                Some(SemanticTimelineVisibleRow {
+                    row_id,
+                    top_offset_px: 0,
+                })
+            })
+            .collect::<Vec<_>>();
+        if visible_rows.is_empty() {
+            return;
+        }
+
+        let in_flight = self.semantic_timeline_in_flight.clone();
+        let actions = semantic::plan_semantic_timeline_requests_from_rows(
+            semantic_rows,
+            &semantic::SemanticTimelineRequestPlannerInput {
+                visible_rows,
+                leading_threshold_rows: DEFAULT_PREFETCH_THRESHOLD_ROWS,
+                trailing_threshold_rows: DEFAULT_PREFETCH_THRESHOLD_ROWS,
+                top_level_limit: DEFAULT_TOP_LEVEL_PAGE_LIMIT,
+                turn_work_limit: DEFAULT_TURN_WORK_PAGE_LIMIT,
+                in_flight,
+            },
+        )
+        .actions;
+
+        if actions.is_empty() {
+            return;
+        }
+
+        let allow_thread_before = self.semantic_prefetch_can_request_thread_before();
+        let allow_thread_after = self.semantic_prefetch_can_request_thread_after();
+        let allow_work_prefetch = self.semantic_prefetch_can_request_work_range();
+        let scroll_generation = self
+            .thread_timeline_view_state
+            .borrow()
+            .semantic_prefetch_scroll_generation;
+        let consumed_scroll_generation = self
+            .thread_timeline_view_state
+            .borrow()
+            .semantic_prefetch_consumed_scroll_generation;
+        let allow_boundary_prefetch = scroll_generation > consumed_scroll_generation;
+        let mut consumed_boundary_prefetch = false;
+        for action in actions {
+            let requires_scroll_intent = semantic_action_requires_scroll_intent(&action);
+            if requires_scroll_intent && (!allow_boundary_prefetch || consumed_boundary_prefetch) {
+                continue;
+            }
+            if semantic_action_allowed_by_scroll(
+                &action,
+                allow_thread_before,
+                allow_thread_after,
+                allow_work_prefetch,
+            ) {
+                if requires_scroll_intent {
+                    consumed_boundary_prefetch = true;
+                }
+                self.execute_semantic_timeline_action(action, cx);
+            }
+        }
+        if consumed_boundary_prefetch {
+            self.thread_timeline_view_state
+                .borrow_mut()
+                .semantic_prefetch_consumed_scroll_generation = scroll_generation;
+        }
+    }
+
+    pub(super) fn toggle_turn_work_group_expanded(
+        &mut self,
+        toggle_key: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(turn_id) = toggle_key.strip_prefix(SEMANTIC_TURN_WORK_GROUP_PREFIX) else {
+            self.toggle_timeline_item_expanded(toggle_key, cx);
+            return;
+        };
+        let Some(thread_id) = self.current_active_thread_id().map(str::to_owned) else {
+            return;
+        };
+
+        let is_expanded = self
+            .semantic_timelines
+            .thread(thread_id.as_str())
+            .and_then(|thread| {
+                thread
+                    .cached_turn_work_block(turn_id)
+                    .map(|work| semantic::resolve_work_expanded(work, &thread.expansion))
+            })
+            .unwrap_or(false);
+
+        let changed = if is_expanded {
+            semantic::collapse_turn_work(
+                &mut self.semantic_timelines,
+                thread_id.clone(),
+                turn_id.to_owned(),
+            )
+        } else {
+            semantic::expand_turn_work(
+                &mut self.semantic_timelines,
+                thread_id.clone(),
+                turn_id.to_owned(),
+            )
+        };
+
+        if changed {
+            self.semantic_timeline_revision = self.semantic_timeline_revision.saturating_add(1);
+            cx.notify();
+        }
+
+        if !is_expanded && self.should_request_initial_turn_work_page(thread_id.as_str(), turn_id) {
+            self.execute_semantic_timeline_action(
+                SemanticTimelineRequestAction::TurnWorkPage {
+                    key: SemanticTimelineRequestKey::TurnWorkInitial {
+                        thread_id: thread_id.clone(),
+                        turn_id: turn_id.to_owned(),
+                    },
+                    params: TurnWorkPageParams {
+                        thread_id,
+                        turn_id: turn_id.to_owned(),
+                        anchor: TimelinePageAnchor::Newest,
+                        limit: Some(DEFAULT_TURN_WORK_PAGE_LIMIT),
+                    },
+                },
+                cx,
+            );
+        }
+    }
+
+    pub(super) fn execute_semantic_timeline_action(
+        &mut self,
+        action: SemanticTimelineRequestAction,
+        cx: &mut Context<Self>,
+    ) {
+        if self.gateway.connection_state != GatewayConnectionState::Connected {
+            return;
+        }
+        let Some(connection_id) = self.gateway.ws_connection_id else {
+            return;
+        };
+
+        let key = semantic_request_action_key(&action).clone();
+        if !self.semantic_timeline_in_flight.insert(key.clone()) {
+            return;
+        }
+        self.mark_semantic_timeline_request_loading(&key);
+        cx.notify();
+
+        let ws_sender = self.gateway.ws_command_sender.clone();
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                let result = cx
+                    .background_spawn(async move {
+                        match action {
+                            SemanticTimelineRequestAction::ThreadTimelinePage { key, params } => {
+                                let merge_mode = match key {
+                                    SemanticTimelineRequestKey::ThreadNewest { .. } => {
+                                        TopLevelPageMergeMode::Merge
+                                    }
+                                    SemanticTimelineRequestKey::ThreadBefore { .. } => {
+                                        TopLevelPageMergeMode::MergeBefore
+                                    }
+                                    SemanticTimelineRequestKey::ThreadAfter { .. } => {
+                                        TopLevelPageMergeMode::MergeAfter
+                                    }
+                                    _ => TopLevelPageMergeMode::Merge,
+                                };
+                                ws_sender.thread_timeline_page(params).map(|page| {
+                                    SemanticTimelinePageResult::Thread { page, merge_mode }
+                                })
+                            }
+                            SemanticTimelineRequestAction::TurnWorkPage { key, params } => {
+                                let merge_mode = match key {
+                                    SemanticTimelineRequestKey::TurnWorkInitial { .. } => {
+                                        WorkPageMergeMode::Reset
+                                    }
+                                    SemanticTimelineRequestKey::TurnWorkBefore { .. } => {
+                                        WorkPageMergeMode::MergeBefore
+                                    }
+                                    SemanticTimelineRequestKey::TurnWorkAfter { .. } => {
+                                        WorkPageMergeMode::MergeAfter
+                                    }
+                                    _ => WorkPageMergeMode::Merge,
+                                };
+                                ws_sender.turn_work_page(params).map(|page| {
+                                    SemanticTimelinePageResult::TurnWork { page, merge_mode }
+                                })
+                            }
+                        }
+                    })
+                    .await;
+
+                let _ = this.update(&mut cx, |view, cx| {
+                    view.semantic_timeline_in_flight.remove(&key);
+                    if view.gateway.ws_connection_id != Some(connection_id) {
+                        cx.notify();
+                        return;
+                    }
+
+                    match result {
+                        Ok(SemanticTimelinePageResult::Thread { page, merge_mode }) => {
+                            view.capture_timeline_scroll_anchor_before_semantic_update();
+                            if semantic::apply_thread_timeline_page(
+                                &mut view.semantic_timelines,
+                                page,
+                                merge_mode,
+                            ) {
+                                view.semantic_timeline_revision =
+                                    view.semantic_timeline_revision.saturating_add(1);
+                            }
+                        }
+                        Ok(SemanticTimelinePageResult::TurnWork { page, merge_mode }) => {
+                            view.capture_timeline_scroll_anchor_before_semantic_update();
+                            if semantic::apply_turn_work_page(
+                                &mut view.semantic_timelines,
+                                page,
+                                merge_mode,
+                            ) {
+                                view.semantic_timeline_revision =
+                                    view.semantic_timeline_revision.saturating_add(1);
+                            }
+                        }
+                        Err(error) => {
+                            warn!(
+                                request_key = ?key,
+                                error = %format!("{error:#}"),
+                                "failed to load semantic timeline page"
+                            );
+                            view.mark_semantic_timeline_request_failed(&key, format!("{error:#}"));
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn mark_semantic_timeline_request_loading(&mut self, key: &SemanticTimelineRequestKey) {
+        let request_key = format!("{key:?}");
+        match key {
+            SemanticTimelineRequestKey::ThreadNewest { thread_id }
+            | SemanticTimelineRequestKey::ThreadBefore { thread_id, .. }
+            | SemanticTimelineRequestKey::ThreadAfter { thread_id, .. } => {
+                self.semantic_timelines
+                    .thread_mut(thread_id.clone())
+                    .top_level
+                    .request_status = TimelineRequestStatus::Loading { request_key };
+            }
+            SemanticTimelineRequestKey::TurnWorkInitial { thread_id, turn_id }
+            | SemanticTimelineRequestKey::TurnWorkBefore {
+                thread_id, turn_id, ..
+            }
+            | SemanticTimelineRequestKey::TurnWorkAfter {
+                thread_id, turn_id, ..
+            } => {
+                self.semantic_timelines
+                    .thread_mut(thread_id.clone())
+                    .work_range_mut(turn_id.clone())
+                    .request_status = TimelineRequestStatus::Loading { request_key };
+            }
+        }
+    }
+
+    fn mark_semantic_timeline_request_failed(
+        &mut self,
+        key: &SemanticTimelineRequestKey,
+        message: String,
+    ) {
+        match key {
+            SemanticTimelineRequestKey::ThreadNewest { thread_id }
+            | SemanticTimelineRequestKey::ThreadBefore { thread_id, .. }
+            | SemanticTimelineRequestKey::ThreadAfter { thread_id, .. } => {
+                self.semantic_timelines
+                    .thread_mut(thread_id.clone())
+                    .top_level
+                    .request_status = TimelineRequestStatus::Failed { message };
+            }
+            SemanticTimelineRequestKey::TurnWorkInitial { thread_id, turn_id }
+            | SemanticTimelineRequestKey::TurnWorkBefore {
+                thread_id, turn_id, ..
+            }
+            | SemanticTimelineRequestKey::TurnWorkAfter {
+                thread_id, turn_id, ..
+            } => {
+                self.semantic_timelines
+                    .thread_mut(thread_id.clone())
+                    .work_range_mut(turn_id.clone())
+                    .request_status = TimelineRequestStatus::Failed { message };
+            }
+        }
+    }
+
+    fn should_request_initial_turn_work_page(&self, thread_id: &str, turn_id: &str) -> bool {
+        let Some(thread) = self.semantic_timelines.thread(thread_id) else {
+            return false;
+        };
+        let Some(work) = thread.cached_turn_work_block(turn_id) else {
+            return false;
+        };
+        if work.visible_work_count == 0 && !work.has_more_before && !work.has_more_after {
+            return false;
+        }
+        thread.work_range(turn_id).is_none_or(|range| {
+            range.ordered_item_ids.is_empty()
+                && !matches!(range.request_status, TimelineRequestStatus::Loading { .. })
+        })
+    }
+
+    fn semantic_prefetch_can_request_thread_before(&self) -> bool {
+        let max_offset = self.thread_timeline_scroll_handle.max_offset().height;
+        if max_offset <= gpui::px(1.) {
+            return false;
+        }
+        self.thread_timeline_scroll_handle.offset().y >= gpui::px(-24.)
+    }
+
+    fn semantic_prefetch_can_request_thread_after(&self) -> bool {
+        let max_offset = self.thread_timeline_scroll_handle.max_offset().height;
+        if max_offset <= gpui::px(1.) {
+            return false;
+        }
+        self.timeline_is_near_bottom()
+    }
+
+    fn semantic_prefetch_can_request_work_range(&self) -> bool {
+        self.thread_timeline_scroll_handle.max_offset().height > gpui::px(1.)
+    }
+}
+
+fn semantic_request_action_key(
+    action: &SemanticTimelineRequestAction,
+) -> &SemanticTimelineRequestKey {
+    match action {
+        SemanticTimelineRequestAction::ThreadTimelinePage { key, .. }
+        | SemanticTimelineRequestAction::TurnWorkPage { key, .. } => key,
+    }
+}
+
+fn semantic_action_allowed_by_scroll(
+    action: &SemanticTimelineRequestAction,
+    allow_thread_before: bool,
+    allow_thread_after: bool,
+    allow_work_prefetch: bool,
+) -> bool {
+    match action {
+        SemanticTimelineRequestAction::ThreadTimelinePage { key, .. } => match key {
+            SemanticTimelineRequestKey::ThreadNewest { .. } => true,
+            SemanticTimelineRequestKey::ThreadBefore { .. } => allow_thread_before,
+            SemanticTimelineRequestKey::ThreadAfter { .. } => allow_thread_after,
+            _ => false,
+        },
+        SemanticTimelineRequestAction::TurnWorkPage { key, .. } => {
+            matches!(key, SemanticTimelineRequestKey::TurnWorkInitial { .. }) || allow_work_prefetch
+        }
+    }
+}
+
+fn semantic_action_requires_scroll_intent(action: &SemanticTimelineRequestAction) -> bool {
+    match action {
+        SemanticTimelineRequestAction::ThreadTimelinePage { key, .. } => {
+            !matches!(key, SemanticTimelineRequestKey::ThreadNewest { .. })
+        }
+        SemanticTimelineRequestAction::TurnWorkPage { key, .. } => {
+            !matches!(key, SemanticTimelineRequestKey::TurnWorkInitial { .. })
+        }
+    }
+}

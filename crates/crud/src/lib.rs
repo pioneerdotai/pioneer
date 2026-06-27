@@ -6,6 +6,9 @@ mod repositories;
 mod task_events;
 mod task_projector;
 mod thread_episodic;
+mod timeline_live_projection;
+mod timeline_projection;
+mod timeline_projection_model;
 mod turn_item_terminal;
 mod util;
 
@@ -213,6 +216,21 @@ pub use crate::repositories::thread_agents_doc::{
     ThreadAgentsDocRevisionRecord, ThreadAgentsDocSaveReason, ThreadAgentsDocScope,
     ThreadAgentsDocScopeContext, ThreadAgentsDocStatus, ThreadAgentsDocSummaryRecord,
 };
+pub use crate::repositories::thread_timeline_projection::{
+    BLOCK_KIND_APPROVAL, BLOCK_KIND_ASSISTANT_MESSAGE, BLOCK_KIND_RUNNING, BLOCK_KIND_SYSTEM,
+    BLOCK_KIND_TURN_WORK, BLOCK_KIND_USER_MESSAGE, PROJECTION_META_STATUS_BACKFILLING,
+    PROJECTION_META_STATUS_COMPLETE, PROJECTION_META_STATUS_FAILED, PROJECTION_META_STATUS_PENDING,
+    ProjectionMetaRecord, ProjectionPageAnchor, SEMANTIC_TIMELINE_PROJECTION_KEY,
+    SEMANTIC_TIMELINE_PROJECTION_VERSION, ThreadTimelineBlockRecord, TurnWorkItemProjectionRecord,
+    TurnWorkProjectionRecord, WORK_VISIBILITY_HIDDEN, WORK_VISIBILITY_VISIBLE,
+    count_thread_timeline_blocks, count_turn_work_items, delete_thread_timeline_blocks_for_thread,
+    delete_thread_timeline_blocks_for_turn, delete_turn_work_items_for_turn,
+    delete_turn_work_projection, find_projection_meta, find_thread_timeline_block_by_sort_key,
+    find_turn_work_item_projection, find_turn_work_item_projection_by_order_key,
+    find_turn_work_projection, list_thread_timeline_blocks_page, list_turn_work_items_page,
+    update_projection_meta_status, upsert_projection_meta, upsert_thread_timeline_block,
+    upsert_turn_work_item_projection, upsert_turn_work_projection,
+};
 use crate::repositories::{
     agent_memory, agent_memory_candidate, agent_memory_capsule, agent_memory_event,
     agent_memory_policy_decision, agent_memory_quality_decision, agent_memory_quarantine,
@@ -229,6 +247,15 @@ use crate::repositories::{
 };
 pub use crate::task_events::{AppendedTaskEvent, TaskEventAppendStatus, TaskEventPayload};
 use crate::task_projector::TaskProjector;
+pub use crate::timeline_projection::{
+    ProjectionPlacement, ProjectionVisibility, TurnItemProjectionClassification,
+    WORK_ITEM_STATUS_CANCELLED, WORK_ITEM_STATUS_COMPLETED, WORK_ITEM_STATUS_FAILED,
+    WORK_ITEM_STATUS_RUNNING, WorkItemClassification, classify_turn_item_row,
+    classify_turn_item_with_db_status,
+};
+pub use crate::timeline_projection_model::{
+    approval_block_id, assistant_block_id, user_block_id, work_block_id, work_item_projection_id,
+};
 use crate::turn_item_terminal::{
     TurnItemTerminalState, terminalize_turn_item_payload, tool_call_status,
 };
@@ -847,7 +874,28 @@ impl CrudStore {
         request: NewCliRuntimePendingRequest,
     ) -> Result<CliRuntimePendingRequestRecord> {
         self.run_serialized_write(|| async {
-            cli_runtime_binding::create_pending_request(&self.connection, request.clone()).await
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin CLI runtime pending request create transaction")?;
+            let record =
+                cli_runtime_binding::create_pending_request(&transaction, request.clone()).await?;
+            if let Err(error) =
+                crate::timeline_live_projection::project_cli_runtime_pending_request(
+                    &transaction,
+                    &record,
+                )
+                .await
+            {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+            transaction
+                .commit()
+                .await
+                .context("failed to commit CLI runtime pending request create transaction")?;
+            Ok(record)
         })
         .await
     }
@@ -857,7 +905,28 @@ impl CrudStore {
         request: NewCliRuntimePendingRequest,
     ) -> Result<CliRuntimePendingRequestRecord> {
         self.run_serialized_write(|| async {
-            cli_runtime_binding::open_pending_request(&self.connection, request.clone()).await
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin CLI runtime pending request open transaction")?;
+            let record =
+                cli_runtime_binding::open_pending_request(&transaction, request.clone()).await?;
+            if let Err(error) =
+                crate::timeline_live_projection::project_cli_runtime_pending_request(
+                    &transaction,
+                    &record,
+                )
+                .await
+            {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+            transaction
+                .commit()
+                .await
+                .context("failed to commit CLI runtime pending request open transaction")?;
+            Ok(record)
         })
         .await
     }
@@ -882,7 +951,30 @@ impl CrudStore {
         resolution: ResolveCliRuntimePendingRequest,
     ) -> Result<Option<CliRuntimePendingRequestRecord>> {
         self.run_serialized_write(|| async {
-            cli_runtime_binding::resolve_pending_request(&self.connection, resolution.clone()).await
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin CLI runtime pending request resolve transaction")?;
+            let record =
+                cli_runtime_binding::resolve_pending_request(&transaction, resolution.clone())
+                    .await?;
+            if let Some(record) = &record
+                && let Err(error) =
+                    crate::timeline_live_projection::project_cli_runtime_pending_request(
+                        &transaction,
+                        record,
+                    )
+                    .await
+            {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+            transaction
+                .commit()
+                .await
+                .context("failed to commit CLI runtime pending request resolve transaction")?;
+            Ok(record)
         })
         .await
     }
@@ -895,13 +987,34 @@ impl CrudStore {
     ) -> Result<Option<CliRuntimePendingRequestRecord>> {
         let request_id = request_id.to_owned();
         self.run_serialized_write(|| async {
-            cli_runtime_binding::cancel_pending_request(
-                &self.connection,
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin CLI runtime pending request cancel transaction")?;
+            let record = cli_runtime_binding::cancel_pending_request(
+                &transaction,
                 request_id.clone(),
                 response_json.clone(),
                 updated_at,
             )
-            .await
+            .await?;
+            if let Some(record) = &record
+                && let Err(error) =
+                    crate::timeline_live_projection::project_cli_runtime_pending_request(
+                        &transaction,
+                        record,
+                    )
+                    .await
+            {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+            transaction
+                .commit()
+                .await
+                .context("failed to commit CLI runtime pending request cancel transaction")?;
+            Ok(record)
         })
         .await
     }
@@ -914,13 +1027,34 @@ impl CrudStore {
     ) -> Result<Option<CliRuntimePendingRequestRecord>> {
         let request_id = request_id.to_owned();
         self.run_serialized_write(|| async {
-            cli_runtime_binding::expire_pending_request(
-                &self.connection,
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin CLI runtime pending request expire transaction")?;
+            let record = cli_runtime_binding::expire_pending_request(
+                &transaction,
                 request_id.clone(),
                 response_json.clone(),
                 updated_at,
             )
-            .await
+            .await?;
+            if let Some(record) = &record
+                && let Err(error) =
+                    crate::timeline_live_projection::project_cli_runtime_pending_request(
+                        &transaction,
+                        record,
+                    )
+                    .await
+            {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+            transaction
+                .commit()
+                .await
+                .context("failed to commit CLI runtime pending request expire transaction")?;
+            Ok(record)
         })
         .await
     }
@@ -7142,6 +7276,62 @@ impl CrudStore {
         thread::find_thread_by_id(&self.connection, thread_id).await
     }
 
+    pub async fn list_thread_timeline_projection_page(
+        &self,
+        thread_id: &str,
+        anchor: ProjectionPageAnchor<'_>,
+        limit: u64,
+    ) -> Result<Vec<pioneer_entity::thread_timeline_block::Model>> {
+        list_thread_timeline_blocks_page(&self.connection, thread_id, anchor, limit).await
+    }
+
+    pub async fn find_thread_timeline_projection_block_by_sort_key(
+        &self,
+        thread_id: &str,
+        sort_key: &str,
+    ) -> Result<Option<pioneer_entity::thread_timeline_block::Model>> {
+        find_thread_timeline_block_by_sort_key(&self.connection, thread_id, sort_key).await
+    }
+
+    pub async fn get_turn_work_projection(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<pioneer_entity::turn_work_projection::Model>> {
+        find_turn_work_projection(&self.connection, turn_id).await
+    }
+
+    pub async fn get_turn_work_item_projection(
+        &self,
+        work_item_id: &str,
+    ) -> Result<Option<pioneer_entity::turn_work_item_projection::Model>> {
+        find_turn_work_item_projection(&self.connection, work_item_id).await
+    }
+
+    pub async fn find_turn_work_item_projection_by_order_key(
+        &self,
+        turn_id: &str,
+        order_key: &str,
+        visibility: Option<&str>,
+    ) -> Result<Option<pioneer_entity::turn_work_item_projection::Model>> {
+        find_turn_work_item_projection_by_order_key(
+            &self.connection,
+            turn_id,
+            order_key,
+            visibility,
+        )
+        .await
+    }
+
+    pub async fn list_turn_work_item_projection_page(
+        &self,
+        turn_id: &str,
+        visibility: Option<&str>,
+        anchor: ProjectionPageAnchor<'_>,
+        limit: u64,
+    ) -> Result<Vec<pioneer_entity::turn_work_item_projection::Model>> {
+        list_turn_work_items_page(&self.connection, turn_id, visibility, anchor, limit).await
+    }
+
     pub async fn get_thread_sandbox_mode(&self, thread_id: &str) -> Result<Option<SandboxMode>> {
         policy::find_thread_sandbox_mode(&self.connection, thread_id).await
     }
@@ -9145,6 +9335,18 @@ impl CrudStore {
                     notification.item.item_id()
                 );
             }
+        }
+
+        if let Err(error) =
+            crate::timeline_live_projection::project_semantic_timeline_live_turn_event(
+                &transaction,
+                &appended_event,
+            )
+            .await
+            .context("failed to project turn event to semantic timeline")
+        {
+            let _ = transaction.rollback().await;
+            return Err(error);
         }
 
         let projected = match turn_event_projection_state::mark_projected_claimed(

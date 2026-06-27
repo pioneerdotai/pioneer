@@ -24,6 +24,9 @@ mod tasks;
 mod tests;
 mod thread_agents_doc_handlers;
 mod thread_handlers;
+mod timeline_cursor;
+mod timeline_handlers;
+mod timeline_notifications;
 mod turn_handlers;
 mod workspace_handlers;
 
@@ -112,19 +115,17 @@ use pioneer_protocol::{
     ThreadAgentsDocStatus, ThreadAgentsDocSummary, ThreadFolderCreateParams,
     ThreadFolderCreateResponse, ThreadFolderDeleteParams, ThreadFolderDeleteResponse,
     ThreadFolderMoveParams, ThreadFolderMoveResponse, ThreadGetParams, ThreadGetResponse,
-    ThreadHistoryParams, ThreadHistoryResponse, ThreadMoveParams, ThreadMoveResponse,
-    ThreadOriginKind, ThreadSidebarVisibility, ThreadStartParams, ThreadTreeChangedNotification,
-    ThreadTreeParams, ThreadTreeResponse, ThreadUnsubscribeParams, ThreadUpdateParams,
-    ThreadUpdateResponse, ThreadUpdatedNotification, TimelineItem, TimelineLane, TimelineOrigin,
-    TimelineOriginKind, TimelinePayload, ToolCallStatus, ToolStoragePayload, Turn,
-    TurnBlockedNotification, TurnCancelParams, TurnCancelResponse, TurnCompletedNotification,
-    TurnFailedNotification, TurnGetParams, TurnGetResponse, TurnItem, TurnItemEvent,
-    TurnItemEventPayload, TurnItemType, TurnItemsParams, TurnResumeParams, TurnResumeResponse,
-    TurnStartParams, TurnStatus, TurnTimelineChangedNotification, TurnTimelineChangedReason,
-    TurnTimelineParams, TurnTimelineResponse, Workspace, WorkspaceChangeKind,
-    WorkspaceChangedNotification, WorkspaceCreateParams, WorkspaceCreateResponse,
-    WorkspaceDefaultParams, WorkspaceDefaultResponse, WorkspaceListParams, WorkspaceListResponse,
-    WorkspaceSelectParams, WorkspaceSelectResponse, WorkspaceUpdateParams, WorkspaceUpdateResponse,
+    ThreadMoveParams, ThreadMoveResponse, ThreadOriginKind, ThreadSidebarVisibility,
+    ThreadStartParams, ThreadTreeChangedNotification, ThreadTreeParams, ThreadTreeResponse,
+    ThreadUnsubscribeParams, ThreadUpdateParams, ThreadUpdateResponse, ThreadUpdatedNotification,
+    ToolCallStatus, ToolStoragePayload, Turn, TurnBlockedNotification, TurnCancelParams,
+    TurnCancelResponse, TurnCompletedNotification, TurnFailedNotification, TurnGetParams,
+    TurnGetResponse, TurnItem, TurnItemEvent, TurnItemEventPayload, TurnItemType, TurnItemsParams,
+    TurnResumeParams, TurnResumeResponse, TurnStartParams, TurnStatus, Workspace,
+    WorkspaceChangeKind, WorkspaceChangedNotification, WorkspaceCreateParams,
+    WorkspaceCreateResponse, WorkspaceDefaultParams, WorkspaceDefaultResponse, WorkspaceListParams,
+    WorkspaceListResponse, WorkspaceSelectParams, WorkspaceSelectResponse, WorkspaceUpdateParams,
+    WorkspaceUpdateResponse,
     constants::{events, methods},
     generate_id, sanitize_runtime_diagnostic_line, sanitize_runtime_diagnostic_lines,
 };

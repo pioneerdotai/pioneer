@@ -1301,6 +1301,22 @@
           "properties": {
             "kind": {
               "type": "string",
+              "const": "thread_timeline_blocks_changed"
+            },
+            "params": {
+              "$ref": "#/$defs/ThreadTimelineBlocksChangedNotification"
+            }
+          },
+          "required": [
+            "kind",
+            "params"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
               "const": "turn_started"
             },
             "params": {
@@ -1365,10 +1381,26 @@
           "properties": {
             "kind": {
               "type": "string",
-              "const": "turn_timeline_changed"
+              "const": "turn_work_items_changed"
             },
             "params": {
-              "$ref": "#/$defs/TurnTimelineChangedNotification"
+              "$ref": "#/$defs/TurnWorkItemsChangedNotification"
+            }
+          },
+          "required": [
+            "kind",
+            "params"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "turn_work_state_changed"
+            },
+            "params": {
+              "$ref": "#/$defs/TurnWorkStateChangedNotification"
             }
           },
           "required": [
@@ -7912,6 +7944,57 @@
         "Closed"
       ]
     },
+    "ThreadTimelineBlocksChangedNotification": {
+      "type": "object",
+      "properties": {
+        "afterCursor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimelineCursor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "beforeCursor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimelineCursor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "changedBlockIds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "reason": {
+          "$ref": "#/$defs/TimelineChangeReason"
+        },
+        "removedBlockIds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "workspaceId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspaceId",
+        "threadId",
+        "reason"
+      ]
+    },
     "ThreadTreeChangedNotification": {
       "type": "object",
       "properties": {
@@ -7932,6 +8015,26 @@
       },
       "required": [
         "thread"
+      ]
+    },
+    "TimelineChangeReason": {
+      "type": "string",
+      "enum": [
+        "backfill",
+        "live_event",
+        "state_changed",
+        "page_invalidated"
+      ]
+    },
+    "TimelineCursor": {
+      "type": "object",
+      "properties": {
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "value"
       ]
     },
     "TimelineOutputPolicy": {
@@ -10284,62 +10387,6 @@
         "Blocked"
       ]
     },
-    "TurnTimelineChangedNotification": {
-      "type": "object",
-      "properties": {
-        "childThreadId": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "childTurnId": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "reason": {
-          "$ref": "#/$defs/TurnTimelineChangedReason"
-        },
-        "runId": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "taskId": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "threadId": {
-          "type": "string"
-        },
-        "turnId": {
-          "type": "string"
-        },
-        "workspaceId": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "workspaceId",
-        "threadId",
-        "turnId",
-        "reason"
-      ]
-    },
-    "TurnTimelineChangedReason": {
-      "type": "string",
-      "enum": [
-        "parent_turn_changed",
-        "task_event_changed",
-        "child_turn_changed",
-        "collapse_state_hint_changed"
-      ]
-    },
     "TurnToolLoopBudgetExceededNotification": {
       "type": "object",
       "properties": {
@@ -10380,6 +10427,208 @@
         "limit",
         "observed",
         "action",
+        "reason"
+      ]
+    },
+    "TurnWorkBlock": {
+      "type": "object",
+      "properties": {
+        "afterCursor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimelineCursor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "beforeCursor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimelineCursor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "completedAtUnixMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "elapsedMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "firstWorkItemId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hasMoreAfter": {
+          "type": "boolean"
+        },
+        "hasMoreBefore": {
+          "type": "boolean"
+        },
+        "hiddenWorkCount": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "lastWorkItemId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "presentation": {
+          "$ref": "#/$defs/TurnWorkPresentation"
+        },
+        "startedAtUnixMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "state": {
+          "$ref": "#/$defs/TurnWorkState"
+        },
+        "turnId": {
+          "type": "string"
+        },
+        "visibleWorkCount": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "workCount": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "turnId",
+        "presentation",
+        "state",
+        "workCount",
+        "visibleWorkCount",
+        "hiddenWorkCount",
+        "hasMoreBefore",
+        "hasMoreAfter"
+      ]
+    },
+    "TurnWorkItemsChangedNotification": {
+      "type": "object",
+      "properties": {
+        "afterCursor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimelineCursor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "beforeCursor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimelineCursor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "changedWorkItemIds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "reason": {
+          "$ref": "#/$defs/TimelineChangeReason"
+        },
+        "removedWorkItemIds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        },
+        "workspaceId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspaceId",
+        "threadId",
+        "turnId",
+        "reason"
+      ]
+    },
+    "TurnWorkPresentation": {
+      "type": "string",
+      "enum": [
+        "expanded_live",
+        "collapsed_after_final",
+        "expanded_terminal_no_final"
+      ]
+    },
+    "TurnWorkState": {
+      "type": "string",
+      "enum": [
+        "starting",
+        "running",
+        "waiting_for_approval",
+        "stalled",
+        "completed",
+        "blocked",
+        "failed",
+        "interrupted"
+      ]
+    },
+    "TurnWorkStateChangedNotification": {
+      "type": "object",
+      "properties": {
+        "reason": {
+          "$ref": "#/$defs/TimelineChangeReason"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        },
+        "work": {
+          "$ref": "#/$defs/TurnWorkBlock"
+        },
+        "workspaceId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspaceId",
+        "threadId",
+        "turnId",
+        "work",
         "reason"
       ]
     },

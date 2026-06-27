@@ -3,7 +3,7 @@ use super::model::{TimelineRow, TimelineRowKind};
 use crate::app::root::PioneerDesktop;
 use gpui::{ImageSource, Resource, prelude::*, *};
 use gpui_component::{StyledExt, h_flex, theme::ActiveTheme};
-use pioneer_client::timeline::labels::{RunningTurnDisplay, now_unix_ms, running_turn_display};
+use pioneer_client::timeline::labels::{RunningTurnDisplay, now_unix_ms};
 use std::{rc::Rc, time::Duration};
 
 fn running_turn_dino_image_source(is_dark: bool) -> ImageSource {
@@ -16,6 +16,20 @@ fn running_turn_dino_image_source(is_dark: bool) -> ImageSource {
 }
 
 impl PioneerDesktop {
+    pub(super) fn semantic_timeline_has_running_turn_row(&self) -> bool {
+        let active_thread_id = self.current_active_thread_id().map(str::to_owned);
+        let model = self.semantic_timeline_render_model(active_thread_id.as_deref());
+        model.rows.iter().any(|row| {
+            matches!(
+                row,
+                super::TimelineRenderRow::Timeline(TimelineRow {
+                    kind: TimelineRowKind::RunningTurn(_),
+                    ..
+                })
+            )
+        })
+    }
+
     pub(super) fn running_turn_row_size(
         &self,
         is_first_row: bool,
@@ -153,11 +167,7 @@ impl PioneerDesktop {
 
                     let keep_running = this
                         .update(&mut cx, |view, cx| {
-                            let visible =
-                                view.active_thread_conversation()
-                                    .is_some_and(|conversation| {
-                                        running_turn_display(conversation.projection()).is_some()
-                                    });
+                            let visible = view.semantic_timeline_has_running_turn_row();
 
                             if !visible {
                                 let mut state = view.thread_timeline_view_state.borrow_mut();

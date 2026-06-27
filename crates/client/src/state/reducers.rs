@@ -144,7 +144,7 @@ pub fn take_thread_list_refresh_request(state: &mut ClientState) -> bool {
     thread_tree::take_thread_tree_refresh_request(&mut state.threads.list_refresh_requested)
 }
 
-pub fn remove_thread_scoped_entries<AttachmentDraft, CapabilityDraft, RefreshState>(
+pub fn remove_thread_scoped_entries<AttachmentDraft, CapabilityDraft>(
     thread_id: &str,
     draft_thread_id: &mut Option<String>,
     coordinators: &mut HashMap<String, ThreadCoordinator>,
@@ -152,7 +152,6 @@ pub fn remove_thread_scoped_entries<AttachmentDraft, CapabilityDraft, RefreshSta
     thread_draft_attachments: &mut HashMap<String, AttachmentDraft>,
     thread_draft_capabilities: &mut HashMap<String, CapabilityDraft>,
     thread_placements: &mut HashMap<String, ThreadPlacement>,
-    turn_timeline_refresh: &mut HashMap<(String, String), RefreshState>,
 ) -> bool {
     let cleared_draft = if draft_thread_id.as_deref() == Some(thread_id) {
         *draft_thread_id = None;
@@ -165,12 +164,11 @@ pub fn remove_thread_scoped_entries<AttachmentDraft, CapabilityDraft, RefreshSta
     thread_draft_attachments.remove(thread_id);
     thread_draft_capabilities.remove(thread_id);
     thread_placements.remove(thread_id);
-    turn_timeline_refresh.retain(|(refresh_thread_id, _), _| refresh_thread_id != thread_id);
     cleared_draft
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn clear_thread_client_state<Attachment, Capability, RefreshState>(
+pub fn clear_thread_client_state<Attachment, Capability>(
     draft_thread_id: &mut Option<String>,
     coordinators: &mut HashMap<String, ThreadCoordinator>,
     thread_drafts: &mut HashMap<String, String>,
@@ -188,7 +186,6 @@ pub fn clear_thread_client_state<Attachment, Capability, RefreshState>(
     thread_agents_doc_summaries: &mut HashMap<ThreadAgentsDocSummaryKey, ThreadAgentsDocSummary>,
     thread_folder_expanded: &mut HashMap<String, bool>,
     thread_tree_selected_node_id: &mut Option<String>,
-    turn_timeline_refresh: &mut HashMap<(String, String), RefreshState>,
 ) {
     *draft_thread_id = None;
     coordinators.clear();
@@ -209,7 +206,6 @@ pub fn clear_thread_client_state<Attachment, Capability, RefreshState>(
     thread_agents_doc_summaries.clear();
     thread_folder_expanded.clear();
     *thread_tree_selected_node_id = None;
-    turn_timeline_refresh.clear();
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -937,9 +933,6 @@ mod tests {
         )]);
         let mut thread_folder_expanded = HashMap::from([("folder_a".to_owned(), true)]);
         let mut thread_tree_selected_node_id = Some("folder_a".to_owned());
-        let mut turn_timeline_refresh =
-            HashMap::from([(("thread_a".to_owned(), "turn_a".to_owned()), true)]);
-
         clear_thread_client_state(
             &mut draft_thread_id,
             &mut coordinators,
@@ -958,7 +951,6 @@ mod tests {
             &mut thread_agents_doc_summaries,
             &mut thread_folder_expanded,
             &mut thread_tree_selected_node_id,
-            &mut turn_timeline_refresh,
         );
 
         assert!(draft_thread_id.is_none());
@@ -978,7 +970,6 @@ mod tests {
         assert!(thread_agents_doc_summaries.is_empty());
         assert!(thread_folder_expanded.is_empty());
         assert!(thread_tree_selected_node_id.is_none());
-        assert!(turn_timeline_refresh.is_empty());
     }
 
     #[test]
@@ -1156,11 +1147,6 @@ mod tests {
                 },
             ),
         ]);
-        let mut refresh = HashMap::from([
-            (("thread_a".to_owned(), "turn_1".to_owned()), 1u8),
-            (("thread_b".to_owned(), "turn_2".to_owned()), 2u8),
-        ]);
-
         assert!(remove_thread_scoped_entries(
             "thread_a",
             &mut draft_thread_id,
@@ -1169,14 +1155,11 @@ mod tests {
             &mut attachments,
             &mut capabilities,
             &mut placements,
-            &mut refresh,
         ));
 
         assert!(draft_thread_id.is_none());
         assert!(!coordinators.contains_key("thread_a"));
         assert!(coordinators.contains_key("thread_b"));
-        assert!(!refresh.contains_key(&("thread_a".to_owned(), "turn_1".to_owned())));
-        assert!(refresh.contains_key(&("thread_b".to_owned(), "turn_2".to_owned())));
     }
 
     #[test]

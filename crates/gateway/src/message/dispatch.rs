@@ -20,7 +20,7 @@ use pioneer_protocol::{
     TaskPauseParams, TaskRescheduleParams, TaskResumeParams, TaskReviseParams,
     TaskTreeParams as TaskTreeTaskParams, TaskWaitParams, ThreadAgentsDocArchiveParams,
     ThreadAgentsDocGetParams, ThreadAgentsDocResolveForThreadParams, ThreadAgentsDocSaveParams,
-    TurnCancelParams, TurnResumeParams, TurnTimelineParams,
+    ThreadTimelinePageParams, TurnCancelParams, TurnResumeParams, TurnWorkPageParams,
 };
 
 impl MessageProcessor {
@@ -636,11 +636,12 @@ impl MessageProcessor {
                         }
                     }
                 }
-                methods::THREAD_HISTORY => {
+                methods::THREAD_TIMELINE_PAGE => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
-                    match serde_json::from_value::<ThreadHistoryParams>(params_value) {
+                    match serde_json::from_value::<ThreadTimelinePageParams>(params_value) {
                         Ok(params) => {
-                            self.thread_history(connection_id, request.id, params).await;
+                            self.thread_timeline_page(connection_id, request.id, params)
+                                .await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -650,7 +651,29 @@ impl MessageProcessor {
                                     INVALID_PARAMS_CODE,
                                     format!(
                                         "invalid params for `{}`: {error}",
-                                        methods::THREAD_HISTORY
+                                        methods::THREAD_TIMELINE_PAGE
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::TURN_WORK_PAGE => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<TurnWorkPageParams>(params_value) {
+                        Ok(params) => {
+                            self.turn_work_page(connection_id, request.id, params).await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{}`: {error}",
+                                        methods::TURN_WORK_PAGE
                                     ),
                                 ),
                             )
@@ -770,34 +793,6 @@ impl MessageProcessor {
                                     format!(
                                         "invalid params for `{}`: {error}",
                                         methods::TURN_ITEMS
-                                    ),
-                                ),
-                            )
-                            .await;
-                        }
-                    }
-                }
-                methods::TURN_TIMELINE => {
-                    let params_value = request.params.unwrap_or_else(empty_object_value);
-                    let params = if params_value.is_null() {
-                        Ok(TurnTimelineParams::default())
-                    } else {
-                        serde_json::from_value::<TurnTimelineParams>(params_value)
-                    };
-
-                    match params {
-                        Ok(params) => {
-                            self.turn_timeline(connection_id, request.id, params).await;
-                        }
-                        Err(error) => {
-                            self.send_error(
-                                connection_id,
-                                JsonRpcErrorResponse::new(
-                                    Some(request.id),
-                                    INVALID_PARAMS_CODE,
-                                    format!(
-                                        "invalid params for `{}`: {error}",
-                                        methods::TURN_TIMELINE
                                     ),
                                 ),
                             )

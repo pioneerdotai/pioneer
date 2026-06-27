@@ -271,12 +271,28 @@ impl MessageProcessor {
             .await?;
         self.send_notification_to_thread_subscribers(thread_id, events::ITEM_STARTED, &started)
             .await;
+        self.notify_semantic_timeline_item_changed(
+            started.workspace_id.as_str(),
+            started.thread_id.as_str(),
+            started.turn_id.as_str(),
+            &started.item,
+            Some("in_progress"),
+        )
+        .await;
 
         self.crud_store
             .materialize_item_completed(completed.clone(), now)
             .await?;
         self.send_notification_to_thread_subscribers(thread_id, events::ITEM_COMPLETED, &completed)
             .await;
+        self.notify_semantic_timeline_item_changed(
+            completed.workspace_id.as_str(),
+            completed.thread_id.as_str(),
+            completed.turn_id.as_str(),
+            &completed.item,
+            None,
+        )
+        .await;
         Ok(())
     }
 

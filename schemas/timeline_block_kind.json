@@ -1,0 +1,1231 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TimelineBlockKind",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "attachments": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/UserMessageAttachment"
+          }
+        },
+        "inputs": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/UserInput"
+          }
+        },
+        "itemId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "type": "string",
+          "const": "user_message"
+        },
+        "text": {
+          "type": "string",
+          "default": ""
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "turn_work"
+        },
+        "work": {
+          "$ref": "#/$defs/TurnWorkBlock"
+        }
+      },
+      "required": [
+        "kind",
+        "work"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "itemId": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "const": "assistant_message"
+        },
+        "markdown": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MarkdownDocument"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "itemId",
+        "text"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "turn_state"
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/TurnWorkState"
+        }
+      },
+      "required": [
+        "kind",
+        "state"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "pending_request"
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "requestId": {
+          "type": "string"
+        },
+        "requestKind": {
+          "$ref": "#/$defs/CLIRuntimeRequestKind"
+        },
+        "status": {
+          "$ref": "#/$defs/CLIRuntimePendingRequestStatus"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "requestId",
+        "requestKind",
+        "status"
+      ]
+    }
+  ],
+  "$defs": {
+    "ArtifactKind": {
+      "type": "string",
+      "enum": [
+        "file",
+        "text",
+        "image",
+        "audio",
+        "video",
+        "pdf",
+        "spreadsheet",
+        "archive",
+        "json",
+        "generated_image",
+        "screenshot",
+        "workspace_file",
+        "directory_manifest",
+        "unknown"
+      ]
+    },
+    "ArtifactPreviewRef": {
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "type": "string"
+        },
+        "blob_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mime_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "projection_kind": {
+          "$ref": "#/$defs/ArtifactProjectionKind"
+        },
+        "sha256": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "size_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "status": {
+          "$ref": "#/$defs/ArtifactProjectionStatus"
+        },
+        "version_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "projection_kind",
+        "status",
+        "artifact_id",
+        "version_id"
+      ]
+    },
+    "ArtifactProjectionKind": {
+      "type": "string",
+      "enum": [
+        "plain_text",
+        "thumbnail",
+        "json_summary",
+        "pdf_text"
+      ]
+    },
+    "ArtifactProjectionStatus": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "ready",
+        "failed",
+        "stale"
+      ]
+    },
+    "ArtifactRef": {
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ArtifactKind"
+        },
+        "mime_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "preview": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArtifactPreviewRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sha256": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "size_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "status": {
+          "$ref": "#/$defs/ArtifactStatus"
+        },
+        "version_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "artifact_id",
+        "display_name",
+        "kind",
+        "status"
+      ]
+    },
+    "ArtifactStatus": {
+      "type": "string",
+      "enum": [
+        "ready",
+        "pending",
+        "quarantined",
+        "deleted",
+        "missing_external_source",
+        "failed"
+      ]
+    },
+    "ByteRange": {
+      "type": "object",
+      "properties": {
+        "end": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "start": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "start",
+        "end"
+      ]
+    },
+    "CLIRuntimePendingRequestStatus": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "answered",
+        "resolved",
+        "cancelled",
+        "expired"
+      ]
+    },
+    "CLIRuntimeRequestKind": {
+      "type": "string",
+      "enum": [
+        "command_approval",
+        "file_change_approval",
+        "user_input",
+        "other"
+      ]
+    },
+    "MarkdownBlock": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "paragraph"
+            }
+          },
+          "$ref": "#/$defs/MarkdownInline",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "content": {
+              "$ref": "#/$defs/MarkdownInline"
+            },
+            "level": {
+              "type": "integer",
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "heading"
+            }
+          },
+          "required": [
+            "type",
+            "level",
+            "content"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "list"
+            }
+          },
+          "$ref": "#/$defs/MarkdownList",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "blocks": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/MarkdownBlock"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "quote"
+            }
+          },
+          "required": [
+            "type",
+            "blocks"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "language": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "code"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "rule"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        }
+      ]
+    },
+    "MarkdownDocument": {
+      "type": "object",
+      "properties": {
+        "blocks": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/MarkdownBlock"
+          }
+        }
+      }
+    },
+    "MarkdownInline": {
+      "type": "object",
+      "properties": {
+        "marks": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/MarkdownMark"
+          }
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ]
+    },
+    "MarkdownList": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/MarkdownListItem"
+          }
+        },
+        "ordered": {
+          "type": "boolean"
+        },
+        "start": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "ordered",
+        "start"
+      ]
+    },
+    "MarkdownListItem": {
+      "type": "object",
+      "properties": {
+        "blocks": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/MarkdownBlock"
+          }
+        },
+        "checked": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "MarkdownMark": {
+      "type": "object",
+      "properties": {
+        "end": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "kind": {
+          "$ref": "#/$defs/MarkdownMarkKind"
+        },
+        "start": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "start",
+        "end",
+        "kind"
+      ]
+    },
+    "MarkdownMarkKind": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "bold"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "italic"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "strike"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "code"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "link"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
+        }
+      ]
+    },
+    "McpScopeKind": {
+      "type": "string",
+      "enum": [
+        "workspace",
+        "user"
+      ]
+    },
+    "TextElement": {
+      "type": "object",
+      "properties": {
+        "byte_range": {
+          "$ref": "#/$defs/ByteRange"
+        },
+        "placeholder": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "byte_range"
+      ]
+    },
+    "TimelineCursor": {
+      "type": "object",
+      "properties": {
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "value"
+      ]
+    },
+    "TurnMcpServerCapabilitySummary": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "scopeKind": {
+          "$ref": "#/$defs/McpScopeKind"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "name",
+        "scopeKind"
+      ]
+    },
+    "TurnMcpToolCapabilitySummary": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "rawToolName": {
+          "type": "string"
+        },
+        "scopeKind": {
+          "$ref": "#/$defs/McpScopeKind"
+        },
+        "serverName": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "serverName",
+        "rawToolName",
+        "scopeKind"
+      ]
+    },
+    "TurnSkillCapabilitySummary": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "slug": {
+          "type": "string"
+        },
+        "sourceKind": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "slug",
+        "sourceKind"
+      ]
+    },
+    "TurnWorkBlock": {
+      "type": "object",
+      "properties": {
+        "afterCursor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimelineCursor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "beforeCursor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimelineCursor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "completedAtUnixMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "elapsedMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "firstWorkItemId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hasMoreAfter": {
+          "type": "boolean"
+        },
+        "hasMoreBefore": {
+          "type": "boolean"
+        },
+        "hiddenWorkCount": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "lastWorkItemId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "presentation": {
+          "$ref": "#/$defs/TurnWorkPresentation"
+        },
+        "startedAtUnixMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "state": {
+          "$ref": "#/$defs/TurnWorkState"
+        },
+        "turnId": {
+          "type": "string"
+        },
+        "visibleWorkCount": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "workCount": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "turnId",
+        "presentation",
+        "state",
+        "workCount",
+        "visibleWorkCount",
+        "hiddenWorkCount",
+        "hasMoreBefore",
+        "hasMoreAfter"
+      ]
+    },
+    "TurnWorkPresentation": {
+      "type": "string",
+      "enum": [
+        "expanded_live",
+        "collapsed_after_final",
+        "expanded_terminal_no_final"
+      ]
+    },
+    "TurnWorkState": {
+      "type": "string",
+      "enum": [
+        "starting",
+        "running",
+        "waiting_for_approval",
+        "stalled",
+        "completed",
+        "blocked",
+        "failed",
+        "interrupted"
+      ]
+    },
+    "UserInput": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "textElements": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/TextElement"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "text"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "image"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "localImage"
+            }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "file"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "localFile"
+            }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "audio"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "localAudio"
+            }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "video"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "localVideo"
+            }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "artifactId": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "artifact"
+            },
+            "versionId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "artifactId"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "mention"
+            }
+          },
+          "required": [
+            "type",
+            "name",
+            "path"
+          ]
+        }
+      ]
+    },
+    "UserMessageAttachment": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "image"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "localImage"
+            }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "file"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "localFile"
+            }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "audio"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "localAudio"
+            }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "video"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "localVideo"
+            }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "artifact": {
+              "$ref": "#/$defs/ArtifactRef"
+            },
+            "type": {
+              "type": "string",
+              "const": "artifact"
+            }
+          },
+          "required": [
+            "type",
+            "artifact"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "capability": {
+              "$ref": "#/$defs/TurnSkillCapabilitySummary"
+            },
+            "type": {
+              "type": "string",
+              "const": "skill"
+            }
+          },
+          "required": [
+            "type",
+            "capability"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "capability": {
+              "$ref": "#/$defs/TurnMcpServerCapabilitySummary"
+            },
+            "type": {
+              "type": "string",
+              "const": "mcpServer"
+            }
+          },
+          "required": [
+            "type",
+            "capability"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "capability": {
+              "$ref": "#/$defs/TurnMcpToolCapabilitySummary"
+            },
+            "type": {
+              "type": "string",
+              "const": "mcpTool"
+            }
+          },
+          "required": [
+            "type",
+            "capability"
+          ]
+        }
+      ]
+    }
+  }
+}

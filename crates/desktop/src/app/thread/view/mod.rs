@@ -4,7 +4,7 @@ mod composer;
 mod header;
 pub(crate) mod timeline;
 
-use super::super::{conversation::ConversationViewState, root::PioneerDesktop};
+use super::super::root::PioneerDesktop;
 use gpui::{prelude::*, *};
 use gpui_component::{
     resizable::{h_resizable, resizable_panel},
@@ -21,17 +21,13 @@ impl PioneerDesktop {
         self.ensure_active_thread_artifacts_loaded(cx);
         let active_thread_id = self.current_active_thread_id().map(str::to_owned);
 
-        let default_projection = ConversationViewState::default();
-        let projection = self
-            .active_thread_conversation()
-            .map(|conversation| conversation.projection())
-            .unwrap_or(&default_projection);
+        let timeline_model = self.semantic_timeline_render_model(active_thread_id.as_deref());
 
         let desktop_entity = cx.entity().clone();
         let pending_cli_runtime_requests = self.active_thread_cli_runtime_pending_requests();
         let timeline = self.render_timeline(
             active_thread_id.as_deref(),
-            projection,
+            timeline_model,
             pending_cli_runtime_requests,
             window,
             cx,

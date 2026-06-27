@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TimelinePageAnchor",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "newest"
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "oldest"
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "cursor": {
+          "$ref": "#/$defs/TimelineCursor"
+        },
+        "kind": {
+          "type": "string",
+          "const": "before"
+        }
+      },
+      "required": [
+        "kind",
+        "cursor"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "cursor": {
+          "$ref": "#/$defs/TimelineCursor"
+        },
+        "kind": {
+          "type": "string",
+          "const": "after"
+        }
+      },
+      "required": [
+        "kind",
+        "cursor"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "cursor": {
+          "$ref": "#/$defs/TimelineCursor"
+        },
+        "kind": {
+          "type": "string",
+          "const": "around"
+        }
+      },
+      "required": [
+        "kind",
+        "cursor"
+      ]
+    }
+  ],
+  "$defs": {
+    "TimelineCursor": {
+      "type": "object",
+      "properties": {
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "value"
+      ]
+    }
+  }
+}

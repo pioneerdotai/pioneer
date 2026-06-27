@@ -1,5 +1,4 @@
 use pioneer_client::{
-    conversation::{Conversation, ConversationEvent, TimelineEntryStatus},
     gateway::{
         registry::{
             GatewayLocalRegistryConfig, GatewayRegistryConfig, default_registry, normalize_registry,
@@ -12,34 +11,26 @@ use pioneer_client::{
         apply_turn_resume_retry, begin_turn_resume_attempt, finish_turn_resume_attempt,
         plan_turn_resume_queue_connection, plan_turn_resume_queue_item, turn_resume_retry_delay,
     },
-    timeline::rows::{TimelineRowKind, build_timeline_rows},
+    timeline::semantic::{
+        SemanticTimelineRequestHint, SemanticTimelineRowKind, SemanticTimelineState,
+        TopLevelPageMergeMode, WorkPageMergeMode, apply_thread_timeline_page, apply_turn_work_page,
+        expand_turn_work, flatten_semantic_timeline,
+    },
     transport::ws::{
         GatewayWsConnectSpec, GatewayWsEvent, rpc::build_ws_request, rpc::normalize_ws_url,
         should_apply_ws_event, worker,
     },
 };
 use pioneer_protocol::{
-    GatewayNotification, JsonRpcNotification, ThreadHistoryResponse, Turn, TurnItem, TurnStatus,
+    GatewayNotification, JsonRpcNotification, ThreadTimelinePageResponse, TimelineBlock,
+    TimelineBlockKind, TimelineCursor, TimelinePageInfo, TurnItem, TurnItemType, TurnWorkBlock,
+    TurnWorkItem, TurnWorkItemStatus, TurnWorkPageResponse, TurnWorkPresentation, TurnWorkState,
 };
-use std::{
-    collections::HashSet,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 const WORKSPACE_ID: &str = "ws_phase29";
 const THREAD_ID: &str = "thr_phase29";
 const TURN_ID: &str = "turn_phase29";
-
-fn turn(id: &str, status: TurnStatus) -> Turn {
-    Turn {
-        id: id.to_owned(),
-        status,
-        turn_kind: Default::default(),
-        origin: Default::default(),
-        error: None,
-        prompt_manifest: None,
-    }
-}
 
 fn remote_spec() -> GatewayWsConnectSpec {
     GatewayWsConnectSpec {
@@ -50,30 +41,6 @@ fn remote_spec() -> GatewayWsConnectSpec {
         auth_token: Some("remote-token".to_owned()),
         timings: GatewayWsTimings::from_millis(100, 200, 300, 400, 5_000, 0).expect("timings"),
     }
-}
-
-#[test]
-fn fixture_thread_history_replays_into_timeline_read_model() {
-    let fixture: ThreadHistoryResponse =
-        serde_json::from_str(include_str!("fixtures/phase29/thread_history_basic.json"))
-            .expect("thread history fixture should decode");
-    assert_eq!(fixture.thread_id, THREAD_ID);
-
-    let mut conversation = Conversation::new(fixture.thread_id.as_str());
-    conversation.hydrate_history(fixture.events.as_slice());
-
-    assert_eq!(conversation.status_label(), "completed");
-    assert!(conversation.can_submit_message());
-    assert_eq!(conversation.projection().turns.len(), 1);
-    assert_eq!(conversation.projection().items.len(), 2);
-    assert_eq!(conversation.projection().timeline.len(), 2);
-
-    let agent = conversation
-        .projection()
-        .item_by_id("agent_phase29")
-        .expect("agent item should project");
-    assert_eq!(agent.status, TimelineEntryStatus::Completed);
-    assert_eq!(agent.partial_text, "Hello from the phase 29 fixture");
 }
 
 #[test]
@@ -105,113 +72,214 @@ fn fixture_gateway_notifications_map_known_and_unknown_events() {
 }
 
 #[test]
-fn large_timeline_projection_has_stable_row_build_time() {
-    const WORK_ITEM_COUNT: usize = 900;
+fn large_semantic_timeline_uses_stable_blocks_and_paged_work() {
+    const TOTAL_WORK_ITEM_COUNT: u64 = 70_000;
+    const LOADED_WORK_ITEM_COUNT: usize = 100;
 
-    let mut conversation = Conversation::new(THREAD_ID);
-    conversation.apply(ConversationEvent::TurnStarted {
-        thread_id: THREAD_ID.to_owned(),
-        turn: turn(TURN_ID, TurnStatus::InProgress),
-    });
-    conversation.apply(ConversationEvent::ItemStarted {
-        thread_id: THREAD_ID.to_owned(),
-        turn_id: TURN_ID.to_owned(),
-        item: TurnItem::UserMessage {
-            id: "user_phase29".to_owned(),
-            text: "Run a large plan".to_owned(),
-            attachments: Vec::new(),
-        },
-    });
-    conversation.apply(ConversationEvent::ItemCompleted {
-        thread_id: THREAD_ID.to_owned(),
-        turn_id: TURN_ID.to_owned(),
-        item: TurnItem::UserMessage {
-            id: "user_phase29".to_owned(),
-            text: "Run a large plan".to_owned(),
-            attachments: Vec::new(),
-        },
-    });
-
-    for index in 0..WORK_ITEM_COUNT {
-        let item = TurnItem::Reasoning {
-            id: format!("reasoning_{index:04}"),
-            summary: vec![format!("step {index}")],
-            content: vec![format!("detail {index}")],
-        };
-        conversation.apply(ConversationEvent::ItemStarted {
-            thread_id: THREAD_ID.to_owned(),
-            turn_id: TURN_ID.to_owned(),
-            item: item.clone(),
-        });
-        conversation.apply(ConversationEvent::ItemCompleted {
-            thread_id: THREAD_ID.to_owned(),
-            turn_id: TURN_ID.to_owned(),
-            item,
-        });
-    }
-
-    conversation.apply(ConversationEvent::ItemStarted {
-        thread_id: THREAD_ID.to_owned(),
-        turn_id: TURN_ID.to_owned(),
-        item: TurnItem::AgentMessage {
-            id: "agent_final".to_owned(),
-            text: String::new(),
-            phase: Default::default(),
-            markdown: None,
-            markdown_version: None,
-        },
-    });
-    conversation.apply(ConversationEvent::ItemCompleted {
-        thread_id: THREAD_ID.to_owned(),
-        turn_id: TURN_ID.to_owned(),
-        item: TurnItem::AgentMessage {
-            id: "agent_final".to_owned(),
-            text: "Done".to_owned(),
-            phase: Default::default(),
-            markdown: None,
-            markdown_version: None,
-        },
-    });
-
-    assert_eq!(conversation.projection().items.len(), WORK_ITEM_COUNT + 2);
+    let mut state = SemanticTimelineState::default();
 
     let started = Instant::now();
-    let collapsed_rows = build_timeline_rows(conversation.projection(), &HashSet::new());
+    assert!(apply_thread_timeline_page(
+        &mut state,
+        ThreadTimelinePageResponse {
+            workspace_id: WORKSPACE_ID.to_owned(),
+            thread_id: THREAD_ID.to_owned(),
+            projection_version: 1,
+            blocks: vec![
+                user_message_block("0001"),
+                turn_work_block(
+                    TurnWorkPresentation::CollapsedAfterFinal,
+                    TOTAL_WORK_ITEM_COUNT
+                ),
+                assistant_message_block("0003"),
+            ],
+            page: page_info(None, None, false, false),
+        },
+        TopLevelPageMergeMode::Reset,
+    ));
+    let collapsed_rows =
+        flatten_semantic_timeline(&state, THREAD_ID).expect("semantic rows should exist");
     let collapsed_elapsed = started.elapsed();
 
     assert!(
         collapsed_elapsed < Duration::from_secs(2),
-        "large collapsed timeline row build took {collapsed_elapsed:?}"
+        "large collapsed semantic timeline flatten took {collapsed_elapsed:?}"
     );
-    assert!(collapsed_rows.iter().any(|row| {
-        matches!(
-            row.kind,
-            TimelineRowKind::TurnWorkToggle(_) | TimelineRowKind::CoalescedTools(_)
-        )
-    }));
+    assert_eq!(
+        collapsed_rows.rows.len(),
+        3,
+        "top-level semantic timeline should stay block-sized even for huge work turns"
+    );
+    assert!(matches!(
+        &collapsed_rows.rows[1].kind,
+        SemanticTimelineRowKind::WorkHeader {
+            expanded: false,
+            work,
+            ..
+        } if work.work_count == TOTAL_WORK_ITEM_COUNT
+    ));
+    assert!(
+        collapsed_rows
+            .request_hints
+            .iter()
+            .all(|hint| { !matches!(hint, SemanticTimelineRequestHint::TurnWorkInitial { .. }) }),
+        "collapsed final work must not eagerly request the full work range"
+    );
 
-    let toggle_key = collapsed_rows
-        .iter()
-        .find_map(|row| match &row.kind {
-            TimelineRowKind::TurnWorkToggle(group) => Some(group.toggle_key.clone()),
-            _ => None,
-        })
-        .expect("large work group should expose a toggle");
-    let mut expanded = HashSet::new();
-    expanded.insert(toggle_key);
+    assert!(expand_turn_work(&mut state, THREAD_ID, TURN_ID));
+    let expanded_without_items =
+        flatten_semantic_timeline(&state, THREAD_ID).expect("expanded rows should exist");
+    assert_eq!(expanded_without_items.rows.len(), 3);
+    assert!(
+        expanded_without_items.request_hints.iter().any(|hint| {
+            matches!(hint, SemanticTimelineRequestHint::TurnWorkInitial { turn_id, .. } if turn_id == TURN_ID)
+        }),
+        "explicit expansion should request one bounded initial work page"
+    );
 
     let started = Instant::now();
-    let expanded_rows = build_timeline_rows(conversation.projection(), &expanded);
+    assert!(apply_turn_work_page(
+        &mut state,
+        TurnWorkPageResponse {
+            workspace_id: WORKSPACE_ID.to_owned(),
+            thread_id: THREAD_ID.to_owned(),
+            turn_id: TURN_ID.to_owned(),
+            projection_version: 1,
+            work: turn_work(
+                TurnWorkPresentation::CollapsedAfterFinal,
+                TOTAL_WORK_ITEM_COUNT
+            ),
+            items: (0..LOADED_WORK_ITEM_COUNT).map(work_item).collect(),
+            page: page_info(None, Some(format!("{}:work:0100", THREAD_ID)), false, true,),
+        },
+        WorkPageMergeMode::Reset,
+    ));
+    let expanded_rows =
+        flatten_semantic_timeline(&state, THREAD_ID).expect("expanded rows should exist");
     let expanded_elapsed = started.elapsed();
 
     assert!(
         expanded_elapsed < Duration::from_secs(2),
-        "large expanded timeline row build took {expanded_elapsed:?}"
+        "large expanded semantic timeline flatten took {expanded_elapsed:?}"
     );
+    let visible_work_rows = expanded_rows
+        .rows
+        .iter()
+        .filter(|row| matches!(row.kind, SemanticTimelineRowKind::WorkItem { .. }))
+        .count();
+    assert_eq!(visible_work_rows, LOADED_WORK_ITEM_COUNT);
+    assert_eq!(expanded_rows.rows.len(), LOADED_WORK_ITEM_COUNT + 3);
     assert!(
-        expanded_rows.len() > WORK_ITEM_COUNT,
-        "expanded large timeline should expose grouped work rows"
+        expanded_rows.request_hints.iter().any(|hint| {
+            matches!(hint, SemanticTimelineRequestHint::TurnWorkAfter { turn_id, .. } if turn_id == TURN_ID)
+        }),
+        "loaded work page should expose a cursor hint instead of forcing full catchup"
     );
+}
+
+fn user_message_block(sort_key: &str) -> TimelineBlock {
+    TimelineBlock {
+        workspace_id: WORKSPACE_ID.to_owned(),
+        thread_id: THREAD_ID.to_owned(),
+        block_id: "block_user_phase29".to_owned(),
+        turn_id: Some(TURN_ID.to_owned()),
+        sort_key: sort_key.to_owned(),
+        started_at_unix_ms: Some(1_000),
+        updated_at_unix_ms: Some(1_000),
+        kind: TimelineBlockKind::UserMessage {
+            item_id: Some("user_phase29".to_owned()),
+            inputs: Vec::new(),
+            text: "Run a large plan".to_owned(),
+            attachments: Vec::new(),
+        },
+    }
+}
+
+fn turn_work_block(presentation: TurnWorkPresentation, work_count: u64) -> TimelineBlock {
+    TimelineBlock {
+        workspace_id: WORKSPACE_ID.to_owned(),
+        thread_id: THREAD_ID.to_owned(),
+        block_id: "block_work_phase29".to_owned(),
+        turn_id: Some(TURN_ID.to_owned()),
+        sort_key: "0002".to_owned(),
+        started_at_unix_ms: Some(1_001),
+        updated_at_unix_ms: Some(1_500),
+        kind: TimelineBlockKind::TurnWork {
+            work: turn_work(presentation, work_count),
+        },
+    }
+}
+
+fn turn_work(presentation: TurnWorkPresentation, work_count: u64) -> TurnWorkBlock {
+    TurnWorkBlock {
+        turn_id: TURN_ID.to_owned(),
+        presentation,
+        state: TurnWorkState::Completed,
+        started_at_unix_ms: Some(1_001),
+        completed_at_unix_ms: Some(1_500),
+        elapsed_ms: Some(499),
+        work_count,
+        visible_work_count: work_count,
+        hidden_work_count: 0,
+        has_more_before: false,
+        has_more_after: work_count > 0,
+        before_cursor: None,
+        after_cursor: Some(TimelineCursor {
+            value: format!("{THREAD_ID}:work:last"),
+        }),
+        first_work_item_id: Some("work_0000".to_owned()),
+        last_work_item_id: Some(format!("work_{:04}", work_count.saturating_sub(1))),
+    }
+}
+
+fn assistant_message_block(sort_key: &str) -> TimelineBlock {
+    TimelineBlock {
+        workspace_id: WORKSPACE_ID.to_owned(),
+        thread_id: THREAD_ID.to_owned(),
+        block_id: "block_assistant_phase29".to_owned(),
+        turn_id: Some(TURN_ID.to_owned()),
+        sort_key: sort_key.to_owned(),
+        started_at_unix_ms: Some(1_501),
+        updated_at_unix_ms: Some(1_600),
+        kind: TimelineBlockKind::AssistantMessage {
+            item_id: "agent_final".to_owned(),
+            text: "Done".to_owned(),
+            markdown: Some(pioneer_protocol::MarkdownDocument::from_plain_text("Done")),
+        },
+    }
+}
+
+fn work_item(index: usize) -> TurnWorkItem {
+    TurnWorkItem {
+        work_item_id: format!("work_{index:04}"),
+        item_id: format!("reasoning_{index:04}"),
+        turn_id: TURN_ID.to_owned(),
+        order_key: format!("{index:08}"),
+        item_type: TurnItemType::Reasoning,
+        status: TurnWorkItemStatus::Completed,
+        started_at_unix_ms: Some(1_001 + index as i64),
+        completed_at_unix_ms: Some(1_001 + index as i64),
+        item: TurnItem::Reasoning {
+            id: format!("reasoning_{index:04}"),
+            summary: vec![format!("step {index}")],
+            content: vec![format!("detail {index}")],
+        },
+        metadata: None,
+    }
+}
+
+fn page_info(
+    before_cursor: Option<String>,
+    after_cursor: Option<String>,
+    has_more_before: bool,
+    has_more_after: bool,
+) -> TimelinePageInfo {
+    TimelinePageInfo {
+        before_cursor: before_cursor.map(|value| TimelineCursor { value }),
+        after_cursor: after_cursor.map(|value| TimelineCursor { value }),
+        has_more_before,
+        has_more_after,
+    }
 }
 
 #[test]

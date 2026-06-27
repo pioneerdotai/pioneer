@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnWorkItemStatus",
+  "type": "string",
+  "enum": [
+    "running",
+    "completed",
+    "blocked",
+    "failed",
+    "cancelled"
+  ]
+}

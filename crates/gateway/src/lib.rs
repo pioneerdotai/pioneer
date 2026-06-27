@@ -20,6 +20,7 @@ mod memory_policy;
 mod memory_runtime;
 mod memory_tools;
 mod message;
+mod migrations;
 mod operations;
 mod prompt_hooks;
 mod resilience;
@@ -434,6 +435,9 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
     let task_runtime_config = task_runtime_config_from_gateway_tasks_config(&config.gateway.tasks);
 
     let cli_runtime_manager = build_cli_runtime_manager(&runtime_home, &config)?;
+
+    migrations::spawn_gateway_startup_migrations(crud_store.clone());
+
     let mut message_processor = MessageProcessor::new_with_memory_runtime_and_task_config(
         thread_manager,
         provider_registry,

@@ -144,7 +144,7 @@ impl PioneerDesktop {
 
         let mut state = self.thread_timeline_view_state.borrow_mut();
         state.expanded_revision = state.expanded_revision.saturating_add(1);
-        state.entry_layout_cache.clear();
+        state.entry_layout_cache.remove(entry_id);
         state.cached_item_sizes = None;
         cx.notify();
     }

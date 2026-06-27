@@ -5,6 +5,13 @@ use pioneer_protocol::{
     TaskRescheduleReason, TaskRunThreadBindingKind, TaskThreadLineage, TaskTriggerKind, TurnKind,
 };
 
+struct TaskTimelineChangedTarget {
+    workspace_id: String,
+    thread_id: String,
+    turn_id: String,
+    run_id: Option<String>,
+}
+
 impl MessageProcessor {
     pub(super) async fn emit_task_event(
         &self,
@@ -38,7 +45,7 @@ impl MessageProcessor {
         let timeline_changed = if is_progress_event {
             None
         } else {
-            self.task_timeline_changed_notification(&task_response, &event.payload)
+            self.task_timeline_changed_target(&task_response, &event.payload)
                 .await
         };
         let refresh_parent_anchor =
@@ -469,10 +476,10 @@ impl MessageProcessor {
             }
         }
         if let Some(notification) = timeline_changed {
-            self.send_notification_to_thread_subscribers(
+            self.notify_semantic_timeline_turn_state_changed(
+                notification.workspace_id.as_str(),
                 notification.thread_id.as_str(),
-                events::TURN_TIMELINE_CHANGED,
-                &notification,
+                notification.turn_id.as_str(),
             )
             .await;
         }
@@ -542,6 +549,14 @@ impl MessageProcessor {
             thread_id,
             events::ITEM_UPDATED,
             &notification,
+        )
+        .await;
+        self.notify_semantic_timeline_item_changed(
+            notification.workspace_id.as_str(),
+            notification.thread_id.as_str(),
+            notification.turn_id.as_str(),
+            &notification.item,
+            None,
         )
         .await;
         Ok(true)
@@ -631,11 +646,11 @@ impl MessageProcessor {
         }
     }
 
-    async fn task_timeline_changed_notification(
+    async fn task_timeline_changed_target(
         &self,
         response: &TaskGetResponse,
         payload: &TaskEventPayload,
-    ) -> Option<TurnTimelineChangedNotification> {
+    ) -> Option<TaskTimelineChangedTarget> {
         let task = &response.task;
         let (parent_thread_id, parent_turn_id) = self
             .task_timeline_parent_target(response, payload)
@@ -646,17 +661,11 @@ impl MessageProcessor {
                     task.created_by_turn_id.clone()?,
                 ))
             })?;
-        let (child_thread_id, child_turn_id) =
-            task_event_child_lineage(&self.crud_store, payload).await;
-        Some(TurnTimelineChangedNotification {
+        Some(TaskTimelineChangedTarget {
             workspace_id: task.workspace_id.clone(),
             thread_id: parent_thread_id,
             turn_id: parent_turn_id,
-            task_id: Some(task.id.clone()),
             run_id: payload.run_id().map(str::to_owned),
-            child_thread_id,
-            child_turn_id,
-            reason: TurnTimelineChangedReason::TaskEventChanged,
         })
     }
 
@@ -821,6 +830,12 @@ impl MessageProcessor {
             &notification,
         )
         .await;
+        self.notify_semantic_timeline_turn_state_changed(
+            notification.workspace_id.as_str(),
+            notification.thread_id.as_str(),
+            notification.turn.id.as_str(),
+        )
+        .await;
         Ok(())
     }
 }
@@ -908,33 +923,6 @@ fn parent_task_anchor_item_id(response: &TaskGetResponse, run_id: Option<&str>) 
             crate::task_tools::task_run_anchor_id(run_id)
         }
         _ => crate::task_tools::task_anchor_id(response.task.id.as_str()),
-    }
-}
-
-async fn task_event_child_lineage(
-    store: &std::sync::Arc<pioneer_crud::CrudStore>,
-    payload: &TaskEventPayload,
-) -> (Option<String>, Option<String>) {
-    if let TaskEventPayload::ChildThreadLinked { lineage } = payload {
-        return (
-            Some(lineage.child_thread_id.clone()),
-            Some(lineage.child_turn_id.clone()),
-        );
-    }
-    if let TaskEventPayload::TaskThreadLineageCreated { lineage, .. } = payload {
-        return (Some(lineage.child_thread_id.clone()), None);
-    }
-
-    if payload.thread_id().is_some() || payload.turn_id().is_some() {
-        return (
-            payload.thread_id().map(str::to_owned),
-            payload.turn_id().map(str::to_owned),
-        );
-    }
-
-    match payload.run_id() {
-        Some(run_id) => task_delivery_child_lineage(store, run_id).await,
-        None => (None, None),
     }
 }
 

@@ -96,7 +96,7 @@ impl PioneerDesktop {
         }
 
         self.current_active_thread_id()
-            .is_some_and(|thread_id| self.is_thread_history_loading(thread_id))
+            .is_some_and(|thread_id| self.is_thread_timeline_loading(thread_id))
     }
 
     fn composer_model_selection_state(&self) -> ComposerModelSelectionState {

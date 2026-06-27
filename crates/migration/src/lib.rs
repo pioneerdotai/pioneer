@@ -15,6 +15,7 @@ mod m20260613_000001_turn_event_projection_state;
 mod m20260614_000001_thread_episodic_memory;
 mod m20260616_000001_cli_runtime_bindings;
 mod m20260624_000001_turn_reasoning_effort;
+mod m20260626_000001_semantic_timeline_projection;
 
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
@@ -33,6 +34,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260614_000001_thread_episodic_memory::Migration),
             Box::new(m20260616_000001_cli_runtime_bindings::Migration),
             Box::new(m20260624_000001_turn_reasoning_effort::Migration),
+            Box::new(m20260626_000001_semantic_timeline_projection::Migration),
         ]
     }
 }

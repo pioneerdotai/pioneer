@@ -259,8 +259,11 @@ impl GatewayWsCommandSender {
         client_ws_commands::thread_agents_doc_resolve_for_thread(self, params)
     }
 
-    pub fn thread_history(&self, params: ThreadHistoryParams) -> Result<ThreadHistoryResponse> {
-        client_ws_commands::thread_history(self, params)
+    pub fn thread_timeline_page(
+        &self,
+        params: ThreadTimelinePageParams,
+    ) -> Result<ThreadTimelinePageResponse> {
+        client_ws_commands::thread_timeline_page(self, params)
     }
 
     pub fn workspace_default(&self) -> Result<WorkspaceDefaultResponse> {
@@ -429,8 +432,8 @@ impl GatewayWsCommandSender {
         client_ws_commands::turn_items(self, params)
     }
 
-    pub fn turn_timeline(&self, params: TurnTimelineParams) -> Result<TurnTimelineResponse> {
-        client_ws_commands::turn_timeline(self, params)
+    pub fn turn_work_page(&self, params: TurnWorkPageParams) -> Result<TurnWorkPageResponse> {
+        client_ws_commands::turn_work_page(self, params)
     }
 
     pub fn task_accept(&self, params: TaskAcceptParams) -> Result<TaskAcceptResponse> {

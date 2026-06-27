@@ -25,12 +25,13 @@ use crate::{
     TaskRunStartedNotification, TaskScheduledNotification,
     TaskTreeChangedNotification as TaskTreeChangedTaskNotification, TaskUpdatedNotification,
     ThreadAgentsDocChangedNotification, ThreadArtifactsChangedNotification,
-    ThreadClosedNotification, ThreadStartedNotification, ThreadTreeChangedNotification,
-    ThreadUpdatedNotification, TurnBlockedNotification, TurnCompletedNotification,
-    TurnExecutionWindowBlockedNotification, TurnExecutionWindowCheckpointedNotification,
-    TurnExecutionWindowContinuedNotification, TurnExecutionWindowExhaustedNotification,
-    TurnExecutionWindowStartedNotification, TurnFailedNotification, TurnStartedNotification,
-    TurnTimelineChangedNotification, TurnToolLoopBudgetExceededNotification,
+    ThreadClosedNotification, ThreadStartedNotification, ThreadTimelineBlocksChangedNotification,
+    ThreadTreeChangedNotification, ThreadUpdatedNotification, TurnBlockedNotification,
+    TurnCompletedNotification, TurnExecutionWindowBlockedNotification,
+    TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
+    TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification,
+    TurnFailedNotification, TurnStartedNotification, TurnToolLoopBudgetExceededNotification,
+    TurnWorkItemsChangedNotification, TurnWorkStateChangedNotification,
     WorkspaceChangedNotification,
 };
 use schemars::JsonSchema;
@@ -61,11 +62,13 @@ pub enum GatewayNotification {
     ThreadUpdated(ThreadUpdatedNotification),
     ThreadTreeChanged(ThreadTreeChangedNotification),
     ThreadAgentsDocChanged(ThreadAgentsDocChangedNotification),
+    ThreadTimelineBlocksChanged(ThreadTimelineBlocksChangedNotification),
     TurnStarted(TurnStartedNotification),
     TurnCompleted(TurnCompletedNotification),
     TurnFailed(TurnFailedNotification),
     TurnBlocked(TurnBlockedNotification),
-    TurnTimelineChanged(TurnTimelineChangedNotification),
+    TurnWorkItemsChanged(TurnWorkItemsChangedNotification),
+    TurnWorkStateChanged(TurnWorkStateChangedNotification),
     TurnExecutionWindowStarted(TurnExecutionWindowStartedNotification),
     TurnExecutionWindowExhausted(TurnExecutionWindowExhaustedNotification),
     TurnExecutionWindowCheckpointed(TurnExecutionWindowCheckpointedNotification),
@@ -175,6 +178,11 @@ impl GatewayNotification {
                     .ok()
                     .map(Self::ThreadAgentsDocChanged)
             }
+            events::THREAD_TIMELINE_BLOCKS_CHANGED => {
+                serde_json::from_value::<ThreadTimelineBlocksChangedNotification>(params)
+                    .ok()
+                    .map(Self::ThreadTimelineBlocksChanged)
+            }
             events::TURN_STARTED => serde_json::from_value::<TurnStartedNotification>(params)
                 .ok()
                 .map(Self::TurnStarted),
@@ -187,10 +195,15 @@ impl GatewayNotification {
             events::TURN_BLOCKED => serde_json::from_value::<TurnBlockedNotification>(params)
                 .ok()
                 .map(Self::TurnBlocked),
-            events::TURN_TIMELINE_CHANGED => {
-                serde_json::from_value::<TurnTimelineChangedNotification>(params)
+            events::TURN_WORK_ITEMS_CHANGED => {
+                serde_json::from_value::<TurnWorkItemsChangedNotification>(params)
                     .ok()
-                    .map(Self::TurnTimelineChanged)
+                    .map(Self::TurnWorkItemsChanged)
+            }
+            events::TURN_WORK_STATE_CHANGED => {
+                serde_json::from_value::<TurnWorkStateChangedNotification>(params)
+                    .ok()
+                    .map(Self::TurnWorkStateChanged)
             }
             events::TURN_EXECUTION_WINDOW_STARTED => {
                 parse_execution_window_notification::<TurnExecutionWindowStartedNotification>(
@@ -1466,6 +1479,68 @@ mod tests {
     }
 
     #[test]
+    fn maps_semantic_timeline_notifications() {
+        let blocks_changed = JsonRpcNotification::from_params(
+            events::THREAD_TIMELINE_BLOCKS_CHANGED,
+            &json!({
+                "workspaceId": "ws_1",
+                "threadId": "thr_1",
+                "changedBlockIds": ["block_1"],
+                "reason": "live_event"
+            }),
+        )
+        .expect("blocks changed notification should encode");
+        assert!(matches!(
+            GatewayNotification::from_jsonrpc(blocks_changed)
+                .expect("blocks changed notification should map"),
+            GatewayNotification::ThreadTimelineBlocksChanged(_)
+        ));
+
+        let work_items_changed = JsonRpcNotification::from_params(
+            events::TURN_WORK_ITEMS_CHANGED,
+            &json!({
+                "workspaceId": "ws_1",
+                "threadId": "thr_1",
+                "turnId": "turn_1",
+                "changedWorkItemIds": ["work_item_1"],
+                "reason": "live_event"
+            }),
+        )
+        .expect("work items notification should encode");
+        assert!(matches!(
+            GatewayNotification::from_jsonrpc(work_items_changed)
+                .expect("work items notification should map"),
+            GatewayNotification::TurnWorkItemsChanged(_)
+        ));
+
+        let work_state_changed = JsonRpcNotification::from_params(
+            events::TURN_WORK_STATE_CHANGED,
+            &json!({
+                "workspaceId": "ws_1",
+                "threadId": "thr_1",
+                "turnId": "turn_1",
+                "work": {
+                    "turnId": "turn_1",
+                    "presentation": "expanded_live",
+                    "state": "running",
+                    "workCount": 1,
+                    "visibleWorkCount": 1,
+                    "hiddenWorkCount": 0,
+                    "hasMoreBefore": false,
+                    "hasMoreAfter": true
+                },
+                "reason": "state_changed"
+            }),
+        )
+        .expect("work state notification should encode");
+        assert!(matches!(
+            GatewayNotification::from_jsonrpc(work_state_changed)
+                .expect("work state notification should map"),
+            GatewayNotification::TurnWorkStateChanged(_)
+        ));
+    }
+
+    #[test]
     fn schema_documents_include_tool_retry_notifications_and_replay_payloads() {
         let schema_names = crate::protocol_schema_documents()
             .into_iter()
@@ -1502,6 +1577,17 @@ mod tests {
             "workspace_change_kind.json",
             "workspace_changed_notification.json",
             "gateway_remote_access_status_changed_notification.json",
+            "thread_timeline_page_params.json",
+            "thread_timeline_page_response.json",
+            "thread_timeline_blocks_changed_notification.json",
+            "timeline_block.json",
+            "timeline_block_kind.json",
+            "timeline_cursor.json",
+            "turn_work_block.json",
+            "turn_work_page_params.json",
+            "turn_work_page_response.json",
+            "turn_work_items_changed_notification.json",
+            "turn_work_state_changed_notification.json",
             "mcp_list_params.json",
             "mcp_list_response.json",
             "mcp_scope_kind.json",

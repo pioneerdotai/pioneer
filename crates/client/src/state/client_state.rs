@@ -6,15 +6,12 @@ use crate::{
     providers::list::ProviderListState,
     skills::catalog::SkillCatalogState,
     threads::{coordinator::ThreadCoordinator, start::ThreadStartCoordinator},
-    turns::timeline_refresh::TurnTimelineRefreshState,
+    timeline::semantic::SemanticTimelineState,
 };
 use pioneer_protocol::{
     GatewaySettingsSnapshot, ThreadAgentsDocSummary, ThreadFolder, ThreadPlacement, Workspace,
 };
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    hash::Hash,
-};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 pub use crate::agents_doc::scope::ThreadAgentsDocSummaryKey;
 pub use crate::threads::tree::WorkspaceThreadState;
@@ -28,6 +25,7 @@ pub struct ClientState {
     pub cli_runtime_pending_requests: CLIRuntimePendingRequestState,
     pub mcp: McpState,
     pub skills: SkillsState,
+    pub semantic_timelines: SemanticTimelineState,
     pub settings: SettingsState,
 }
 
@@ -48,7 +46,6 @@ pub struct ThreadsState {
     pub start_requested: bool,
     pub ready_turn_resume_threads: VecDeque<String>,
     pub ready_turn_resume_thread_set: HashSet<String>,
-    pub turn_timeline_refresh: HashMap<TurnTimelineRefreshKey, TurnTimelineRefreshState>,
 }
 
 #[derive(Default)]
@@ -112,33 +109,6 @@ pub fn gateway_has_ready_ws_connection(
     ws_connection_id: Option<u64>,
 ) -> bool {
     connection_state == GatewayConnectionState::Connected && ws_connection_id.is_some()
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct TurnTimelineRefreshKey {
-    pub thread_id: String,
-    pub turn_id: String,
-}
-
-impl TurnTimelineRefreshKey {
-    pub fn new(thread_id: impl Into<String>, turn_id: impl Into<String>) -> Self {
-        Self {
-            thread_id: thread_id.into(),
-            turn_id: turn_id.into(),
-        }
-    }
-}
-
-impl From<(String, String)> for TurnTimelineRefreshKey {
-    fn from((thread_id, turn_id): (String, String)) -> Self {
-        Self { thread_id, turn_id }
-    }
-}
-
-impl From<TurnTimelineRefreshKey> for (String, String) {
-    fn from(key: TurnTimelineRefreshKey) -> Self {
-        (key.thread_id, key.turn_id)
-    }
 }
 
 #[cfg(test)]

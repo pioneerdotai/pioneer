@@ -2,7 +2,8 @@ pub mod core;
 pub mod display;
 pub mod events;
 pub mod handlers;
-pub mod history;
+#[cfg(test)]
+mod history;
 pub mod reducer;
 pub mod state_machine;
 
@@ -10,10 +11,8 @@ use self::events::EventEnvelope;
 use self::handlers::TurnItemHandlerRegistry;
 use self::reducer::ConversationProjector;
 use self::state_machine::TurnStateMachine;
-use pioneer_protocol::{
-    SystemEventLevel, TaskEvent, ThreadHistoryEvent, ThreadHistoryEventPayload, TimelineOriginKind,
-    TimelinePayload, TurnItem, TurnItemEventPayload, TurnTimelineResponse,
-};
+#[cfg(test)]
+use pioneer_protocol::{ThreadHistoryEvent, ThreadHistoryEventPayload};
 use std::collections::VecDeque;
 
 pub use self::display::tool_display_text;
@@ -38,6 +37,7 @@ pub const MAX_EVENT_LOG_LEN: usize = 2_000;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
 fn history_event_thread_id(payload: &ThreadHistoryEventPayload) -> &str {
     match payload {
         ThreadHistoryEventPayload::TurnStarted { thread_id, .. }

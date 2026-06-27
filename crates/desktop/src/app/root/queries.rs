@@ -81,10 +81,6 @@ impl PioneerDesktop {
         client_selectors::thread_coordinator_from(&self.thread_coordinators, thread_id)
     }
 
-    pub(in crate::app) fn thread_conversation(&self, thread_id: &str) -> Option<&Conversation> {
-        client_selectors::thread_conversation_from(&self.thread_coordinators, thread_id)
-    }
-
     pub(in crate::app) fn thread_workspace_id(&self, thread_id: &str) -> Option<&str> {
         client_selectors::thread_workspace_id_from(&self.thread_coordinators, thread_id)
     }
@@ -160,12 +156,15 @@ impl PioneerDesktop {
         client_selectors::has_known_threads_for_workspace(&self.thread_coordinators, workspace_id)
     }
 
-    pub(in crate::app) fn is_thread_history_loading(&self, thread_id: &str) -> bool {
-        client_selectors::is_thread_history_loading(&self.thread_coordinators, thread_id)
-    }
-
-    pub(in crate::app) fn is_thread_history_loaded(&self, thread_id: &str) -> bool {
-        client_selectors::is_thread_history_loaded(&self.thread_coordinators, thread_id)
+    pub(in crate::app) fn is_thread_timeline_loading(&self, thread_id: &str) -> bool {
+        self.semantic_timelines
+            .thread(thread_id)
+            .is_some_and(|thread| {
+                matches!(
+                    thread.top_level.request_status,
+                    pioneer_client::timeline::semantic::TimelineRequestStatus::Loading { .. }
+                )
+            })
     }
 
     pub(in crate::app) fn active_thread_conversation(&self) -> Option<&Conversation> {

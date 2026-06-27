@@ -1,10 +1,6 @@
 use super::*;
-use pioneer_client::threads::history as thread_history;
 use pioneer_client::threads::start as thread_start;
 use pioneer_client::threads::tree as thread_tree;
-pub(super) use pioneer_client::turns::timeline_refresh::{
-    TurnTimelineRefreshTransitionEvent, transition_turn_timeline_refresh_state,
-};
 
 impl PioneerDesktop {
     pub(crate) fn upsert_thread_for_workspace(&mut self, thread_id: &str, workspace_id: &str) {
@@ -49,8 +45,8 @@ impl PioneerDesktop {
                 cx,
             );
         }
-        if let Some(thread_id) = reduction.ensure_thread_history_loaded {
-            self.ensure_thread_history_loaded(thread_id.as_str(), cx);
+        if let Some(thread_id) = reduction.ensure_thread_timeline_loaded {
+            self.ensure_thread_semantic_timeline_loaded(thread_id.as_str(), cx);
         }
         if reduction.request_thread_start_if_needed {
             self.request_thread_start_if_needed();
@@ -74,50 +70,6 @@ impl PioneerDesktop {
         if reduction.drive_thread_start_queue {
             let _ = self.drive_thread_start_queue(cx);
         }
-    }
-
-    fn apply_thread_history_load_success_reduction(
-        &mut self,
-        reduction: thread_history::ThreadHistoryLoadSuccessReduction,
-    ) -> bool {
-        let thread_history::ThreadHistoryLoadSuccessReduction::Apply(reduction) = reduction else {
-            return false;
-        };
-
-        if let Some(thread_id) = reduction.clear_draft_thread_id.as_deref() {
-            self.clear_draft_thread_if_matches(thread_id);
-        }
-
-        self.upsert_thread_for_workspace(
-            reduction.thread_id.as_str(),
-            reduction.workspace_id.as_str(),
-        );
-
-        if let Some(coordinator) = self.thread_coordinator_mut(reduction.thread_id.as_str()) {
-            coordinator.conversation.hydrate_history(&reduction.events);
-            for timeline in &reduction.timelines {
-                coordinator
-                    .conversation
-                    .apply_composed_turn_timeline(timeline);
-            }
-        }
-
-        self.mark_thread_history_loaded(
-            reduction.thread_id.as_str(),
-            reduction.mark_history_loaded,
-        );
-        if reduction.sync_composer_model_selection {
-            self.sync_composer_model_selection_for_active_thread();
-        }
-        true
-    }
-
-    fn apply_thread_history_load_failure_reduction(
-        &mut self,
-        thread_id: &str,
-        reduction: thread_history::ThreadHistoryLoadFailureReduction,
-    ) {
-        self.mark_thread_history_loaded(thread_id, reduction.mark_history_loaded);
     }
 
     pub(crate) fn open_thread_from_sidebar(
@@ -149,7 +101,7 @@ impl PioneerDesktop {
             }
         }
 
-        self.ensure_thread_history_loaded(thread_id.as_str(), cx);
+        self.ensure_thread_semantic_timeline_loaded(thread_id.as_str(), cx);
         self.rebuild_sidebar_tree_state(cx);
     }
 
@@ -355,23 +307,37 @@ impl PioneerDesktop {
         .detach();
     }
 
-    fn ensure_thread_history_loaded(&mut self, thread_id: &str, cx: &mut Context<Self>) {
-        if self.is_thread_history_loaded(thread_id) || self.is_thread_history_loading(thread_id) {
-            return;
-        }
-
+    fn ensure_thread_semantic_timeline_loaded(&mut self, thread_id: &str, cx: &mut Context<Self>) {
         if self.gateway.connection_state != GatewayConnectionState::Connected {
             return;
         }
         let Some(connection_id) = self.gateway.ws_connection_id else {
             return;
         };
+        if self.thread_coordinator(thread_id).is_none() {
+            return;
+        }
 
-        self.set_thread_history_loading(thread_id, true);
+        let request_key = format!("thread/timeline/page:newest:{thread_id}");
+        {
+            let thread = self.semantic_timelines.thread_mut(thread_id.to_owned());
+            if !thread.top_level.is_empty()
+                || matches!(
+                    thread.top_level.request_status,
+                    pioneer_client::timeline::semantic::TimelineRequestStatus::Loading { .. }
+                )
+            {
+                return;
+            }
+            thread.top_level.request_status =
+                pioneer_client::timeline::semantic::TimelineRequestStatus::Loading {
+                    request_key: request_key.clone(),
+                };
+        }
+        cx.notify();
 
-        let thread_id = thread_id.to_owned();
         let ws_sender = self.gateway.ws_command_sender.clone();
-
+        let thread_id = thread_id.to_owned();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             let thread_id_for_request = thread_id.clone();
@@ -379,14 +345,13 @@ impl PioneerDesktop {
             async move {
                 let result = cx
                     .background_spawn(async move {
-                        let response = ws_sender.thread_history(
-                            pioneer_client::threads::history::thread_history_params(
-                                thread_id_for_request,
-                                None,
+                        ws_sender.thread_timeline_page(pioneer_protocol::ThreadTimelinePageParams {
+                            thread_id: thread_id_for_request,
+                            anchor: pioneer_protocol::TimelinePageAnchor::Newest,
+                            limit: Some(
+                                pioneer_client::timeline::semantic::DEFAULT_TOP_LEVEL_PAGE_LIMIT,
                             ),
-                        )?;
-                        let timelines = load_task_turn_timelines(&ws_sender, &response);
-                        Ok::<_, anyhow::Error>((response, timelines))
+                        })
                     })
                     .await;
 
@@ -394,34 +359,34 @@ impl PioneerDesktop {
                     if view.gateway.ws_connection_id != Some(connection_id) {
                         return;
                     }
-
-                    view.set_thread_history_loading(thread_id.as_str(), false);
+                    if view.thread_coordinator(thread_id.as_str()).is_none() {
+                        return;
+                    }
 
                     match result {
-                        Ok((response, timelines)) => {
-                            let reduction = thread_history::reduce_thread_history_load_success(
-                                thread_id.as_str(),
-                                response,
-                                timelines,
-                            );
-                            if !view.apply_thread_history_load_success_reduction(reduction) {
-                                return;
+                        Ok(page) => {
+                            if pioneer_client::timeline::semantic::apply_thread_timeline_page(
+                                &mut view.semantic_timelines,
+                                page,
+                                pioneer_client::timeline::semantic::TopLevelPageMergeMode::Reset,
+                            ) {
+                                view.semantic_timeline_revision =
+                                    view.semantic_timeline_revision.saturating_add(1);
                             }
                         }
                         Err(error) => {
                             warn!(
                                 thread_id = thread_id.as_str(),
                                 error = %format!("{error:#}"),
-                                "failed to load thread history"
+                                "failed to load semantic thread timeline page"
                             );
-                            let reduction = thread_history::reduce_thread_history_load_failure();
-                            view.apply_thread_history_load_failure_reduction(
-                                thread_id.as_str(),
-                                reduction,
-                            );
+                            let thread = view.semantic_timelines.thread_mut(thread_id.clone());
+                            thread.top_level.request_status =
+                                pioneer_client::timeline::semantic::TimelineRequestStatus::Failed {
+                                    message: format!("{error:#}"),
+                                };
                         }
                     }
-
                     cx.notify();
                 });
             }
@@ -490,167 +455,6 @@ impl PioneerDesktop {
         })
         .detach();
     }
-
-    pub(crate) fn refresh_turn_timeline(
-        &mut self,
-        thread_id: String,
-        turn_id: String,
-        cx: &mut Context<Self>,
-    ) {
-        if self.gateway.connection_state != GatewayConnectionState::Connected {
-            return;
-        }
-        let Some(connection_id) = self.gateway.ws_connection_id else {
-            return;
-        };
-        if self.thread_coordinator(thread_id.as_str()).is_none() {
-            return;
-        }
-        if !self.is_thread_history_loaded(thread_id.as_str()) {
-            return;
-        }
-        let Some(generation) =
-            self.request_turn_timeline_refresh(thread_id.as_str(), turn_id.as_str())
-        else {
-            return;
-        };
-
-        self.spawn_turn_timeline_refresh(thread_id, turn_id, connection_id, generation, cx);
-    }
-
-    fn spawn_turn_timeline_refresh(
-        &self,
-        thread_id: String,
-        turn_id: String,
-        connection_id: u64,
-        generation: u64,
-        cx: &mut Context<Self>,
-    ) {
-        let ws_sender = self.gateway.ws_command_sender.clone();
-        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let mut cx = cx.clone();
-            let thread_id_for_request = thread_id.clone();
-            let turn_id_for_request = turn_id.clone();
-
-            async move {
-                let result = cx
-                    .background_spawn(async move {
-                        ws_sender.turn_timeline(
-                            pioneer_client::threads::history::composed_task_turn_timeline_param(
-                                thread_id_for_request,
-                                turn_id_for_request,
-                            ),
-                        )
-                    })
-                    .await;
-
-                let _ = this.update(&mut cx, |view, cx| {
-                    let has_matching_connection =
-                        view.gateway.ws_connection_id == Some(connection_id);
-                    if has_matching_connection {
-                        match result {
-                            Ok(timeline) => {
-                                let reduction =
-                                    thread_history::reduce_composed_turn_timeline_refresh_success(
-                                        timeline,
-                                    );
-                                if let Some(coordinator) =
-                                    view.thread_coordinator_mut(reduction.thread_id.as_str())
-                                {
-                                    coordinator
-                                        .conversation
-                                        .apply_composed_turn_timeline(&reduction.timeline);
-                                }
-                            }
-                            Err(error) => {
-                                warn!(
-                                    thread_id = thread_id.as_str(),
-                                    turn_id = turn_id.as_str(),
-                                    error = %format!("{error:#}"),
-                                    "failed to refresh composed turn timeline"
-                                );
-                            }
-                        }
-                    }
-
-                    let queued_generation = view.complete_turn_timeline_refresh(
-                        thread_id.as_str(),
-                        turn_id.as_str(),
-                        generation,
-                    );
-                    if let Some(next_generation) = queued_generation {
-                        let next_connection_id = match view.gateway.ws_connection_id {
-                            Some(id)
-                                if view.gateway.connection_state
-                                    == GatewayConnectionState::Connected =>
-                            {
-                                id
-                            }
-                            _ => {
-                                view.abort_turn_timeline_refresh(
-                                    thread_id.as_str(),
-                                    turn_id.as_str(),
-                                );
-                                cx.notify();
-                                return;
-                            }
-                        };
-
-                        view.spawn_turn_timeline_refresh(
-                            thread_id.clone(),
-                            turn_id.clone(),
-                            next_connection_id,
-                            next_generation,
-                            cx,
-                        );
-                    }
-
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
-    }
-
-    fn request_turn_timeline_refresh(&mut self, thread_id: &str, turn_id: &str) -> Option<u64> {
-        let key = (thread_id.to_owned(), turn_id.to_owned());
-        let current = self.turn_timeline_refresh.remove(&key);
-        let (next_state, generation) = transition_turn_timeline_refresh_state(
-            current,
-            TurnTimelineRefreshTransitionEvent::Request,
-        );
-        if let Some(state) = next_state {
-            self.turn_timeline_refresh.insert(key, state);
-        }
-        generation
-    }
-
-    fn complete_turn_timeline_refresh(
-        &mut self,
-        thread_id: &str,
-        turn_id: &str,
-        completed_generation: u64,
-    ) -> Option<u64> {
-        let key = (thread_id.to_owned(), turn_id.to_owned());
-        let Some(current) = self.turn_timeline_refresh.remove(&key) else {
-            return None;
-        };
-        let (next_state, next_generation) = transition_turn_timeline_refresh_state(
-            Some(current),
-            TurnTimelineRefreshTransitionEvent::Complete {
-                generation: completed_generation,
-            },
-        );
-        if let Some(state) = next_state {
-            self.turn_timeline_refresh.insert(key, state);
-        }
-        next_generation
-    }
-
-    fn abort_turn_timeline_refresh(&mut self, thread_id: &str, turn_id: &str) {
-        self.turn_timeline_refresh
-            .remove(&(thread_id.to_owned(), turn_id.to_owned()));
-    }
 }
 
 pub(crate) fn resolve_thread_tree_workspace_id(
@@ -663,26 +467,4 @@ pub(crate) fn resolve_thread_tree_workspace_id(
         preferred_workspace_id,
         runtime_workspace_id,
     )
-}
-
-fn load_task_turn_timelines(
-    ws_sender: &crate::gateway::GatewayWsCommandSender,
-    response: &ThreadHistoryResponse,
-) -> Vec<TurnTimelineResponse> {
-    pioneer_client::threads::history::composed_task_turn_timeline_params(response)
-        .into_iter()
-        .filter_map(|params| {
-            ws_sender
-                .turn_timeline(params)
-                .map_err(|error| {
-                    warn!(
-                        thread_id = response.thread_id.as_str(),
-                        error = %format!("{error:#}"),
-                        "failed to load composed turn timeline"
-                    );
-                    error
-                })
-                .ok()
-        })
-        .collect()
 }

@@ -12,12 +12,6 @@
     "drive_thread_start_queue": {
       "type": "boolean"
     },
-    "ensure_thread_history_loaded": {
-      "type": [
-        "string",
-        "null"
-      ]
-    },
     "ensure_thread_subscription": {
       "anyOf": [
         {
@@ -26,6 +20,12 @@
         {
           "type": "null"
         }
+      ]
+    },
+    "ensure_thread_timeline_loaded": {
+      "type": [
+        "string",
+        "null"
       ]
     },
     "folders": {

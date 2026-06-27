@@ -3,8 +3,7 @@ use pioneer_client::notifications::router::{
     ArtifactDeletedRefreshReduction, ArtifactThreadRefreshReduction, CLIRuntimeRefreshReduction,
     ConversationEventReduction, SkillsRefreshReduction, ThreadArtifactsRefreshReduction,
     ThreadClosedReduction, ThreadStartedReduction, ThreadUpdatedReduction, TurnLifecycleReduction,
-    TurnTimelineRefreshReduction, WorkspacePreferenceReduction, WorkspaceRefreshReduction,
-    apply_workspace_changed_to_catalog,
+    WorkspacePreferenceReduction, WorkspaceRefreshReduction, apply_workspace_changed_to_catalog,
 };
 use pioneer_client::runtime::{ClientRuntimeNotification, ClientRuntimeNotificationContext};
 use pioneer_client::workspaces::selectors as workspace_selectors;
@@ -101,8 +100,8 @@ impl PioneerDesktop {
             ClientRuntimeNotification::ArtifactDeletedRefresh(reduction) => {
                 self.apply_artifact_deleted_refresh_reduction(reduction, cx);
             }
-            ClientRuntimeNotification::TurnTimelineRefresh(reduction) => {
-                self.apply_turn_timeline_refresh_reduction(reduction, cx);
+            ClientRuntimeNotification::SemanticTimeline(update) => {
+                self.apply_semantic_timeline_live_update(update, cx);
             }
             ClientRuntimeNotification::CLIRuntimeRefresh(reduction) => {
                 self.apply_cli_runtime_refresh_reduction(reduction, cx);
@@ -308,14 +307,65 @@ impl PioneerDesktop {
         }
     }
 
-    fn apply_turn_timeline_refresh_reduction(
+    fn apply_semantic_timeline_live_update(
         &mut self,
-        reduction: TurnTimelineRefreshReduction,
+        update: pioneer_client::timeline::semantic::SemanticTimelineLiveUpdate,
         cx: &mut Context<Self>,
     ) {
-        if reduction.queue_turn_timeline_refresh {
-            self.refresh_turn_timeline(reduction.thread_id, reduction.turn_id, cx);
+        let active_thread_id = self.current_active_thread_id().map(str::to_owned);
+        let mut refetch_thread_id = None;
+        let mut refetch_work_candidate = None;
+        match &update {
+            pioneer_client::timeline::semantic::SemanticTimelineLiveUpdate::ThreadTimelineBlocksChanged(notification)
+                if active_thread_id.as_deref() == Some(notification.thread_id.as_str()) =>
+            {
+                refetch_thread_id = Some(notification.thread_id.clone());
+            }
+            pioneer_client::timeline::semantic::SemanticTimelineLiveUpdate::TurnWorkItemsChanged(notification)
+                if active_thread_id.as_deref() == Some(notification.thread_id.as_str()) =>
+            {
+                refetch_work_candidate =
+                    Some((notification.thread_id.clone(), notification.turn_id.clone()));
+            }
+            pioneer_client::timeline::semantic::SemanticTimelineLiveUpdate::TurnWorkStateChanged(notification)
+                if active_thread_id.as_deref() == Some(notification.thread_id.as_str()) =>
+            {
+                refetch_work_candidate =
+                    Some((notification.thread_id.clone(), notification.turn_id.clone()));
+            }
+            _ => {}
         }
+
+        if pioneer_client::timeline::semantic::apply_semantic_timeline_live_update(
+            &mut self.semantic_timelines,
+            update,
+        ) {
+            self.semantic_timeline_revision = self.semantic_timeline_revision.saturating_add(1);
+            cx.notify();
+        }
+
+        if let Some(thread_id) = refetch_thread_id {
+            self.request_semantic_thread_newest_page(thread_id, cx);
+        }
+        if let Some((thread_id, turn_id)) = refetch_work_candidate
+            && self.should_refetch_semantic_turn_work(thread_id.as_str(), turn_id.as_str())
+        {
+            self.request_semantic_turn_work_newest_page(thread_id, turn_id, cx);
+        }
+    }
+
+    fn should_refetch_semantic_turn_work(&self, thread_id: &str, turn_id: &str) -> bool {
+        self.semantic_timelines
+            .thread(thread_id)
+            .and_then(|thread| {
+                thread.cached_turn_work_block(turn_id).map(|work| {
+                    pioneer_client::timeline::semantic::resolve_work_expanded(
+                        work,
+                        &thread.expansion,
+                    )
+                })
+            })
+            .unwrap_or(false)
     }
 
     fn apply_cli_runtime_refresh_reduction(

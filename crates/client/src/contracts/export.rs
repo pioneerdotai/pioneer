@@ -1658,10 +1658,6 @@ pub fn client_schema_internal_exclusions() -> Vec<ClientSchemaInternalExclusion>
             "notification reducer output consumed inside Rust state mutation"
         ),
         internal_exclusion!(
-            crate::notifications::router::TurnTimelineRefreshReduction,
-            "notification reducer output consumed inside Rust state mutation"
-        ),
-        internal_exclusion!(
             crate::conversation::reducer::ConversationProjector,
             "projector implementation detail"
         ),

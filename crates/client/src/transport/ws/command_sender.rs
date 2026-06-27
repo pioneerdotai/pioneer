@@ -48,12 +48,12 @@ use pioneer_protocol::{
     ThreadAgentsDocSaveParams, ThreadAgentsDocSaveResponse, ThreadFolderCreateParams,
     ThreadFolderCreateResponse, ThreadFolderDeleteParams, ThreadFolderDeleteResponse,
     ThreadFolderMoveParams, ThreadFolderMoveResponse, ThreadGetParams, ThreadGetResponse,
-    ThreadHistoryParams, ThreadHistoryResponse, ThreadMoveParams, ThreadMoveResponse,
-    ThreadStartParams, ThreadStartResponse, ThreadTreeParams, ThreadTreeResponse,
+    ThreadMoveParams, ThreadMoveResponse, ThreadStartParams, ThreadStartResponse,
+    ThreadTimelinePageParams, ThreadTimelinePageResponse, ThreadTreeParams, ThreadTreeResponse,
     ThreadUnsubscribeParams, ThreadUnsubscribeResponse, ThreadUpdateParams, ThreadUpdateResponse,
     TurnCancelParams, TurnCancelResponse, TurnGetParams, TurnGetResponse, TurnItemsParams,
-    TurnItemsResponse, TurnStartParams, TurnStartResponse, TurnTimelineParams,
-    TurnTimelineResponse, WorkspaceCreateParams, WorkspaceCreateResponse, WorkspaceDefaultParams,
+    TurnItemsResponse, TurnStartParams, TurnStartResponse, TurnWorkPageParams,
+    TurnWorkPageResponse, WorkspaceCreateParams, WorkspaceCreateResponse, WorkspaceDefaultParams,
     WorkspaceDefaultResponse, WorkspaceListParams, WorkspaceListResponse, WorkspaceSelectParams,
     WorkspaceSelectResponse, WorkspaceUpdateParams, WorkspaceUpdateResponse,
 };
@@ -174,22 +174,22 @@ where
     )
 }
 
-pub fn thread_history<TTransport>(
+pub fn thread_timeline_page<TTransport>(
     transport: &TTransport,
-    params: ThreadHistoryParams,
-) -> Result<ThreadHistoryResponse>
+    params: ThreadTimelinePageParams,
+) -> Result<ThreadTimelinePageResponse>
 where
     TTransport: JsonRpcRequestTransport + ?Sized,
 {
     require_non_empty_field(
         params.thread_id.as_str(),
         "thread_id",
-        methods::THREAD_HISTORY,
+        methods::THREAD_TIMELINE_PAGE,
     )?;
 
     send_json_rpc_request_typed(
         transport,
-        methods::THREAD_HISTORY,
+        methods::THREAD_TIMELINE_PAGE,
         &params,
         RPC_REQUEST_TIMEOUT,
     )
@@ -517,23 +517,23 @@ where
     send_json_rpc_request_typed(transport, methods::TURN_ITEMS, &params, RPC_REQUEST_TIMEOUT)
 }
 
-pub fn turn_timeline<TTransport>(
+pub fn turn_work_page<TTransport>(
     transport: &TTransport,
-    params: TurnTimelineParams,
-) -> Result<TurnTimelineResponse>
+    params: TurnWorkPageParams,
+) -> Result<TurnWorkPageResponse>
 where
     TTransport: JsonRpcRequestTransport + ?Sized,
 {
     require_non_empty_field(
         params.thread_id.as_str(),
         "thread_id",
-        methods::TURN_TIMELINE,
+        methods::TURN_WORK_PAGE,
     )?;
-    require_non_empty_field(params.turn_id.as_str(), "turn_id", methods::TURN_TIMELINE)?;
+    require_non_empty_field(params.turn_id.as_str(), "turn_id", methods::TURN_WORK_PAGE)?;
 
     send_json_rpc_request_typed(
         transport,
-        methods::TURN_TIMELINE,
+        methods::TURN_WORK_PAGE,
         &params,
         RPC_REQUEST_TIMEOUT,
     )
@@ -2315,23 +2315,6 @@ mod tests {
                 .expect_err("turn id should be required")
             ),
             "turn_id is required for turn/start"
-        );
-        assert_eq!(
-            format!(
-                "{:#}",
-                turn_timeline(
-                    &PanicTransport,
-                    TurnTimelineParams {
-                        thread_id: "thread_1".to_owned(),
-                        turn_id: " ".to_owned(),
-                        compose_tasks: true,
-                        include_collapsed_task_events: false,
-                        max_child_items_per_task: None,
-                    },
-                )
-                .expect_err("turn id should be required")
-            ),
-            "turn_id is required for turn/timeline"
         );
     }
 

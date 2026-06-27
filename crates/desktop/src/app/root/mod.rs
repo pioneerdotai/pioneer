@@ -10,7 +10,7 @@ use crate::{
         editor::AgentsDocEditor,
         gateway_setup::{GatewaySetupDialogState, GatewaySetupFormState},
         skills::details::table::SkillDiagnosticsTableDelegate,
-        thread::{ThreadCoordinator, view::timeline::model::TimelineRow},
+        thread::{ThreadCoordinator, view::timeline::TimelineRenderModel},
     },
     gateway::{ClientRuntime, GatewayRuntime, GatewayWsCommandSender},
 };
@@ -37,7 +37,7 @@ pub(super) use pioneer_client::{
     state::client_state::{GatewayConnectionState, GatewayStatusLevel},
     tasks::review::TaskReviewActionState,
     threads::{resume::ThreadResumeCoordinator, start::ThreadStartCoordinator},
-    turns::timeline_refresh::TurnTimelineRefreshState,
+    timeline::semantic::{SemanticTimelineRequestKey, SemanticTimelineState},
 };
 use pioneer_protocol::{
     CLIRuntimeThreadBinding, GatewaySettingsSnapshot, McpListItem, McpServerDetailsResponse,
@@ -157,13 +157,22 @@ pub(super) struct ThreadTimelineViewState {
     pub(super) cached_render_tail_layout_hash: u64,
     pub(super) cached_render_model_layout_hash: u64,
     pub(super) cached_item_sizes: Option<Rc<Vec<Size<Pixels>>>>,
+    pub(super) cached_semantic_model_active_thread_id: Option<String>,
+    pub(super) cached_semantic_model_revision: u64,
+    pub(super) cached_semantic_model: Option<TimelineRenderModel>,
     pub(super) expanded_revision: u64,
-    pub(super) cached_model_signature_hash: u64,
-    pub(super) cached_model_rows_layout_hash: u64,
-    pub(super) cached_model_rows: Option<Rc<Vec<TimelineRow>>>,
+    pub(super) pending_scroll_anchor: Option<TimelineScrollAnchor>,
+    pub(super) semantic_prefetch_scroll_generation: u64,
+    pub(super) semantic_prefetch_consumed_scroll_generation: u64,
     pub(super) running_turn_indicator_timer_active: bool,
     pub(super) running_turn_indicator_fallback_turn_id: Option<String>,
     pub(super) running_turn_indicator_fallback_started_at_unix_ms: Option<i64>,
+}
+
+pub(super) struct TimelineScrollAnchor {
+    pub(super) thread_id: String,
+    pub(super) row_key: String,
+    pub(super) row_top_offset_px: Pixels,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -257,13 +266,15 @@ pub struct PioneerDesktop {
     pub(super) thread_timeline_view_state: RefCell<ThreadTimelineViewState>,
     pub(super) thread_timeline_item_expanded: RefCell<HashSet<String>>,
     pub(super) thread_timeline_terminal_item: RefCell<HashMap<String, CachedTimelineTerminal>>,
+    pub(super) semantic_timelines: SemanticTimelineState,
+    pub(super) semantic_timeline_revision: u64,
+    pub(super) semantic_timeline_in_flight: HashSet<SemanticTimelineRequestKey>,
     pub(super) task_review_actions: TaskReviewActionState,
     pub(super) thread_artifacts: ThreadArtifactsState,
     pub(super) show_thread_artifacts_sidebar: bool,
     pub(super) thread_artifacts_sidebar_width: Pixels,
     pub(super) ready_turn_resume_threads: VecDeque<String>,
     pub(super) ready_turn_resume_thread_set: HashSet<String>,
-    pub(super) turn_timeline_refresh: HashMap<(String, String), TurnTimelineRefreshState>,
     pub(super) gateway_setup_form_state: Entity<GatewaySetupFormState>,
     pub(super) gateway: GatewayCoordinator,
     pub(super) show_sidebar: bool,

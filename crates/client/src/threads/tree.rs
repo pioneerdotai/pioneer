@@ -203,7 +203,7 @@ pub struct ThreadTreeRefreshSuccessReduction {
     pub set_active_thread_id: Option<String>,
     pub set_preferred_workspace_id: Option<String>,
     pub ensure_thread_subscription: Option<ThreadTreeThreadAction>,
-    pub ensure_thread_history_loaded: Option<String>,
+    pub ensure_thread_timeline_loaded: Option<String>,
     pub request_thread_start_if_needed: bool,
     pub drive_thread_start_queue: bool,
     pub sync_composer_model_selection: bool,
@@ -223,18 +223,18 @@ pub fn reduce_thread_tree_refresh_success(
     let mut set_active_thread_id = None;
     let mut set_preferred_workspace_id = None;
     let mut ensure_thread_subscription = None;
-    let mut ensure_thread_history_loaded = None;
+    let mut ensure_thread_timeline_loaded = None;
     let mut request_thread_start_if_needed = false;
     let mut drive_thread_start_queue = false;
 
     match context.active_thread_id {
         Some(active_thread_id) => {
-            ensure_thread_history_loaded = Some(active_thread_id.to_owned());
+            ensure_thread_timeline_loaded = Some(active_thread_id.to_owned());
         }
         None => {
             if let Some(draft_thread_id) = context.existing_draft_thread_id {
                 set_active_thread_id = Some(draft_thread_id.to_owned());
-                ensure_thread_history_loaded = Some(draft_thread_id.to_owned());
+                ensure_thread_timeline_loaded = Some(draft_thread_id.to_owned());
 
                 if let Some(workspace_id) = context.existing_draft_thread_workspace_id {
                     set_preferred_workspace_id = Some(workspace_id.to_owned());
@@ -259,7 +259,7 @@ pub fn reduce_thread_tree_refresh_success(
         set_active_thread_id,
         set_preferred_workspace_id,
         ensure_thread_subscription,
-        ensure_thread_history_loaded,
+        ensure_thread_timeline_loaded,
         request_thread_start_if_needed,
         drive_thread_start_queue,
         sync_composer_model_selection: true,
@@ -1216,7 +1216,7 @@ mod tests {
             })
         );
         assert_eq!(
-            reduction.ensure_thread_history_loaded.as_deref(),
+            reduction.ensure_thread_timeline_loaded.as_deref(),
             Some("thread_draft")
         );
         assert!(reduction.request_thread_start_if_needed);
@@ -1225,7 +1225,7 @@ mod tests {
     }
 
     #[test]
-    fn thread_tree_refresh_success_loads_active_thread_history_without_starting_thread() {
+    fn thread_tree_refresh_success_loads_active_thread_timeline_without_starting_thread() {
         let reduction = reduce_thread_tree_refresh_success(
             ThreadTreeResponse {
                 workspace_id: "ws_a".to_owned(),
@@ -1246,7 +1246,7 @@ mod tests {
         assert_eq!(reduction.set_preferred_workspace_id, None);
         assert_eq!(reduction.ensure_thread_subscription, None);
         assert_eq!(
-            reduction.ensure_thread_history_loaded.as_deref(),
+            reduction.ensure_thread_timeline_loaded.as_deref(),
             Some("thread_active")
         );
         assert!(!reduction.request_thread_start_if_needed);

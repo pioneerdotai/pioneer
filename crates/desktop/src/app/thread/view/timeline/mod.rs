@@ -3,6 +3,8 @@ mod markdown;
 pub(crate) mod model;
 mod running_indicator;
 mod scroll;
+mod semantic_adapter;
+mod semantic_requests;
 mod view;
 
 use self::model::{TimelineRow, TimelineRowKind};
@@ -10,24 +12,24 @@ use crate::app::{
     conversation::{ConversationViewState, ItemView},
     root::{
         CLIRuntimePendingRequestEntry, CachedTimelineEntryLayout, PioneerDesktop,
-        ThreadTimelineViewState,
+        ThreadTimelineViewState, TimelineScrollAnchor,
     },
 };
 use gpui::{prelude::*, *};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     hash::{Hash, Hasher},
     rc::Rc,
 };
 
 #[derive(Clone)]
-pub(super) struct TimelinePendingRequestRow {
+pub(crate) struct TimelinePendingRequestRow {
     pub key: String,
     pub entry: CLIRuntimePendingRequestEntry,
 }
 
 #[derive(Clone)]
-pub(super) enum TimelineRenderRow {
+pub(crate) enum TimelineRenderRow {
     Timeline(TimelineRow),
     PendingRequest(TimelinePendingRequestRow),
 }
@@ -37,6 +39,28 @@ impl TimelineRenderRow {
         match self {
             TimelineRenderRow::Timeline(row) => row.key.as_str(),
             TimelineRenderRow::PendingRequest(row) => row.key.as_str(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct TimelineRenderModel {
+    pub projection: Rc<ConversationViewState>,
+    pub rows: Rc<Vec<TimelineRenderRow>>,
+    pub semantic_row_ids:
+        Rc<HashMap<String, pioneer_client::timeline::semantic::SemanticTimelineRowId>>,
+    pub semantic_rows: Rc<pioneer_client::timeline::semantic::SemanticTimelineRows>,
+}
+
+impl TimelineRenderModel {
+    pub(crate) fn empty() -> Self {
+        Self {
+            projection: Rc::new(ConversationViewState::default()),
+            rows: Rc::new(Vec::new()),
+            semantic_row_ids: Rc::new(HashMap::new()),
+            semantic_rows: Rc::new(
+                pioneer_client::timeline::semantic::SemanticTimelineRows::default(),
+            ),
         }
     }
 }

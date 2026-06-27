@@ -201,13 +201,6 @@ pub struct ThreadGetResponse {
     pub thread: Thread,
 }
 
-#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq, Default)]
-pub struct ThreadHistoryParams {
-    pub thread_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<u32>,
-}
-
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ThreadHistoryEventPayload {
@@ -435,14 +428,6 @@ pub struct ThreadHistoryEvent {
     pub sequence: i64,
     pub created_at: i64,
     pub payload: ThreadHistoryEventPayload,
-}
-
-#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
-pub struct ThreadHistoryResponse {
-    pub workspace_id: String,
-    pub thread_id: String,
-    #[serde(default)]
-    pub events: Vec<ThreadHistoryEvent>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]

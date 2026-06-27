@@ -232,6 +232,47 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             crate::threads::ClientThreadTreeSnapshot
         ),
         schema_doc!(
+            "thread_timeline_page_params.json",
+            pioneer_protocol::ThreadTimelinePageParams
+        ),
+        schema_doc!(
+            "thread_timeline_page_response.json",
+            pioneer_protocol::ThreadTimelinePageResponse
+        ),
+        schema_doc!("timeline_block.json", pioneer_protocol::TimelineBlock),
+        schema_doc!(
+            "timeline_block_kind.json",
+            pioneer_protocol::TimelineBlockKind
+        ),
+        schema_doc!("timeline_cursor.json", pioneer_protocol::TimelineCursor),
+        schema_doc!(
+            "timeline_page_anchor.json",
+            pioneer_protocol::TimelinePageAnchor
+        ),
+        schema_doc!(
+            "timeline_page_info.json",
+            pioneer_protocol::TimelinePageInfo
+        ),
+        schema_doc!("turn_work_block.json", pioneer_protocol::TurnWorkBlock),
+        schema_doc!("turn_work_item.json", pioneer_protocol::TurnWorkItem),
+        schema_doc!(
+            "turn_work_item_status.json",
+            pioneer_protocol::TurnWorkItemStatus
+        ),
+        schema_doc!(
+            "turn_work_page_params.json",
+            pioneer_protocol::TurnWorkPageParams
+        ),
+        schema_doc!(
+            "turn_work_page_response.json",
+            pioneer_protocol::TurnWorkPageResponse
+        ),
+        schema_doc!(
+            "turn_work_presentation.json",
+            pioneer_protocol::TurnWorkPresentation
+        ),
+        schema_doc!("turn_work_state.json", pioneer_protocol::TurnWorkState),
+        schema_doc!(
             "workspace_create_request.json",
             crate::workspaces::WorkspaceCreateRequest
         ),

@@ -15,23 +15,14 @@ use pioneer_client::{
     },
     conversation::ConversationViewState,
     notifications::effects::ClientEffect,
-    notifications::router::TurnTimelineRefreshReduction,
     providers::list::{
         cli_runtime_list_params, resolve_cli_runtime_execution_backend,
         runtime_id_from_cli_runtime_provider_key,
     },
     runtime::{ClientRuntime, ClientRuntimeNotification, ClientRuntimeNotificationContext},
     state::{reducers as client_state_reducers, selectors as client_selectors},
-    threads::{
-        coordinator::ThreadCoordinator,
-        history::{
-            composed_task_turn_timeline_param, composed_task_turn_timeline_params,
-            reduce_composed_turn_timeline_refresh_success, reduce_thread_history_load_success,
-            thread_history_params,
-        },
-        start as thread_start,
-    },
-    timeline::rows::{TimelineRow, build_timeline_rows},
+    threads::{coordinator::ThreadCoordinator, start as thread_start},
+    timeline::rows::TimelineRow,
     transport::ws::command_sender as ws_commands,
     turns::{
         cancel as turn_cancel,
@@ -42,16 +33,9 @@ use pioneer_client::{
         },
     },
 };
-use pioneer_protocol::{
-    AgentExecutionBackend, GatewayNotification, Thread, ThreadHistoryResponse, ThreadMode,
-    TurnTimelineResponse,
-};
+use pioneer_protocol::{AgentExecutionBackend, GatewayNotification, Thread, ThreadMode};
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::{HashMap, HashSet},
-    fs,
-    sync::Mutex,
-};
+use std::{collections::HashMap, fs, sync::Mutex};
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -192,23 +176,6 @@ impl ClientFfiActiveThreadState {
 
         self.ensure_thread_subscription(runtime, thread_id.as_str(), workspace_id.clone())?;
 
-        let should_load = {
-            let inner = self
-                .inner
-                .lock()
-                .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
-            inner
-                .coordinators
-                .get(thread_id.as_str())
-                .is_some_and(|coordinator| {
-                    !coordinator.history_loaded && !coordinator.history_loading
-                })
-        };
-
-        if should_load {
-            self.load_thread_history(runtime, thread_id.as_str())?;
-        }
-
         let mut inner = self
             .inner
             .lock()
@@ -217,25 +184,19 @@ impl ClientFfiActiveThreadState {
             coordinator.set_workspace_id(workspace_id.as_str());
         }
 
-        Ok(snapshot_from_inner(
-            &inner,
-            &expanded_key_set(&request.expanded_keys),
-        ))
+        Ok(snapshot_from_inner(&inner))
     }
 
     pub fn snapshot(
         &self,
-        request: ClientActiveThreadSnapshotRequest,
+        _request: ClientActiveThreadSnapshotRequest,
     ) -> anyhow::Result<ClientActiveThreadSnapshot> {
         let inner = self
             .inner
             .lock()
             .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
 
-        Ok(snapshot_from_inner(
-            &inner,
-            &expanded_key_set(&request.expanded_keys),
-        ))
+        Ok(snapshot_from_inner(&inner))
     }
 
     pub fn apply_event(
@@ -304,7 +265,7 @@ impl ClientFfiActiveThreadState {
             selected_mode,
             attachments,
             capabilities,
-            expanded_keys,
+            expanded_keys: _,
         } = request;
 
         let requested_thread_id = non_empty_string(thread_id);
@@ -455,7 +416,7 @@ impl ClientFfiActiveThreadState {
             thread_id,
             turn_id,
             pending_request_id,
-            snapshot: snapshot_from_inner(&inner, &expanded_key_set(&expanded_keys)),
+            snapshot: snapshot_from_inner(&inner),
         })
     }
 
@@ -464,7 +425,6 @@ impl ClientFfiActiveThreadState {
         runtime: &ClientRuntime,
         request: ClientActiveThreadCancelTurnRequest,
     ) -> anyhow::Result<ClientActiveThreadCancelTurnResult> {
-        let expanded_keys = expanded_key_set(&request.expanded_keys);
         let Some((thread_id, turn_id, params)) =
             self.apply_local_turn_cancel_request(request.reason)?
         else {
@@ -477,7 +437,7 @@ impl ClientFfiActiveThreadState {
                 cancelled: false,
                 thread_id: inner.active_thread_id.clone(),
                 turn_id: None,
-                snapshot: snapshot_from_inner(&inner, &expanded_keys),
+                snapshot: snapshot_from_inner(&inner),
             });
         };
 
@@ -500,7 +460,7 @@ impl ClientFfiActiveThreadState {
             cancelled: true,
             thread_id: Some(thread_id),
             turn_id: Some(turn_id),
-            snapshot: snapshot_from_inner(&inner, &expanded_keys),
+            snapshot: snapshot_from_inner(&inner),
         })
     }
 
@@ -646,59 +606,6 @@ impl ClientFfiActiveThreadState {
         Ok(thread_id)
     }
 
-    fn load_thread_history(&self, runtime: &ClientRuntime, thread_id: &str) -> anyhow::Result<()> {
-        {
-            let mut inner = self
-                .inner
-                .lock()
-                .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
-            if let Some(coordinator) = inner.coordinators.get_mut(thread_id) {
-                if coordinator.history_loaded || coordinator.history_loading {
-                    return Ok(());
-                }
-                coordinator.history_loading = true;
-            }
-        }
-
-        let load_result = (|| {
-            let response = ws_commands::thread_history(
-                &runtime.ws_command_sender(),
-                thread_history_params(thread_id.to_owned(), None),
-            )?;
-            let timelines = load_task_turn_timelines(runtime, &response);
-            Ok::<_, anyhow::Error>((response, timelines))
-        })();
-
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
-        if let Some(coordinator) = inner.coordinators.get_mut(thread_id) {
-            coordinator.history_loading = false;
-        }
-
-        let (response, timelines) = load_result?;
-        let reduction = reduce_thread_history_load_success(thread_id, response, timelines);
-        let pioneer_client::threads::history::ThreadHistoryLoadSuccessReduction::Apply(reduction) =
-            reduction
-        else {
-            return Ok(());
-        };
-
-        if let Some(coordinator) = inner.coordinators.get_mut(reduction.thread_id.as_str()) {
-            coordinator.workspace_id = reduction.workspace_id;
-            coordinator.conversation.hydrate_history(&reduction.events);
-            for timeline in &reduction.timelines {
-                coordinator
-                    .conversation
-                    .apply_composed_turn_timeline(timeline);
-            }
-            coordinator.history_loaded = reduction.mark_history_loaded;
-        }
-
-        Ok(())
-    }
-
     fn apply_gateway_notification(
         &self,
         runtime: &ClientRuntime,
@@ -825,9 +732,6 @@ impl ClientFfiActiveThreadState {
                     inner.coordinators.remove(reduction.thread_id.as_str());
                 }
             }
-            ClientRuntimeNotification::TurnTimelineRefresh(reduction) => {
-                self.refresh_turn_timeline(runtime, reduction)?;
-            }
             ClientRuntimeNotification::WorkspaceRefresh(_)
             | ClientRuntimeNotification::SkillsRefresh(_)
             | ClientRuntimeNotification::McpRefresh(_)
@@ -838,53 +742,9 @@ impl ClientFfiActiveThreadState {
             | ClientRuntimeNotification::ArtifactDeletedRefresh(_)
             | ClientRuntimeNotification::CLIRuntimeRefresh(_)
             | ClientRuntimeNotification::CLIRuntimePendingRequests { .. }
+            | ClientRuntimeNotification::SemanticTimeline(_)
             | ClientRuntimeNotification::GatewayRemoteAccessStatusChanged(_)
             | ClientRuntimeNotification::WorkspaceChanged { .. } => {}
-        }
-
-        Ok(())
-    }
-
-    fn refresh_turn_timeline(
-        &self,
-        runtime: &ClientRuntime,
-        reduction: TurnTimelineRefreshReduction,
-    ) -> anyhow::Result<()> {
-        if !reduction.queue_turn_timeline_refresh {
-            return Ok(());
-        }
-
-        {
-            let inner = self
-                .inner
-                .lock()
-                .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
-            if !inner
-                .coordinators
-                .get(reduction.thread_id.as_str())
-                .is_some_and(|coordinator| coordinator.history_loaded)
-            {
-                return Ok(());
-            }
-        }
-
-        let timeline = ws_commands::turn_timeline(
-            &runtime.ws_command_sender(),
-            composed_task_turn_timeline_param(reduction.thread_id.clone(), reduction.turn_id),
-        )?;
-        let timeline_reduction = reduce_composed_turn_timeline_refresh_success(timeline);
-
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
-        if let Some(coordinator) = inner
-            .coordinators
-            .get_mut(timeline_reduction.thread_id.as_str())
-        {
-            coordinator
-                .conversation
-                .apply_composed_turn_timeline(&timeline_reduction.timeline);
         }
 
         Ok(())
@@ -933,10 +793,7 @@ fn thread_ids_from_effects(effects: Vec<ClientEffect>) -> Vec<String> {
         .collect()
 }
 
-fn snapshot_from_inner(
-    inner: &ClientFfiActiveThreadInner,
-    expanded: &HashSet<String>,
-) -> ClientActiveThreadSnapshot {
+fn snapshot_from_inner(inner: &ClientFfiActiveThreadInner) -> ClientActiveThreadSnapshot {
     let Some(thread_id) = inner.active_thread_id.as_deref() else {
         return ClientActiveThreadSnapshot::default();
     };
@@ -946,8 +803,10 @@ fn snapshot_from_inner(
             ..Default::default()
         };
     };
-    let projection = coordinator.conversation.projection().clone();
-    let rows = build_timeline_rows(&projection, expanded);
+    let mut projection = coordinator.conversation.projection().clone();
+    projection.items.clear();
+    projection.timeline.clear();
+    let rows = Vec::new();
 
     ClientActiveThreadSnapshot {
         thread_id: Some(thread_id.to_owned()),
@@ -958,10 +817,6 @@ fn snapshot_from_inner(
         projection,
         rows,
     }
-}
-
-fn expanded_key_set(keys: &[String]) -> HashSet<String> {
-    keys.iter().cloned().collect()
 }
 
 fn non_empty_string(value: Option<String>) -> Option<String> {
@@ -1120,16 +975,6 @@ impl pioneer_client::platform::ClientFileSystem for ClientFfiFileSystem {
     }
 }
 
-fn load_task_turn_timelines(
-    runtime: &ClientRuntime,
-    response: &ThreadHistoryResponse,
-) -> Vec<TurnTimelineResponse> {
-    composed_task_turn_timeline_params(response)
-        .into_iter()
-        .filter_map(|params| ws_commands::turn_timeline(&runtime.ws_command_sender(), params).ok())
-        .collect()
-}
-
 fn notification_thread_id(notification: &GatewayNotification) -> Option<&str> {
     match notification {
         GatewayNotification::ThreadStarted(notification) => Some(notification.thread.id.as_str()),
@@ -1177,9 +1022,6 @@ fn notification_thread_id(notification: &GatewayNotification) -> Option<&str> {
             Some(notification.thread_id.as_str())
         }
         GatewayNotification::ThreadArtifactsChanged(notification) => {
-            Some(notification.thread_id.as_str())
-        }
-        GatewayNotification::TurnTimelineChanged(notification) => {
             Some(notification.thread_id.as_str())
         }
         GatewayNotification::Unknown(notification) => notification.thread_id.as_deref(),
@@ -1279,9 +1121,6 @@ fn notification_workspace_id(notification: &GatewayNotification) -> Option<&str>
             Some(notification.workspace_id.as_str())
         }
         GatewayNotification::McpServerCatalogChanged(notification) => {
-            Some(notification.workspace_id.as_str())
-        }
-        GatewayNotification::TurnTimelineChanged(notification) => {
             Some(notification.workspace_id.as_str())
         }
         GatewayNotification::Unknown(notification) => notification.workspace_id.as_deref(),

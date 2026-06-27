@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TimelineChangeReason",
+  "type": "string",
+  "enum": [
+    "backfill",
+    "live_event",
+    "state_changed",
+    "page_invalidated"
+  ]
+}

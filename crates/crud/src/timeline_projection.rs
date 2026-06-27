@@ -1,0 +1,655 @@
+use pioneer_entity::turn_item;
+use pioneer_protocol::{AgentMessagePhase, SystemEventLevel, ToolCallStatus, TurnItem};
+use serde_json::Value as JsonValue;
+
+use crate::repositories::thread_timeline_projection::{
+    WORK_VISIBILITY_HIDDEN, WORK_VISIBILITY_VISIBLE,
+};
+
+pub const WORK_ITEM_STATUS_RUNNING: &str = "running";
+pub const WORK_ITEM_STATUS_COMPLETED: &str = "completed";
+pub const WORK_ITEM_STATUS_FAILED: &str = "failed";
+pub const WORK_ITEM_STATUS_CANCELLED: &str = "cancelled";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectionVisibility {
+    Visible,
+    Hidden,
+}
+
+impl ProjectionVisibility {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Visible => WORK_VISIBILITY_VISIBLE,
+            Self::Hidden => WORK_VISIBILITY_HIDDEN,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectionPlacement {
+    TopLevelUserMessage,
+    TurnWork,
+    TopLevelAssistantMessage,
+    Hidden,
+}
+
+impl ProjectionPlacement {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TopLevelUserMessage => "top_level_user_message",
+            Self::TurnWork => "turn_work",
+            Self::TopLevelAssistantMessage => "top_level_assistant_message",
+            Self::Hidden => "hidden",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkItemClassification {
+    UserMessage,
+    FinalAssistantMessage,
+    AgentCommentary,
+    Reasoning,
+    Task,
+    CommandExecution,
+    FileChange,
+    WebSearch,
+    WebFetch,
+    Download,
+    DynamicToolCall,
+    SystemRecovery,
+    SystemExecutionWindow,
+    SystemError,
+    SystemWarning,
+    AgentContextCompaction,
+    AgentReview,
+    InternalTokenUsage,
+    InternalThreadStatus,
+    InternalDiffUpdate,
+    InternalPlanUpdate,
+    InternalRuntimeEvent,
+    InternalAgentRuntimeItem,
+    UnknownSystemEvent,
+    InvalidPayload,
+}
+
+impl WorkItemClassification {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UserMessage => "user_message",
+            Self::FinalAssistantMessage => "final_assistant_message",
+            Self::AgentCommentary => "agent_commentary",
+            Self::Reasoning => "reasoning",
+            Self::Task => "task",
+            Self::CommandExecution => "command_execution",
+            Self::FileChange => "file_change",
+            Self::WebSearch => "web_search",
+            Self::WebFetch => "web_fetch",
+            Self::Download => "download",
+            Self::DynamicToolCall => "dynamic_tool_call",
+            Self::SystemRecovery => "system_recovery",
+            Self::SystemExecutionWindow => "system_execution_window",
+            Self::SystemError => "system_error",
+            Self::SystemWarning => "system_warning",
+            Self::AgentContextCompaction => "agent_context_compaction",
+            Self::AgentReview => "agent_review",
+            Self::InternalTokenUsage => "internal_token_usage",
+            Self::InternalThreadStatus => "internal_thread_status",
+            Self::InternalDiffUpdate => "internal_diff_update",
+            Self::InternalPlanUpdate => "internal_plan_update",
+            Self::InternalRuntimeEvent => "internal_runtime_event",
+            Self::InternalAgentRuntimeItem => "internal_agent_runtime_item",
+            Self::UnknownSystemEvent => "unknown_system_event",
+            Self::InvalidPayload => "invalid_payload",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnItemProjectionClassification {
+    pub item_id: String,
+    pub item_type: String,
+    pub visibility: ProjectionVisibility,
+    pub placement: ProjectionPlacement,
+    pub classification: WorkItemClassification,
+    pub status: &'static str,
+    pub audit: bool,
+    pub audit_reason: Option<String>,
+}
+
+impl TurnItemProjectionClassification {
+    pub fn visibility_str(&self) -> &'static str {
+        self.visibility.as_str()
+    }
+
+    pub fn placement_str(&self) -> &'static str {
+        self.placement.as_str()
+    }
+
+    pub fn classification_str(&self) -> &'static str {
+        self.classification.as_str()
+    }
+}
+
+pub fn classify_turn_item_row(row: &turn_item::Model) -> TurnItemProjectionClassification {
+    match serde_json::from_str::<TurnItem>(row.payload.as_str()) {
+        Ok(item) => classify_turn_item_with_db_status(&item, row.status.as_deref()),
+        Err(error) => TurnItemProjectionClassification {
+            item_id: row.item_id.clone(),
+            item_type: row.item_type.clone(),
+            visibility: ProjectionVisibility::Hidden,
+            placement: ProjectionPlacement::Hidden,
+            classification: WorkItemClassification::InvalidPayload,
+            status: db_status_to_work_status(row.status.as_deref()),
+            audit: true,
+            audit_reason: Some(format!("failed to decode turn item payload: {error}")),
+        },
+    }
+}
+
+pub fn classify_turn_item_with_db_status(
+    item: &TurnItem,
+    db_status: Option<&str>,
+) -> TurnItemProjectionClassification {
+    let item_id = item.item_id().to_owned();
+    let item_type = turn_item_type_label(item).to_owned();
+    let status = turn_item_work_status(item).unwrap_or_else(|| db_status_to_work_status(db_status));
+
+    match item {
+        TurnItem::UserMessage { .. } => TurnItemProjectionClassification {
+            item_id,
+            item_type,
+            visibility: ProjectionVisibility::Visible,
+            placement: ProjectionPlacement::TopLevelUserMessage,
+            classification: WorkItemClassification::UserMessage,
+            status,
+            audit: false,
+            audit_reason: None,
+        },
+        TurnItem::AgentMessage { phase, .. } => {
+            if matches!(phase, AgentMessagePhase::FinalAnswer) {
+                TurnItemProjectionClassification {
+                    item_id,
+                    item_type,
+                    visibility: ProjectionVisibility::Visible,
+                    placement: ProjectionPlacement::TopLevelAssistantMessage,
+                    classification: WorkItemClassification::FinalAssistantMessage,
+                    status,
+                    audit: false,
+                    audit_reason: None,
+                }
+            } else {
+                TurnItemProjectionClassification {
+                    item_id,
+                    item_type,
+                    visibility: ProjectionVisibility::Visible,
+                    placement: ProjectionPlacement::TurnWork,
+                    classification: WorkItemClassification::AgentCommentary,
+                    status,
+                    audit: false,
+                    audit_reason: None,
+                }
+            }
+        }
+        TurnItem::Reasoning { .. } => visible_work(
+            item_id,
+            item_type,
+            WorkItemClassification::Reasoning,
+            status,
+        ),
+        TurnItem::Task { .. } => {
+            visible_work(item_id, item_type, WorkItemClassification::Task, status)
+        }
+        TurnItem::CommandExecution { .. } => visible_work(
+            item_id,
+            item_type,
+            WorkItemClassification::CommandExecution,
+            status,
+        ),
+        TurnItem::FileChange { .. } => visible_work(
+            item_id,
+            item_type,
+            WorkItemClassification::FileChange,
+            status,
+        ),
+        TurnItem::WebSearch { .. } => visible_work(
+            item_id,
+            item_type,
+            WorkItemClassification::WebSearch,
+            status,
+        ),
+        TurnItem::WebFetch { .. } => {
+            visible_work(item_id, item_type, WorkItemClassification::WebFetch, status)
+        }
+        TurnItem::Download { .. } => {
+            visible_work(item_id, item_type, WorkItemClassification::Download, status)
+        }
+        TurnItem::DynamicToolCall { .. } => visible_work(
+            item_id,
+            item_type,
+            WorkItemClassification::DynamicToolCall,
+            status,
+        ),
+        TurnItem::SystemEvent {
+            level,
+            message,
+            code,
+            details,
+            ..
+        } => classify_system_event(
+            item_id,
+            item_type,
+            *level,
+            message,
+            code.as_deref(),
+            details.as_ref(),
+            status,
+        ),
+    }
+}
+
+fn visible_work(
+    item_id: String,
+    item_type: String,
+    classification: WorkItemClassification,
+    status: &'static str,
+) -> TurnItemProjectionClassification {
+    TurnItemProjectionClassification {
+        item_id,
+        item_type,
+        visibility: ProjectionVisibility::Visible,
+        placement: ProjectionPlacement::TurnWork,
+        classification,
+        status,
+        audit: false,
+        audit_reason: None,
+    }
+}
+
+fn hidden_work(
+    item_id: String,
+    item_type: String,
+    classification: WorkItemClassification,
+    status: &'static str,
+    audit_reason: impl Into<String>,
+) -> TurnItemProjectionClassification {
+    TurnItemProjectionClassification {
+        item_id,
+        item_type,
+        visibility: ProjectionVisibility::Hidden,
+        placement: ProjectionPlacement::Hidden,
+        classification,
+        status,
+        audit: true,
+        audit_reason: Some(audit_reason.into()),
+    }
+}
+
+fn classify_system_event(
+    item_id: String,
+    item_type: String,
+    level: SystemEventLevel,
+    message: &str,
+    code: Option<&str>,
+    details: Option<&JsonValue>,
+    status: &'static str,
+) -> TurnItemProjectionClassification {
+    if matches!(level, SystemEventLevel::Error) {
+        return visible_work(
+            item_id,
+            item_type,
+            WorkItemClassification::SystemError,
+            status,
+        );
+    }
+
+    if matches!(level, SystemEventLevel::Warning) {
+        return visible_work(
+            item_id,
+            item_type,
+            WorkItemClassification::SystemWarning,
+            status,
+        );
+    }
+
+    match code {
+        Some("agent_thread_status_changed") => hidden_work(
+            item_id,
+            item_type,
+            WorkItemClassification::InternalThreadStatus,
+            status,
+            "internal thread status update",
+        ),
+        Some("agent_diff_updated") => hidden_work(
+            item_id,
+            item_type,
+            WorkItemClassification::InternalDiffUpdate,
+            status,
+            "internal turn diff update",
+        ),
+        Some("agent_plan_updated") => hidden_work(
+            item_id,
+            item_type,
+            WorkItemClassification::InternalPlanUpdate,
+            status,
+            "internal plan update",
+        ),
+        Some("agent_runtime_event") => {
+            classify_runtime_event(item_id, item_type, message, details, status)
+        }
+        Some("agent_runtime_item") => hidden_work(
+            item_id,
+            item_type,
+            WorkItemClassification::InternalAgentRuntimeItem,
+            status,
+            "unmapped info-level runtime item",
+        ),
+        Some("agent_context_compaction") => visible_work(
+            item_id,
+            item_type,
+            WorkItemClassification::AgentContextCompaction,
+            status,
+        ),
+        Some("agent_review") => visible_work(
+            item_id,
+            item_type,
+            WorkItemClassification::AgentReview,
+            status,
+        ),
+        Some(code) if is_recovery_system_code(code) => visible_work(
+            item_id,
+            item_type,
+            WorkItemClassification::SystemRecovery,
+            status,
+        ),
+        Some(code) if is_execution_window_system_code(code) => visible_work(
+            item_id,
+            item_type,
+            WorkItemClassification::SystemExecutionWindow,
+            status,
+        ),
+        _ if message.starts_with("Thread status changed:") => hidden_work(
+            item_id,
+            item_type,
+            WorkItemClassification::InternalThreadStatus,
+            status,
+            "internal thread status update",
+        ),
+        _ if message == "Diff updated" => hidden_work(
+            item_id,
+            item_type,
+            WorkItemClassification::InternalDiffUpdate,
+            status,
+            "internal turn diff update",
+        ),
+        _ if message == "Plan updated" => hidden_work(
+            item_id,
+            item_type,
+            WorkItemClassification::InternalPlanUpdate,
+            status,
+            "internal plan update",
+        ),
+        _ if message.starts_with("Runtime event: ") => hidden_work(
+            item_id,
+            item_type,
+            WorkItemClassification::InternalRuntimeEvent,
+            status,
+            "unmapped info-level runtime event",
+        ),
+        _ => hidden_work(
+            item_id,
+            item_type,
+            WorkItemClassification::UnknownSystemEvent,
+            status,
+            "unknown info-level system event",
+        ),
+    }
+}
+
+fn classify_runtime_event(
+    item_id: String,
+    item_type: String,
+    message: &str,
+    details: Option<&JsonValue>,
+    status: &'static str,
+) -> TurnItemProjectionClassification {
+    let native_method = details
+        .and_then(|details| details.get("nativeMethod"))
+        .and_then(JsonValue::as_str)
+        .or_else(|| message.strip_prefix("Runtime event: "));
+
+    match native_method {
+        Some("thread/tokenUsage/updated") => hidden_work(
+            item_id,
+            item_type,
+            WorkItemClassification::InternalTokenUsage,
+            status,
+            "internal token usage update",
+        ),
+        Some(
+            "fuzzyFileSearch/sessionUpdated"
+            | "fuzzyFileSearch/sessionCompleted"
+            | "windowsSandbox/setupCompleted",
+        ) => hidden_work(
+            item_id,
+            item_type,
+            WorkItemClassification::InternalRuntimeEvent,
+            status,
+            "internal runtime lifecycle event",
+        ),
+        Some(other) => hidden_work(
+            item_id,
+            item_type,
+            WorkItemClassification::InternalRuntimeEvent,
+            status,
+            format!("unmapped info-level runtime event `{other}`"),
+        ),
+        None => hidden_work(
+            item_id,
+            item_type,
+            WorkItemClassification::InternalRuntimeEvent,
+            status,
+            "runtime event without native method",
+        ),
+    }
+}
+
+fn is_recovery_system_code(code: &str) -> bool {
+    matches!(
+        code,
+        "turn_start_rejected"
+            | "turn_blocked_resumable"
+            | "item_timeout_detected"
+            | "item_recovery_opened"
+            | "item_recovery_attached"
+            | "item_retry_scheduled"
+            | "item_retry_attempt_started"
+            | "item_recovery_succeeded"
+            | "item_recovery_exhausted"
+            | "item_tool_retry_scheduled"
+            | "item_tool_retry_resolved"
+            | "item_tool_retry_exhausted"
+            | "turn_tool_loop_budget_exceeded"
+    )
+}
+
+fn is_execution_window_system_code(code: &str) -> bool {
+    matches!(
+        code,
+        "turn_execution_window_exhausted"
+            | "turn_execution_window_continued"
+            | "turn_execution_window_blocked"
+    )
+}
+
+fn turn_item_work_status(item: &TurnItem) -> Option<&'static str> {
+    let status = match item {
+        TurnItem::CommandExecution { status, .. }
+        | TurnItem::FileChange { status, .. }
+        | TurnItem::WebSearch { status, .. }
+        | TurnItem::WebFetch { status, .. }
+        | TurnItem::Download { status, .. }
+        | TurnItem::DynamicToolCall { status, .. } => match status {
+            ToolCallStatus::InProgress => WORK_ITEM_STATUS_RUNNING,
+            ToolCallStatus::Completed => WORK_ITEM_STATUS_COMPLETED,
+            ToolCallStatus::Failed => WORK_ITEM_STATUS_FAILED,
+        },
+        TurnItem::SystemEvent { level, .. } => match level {
+            SystemEventLevel::Info | SystemEventLevel::Warning => WORK_ITEM_STATUS_COMPLETED,
+            SystemEventLevel::Error => WORK_ITEM_STATUS_FAILED,
+        },
+        _ => return None,
+    };
+    Some(status)
+}
+
+fn db_status_to_work_status(db_status: Option<&str>) -> &'static str {
+    match db_status {
+        Some("in_progress") | Some("running") => WORK_ITEM_STATUS_RUNNING,
+        Some("failed") | Some("timed_out") => WORK_ITEM_STATUS_FAILED,
+        Some("cancelled") | Some("canceled") => WORK_ITEM_STATUS_CANCELLED,
+        Some("completed") | None => WORK_ITEM_STATUS_COMPLETED,
+        Some(_) => WORK_ITEM_STATUS_COMPLETED,
+    }
+}
+
+fn turn_item_type_label(item: &TurnItem) -> &'static str {
+    match item {
+        TurnItem::UserMessage { .. } => "user_message",
+        TurnItem::AgentMessage { .. } => "agent_message",
+        TurnItem::Reasoning { .. } => "reasoning",
+        TurnItem::SystemEvent { .. } => "system_event",
+        TurnItem::Task { .. } => "task",
+        TurnItem::CommandExecution { .. } => "command_execution",
+        TurnItem::FileChange { .. } => "file_change",
+        TurnItem::WebSearch { .. } => "web_search",
+        TurnItem::WebFetch { .. } => "web_fetch",
+        TurnItem::Download { .. } => "download",
+        TurnItem::DynamicToolCall { .. } => "dynamic_tool_call",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pioneer_protocol::{AgentMessagePhase, SystemEventLevel, TurnItem};
+    use serde_json::json;
+
+    use super::*;
+
+    fn info_system(code: Option<&str>, message: &str, details: Option<JsonValue>) -> TurnItem {
+        TurnItem::SystemEvent {
+            id: "item_system".to_owned(),
+            level: SystemEventLevel::Info,
+            message: message.to_owned(),
+            code: code.map(str::to_owned),
+            details,
+        }
+    }
+
+    #[test]
+    fn hides_known_internal_runtime_events() {
+        let item = info_system(
+            Some("agent_runtime_event"),
+            "Runtime event: thread/tokenUsage/updated",
+            Some(json!({ "nativeMethod": "thread/tokenUsage/updated" })),
+        );
+        let classified = classify_turn_item_with_db_status(&item, Some("completed"));
+        assert_eq!(classified.visibility, ProjectionVisibility::Hidden);
+        assert_eq!(
+            classified.classification,
+            WorkItemClassification::InternalTokenUsage
+        );
+
+        let item = info_system(
+            Some("agent_thread_status_changed"),
+            "Thread status changed: changed",
+            Some(json!({ "status": "changed" })),
+        );
+        let classified = classify_turn_item_with_db_status(&item, Some("completed"));
+        assert_eq!(classified.visibility, ProjectionVisibility::Hidden);
+        assert_eq!(
+            classified.classification,
+            WorkItemClassification::InternalThreadStatus
+        );
+
+        let item = info_system(Some("agent_diff_updated"), "Diff updated", None);
+        let classified = classify_turn_item_with_db_status(&item, Some("completed"));
+        assert_eq!(classified.visibility, ProjectionVisibility::Hidden);
+        assert_eq!(
+            classified.classification,
+            WorkItemClassification::InternalDiffUpdate
+        );
+    }
+
+    #[test]
+    fn keeps_errors_and_recovery_system_events_visible() {
+        let item = TurnItem::SystemEvent {
+            id: "item_error".to_owned(),
+            level: SystemEventLevel::Error,
+            message: "tool failed".to_owned(),
+            code: Some("agent_runtime_item".to_owned()),
+            details: None,
+        };
+        let classified = classify_turn_item_with_db_status(&item, Some("completed"));
+        assert_eq!(classified.visibility, ProjectionVisibility::Visible);
+        assert_eq!(
+            classified.classification,
+            WorkItemClassification::SystemError
+        );
+
+        let item = info_system(
+            Some("item_recovery_exhausted"),
+            "Recovery failed",
+            Some(json!({ "item_type": "web_fetch" })),
+        );
+        let classified = classify_turn_item_with_db_status(&item, Some("completed"));
+        assert_eq!(classified.visibility, ProjectionVisibility::Visible);
+        assert_eq!(
+            classified.classification,
+            WorkItemClassification::SystemRecovery
+        );
+    }
+
+    #[test]
+    fn splits_final_answer_from_commentary() {
+        let final_item = TurnItem::AgentMessage {
+            id: "final".to_owned(),
+            text: "done".to_owned(),
+            phase: AgentMessagePhase::FinalAnswer,
+            markdown: None,
+            markdown_version: None,
+        };
+        let classified = classify_turn_item_with_db_status(&final_item, Some("completed"));
+        assert_eq!(
+            classified.placement,
+            ProjectionPlacement::TopLevelAssistantMessage
+        );
+
+        let commentary_item = TurnItem::AgentMessage {
+            id: "commentary".to_owned(),
+            text: "checking".to_owned(),
+            phase: AgentMessagePhase::Commentary,
+            markdown: None,
+            markdown_version: None,
+        };
+        let classified = classify_turn_item_with_db_status(&commentary_item, Some("completed"));
+        assert_eq!(classified.placement, ProjectionPlacement::TurnWork);
+        assert_eq!(
+            classified.classification,
+            WorkItemClassification::AgentCommentary
+        );
+    }
+
+    #[test]
+    fn unknown_info_system_event_is_hidden_and_audited() {
+        let item = info_system(Some("future_event"), "Future event", None);
+        let classified = classify_turn_item_with_db_status(&item, Some("completed"));
+        assert_eq!(classified.visibility, ProjectionVisibility::Hidden);
+        assert_eq!(
+            classified.classification,
+            WorkItemClassification::UnknownSystemEvent
+        );
+        assert!(classified.audit);
+    }
+}

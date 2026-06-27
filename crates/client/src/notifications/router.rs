@@ -23,8 +23,7 @@ use pioneer_protocol::{
     TurnCompletedNotification, TurnExecutionWindowBlockedNotification,
     TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
     TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification,
-    TurnFailedNotification, TurnStartedNotification, TurnTimelineChangedNotification,
-    TurnToolLoopBudgetExceededNotification,
+    TurnFailedNotification, TurnStartedNotification, TurnToolLoopBudgetExceededNotification,
 };
 
 pub use crate::mcp::notifications::{
@@ -146,14 +145,6 @@ pub struct ArtifactDeletedRefreshReduction {
     pub active_thread_id: Option<String>,
     pub refresh_thread_artifacts: bool,
     pub force_refresh: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TurnTimelineRefreshReduction {
-    pub workspace_id: String,
-    pub thread_id: String,
-    pub turn_id: String,
-    pub queue_turn_timeline_refresh: bool,
 }
 
 pub fn reduce_thread_started_notification(
@@ -880,17 +871,6 @@ pub fn reduce_artifact_deleted_notification(
     }
 }
 
-pub fn reduce_turn_timeline_changed_notification(
-    notification: TurnTimelineChangedNotification,
-) -> TurnTimelineRefreshReduction {
-    TurnTimelineRefreshReduction {
-        workspace_id: notification.workspace_id,
-        thread_id: notification.thread_id,
-        turn_id: notification.turn_id,
-        queue_turn_timeline_refresh: true,
-    }
-}
-
 pub fn should_refresh_workspace_bound_data(
     active_workspace: Option<&str>,
     notification_workspace: &str,
@@ -924,8 +904,7 @@ mod tests {
         SkillsChangedNotification, ThreadArtifactsChangedNotification, ThreadMode,
         ThreadOriginKind, ThreadSidebarVisibility, ToolLoopBudgetAction, ToolLoopBudgetLimitKind,
         ToolRetryErrorClass, ToolRetryResolution, TurnItem, TurnItemTimeoutReason, TurnItemType,
-        TurnStatus, TurnTimelineChangedNotification, TurnTimelineChangedReason, Workspace,
-        WorkspaceChangeKind, WorkspaceChangedNotification,
+        TurnStatus, Workspace, WorkspaceChangeKind, WorkspaceChangedNotification,
     };
     use std::collections::BTreeMap;
 
@@ -1746,25 +1725,5 @@ mod tests {
             active_artifacts.as_slice(),
         );
         assert!(!deleted_missing.refresh_thread_artifacts);
-    }
-
-    #[test]
-    fn turn_timeline_changed_reduction_queues_target_turn_refresh() {
-        let reduction =
-            reduce_turn_timeline_changed_notification(TurnTimelineChangedNotification {
-                workspace_id: "ws_a".to_owned(),
-                thread_id: "thr_a".to_owned(),
-                turn_id: "turn_a".to_owned(),
-                task_id: Some("task_a".to_owned()),
-                run_id: None,
-                child_thread_id: None,
-                child_turn_id: None,
-                reason: TurnTimelineChangedReason::TaskEventChanged,
-            });
-
-        assert!(reduction.queue_turn_timeline_refresh);
-        assert_eq!(reduction.workspace_id, "ws_a");
-        assert_eq!(reduction.thread_id, "thr_a");
-        assert_eq!(reduction.turn_id, "turn_a");
     }
 }

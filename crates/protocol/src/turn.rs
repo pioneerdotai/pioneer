@@ -1,6 +1,4 @@
-use crate::{
-    ArtifactRef, MarkdownDocument, McpScopeKind, SandboxPolicy, TaskEvent, TaskTurnItem, ThreadMode,
-};
+use crate::{ArtifactRef, MarkdownDocument, McpScopeKind, SandboxPolicy, TaskTurnItem, ThreadMode};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -536,35 +534,6 @@ pub struct TurnItemsResponse {
     pub last_sequence: i64,
 }
 
-#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct TurnTimelineParams {
-    pub thread_id: String,
-    pub turn_id: String,
-    #[serde(default = "default_compose_tasks")]
-    pub compose_tasks: bool,
-    #[serde(default)]
-    pub include_collapsed_task_events: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_child_items_per_task: Option<u32>,
-}
-
-impl Default for TurnTimelineParams {
-    fn default() -> Self {
-        Self {
-            thread_id: String::new(),
-            turn_id: String::new(),
-            compose_tasks: true,
-            include_collapsed_task_events: false,
-            max_child_items_per_task: Some(100),
-        }
-    }
-}
-
-fn default_compose_tasks() -> bool {
-    true
-}
-
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TimelineOriginKind {
@@ -603,58 +572,6 @@ pub struct TimelineOrigin {
     pub origin_sequence: i64,
     pub occurred_at: i64,
     pub lane: TimelineLane,
-}
-
-#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum TimelinePayload {
-    TurnItemEvent { event: TurnItemEvent },
-    TaskEvent { event: TaskEvent },
-}
-
-#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct TimelineItem {
-    pub id: String,
-    pub origin: TimelineOrigin,
-    pub payload: TimelinePayload,
-}
-
-#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct TurnTimelineResponse {
-    pub thread_id: String,
-    pub workspace_id: String,
-    pub turn_id: String,
-    #[serde(default)]
-    pub items: Vec<TimelineItem>,
-    pub last_sequence: i64,
-}
-
-#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TurnTimelineChangedReason {
-    ParentTurnChanged,
-    TaskEventChanged,
-    ChildTurnChanged,
-    CollapseStateHintChanged,
-}
-
-#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct TurnTimelineChangedNotification {
-    pub workspace_id: String,
-    pub thread_id: String,
-    pub turn_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub child_thread_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub child_turn_id: Option<String>,
-    pub reason: TurnTimelineChangedReason,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
