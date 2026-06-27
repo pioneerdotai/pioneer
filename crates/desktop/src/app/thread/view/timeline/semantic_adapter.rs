@@ -181,6 +181,7 @@ fn push_assistant_block(
     let TimelineBlockKind::AssistantMessage {
         item_id,
         text,
+        status,
         markdown,
     } = &block.kind
     else {
@@ -202,14 +203,20 @@ fn push_assistant_block(
             item_id: item_id.clone(),
             turn_id: turn_id.to_owned(),
             item_type: "agent_message".to_owned(),
-            status: TimelineEntryStatus::Completed,
+            status: work_item_status(*status),
             started_at_unix_ms: block.started_at_unix_ms.or(block.updated_at_unix_ms),
             updated_at_unix_ms: block.updated_at_unix_ms.or(block.started_at_unix_ms),
-            completed_at_unix_ms: block.updated_at_unix_ms.or(block.started_at_unix_ms),
+            completed_at_unix_ms: if is_terminal_work_status(*status) {
+                block.updated_at_unix_ms.or(block.started_at_unix_ms)
+            } else {
+                None
+            },
             partial_text: text.clone(),
-            final_text: Some(text.clone()),
+            final_text: is_terminal_work_status(*status).then(|| text.clone()),
             partial_markdown: markdown.clone(),
-            final_markdown: markdown.clone(),
+            final_markdown: is_terminal_work_status(*status)
+                .then(|| markdown.clone())
+                .flatten(),
             item,
             opaque_meta: None,
         },
@@ -558,6 +565,7 @@ mod tests {
             kind: TimelineBlockKind::AssistantMessage {
                 item_id: "assistant_final".to_owned(),
                 text: "final **markdown**".to_owned(),
+                status: TurnWorkItemStatus::Completed,
                 markdown,
             },
         }

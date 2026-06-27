@@ -22,7 +22,15 @@ use pioneer_client::{
     runtime::{ClientRuntime, ClientRuntimeNotification, ClientRuntimeNotificationContext},
     state::{reducers as client_state_reducers, selectors as client_selectors},
     threads::{coordinator::ThreadCoordinator, start as thread_start},
-    timeline::rows::TimelineRow,
+    timeline::{
+        labels::now_unix_ms,
+        rows::TimelineRow,
+        semantic::{
+            SemanticTimelineCachePatch, SemanticTimelineState,
+            apply_conversation_event_to_semantic_timeline,
+            apply_conversation_event_to_semantic_timeline_with_patch,
+        },
+    },
     transport::ws::command_sender as ws_commands,
     turns::{
         cancel as turn_cancel,
@@ -35,7 +43,11 @@ use pioneer_client::{
 };
 use pioneer_protocol::{AgentExecutionBackend, GatewayNotification, Thread, ThreadMode};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fs, sync::Mutex};
+use std::{
+    collections::HashMap,
+    fs,
+    sync::{Arc, Mutex},
+};
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -95,6 +107,7 @@ pub struct ClientActiveThreadSendTextResult {
     pub turn_id: String,
     pub pending_request_id: String,
     pub snapshot: ClientActiveThreadSnapshot,
+    pub semantic_timeline_patch: SemanticTimelineCachePatch,
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -141,15 +154,16 @@ pub struct ClientActiveThreadSnapshot {
     pub rows: Vec<TimelineRow>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ClientFfiActiveThreadState {
-    inner: Mutex<ClientFfiActiveThreadInner>,
+    inner: Arc<Mutex<ClientFfiActiveThreadInner>>,
 }
 
 #[derive(Default)]
 struct ClientFfiActiveThreadInner {
     active_thread_id: Option<String>,
     coordinators: HashMap<String, ThreadCoordinator>,
+    semantic_timelines: SemanticTimelineState,
 }
 
 impl ClientFfiActiveThreadState {
@@ -326,7 +340,7 @@ impl ClientFfiActiveThreadState {
             &runtime.ws_command_sender(),
             &ClientFfiFileSystem,
             PrepareComposerTurnRequest {
-                workspace_id,
+                workspace_id: workspace_id.clone(),
                 thread_id: thread_id.clone(),
                 turn_id: turn_id.clone(),
                 endpoint_kind,
@@ -361,9 +375,8 @@ impl ClientFfiActiveThreadState {
             submit_reduction.local_turn_start_requested_event.clone();
         let turn_start_params =
             turn_start_params_from_plan(submit_reduction.turn_start_params_plan);
-        let send_context = submit_reduction.send_context;
 
-        {
+        let semantic_timeline_patch = {
             let mut inner = self
                 .inner
                 .lock()
@@ -377,7 +390,7 @@ impl ClientFfiActiveThreadState {
                 })?;
             coordinator
                 .conversation
-                .apply(local_turn_start_requested_event);
+                .apply(local_turn_start_requested_event.clone());
             if let Some(thread) = coordinator.thread_mut() {
                 apply_prepared_turn_to_thread_snapshot(
                     thread,
@@ -388,24 +401,25 @@ impl ClientFfiActiveThreadState {
                     thread_snapshot_update.updated_at_unix,
                 );
             }
-        }
+            apply_conversation_event_to_semantic_timeline_with_patch(
+                &mut inner.semantic_timelines,
+                workspace_id.as_str(),
+                &local_turn_start_requested_event,
+                now_unix_ms(),
+            )
+        };
 
-        match ws_commands::turn_start(&runtime.ws_command_sender(), turn_start_params) {
-            Ok(response) => {
-                self.apply_turn_start_send_reduction(
-                    reduce_turn_start_send_success(send_context, response),
-                    thread_id.as_str(),
-                )?;
-            }
-            Err(error) => {
-                let message = format!("{error:#}");
-                self.apply_turn_start_send_reduction(
-                    reduce_turn_start_send_failure(send_context, message.clone()),
-                    thread_id.as_str(),
-                )?;
-                return Err(anyhow::anyhow!(message));
-            }
-        }
+        let send_context = submit_reduction.send_context;
+        let ws_sender = runtime.ws_command_sender();
+        let state = self.clone();
+        let thread_id_for_send = thread_id.clone();
+        std::thread::spawn(move || {
+            let reduction = match ws_commands::turn_start(&ws_sender, turn_start_params) {
+                Ok(response) => reduce_turn_start_send_success(send_context, response),
+                Err(error) => reduce_turn_start_send_failure(send_context, format!("{error:#}")),
+            };
+            let _ = state.apply_turn_start_send_reduction(reduction, thread_id_for_send.as_str());
+        });
 
         let inner = self
             .inner
@@ -417,6 +431,7 @@ impl ClientFfiActiveThreadState {
             turn_id,
             pending_request_id,
             snapshot: snapshot_from_inner(&inner),
+            semantic_timeline_patch,
         })
     }
 
@@ -672,40 +687,60 @@ impl ClientFfiActiveThreadState {
                     .inner
                     .lock()
                     .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
-                let coordinator = inner
-                    .coordinators
-                    .entry(reduction.thread_id.clone())
-                    .or_insert_with(|| {
-                        ThreadCoordinator::pending(
-                            reduction.thread_id.as_str(),
-                            reduction.workspace_id.as_str(),
-                        )
-                    });
-                coordinator.conversation.apply(reduction.conversation_event);
-                if reduction.tick_conversation {
-                    let _ = coordinator.conversation.tick();
-                }
-                if let Some(status) = reduction.thread_status
-                    && let Some(thread) = coordinator.thread_mut()
                 {
-                    thread.status = status;
+                    let coordinator = inner
+                        .coordinators
+                        .entry(reduction.thread_id.clone())
+                        .or_insert_with(|| {
+                            ThreadCoordinator::pending(
+                                reduction.thread_id.as_str(),
+                                reduction.workspace_id.as_str(),
+                            )
+                        });
+                    coordinator
+                        .conversation
+                        .apply(reduction.conversation_event.clone());
+                    if reduction.tick_conversation {
+                        let _ = coordinator.conversation.tick();
+                    }
+                    if let Some(status) = reduction.thread_status
+                        && let Some(thread) = coordinator.thread_mut()
+                    {
+                        thread.status = status;
+                    }
                 }
+                apply_conversation_event_to_semantic_timeline(
+                    &mut inner.semantic_timelines,
+                    reduction.workspace_id.as_str(),
+                    &reduction.conversation_event,
+                    now_unix_ms(),
+                );
             }
             ClientRuntimeNotification::ConversationEvent(reduction) => {
                 let mut inner = self
                     .inner
                     .lock()
                     .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
-                let coordinator = inner
-                    .coordinators
-                    .entry(reduction.thread_id.clone())
-                    .or_insert_with(|| {
-                        ThreadCoordinator::pending(
-                            reduction.thread_id.as_str(),
-                            reduction.workspace_id.as_str(),
-                        )
-                    });
-                coordinator.conversation.apply(reduction.conversation_event);
+                {
+                    let coordinator = inner
+                        .coordinators
+                        .entry(reduction.thread_id.clone())
+                        .or_insert_with(|| {
+                            ThreadCoordinator::pending(
+                                reduction.thread_id.as_str(),
+                                reduction.workspace_id.as_str(),
+                            )
+                        });
+                    coordinator
+                        .conversation
+                        .apply(reduction.conversation_event.clone());
+                }
+                apply_conversation_event_to_semantic_timeline(
+                    &mut inner.semantic_timelines,
+                    reduction.workspace_id.as_str(),
+                    &reduction.conversation_event,
+                    now_unix_ms(),
+                );
             }
             ClientRuntimeNotification::ThreadUpdated(reduction) => {
                 let mut inner = self
@@ -759,20 +794,33 @@ impl ClientFfiActiveThreadState {
             .inner
             .lock()
             .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
-        let coordinator = inner
+        let workspace_id = inner
             .coordinators
-            .get_mut(thread_id)
-            .ok_or_else(|| anyhow::anyhow!("active thread must be opened before starting turn"))?;
+            .get(thread_id)
+            .ok_or_else(|| anyhow::anyhow!("active thread must be opened before starting turn"))?
+            .workspace_id
+            .clone();
 
-        match reduction {
-            TurnStartSendReduction::Accepted { events } => {
-                for event in events {
-                    coordinator.conversation.apply(event);
-                }
-            }
+        let events = match reduction {
+            TurnStartSendReduction::Accepted { events } => events,
             TurnStartSendReduction::Rejected { event } => {
-                coordinator.conversation.apply(event);
+                vec![event]
             }
+        };
+
+        for event in events {
+            {
+                let coordinator = inner.coordinators.get_mut(thread_id).ok_or_else(|| {
+                    anyhow::anyhow!("active thread must be opened before starting turn")
+                })?;
+                coordinator.conversation.apply(event.clone());
+            }
+            apply_conversation_event_to_semantic_timeline(
+                &mut inner.semantic_timelines,
+                workspace_id.as_str(),
+                &event,
+                now_unix_ms(),
+            );
         }
 
         Ok(())

@@ -925,6 +925,7 @@ impl MessageProcessor {
         Ok(TimelineBlockKind::AssistantMessage {
             item_id: id,
             text,
+            status: TurnWorkItemStatus::Completed,
             markdown,
         })
     }

@@ -187,7 +187,18 @@ impl PioneerDesktop {
             thread.status = status;
         }
         self.upsert_thread_conversation_mut(thread_id.as_str(), reduction.workspace_id.as_str())
-            .apply(reduction.conversation_event);
+            .apply(reduction.conversation_event.clone());
+        if pioneer_client::timeline::semantic::apply_conversation_event_to_semantic_timeline(
+            &mut self.semantic_timelines,
+            reduction.workspace_id.as_str(),
+            &reduction.conversation_event,
+            pioneer_client::timeline::labels::now_unix_ms(),
+        ) {
+            self.semantic_timeline_revision = self.semantic_timeline_revision.saturating_add(1);
+            if let Some(cx) = cx.as_deref_mut() {
+                cx.notify();
+            }
+        }
         if reduction.tick_conversation
             && let Some(conversation) = self.thread_conversation_mut(thread_id.as_str())
         {
@@ -217,7 +228,15 @@ impl PioneerDesktop {
             reduction.thread_id.as_str(),
             reduction.workspace_id.as_str(),
         )
-        .apply(reduction.conversation_event);
+        .apply(reduction.conversation_event.clone());
+        if pioneer_client::timeline::semantic::apply_conversation_event_to_semantic_timeline(
+            &mut self.semantic_timelines,
+            reduction.workspace_id.as_str(),
+            &reduction.conversation_event,
+            pioneer_client::timeline::labels::now_unix_ms(),
+        ) {
+            self.semantic_timeline_revision = self.semantic_timeline_revision.saturating_add(1);
+        }
     }
 
     fn apply_thread_closed_reduction(&mut self, reduction: ThreadClosedReduction) {

@@ -4,11 +4,14 @@
 //! keep scroll/list/rendering state locally, but semantic block and work-range
 //! cache ownership lives here.
 
+use crate::conversation::ConversationEvent;
 use pioneer_protocol::{
+    AgentMessagePhase, ItemDeltaStream, MarkdownDocument, SystemEventLevel,
     ThreadTimelineBlocksChangedNotification, ThreadTimelinePageParams, ThreadTimelinePageResponse,
-    TimelineBlock, TimelineBlockKind, TimelineCursor, TimelinePageAnchor, TimelinePageInfo,
-    TurnWorkBlock, TurnWorkItem, TurnWorkItemsChangedNotification, TurnWorkPageParams,
-    TurnWorkPageResponse, TurnWorkPresentation, TurnWorkStateChangedNotification,
+    TimelineBlock, TimelineBlockKind, TimelineCursor, TimelinePageAnchor, TimelinePageInfo, Turn,
+    TurnItem, TurnStatus, TurnWorkBlock, TurnWorkItem, TurnWorkItemStatus,
+    TurnWorkItemsChangedNotification, TurnWorkPageParams, TurnWorkPageResponse,
+    TurnWorkPresentation, TurnWorkState, TurnWorkStateChangedNotification, UserMessageAttachment,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -99,6 +102,28 @@ pub struct SemanticTimelineRows {
     pub thread_id: ThreadId,
     pub rows: Vec<SemanticTimelineRow>,
     pub request_hints: Vec<SemanticTimelineRequestHint>,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct SemanticTimelineCachePatch {
+    pub workspace_id: String,
+    pub thread_id: ThreadId,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed_blocks: Vec<TimelineBlock>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_block_ids: Vec<TimelineBlockId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed_work_items: Vec<TurnWorkItem>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_work_items: Vec<SemanticTimelineRemovedWorkItem>,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct SemanticTimelineRemovedWorkItem {
+    pub turn_id: TurnId,
+    pub work_item_id: TurnWorkItemId,
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -877,6 +902,483 @@ pub fn apply_semantic_timeline_live_update(
     }
 }
 
+pub fn apply_conversation_event_to_semantic_timeline(
+    state: &mut SemanticTimelineState,
+    workspace_id: &str,
+    event: &ConversationEvent,
+    now_unix_ms: i64,
+) -> bool {
+    match event {
+        ConversationEvent::LocalTurnStartRequested {
+            thread_id,
+            turn_id,
+            user_text,
+            attachments,
+            ..
+        } => apply_local_turn_start_requested_to_semantic_timeline(
+            state,
+            workspace_id,
+            thread_id,
+            turn_id,
+            user_text,
+            attachments,
+            now_unix_ms,
+        ),
+        ConversationEvent::LocalTurnStartAccepted {
+            thread_id, turn_id, ..
+        }
+        | ConversationEvent::TurnStarted {
+            thread_id,
+            turn: Turn { id: turn_id, .. },
+        } => apply_turn_state_to_semantic_timeline(
+            state,
+            workspace_id,
+            thread_id,
+            turn_id,
+            TurnWorkState::Running,
+            None,
+            now_unix_ms,
+        ),
+        ConversationEvent::LocalTurnStartRejected {
+            thread_id, turn_id, ..
+        } => apply_turn_state_to_semantic_timeline(
+            state,
+            workspace_id,
+            thread_id,
+            turn_id,
+            TurnWorkState::Failed,
+            Some(now_unix_ms),
+            now_unix_ms,
+        ),
+        ConversationEvent::TurnCompleted { thread_id, turn } => {
+            apply_terminal_turn_to_semantic_timeline(
+                state,
+                workspace_id,
+                thread_id,
+                turn,
+                TurnWorkState::Completed,
+                now_unix_ms,
+            )
+        }
+        ConversationEvent::TurnFailed { thread_id, turn } => {
+            apply_terminal_turn_to_semantic_timeline(
+                state,
+                workspace_id,
+                thread_id,
+                turn,
+                TurnWorkState::Failed,
+                now_unix_ms,
+            )
+        }
+        ConversationEvent::TurnBlocked {
+            thread_id, turn, ..
+        } => apply_terminal_turn_to_semantic_timeline(
+            state,
+            workspace_id,
+            thread_id,
+            turn,
+            TurnWorkState::Blocked,
+            now_unix_ms,
+        ),
+        ConversationEvent::ItemStarted {
+            thread_id,
+            turn_id,
+            item,
+        } => apply_item_started_to_semantic_timeline(
+            state,
+            workspace_id,
+            thread_id,
+            turn_id,
+            item,
+            now_unix_ms,
+        ),
+        ConversationEvent::ItemDelta {
+            thread_id,
+            turn_id,
+            item_id,
+            delta,
+            stream,
+            markdown,
+            ..
+        } => apply_item_delta_to_semantic_timeline(
+            state,
+            workspace_id,
+            thread_id,
+            turn_id,
+            item_id,
+            delta,
+            *stream,
+            markdown.as_ref(),
+            now_unix_ms,
+        ),
+        ConversationEvent::ItemCompleted {
+            thread_id,
+            turn_id,
+            item,
+        }
+        | ConversationEvent::ItemUpdated {
+            thread_id,
+            turn_id,
+            item,
+        } => apply_item_completed_to_semantic_timeline(
+            state,
+            workspace_id,
+            thread_id,
+            turn_id,
+            item,
+            now_unix_ms,
+        ),
+        _ => false,
+    }
+}
+
+pub fn apply_conversation_event_to_semantic_timeline_with_patch(
+    state: &mut SemanticTimelineState,
+    workspace_id: &str,
+    event: &ConversationEvent,
+    now_unix_ms: i64,
+) -> SemanticTimelineCachePatch {
+    let Some(thread_id) = event.thread_id().map(str::to_owned) else {
+        return SemanticTimelineCachePatch::default();
+    };
+    let before = state.thread(thread_id.as_str()).cloned();
+    if !apply_conversation_event_to_semantic_timeline(state, workspace_id, event, now_unix_ms) {
+        return SemanticTimelineCachePatch {
+            workspace_id: workspace_id.to_owned(),
+            thread_id,
+            ..SemanticTimelineCachePatch::default()
+        };
+    }
+    let after = state.thread(thread_id.as_str());
+    semantic_timeline_cache_patch_from_diff(workspace_id, thread_id, before.as_ref(), after)
+}
+
+fn apply_local_turn_start_requested_to_semantic_timeline(
+    state: &mut SemanticTimelineState,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    user_text: &str,
+    attachments: &[UserMessageAttachment],
+    now_unix_ms: i64,
+) -> bool {
+    let thread = state.thread_mut(thread_id.to_owned());
+    let before = thread.clone();
+    upsert_user_message_block(
+        thread,
+        workspace_id,
+        thread_id,
+        turn_id,
+        None,
+        user_text.to_owned(),
+        attachments.to_vec(),
+        now_unix_ms,
+    );
+    upsert_turn_work_summary(
+        thread,
+        workspace_id,
+        thread_id,
+        turn_id,
+        TurnWorkState::Starting,
+        TurnWorkPresentation::ExpandedLive,
+        None,
+        now_unix_ms,
+    );
+    before != *thread
+}
+
+fn apply_turn_state_to_semantic_timeline(
+    state: &mut SemanticTimelineState,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    work_state: TurnWorkState,
+    completed_at_unix_ms: Option<i64>,
+    now_unix_ms: i64,
+) -> bool {
+    let thread = state.thread_mut(thread_id.to_owned());
+    let before = thread.clone();
+    let presentation = if turn_has_assistant_block(thread, turn_id) {
+        TurnWorkPresentation::CollapsedAfterFinal
+    } else if completed_at_unix_ms.is_some() {
+        TurnWorkPresentation::ExpandedTerminalNoFinal
+    } else {
+        TurnWorkPresentation::ExpandedLive
+    };
+    upsert_turn_work_summary(
+        thread,
+        workspace_id,
+        thread_id,
+        turn_id,
+        work_state,
+        presentation,
+        completed_at_unix_ms,
+        now_unix_ms,
+    );
+    before != *thread
+}
+
+fn apply_terminal_turn_to_semantic_timeline(
+    state: &mut SemanticTimelineState,
+    workspace_id: &str,
+    thread_id: &str,
+    turn: &Turn,
+    fallback_state: TurnWorkState,
+    now_unix_ms: i64,
+) -> bool {
+    let work_state = turn_status_to_work_state(turn.status).unwrap_or(fallback_state);
+    apply_turn_state_to_semantic_timeline(
+        state,
+        workspace_id,
+        thread_id,
+        turn.id.as_str(),
+        work_state,
+        Some(now_unix_ms),
+        now_unix_ms,
+    )
+}
+
+fn apply_item_started_to_semantic_timeline(
+    state: &mut SemanticTimelineState,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    item: &TurnItem,
+    now_unix_ms: i64,
+) -> bool {
+    let thread = state.thread_mut(thread_id.to_owned());
+    let before = thread.clone();
+    match live_item_placement(item) {
+        LiveItemPlacement::TopLevelUser => {
+            let TurnItem::UserMessage {
+                id,
+                text,
+                attachments,
+            } = item
+            else {
+                return false;
+            };
+            upsert_user_message_block(
+                thread,
+                workspace_id,
+                thread_id,
+                turn_id,
+                Some(id.clone()),
+                text.clone(),
+                attachments.clone(),
+                now_unix_ms,
+            );
+        }
+        LiveItemPlacement::TopLevelAssistant => {
+            upsert_assistant_message_block(
+                thread,
+                workspace_id,
+                thread_id,
+                turn_id,
+                item,
+                TurnWorkItemStatus::Running,
+                now_unix_ms,
+            );
+            upsert_turn_work_summary(
+                thread,
+                workspace_id,
+                thread_id,
+                turn_id,
+                TurnWorkState::Running,
+                TurnWorkPresentation::CollapsedAfterFinal,
+                None,
+                now_unix_ms,
+            );
+        }
+        LiveItemPlacement::TurnWork => {
+            upsert_turn_work_item(
+                thread,
+                workspace_id,
+                thread_id,
+                turn_id,
+                item.clone(),
+                TurnWorkItemStatus::Running,
+                now_unix_ms,
+            );
+            upsert_turn_work_summary(
+                thread,
+                workspace_id,
+                thread_id,
+                turn_id,
+                TurnWorkState::Running,
+                current_or_live_work_presentation(thread, turn_id),
+                None,
+                now_unix_ms,
+            );
+        }
+        LiveItemPlacement::Hidden => {}
+    }
+    before != *thread
+}
+
+fn apply_item_delta_to_semantic_timeline(
+    state: &mut SemanticTimelineState,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    item_id: &str,
+    delta: &str,
+    stream: Option<ItemDeltaStream>,
+    markdown: Option<&MarkdownDocument>,
+    now_unix_ms: i64,
+) -> bool {
+    let thread = state.thread_mut(thread_id.to_owned());
+    let before = thread.clone();
+    let assistant_block_id = assistant_block_id(turn_id, item_id);
+    if let Some(block) = thread
+        .top_level
+        .blocks_by_id
+        .get_mut(assistant_block_id.as_str())
+        && let TimelineBlockKind::AssistantMessage {
+            text,
+            status,
+            markdown: block_markdown,
+            ..
+        } = &mut block.kind
+    {
+        text.push_str(delta);
+        *status = TurnWorkItemStatus::Running;
+        if let Some(markdown) = markdown {
+            *block_markdown = Some(markdown.clone());
+        }
+        block.updated_at_unix_ms = Some(now_unix_ms);
+        upsert_turn_work_summary(
+            thread,
+            workspace_id,
+            thread_id,
+            turn_id,
+            TurnWorkState::Running,
+            TurnWorkPresentation::CollapsedAfterFinal,
+            None,
+            now_unix_ms,
+        );
+    } else {
+        let work_item_id = work_item_projection_id(turn_id, item_id);
+        if let Some(item) = thread
+            .work_range_mut(turn_id.to_owned())
+            .items_by_id
+            .get_mut(work_item_id.as_str())
+        {
+            append_delta_to_turn_item(&mut item.item, delta, markdown);
+            item.status = TurnWorkItemStatus::Running;
+            item.completed_at_unix_ms = None;
+        } else if matches!(stream, Some(ItemDeltaStream::AgentMessage)) {
+            let item = TurnItem::AgentMessage {
+                id: item_id.to_owned(),
+                text: delta.to_owned(),
+                phase: AgentMessagePhase::FinalAnswer,
+                markdown: markdown.cloned(),
+                markdown_version: None,
+            };
+            upsert_assistant_message_block(
+                thread,
+                workspace_id,
+                thread_id,
+                turn_id,
+                &item,
+                TurnWorkItemStatus::Running,
+                now_unix_ms,
+            );
+            upsert_turn_work_summary(
+                thread,
+                workspace_id,
+                thread_id,
+                turn_id,
+                TurnWorkState::Running,
+                TurnWorkPresentation::CollapsedAfterFinal,
+                None,
+                now_unix_ms,
+            );
+        }
+    }
+    before != *thread
+}
+
+fn apply_item_completed_to_semantic_timeline(
+    state: &mut SemanticTimelineState,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    item: &TurnItem,
+    now_unix_ms: i64,
+) -> bool {
+    let thread = state.thread_mut(thread_id.to_owned());
+    let before = thread.clone();
+    match live_item_placement(item) {
+        LiveItemPlacement::TopLevelUser => {
+            if let TurnItem::UserMessage {
+                id,
+                text,
+                attachments,
+            } = item
+            {
+                upsert_user_message_block(
+                    thread,
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    Some(id.clone()),
+                    text.clone(),
+                    attachments.clone(),
+                    now_unix_ms,
+                );
+            }
+        }
+        LiveItemPlacement::TopLevelAssistant => {
+            remove_turn_work_item(thread, turn_id, item.item_id());
+            upsert_assistant_message_block(
+                thread,
+                workspace_id,
+                thread_id,
+                turn_id,
+                item,
+                TurnWorkItemStatus::Completed,
+                now_unix_ms,
+            );
+            upsert_turn_work_summary(
+                thread,
+                workspace_id,
+                thread_id,
+                turn_id,
+                TurnWorkState::Running,
+                TurnWorkPresentation::CollapsedAfterFinal,
+                None,
+                now_unix_ms,
+            );
+        }
+        LiveItemPlacement::TurnWork => {
+            upsert_turn_work_item(
+                thread,
+                workspace_id,
+                thread_id,
+                turn_id,
+                item.clone(),
+                completed_work_status_for_item(item),
+                now_unix_ms,
+            );
+            upsert_turn_work_summary(
+                thread,
+                workspace_id,
+                thread_id,
+                turn_id,
+                TurnWorkState::Running,
+                current_or_live_work_presentation(thread, turn_id),
+                None,
+                now_unix_ms,
+            );
+        }
+        LiveItemPlacement::Hidden => {
+            remove_turn_work_item(thread, turn_id, item.item_id());
+        }
+    }
+    before != *thread
+}
+
 pub fn remove_thread_semantic_timeline(state: &mut SemanticTimelineState, thread_id: &str) -> bool {
     state.threads_by_id.remove(thread_id).is_some()
 }
@@ -981,6 +1483,11 @@ pub fn apply_work_range_page(
     range.turn_id = page.turn_id;
     range.work = Some(page.work);
     for item in page.items {
+        remove_existing_work_items_for_item_id(
+            range,
+            item.item_id.as_str(),
+            item.work_item_id.as_str(),
+        );
         range.stale_work_item_ids.remove(item.work_item_id.as_str());
         range.items_by_id.insert(item.work_item_id.clone(), item);
     }
@@ -989,6 +1496,26 @@ pub fn apply_work_range_page(
     range.request_status = TimelineRequestStatus::Ready;
 
     before != *range
+}
+
+fn remove_existing_work_items_for_item_id(
+    range: &mut TurnWorkRangeCache,
+    item_id: &str,
+    keep_work_item_id: &str,
+) {
+    let duplicate_ids = range
+        .items_by_id
+        .values()
+        .filter(|item| item.item_id == item_id && item.work_item_id != keep_work_item_id)
+        .map(|item| item.work_item_id.clone())
+        .collect::<Vec<_>>();
+    for duplicate_id in duplicate_ids {
+        range.items_by_id.remove(duplicate_id.as_str());
+        range.stale_work_item_ids.remove(duplicate_id.as_str());
+    }
+    range
+        .ordered_item_ids
+        .retain(|work_item_id| range.items_by_id.contains_key(work_item_id));
 }
 
 pub fn apply_turn_work_items_changed(
@@ -1049,6 +1576,571 @@ fn set_turn_work_expanded(
         .expansion
         .set_turn_work_expanded(turn_id.into(), expanded);
     before != thread.expansion
+}
+
+fn semantic_timeline_cache_patch_from_diff(
+    workspace_id: &str,
+    thread_id: ThreadId,
+    before: Option<&ThreadSemanticTimelineState>,
+    after: Option<&ThreadSemanticTimelineState>,
+) -> SemanticTimelineCachePatch {
+    let mut changed_blocks = Vec::new();
+    let mut removed_block_ids = Vec::new();
+    let mut changed_work_items = Vec::new();
+    let mut removed_work_items = Vec::new();
+
+    if let Some(after) = after {
+        for block in after.top_level.blocks_by_id.values() {
+            if before.and_then(|before| before.top_level.blocks_by_id.get(block.block_id.as_str()))
+                != Some(block)
+            {
+                changed_blocks.push(block.clone());
+            }
+        }
+        for range in after.work_ranges_by_turn.values() {
+            for item in range.items_by_id.values() {
+                let before_item = before
+                    .and_then(|before| before.work_ranges_by_turn.get(range.turn_id.as_str()))
+                    .and_then(|range| range.items_by_id.get(item.work_item_id.as_str()));
+                if before_item != Some(item) {
+                    changed_work_items.push(item.clone());
+                }
+            }
+        }
+    }
+
+    if let Some(before) = before {
+        for block_id in before.top_level.blocks_by_id.keys() {
+            if after.is_none_or(|after| !after.top_level.blocks_by_id.contains_key(block_id)) {
+                removed_block_ids.push(block_id.clone());
+            }
+        }
+        for range in before.work_ranges_by_turn.values() {
+            for work_item_id in range.items_by_id.keys() {
+                let item_still_exists = after
+                    .and_then(|after| after.work_ranges_by_turn.get(range.turn_id.as_str()))
+                    .is_some_and(|range| range.items_by_id.contains_key(work_item_id));
+                if !item_still_exists {
+                    removed_work_items.push(SemanticTimelineRemovedWorkItem {
+                        turn_id: range.turn_id.clone(),
+                        work_item_id: work_item_id.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    changed_blocks.sort_by(|left, right| {
+        left.sort_key
+            .cmp(&right.sort_key)
+            .then_with(|| left.block_id.cmp(&right.block_id))
+    });
+    removed_block_ids.sort();
+    changed_work_items.sort_by(|left, right| {
+        left.turn_id
+            .cmp(&right.turn_id)
+            .then_with(|| left.order_key.cmp(&right.order_key))
+            .then_with(|| left.work_item_id.cmp(&right.work_item_id))
+    });
+    removed_work_items.sort_by(|left, right| {
+        left.turn_id
+            .cmp(&right.turn_id)
+            .then_with(|| left.work_item_id.cmp(&right.work_item_id))
+    });
+
+    SemanticTimelineCachePatch {
+        workspace_id: workspace_id.to_owned(),
+        thread_id,
+        changed_blocks,
+        removed_block_ids,
+        changed_work_items,
+        removed_work_items,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveItemPlacement {
+    TopLevelUser,
+    TurnWork,
+    TopLevelAssistant,
+    Hidden,
+}
+
+fn live_item_placement(item: &TurnItem) -> LiveItemPlacement {
+    match item {
+        TurnItem::UserMessage { .. } => LiveItemPlacement::TopLevelUser,
+        TurnItem::AgentMessage { phase, .. } if matches!(phase, AgentMessagePhase::FinalAnswer) => {
+            LiveItemPlacement::TopLevelAssistant
+        }
+        TurnItem::SystemEvent {
+            level,
+            message,
+            code,
+            details,
+            ..
+        } => {
+            if matches!(level, SystemEventLevel::Error | SystemEventLevel::Warning) {
+                LiveItemPlacement::TurnWork
+            } else if system_event_visible_in_work(message, code.as_deref(), details.as_ref()) {
+                LiveItemPlacement::TurnWork
+            } else {
+                LiveItemPlacement::Hidden
+            }
+        }
+        _ => LiveItemPlacement::TurnWork,
+    }
+}
+
+fn system_event_visible_in_work(
+    message: &str,
+    code: Option<&str>,
+    details: Option<&serde_json::Value>,
+) -> bool {
+    match code {
+        Some("agent_context_compaction") | Some("agent_review") => true,
+        Some(code) if is_recovery_system_code(code) || is_execution_window_system_code(code) => {
+            true
+        }
+        Some("agent_runtime_event") => details
+            .and_then(|details| details.get("nativeMethod"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|method| !is_hidden_runtime_method(method)),
+        Some(_) => false,
+        None if message.starts_with("Runtime event: ") => message
+            .strip_prefix("Runtime event: ")
+            .is_some_and(|method| !is_hidden_runtime_method(method)),
+        None if message.starts_with("Thread status changed:")
+            || message == "Diff updated"
+            || message == "Plan updated" =>
+        {
+            false
+        }
+        None => false,
+    }
+}
+
+fn is_hidden_runtime_method(method: &str) -> bool {
+    matches!(
+        method,
+        "thread/tokenUsage/updated"
+            | "fuzzyFileSearch/sessionUpdated"
+            | "fuzzyFileSearch/sessionCompleted"
+            | "windowsSandbox/setupCompleted"
+    )
+}
+
+fn is_recovery_system_code(code: &str) -> bool {
+    matches!(
+        code,
+        "turn_start_rejected"
+            | "turn_blocked_resumable"
+            | "item_timeout_detected"
+            | "item_recovery_opened"
+            | "item_recovery_attached"
+            | "item_retry_scheduled"
+            | "item_retry_attempt_started"
+            | "item_recovery_succeeded"
+            | "item_recovery_exhausted"
+            | "item_tool_retry_scheduled"
+            | "item_tool_retry_resolved"
+            | "item_tool_retry_exhausted"
+            | "turn_tool_loop_budget_exceeded"
+    )
+}
+
+fn is_execution_window_system_code(code: &str) -> bool {
+    matches!(
+        code,
+        "turn_execution_window_exhausted"
+            | "turn_execution_window_continued"
+            | "turn_execution_window_blocked"
+    )
+}
+
+fn user_block_id(turn_id: &str) -> String {
+    format!("turn:{turn_id}:user")
+}
+
+fn work_block_id(turn_id: &str) -> String {
+    format!("turn:{turn_id}:work")
+}
+
+fn assistant_block_id(turn_id: &str, item_id: &str) -> String {
+    format!("turn:{turn_id}:assistant:{item_id}")
+}
+
+fn work_item_projection_id(turn_id: &str, item_id: &str) -> String {
+    format!("turn:{turn_id}:work:{item_id}")
+}
+
+fn turn_sort_base(thread: &ThreadSemanticTimelineState, turn_id: &str, now_unix_ms: i64) -> String {
+    for block in thread.top_level.blocks_by_id.values() {
+        if block_turn_id(block) == Some(turn_id)
+            && let Some((millis, rest)) = block.sort_key.split_once(':')
+            && let Some((existing_turn_id, _)) = rest.split_once(':')
+            && existing_turn_id == turn_id
+        {
+            return format!("{millis}:{turn_id}");
+        }
+    }
+    format!("{:020}:{turn_id}", now_unix_ms.max(0))
+}
+
+fn turn_block_sort_key(
+    thread: &ThreadSemanticTimelineState,
+    turn_id: &str,
+    rank: u16,
+    suffix: &str,
+    now_unix_ms: i64,
+) -> String {
+    format!(
+        "{}:{:03}:{}",
+        turn_sort_base(thread, turn_id, now_unix_ms),
+        rank,
+        suffix
+    )
+}
+
+fn work_item_order_key(
+    range: Option<&TurnWorkRangeCache>,
+    item_id: &str,
+    now_unix_ms: i64,
+) -> String {
+    if let Some(range) = range {
+        for item in range.items_by_id.values() {
+            if item.item_id == item_id {
+                return item.order_key.clone();
+            }
+        }
+    }
+    format!("{:020}:{}", now_unix_ms.max(0), item_id)
+}
+
+fn upsert_top_level_block(thread: &mut ThreadSemanticTimelineState, block: TimelineBlock) {
+    thread
+        .top_level
+        .stale_block_ids
+        .remove(block.block_id.as_str());
+    thread
+        .top_level
+        .blocks_by_id
+        .insert(block.block_id.clone(), block);
+    sort_top_level_blocks(&mut thread.top_level);
+}
+
+fn upsert_user_message_block(
+    thread: &mut ThreadSemanticTimelineState,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    item_id: Option<String>,
+    text: String,
+    attachments: Vec<UserMessageAttachment>,
+    now_unix_ms: i64,
+) {
+    let block_id = user_block_id(turn_id);
+    let existing = thread.top_level.blocks_by_id.get(block_id.as_str());
+    let block = TimelineBlock {
+        workspace_id: workspace_id.to_owned(),
+        thread_id: thread_id.to_owned(),
+        block_id,
+        turn_id: Some(turn_id.to_owned()),
+        sort_key: existing
+            .map(|block| block.sort_key.clone())
+            .unwrap_or_else(|| turn_block_sort_key(thread, turn_id, 0, "user", now_unix_ms)),
+        started_at_unix_ms: existing
+            .and_then(|block| block.started_at_unix_ms)
+            .or(Some(now_unix_ms)),
+        updated_at_unix_ms: Some(now_unix_ms),
+        kind: TimelineBlockKind::UserMessage {
+            item_id,
+            inputs: Vec::new(),
+            text,
+            attachments,
+        },
+    };
+    upsert_top_level_block(thread, block);
+}
+
+fn upsert_assistant_message_block(
+    thread: &mut ThreadSemanticTimelineState,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    item: &TurnItem,
+    status: TurnWorkItemStatus,
+    now_unix_ms: i64,
+) {
+    let TurnItem::AgentMessage {
+        id, text, markdown, ..
+    } = item
+    else {
+        return;
+    };
+    let block_id = assistant_block_id(turn_id, id);
+    let existing = thread.top_level.blocks_by_id.get(block_id.as_str());
+    let block = TimelineBlock {
+        workspace_id: workspace_id.to_owned(),
+        thread_id: thread_id.to_owned(),
+        block_id,
+        turn_id: Some(turn_id.to_owned()),
+        sort_key: existing
+            .map(|block| block.sort_key.clone())
+            .unwrap_or_else(|| {
+                turn_block_sort_key(
+                    thread,
+                    turn_id,
+                    200,
+                    work_item_order_key(thread.work_range(turn_id), id, now_unix_ms).as_str(),
+                    now_unix_ms,
+                )
+            }),
+        started_at_unix_ms: existing
+            .and_then(|block| block.started_at_unix_ms)
+            .or(Some(now_unix_ms)),
+        updated_at_unix_ms: Some(now_unix_ms),
+        kind: TimelineBlockKind::AssistantMessage {
+            item_id: id.clone(),
+            text: text.clone(),
+            status,
+            markdown: markdown.clone(),
+        },
+    };
+    upsert_top_level_block(thread, block);
+}
+
+fn upsert_turn_work_item(
+    thread: &mut ThreadSemanticTimelineState,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    item: TurnItem,
+    status: TurnWorkItemStatus,
+    now_unix_ms: i64,
+) {
+    let item_id = item.item_id().to_owned();
+    let work_item_id = work_item_projection_id(turn_id, item_id.as_str());
+    let order_key = work_item_order_key(thread.work_range(turn_id), item_id.as_str(), now_unix_ms);
+    let item_type = item.item_type();
+    let range = thread.work_range_mut(turn_id.to_owned());
+    range.thread_id = thread_id.to_owned();
+    range.turn_id = turn_id.to_owned();
+    range.stale_work_item_ids.remove(work_item_id.as_str());
+    let existing_started_at = range
+        .items_by_id
+        .get(work_item_id.as_str())
+        .and_then(|item| item.started_at_unix_ms);
+    range.items_by_id.insert(
+        work_item_id.clone(),
+        TurnWorkItem {
+            work_item_id,
+            item_id,
+            turn_id: turn_id.to_owned(),
+            order_key,
+            item_type,
+            status,
+            started_at_unix_ms: existing_started_at.or(Some(now_unix_ms)),
+            completed_at_unix_ms: if is_terminal_turn_work_item_status(status) {
+                Some(now_unix_ms)
+            } else {
+                None
+            },
+            item,
+            metadata: Some(serde_json::json!({
+                "workspaceId": workspace_id,
+                "live": true,
+            })),
+        },
+    );
+    sort_work_items(range);
+}
+
+fn remove_turn_work_item(thread: &mut ThreadSemanticTimelineState, turn_id: &str, item_id: &str) {
+    if let Some(range) = thread.work_ranges_by_turn.get_mut(turn_id) {
+        let work_item_id = work_item_projection_id(turn_id, item_id);
+        range.items_by_id.remove(work_item_id.as_str());
+        range
+            .ordered_item_ids
+            .retain(|candidate| candidate != work_item_id.as_str());
+        range.stale_work_item_ids.remove(work_item_id.as_str());
+    }
+}
+
+fn upsert_turn_work_summary(
+    thread: &mut ThreadSemanticTimelineState,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    state: TurnWorkState,
+    presentation: TurnWorkPresentation,
+    completed_at_unix_ms: Option<i64>,
+    now_unix_ms: i64,
+) {
+    let existing = thread.cached_turn_work_block(turn_id).cloned();
+    let visible_count_from_range = thread
+        .work_range(turn_id)
+        .map(|range| range.items_by_id.len() as u64)
+        .unwrap_or(0);
+    let visible_work_count = existing
+        .as_ref()
+        .map(|work| work.visible_work_count.max(visible_count_from_range))
+        .unwrap_or(visible_count_from_range);
+    let hidden_work_count = existing
+        .as_ref()
+        .map(|work| work.hidden_work_count)
+        .unwrap_or(0);
+    let (first_work_item_id, last_work_item_id) = live_first_last_work_item_ids(thread, turn_id);
+    let work = TurnWorkBlock {
+        turn_id: turn_id.to_owned(),
+        presentation,
+        state,
+        started_at_unix_ms: existing
+            .as_ref()
+            .and_then(|work| work.started_at_unix_ms)
+            .or(Some(now_unix_ms)),
+        completed_at_unix_ms,
+        elapsed_ms: existing
+            .as_ref()
+            .and_then(|work| work.started_at_unix_ms)
+            .map(|started_at| now_unix_ms.saturating_sub(started_at).max(0) as u64),
+        work_count: visible_work_count.saturating_add(hidden_work_count),
+        visible_work_count,
+        hidden_work_count,
+        has_more_before: existing
+            .as_ref()
+            .map(|work| work.has_more_before)
+            .unwrap_or(false),
+        has_more_after: existing
+            .as_ref()
+            .map(|work| work.has_more_after)
+            .unwrap_or(false),
+        before_cursor: existing
+            .as_ref()
+            .and_then(|work| work.before_cursor.clone()),
+        after_cursor: existing.as_ref().and_then(|work| work.after_cursor.clone()),
+        first_work_item_id: first_work_item_id.or_else(|| {
+            existing
+                .as_ref()
+                .and_then(|work| work.first_work_item_id.clone())
+        }),
+        last_work_item_id: last_work_item_id.or_else(|| {
+            existing
+                .as_ref()
+                .and_then(|work| work.last_work_item_id.clone())
+        }),
+    };
+    thread.work_range_mut(turn_id.to_owned()).work = Some(work.clone());
+    let block_id = work_block_id(turn_id);
+    let existing_block = thread.top_level.blocks_by_id.get(block_id.as_str());
+    let block = TimelineBlock {
+        workspace_id: workspace_id.to_owned(),
+        thread_id: thread_id.to_owned(),
+        block_id,
+        turn_id: Some(turn_id.to_owned()),
+        sort_key: existing_block
+            .map(|block| block.sort_key.clone())
+            .unwrap_or_else(|| turn_block_sort_key(thread, turn_id, 100, "work", now_unix_ms)),
+        started_at_unix_ms: existing_block
+            .and_then(|block| block.started_at_unix_ms)
+            .or(work.started_at_unix_ms),
+        updated_at_unix_ms: Some(now_unix_ms),
+        kind: TimelineBlockKind::TurnWork { work },
+    };
+    upsert_top_level_block(thread, block);
+}
+
+fn live_first_last_work_item_ids(
+    thread: &ThreadSemanticTimelineState,
+    turn_id: &str,
+) -> (Option<String>, Option<String>) {
+    let Some(range) = thread.work_range(turn_id) else {
+        return (None, None);
+    };
+    (
+        range.ordered_item_ids.first().cloned(),
+        range.ordered_item_ids.last().cloned(),
+    )
+}
+
+fn current_or_live_work_presentation(
+    thread: &ThreadSemanticTimelineState,
+    turn_id: &str,
+) -> TurnWorkPresentation {
+    thread
+        .cached_turn_work_block(turn_id)
+        .map(|work| work.presentation)
+        .unwrap_or(TurnWorkPresentation::ExpandedLive)
+}
+
+fn turn_has_assistant_block(thread: &ThreadSemanticTimelineState, turn_id: &str) -> bool {
+    thread.top_level.blocks_by_id.values().any(|block| {
+        block.turn_id.as_deref() == Some(turn_id)
+            && matches!(block.kind, TimelineBlockKind::AssistantMessage { .. })
+    })
+}
+
+fn turn_status_to_work_state(status: TurnStatus) -> Option<TurnWorkState> {
+    match status {
+        TurnStatus::InProgress => Some(TurnWorkState::Running),
+        TurnStatus::Completed => Some(TurnWorkState::Completed),
+        TurnStatus::Failed => Some(TurnWorkState::Failed),
+        TurnStatus::Interrupted => Some(TurnWorkState::Interrupted),
+        TurnStatus::Blocked => Some(TurnWorkState::Blocked),
+    }
+}
+
+fn completed_work_status_for_item(item: &TurnItem) -> TurnWorkItemStatus {
+    match item {
+        TurnItem::CommandExecution { status, .. }
+        | TurnItem::FileChange { status, .. }
+        | TurnItem::WebSearch { status, .. }
+        | TurnItem::WebFetch { status, .. }
+        | TurnItem::Download { status, .. }
+        | TurnItem::DynamicToolCall { status, .. } => match status {
+            pioneer_protocol::ToolCallStatus::InProgress => TurnWorkItemStatus::Running,
+            pioneer_protocol::ToolCallStatus::Completed => TurnWorkItemStatus::Completed,
+            pioneer_protocol::ToolCallStatus::Failed => TurnWorkItemStatus::Failed,
+        },
+        TurnItem::SystemEvent { level, .. } => match level {
+            SystemEventLevel::Error => TurnWorkItemStatus::Failed,
+            SystemEventLevel::Info | SystemEventLevel::Warning => TurnWorkItemStatus::Completed,
+        },
+        _ => TurnWorkItemStatus::Completed,
+    }
+}
+
+fn is_terminal_turn_work_item_status(status: TurnWorkItemStatus) -> bool {
+    !matches!(status, TurnWorkItemStatus::Running)
+}
+
+fn append_delta_to_turn_item(
+    item: &mut TurnItem,
+    delta: &str,
+    markdown: Option<&MarkdownDocument>,
+) {
+    match item {
+        TurnItem::AgentMessage {
+            text,
+            markdown: item_markdown,
+            ..
+        } => {
+            text.push_str(delta);
+            if let Some(markdown) = markdown {
+                *item_markdown = Some(markdown.clone());
+            }
+        }
+        TurnItem::Reasoning { content, .. } => {
+            if let Some(last) = content.last_mut() {
+                last.push_str(delta);
+            } else {
+                content.push(delta.to_owned());
+            }
+        }
+        TurnItem::SystemEvent { message, .. } => {
+            message.push_str(delta);
+        }
+        _ => {}
+    }
 }
 
 fn push_request_action(
@@ -1356,6 +2448,100 @@ mod tests {
         ));
         let thread = state.thread("thread_a").expect("thread cache should exist");
         assert_eq!(thread.top_level.ordered_block_ids, vec!["block_b"]);
+    }
+
+    #[test]
+    fn live_commentary_agent_message_delta_stays_in_turn_work() {
+        let mut state = SemanticTimelineState::default();
+
+        assert!(apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::ItemStarted {
+                thread_id: "thread_a".to_owned(),
+                turn_id: "turn_a".to_owned(),
+                item: TurnItem::AgentMessage {
+                    id: "item_comment".to_owned(),
+                    text: "thinking".to_owned(),
+                    phase: AgentMessagePhase::Commentary,
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            10,
+        ));
+
+        assert!(apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::ItemDelta {
+                thread_id: "thread_a".to_owned(),
+                turn_id: "turn_a".to_owned(),
+                item_id: "item_comment".to_owned(),
+                delta: " more".to_owned(),
+                stream: Some(ItemDeltaStream::AgentMessage),
+                payload: None,
+                markdown: None,
+                markdown_version: None,
+            },
+            11,
+        ));
+
+        let thread = state.thread("thread_a").expect("thread cache should exist");
+        assert!(
+            thread
+                .top_level
+                .ordered_blocks()
+                .all(|block| !matches!(block.kind, TimelineBlockKind::AssistantMessage { .. })),
+            "commentary agent messages must not become top-level final assistant blocks"
+        );
+        let item = thread
+            .work_range("turn_a")
+            .and_then(|range| range.items_by_id.get("turn:turn_a:work:item_comment"))
+            .expect("commentary message should be a turn work item");
+        assert_eq!(item.status, TurnWorkItemStatus::Running);
+        assert!(
+            matches!(&item.item, TurnItem::AgentMessage { text, phase, .. }
+                if text == "thinking more" && *phase == AgentMessagePhase::Commentary)
+        );
+    }
+
+    #[test]
+    fn local_turn_start_patch_contains_shared_semantic_blocks() {
+        let mut state = SemanticTimelineState::default();
+        let patch = apply_conversation_event_to_semantic_timeline_with_patch(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::LocalTurnStartRequested {
+                thread_id: "thread_a".to_owned(),
+                turn_id: "turn_a".to_owned(),
+                pending_request_id: "pending_a".to_owned(),
+                user_text: "hello".to_owned(),
+                attachments: Vec::new(),
+            },
+            10,
+        );
+
+        assert_eq!(patch.workspace_id, "workspace_a");
+        assert_eq!(patch.thread_id, "thread_a");
+        assert_eq!(patch.removed_block_ids, Vec::<String>::new());
+        assert_eq!(patch.changed_work_items, Vec::<TurnWorkItem>::new());
+        assert_eq!(
+            patch
+                .changed_blocks
+                .iter()
+                .map(|block| block.block_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["turn:turn_a:user", "turn:turn_a:work"]
+        );
+        assert!(matches!(
+            patch.changed_blocks[0].kind,
+            TimelineBlockKind::UserMessage { .. }
+        ));
+        assert!(matches!(
+            patch.changed_blocks[1].kind,
+            TimelineBlockKind::TurnWork { .. }
+        ));
     }
 
     #[test]
@@ -2074,6 +3260,7 @@ mod tests {
             kind: TimelineBlockKind::AssistantMessage {
                 item_id: format!("item_{block_id}"),
                 text: "final **markdown**".to_owned(),
+                status: TurnWorkItemStatus::Completed,
                 markdown,
             },
         }

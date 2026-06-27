@@ -19410,6 +19410,7 @@ async fn live_semantic_timeline_final_answer_collapses_work_without_work_flood()
             item_id,
             text,
             markdown,
+            ..
         } => (item_id, text, markdown),
         other => panic!("third block should be assistant message, got {other:?}"),
     };

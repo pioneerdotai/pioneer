@@ -387,11 +387,21 @@ impl PioneerDesktop {
                             cx.notify();
                             return;
                         };
-                        conversation.apply(reduction.local_turn_start_requested_event);
+                        conversation.apply(reduction.local_turn_start_requested_event.clone());
+                        if pioneer_client::timeline::semantic::apply_conversation_event_to_semantic_timeline(
+                            &mut view.semantic_timelines,
+                            workspace_id.as_str(),
+                            &reduction.local_turn_start_requested_event,
+                            pioneer_client::timeline::labels::now_unix_ms(),
+                        ) {
+                            view.semantic_timeline_revision =
+                                view.semantic_timeline_revision.saturating_add(1);
+                        }
 
                         let ws_sender = turn_start_sender.clone();
                         let turn_start_params_plan = reduction.turn_start_params_plan;
                         let send_context = reduction.send_context;
+                        let workspace_id_for_update = workspace_id.clone();
 
                         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
                             let mut cx = cx.clone();
@@ -419,19 +429,34 @@ impl PioneerDesktop {
                                             format!("{error:#}"),
                                         ),
                                     };
-                                    let Some(conversation) =
-                                        view.thread_conversation_mut(thread_id_for_update.as_str())
-                                    else {
-                                        return;
-                                    };
-                                    match reduction {
+                                    let events = match reduction {
                                         turn_start::TurnStartSendReduction::Accepted { events } => {
-                                            for event in events {
-                                                conversation.apply(event);
-                                            }
+                                            events
                                         }
                                         turn_start::TurnStartSendReduction::Rejected { event } => {
-                                            conversation.apply(event);
+                                            vec![event]
+                                        }
+                                    };
+                                    {
+                                        let Some(conversation) = view
+                                            .thread_conversation_mut(thread_id_for_update.as_str())
+                                        else {
+                                            return;
+                                        };
+                                        for event in &events {
+                                            conversation.apply(event.clone());
+                                        }
+                                    }
+                                    for event in &events {
+                                        if pioneer_client::timeline::semantic::apply_conversation_event_to_semantic_timeline(
+                                            &mut view.semantic_timelines,
+                                            workspace_id_for_update.as_str(),
+                                            event,
+                                            pioneer_client::timeline::labels::now_unix_ms(),
+                                        ) {
+                                            view.semantic_timeline_revision = view
+                                                .semantic_timeline_revision
+                                                .saturating_add(1);
                                         }
                                     }
 

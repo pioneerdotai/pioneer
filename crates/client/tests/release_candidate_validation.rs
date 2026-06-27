@@ -244,6 +244,7 @@ fn assistant_message_block(sort_key: &str) -> TimelineBlock {
         kind: TimelineBlockKind::AssistantMessage {
             item_id: "agent_final".to_owned(),
             text: "Done".to_owned(),
+            status: TurnWorkItemStatus::Completed,
             markdown: Some(pioneer_protocol::MarkdownDocument::from_plain_text("Done")),
         },
     }

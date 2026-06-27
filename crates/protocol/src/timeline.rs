@@ -108,6 +108,8 @@ pub enum TimelineBlockKind {
     AssistantMessage {
         item_id: String,
         text: String,
+        #[serde(default = "completed_turn_work_item_status")]
+        status: TurnWorkItemStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         markdown: Option<MarkdownDocument>,
     },
@@ -174,6 +176,10 @@ pub enum TurnWorkItemStatus {
     Blocked,
     Failed,
     Cancelled,
+}
+
+fn completed_turn_work_item_status() -> TurnWorkItemStatus {
+    TurnWorkItemStatus::Completed
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
