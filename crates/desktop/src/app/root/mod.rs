@@ -165,6 +165,7 @@ pub(super) struct ThreadTimelineViewState {
     pub(super) semantic_prefetch_scroll_generation: u64,
     pub(super) semantic_prefetch_consumed_scroll_generation: u64,
     pub(super) running_turn_indicator_timer_active: bool,
+    pub(super) running_turn_indicator_tick: u64,
     pub(super) running_turn_indicator_fallback_turn_id: Option<String>,
     pub(super) running_turn_indicator_fallback_started_at_unix_ms: Option<i64>,
 }

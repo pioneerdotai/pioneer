@@ -121,6 +121,17 @@ impl PioneerDesktop {
         } else {
             String::new()
         };
+        let elapsed_tick = self
+            .thread_timeline_view_state
+            .borrow()
+            .running_turn_indicator_tick;
+        let elapsed_id = ElementId::from((
+            ElementId::from((
+                ElementId::from("running-turn-elapsed"),
+                running_turn.turn_id.clone(),
+            )),
+            elapsed_tick.to_string(),
+        ));
         let is_dark = cx.theme().mode.is_dark();
         let dino_image_source = running_turn_dino_image_source(is_dark);
 
@@ -151,7 +162,7 @@ impl PioneerDesktop {
                             .child(t!("timeline.running.turn").to_string()),
                     ),
             )
-            .child(div().pt_1().font_semibold().child(elapsed))
+            .child(div().id(elapsed_id).pt_1().font_semibold().child(elapsed))
             .into_any_element();
 
         self.render_item_row(is_first_row, is_last_row, content_width, content)
@@ -172,8 +183,13 @@ impl PioneerDesktop {
                             if !visible {
                                 let mut state = view.thread_timeline_view_state.borrow_mut();
                                 state.running_turn_indicator_timer_active = false;
+                                state.running_turn_indicator_tick = 0;
                                 state.running_turn_indicator_fallback_turn_id = None;
                                 state.running_turn_indicator_fallback_started_at_unix_ms = None;
+                            } else {
+                                let mut state = view.thread_timeline_view_state.borrow_mut();
+                                state.running_turn_indicator_tick =
+                                    state.running_turn_indicator_tick.wrapping_add(1);
                             }
 
                             cx.notify();
