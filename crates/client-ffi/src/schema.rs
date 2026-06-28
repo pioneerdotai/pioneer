@@ -56,6 +56,10 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             crate::active_thread::ClientActiveThreadEventRequest
         ),
         schema_doc!(
+            "client_active_thread_event_result.json",
+            crate::active_thread::ClientActiveThreadEventResult
+        ),
+        schema_doc!(
             "client_active_thread_open_request.json",
             crate::active_thread::ClientActiveThreadOpenRequest
         ),

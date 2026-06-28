@@ -16,9 +16,10 @@ mod workspaces;
 
 use active_thread::{
     ClientActiveThreadCancelTurnRequest, ClientActiveThreadCancelTurnResult,
-    ClientActiveThreadClearResult, ClientActiveThreadEventRequest, ClientActiveThreadOpenRequest,
-    ClientActiveThreadSendTextRequest, ClientActiveThreadSendTextResult,
-    ClientActiveThreadSnapshot, ClientActiveThreadSnapshotRequest, ClientFfiActiveThreadState,
+    ClientActiveThreadClearResult, ClientActiveThreadEventRequest, ClientActiveThreadEventResult,
+    ClientActiveThreadOpenRequest, ClientActiveThreadSendTextRequest,
+    ClientActiveThreadSendTextResult, ClientActiveThreadSnapshot,
+    ClientActiveThreadSnapshotRequest, ClientFfiActiveThreadState,
 };
 use composer::{
     ClientComposerAttachmentFromPathRequest, ClientComposerAttachmentsUpdateRequest,
@@ -797,7 +798,7 @@ impl ClientFfiRuntime {
     fn active_thread_apply_event(
         &self,
         input_json: &str,
-    ) -> Result<ClientActiveThreadSnapshot, String> {
+    ) -> Result<ClientActiveThreadEventResult, String> {
         let request = serde_json::from_str::<ClientActiveThreadEventRequest>(input_json)
             .map_err(|error| format!("invalid active thread event request: {error}"))?;
 

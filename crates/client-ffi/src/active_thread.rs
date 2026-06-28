@@ -76,6 +76,13 @@ pub struct ClientActiveThreadEventRequest {
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Serialize)]
+pub struct ClientActiveThreadEventResult {
+    pub snapshot: ClientActiveThreadSnapshot,
+    pub semantic_timeline_patch: SemanticTimelineCachePatch,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ClientActiveThreadSendTextRequest {
@@ -217,13 +224,21 @@ impl ClientFfiActiveThreadState {
         &self,
         runtime: &ClientRuntime,
         request: ClientActiveThreadEventRequest,
-    ) -> anyhow::Result<ClientActiveThreadSnapshot> {
-        if let ClientEvent::GatewayNotification(notification) = request.event {
-            self.apply_gateway_notification(runtime, notification)?;
-        }
+    ) -> anyhow::Result<ClientActiveThreadEventResult> {
+        let semantic_timeline_patch =
+            if let ClientEvent::GatewayNotification(notification) = request.event {
+                self.apply_gateway_notification(runtime, notification)?
+            } else {
+                SemanticTimelineCachePatch::default()
+            };
 
-        self.snapshot(ClientActiveThreadSnapshotRequest {
+        let snapshot = self.snapshot(ClientActiveThreadSnapshotRequest {
             expanded_keys: request.expanded_keys,
+        })?;
+
+        Ok(ClientActiveThreadEventResult {
+            snapshot,
+            semantic_timeline_patch,
         })
     }
 
@@ -625,7 +640,7 @@ impl ClientFfiActiveThreadState {
         &self,
         runtime: &ClientRuntime,
         notification: GatewayNotification,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<SemanticTimelineCachePatch> {
         let (active_thread_id, active_workspace_id, notification_thread_workspace_matches) = {
             let inner = self
                 .inner
@@ -664,10 +679,10 @@ impl ClientFfiActiveThreadState {
         };
 
         let Some(reduction) = runtime.reduce_gateway_notification(notification, context) else {
-            return Ok(());
+            return Ok(SemanticTimelineCachePatch::default());
         };
 
-        match reduction {
+        let semantic_timeline_patch = match reduction {
             ClientRuntimeNotification::ThreadStarted(reduction) => {
                 let mut inner = self
                     .inner
@@ -681,6 +696,7 @@ impl ClientFfiActiveThreadState {
                 if let Some(thread_id) = reduction.set_active_thread_id {
                     inner.active_thread_id = Some(thread_id);
                 }
+                SemanticTimelineCachePatch::default()
             }
             ClientRuntimeNotification::TurnLifecycle(reduction) => {
                 let mut inner = self
@@ -709,12 +725,12 @@ impl ClientFfiActiveThreadState {
                         thread.status = status;
                     }
                 }
-                apply_conversation_event_to_semantic_timeline(
+                apply_conversation_event_to_semantic_timeline_with_patch(
                     &mut inner.semantic_timelines,
                     reduction.workspace_id.as_str(),
                     &reduction.conversation_event,
                     now_unix_ms(),
-                );
+                )
             }
             ClientRuntimeNotification::ConversationEvent(reduction) => {
                 let mut inner = self
@@ -735,12 +751,12 @@ impl ClientFfiActiveThreadState {
                         .conversation
                         .apply(reduction.conversation_event.clone());
                 }
-                apply_conversation_event_to_semantic_timeline(
+                apply_conversation_event_to_semantic_timeline_with_patch(
                     &mut inner.semantic_timelines,
                     reduction.workspace_id.as_str(),
                     &reduction.conversation_event,
                     now_unix_ms(),
-                );
+                )
             }
             ClientRuntimeNotification::ThreadUpdated(reduction) => {
                 let mut inner = self
@@ -752,6 +768,7 @@ impl ClientFfiActiveThreadState {
                     .entry(reduction.thread_id.clone())
                     .and_modify(|coordinator| coordinator.set_snapshot(reduction.thread.clone()))
                     .or_insert_with(|| ThreadCoordinator::new(reduction.thread));
+                SemanticTimelineCachePatch::default()
             }
             ClientRuntimeNotification::ThreadClosed(reduction) => {
                 let mut inner = self
@@ -766,6 +783,7 @@ impl ClientFfiActiveThreadState {
                 if reduction.remove_thread_conversation {
                     inner.coordinators.remove(reduction.thread_id.as_str());
                 }
+                SemanticTimelineCachePatch::default()
             }
             ClientRuntimeNotification::WorkspaceRefresh(_)
             | ClientRuntimeNotification::SkillsRefresh(_)
@@ -779,10 +797,12 @@ impl ClientFfiActiveThreadState {
             | ClientRuntimeNotification::CLIRuntimePendingRequests { .. }
             | ClientRuntimeNotification::SemanticTimeline(_)
             | ClientRuntimeNotification::GatewayRemoteAccessStatusChanged(_)
-            | ClientRuntimeNotification::WorkspaceChanged { .. } => {}
-        }
+            | ClientRuntimeNotification::WorkspaceChanged { .. } => {
+                SemanticTimelineCachePatch::default()
+            }
+        };
 
-        Ok(())
+        Ok(semantic_timeline_patch)
     }
 
     fn apply_turn_start_send_reduction(
