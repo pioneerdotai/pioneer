@@ -15,8 +15,8 @@ use pioneer_protocol::{
 };
 use std::collections::{HashMap, HashSet};
 
-pub const DEFAULT_TOP_LEVEL_PAGE_LIMIT: u32 = 50;
-pub const DEFAULT_TURN_WORK_PAGE_LIMIT: u32 = 100;
+pub const DEFAULT_TOP_LEVEL_PAGE_LIMIT: u32 = 12;
+pub const DEFAULT_TURN_WORK_PAGE_LIMIT: u32 = 30;
 pub const DEFAULT_PREFETCH_THRESHOLD_ROWS: usize = 3;
 
 pub type ThreadId = String;
