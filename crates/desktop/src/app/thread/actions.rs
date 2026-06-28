@@ -77,18 +77,10 @@ impl PioneerDesktop {
 
     pub(super) fn respond_cli_runtime_pending_request(
         &mut self,
-        request_id: String,
+        entry: crate::app::root::CLIRuntimePendingRequestEntry,
         resolution: CLIRuntimeRequestResolution,
         cx: &mut Context<Self>,
     ) {
-        let Some(entry) = self
-            .cli_runtime_pending_requests
-            .request(&request_id)
-            .cloned()
-        else {
-            return;
-        };
-
         let ws_sender = self.gateway.ws_command_sender.clone();
         let params = CLIRuntimeRequestRespondParams {
             workspace_id: entry.workspace_id.clone(),

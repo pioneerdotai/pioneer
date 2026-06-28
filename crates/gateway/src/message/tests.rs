@@ -15047,6 +15047,57 @@ async fn cli_runtime_file_change_approval_allow_preserves_paths_and_truncates_la
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_file_change_approval_accept_for_session_sends_codex_decision() {
+    let (processor, connection_id, mut rx, workspace_id, _crud_store, cli_session) =
+        cli_runtime_approval_processor().await;
+    let opened = open_test_codex_file_change_approval(
+        &processor,
+        &mut rx,
+        workspace_id.as_str(),
+        json!("file-approval-session"),
+        "--- a/src/lib.rs\n+++ b/src/lib.rs\n",
+    )
+    .await;
+
+    let response_id = "fileapproval_sess0001";
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": response_id,
+                "method": pioneer_protocol::constants::methods::CLI_RUNTIME_REQUEST_RESPOND,
+                "params": {
+                    "workspace_id": workspace_id,
+                    "runtime_id": "codex",
+                    "request_id": opened.request_id,
+                    "resolution": {
+                        "status": "answered",
+                        "response": { "decision": "allow_for_session" }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await;
+
+    let (response, _resolved) = recv_response_and_notification_by_id_method(
+        &mut rx,
+        response_id,
+        events::CLI_RUNTIME_REQUEST_RESOLVED,
+    )
+    .await;
+    let result: CLIRuntimeRequestRespondResponse =
+        serde_json::from_value(response.result).expect("respond result should decode");
+    assert_eq!(result.status, CLIRuntimePendingRequestStatus::Answered);
+
+    let responses = cli_session.responses.lock().await;
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].0, json!("file-approval-session"));
+    assert_eq!(responses[0].1, json!({"decision": "acceptForSession"}));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_file_change_approval_deny_resolves_and_sends_decline() {
     let (processor, connection_id, mut rx, workspace_id, crud_store, cli_session) =
         cli_runtime_approval_processor().await;
@@ -19508,26 +19559,31 @@ async fn live_semantic_timeline_pending_request_projects_approval_block() {
         .iter()
         .find_map(|block| match &block.kind {
             pioneer_protocol::TimelineBlockKind::PendingRequest {
+                runtime_id,
                 request_id,
-                request_kind,
                 status,
-                title,
-                message,
-            } => Some((request_id, request_kind, status, title, message)),
+                item_id,
+                request,
+            } => Some((runtime_id, request_id, status, item_id, request)),
             _ => None,
         })
         .expect("top-level page should contain approval block");
-    assert_eq!(approval.0, request_id);
+    assert_eq!(approval.0, "codex");
+    assert_eq!(approval.1, request_id);
     assert_eq!(
-        *approval.1,
+        approval.4.kind,
         pioneer_protocol::CLIRuntimeRequestKind::CommandApproval
     );
     assert_eq!(
         *approval.2,
         pioneer_protocol::CLIRuntimePendingRequestStatus::Pending
     );
-    assert_eq!(approval.3.as_deref(), Some("Run command"));
-    assert_eq!(approval.4.as_deref(), Some("Approve semantic live command"));
+    assert_eq!(approval.3.as_deref(), Some("semantic-native-item"));
+    assert_eq!(approval.4.title.as_deref(), Some("Run command"));
+    assert_eq!(
+        approval.4.message.as_deref(),
+        Some("Approve semantic live command")
+    );
 
     let work = page
         .blocks

@@ -240,10 +240,10 @@ impl PioneerDesktop {
                     .label("Cancel turn")
                     .danger()
                     .on_click({
-                        let request_id = request_id.clone();
+                        let entry = entry.clone();
                         cx.listener(move |view, _, _, cx| {
                             view.respond_cli_runtime_pending_request(
-                                request_id.clone(),
+                                entry.clone(),
                                 CLIRuntimeRequestResolution::Cancelled,
                                 cx,
                             );
@@ -264,7 +264,7 @@ impl PioneerDesktop {
                 )
                 .into_any_element(),
             CLIRuntimeRequestKind::CommandApproval | CLIRuntimeRequestKind::FileChangeApproval => {
-                approval_actions_row(request_id, cx)
+                approval_actions_row(entry, cx)
             }
             CLIRuntimeRequestKind::Other => h_flex()
                 .w_full()
@@ -278,10 +278,10 @@ impl PioneerDesktop {
                     .label("Cancel turn")
                     .danger()
                     .on_click({
-                        let request_id = request_id.clone();
+                        let entry = entry.clone();
                         cx.listener(move |view, _, _, cx| {
                             view.respond_cli_runtime_pending_request(
-                                request_id.clone(),
+                                entry.clone(),
                                 CLIRuntimeRequestResolution::Cancelled,
                                 cx,
                             );
@@ -295,9 +295,10 @@ impl PioneerDesktop {
                     ))
                     .label("Allow")
                     .on_click({
+                        let entry = entry.clone();
                         cx.listener(move |view, _, _, cx| {
                             view.respond_cli_runtime_pending_request(
-                                entry.request_id.clone(),
+                                entry.clone(),
                                 CLIRuntimeRequestResolution::Approved,
                                 cx,
                             );
@@ -334,12 +335,11 @@ impl PioneerDesktop {
             .collect::<Vec<_>>();
         let inputs = Rc::new(inputs);
         let desktop_entity = cx.entity().clone();
-        let request_id = entry.request_id.clone();
 
         let submit: Rc<dyn Fn(&mut App) -> bool> = Rc::new({
             let desktop_entity = desktop_entity.clone();
             let inputs = inputs.clone();
-            let request_id = request_id.clone();
+            let entry = entry.clone();
             move |cx| {
                 let mut answers = JsonMap::new();
                 for (id, input) in inputs.iter() {
@@ -351,7 +351,7 @@ impl PioneerDesktop {
 
                 let _ = desktop_entity.update(cx, |view, cx| {
                     view.respond_cli_runtime_pending_request(
-                        request_id.clone(),
+                        entry.clone(),
                         CLIRuntimeRequestResolution::Answered {
                             response: Some(json!({ "answers": answers })),
                         },
@@ -382,7 +382,7 @@ impl PioneerDesktop {
                 })
                 .footer({
                     let submit = submit.clone();
-                    let request_id = request_id.clone();
+                    let entry = entry.clone();
                     let desktop_entity = desktop_entity.clone();
                     move |_, _, _, _| {
                         vec![
@@ -390,12 +390,12 @@ impl PioneerDesktop {
                                 .label("Cancel turn")
                                 .danger()
                                 .on_click({
-                                    let request_id = request_id.clone();
+                                    let entry = entry.clone();
                                     let desktop_entity = desktop_entity.clone();
                                     move |_, window, cx| {
                                         let _ = desktop_entity.update(cx, |view, cx| {
                                             view.respond_cli_runtime_pending_request(
-                                                request_id.clone(),
+                                                entry.clone(),
                                                 CLIRuntimeRequestResolution::Cancelled,
                                                 cx,
                                             );
@@ -434,7 +434,11 @@ impl PioneerDesktop {
     }
 }
 
-fn approval_actions_row(request_id: String, cx: &mut Context<PioneerDesktop>) -> AnyElement {
+fn approval_actions_row(
+    entry: CLIRuntimePendingRequestEntry,
+    cx: &mut Context<PioneerDesktop>,
+) -> AnyElement {
+    let request_id = entry.request_id.clone();
     h_flex()
         .w_full()
         .justify_end()
@@ -447,10 +451,10 @@ fn approval_actions_row(request_id: String, cx: &mut Context<PioneerDesktop>) ->
             .label("Cancel turn")
             .danger()
             .on_click({
-                let request_id = request_id.clone();
+                let entry = entry.clone();
                 cx.listener(move |view, _, _, cx| {
                     view.respond_cli_runtime_pending_request(
-                        request_id.clone(),
+                        entry.clone(),
                         CLIRuntimeRequestResolution::Cancelled,
                         cx,
                     );
@@ -464,10 +468,10 @@ fn approval_actions_row(request_id: String, cx: &mut Context<PioneerDesktop>) ->
             ))
             .label("Deny")
             .on_click({
-                let request_id = request_id.clone();
+                let entry = entry.clone();
                 cx.listener(move |view, _, _, cx| {
                     view.respond_cli_runtime_pending_request(
-                        request_id.clone(),
+                        entry.clone(),
                         CLIRuntimeRequestResolution::Denied { reason: None },
                         cx,
                     );
@@ -481,10 +485,10 @@ fn approval_actions_row(request_id: String, cx: &mut Context<PioneerDesktop>) ->
             ))
             .label("Allow for session")
             .on_click({
-                let request_id = request_id.clone();
+                let entry = entry.clone();
                 cx.listener(move |view, _, _, cx| {
                     view.respond_cli_runtime_pending_request(
-                        request_id.clone(),
+                        entry.clone(),
                         CLIRuntimeRequestResolution::Answered {
                             response: Some(json!({ "decision": "allow_for_session" })),
                         },
@@ -500,9 +504,10 @@ fn approval_actions_row(request_id: String, cx: &mut Context<PioneerDesktop>) ->
             ))
             .label("Allow")
             .on_click({
+                let entry = entry.clone();
                 cx.listener(move |view, _, _, cx| {
                     view.respond_cli_runtime_pending_request(
-                        request_id.clone(),
+                        entry.clone(),
                         CLIRuntimeRequestResolution::Approved,
                         cx,
                     );

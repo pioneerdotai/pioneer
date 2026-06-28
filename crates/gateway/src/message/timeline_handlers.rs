@@ -828,11 +828,17 @@ impl MessageProcessor {
             })?;
         let Some(record) = record else {
             return Ok(TimelineBlockKind::PendingRequest {
+                runtime_id: String::new(),
                 request_id: request_id.to_owned(),
-                request_kind: CLIRuntimeRequestKind::Other,
                 status: CLIRuntimePendingRequestStatus::Expired,
-                title: None,
-                message: None,
+                item_id: None,
+                request: CLIRuntimePendingRequest {
+                    kind: CLIRuntimeRequestKind::Other,
+                    title: None,
+                    message: None,
+                    native_request_id: None,
+                    payload: None,
+                },
             });
         };
         let request =
@@ -845,11 +851,11 @@ impl MessageProcessor {
                 })?;
 
         Ok(TimelineBlockKind::PendingRequest {
+            runtime_id: record.runtime_id,
             request_id: record.request_id,
-            request_kind: request.kind,
             status: parse_cli_runtime_pending_request_status(record.status.as_str()),
-            title: request.title,
-            message: request.message,
+            item_id: record.native_item_id,
+            request,
         })
     }
 

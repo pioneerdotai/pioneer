@@ -11,9 +11,9 @@ use pioneer_client::timeline::{
     semantic::{self, SemanticTimelineRow, SemanticTimelineRowId, SemanticTimelineRowKind},
 };
 use pioneer_protocol::{
-    AgentMessagePhase, CLIRuntimePendingRequest, CLIRuntimePendingRequestStatus, TimelineBlock,
-    TimelineBlockKind, TurnItem, TurnItemType, TurnWorkBlock, TurnWorkItem, TurnWorkItemStatus,
-    TurnWorkPresentation, TurnWorkState,
+    AgentMessagePhase, CLIRuntimePendingRequestStatus, TimelineBlock, TimelineBlockKind, TurnItem,
+    TurnItemType, TurnWorkBlock, TurnWorkItem, TurnWorkItemStatus, TurnWorkPresentation,
+    TurnWorkState,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -347,11 +347,11 @@ fn push_item_row(
 
 fn pending_request_row_from_block(block: &TimelineBlock) -> Option<TimelineRenderRow> {
     let TimelineBlockKind::PendingRequest {
+        runtime_id,
         request_id,
-        request_kind,
         status,
-        title,
-        message,
+        item_id,
+        request,
     } = &block.kind
     else {
         return None;
@@ -364,18 +364,12 @@ fn pending_request_row_from_block(block: &TimelineBlock) -> Option<TimelineRende
             key: format!("timeline-cli-runtime-request::{request_id}"),
             entry: CLIRuntimePendingRequestEntry {
                 workspace_id: block.workspace_id.clone(),
-                runtime_id: "semantic-timeline".to_owned(),
+                runtime_id: runtime_id.clone(),
                 request_id: request_id.clone(),
                 thread_id: Some(block.thread_id.clone()),
                 turn_id: block.turn_id.clone(),
-                item_id: None,
-                request: CLIRuntimePendingRequest {
-                    kind: *request_kind,
-                    title: title.clone(),
-                    message: message.clone(),
-                    native_request_id: None,
-                    payload: None,
-                },
+                item_id: item_id.clone(),
+                request: request.clone(),
             },
         },
     ))

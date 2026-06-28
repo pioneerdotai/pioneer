@@ -1,5 +1,5 @@
 use crate::{
-    CLIRuntimePendingRequestStatus, CLIRuntimeRequestKind, MarkdownDocument, TurnItem,
+    CLIRuntimePendingRequest, CLIRuntimePendingRequestStatus, MarkdownDocument, TurnItem,
     TurnItemType, UserInput, UserMessageAttachment,
 };
 use schemars::JsonSchema;
@@ -121,13 +121,12 @@ pub enum TimelineBlockKind {
     },
     #[serde(rename_all = "camelCase")]
     PendingRequest {
+        runtime_id: String,
         request_id: String,
-        request_kind: CLIRuntimeRequestKind,
         status: CLIRuntimePendingRequestStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        title: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        message: Option<String>,
+        item_id: Option<String>,
+        request: CLIRuntimePendingRequest,
     },
 }
 
