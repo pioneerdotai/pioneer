@@ -328,6 +328,31 @@ impl TurnStateMachine {
         }
     }
 
+    pub fn sync_snapshot_turn(&mut self, turn: &pioneer_protocol::Turn) {
+        self.state = match turn.status {
+            TurnStatus::InProgress => TurnFlowState::Running {
+                turn_id: turn.id.clone(),
+            },
+            TurnStatus::Completed => TurnFlowState::Completed {
+                turn_id: turn.id.clone(),
+            },
+            TurnStatus::Failed => TurnFlowState::Failed {
+                turn_id: turn.id.clone(),
+                error: turn
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_TURN_FAILED_ERROR.to_owned()),
+            },
+            TurnStatus::Interrupted => TurnFlowState::Cancelled {
+                turn_id: turn.id.clone(),
+                error: turn.error.clone(),
+            },
+            TurnStatus::Blocked => TurnFlowState::Blocked {
+                turn_id: turn.id.clone(),
+            },
+        };
+    }
+
     pub fn finalize_completing_turn(&mut self, turn_id: &str) -> bool {
         match &self.state {
             TurnFlowState::Completing {

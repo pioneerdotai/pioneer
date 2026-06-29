@@ -1226,7 +1226,8 @@ mod tests {
     use super::*;
     use pioneer_client::cli_runtime::approvals::{PendingRequest, PendingRequestsReduction};
     use pioneer_protocol::{
-        ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus, TurnPermissionApprovalRequest,
+        ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus, Turn, TurnKind, TurnOrigin,
+        TurnPermissionApprovalRequest, TurnStatus,
     };
     use serde_json::json;
 
@@ -1248,6 +1249,18 @@ mod tests {
             agent_nickname: None,
             agent_role: None,
             turns: Vec::new(),
+        }
+    }
+
+    fn running_turn(turn_id: &str) -> Turn {
+        Turn {
+            id: turn_id.to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: TurnKind::Conversation,
+            origin: TurnOrigin::User,
+            error: None,
+            prompt_manifest: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
         }
     }
 
@@ -1316,5 +1329,27 @@ mod tests {
 
         assert_eq!(snapshot.pending_requests.len(), 1);
         assert_eq!(snapshot.pending_requests[0].request_id, "req_a");
+    }
+
+    #[test]
+    fn active_thread_snapshot_restores_running_composer_state_from_thread_snapshot() {
+        let mut inner = ClientFfiActiveThreadInner {
+            active_thread_id: Some("thread_a".to_owned()),
+            ..Default::default()
+        };
+        let mut thread = thread("thread_a", "ws_a");
+        thread.status = ThreadStatus::Active;
+        thread.turns.push(running_turn("turn_a"));
+        inner
+            .coordinators
+            .insert("thread_a".to_owned(), ThreadCoordinator::new(thread));
+
+        let snapshot = snapshot_from_inner(&inner);
+
+        assert!(snapshot.projection.composer_locked);
+        assert_eq!(
+            snapshot.projection.in_flight_turn_id.as_deref(),
+            Some("turn_a")
+        );
     }
 }

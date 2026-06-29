@@ -1,4 +1,5 @@
 use super::*;
+use pioneer_protocol::{Thread, TurnStatus};
 
 impl Conversation {
     pub fn new(thread_id: impl Into<String>) -> Self {
@@ -464,6 +465,28 @@ impl Conversation {
             }
         }
 
+        self.projector.sync_flow_state(&self.state_machine);
+        self.projector.bump_revision();
+    }
+
+    pub fn sync_thread_snapshot(&mut self, thread: &Thread) {
+        if thread.id != self.thread_id {
+            return;
+        }
+
+        let Some(turn) = thread.turns.last() else {
+            return;
+        };
+
+        let current_in_flight_turn_id = self.state_machine.in_flight_turn_id().map(str::to_owned);
+        if current_in_flight_turn_id.as_deref().is_some_and(|current| {
+            current != turn.id.as_str() && turn.status != TurnStatus::InProgress
+        }) {
+            return;
+        }
+
+        self.state_machine.sync_snapshot_turn(turn);
+        self.projector.upsert_turn_snapshot_metadata(turn);
         self.projector.sync_flow_state(&self.state_machine);
         self.projector.bump_revision();
     }

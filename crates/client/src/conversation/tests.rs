@@ -4,18 +4,18 @@ use super::{Conversation, ConversationEvent, MAX_EVENT_LOG_LEN, TimelineEntrySta
 use pioneer_protocol::{
     ArtifactKind, ArtifactRef, ArtifactStatus, ExecutionWindowExhaustionReason,
     ExecutionWindowStatus, ItemDeltaStream, RecoveryAction, RecoveryJobStatus, RecoveryTrigger,
-    SystemEventLevel, ThreadHistoryEvent, ThreadHistoryEventPayload, ToolCallStatus,
-    ToolDisplayPayload, ToolLoopBudgetAction, ToolLoopBudgetLimitKind, ToolMetadata,
-    ToolOutputPolicySnapshot, ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot,
-    ToolRecoveryRetryClass, ToolRetryBudgetKind, ToolRetryBudgetUsage, ToolRetryErrorClass,
-    ToolRetryExhaustionKind, ToolRetryResolution, ToolStoragePayload, Turn,
-    TurnBlockedResumeMetadata, TurnExecutionWindowBlockedNotification,
-    TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
-    TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification, TurnItem,
-    TurnItemTimeoutReason, TurnItemType, TurnPermissionActionKind, TurnPermissionAuditDecision,
-    TurnPermissionAuditEvent, TurnPermissionAuditEventKind, TurnPermissionAuditRequestKey,
-    TurnPermissionDecisionReason, TurnPermissionMode, TurnPermissionProfileSource, TurnStatus,
-    UserInput, UserMessageAttachment,
+    SystemEventLevel, Thread, ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadMode,
+    ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus, ToolCallStatus, ToolDisplayPayload,
+    ToolLoopBudgetAction, ToolLoopBudgetLimitKind, ToolMetadata, ToolOutputPolicySnapshot,
+    ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass,
+    ToolRetryBudgetKind, ToolRetryBudgetUsage, ToolRetryErrorClass, ToolRetryExhaustionKind,
+    ToolRetryResolution, ToolStoragePayload, Turn, TurnBlockedResumeMetadata,
+    TurnExecutionWindowBlockedNotification, TurnExecutionWindowCheckpointedNotification,
+    TurnExecutionWindowContinuedNotification, TurnExecutionWindowExhaustedNotification,
+    TurnExecutionWindowStartedNotification, TurnItem, TurnItemTimeoutReason, TurnItemType,
+    TurnPermissionActionKind, TurnPermissionAuditDecision, TurnPermissionAuditEvent,
+    TurnPermissionAuditEventKind, TurnPermissionAuditRequestKey, TurnPermissionDecisionReason,
+    TurnPermissionMode, TurnPermissionProfileSource, TurnStatus, UserInput, UserMessageAttachment,
 };
 
 const THREAD_ID: &str = "thr_000000000000000001";
@@ -25,6 +25,39 @@ const WORKSPACE_ID: &str = "ws_000000000000000001";
 
 fn default_test_permission_profile() -> pioneer_protocol::TurnPermissionProfileSnapshot {
     pioneer_protocol::default_turn_permission_profile_snapshot()
+}
+
+fn thread_snapshot_with_turn(turn: Turn) -> Thread {
+    Thread {
+        workspace_id: WORKSPACE_ID.to_owned(),
+        id: THREAD_ID.to_owned(),
+        name: None,
+        preview: String::new(),
+        mode: ThreadMode::Chat,
+        model: "gpt-5".to_owned(),
+        model_provider: "openai".to_owned(),
+        reasoning_effort: None,
+        created_at: 1,
+        updated_at: 2,
+        status: ThreadStatus::Active,
+        origin_kind: ThreadOriginKind::User,
+        sidebar_visibility: ThreadSidebarVisibility::Visible,
+        agent_nickname: None,
+        agent_role: None,
+        turns: vec![turn],
+    }
+}
+
+fn turn_snapshot(id: &str, status: TurnStatus, error: Option<String>) -> Turn {
+    Turn {
+        id: id.to_owned(),
+        status,
+        turn_kind: Default::default(),
+        origin: Default::default(),
+        error,
+        prompt_manifest: None,
+        permission_profile: default_test_permission_profile(),
+    }
 }
 
 fn pending_request_id(conversation: &Conversation) -> Option<&str> {
@@ -44,6 +77,51 @@ fn apply_in_progress_turn(conversation: &mut Conversation) {
             permission_profile: default_test_permission_profile(),
         },
     });
+}
+
+#[test]
+fn thread_snapshot_hydration_locks_composer_for_running_turn() {
+    let mut conversation = Conversation::new(THREAD_ID);
+
+    conversation.sync_thread_snapshot(&thread_snapshot_with_turn(turn_snapshot(
+        TURN_ID,
+        TurnStatus::InProgress,
+        None,
+    )));
+
+    assert!(!conversation.can_submit_message());
+    assert_eq!(conversation.in_flight_turn_id(), Some(TURN_ID));
+    assert!(conversation.projection().composer_locked);
+    assert_eq!(
+        conversation.projection().in_flight_turn_id.as_deref(),
+        Some(TURN_ID)
+    );
+    assert_eq!(conversation.projection().phase_label, "running");
+}
+
+#[test]
+fn stale_terminal_thread_snapshot_does_not_unlock_local_start() {
+    let mut conversation = Conversation::new(THREAD_ID);
+    let local_turn_id = "turn_000000000000000002";
+
+    conversation.apply(ConversationEvent::LocalTurnStartRequested {
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: local_turn_id.to_owned(),
+        pending_request_id: PENDING_REQUEST_ID.to_owned(),
+        user_text: "hello".to_owned(),
+        attachments: Vec::new(),
+    });
+
+    conversation.sync_thread_snapshot(&thread_snapshot_with_turn(turn_snapshot(
+        TURN_ID,
+        TurnStatus::Completed,
+        None,
+    )));
+
+    assert!(!conversation.can_submit_message());
+    assert_eq!(conversation.in_flight_turn_id(), Some(local_turn_id));
+    assert!(conversation.projection().composer_locked);
+    assert_eq!(conversation.projection().phase_label, "starting");
 }
 
 fn permission_audit_event(

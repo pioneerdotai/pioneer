@@ -298,6 +298,10 @@ impl ConversationProjector {
         self.view_state.phase_label = state_machine.status_label().to_owned();
     }
 
+    pub fn upsert_turn_snapshot_metadata(&mut self, turn: &Turn) {
+        self.view_state.upsert_turn_snapshot_metadata(turn);
+    }
+
     pub fn apply_local_turn_start_requested(
         &mut self,
         turn_id: &str,

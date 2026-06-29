@@ -20,7 +20,8 @@ enum ThreadState {
 impl ThreadCoordinator {
     pub fn new(thread: Thread) -> Self {
         let workspace_id = thread.workspace_id.clone();
-        let conversation = Conversation::new(thread.id.clone());
+        let mut conversation = Conversation::new(thread.id.clone());
+        conversation.sync_thread_snapshot(&thread);
 
         Self {
             workspace_id,
@@ -52,6 +53,7 @@ impl ThreadCoordinator {
 
     pub fn set_snapshot(&mut self, thread: Thread) {
         self.workspace_id = thread.workspace_id.clone();
+        self.conversation.sync_thread_snapshot(&thread);
         self.thread_state = ThreadState::Ready(thread);
     }
 
