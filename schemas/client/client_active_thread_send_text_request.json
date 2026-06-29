@@ -25,8 +25,7 @@
       }
     },
     "permission_mode": {
-      "$ref": "#/$defs/TurnPermissionMode",
-      "default": "full_access"
+      "$ref": "#/$defs/TurnPermissionMode"
     },
     "selected_mode": {
       "anyOf": [
@@ -80,7 +79,8 @@
   },
   "additionalProperties": false,
   "required": [
-    "text"
+    "text",
+    "permission_mode"
   ],
   "$defs": {
     "ArtifactKind": {

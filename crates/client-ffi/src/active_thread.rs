@@ -2,6 +2,7 @@ use crate::contracts::ClientEvent;
 use crate::threads::ClientThreadTreeSnapshot;
 use pioneer_client::{
     ClientError, ClientResult,
+    cli_runtime::approvals::{PendingRequest, PendingRequestState},
     composer::{
         attachments::ComposerAttachment,
         capabilities::ComposerCapability,
@@ -41,6 +42,7 @@ use pioneer_client::{
         },
     },
 };
+use pioneer_protocol::TurnPermissionMode;
 use pioneer_protocol::{AgentExecutionBackend, GatewayNotification, Thread, ThreadMode};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -99,6 +101,7 @@ pub struct ClientActiveThreadSendTextRequest {
     pub selected_reasoning_effort: Option<String>,
     #[serde(default)]
     pub selected_mode: Option<ThreadMode>,
+    pub permission_mode: TurnPermissionMode,
     #[serde(default)]
     pub attachments: Vec<ComposerAttachment>,
     #[serde(default)]
@@ -159,6 +162,8 @@ pub struct ClientActiveThreadSnapshot {
     pub history_loading: bool,
     pub projection: ConversationViewState,
     pub rows: Vec<TimelineRow>,
+    #[serde(default)]
+    pub pending_requests: Vec<PendingRequest>,
 }
 
 #[derive(Clone, Default)]
@@ -171,6 +176,7 @@ struct ClientFfiActiveThreadInner {
     active_thread_id: Option<String>,
     coordinators: HashMap<String, ThreadCoordinator>,
     semantic_timelines: SemanticTimelineState,
+    pending_requests: PendingRequestState,
 }
 
 impl ClientFfiActiveThreadState {
@@ -292,6 +298,7 @@ impl ClientFfiActiveThreadState {
             selected_provider,
             selected_reasoning_effort,
             selected_mode,
+            permission_mode,
             attachments,
             capabilities,
             expanded_keys: _,
@@ -378,6 +385,7 @@ impl ClientFfiActiveThreadState {
                 selected_provider: Some(selection.selected_provider.clone()),
                 turn_model_provider,
                 selected_mode: Some(selection.selected_mode),
+                permission_mode,
                 execution_backend: selected_cli_runtime_backend,
                 selected_reasoning_effort,
                 cli_runtime_options: None,
@@ -725,6 +733,9 @@ impl ClientFfiActiveThreadState {
                         thread.status = status;
                     }
                 }
+                if let Some(pending_reduction) = reduction.pending_requests {
+                    inner.pending_requests.apply(pending_reduction);
+                }
                 apply_conversation_event_to_semantic_timeline_with_patch(
                     &mut inner.semantic_timelines,
                     reduction.workspace_id.as_str(),
@@ -775,6 +786,9 @@ impl ClientFfiActiveThreadState {
                     .inner
                     .lock()
                     .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
+                if let Some(pending_reduction) = reduction.pending_requests {
+                    inner.pending_requests.apply(pending_reduction);
+                }
                 if reduction.clear_active_thread_if_matches
                     && inner.active_thread_id.as_deref() == Some(reduction.thread_id.as_str())
                 {
@@ -794,10 +808,18 @@ impl ClientFfiActiveThreadState {
             | ClientRuntimeNotification::ArtifactThreadRefresh(_)
             | ClientRuntimeNotification::ArtifactDeletedRefresh(_)
             | ClientRuntimeNotification::CLIRuntimeRefresh(_)
-            | ClientRuntimeNotification::CLIRuntimePendingRequests { .. }
             | ClientRuntimeNotification::SemanticTimeline(_)
             | ClientRuntimeNotification::GatewayRemoteAccessStatusChanged(_)
             | ClientRuntimeNotification::WorkspaceChanged { .. } => {
+                SemanticTimelineCachePatch::default()
+            }
+            ClientRuntimeNotification::CLIRuntimePendingRequests { reduction, .. }
+            | ClientRuntimeNotification::PendingRequests { reduction } => {
+                let mut inner = self
+                    .inner
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
+                inner.pending_requests.apply(reduction);
                 SemanticTimelineCachePatch::default()
             }
         };
@@ -884,6 +906,9 @@ fn snapshot_from_inner(inner: &ClientFfiActiveThreadInner) -> ClientActiveThread
         history_loading: coordinator.history_loading,
         projection,
         rows,
+        pending_requests: inner
+            .pending_requests
+            .pending_for_scope(Some(coordinator.workspace_id.as_str()), Some(thread_id)),
     }
 }
 
@@ -1193,5 +1218,103 @@ fn notification_workspace_id(notification: &GatewayNotification) -> Option<&str>
         }
         GatewayNotification::Unknown(notification) => notification.workspace_id.as_deref(),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pioneer_client::cli_runtime::approvals::{PendingRequest, PendingRequestsReduction};
+    use pioneer_protocol::{
+        ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus, TurnPermissionApprovalRequest,
+    };
+    use serde_json::json;
+
+    fn thread(thread_id: &str, workspace_id: &str) -> Thread {
+        Thread {
+            workspace_id: workspace_id.to_owned(),
+            id: thread_id.to_owned(),
+            name: None,
+            preview: String::new(),
+            mode: ThreadMode::Chat,
+            model: "gpt-5.4".to_owned(),
+            model_provider: "openai".to_owned(),
+            reasoning_effort: None,
+            created_at: 1,
+            updated_at: 2,
+            status: ThreadStatus::Idle,
+            origin_kind: ThreadOriginKind::User,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            turns: Vec::new(),
+        }
+    }
+
+    fn pending_request(request_id: &str, workspace_id: &str, thread_id: &str) -> PendingRequest {
+        PendingRequest::from_native_permission_request(TurnPermissionApprovalRequest {
+            request_id: request_id.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            turn_id: "turn".to_owned(),
+            tool_name: "exec_command".to_owned(),
+            action: pioneer_protocol::TurnPermissionActionKind::ShellCommand,
+            scope_hash: format!("{request_id}_scope"),
+            reason: pioneer_protocol::TurnPermissionDecisionReason::PolicyRequiresApproval,
+            summary: None,
+            details: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn active_thread_send_text_requires_permission_mode() {
+        let error = serde_json::from_value::<ClientActiveThreadSendTextRequest>(json!({
+            "text": "hello"
+        }))
+        .expect_err("permission mode should be required");
+
+        assert!(
+            error
+                .to_string()
+                .contains("missing field `permission_mode`")
+        );
+    }
+
+    #[test]
+    fn active_thread_send_text_decodes_explicit_permission_mode() {
+        let request: ClientActiveThreadSendTextRequest = serde_json::from_value(json!({
+            "text": "hello",
+            "permission_mode": "supervised"
+        }))
+        .expect("request decodes");
+
+        assert_eq!(request.permission_mode, TurnPermissionMode::Supervised);
+    }
+
+    #[test]
+    fn active_thread_snapshot_includes_active_scope_pending_requests() {
+        let mut inner = ClientFfiActiveThreadInner {
+            active_thread_id: Some("thread_a".to_owned()),
+            ..Default::default()
+        };
+        inner.coordinators.insert(
+            "thread_a".to_owned(),
+            ThreadCoordinator::new(thread("thread_a", "ws_a")),
+        );
+        inner
+            .pending_requests
+            .apply(PendingRequestsReduction::Opened(pending_request(
+                "req_a", "ws_a", "thread_a",
+            )));
+        inner
+            .pending_requests
+            .apply(PendingRequestsReduction::Opened(pending_request(
+                "req_b", "ws_a", "thread_b",
+            )));
+
+        let snapshot = snapshot_from_inner(&inner);
+
+        assert_eq!(snapshot.pending_requests.len(), 1);
+        assert_eq!(snapshot.pending_requests[0].request_id, "req_a");
     }
 }

@@ -8,6 +8,7 @@ mod composer;
 mod contracts;
 mod diagnostics;
 mod gateway;
+mod pending_requests;
 #[cfg(feature = "schema")]
 pub mod schema;
 mod threads;
@@ -48,6 +49,10 @@ use gateway::{
     plan_add_remote_gateway_request, plan_delete_remote_gateway_registry_request,
     plan_set_gateway_workspace_registry_request, plan_update_remote_gateway_registry_request,
     validate_remote_gateway_request,
+};
+use pending_requests::{
+    ClientPendingRequestResponsePlanRequest, ClientPendingRequestResponsePlanResult,
+    plan_pending_request_response_for_bridge,
 };
 use pioneer_client::{
     agents_doc::content::{
@@ -90,7 +95,8 @@ use pioneer_protocol::{
     ProviderListModelsParams, ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
     ThreadAgentsDocArchiveParams, ThreadAgentsDocArchiveResponse, ThreadAgentsDocGetParams,
     ThreadAgentsDocGetResponse, ThreadAgentsDocSaveParams, ThreadAgentsDocSaveResponse,
-    ThreadTimelinePageParams, ThreadTimelinePageResponse, TurnWorkPageParams, TurnWorkPageResponse,
+    ThreadTimelinePageParams, ThreadTimelinePageResponse, TurnPermissionRequestRespondParams,
+    TurnPermissionRequestRespondResponse, TurnWorkPageParams, TurnWorkPageResponse,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -481,6 +487,31 @@ impl ClientFfiRuntime {
             .map_err(|error| format!("{error:#}"))
     }
 
+    fn turn_permission_request_respond(
+        &self,
+        input_json: &str,
+    ) -> Result<TurnPermissionRequestRespondResponse, String> {
+        let params = serde_json::from_str::<TurnPermissionRequestRespondParams>(input_json)
+            .map_err(|error| format!("invalid turn permission request respond params: {error}"))?;
+
+        self.client_runtime
+            .ws_command_sender()
+            .turn_permission_request_respond(params)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn pending_request_response_plan(
+        &self,
+        input_json: &str,
+    ) -> Result<ClientPendingRequestResponsePlanResult, String> {
+        let request = serde_json::from_str::<ClientPendingRequestResponsePlanRequest>(input_json)
+            .map_err(|error| {
+            format!("invalid pending request response plan request: {error}")
+        })?;
+
+        plan_pending_request_response_for_bridge(request)
+    }
+
     fn provider_list_models(&self, input_json: &str) -> Result<ProviderListModelsResponse, String> {
         let params = serde_json::from_str::<ProviderListModelsParams>(input_json)
             .map_err(|error| format!("invalid provider list models params: {error}"))?;
@@ -554,6 +585,17 @@ impl ClientFfiRuntime {
         let request = serde_json::from_str::<ReasoningEffortRowsRequest>(input_json)
             .map_err(|error| format!("invalid reasoning effort rows request: {error}"))?;
         Ok(reasoning_effort_rows_from_request(request))
+    }
+
+    fn composer_permission_mode_options(
+        &self,
+    ) -> Result<Vec<pioneer_client::composer::permissions::ComposerPermissionModeOption>, String>
+    {
+        Ok(
+            pioneer_client::composer::permissions::composer_permission_mode_options()
+                .into_iter()
+                .collect(),
+        )
     }
 
     fn composer_attachment_from_path(
@@ -1032,6 +1074,14 @@ ffi_client_json_method!(
     cli_runtime_request_respond
 );
 ffi_client_json_method!(
+    pioneer_client_ffi_turn_permission_request_respond,
+    turn_permission_request_respond
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_pending_request_response_plan,
+    pending_request_response_plan
+);
+ffi_client_json_method!(
     pioneer_client_ffi_provider_list_models,
     provider_list_models
 );
@@ -1043,6 +1093,14 @@ ffi_client_json_method!(
     pioneer_client_ffi_reasoning_effort_rows,
     reasoning_effort_rows
 );
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pioneer_client_ffi_composer_permission_mode_options(
+    ptr: *mut PioneerClientFfi,
+) -> *mut c_char {
+    ffi_client_response(ptr, "composer_permission_mode_options", |runtime| {
+        runtime.composer_permission_mode_options()
+    })
+}
 ffi_client_json_method!(
     pioneer_client_ffi_composer_attachment_from_path,
     composer_attachment_from_path
@@ -1388,6 +1446,28 @@ mod tests {
         let value: serde_json::Value = decode_response(response.as_str());
 
         assert_eq!(value["value"], 1);
+    }
+
+    #[test]
+    fn composer_permission_mode_options_use_shared_client_contract() {
+        let runtime = ClientFfiRuntime::default();
+        let options = runtime
+            .composer_permission_mode_options()
+            .expect("composer permission options");
+
+        assert_eq!(options.len(), 3);
+        assert_eq!(
+            options[0].mode,
+            pioneer_protocol::TurnPermissionMode::Supervised
+        );
+        assert_eq!(
+            options[1].mode,
+            pioneer_protocol::TurnPermissionMode::AutoAcceptEdits
+        );
+        assert_eq!(
+            options[2].mode,
+            pioneer_protocol::TurnPermissionMode::FullAccess
+        );
     }
 
     #[test]

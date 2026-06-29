@@ -152,6 +152,62 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             crate::contracts::ClientGatewayWsTimings
         ),
         schema_doc!(
+            "client_pending_request_response_action.json",
+            crate::pending_requests::ClientPendingRequestResponseAction
+        ),
+        schema_doc!(
+            "client_pending_request_response_plan_request.json",
+            crate::pending_requests::ClientPendingRequestResponsePlanRequest
+        ),
+        schema_doc!(
+            "client_pending_request_response_plan_result.json",
+            crate::pending_requests::ClientPendingRequestResponsePlanResult
+        ),
+        schema_doc!(
+            "pending_request.json",
+            pioneer_client::cli_runtime::approvals::PendingRequest
+        ),
+        schema_doc!(
+            "pending_request_kind.json",
+            pioneer_client::cli_runtime::approvals::PendingRequestKind
+        ),
+        schema_doc!(
+            "pending_request_origin.json",
+            pioneer_client::cli_runtime::approvals::PendingRequestOrigin
+        ),
+        schema_doc!(
+            "pending_request_payload.json",
+            pioneer_client::cli_runtime::approvals::PendingRequestPayload
+        ),
+        schema_doc!(
+            "pending_request_resolution.json",
+            pioneer_client::cli_runtime::approvals::PendingRequestResolution
+        ),
+        schema_doc!(
+            "turn_permission_approval_request.json",
+            pioneer_protocol::TurnPermissionApprovalRequest
+        ),
+        schema_doc!(
+            "turn_permission_approval_resolution.json",
+            pioneer_protocol::TurnPermissionApprovalResolution
+        ),
+        schema_doc!(
+            "turn_permission_request_opened_notification.json",
+            pioneer_protocol::TurnPermissionRequestOpenedNotification
+        ),
+        schema_doc!(
+            "turn_permission_request_resolved_notification.json",
+            pioneer_protocol::TurnPermissionRequestResolvedNotification
+        ),
+        schema_doc!(
+            "turn_permission_request_respond_params.json",
+            pioneer_protocol::TurnPermissionRequestRespondParams
+        ),
+        schema_doc!(
+            "turn_permission_request_respond_response.json",
+            pioneer_protocol::TurnPermissionRequestRespondResponse
+        ),
+        schema_doc!(
             "thread_agents_doc_archive_params.json",
             pioneer_protocol::ThreadAgentsDocArchiveParams
         ),

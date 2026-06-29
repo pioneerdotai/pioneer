@@ -47,7 +47,9 @@ fn map_timeline_page_error(error: anyhow::Error) -> ClientFfiError {
 
     if message == WEBSOCKET_WORKER_UNAVAILABLE_MESSAGE
         || lower.contains("timed out waiting for `threadtimeline/page` response")
+        || lower.contains("timed out waiting for `thread/timeline/page` response")
         || lower.contains("timed out waiting for `turnwork/page` response")
+        || lower.contains("timed out waiting for `turn/work/page` response")
         || lower.contains(worker::WEBSOCKET_PONG_TIMEOUT_MESSAGE)
         || lower.contains(worker::WEBSOCKET_COMMAND_CHANNEL_CLOSED_MESSAGE)
         || lower.contains(worker::WEBSOCKET_CLOSED_BY_PEER_MESSAGE)
@@ -61,10 +63,15 @@ fn map_timeline_page_error(error: anyhow::Error) -> ClientFfiError {
     }
 
     if lower.contains("invalid params for `threadtimeline/page`")
+        || lower.contains("invalid params for `thread/timeline/page`")
         || lower.contains("invalid params for `turnwork/page`")
+        || lower.contains("invalid params for `turn/work/page`")
         || lower.contains("thread_id is required for threadtimeline/page")
+        || lower.contains("thread_id is required for thread/timeline/page")
         || lower.contains("thread_id is required for turnwork/page")
+        || lower.contains("thread_id is required for turn/work/page")
         || lower.contains("turn_id is required for turnwork/page")
+        || lower.contains("turn_id is required for turn/work/page")
         || lower.contains("failed to encode json-rpc params")
         || lower.contains("failed to decode `threadtimeline/page` response payload")
         || lower.contains("failed to decode `turnwork/page` response payload")
