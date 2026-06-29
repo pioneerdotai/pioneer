@@ -5,6 +5,7 @@ use crate::events::{ToolEventBus, ToolEventTrace};
 use crate::orchestrator::ToolOrchestrator;
 use crate::output_policy::{DeltaOutputPolicy, ToolDisplayPayload};
 use crate::output_projection::{ToolProjectionInput, project_tool_result};
+use crate::permissions::PermissionEvaluationContext;
 use crate::router::{ToolCall, ToolRouter};
 use crate::spec::ExecutionClass;
 use serde_json::Value as JsonValue;
@@ -23,6 +24,7 @@ pub struct ToolCallRuntime {
     orchestrator: Arc<ToolOrchestrator>,
     event_bus: ToolEventBus,
     turn_id: String,
+    permission_context: PermissionEvaluationContext,
     workdir: PathBuf,
     environment: BTreeMap<String, String>,
     global_lock: Arc<RwLock<()>>,
@@ -35,13 +37,22 @@ impl ToolCallRuntime {
         orchestrator: Arc<ToolOrchestrator>,
         event_bus: ToolEventBus,
         turn_id: impl Into<String>,
+        permission_context: PermissionEvaluationContext,
         workdir: PathBuf,
     ) -> Self {
+        let turn_id = turn_id.into();
+        assert!(
+            permission_context.workspace_id.is_some()
+                && permission_context.thread_id.is_some()
+                && permission_context.turn_id.as_deref() == Some(turn_id.as_str()),
+            "tool runtime requires a resolved permission context for its turn"
+        );
         Self {
             router,
             orchestrator,
             event_bus,
-            turn_id: turn_id.into(),
+            turn_id,
+            permission_context,
             workdir,
             environment: BTreeMap::new(),
             global_lock: Arc::new(RwLock::new(())),
@@ -52,6 +63,15 @@ impl ToolCallRuntime {
     pub fn with_environment(mut self, environment: BTreeMap<String, String>) -> Self {
         self.environment = environment;
         self
+    }
+
+    pub fn with_orchestrator(mut self, orchestrator: Arc<ToolOrchestrator>) -> Self {
+        self.orchestrator = orchestrator;
+        self
+    }
+
+    pub fn permission_context(&self) -> &PermissionEvaluationContext {
+        &self.permission_context
     }
 
     pub fn router(&self) -> Arc<ToolRouter> {
@@ -320,6 +340,7 @@ impl ToolCallRuntime {
             source,
             workdir.clone(),
             self.environment.clone(),
+            &self.permission_context,
             trace,
             cancellation.clone(),
         );
@@ -353,6 +374,7 @@ fn classify_call_error(
         attempt_id: 1,
         idempotency_key: call.idempotency_key.clone(),
         recovery: call.recovery,
+        permission_metadata: call.permission_metadata.clone(),
         cancellation: CancellationToken::new(),
     };
     DefaultErrorClassifier.classify_error(&invocation, error)
@@ -365,10 +387,16 @@ fn payload_arguments_json(payload: &ToolPayload) -> JsonValue {
             server,
             tool,
             arguments,
+            read_only_hint,
+            destructive_hint,
+            open_world_hint,
         } => serde_json::json!({
             "server": server,
             "tool": tool,
             "arguments": arguments,
+            "read_only_hint": read_only_hint,
+            "destructive_hint": destructive_hint,
+            "open_world_hint": open_world_hint,
         }),
         ToolPayload::LocalShell(LocalShellPayload::ExecCommand(args)) => {
             serde_json::to_value(args).unwrap_or_else(|_| serde_json::json!({}))
@@ -555,6 +583,12 @@ mod tests {
             orchestrator,
             event_bus,
             "turn_test",
+            crate::PermissionEvaluationContext::for_turn(
+                "workspace_test",
+                "thread_test",
+                "turn_test",
+                pioneer_protocol::default_turn_permission_profile_snapshot(),
+            ),
             PathBuf::from("."),
         )
     }
@@ -568,6 +602,7 @@ mod tests {
             },
             execution_class: class,
             recovery: crate::spec::ToolRecoveryMetadata::default(),
+            permission_metadata: crate::spec::ToolPermissionMetadata::default(),
             output_policy: crate::output_policy::ToolOutputPolicySnapshot::for_tool_name(tool_name),
             output_projection: crate::output_policy::ToolOutputProjectionKind::Builtin,
             idempotency_key: None,
@@ -588,12 +623,99 @@ mod tests {
             })),
             execution_class: ExecutionClass::SessionScoped,
             recovery: crate::spec::ToolRecoveryMetadata::default(),
+            permission_metadata: crate::spec::ToolPermissionMetadata::default(),
             output_policy: crate::output_policy::ToolOutputPolicySnapshot::for_tool_name(tool_name),
             output_projection: crate::output_policy::ToolOutputProjectionKind::Builtin,
             idempotency_key: Some(format!("{tool_name}:{call_id}")),
             trace_id: format!("trace_{call_id}"),
             session_scope_key: Some(format!("shell:{session_id}")),
         }
+    }
+
+    #[test]
+    fn runtime_permission_context_tracks_explicit_turn_profile() {
+        let runtime = build_runtime(
+            "tool",
+            ExecutionClass::Shared,
+            Arc::new(SleepHandler {
+                sleep_ms: 1,
+                active: Arc::new(AtomicUsize::new(0)),
+                max_active: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+
+        assert_eq!(
+            runtime.permission_context().turn_id.as_deref(),
+            Some("turn_test")
+        );
+        assert_eq!(
+            runtime.permission_context().permission_profile.mode,
+            pioneer_protocol::TurnPermissionMode::FullAccess
+        );
+    }
+
+    #[test]
+    fn runtime_can_be_constructed_with_restricted_turn_snapshot() {
+        let mut builder = ToolRegistryBuilder::new();
+        builder.push_configured_spec(ConfiguredToolSpec::with_output_projection(
+            ToolSpec::new(
+                "tool",
+                "test tool",
+                serde_json::json!({ "type": "object" }),
+                PayloadKind::Function,
+            ),
+            ExecutionClass::Shared,
+            dynamic_unknown_output_policy(),
+            ToolOutputProjectionKind::DynamicGeneric,
+        ));
+        builder.register_dyn_handler(
+            "tool",
+            Arc::new(SleepHandler {
+                sleep_ms: 1,
+                active: Arc::new(AtomicUsize::new(0)),
+                max_active: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let (specs, registry) = builder.build();
+        let visibility = ToolVisibilitySnapshot::new(
+            specs
+                .iter()
+                .map(|configured| configured.spec.clone())
+                .collect(),
+        );
+        let event_bus = ToolEventBus::default();
+        let router = Arc::new(ToolRouter::new(
+            specs,
+            registry,
+            visibility,
+            event_bus.clone(),
+            "turn",
+        ));
+        let runtime = ToolCallRuntime::new(
+            router,
+            Arc::new(ToolOrchestrator::default()),
+            event_bus,
+            "turn",
+            crate::PermissionEvaluationContext::for_turn(
+                "workspace",
+                "thread",
+                "turn",
+                pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+                    pioneer_protocol::TurnPermissionMode::Supervised,
+                    pioneer_protocol::TurnPermissionProfileSource::Composer,
+                ),
+            ),
+            PathBuf::from("."),
+        );
+
+        assert_eq!(
+            runtime.permission_context().workspace_id.as_deref(),
+            Some("workspace")
+        );
+        assert_eq!(
+            runtime.permission_context().permission_profile.mode,
+            pioneer_protocol::TurnPermissionMode::Supervised
+        );
     }
 
     #[tokio::test]
@@ -746,6 +868,7 @@ mod tests {
 
             match event.kind() {
                 ToolEventKind::CallStarted => seen_started = true,
+                ToolEventKind::PermissionAudit => {}
                 ToolEventKind::OutputDelta => seen_delta = true,
                 ToolEventKind::CallCompleted => {
                     seen_completed = true;
@@ -818,8 +941,12 @@ mod tests {
 
         assert_eq!(
             application_stages,
-            vec!["runtime.call.started", "runtime.call.completed"],
-            "ToolEventBus must carry product lifecycle events only"
+            vec![
+                "runtime.call.started",
+                "permission.audit",
+                "runtime.call.completed"
+            ],
+            "ToolEventBus must carry product lifecycle and permission audit events only"
         );
     }
 
@@ -855,8 +982,12 @@ mod tests {
 
         assert_eq!(
             application_stages,
-            vec!["runtime.call.started", "runtime.call.failed"],
-            "failed calls must terminalize through product lifecycle events only"
+            vec![
+                "runtime.call.started",
+                "permission.audit",
+                "runtime.call.failed"
+            ],
+            "failed calls must terminalize through product lifecycle and permission audit events only"
         );
     }
 }

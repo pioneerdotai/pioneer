@@ -876,7 +876,6 @@ mod tests {
         for expected in [
             "agent_execution_backend.json",
             "cli_agent_runtime_kind.json",
-            "cli_agent_runtime_approval_policy.json",
             "cli_agent_runtime_sandbox_policy.json",
             "turn_cli_runtime_options.json",
             "runtime_summary.json",

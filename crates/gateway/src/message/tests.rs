@@ -147,6 +147,15 @@ fn default_test_permission_profile() -> pioneer_protocol::TurnPermissionProfileS
     pioneer_protocol::default_turn_permission_profile_snapshot()
 }
 
+fn test_tools_permission_context(turn_id: &str) -> pioneer_tools::PermissionEvaluationContext {
+    pioneer_tools::PermissionEvaluationContext::for_turn(
+        "workspace_test",
+        "thread_test",
+        turn_id,
+        default_test_permission_profile(),
+    )
+}
+
 #[derive(Default)]
 struct RecordingThreadEpisodicIngestor {
     calls: TokioMutex<Vec<ThreadEpisodicCommittedItem>>,
@@ -2110,7 +2119,9 @@ fn test_task_create_params(
             },
             context_policy: None,
             tool_policy: None,
-            permission_cap: None,
+            permission_cap: Some(pioneer_protocol::task_permission_cap_from_snapshot(
+                &pioneer_protocol::default_turn_permission_profile_snapshot(),
+            )),
             result_contract: None,
             review_policy: None,
             depth: 0,
@@ -7574,7 +7585,6 @@ async fn blocked_execution_window_recovery_blocks_child_task_run_without_failure
             task_id: response.task.id.clone(),
             execution_id: Some(execution.id.clone()),
             worker_id: "task-window-block-recovery".to_owned(),
-            permission_profile: None,
         },
         current_run,
         handle,
@@ -24049,6 +24059,7 @@ async fn turn_start_materializes_mcp_tool_bindings_and_executes_tool() {
     let built_tools = pioneer_tools::build_tools(
         std::env::temp_dir(),
         "turn_000000000000000131",
+        test_tools_permission_context("turn_000000000000000131"),
         tool_loop_config.web,
         tool_loop_config.computer_use,
         materialization.bundles,
@@ -27960,7 +27971,8 @@ async fn built_memory_tools(harness: &MemoryGatewayHarness, turn_suffix: &str) -
     let tool_loop_config = test_tool_loop_config();
     build_tools(
         harness.runtime_home.clone(),
-        context.turn_id,
+        context.turn_id.clone(),
+        test_tools_permission_context(&context.turn_id),
         tool_loop_config.web,
         tool_loop_config.computer_use,
         materialization.bundles,
@@ -29010,9 +29022,11 @@ async fn memory_task_runtime_context_materializes_all_memory_tools() {
     assert!(materialization.diagnostics.is_empty());
 
     let tool_loop_config = test_tool_loop_config();
+    let tools_turn_id = generate_test_request_id("turn", "task_runtime_memory_tools");
     let tools = build_tools(
         harness.runtime_home.clone(),
-        generate_test_request_id("turn", "task_runtime_memory_tools"),
+        tools_turn_id.clone(),
+        test_tools_permission_context(&tools_turn_id),
         tool_loop_config.web,
         tool_loop_config.computer_use,
         materialization.bundles,

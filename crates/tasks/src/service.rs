@@ -1611,6 +1611,7 @@ impl TaskService {
             prompt: input.prompt,
             context_policy: input.context_policy,
             tool_policy: input.tool_policy,
+            permission_cap: input.permission_cap,
             result_contract: input.result_contract,
             review_policy: agent_review_policy,
             depth,
@@ -3011,11 +3012,23 @@ impl TaskService {
                 }
                 None => Default::default(),
             };
+            let permission_profile = match (
+                child_anchor.child_thread_id.as_deref(),
+                child_anchor.child_turn_id.as_deref(),
+            ) {
+                (Some(thread_id), Some(turn_id)) => self
+                    .store
+                    .get_turn(thread_id, turn_id)
+                    .await?
+                    .map(|(_, turn)| turn.permission_profile),
+                _ => None,
+            };
             let item = TaskWaitItem {
                 task: response.task.clone(),
                 run: run.clone(),
                 child_thread_id: child_anchor.child_thread_id,
                 child_turn_id: child_anchor.child_turn_id,
+                permission_profile,
             };
             total_count = total_count.saturating_add(1);
             match wait_item_state(&item) {
@@ -3203,6 +3216,7 @@ impl TaskService {
                 run: None,
                 child_thread_id: None,
                 child_turn_id: None,
+                permission_profile: None,
             },
             reason: TaskWaitNonWaitableReason::FutureScheduledTaskWithoutActiveRun,
             next_fire_at: Some(next_fire_at),
@@ -3682,6 +3696,9 @@ fn validate_create_params(params: &TaskCreateParams) -> TaskRuntimeResult<()> {
             .is_none()
         {
             bail!("agent executor requires agent_spec.model_provider");
+        }
+        if agent_spec.permission_cap.is_none() {
+            bail!("agent executor requires agent_spec.permission_cap");
         }
         validate_agent_spec_for_trigger(params.trigger.spec.kind(), agent_spec)?;
     }

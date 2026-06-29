@@ -279,6 +279,15 @@ fn set_execution_window_budget(
     config.execution_windows.window.max_tool_calls_per_window = max_tool_calls_per_window;
 }
 
+fn test_tools_permission_context(turn_id: &str) -> pioneer_tools::PermissionEvaluationContext {
+    pioneer_tools::PermissionEvaluationContext::for_turn(
+        "workspace_test",
+        "thread_test",
+        turn_id,
+        pioneer_protocol::default_turn_permission_profile_snapshot(),
+    )
+}
+
 fn test_manager() -> AgentManager {
     let registry = Arc::new(ProviderRegistry::with_provider(
         "echo",
@@ -5848,6 +5857,7 @@ async fn phase_10_preflight_selected_optional_domain_tool_schemas_are_serialized
     let computer_use_available = pioneer_tools::build_builtin_tools(
         ".",
         "turn_phase10_computer_use_probe",
+        test_tools_permission_context("turn_phase10_computer_use_probe"),
         probe_tool_loop_config.web,
         probe_tool_loop_config.computer_use,
     )
@@ -6142,6 +6152,7 @@ async fn computer_use_text_only_model_does_not_gate_computer_use() {
     let computer_use_available = pioneer_tools::build_builtin_tools(
         ".",
         "turn_computer_use_text_only_no_gate_probe",
+        test_tools_permission_context("turn_computer_use_text_only_no_gate_probe"),
         probe_tool_loop_config.web,
         probe_tool_loop_config.computer_use,
     )
@@ -6193,6 +6204,7 @@ async fn computer_use_registered_tool_exposes_when_preflight_selects_it() {
     let computer_use_available = pioneer_tools::build_builtin_tools(
         ".",
         "turn_computer_use_registered_tool_probe",
+        test_tools_permission_context("turn_computer_use_registered_tool_probe"),
         probe_tool_loop_config.web,
         probe_tool_loop_config.computer_use,
     )

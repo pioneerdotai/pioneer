@@ -45,6 +45,7 @@ fn invocation(payload: JsonValue) -> ToolInvocation {
         attempt_id: 1,
         idempotency_key: None,
         recovery: ToolRecoveryMetadata::default(),
+        permission_metadata: crate::spec::ToolPermissionMetadata::default(),
         cancellation: tokio_util::sync::CancellationToken::new(),
     }
 }

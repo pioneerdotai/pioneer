@@ -92,7 +92,6 @@ impl TaskAgentExecutor {
             return self
                 .recover_existing_child_turn(
                     &processor,
-                    &context,
                     &task_response,
                     &run,
                     &agent_spec,
@@ -111,10 +110,8 @@ impl TaskAgentExecutor {
             TaskExecutorStartOutcome::Started => {}
             outcome => return Ok(outcome),
         }
-        let occurrence_permission_profile = effective_task_child_permission_profile(
-            &agent_spec,
-            context.permission_profile.as_ref(),
-        );
+        let occurrence_permission_profile =
+            effective_task_child_permission_profile(&agent_spec, None)?;
         let parent = ensure_task_run_occurrence_context(
             &processor,
             &task_response,
@@ -239,10 +236,7 @@ impl TaskAgentExecutor {
         let child_thread_id = child_runtime.task_run_turn.thread_id.clone();
         let child_turn_id = child_runtime.task_run_turn.turn_id.clone();
         let effective_model = effective_agent_model(agent_spec)?;
-        let child_permission_profile = effective_task_child_permission_profile(
-            agent_spec,
-            context.permission_profile.as_ref(),
-        );
+        let child_permission_profile = effective_task_child_permission_profile(agent_spec, None)?;
         let thread_params = pioneer_protocol::ThreadStartParams {
             thread_id: child_thread_id.clone(),
             workspace_id: context.workspace_id.clone(),
@@ -645,7 +639,7 @@ impl TaskAgentExecutor {
             )
             .await
             .context("failed to restore revision task thread")?;
-        let child_permission_profile = effective_task_child_permission_profile(agent_spec, None);
+        let child_permission_profile = effective_task_child_permission_profile(agent_spec, None)?;
         let input = materialize_child_task_input(
             materialize_child_task_prompt(
                 processor,
@@ -943,7 +937,6 @@ impl TaskAgentExecutor {
     async fn recover_existing_child_turn(
         &self,
         processor: &Arc<MessageProcessor>,
-        context: &TaskExecutionContext,
         task_response: &TaskGetResponse,
         run: &TaskRun,
         agent_spec: &TaskAgentSpec,
@@ -1005,7 +998,7 @@ impl TaskAgentExecutor {
                     agent_spec,
                     execution,
                     &child_runtime,
-                    context.permission_profile.as_ref(),
+                    None,
                     handle,
                 )
                 .await
@@ -1082,7 +1075,7 @@ impl TaskAgentExecutor {
             .await
             .context("failed to restore hidden task thread")?;
         let child_permission_profile =
-            effective_task_child_permission_profile(agent_spec, launch_permission_profile);
+            effective_task_child_permission_profile(agent_spec, launch_permission_profile)?;
         let input = materialize_child_task_input(
             materialize_child_task_prompt(
                 processor,
@@ -1783,7 +1776,8 @@ impl TaskAgentExecutor {
             text: prompt,
             text_elements: Vec::new(),
         }];
-        let reviewer_permission_profile = effective_task_child_permission_profile(agent_spec, None);
+        let reviewer_permission_profile =
+            effective_task_child_permission_profile(agent_spec, None)?;
         let turn_outcome = processor
             .thread_manager
             .system_turn_start_with_permission_profile(
@@ -3228,13 +3222,14 @@ fn effective_agent_model(agent_spec: &TaskAgentSpec) -> Result<EffectiveAgentMod
 fn effective_task_child_permission_profile(
     agent_spec: &TaskAgentSpec,
     launch_profile: Option<&TurnPermissionProfileSnapshot>,
-) -> TurnPermissionProfileSnapshot {
-    let cap = agent_spec.permission_cap.clone().unwrap_or_else(|| {
-        pioneer_protocol::task_permission_cap_from_snapshot(
-            &pioneer_protocol::default_turn_permission_profile_snapshot(),
+) -> Result<TurnPermissionProfileSnapshot> {
+    let cap = agent_spec.permission_cap.as_ref().ok_or_else(|| {
+        anyhow!(
+            "task agent spec `{}` is missing permission_cap",
+            agent_spec.id
         )
-    });
-    let cap_profile = pioneer_protocol::task_permission_cap_snapshot(&cap);
+    })?;
+    let cap_profile = pioneer_protocol::task_permission_cap_snapshot(cap);
     let launcher = launch_profile
         .cloned()
         .unwrap_or_else(pioneer_protocol::default_turn_permission_profile_snapshot);
@@ -3246,7 +3241,7 @@ fn effective_task_child_permission_profile(
     if let Some(tool_policy) = agent_spec.tool_policy.as_ref() {
         apply_task_tool_policy_to_permission_profile(&mut profile, tool_policy);
     }
-    profile
+    Ok(profile)
 }
 
 fn apply_task_tool_policy_to_permission_profile(
@@ -4638,18 +4633,12 @@ mod tests {
     }
 
     #[test]
-    fn task_child_permission_profile_defaults_missing_cap_to_full_access() {
+    fn task_child_permission_profile_rejects_missing_cap() {
         let agent_spec = permission_test_agent_spec(None, None);
-        let profile = effective_task_child_permission_profile(&agent_spec, None);
+        let error = effective_task_child_permission_profile(&agent_spec, None)
+            .expect_err("missing permission cap should fail");
 
-        assert_eq!(
-            profile.mode,
-            pioneer_protocol::TurnPermissionMode::FullAccess
-        );
-        assert_eq!(
-            profile.effective_policy,
-            ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow)
-        );
+        assert!(format!("{error:#}").contains("missing permission_cap"));
     }
 
     #[test]
@@ -4666,6 +4655,7 @@ mod tests {
                 None,
             );
             let profile = effective_task_child_permission_profile(&agent_spec, None);
+            let profile = profile.expect("permission cap should produce a profile");
 
             assert_eq!(profile.mode, mode);
             assert_eq!(
@@ -4686,7 +4676,8 @@ mod tests {
         let launch_profile = pioneer_protocol::inherited_turn_permission_profile_snapshot(
             pioneer_protocol::TurnPermissionMode::Supervised,
         );
-        let profile = effective_task_child_permission_profile(&agent_spec, Some(&launch_profile));
+        let profile = effective_task_child_permission_profile(&agent_spec, Some(&launch_profile))
+            .expect("permission cap should produce a profile");
 
         assert_eq!(
             profile.mode,
@@ -4706,7 +4697,8 @@ mod tests {
         let launch_profile = pioneer_protocol::system_turn_permission_profile_snapshot(
             pioneer_protocol::TurnPermissionMode::FullAccess,
         );
-        let profile = effective_task_child_permission_profile(&agent_spec, Some(&launch_profile));
+        let profile = effective_task_child_permission_profile(&agent_spec, Some(&launch_profile))
+            .expect("permission cap should produce a profile");
 
         assert_eq!(
             profile.mode,
@@ -4728,7 +4720,8 @@ mod tests {
                 network_access: false,
             }),
         );
-        let profile = effective_task_child_permission_profile(&agent_spec, None);
+        let profile = effective_task_child_permission_profile(&agent_spec, None)
+            .expect("permission cap should produce a profile");
 
         assert_eq!(
             profile.mode,
@@ -5082,7 +5075,9 @@ mod tests {
             },
             context_policy: None,
             tool_policy: None,
-            permission_cap: None,
+            permission_cap: Some(pioneer_protocol::task_permission_cap_from_snapshot(
+                &pioneer_protocol::default_turn_permission_profile_snapshot(),
+            )),
             result_contract: None,
             review_policy: None,
             depth: 0,

@@ -161,6 +161,9 @@ pub fn materialize_mcp_runtime_tools(
             raw_tool_name: descriptor.raw_tool_name.clone(),
             catalog_version: descriptor.catalog_version.clone(),
             snapshot_version: descriptor.snapshot_version,
+            read_only_hint: descriptor.annotations.read_only_hint,
+            destructive_hint: descriptor.annotations.destructive_hint,
+            open_world_hint: descriptor.annotations.open_world_hint,
         });
 
         bindings.push(McpDynamicToolBinding {

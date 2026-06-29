@@ -5,7 +5,7 @@ use crate::output_policy::{
 };
 use pioneer_protocol::{
     ItemDeltaStream, ProtocolEventClass, StorageOutputPolicy, TimelineOutputPolicy, ToolMetadata,
-    ToolOutputSummary, ToolRecoveryPolicySnapshot,
+    ToolOutputSummary, ToolRecoveryPolicySnapshot, TurnPermissionAuditEvent,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -21,6 +21,7 @@ use tracing::debug;
 #[serde(rename_all = "snake_case")]
 pub enum ToolEventKind {
     CallStarted,
+    PermissionAudit,
     OutputDelta,
     CallCompleted,
     CallFailed,
@@ -30,6 +31,7 @@ pub enum ToolEventKind {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolEventPayload {
     CallStarted(ToolCallStartedEvent),
+    PermissionAudit(TurnPermissionAuditEvent),
     OutputDelta(ToolOutputDeltaEvent),
     CallCompleted(ToolCallCompletedEvent),
     CallFailed(ToolCallFailedEvent),
@@ -39,6 +41,7 @@ impl ToolEventPayload {
     pub fn kind(&self) -> ToolEventKind {
         match self {
             Self::CallStarted(_) => ToolEventKind::CallStarted,
+            Self::PermissionAudit(_) => ToolEventKind::PermissionAudit,
             Self::OutputDelta(_) => ToolEventKind::OutputDelta,
             Self::CallCompleted(_) => ToolEventKind::CallCompleted,
             Self::CallFailed(_) => ToolEventKind::CallFailed,
@@ -48,9 +51,10 @@ impl ToolEventPayload {
     pub fn event_class(&self) -> ProtocolEventClass {
         match self {
             Self::OutputDelta(_) => ProtocolEventClass::Progress,
-            Self::CallStarted(_) | Self::CallCompleted(_) | Self::CallFailed(_) => {
-                ProtocolEventClass::Durable
-            }
+            Self::CallStarted(_)
+            | Self::PermissionAudit(_)
+            | Self::CallCompleted(_)
+            | Self::CallFailed(_) => ProtocolEventClass::Durable,
         }
     }
 }
@@ -223,6 +227,15 @@ impl ToolEventTrace {
             message = message.as_deref().unwrap_or(""),
             metadata = ?metadata,
             "tool pipeline stage"
+        );
+    }
+
+    pub fn emit_permission_audit(&self, attempt_id: u32, event: TurnPermissionAuditEvent) {
+        self.event_bus.emit_internal(
+            self,
+            attempt_id,
+            "permission.audit",
+            ToolEventPayload::PermissionAudit(event),
         );
     }
 

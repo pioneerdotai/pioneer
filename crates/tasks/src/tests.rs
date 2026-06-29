@@ -461,6 +461,12 @@ fn create_params(spec: TaskTriggerSpec) -> TaskCreateParams {
     }
 }
 
+fn test_permission_cap() -> pioneer_protocol::TurnPermissionProfileCap {
+    pioneer_protocol::task_permission_cap_from_snapshot(
+        &pioneer_protocol::default_turn_permission_profile_snapshot(),
+    )
+}
+
 fn agent_spec(max_depth: i64) -> TaskAgentSpecInput {
     TaskAgentSpecInput {
         agent_role: None,
@@ -475,6 +481,7 @@ fn agent_spec(max_depth: i64) -> TaskAgentSpecInput {
         },
         context_policy: None,
         tool_policy: None,
+        permission_cap: Some(test_permission_cap()),
         result_contract: None,
         review_policy: None,
         depth: 0,
@@ -3850,6 +3857,24 @@ async fn cron_trigger_computes_moscow_morning_fire_in_utc() {
     .expect("cron should compute")
     .expect("cron should have next fire");
     assert_eq!(next, 1_778_817_600);
+}
+
+#[tokio::test]
+async fn agent_task_create_requires_permission_cap() {
+    let runtime = runtime().await;
+    let mut params = create_params(TaskTriggerSpec::Immediate);
+    params.executor_kind = TaskExecutorKind::Agent;
+    let mut spec = agent_spec(3);
+    spec.permission_cap = None;
+    params.agent_spec = Some(spec);
+
+    let error = runtime
+        .service()
+        .create_task(TaskCreateContext::default(), params)
+        .await
+        .expect_err("agent task should reject missing permission cap");
+
+    assert!(format!("{error:#}").contains("agent_spec.permission_cap"));
 }
 
 #[tokio::test]

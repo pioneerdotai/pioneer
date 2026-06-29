@@ -34,19 +34,18 @@ use crate::artifact::{
 
 use crate::{
     AgentDurableEvent, AgentExecutionBackend, AgentMessagePhase, AgentProgressEvent, ByteRange,
-    CLIAgentRuntimeApprovalPolicy, CLIAgentRuntimeKind, CLIAgentRuntimeSandboxPolicy,
-    CLIRuntimeAccountUpdatedNotification, CLIRuntimeAppsChangedNotification, CLIRuntimeGetParams,
-    CLIRuntimeGetResponse, CLIRuntimeListModelsParams, CLIRuntimeListModelsResponse,
-    CLIRuntimeListParams, CLIRuntimeListResponse, CLIRuntimeLoginCancelParams,
-    CLIRuntimeLoginCancelResponse, CLIRuntimeLoginStartParams, CLIRuntimeLoginStartResponse,
-    CLIRuntimeLoginStartType, CLIRuntimePendingRequest, CLIRuntimePendingRequestStatus,
-    CLIRuntimeRefreshParams, CLIRuntimeRefreshResponse, CLIRuntimeRequestKind,
-    CLIRuntimeRequestOpenedNotification, CLIRuntimeRequestResolution,
-    CLIRuntimeRequestResolvedNotification, CLIRuntimeRequestRespondParams,
-    CLIRuntimeRequestRespondResponse, CLIRuntimeReviewDelivery, CLIRuntimeReviewStartParams,
-    CLIRuntimeReviewStartResponse, CLIRuntimeReviewTarget, CLIRuntimeStatusChangedNotification,
-    CLIRuntimeStatusParams, CLIRuntimeStatusResponse, CLIRuntimeThreadBinding,
-    CLIRuntimeThreadBindingGetParams, CLIRuntimeThreadBindingGetResponse,
+    CLIAgentRuntimeKind, CLIAgentRuntimeSandboxPolicy, CLIRuntimeAccountUpdatedNotification,
+    CLIRuntimeAppsChangedNotification, CLIRuntimeGetParams, CLIRuntimeGetResponse,
+    CLIRuntimeListModelsParams, CLIRuntimeListModelsResponse, CLIRuntimeListParams,
+    CLIRuntimeListResponse, CLIRuntimeLoginCancelParams, CLIRuntimeLoginCancelResponse,
+    CLIRuntimeLoginStartParams, CLIRuntimeLoginStartResponse, CLIRuntimeLoginStartType,
+    CLIRuntimePendingRequest, CLIRuntimePendingRequestStatus, CLIRuntimeRefreshParams,
+    CLIRuntimeRefreshResponse, CLIRuntimeRequestKind, CLIRuntimeRequestOpenedNotification,
+    CLIRuntimeRequestResolution, CLIRuntimeRequestResolvedNotification,
+    CLIRuntimeRequestRespondParams, CLIRuntimeRequestRespondResponse, CLIRuntimeReviewDelivery,
+    CLIRuntimeReviewStartParams, CLIRuntimeReviewStartResponse, CLIRuntimeReviewTarget,
+    CLIRuntimeStatusChangedNotification, CLIRuntimeStatusParams, CLIRuntimeStatusResponse,
+    CLIRuntimeThreadBinding, CLIRuntimeThreadBindingGetParams, CLIRuntimeThreadBindingGetResponse,
     CLIRuntimeThreadCompactParams, CLIRuntimeThreadCompactResponse, CLIRuntimeThreadForkParams,
     CLIRuntimeThreadForkResponse, CLIRuntimeTurnSteerParams, CLIRuntimeTurnSteerResponse,
     ContextCompressedNotification, ContextCompressingNotification, DurableEventCausalityKey,
@@ -1034,10 +1033,6 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!("permission_behavior.json", PermissionBehavior),
         schema_doc!("agent_execution_backend.json", AgentExecutionBackend),
         schema_doc!("cli_agent_runtime_kind.json", CLIAgentRuntimeKind),
-        schema_doc!(
-            "cli_agent_runtime_approval_policy.json",
-            CLIAgentRuntimeApprovalPolicy
-        ),
         schema_doc!(
             "cli_agent_runtime_sandbox_policy.json",
             CLIAgentRuntimeSandboxPolicy

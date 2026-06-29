@@ -686,8 +686,6 @@ pub enum CLIAgentRuntimeKind {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 pub struct TurnCLIRuntimeOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub approval_policy: Option<CLIAgentRuntimeApprovalPolicy>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<CLIAgentRuntimeSandboxPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
@@ -698,10 +696,6 @@ pub struct TurnCLIRuntimeOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub steer_if_active: Option<bool>,
 }
-
-#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
-#[serde(transparent)]
-pub struct CLIAgentRuntimeApprovalPolicy(pub String);
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 #[serde(transparent)]
@@ -1058,8 +1052,7 @@ pub struct Turn {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_manifest: Option<PromptManifest>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub permission_profile: Option<TurnPermissionProfileSnapshot>,
+    pub permission_profile: TurnPermissionProfileSnapshot,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -4282,7 +4275,6 @@ mod tests {
                 "runtime_kind": "codex"
             },
             "cli_runtime_options": {
-                "approval_policy": "unlessTrusted",
                 "sandbox": {
                     "type": "workspaceWrite",
                     "networkAccess": false
@@ -4306,13 +4298,6 @@ mod tests {
             .cli_runtime_options
             .as_ref()
             .expect("cli options should decode");
-        assert_eq!(
-            options
-                .approval_policy
-                .as_ref()
-                .map(|policy| policy.0.as_str()),
-            Some("unlessTrusted")
-        );
         assert_eq!(options.effort.as_deref(), Some("medium"));
         assert_eq!(options.personality.as_deref(), Some("friendly"));
         assert_eq!(options.summary.as_deref(), Some("concise"));
@@ -4504,18 +4489,47 @@ mod tests {
     }
 
     #[test]
-    fn old_turn_payload_can_omit_permission_profile_snapshot() {
-        let turn: Turn = serde_json::from_value(json!({
+    fn turn_payload_requires_permission_profile_snapshot() {
+        let error = serde_json::from_value::<Turn>(json!({
             "id": "turn_123",
             "status": "InProgress"
         }))
-        .expect("old turn payload should deserialize");
+        .expect_err("turn payload without permission profile should fail");
+        assert!(
+            error.to_string().contains("permission_profile"),
+            "unexpected error: {error}"
+        );
 
+        let turn: Turn = serde_json::from_value(json!({
+            "id": "turn_123",
+            "status": "InProgress",
+            "permission_profile": {
+                "mode": "full_access",
+                "source": "defaulted",
+                "effective_policy": {
+                    "default_behavior": "allow",
+                    "file_read": "allow",
+                    "file_write": "allow",
+                    "shell_command": "allow",
+                    "network": "allow",
+                    "mcp_read": "allow",
+                    "mcp_write_or_unknown": "allow",
+                    "dynamic_skill_tool": "allow",
+                    "computer_use": "allow",
+                    "task_subagent": "allow"
+                }
+            }
+        }))
+        .expect("turn payload with permission profile should deserialize");
         assert_eq!(turn.id, "turn_123");
         assert_eq!(turn.status, TurnStatus::InProgress);
         assert_eq!(turn.turn_kind, TurnKind::Conversation);
         assert_eq!(turn.origin, TurnOrigin::User);
-        assert!(turn.permission_profile.is_none());
+        assert_eq!(turn.permission_profile.mode, TurnPermissionMode::FullAccess);
+        assert_eq!(
+            turn.permission_profile.source,
+            TurnPermissionProfileSource::Defaulted
+        );
     }
 
     #[test]

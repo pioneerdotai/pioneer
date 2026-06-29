@@ -1,5 +1,5 @@
 use crate::output_policy::ToolResultEnvelope;
-use crate::spec::ToolRecoveryMetadata;
+use crate::spec::{ToolPermissionMetadata, ToolRecoveryMetadata};
 use pioneer_provider::ModelInputItem;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -49,6 +49,9 @@ pub enum ToolPayload {
         server: String,
         tool: String,
         arguments: JsonValue,
+        read_only_hint: Option<bool>,
+        destructive_hint: Option<bool>,
+        open_world_hint: Option<bool>,
     },
     LocalShell(LocalShellPayload),
     ToolSearch {
@@ -69,6 +72,7 @@ impl ToolPayload {
                 server,
                 tool,
                 arguments,
+                ..
             } => {
                 format!("{server}:{tool} {arguments}")
             }
@@ -101,6 +105,7 @@ pub struct ToolInvocation {
     pub attempt_id: u32,
     pub idempotency_key: Option<String>,
     pub recovery: ToolRecoveryMetadata,
+    pub permission_metadata: ToolPermissionMetadata,
     pub cancellation: CancellationToken,
 }
 
@@ -110,6 +115,16 @@ pub enum ToolCallSource {
     Model,
     NestedTool,
     System,
+}
+
+impl ToolCallSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::NestedTool => "nested_tool",
+            Self::System => "system",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

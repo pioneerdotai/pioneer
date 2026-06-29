@@ -1,7 +1,7 @@
 #[cfg(feature = "computer-use")]
 mod computer_use;
 
-mod apply_patch;
+pub(crate) mod apply_patch;
 mod files;
 mod http;
 mod mcp;

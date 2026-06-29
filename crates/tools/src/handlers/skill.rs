@@ -11,6 +11,9 @@ use crate::registry::ToolHandler;
 use crate::router::{RawToolCall, ToolRouter};
 use crate::runtime::ToolCallRuntime;
 use crate::spec::{ConfiguredToolSpec, ExecutionClass, PayloadKind, ToolSpec};
+use crate::spec::{
+    DynamicSkillPermissionKind, DynamicSkillPermissionMetadata, ToolPermissionMetadata,
+};
 use async_trait::async_trait;
 use pioneer_skills::{DynamicToolOutputPolicyDeclaration, SkillSourceKind, SkillTrustLevel};
 use serde_json::Value as JsonValue;
@@ -226,7 +229,8 @@ fn runtime_descriptor_to_spec(
         descriptor.description.clone(),
         parameters,
         PayloadKind::Function,
-    );
+    )
+    .with_permission_metadata(permission_metadata_for_descriptor(descriptor));
     let resolution = resolve_dynamic_tool_output_policy(
         dynamic_policy_context(descriptor, output_policy_caps),
         descriptor.requested_output_policy.clone(),
@@ -240,6 +244,42 @@ fn runtime_descriptor_to_spec(
         ),
         diagnostics: resolution.diagnostics,
     })
+}
+
+fn permission_metadata_for_descriptor(
+    descriptor: &SkillDynamicToolDescriptor,
+) -> ToolPermissionMetadata {
+    let config = descriptor.config.as_object();
+    ToolPermissionMetadata {
+        dynamic_skill: Some(DynamicSkillPermissionMetadata {
+            kind: match descriptor.kind {
+                SkillDynamicToolKind::Http => DynamicSkillPermissionKind::Http,
+                SkillDynamicToolKind::Shell => DynamicSkillPermissionKind::Shell,
+                SkillDynamicToolKind::FunctionProxy => DynamicSkillPermissionKind::FunctionProxy,
+            },
+            skill_slug: descriptor.skill_slug.clone(),
+            source_kind: format!("{:?}", descriptor.source_kind),
+            trust_level: format!("{:?}", descriptor.trust_level),
+            target_tool: config
+                .and_then(|config| config.get("target_tool"))
+                .and_then(JsonValue::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+            configured_method: config
+                .and_then(|config| config.get("method"))
+                .and_then(JsonValue::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+            configured_url: config
+                .and_then(|config| config.get("url"))
+                .and_then(JsonValue::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+        }),
+    }
 }
 
 fn dynamic_policy_context(
@@ -847,6 +887,7 @@ mod tests {
             attempt_id: 1,
             idempotency_key: None,
             recovery: ToolRecoveryMetadata::default(),
+            permission_metadata: crate::spec::ToolPermissionMetadata::default(),
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
     }

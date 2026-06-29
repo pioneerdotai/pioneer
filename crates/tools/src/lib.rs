@@ -9,6 +9,7 @@ mod orchestrator;
 mod output_dynamic_policy;
 mod output_policy;
 mod output_projection;
+mod permissions;
 mod registry;
 mod retry_controller;
 mod router;
@@ -74,6 +75,12 @@ pub use output_policy::{
     web_search_output_policy,
 };
 pub use output_projection::{ToolProjectionInput, project_tool_result};
+pub use permissions::{
+    PermissionActionKind, PermissionApprovalBroker, PermissionApprovalResolution,
+    PermissionDecision, PermissionDecisionReason, PermissionEvaluationContext, PermissionIntent,
+    PermissionRequestKey, PermissionRequestScope, ProfileToolPermissionEvaluator,
+    StaticPermissionApprovalBroker, ToolPermissionEvaluator,
+};
 pub use registry::{ToolHandler, ToolRegistry, ToolRegistryBuilder};
 pub use retry_controller::{
     ToolFailureSignature, ToolRetryBudgetConfig, ToolRetryBudgetKind, ToolRetryBudgetSnapshot,
@@ -86,8 +93,9 @@ pub use router::{RawToolCall, ToolCall, ToolRouter};
 pub use runtime::ToolCallRuntime;
 pub use shell_format::{ExecModelPayload, ExecPayloadInput, ExecTruncation, render_exec_ui_text};
 pub use spec::{
-    ConfiguredToolSpec, ExecutionClass, PayloadKind, REQUEST_TOOLS_TOOL_NAME, ToolIdempotencyMode,
-    ToolPayloadBinding, ToolRecoveryMetadata, ToolRetryClass, ToolSpec,
+    ConfiguredToolSpec, DynamicSkillPermissionKind, DynamicSkillPermissionMetadata, ExecutionClass,
+    PayloadKind, REQUEST_TOOLS_TOOL_NAME, ToolIdempotencyMode, ToolPayloadBinding,
+    ToolPermissionMetadata, ToolRecoveryMetadata, ToolRetryClass, ToolSpec,
     builtin_tool_recovery_metadata, builtin_tool_specs,
 };
 pub use tool_index::{
@@ -310,6 +318,21 @@ pub struct BuiltinTools {
     pub event_bus: ToolEventBus,
 }
 
+impl BuiltinTools {
+    pub fn with_permission_approval_broker(
+        mut self,
+        approval_broker: Arc<dyn PermissionApprovalBroker>,
+    ) -> Self {
+        self.runtime =
+            self.runtime
+                .with_orchestrator(Arc::new(ToolOrchestrator::with_approval_broker(
+                    OrchestratorPolicy::default(),
+                    approval_broker,
+                )));
+        self
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct ToolExtensionBundle {
     pub specs: Vec<ConfiguredToolSpec>,
@@ -322,6 +345,7 @@ pub enum BuildToolsError {
     DuplicateHandlerName(String),
     MissingHandlerForTool(String),
     HandlerWithoutSpec(String),
+    InvalidPermissionContext(String),
 }
 
 impl Display for BuildToolsError {
@@ -335,6 +359,9 @@ impl Display for BuildToolsError {
             Self::HandlerWithoutSpec(name) => {
                 write!(f, "extension handler `{name}` has no matching tool spec")
             }
+            Self::InvalidPermissionContext(message) => {
+                write!(f, "invalid permission context: {message}")
+            }
         }
     }
 }
@@ -344,6 +371,7 @@ impl std::error::Error for BuildToolsError {}
 pub fn build_tools(
     workdir: impl Into<PathBuf>,
     turn_id: impl Into<String>,
+    permission_context: PermissionEvaluationContext,
     web_tools_config: WebToolsConfig,
     computer_use_tools_config: ComputerUseToolsConfig,
     extensions: Vec<ToolExtensionBundle>,
@@ -351,6 +379,7 @@ pub fn build_tools(
     build_tools_with_environment(
         workdir,
         turn_id,
+        permission_context,
         web_tools_config,
         computer_use_tools_config,
         extensions,
@@ -361,12 +390,14 @@ pub fn build_tools(
 pub fn build_tools_with_environment(
     workdir: impl Into<PathBuf>,
     turn_id: impl Into<String>,
+    permission_context: PermissionEvaluationContext,
     web_tools_config: WebToolsConfig,
     computer_use_tools_config: ComputerUseToolsConfig,
     extensions: Vec<ToolExtensionBundle>,
     environment: BTreeMap<String, String>,
 ) -> Result<BuiltinTools, BuildToolsError> {
     let turn_id = turn_id.into();
+    validate_permission_context(&turn_id, &permission_context)?;
     let web_tools_config = web_tools_config.normalized();
 
     #[cfg(feature = "computer-use")]
@@ -510,6 +541,7 @@ pub fn build_tools_with_environment(
         orchestrator,
         event_bus.clone(),
         turn_id,
+        permission_context,
         workdir.into(),
     )
     .with_environment(environment);
@@ -525,18 +557,42 @@ pub fn build_tools_with_environment(
 pub fn build_builtin_tools(
     workdir: impl Into<PathBuf>,
     turn_id: impl Into<String>,
+    permission_context: PermissionEvaluationContext,
     web_tools_config: WebToolsConfig,
     computer_use_tools_config: ComputerUseToolsConfig,
 ) -> BuiltinTools {
     build_tools_with_environment(
         workdir,
         turn_id,
+        permission_context,
         web_tools_config,
         computer_use_tools_config,
         Vec::new(),
         BTreeMap::new(),
     )
     .expect("build builtin tools")
+}
+
+fn validate_permission_context(
+    turn_id: &str,
+    permission_context: &PermissionEvaluationContext,
+) -> Result<(), BuildToolsError> {
+    if permission_context.workspace_id.is_none() {
+        return Err(BuildToolsError::InvalidPermissionContext(
+            "workspace_id is required".to_owned(),
+        ));
+    }
+    if permission_context.thread_id.is_none() {
+        return Err(BuildToolsError::InvalidPermissionContext(
+            "thread_id is required".to_owned(),
+        ));
+    }
+    if permission_context.turn_id.as_deref() != Some(turn_id) {
+        return Err(BuildToolsError::InvalidPermissionContext(
+            "turn_id must match tool runtime turn".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -619,6 +675,15 @@ mod tests {
         }
     }
 
+    fn test_permission_context(turn_id: &str) -> crate::PermissionEvaluationContext {
+        crate::PermissionEvaluationContext::for_turn(
+            "workspace_test",
+            "thread_test",
+            turn_id,
+            pioneer_protocol::default_turn_permission_profile_snapshot(),
+        )
+    }
+
     fn tools_runtime_temp_dir(prefix: &str) -> std::path::PathBuf {
         let now_nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -691,6 +756,7 @@ mod tests {
         let built = build_tools(
             ".",
             "turn_merge",
+            test_permission_context("turn_merge"),
             test_web_config(),
             test_computer_use_config(),
             vec![ToolExtensionBundle {
@@ -734,6 +800,7 @@ mod tests {
         let built = build_builtin_tools(
             ".",
             "turn_request_tools_visible",
+            test_permission_context("turn_request_tools_visible"),
             test_web_config(),
             test_computer_use_config(),
         );
@@ -754,6 +821,7 @@ mod tests {
         let built = build_builtin_tools(
             ".",
             "turn_write_file_registered",
+            test_permission_context("turn_write_file_registered"),
             test_web_config(),
             test_computer_use_config(),
         );
@@ -778,6 +846,7 @@ mod tests {
         let built = build_builtin_tools(
             ".",
             "turn_edit_file_registered",
+            test_permission_context("turn_edit_file_registered"),
             test_web_config(),
             test_computer_use_config(),
         );
@@ -805,6 +874,7 @@ mod tests {
         let built = build_builtin_tools(
             workdir.as_path(),
             "turn_write_file_runtime_flow",
+            test_permission_context("turn_write_file_runtime_flow"),
             test_web_config(),
             test_computer_use_config(),
         );
@@ -905,6 +975,7 @@ mod tests {
         let built = build_builtin_tools(
             workdir.as_path(),
             "turn_edit_file_runtime_flow",
+            test_permission_context("turn_edit_file_runtime_flow"),
             test_web_config(),
             test_computer_use_config(),
         );
@@ -975,6 +1046,7 @@ mod tests {
         let built = build_builtin_tools(
             workdir.as_path(),
             "turn_edit_file_chain",
+            test_permission_context("turn_edit_file_chain"),
             test_web_config(),
             test_computer_use_config(),
         );
@@ -1060,6 +1132,7 @@ mod tests {
         let built = build_builtin_tools(
             ".",
             "turn_computer_use_hidden_default",
+            test_permission_context("turn_computer_use_hidden_default"),
             test_web_config(),
             test_computer_use_config(),
         );
@@ -1077,6 +1150,7 @@ mod tests {
         let built = build_builtin_tools(
             ".",
             "turn_computer_use_visible_handler",
+            test_permission_context("turn_computer_use_visible_handler"),
             test_web_config(),
             test_computer_use_config(),
         );
@@ -1126,6 +1200,7 @@ mod tests {
         let built = build_builtin_tools(
             ".",
             "turn_request_tools_computer_use_available",
+            test_permission_context("turn_request_tools_computer_use_available"),
             test_web_config(),
             test_computer_use_config(),
         );
@@ -1165,6 +1240,7 @@ mod tests {
         let built = build_builtin_tools(
             ".",
             "turn_request_tools_computer_use_unavailable",
+            test_permission_context("turn_request_tools_computer_use_unavailable"),
             test_web_config(),
             test_computer_use_config(),
         );
@@ -1221,6 +1297,7 @@ mod tests {
         let built = build_tools(
             ".",
             "turn_request_tools_result",
+            test_permission_context("turn_request_tools_result"),
             test_web_config(),
             test_computer_use_config(),
             vec![ToolExtensionBundle {
@@ -1297,6 +1374,7 @@ mod tests {
         let built = build_tools(
             ".",
             "turn_dynamic_visible",
+            test_permission_context("turn_dynamic_visible"),
             test_web_config(),
             test_computer_use_config(),
             vec![ToolExtensionBundle {
@@ -1345,6 +1423,7 @@ mod tests {
         let built = build_tools(
             ".",
             "turn_hidden_dispatch",
+            test_permission_context("turn_hidden_dispatch"),
             test_web_config(),
             test_computer_use_config(),
             vec![ToolExtensionBundle {
@@ -1394,6 +1473,7 @@ mod tests {
         let error = match build_tools(
             ".",
             "turn_dup",
+            test_permission_context("turn_dup"),
             test_web_config(),
             test_computer_use_config(),
             vec![ToolExtensionBundle {
@@ -1424,6 +1504,7 @@ mod tests {
         let error = match build_tools(
             ".",
             "turn_missing_handler",
+            test_permission_context("turn_missing_handler"),
             test_web_config(),
             test_computer_use_config(),
             vec![ToolExtensionBundle {
@@ -1436,5 +1517,25 @@ mod tests {
         };
 
         assert!(matches!(error, BuildToolsError::MissingHandlerForTool(_)));
+    }
+
+    #[test]
+    fn build_tools_rejects_permission_context_for_another_turn() {
+        let error = match build_tools(
+            ".",
+            "turn_expected",
+            test_permission_context("turn_other"),
+            test_web_config(),
+            test_computer_use_config(),
+            Vec::new(),
+        ) {
+            Ok(_) => panic!("mismatched permission context should fail"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            BuildToolsError::InvalidPermissionContext(_)
+        ));
     }
 }

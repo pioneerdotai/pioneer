@@ -34,6 +34,12 @@ pub enum ToolPayloadBinding {
         raw_tool_name: String,
         catalog_version: String,
         snapshot_version: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        read_only_hint: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        destructive_hint: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        open_world_hint: Option<bool>,
     },
 }
 
@@ -60,6 +66,34 @@ pub enum ToolIdempotencyMode {
     Safe,
     RequiresKey,
     SessionBound,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DynamicSkillPermissionKind {
+    Http,
+    Shell,
+    FunctionProxy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DynamicSkillPermissionMetadata {
+    pub kind: DynamicSkillPermissionKind,
+    pub skill_slug: String,
+    pub source_kind: String,
+    pub trust_level: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_tool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ToolPermissionMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_skill: Option<DynamicSkillPermissionMetadata>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -92,6 +126,8 @@ pub struct ToolSpec {
     pub parameters: JsonValue,
     pub payload_kind: PayloadKind,
     pub recovery: ToolRecoveryMetadata,
+    #[serde(default)]
+    pub permission_metadata: ToolPermissionMetadata,
 }
 
 impl ToolSpec {
@@ -107,11 +143,17 @@ impl ToolSpec {
             parameters,
             payload_kind,
             recovery: ToolRecoveryMetadata::default(),
+            permission_metadata: ToolPermissionMetadata::default(),
         }
     }
 
     pub fn with_recovery(mut self, recovery: ToolRecoveryMetadata) -> Self {
         self.recovery = recovery;
+        self
+    }
+
+    pub fn with_permission_metadata(mut self, metadata: ToolPermissionMetadata) -> Self {
+        self.permission_metadata = metadata;
         self
     }
 }

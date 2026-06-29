@@ -59,8 +59,12 @@ impl ToolHandler for ApplyPatchHandler {
 }
 
 fn extract_patch(payload: ToolPayload) -> Result<String, ToolError> {
+    extract_patch_input(&payload).map(str::to_owned)
+}
+
+pub(crate) fn extract_patch_input(payload: &ToolPayload) -> Result<&str, ToolError> {
     match payload {
-        ToolPayload::Custom { input } => Ok(input),
+        ToolPayload::Custom { input } => Ok(input.as_str()),
         ToolPayload::Function { arguments } => extract_patch_from_json(arguments),
         other => Err(ToolError::invalid_arguments(format!(
             "unsupported apply_patch payload: {}",
@@ -69,15 +73,15 @@ fn extract_patch(payload: ToolPayload) -> Result<String, ToolError> {
     }
 }
 
-fn extract_patch_from_json(value: JsonValue) -> Result<String, ToolError> {
+fn extract_patch_from_json(value: &JsonValue) -> Result<&str, ToolError> {
     if let Some(input) = value.get("input").and_then(JsonValue::as_str) {
-        return Ok(input.to_owned());
+        return Ok(input);
     }
     if let Some(input) = value.get("patch").and_then(JsonValue::as_str) {
-        return Ok(input.to_owned());
+        return Ok(input);
     }
     if let Some(input) = value.as_str() {
-        return Ok(input.to_owned());
+        return Ok(input);
     }
 
     Err(ToolError::invalid_arguments(
@@ -85,7 +89,7 @@ fn extract_patch_from_json(value: JsonValue) -> Result<String, ToolError> {
     ))
 }
 
-fn validate_patch_document(patch: &str) -> Result<Vec<String>, ToolError> {
+pub(crate) fn validate_patch_document(patch: &str) -> Result<Vec<String>, ToolError> {
     let lines = patch.lines().collect::<Vec<_>>();
     if lines.first().copied() != Some(BEGIN_PATCH) {
         return Err(ToolError::invalid_arguments(

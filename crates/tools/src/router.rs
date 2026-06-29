@@ -7,10 +7,11 @@ use crate::events::{ToolEventBus, ToolEventTrace};
 use crate::normalize_tool_arguments_for_tool;
 use crate::orchestrator::ToolOrchestrator;
 use crate::output_policy::{ToolOutputPolicySnapshot, ToolOutputProjectionKind};
+use crate::permissions::PermissionEvaluationContext;
 use crate::registry::ToolRegistry;
 use crate::spec::{
     ConfiguredToolSpec, ExecutionClass, PayloadKind, REQUEST_TOOLS_TOOL_NAME, ToolIdempotencyMode,
-    ToolPayloadBinding, ToolRecoveryMetadata, ToolSpec,
+    ToolPayloadBinding, ToolPermissionMetadata, ToolRecoveryMetadata, ToolSpec,
 };
 use crate::tool_index::{PreflightToolIndex, build_preflight_tool_index};
 use crate::visibility::{
@@ -37,6 +38,7 @@ pub struct ToolCall {
     pub payload: ToolPayload,
     pub execution_class: ExecutionClass,
     pub recovery: ToolRecoveryMetadata,
+    pub permission_metadata: ToolPermissionMetadata,
     pub output_policy: ToolOutputPolicySnapshot,
     pub output_projection: ToolOutputProjectionKind,
     pub idempotency_key: Option<String>,
@@ -277,6 +279,7 @@ impl ToolRouter {
             payload,
             execution_class: configured.execution_class,
             recovery: configured.spec.recovery,
+            permission_metadata: configured.spec.permission_metadata,
             output_policy: configured.output_policy,
             output_projection: configured.output_projection,
             idempotency_key,
@@ -291,6 +294,7 @@ impl ToolRouter {
         source: ToolCallSource,
         workdir: PathBuf,
         environment: BTreeMap<String, String>,
+        permission_context: &PermissionEvaluationContext,
         trace: &ToolEventTrace,
         cancellation: CancellationToken,
     ) -> Result<crate::context::AnyToolResult, ToolError> {
@@ -304,9 +308,12 @@ impl ToolRouter {
             attempt_id: 1,
             idempotency_key: call.idempotency_key,
             recovery: call.recovery,
+            permission_metadata: call.permission_metadata,
             cancellation,
         };
-        orchestrator.run(&self.registry, invocation, trace).await
+        orchestrator
+            .run_with_context(&self.registry, invocation, trace, permission_context)
+            .await
     }
 
     fn parse_payload(
@@ -344,12 +351,18 @@ impl ToolRouter {
                     ToolPayloadBinding::Mcp {
                         server_id,
                         raw_tool_name,
+                        read_only_hint,
+                        destructive_hint,
+                        open_world_hint,
                         ..
                     } => Ok((
                         ToolPayload::Mcp {
                             server: server_id.clone(),
                             tool: raw_tool_name.clone(),
                             arguments: normalized.arguments,
+                            read_only_hint: *read_only_hint,
+                            destructive_hint: *destructive_hint,
+                            open_world_hint: *open_world_hint,
                         },
                         normalized.coercions,
                     )),
@@ -1144,6 +1157,9 @@ mod tests {
             raw_tool_name: "send".to_owned(),
             catalog_version: "sha256:catalog".to_owned(),
             snapshot_version: 7,
+            read_only_hint: Some(false),
+            destructive_hint: Some(true),
+            open_world_hint: Some(true),
         });
         let router = router_with_specs(vec![spec]);
 
@@ -1161,10 +1177,16 @@ mod tests {
                 server,
                 tool,
                 arguments,
+                read_only_hint,
+                destructive_hint,
+                open_world_hint,
             } => {
                 assert_eq!(server, "srv_1");
                 assert_eq!(tool, "send");
                 assert_eq!(arguments["to"], "a@example.com");
+                assert_eq!(read_only_hint, Some(false));
+                assert_eq!(destructive_hint, Some(true));
+                assert_eq!(open_world_hint, Some(true));
             }
             other => panic!("unexpected payload: {other:?}"),
         }

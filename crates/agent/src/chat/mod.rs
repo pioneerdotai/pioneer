@@ -3313,6 +3313,7 @@ async fn execute_agent_provider_response(
     let tools = match build_tools_with_environment(
         workdir.clone(),
         turn_id.to_owned(),
+        permission_context.clone(),
         tool_loop_config.web.clone(),
         tool_loop_config.computer_use.clone(),
         extension_bundles,
@@ -3329,6 +3330,7 @@ async fn execute_agent_provider_response(
             build_tools_with_environment(
                 workdir.clone(),
                 turn_id.to_owned(),
+                permission_context.clone(),
                 tool_loop_config.web.clone(),
                 tool_loop_config.computer_use.clone(),
                 Vec::new(),
@@ -3338,13 +3340,13 @@ async fn execute_agent_provider_response(
                 build_builtin_tools(
                     workdir.clone(),
                     turn_id.to_owned(),
+                    permission_context.clone(),
                     tool_loop_config.web.clone(),
                     tool_loop_config.computer_use.clone(),
                 )
             })
         }
     }
-    .with_permission_context(permission_context)
     .with_permission_approval_broker(permission_approval_broker);
 
     skill_tool_materialization
@@ -5979,6 +5981,15 @@ mod tests {
         }
     }
 
+    fn test_tools_permission_context(turn_id: &str) -> pioneer_tools::PermissionEvaluationContext {
+        pioneer_tools::PermissionEvaluationContext::for_turn(
+            "workspace_test",
+            "thread_test",
+            turn_id,
+            pioneer_protocol::default_turn_permission_profile_snapshot(),
+        )
+    }
+
     fn configured_test_tool(name: &str) -> ConfiguredToolSpec {
         ConfiguredToolSpec::new(
             ToolSpec::new(
@@ -5996,6 +6007,7 @@ mod tests {
         pioneer_tools::build_tools(
             ".",
             "turn_request_tools_visibility",
+            test_tools_permission_context("turn_request_tools_visibility"),
             test_web_config(),
             test_computer_use_config(),
             vec![ToolExtensionBundle {
@@ -6038,6 +6050,7 @@ mod tests {
         pioneer_tools::build_tools(
             ".",
             "turn_schema_token_guard",
+            test_tools_permission_context("turn_schema_token_guard"),
             test_web_config(),
             test_computer_use_config(),
             vec![ToolExtensionBundle { specs, handlers }],
@@ -6131,6 +6144,7 @@ mod tests {
         let built = pioneer_tools::build_builtin_tools(
             ".",
             "turn_agent_request_tools_result",
+            test_tools_permission_context("turn_agent_request_tools_result"),
             test_web_config(),
             test_computer_use_config(),
         );
@@ -6402,6 +6416,7 @@ mod tests {
         let built = pioneer_tools::build_builtin_tools(
             ".",
             "turn_request_tools_computer_use_visibility",
+            test_tools_permission_context("turn_request_tools_computer_use_visibility"),
             test_web_config(),
             test_computer_use_config(),
         );
@@ -6436,6 +6451,7 @@ mod tests {
         let built = pioneer_tools::build_builtin_tools(
             ".",
             "turn_tool_visibility_computer_use",
+            test_tools_permission_context("turn_tool_visibility_computer_use"),
             test_web_config(),
             test_computer_use_config(),
         );
