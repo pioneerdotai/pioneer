@@ -19,13 +19,15 @@ mod thread_agents_doc;
 mod thread_episodic;
 mod timeline;
 mod turn;
+mod turn_permissions;
 mod workspace;
 
 pub use agent_event::{
     AgentDurableEvent, AgentProgressEvent, DurableEventCausalityKey, ProgressCoalescingKey,
     ProtocolEventClass, RecoveryAttemptContext, SkillAuditEvent, ToolResultView,
     TurnAcceptedCapability, TurnCapabilityAcceptedReason, TurnCapabilityRejectedReason,
-    TurnRejectedCapability, TurnSkillBinding,
+    TurnPermissionAuditDecision, TurnPermissionAuditEvent, TurnPermissionAuditEventKind,
+    TurnPermissionAuditRequestKey, TurnRejectedCapability, TurnSkillBinding,
 };
 pub use artifact::{
     ArtifactBindParams, ArtifactBindResponse, ArtifactBindingDirection, ArtifactBindingKind,
@@ -239,17 +241,18 @@ pub use turn::{
     ItemRetryAttemptStartedNotification, ItemRetryScheduledNotification, ItemStartedNotification,
     ItemTimeoutDetectedNotification, ItemToolRetryExhaustedNotification,
     ItemToolRetryResolvedNotification, ItemToolRetryScheduledNotification, ItemUpdatedNotification,
-    LlmOutputPolicy, LlmRetentionPolicy, PromptManifest, PromptManifestDiagnostic,
-    PromptManifestDiagnosticCode, PromptManifestHookContributionKind, PromptManifestHookPhase,
-    PromptManifestHookSource, PromptManifestHookSourceEntry, PromptManifestHookTruncation,
-    PromptManifestProfile, ProviderFailureClass, ProviderFailureDetails, ProviderFailureStage,
-    ProviderTransportKind, ReasoningEffort, RecoveryAction, RecoveryJobStatus,
-    RecoveryOutputPolicy, RecoveryTrigger, StaticStrictObligationCollector, StorageOutputPolicy,
-    StrictObligationCollector, SystemEventLevel, TextElement, TimelineLane, TimelineOrigin,
-    TimelineOriginKind, TimelineOutputPolicy, ToolCallStatus, ToolDisplayPayload, ToolErrorClass,
-    ToolLoopBudgetAction, ToolLoopBudgetLimitKind, ToolMetadata, ToolMetadataRawKind,
-    ToolMetadataValue, ToolObservation, ToolOutcome, ToolOutcomeStatus, ToolOutputPolicySnapshot,
-    ToolOutputSummary, ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot,
+    LlmOutputPolicy, LlmRetentionPolicy, PermissionBehavior, PromptManifest,
+    PromptManifestDiagnostic, PromptManifestDiagnosticCode, PromptManifestHookContributionKind,
+    PromptManifestHookPhase, PromptManifestHookSource, PromptManifestHookSourceEntry,
+    PromptManifestHookTruncation, PromptManifestProfile, ProviderFailureClass,
+    ProviderFailureDetails, ProviderFailureStage, ProviderTransportKind, ReasoningEffort,
+    RecoveryAction, RecoveryJobStatus, RecoveryOutputPolicy, RecoveryTrigger,
+    StaticStrictObligationCollector, StorageOutputPolicy, StrictObligationCollector,
+    SystemEventLevel, TextElement, TimelineLane, TimelineOrigin, TimelineOriginKind,
+    TimelineOutputPolicy, ToolCallStatus, ToolDisplayPayload, ToolErrorClass, ToolLoopBudgetAction,
+    ToolLoopBudgetLimitKind, ToolMetadata, ToolMetadataRawKind, ToolMetadataValue, ToolObservation,
+    ToolOutcome, ToolOutcomeStatus, ToolOutputPolicySnapshot, ToolOutputSummary,
+    ToolPermissionPolicySnapshot, ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot,
     ToolRecoveryRetryClass, ToolRecoveryView, ToolRetryBudgetKind, ToolRetryBudgetUsage,
     ToolRetryErrorClass, ToolRetryExhaustionKind, ToolRetryResolution, ToolStoragePayload, Turn,
     TurnBlockedNotification, TurnBlockedResumeMetadata, TurnCLIRuntimeOptions, TurnCancelParams,
@@ -259,13 +262,29 @@ pub use turn::{
     TurnExecutionWindowStartedNotification, TurnFailedNotification, TurnGetParams, TurnGetResponse,
     TurnItem, TurnItemAttemptStatus, TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason,
     TurnItemType, TurnItemsParams, TurnItemsResponse, TurnKind, TurnMcpServerCapabilitySummary,
-    TurnMcpToolCapabilitySummary, TurnOrigin, TurnReasoningSelection, TurnResumeParams,
+    TurnMcpToolCapabilitySummary, TurnOrigin, TurnPermissionActionKind,
+    TurnPermissionApprovalRequest, TurnPermissionApprovalRequestDetail,
+    TurnPermissionApprovalResolution, TurnPermissionDecisionReason, TurnPermissionMode,
+    TurnPermissionProfileCap, TurnPermissionProfileSelection, TurnPermissionProfileSnapshot,
+    TurnPermissionProfileSource, TurnPermissionRequestOpenedNotification,
+    TurnPermissionRequestResolvedNotification, TurnPermissionRequestRespondParams,
+    TurnPermissionRequestRespondResponse, TurnReasoningSelection, TurnResumeParams,
     TurnResumeResponse, TurnSkillCapabilitySummary, TurnStartParams, TurnStartResponse,
     TurnStartedNotification, TurnStatus, TurnStatusChangedNotification,
     TurnToolLoopBudgetExceededNotification, UserInput, UserMessageAttachment, WebFetchLink,
     WebSearchResultItem, build_execution_checkpoint_original_request_summary,
     build_execution_checkpoint_payload, build_execution_checkpoint_provider_budget_summary,
     build_execution_checkpoint_tool_summary, collect_execution_checkpoint_strict_obligations,
+    resolve_turn_permission_profile,
+};
+pub use turn_permissions::{
+    compile_turn_permission_profile, composer_turn_permission_profile_snapshot,
+    default_turn_permission_profile_snapshot, inherited_turn_permission_profile_from_snapshot,
+    inherited_turn_permission_profile_snapshot, intersect_tool_permission_policies,
+    intersect_turn_permission_profiles, most_restrictive_permission_behavior,
+    most_restrictive_turn_permission_mode, permission_policy_for_mode,
+    system_turn_permission_profile_snapshot, task_permission_cap_for_mode,
+    task_permission_cap_from_snapshot, task_permission_cap_snapshot,
 };
 pub use workspace::{
     Workspace, WorkspaceChangeKind, WorkspaceChangedNotification, WorkspaceCreateParams,

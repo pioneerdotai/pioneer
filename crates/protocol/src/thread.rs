@@ -2,6 +2,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::MarkdownDocument;
+use crate::TurnPermissionAuditEvent;
 use crate::thread_agents_doc::ThreadAgentsDocSummary;
 use crate::turn::{
     ItemDeltaStream, RecoveryAction, RecoveryJobStatus, RecoveryTrigger, ToolLoopBudgetAction,
@@ -400,6 +401,8 @@ pub enum ThreadHistoryEventPayload {
     TurnExecutionWindowContinued(TurnExecutionWindowContinuedNotification),
     #[serde(rename_all = "camelCase")]
     TurnExecutionWindowBlocked(TurnExecutionWindowBlockedNotification),
+    #[serde(rename_all = "camelCase")]
+    TurnPermissionAudit(TurnPermissionAuditEvent),
     #[serde(rename_all = "camelCase")]
     TurnCompleted {
         workspace_id: String,

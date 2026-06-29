@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnPermissionMode",
+  "type": "string",
+  "enum": [
+    "full_access",
+    "auto_accept_edits",
+    "supervised"
+  ]
+}

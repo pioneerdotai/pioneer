@@ -100,8 +100,8 @@ use crate::{
     MemoryScopeHint, MemoryScopeKind, MemorySearchHit, MemorySearchParams, MemorySearchResponse,
     MemorySemanticFields, MemorySemanticWriteDisposition, MemorySemanticWriteParams,
     MemorySemanticWriteResponse, MemorySensitivity, MemorySensitivityHint, MemorySourceContextKind,
-    MemoryStatus, MemorySubject, MemoryWriteEvidence, MemoryWriteRelation, ProgressCoalescingKey,
-    PromptManifest, PromptManifestDiagnostic, PromptManifestDiagnosticCode,
+    MemoryStatus, MemorySubject, MemoryWriteEvidence, MemoryWriteRelation, PermissionBehavior,
+    ProgressCoalescingKey, PromptManifest, PromptManifestDiagnostic, PromptManifestDiagnosticCode,
     PromptManifestHookContributionKind, PromptManifestHookPhase, PromptManifestHookSource,
     PromptManifestHookSourceEntry, PromptManifestHookTruncation, PromptManifestProfile,
     ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse, ProviderFailureClass,
@@ -177,21 +177,28 @@ use crate::{
     ThreadUnsubscribeResponse, ThreadUnsubscribeStatus, ThreadUpdateParams, ThreadUpdateResponse,
     ThreadUpdatedNotification, ToolDisplayPayload, ToolLoopBudgetAction, ToolLoopBudgetLimitKind,
     ToolMetadata, ToolMetadataRawKind, ToolMetadataValue, ToolOutputPolicySnapshot,
-    ToolOutputSummary, ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot,
-    ToolRecoveryRetryClass, ToolRecoveryView, ToolRetryBudgetKind, ToolRetryBudgetUsage,
-    ToolRetryErrorClass, ToolRetryExhaustionKind, ToolRetryResolution, ToolStoragePayload, Turn,
-    TurnAcceptedCapability, TurnBlockedNotification, TurnBlockedResumeMetadata,
-    TurnCLIRuntimeOptions, TurnCancelParams, TurnCancelResponse, TurnCapability,
-    TurnCapabilityAcceptedReason, TurnCapabilityKind, TurnCapabilityRejectedReason,
+    ToolOutputSummary, ToolPermissionPolicySnapshot, ToolRecoveryIdempotencyMode,
+    ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass, ToolRecoveryView, ToolRetryBudgetKind,
+    ToolRetryBudgetUsage, ToolRetryErrorClass, ToolRetryExhaustionKind, ToolRetryResolution,
+    ToolStoragePayload, Turn, TurnAcceptedCapability, TurnBlockedNotification,
+    TurnBlockedResumeMetadata, TurnCLIRuntimeOptions, TurnCancelParams, TurnCancelResponse,
+    TurnCapability, TurnCapabilityAcceptedReason, TurnCapabilityKind, TurnCapabilityRejectedReason,
     TurnCompletedNotification, TurnExecutionWindowBlockedNotification,
     TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
     TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification,
     TurnFailedNotification, TurnGetParams, TurnGetResponse, TurnItem, TurnItemAttemptStatus,
     TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType, TurnItemsParams,
     TurnItemsResponse, TurnKind, TurnMcpServerCapabilitySummary, TurnMcpToolCapabilitySummary,
-    TurnOrigin, TurnReasoningSelection, TurnRejectedCapability, TurnResumeParams,
-    TurnResumeResponse, TurnSkillCapabilitySummary, TurnStartParams, TurnStartResponse,
-    TurnStartedNotification, TurnStatus, TurnStatusChangedNotification,
+    TurnOrigin, TurnPermissionActionKind, TurnPermissionApprovalRequest,
+    TurnPermissionApprovalRequestDetail, TurnPermissionApprovalResolution,
+    TurnPermissionAuditDecision, TurnPermissionAuditEvent, TurnPermissionAuditEventKind,
+    TurnPermissionAuditRequestKey, TurnPermissionDecisionReason, TurnPermissionMode,
+    TurnPermissionProfileCap, TurnPermissionProfileSelection, TurnPermissionProfileSnapshot,
+    TurnPermissionProfileSource, TurnPermissionRequestOpenedNotification,
+    TurnPermissionRequestResolvedNotification, TurnPermissionRequestRespondParams,
+    TurnPermissionRequestRespondResponse, TurnReasoningSelection, TurnRejectedCapability,
+    TurnResumeParams, TurnResumeResponse, TurnSkillCapabilitySummary, TurnStartParams,
+    TurnStartResponse, TurnStartedNotification, TurnStatus, TurnStatusChangedNotification,
     TurnToolLoopBudgetExceededNotification, UnknownGatewayNotification, UserInput, Workspace,
     WorkspaceChangeKind, WorkspaceChangedNotification, WorkspaceCreateParams,
     WorkspaceCreateResponse, WorkspaceDefaultParams, WorkspaceDefaultResponse, WorkspaceListParams,
@@ -227,6 +234,19 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "turn_capability_rejected_reason.json",
             TurnCapabilityRejectedReason
+        ),
+        schema_doc!(
+            "turn_permission_audit_decision.json",
+            TurnPermissionAuditDecision
+        ),
+        schema_doc!("turn_permission_audit_event.json", TurnPermissionAuditEvent),
+        schema_doc!(
+            "turn_permission_audit_event_kind.json",
+            TurnPermissionAuditEventKind
+        ),
+        schema_doc!(
+            "turn_permission_audit_request_key.json",
+            TurnPermissionAuditRequestKey
         ),
         schema_doc!("turn_rejected_capability.json", TurnRejectedCapability),
         schema_doc!("workspace.json", Workspace),
@@ -960,6 +980,58 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!("turn_status.json", TurnStatus),
         schema_doc!("turn_start_params.json", TurnStartParams),
         schema_doc!("turn_reasoning_selection.json", TurnReasoningSelection),
+        schema_doc!("turn_permission_mode.json", TurnPermissionMode),
+        schema_doc!("turn_permission_action_kind.json", TurnPermissionActionKind),
+        schema_doc!(
+            "turn_permission_decision_reason.json",
+            TurnPermissionDecisionReason
+        ),
+        schema_doc!(
+            "turn_permission_profile_selection.json",
+            TurnPermissionProfileSelection
+        ),
+        schema_doc!("turn_permission_profile_cap.json", TurnPermissionProfileCap),
+        schema_doc!(
+            "turn_permission_profile_snapshot.json",
+            TurnPermissionProfileSnapshot
+        ),
+        schema_doc!(
+            "turn_permission_profile_source.json",
+            TurnPermissionProfileSource
+        ),
+        schema_doc!(
+            "turn_permission_approval_request.json",
+            TurnPermissionApprovalRequest
+        ),
+        schema_doc!(
+            "turn_permission_approval_request_detail.json",
+            TurnPermissionApprovalRequestDetail
+        ),
+        schema_doc!(
+            "turn_permission_approval_resolution.json",
+            TurnPermissionApprovalResolution
+        ),
+        schema_doc!(
+            "turn_permission_request_opened_notification.json",
+            TurnPermissionRequestOpenedNotification
+        ),
+        schema_doc!(
+            "turn_permission_request_resolved_notification.json",
+            TurnPermissionRequestResolvedNotification
+        ),
+        schema_doc!(
+            "turn_permission_request_respond_params.json",
+            TurnPermissionRequestRespondParams
+        ),
+        schema_doc!(
+            "turn_permission_request_respond_response.json",
+            TurnPermissionRequestRespondResponse
+        ),
+        schema_doc!(
+            "tool_permission_policy_snapshot.json",
+            ToolPermissionPolicySnapshot
+        ),
+        schema_doc!("permission_behavior.json", PermissionBehavior),
         schema_doc!("agent_execution_backend.json", AgentExecutionBackend),
         schema_doc!("cli_agent_runtime_kind.json", CLIAgentRuntimeKind),
         schema_doc!(

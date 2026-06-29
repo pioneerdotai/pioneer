@@ -30,9 +30,10 @@ use crate::{
     TurnCompletedNotification, TurnExecutionWindowBlockedNotification,
     TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
     TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification,
-    TurnFailedNotification, TurnStartedNotification, TurnToolLoopBudgetExceededNotification,
-    TurnWorkItemsChangedNotification, TurnWorkStateChangedNotification,
-    WorkspaceChangedNotification,
+    TurnFailedNotification, TurnPermissionRequestOpenedNotification,
+    TurnPermissionRequestResolvedNotification, TurnStartedNotification,
+    TurnToolLoopBudgetExceededNotification, TurnWorkItemsChangedNotification,
+    TurnWorkStateChangedNotification, WorkspaceChangedNotification,
 };
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
@@ -69,6 +70,8 @@ pub enum GatewayNotification {
     TurnBlocked(TurnBlockedNotification),
     TurnWorkItemsChanged(TurnWorkItemsChangedNotification),
     TurnWorkStateChanged(TurnWorkStateChangedNotification),
+    TurnPermissionRequestOpened(TurnPermissionRequestOpenedNotification),
+    TurnPermissionRequestResolved(TurnPermissionRequestResolvedNotification),
     TurnExecutionWindowStarted(TurnExecutionWindowStartedNotification),
     TurnExecutionWindowExhausted(TurnExecutionWindowExhaustedNotification),
     TurnExecutionWindowCheckpointed(TurnExecutionWindowCheckpointedNotification),
@@ -204,6 +207,22 @@ impl GatewayNotification {
                 serde_json::from_value::<TurnWorkStateChangedNotification>(params)
                     .ok()
                     .map(Self::TurnWorkStateChanged)
+            }
+            events::TURN_PERMISSION_REQUEST_OPENED => {
+                match serde_json::from_value::<TurnPermissionRequestOpenedNotification>(
+                    params.clone(),
+                ) {
+                    Ok(notification) => Some(Self::TurnPermissionRequestOpened(notification)),
+                    Err(_) => Some(Self::Unknown(unknown_notification(method, params))),
+                }
+            }
+            events::TURN_PERMISSION_REQUEST_RESOLVED => {
+                match serde_json::from_value::<TurnPermissionRequestResolvedNotification>(
+                    params.clone(),
+                ) {
+                    Ok(notification) => Some(Self::TurnPermissionRequestResolved(notification)),
+                    Err(_) => Some(Self::Unknown(unknown_notification(method, params))),
+                }
             }
             events::TURN_EXECUTION_WINDOW_STARTED => {
                 parse_execution_window_notification::<TurnExecutionWindowStartedNotification>(
@@ -1016,6 +1035,47 @@ mod tests {
 
             assert_eq!(serialized["kind"], expected_kind);
         }
+    }
+
+    #[test]
+    fn maps_turn_permission_request_notifications() {
+        let opened = JsonRpcNotification::from_params(
+            events::TURN_PERMISSION_REQUEST_OPENED,
+            &json!({
+                "request": {
+                    "request_id": "req_native",
+                    "workspace_id": "ws_1",
+                    "thread_id": "thread_1",
+                    "turn_id": "turn_1",
+                    "tool_name": "shell",
+                    "action": "shell_command",
+                    "scope_hash": "scope_1",
+                    "reason": "policy_requires_approval",
+                    "summary": "cargo check"
+                }
+            }),
+        )
+        .expect("permission request opened notification should encode");
+        assert!(matches!(
+            GatewayNotification::from_jsonrpc(opened).expect("opened should map"),
+            GatewayNotification::TurnPermissionRequestOpened(_)
+        ));
+
+        let resolved = JsonRpcNotification::from_params(
+            events::TURN_PERMISSION_REQUEST_RESOLVED,
+            &json!({
+                "workspace_id": "ws_1",
+                "thread_id": "thread_1",
+                "turn_id": "turn_1",
+                "request_id": "req_native",
+                "resolution": "allow_for_turn"
+            }),
+        )
+        .expect("permission request resolved notification should encode");
+        assert!(matches!(
+            GatewayNotification::from_jsonrpc(resolved).expect("resolved should map"),
+            GatewayNotification::TurnPermissionRequestResolved(_)
+        ));
     }
 
     #[test]

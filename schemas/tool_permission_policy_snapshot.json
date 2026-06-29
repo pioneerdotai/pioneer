@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ToolPermissionPolicySnapshot",
+  "type": "object",
+  "properties": {
+    "allowed_paths": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "allowed_tools": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "computer_use": {
+      "$ref": "#/$defs/PermissionBehavior"
+    },
+    "default_behavior": {
+      "$ref": "#/$defs/PermissionBehavior"
+    },
+    "denied_tools": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "dynamic_skill_tool": {
+      "$ref": "#/$defs/PermissionBehavior"
+    },
+    "file_read": {
+      "$ref": "#/$defs/PermissionBehavior"
+    },
+    "file_write": {
+      "$ref": "#/$defs/PermissionBehavior"
+    },
+    "mcp_read": {
+      "$ref": "#/$defs/PermissionBehavior"
+    },
+    "mcp_write_or_unknown": {
+      "$ref": "#/$defs/PermissionBehavior"
+    },
+    "network": {
+      "$ref": "#/$defs/PermissionBehavior"
+    },
+    "shell_command": {
+      "$ref": "#/$defs/PermissionBehavior"
+    },
+    "task_subagent": {
+      "$ref": "#/$defs/PermissionBehavior"
+    }
+  },
+  "required": [
+    "default_behavior",
+    "file_read",
+    "file_write",
+    "shell_command",
+    "network",
+    "mcp_read",
+    "mcp_write_or_unknown",
+    "dynamic_skill_tool",
+    "computer_use",
+    "task_subagent"
+  ],
+  "$defs": {
+    "PermissionBehavior": {
+      "type": "string",
+      "enum": [
+        "allow",
+        "ask",
+        "deny"
+      ]
+    }
+  }
+}

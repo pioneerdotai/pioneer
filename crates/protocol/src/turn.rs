@@ -335,7 +335,277 @@ pub struct TurnStartParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<TurnReasoningSelection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_profile: Option<TurnPermissionProfileSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cli_runtime_options: Option<TurnCLIRuntimeOptions>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnPermissionMode {
+    #[default]
+    FullAccess,
+    AutoAcceptEdits,
+    Supervised,
+}
+
+impl TurnPermissionMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FullAccess => "full_access",
+            Self::AutoAcceptEdits => "auto_accept_edits",
+            Self::Supervised => "supervised",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnPermissionProfileSelection {
+    pub mode: TurnPermissionMode,
+}
+
+impl TurnPermissionProfileSelection {
+    pub fn full_access() -> Self {
+        Self {
+            mode: TurnPermissionMode::FullAccess,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnPermissionProfileSnapshot {
+    pub mode: TurnPermissionMode,
+    pub source: TurnPermissionProfileSource,
+    pub effective_policy: ToolPermissionPolicySnapshot,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnPermissionProfileCap {
+    pub mode: TurnPermissionMode,
+    pub effective_policy: ToolPermissionPolicySnapshot,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnPermissionApprovalRequest {
+    pub request_id: String,
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub tool_name: String,
+    pub action: TurnPermissionActionKind,
+    pub scope_hash: String,
+    pub reason: TurnPermissionDecisionReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub details: Vec<TurnPermissionApprovalRequestDetail>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnPermissionApprovalRequestDetail {
+    pub label: String,
+    pub value: String,
+    #[serde(default)]
+    pub monospace: bool,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnPermissionActionKind {
+    FileRead,
+    FileWrite,
+    ShellCommand,
+    Network,
+    McpRead,
+    McpWriteOrUnknown,
+    DynamicSkillTool,
+    ComputerUse,
+    TaskSubagent,
+    Internal,
+    Unknown,
+}
+
+impl TurnPermissionActionKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FileRead => "file_read",
+            Self::FileWrite => "file_write",
+            Self::ShellCommand => "shell_command",
+            Self::Network => "network",
+            Self::McpRead => "mcp_read",
+            Self::McpWriteOrUnknown => "mcp_write_or_unknown",
+            Self::DynamicSkillTool => "dynamic_skill_tool",
+            Self::ComputerUse => "computer_use",
+            Self::TaskSubagent => "task_subagent",
+            Self::Internal => "internal",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnPermissionDecisionReason {
+    FullAccess,
+    PolicyAllowsAction,
+    PolicyRequiresApproval,
+    PolicyDeniesAction,
+    CachedApproval,
+    UserApproved,
+    UserDenied,
+    Cancelled,
+    Expired,
+    UnknownActionDefault,
+}
+
+impl TurnPermissionDecisionReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FullAccess => "full_access",
+            Self::PolicyAllowsAction => "policy_allows_action",
+            Self::PolicyRequiresApproval => "policy_requires_approval",
+            Self::PolicyDeniesAction => "policy_denies_action",
+            Self::CachedApproval => "cached_approval",
+            Self::UserApproved => "user_approved",
+            Self::UserDenied => "user_denied",
+            Self::Cancelled => "cancelled",
+            Self::Expired => "expired",
+            Self::UnknownActionDefault => "unknown_action_default",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnPermissionApprovalResolution {
+    AllowOnce,
+    AllowForTurn,
+    Deny,
+    Cancelled,
+    Expired,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnPermissionRequestOpenedNotification {
+    pub request: TurnPermissionApprovalRequest,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnPermissionRequestResolvedNotification {
+    pub request_id: String,
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub resolution: TurnPermissionApprovalResolution,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnPermissionRequestRespondParams {
+    pub request_id: String,
+    pub resolution: TurnPermissionApprovalResolution,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnPermissionRequestRespondResponse {
+    pub request_id: String,
+    pub resolution: TurnPermissionApprovalResolution,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnPermissionProfileSource {
+    Composer,
+    Defaulted,
+    InheritedFromParentTurn,
+    TaskPermissionCap,
+    System,
+}
+
+impl TurnPermissionProfileSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Composer => "composer",
+            Self::Defaulted => "defaulted",
+            Self::InheritedFromParentTurn => "inherited_from_parent_turn",
+            Self::TaskPermissionCap => "task_permission_cap",
+            Self::System => "system",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct ToolPermissionPolicySnapshot {
+    pub default_behavior: PermissionBehavior,
+    pub file_read: PermissionBehavior,
+    pub file_write: PermissionBehavior,
+    pub shell_command: PermissionBehavior,
+    pub network: PermissionBehavior,
+    pub mcp_read: PermissionBehavior,
+    pub mcp_write_or_unknown: PermissionBehavior,
+    pub dynamic_skill_tool: PermissionBehavior,
+    pub computer_use: PermissionBehavior,
+    pub task_subagent: PermissionBehavior,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub denied_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_paths: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionBehavior {
+    Allow,
+    Ask,
+    Deny,
+}
+
+impl PermissionBehavior {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Ask => "ask",
+            Self::Deny => "deny",
+        }
+    }
+}
+
+impl ToolPermissionPolicySnapshot {
+    pub fn all(behavior: PermissionBehavior) -> Self {
+        Self {
+            default_behavior: behavior,
+            file_read: behavior,
+            file_write: behavior,
+            shell_command: behavior,
+            network: behavior,
+            mcp_read: behavior,
+            mcp_write_or_unknown: behavior,
+            dynamic_skill_tool: behavior,
+            computer_use: behavior,
+            task_subagent: behavior,
+            allowed_tools: Vec::new(),
+            denied_tools: Vec::new(),
+            allowed_paths: Vec::new(),
+        }
+    }
+
+    pub fn for_mode(mode: TurnPermissionMode) -> Self {
+        crate::turn_permissions::permission_policy_for_mode(mode)
+    }
+}
+
+impl TurnPermissionProfileSnapshot {
+    pub fn from_mode(mode: TurnPermissionMode, source: TurnPermissionProfileSource) -> Self {
+        crate::turn_permissions::compile_turn_permission_profile(mode, source)
+    }
+}
+
+pub fn resolve_turn_permission_profile(
+    selection: Option<&TurnPermissionProfileSelection>,
+) -> TurnPermissionProfileSnapshot {
+    crate::turn_permissions::resolve_turn_permission_profile(selection)
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
@@ -765,6 +1035,8 @@ pub enum TurnItemEventPayload {
     TurnExecutionWindowContinued(TurnExecutionWindowContinuedNotification),
     #[serde(rename_all = "camelCase")]
     TurnExecutionWindowBlocked(TurnExecutionWindowBlockedNotification),
+    #[serde(rename_all = "camelCase")]
+    TurnPermissionAudit(crate::TurnPermissionAuditEvent),
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
@@ -786,6 +1058,8 @@ pub struct Turn {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_manifest: Option<PromptManifest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_profile: Option<TurnPermissionProfileSnapshot>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -3102,6 +3376,330 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn turn_permission_mode_uses_snake_case_wire_values() {
+        let cases = [
+            (TurnPermissionMode::FullAccess, "full_access"),
+            (TurnPermissionMode::AutoAcceptEdits, "auto_accept_edits"),
+            (TurnPermissionMode::Supervised, "supervised"),
+        ];
+
+        for (value, expected) in cases {
+            let encoded = serde_json::to_value(value).expect("mode should serialize");
+            assert_eq!(encoded, json!(expected));
+            assert_eq!(value.as_str(), expected);
+            let decoded: TurnPermissionMode =
+                serde_json::from_value(encoded).expect("mode should deserialize");
+            assert_eq!(decoded, value);
+        }
+
+        assert_eq!(
+            TurnPermissionMode::default(),
+            TurnPermissionMode::FullAccess
+        );
+    }
+
+    #[test]
+    fn permission_behavior_uses_snake_case_wire_values() {
+        let cases = [
+            (PermissionBehavior::Allow, "allow"),
+            (PermissionBehavior::Ask, "ask"),
+            (PermissionBehavior::Deny, "deny"),
+        ];
+
+        for (value, expected) in cases {
+            let encoded = serde_json::to_value(value).expect("behavior should serialize");
+            assert_eq!(encoded, json!(expected));
+            assert_eq!(value.as_str(), expected);
+            let decoded: PermissionBehavior =
+                serde_json::from_value(encoded).expect("behavior should deserialize");
+            assert_eq!(decoded, value);
+        }
+    }
+
+    #[test]
+    fn turn_permission_profile_source_uses_snake_case_wire_values() {
+        let cases = [
+            (TurnPermissionProfileSource::Composer, "composer"),
+            (TurnPermissionProfileSource::Defaulted, "defaulted"),
+            (
+                TurnPermissionProfileSource::InheritedFromParentTurn,
+                "inherited_from_parent_turn",
+            ),
+            (
+                TurnPermissionProfileSource::TaskPermissionCap,
+                "task_permission_cap",
+            ),
+            (TurnPermissionProfileSource::System, "system"),
+        ];
+
+        for (value, expected) in cases {
+            let encoded = serde_json::to_value(value).expect("source should serialize");
+            assert_eq!(encoded, json!(expected));
+            assert_eq!(value.as_str(), expected);
+            let decoded: TurnPermissionProfileSource =
+                serde_json::from_value(encoded).expect("source should deserialize");
+            assert_eq!(decoded, value);
+        }
+    }
+
+    #[test]
+    fn turn_permission_profile_selection_round_trips() {
+        let selection: TurnPermissionProfileSelection = serde_json::from_value(json!({
+            "mode": "auto_accept_edits"
+        }))
+        .expect("selection should deserialize");
+
+        assert_eq!(selection.mode, TurnPermissionMode::AutoAcceptEdits);
+        assert_eq!(
+            serde_json::to_value(selection).expect("selection should serialize"),
+            json!({ "mode": "auto_accept_edits" })
+        );
+    }
+
+    #[test]
+    fn turn_permission_profile_snapshot_round_trips_policy_fields() {
+        let snapshot = TurnPermissionProfileSnapshot {
+            mode: TurnPermissionMode::Supervised,
+            source: TurnPermissionProfileSource::Composer,
+            effective_policy: ToolPermissionPolicySnapshot {
+                default_behavior: PermissionBehavior::Ask,
+                file_read: PermissionBehavior::Allow,
+                file_write: PermissionBehavior::Ask,
+                shell_command: PermissionBehavior::Ask,
+                network: PermissionBehavior::Ask,
+                mcp_read: PermissionBehavior::Allow,
+                mcp_write_or_unknown: PermissionBehavior::Ask,
+                dynamic_skill_tool: PermissionBehavior::Ask,
+                computer_use: PermissionBehavior::Ask,
+                task_subagent: PermissionBehavior::Ask,
+                allowed_tools: vec!["read_file".to_owned()],
+                denied_tools: vec!["exec_command".to_owned()],
+                allowed_paths: vec!["/workspace/src".to_owned()],
+            },
+        };
+
+        let encoded = serde_json::to_value(&snapshot).expect("snapshot should serialize");
+        assert_eq!(encoded["mode"], "supervised");
+        assert_eq!(encoded["source"], "composer");
+        assert_eq!(encoded["effective_policy"]["file_read"], "allow");
+        assert_eq!(encoded["effective_policy"]["shell_command"], "ask");
+        assert_eq!(encoded["effective_policy"]["allowed_tools"][0], "read_file");
+
+        let decoded: TurnPermissionProfileSnapshot =
+            serde_json::from_value(encoded).expect("snapshot should deserialize");
+        assert_eq!(decoded, snapshot);
+    }
+
+    #[test]
+    fn resolve_turn_permission_profile_defaults_to_full_access() {
+        let snapshot = resolve_turn_permission_profile(None);
+
+        assert_eq!(snapshot.mode, TurnPermissionMode::FullAccess);
+        assert_eq!(snapshot.source, TurnPermissionProfileSource::Defaulted);
+        assert_eq!(
+            snapshot.effective_policy,
+            ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow)
+        );
+    }
+
+    #[test]
+    fn resolve_turn_permission_profile_uses_composer_source_for_selection() {
+        let selection = TurnPermissionProfileSelection {
+            mode: TurnPermissionMode::AutoAcceptEdits,
+        };
+        let snapshot = resolve_turn_permission_profile(Some(&selection));
+
+        assert_eq!(snapshot.mode, TurnPermissionMode::AutoAcceptEdits);
+        assert_eq!(snapshot.source, TurnPermissionProfileSource::Composer);
+        assert_eq!(
+            snapshot.effective_policy.file_write,
+            PermissionBehavior::Allow
+        );
+        assert_eq!(
+            snapshot.effective_policy.shell_command,
+            PermissionBehavior::Ask
+        );
+    }
+
+    #[test]
+    fn compile_turn_permission_profile_full_access_is_allow_all() {
+        let snapshot = crate::compile_turn_permission_profile(
+            TurnPermissionMode::FullAccess,
+            TurnPermissionProfileSource::Composer,
+        );
+
+        assert_eq!(snapshot.mode, TurnPermissionMode::FullAccess);
+        assert_eq!(snapshot.source, TurnPermissionProfileSource::Composer);
+        assert_eq!(
+            snapshot.effective_policy,
+            ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow)
+        );
+    }
+
+    #[test]
+    fn default_turn_permission_profile_snapshot_is_full_access_defaulted() {
+        let snapshot = crate::default_turn_permission_profile_snapshot();
+
+        assert_eq!(snapshot.mode, TurnPermissionMode::FullAccess);
+        assert_eq!(snapshot.source, TurnPermissionProfileSource::Defaulted);
+        assert_eq!(
+            snapshot.effective_policy,
+            ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow)
+        );
+    }
+
+    #[test]
+    fn permission_profile_compilation_is_deterministic() {
+        let first = crate::compile_turn_permission_profile(
+            TurnPermissionMode::FullAccess,
+            TurnPermissionProfileSource::System,
+        );
+        let second = crate::compile_turn_permission_profile(
+            TurnPermissionMode::FullAccess,
+            TurnPermissionProfileSource::System,
+        );
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn permission_profile_snapshot_json_field_order_is_not_semantic() {
+        let first: TurnPermissionProfileSnapshot = serde_json::from_value(json!({
+            "mode": "full_access",
+            "source": "defaulted",
+            "effective_policy": {
+                "default_behavior": "allow",
+                "file_read": "allow",
+                "file_write": "allow",
+                "shell_command": "allow",
+                "network": "allow",
+                "mcp_read": "allow",
+                "mcp_write_or_unknown": "allow",
+                "dynamic_skill_tool": "allow",
+                "computer_use": "allow",
+                "task_subagent": "allow"
+            }
+        }))
+        .expect("first snapshot should decode");
+        let second: TurnPermissionProfileSnapshot = serde_json::from_value(json!({
+            "effective_policy": {
+                "task_subagent": "allow",
+                "computer_use": "allow",
+                "dynamic_skill_tool": "allow",
+                "mcp_write_or_unknown": "allow",
+                "mcp_read": "allow",
+                "network": "allow",
+                "shell_command": "allow",
+                "file_write": "allow",
+                "file_read": "allow",
+                "default_behavior": "allow"
+            },
+            "source": "defaulted",
+            "mode": "full_access"
+        }))
+        .expect("second snapshot should decode");
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn source_specific_permission_profile_helpers_set_explicit_sources() {
+        let selection = TurnPermissionProfileSelection {
+            mode: TurnPermissionMode::Supervised,
+        };
+
+        assert_eq!(
+            crate::composer_turn_permission_profile_snapshot(&selection).source,
+            TurnPermissionProfileSource::Composer
+        );
+        assert_eq!(
+            crate::inherited_turn_permission_profile_snapshot(TurnPermissionMode::Supervised)
+                .source,
+            TurnPermissionProfileSource::InheritedFromParentTurn
+        );
+        assert_eq!(
+            crate::system_turn_permission_profile_snapshot(TurnPermissionMode::Supervised).source,
+            TurnPermissionProfileSource::System
+        );
+        assert_eq!(
+            crate::task_permission_cap_snapshot(&crate::task_permission_cap_for_mode(
+                TurnPermissionMode::Supervised
+            ))
+            .source,
+            TurnPermissionProfileSource::TaskPermissionCap
+        );
+    }
+
+    #[test]
+    fn permission_policy_tables_match_product_modes() {
+        let full_access = crate::permission_policy_for_mode(TurnPermissionMode::FullAccess);
+        assert_eq!(
+            full_access,
+            ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow)
+        );
+
+        let auto_accept_edits =
+            crate::permission_policy_for_mode(TurnPermissionMode::AutoAcceptEdits);
+        assert_eq!(auto_accept_edits.default_behavior, PermissionBehavior::Ask);
+        assert_eq!(auto_accept_edits.file_read, PermissionBehavior::Allow);
+        assert_eq!(auto_accept_edits.file_write, PermissionBehavior::Allow);
+        assert_eq!(auto_accept_edits.shell_command, PermissionBehavior::Ask);
+        assert_eq!(auto_accept_edits.network, PermissionBehavior::Ask);
+        assert_eq!(auto_accept_edits.mcp_read, PermissionBehavior::Allow);
+        assert_eq!(
+            auto_accept_edits.mcp_write_or_unknown,
+            PermissionBehavior::Ask
+        );
+        assert_eq!(
+            auto_accept_edits.dynamic_skill_tool,
+            PermissionBehavior::Ask
+        );
+        assert_eq!(auto_accept_edits.computer_use, PermissionBehavior::Ask);
+        assert_eq!(auto_accept_edits.task_subagent, PermissionBehavior::Ask);
+
+        let supervised = crate::permission_policy_for_mode(TurnPermissionMode::Supervised);
+        assert_eq!(supervised.default_behavior, PermissionBehavior::Ask);
+        assert_eq!(supervised.file_read, PermissionBehavior::Allow);
+        assert_eq!(supervised.file_write, PermissionBehavior::Ask);
+        assert_eq!(supervised.shell_command, PermissionBehavior::Ask);
+        assert_eq!(supervised.network, PermissionBehavior::Ask);
+        assert_eq!(supervised.mcp_read, PermissionBehavior::Allow);
+        assert_eq!(supervised.mcp_write_or_unknown, PermissionBehavior::Ask);
+        assert_eq!(supervised.dynamic_skill_tool, PermissionBehavior::Ask);
+        assert_eq!(supervised.computer_use, PermissionBehavior::Ask);
+        assert_eq!(supervised.task_subagent, PermissionBehavior::Ask);
+    }
+
+    #[test]
+    fn restricted_permission_policy_tables_do_not_deny_by_default() {
+        for mode in [
+            TurnPermissionMode::AutoAcceptEdits,
+            TurnPermissionMode::Supervised,
+        ] {
+            let policy = crate::permission_policy_for_mode(mode);
+            let fields = [
+                policy.default_behavior,
+                policy.file_read,
+                policy.file_write,
+                policy.shell_command,
+                policy.network,
+                policy.mcp_read,
+                policy.mcp_write_or_unknown,
+                policy.dynamic_skill_tool,
+                policy.computer_use,
+                policy.task_subagent,
+            ];
+
+            assert!(
+                fields
+                    .into_iter()
+                    .all(|behavior| behavior != PermissionBehavior::Deny)
+            );
+            assert_eq!(policy.default_behavior, PermissionBehavior::Ask);
+        }
+    }
+
+    #[test]
     fn execution_window_status_uses_snake_case_wire_values() {
         let cases = [
             (ExecutionWindowStatus::Running, "running"),
@@ -3620,6 +4218,7 @@ mod tests {
                 effort: "high".to_owned()
             })
         );
+        assert!(params.permission_profile.is_none());
 
         let encoded = serde_json::to_value(params).expect("params should encode");
         assert_eq!(
@@ -3772,6 +4371,7 @@ mod tests {
             mode: None,
             execution_backend: None,
             reasoning: None,
+            permission_profile: None,
             cli_runtime_options: None,
         };
 
@@ -3855,6 +4455,7 @@ mod tests {
             mode: None,
             execution_backend: None,
             reasoning: None,
+            permission_profile: None,
             cli_runtime_options: None,
         };
 
@@ -3875,6 +4476,46 @@ mod tests {
                 ]
             })
         );
+    }
+
+    #[test]
+    fn turn_start_params_round_trips_permission_profile_selection() {
+        let params: TurnStartParams = serde_json::from_value(json!({
+            "thread_id": "thr_123",
+            "turn_id": "turn_123",
+            "permission_profile": {
+                "mode": "supervised"
+            }
+        }))
+        .expect("params should decode");
+
+        assert_eq!(
+            params.permission_profile,
+            Some(TurnPermissionProfileSelection {
+                mode: TurnPermissionMode::Supervised
+            })
+        );
+
+        let encoded = serde_json::to_value(params).expect("params should encode");
+        assert_eq!(
+            encoded["permission_profile"],
+            json!({ "mode": "supervised" })
+        );
+    }
+
+    #[test]
+    fn old_turn_payload_can_omit_permission_profile_snapshot() {
+        let turn: Turn = serde_json::from_value(json!({
+            "id": "turn_123",
+            "status": "InProgress"
+        }))
+        .expect("old turn payload should deserialize");
+
+        assert_eq!(turn.id, "turn_123");
+        assert_eq!(turn.status, TurnStatus::InProgress);
+        assert_eq!(turn.turn_kind, TurnKind::Conversation);
+        assert_eq!(turn.origin, TurnOrigin::User);
+        assert!(turn.permission_profile.is_none());
     }
 
     #[test]

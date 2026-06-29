@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnPermissionProfileSelection",
+  "type": "object",
+  "properties": {
+    "mode": {
+      "$ref": "#/$defs/TurnPermissionMode"
+    }
+  },
+  "required": [
+    "mode"
+  ],
+  "$defs": {
+    "TurnPermissionMode": {
+      "type": "string",
+      "enum": [
+        "full_access",
+        "auto_accept_edits",
+        "supervised"
+      ]
+    }
+  }
+}

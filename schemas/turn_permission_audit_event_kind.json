@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnPermissionAuditEventKind",
+  "type": "string",
+  "enum": [
+    "profile_selected",
+    "approval_requested",
+    "approval_resolved",
+    "decision_allowed",
+    "decision_denied"
+  ]
+}

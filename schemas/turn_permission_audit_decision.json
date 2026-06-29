@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnPermissionAuditDecision",
+  "type": "string",
+  "enum": [
+    "allow",
+    "ask",
+    "deny",
+    "allow_once",
+    "allow_for_turn",
+    "cancelled",
+    "expired"
+  ]
+}

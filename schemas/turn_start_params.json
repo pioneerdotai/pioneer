@@ -58,6 +58,16 @@
         "null"
       ]
     },
+    "permission_profile": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TurnPermissionProfileSelection"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "reasoning": {
       "anyOf": [
         {
@@ -343,6 +353,25 @@
             "scopeKind"
           ]
         }
+      ]
+    },
+    "TurnPermissionMode": {
+      "type": "string",
+      "enum": [
+        "full_access",
+        "auto_accept_edits",
+        "supervised"
+      ]
+    },
+    "TurnPermissionProfileSelection": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/TurnPermissionMode"
+        }
+      },
+      "required": [
+        "mode"
       ]
     },
     "TurnReasoningSelection": {

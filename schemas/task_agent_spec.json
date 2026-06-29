@@ -52,6 +52,16 @@
         "null"
       ]
     },
+    "permissionCap": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TurnPermissionProfileCap"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "prompt": {
       "$ref": "#/$defs/TaskAgentPrompt"
     },
@@ -109,6 +119,14 @@
     "updatedAt"
   ],
   "$defs": {
+    "PermissionBehavior": {
+      "type": "string",
+      "enum": [
+        "allow",
+        "ask",
+        "deny"
+      ]
+    },
     "TaskAgentContext": {
       "type": "object",
       "properties": {
@@ -664,6 +682,94 @@
             "value"
           ]
         }
+      ]
+    },
+    "ToolPermissionPolicySnapshot": {
+      "type": "object",
+      "properties": {
+        "allowed_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "allowed_tools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "computer_use": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "default_behavior": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "denied_tools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "dynamic_skill_tool": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "file_read": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "file_write": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "mcp_read": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "mcp_write_or_unknown": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "network": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "shell_command": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "task_subagent": {
+          "$ref": "#/$defs/PermissionBehavior"
+        }
+      },
+      "required": [
+        "default_behavior",
+        "file_read",
+        "file_write",
+        "shell_command",
+        "network",
+        "mcp_read",
+        "mcp_write_or_unknown",
+        "dynamic_skill_tool",
+        "computer_use",
+        "task_subagent"
+      ]
+    },
+    "TurnPermissionMode": {
+      "type": "string",
+      "enum": [
+        "full_access",
+        "auto_accept_edits",
+        "supervised"
+      ]
+    },
+    "TurnPermissionProfileCap": {
+      "type": "object",
+      "properties": {
+        "effective_policy": {
+          "$ref": "#/$defs/ToolPermissionPolicySnapshot"
+        },
+        "mode": {
+          "$ref": "#/$defs/TurnPermissionMode"
+        }
+      },
+      "required": [
+        "mode",
+        "effective_policy"
       ]
     }
   }

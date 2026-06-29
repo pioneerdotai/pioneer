@@ -5,7 +5,9 @@ use crate::{
     TaskEventPayload, ThreadLineage, ToolOutputPolicySnapshot, TurnCapabilityKind,
     TurnExecutionWindowBlockedNotification, TurnExecutionWindowCheckpointedNotification,
     TurnExecutionWindowContinuedNotification, TurnExecutionWindowExhaustedNotification,
-    TurnExecutionWindowStartedNotification, TurnItemType, TurnToolLoopBudgetExceededNotification,
+    TurnExecutionWindowStartedNotification, TurnItemType, TurnPermissionActionKind,
+    TurnPermissionDecisionReason, TurnPermissionMode, TurnPermissionProfileSource,
+    TurnToolLoopBudgetExceededNotification,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -49,6 +51,9 @@ pub enum AgentDurableEvent {
         thread_id: String,
         turn_id: String,
         events: Vec<SkillAuditEvent>,
+    },
+    TurnPermissionAudit {
+        event: TurnPermissionAuditEvent,
     },
     TurnLlmContextAppended {
         thread_id: String,
@@ -220,6 +225,66 @@ pub struct SkillAuditEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnPermissionAuditEvent {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub event_kind: TurnPermissionAuditEventKind,
+    pub profile_mode: TurnPermissionMode,
+    pub profile_source: TurnPermissionProfileSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_kind: Option<TurnPermissionActionKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_key: Option<TurnPermissionAuditRequestKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<TurnPermissionAuditDecision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<TurnPermissionDecisionReason>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cached: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnPermissionAuditEventKind {
+    ProfileSelected,
+    ApprovalRequested,
+    ApprovalResolved,
+    DecisionAllowed,
+    DecisionDenied,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnPermissionAuditDecision {
+    Allow,
+    Ask,
+    Deny,
+    AllowOnce,
+    AllowForTurn,
+    Cancelled,
+    Expired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnPermissionAuditRequestKey {
+    pub action_kind: TurnPermissionActionKind,
+    pub scope_hash: String,
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct RecoveryAttemptContext {
     pub job_id: String,
     pub attempt_id: String,
@@ -248,6 +313,9 @@ impl AgentDurableEvent {
             | Self::TurnBlocked { turn_id, .. }
             | Self::TurnInterrupted { turn_id, .. } => DurableEventCausalityKey::Turn {
                 turn_id: turn_id.clone(),
+            },
+            Self::TurnPermissionAudit { event } => DurableEventCausalityKey::Turn {
+                turn_id: event.turn_id.clone(),
             },
             Self::ItemStarted { notification } => DurableEventCausalityKey::Turn {
                 turn_id: notification.turn_id.clone(),
@@ -304,6 +372,7 @@ impl AgentDurableEvent {
             | Self::TurnSkillsResolved { .. }
             | Self::TurnCapabilitiesResolved { .. }
             | Self::SkillAuditEvents { .. }
+            | Self::TurnPermissionAudit { .. }
             | Self::TurnLlmContextAppended { .. }
             | Self::ItemStarted { .. }
             | Self::ItemToolRetryScheduled { .. }

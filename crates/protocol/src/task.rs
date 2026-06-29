@@ -1171,6 +1171,8 @@ pub struct TaskAgentSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_policy: Option<TaskAgentToolPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_cap: Option<crate::TurnPermissionProfileCap>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_contract: Option<TaskAgentResultContract>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_policy: Option<TaskAgentReviewPolicy>,
@@ -1957,6 +1959,8 @@ pub struct TaskAgentSpecInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_policy: Option<TaskAgentToolPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_cap: Option<crate::TurnPermissionProfileCap>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_contract: Option<TaskAgentResultContract>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_policy: Option<TaskAgentReviewPolicy>,
@@ -2357,6 +2361,8 @@ pub struct TaskWaitItem {
     pub child_thread_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub child_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_profile: Option<crate::TurnPermissionProfileSnapshot>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]

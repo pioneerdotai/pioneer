@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnPermissionApprovalRequestDetail",
+  "type": "object",
+  "properties": {
+    "label": {
+      "type": "string"
+    },
+    "monospace": {
+      "type": "boolean",
+      "default": false
+    },
+    "value": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "label",
+    "value"
+  ]
+}

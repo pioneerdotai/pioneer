@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnPermissionActionKind",
+  "type": "string",
+  "enum": [
+    "file_read",
+    "file_write",
+    "shell_command",
+    "network",
+    "mcp_read",
+    "mcp_write_or_unknown",
+    "dynamic_skill_tool",
+    "computer_use",
+    "task_subagent",
+    "internal",
+    "unknown"
+  ]
+}

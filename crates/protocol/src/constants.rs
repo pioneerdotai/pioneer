@@ -24,6 +24,7 @@ pub mod methods {
     pub const TURN_GET: &str = "turn/get";
     pub const TURN_ITEMS: &str = "turn/items";
     pub const TURN_WORK_PAGE: &str = "turn/work/page";
+    pub const TURN_PERMISSION_REQUEST_RESPOND: &str = "turn/permission/request/respond";
     pub const PROVIDER_LIST: &str = "provider/list";
     pub const PROVIDER_MODELS_LIST: &str = "provider/models/list";
     pub const PROVIDER_SET_API_KEY: &str = "provider/set_api_key";
@@ -121,6 +122,9 @@ pub mod events {
     pub const TURN_BLOCKED: &str = "turn/blocked";
     pub const TURN_WORK_ITEMS_CHANGED: &str = "turn/work/items/changed";
     pub const TURN_WORK_STATE_CHANGED: &str = "turn/work/state/changed";
+    pub const TURN_PERMISSION_REQUEST_OPENED: &str = "turn/permission/request/opened";
+    pub const TURN_PERMISSION_REQUEST_RESOLVED: &str = "turn/permission/request/resolved";
+    pub const TURN_PERMISSION_AUDIT: &str = "turn/permission/audit";
     pub const TURN_EXECUTION_WINDOW_STARTED: &str = "turn/execution_window/started";
     pub const TURN_EXECUTION_WINDOW_EXHAUSTED: &str = "turn/execution_window/exhausted";
     pub const TURN_EXECUTION_WINDOW_CHECKPOINTED: &str = "turn/execution_window/checkpointed";

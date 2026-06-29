@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnPermissionProfileSource",
+  "type": "string",
+  "enum": [
+    "composer",
+    "defaulted",
+    "inherited_from_parent_turn",
+    "task_permission_cap",
+    "system"
+  ]
+}

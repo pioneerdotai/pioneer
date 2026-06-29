@@ -222,6 +222,36 @@
         "end"
       ]
     },
+    "CLIRuntimePendingRequest": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/CLIRuntimeRequestKind"
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "native_request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "payload": true,
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
     "CLIRuntimePendingRequestStatus": {
       "type": "string",
       "enum": [
@@ -607,6 +637,10 @@
                 }
               ]
             },
+            "status": {
+              "$ref": "#/$defs/TurnWorkItemStatus",
+              "default": "completed"
+            },
             "text": {
               "type": "string"
             }
@@ -642,37 +676,35 @@
         {
           "type": "object",
           "properties": {
+            "itemId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "kind": {
               "type": "string",
               "const": "pending_request"
             },
-            "message": {
-              "type": [
-                "string",
-                "null"
-              ]
+            "request": {
+              "$ref": "#/$defs/CLIRuntimePendingRequest"
             },
             "requestId": {
               "type": "string"
             },
-            "requestKind": {
-              "$ref": "#/$defs/CLIRuntimeRequestKind"
+            "runtimeId": {
+              "type": "string"
             },
             "status": {
               "$ref": "#/$defs/CLIRuntimePendingRequestStatus"
-            },
-            "title": {
-              "type": [
-                "string",
-                "null"
-              ]
             }
           },
           "required": [
             "kind",
+            "runtimeId",
             "requestId",
-            "requestKind",
-            "status"
+            "status",
+            "request"
           ]
         }
       ]
@@ -858,6 +890,16 @@
         "hiddenWorkCount",
         "hasMoreBefore",
         "hasMoreAfter"
+      ]
+    },
+    "TurnWorkItemStatus": {
+      "type": "string",
+      "enum": [
+        "running",
+        "completed",
+        "blocked",
+        "failed",
+        "cancelled"
       ]
     },
     "TurnWorkPresentation": {
