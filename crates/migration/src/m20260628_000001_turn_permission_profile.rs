@@ -8,7 +8,6 @@ enum Turn {
     Table,
     PermissionProfileMode,
     PermissionProfileSource,
-    PermissionProfileVersion,
     PermissionProfileSnapshotJson,
 }
 
@@ -43,19 +42,6 @@ impl MigrationTrait for Migration {
                     Table::alter()
                         .table(Turn::Table)
                         .add_column(string(Turn::PermissionProfileSource).null())
-                        .to_owned(),
-                )
-                .await?;
-        }
-        if !manager
-            .has_column("turn", "permission_profile_version")
-            .await?
-        {
-            manager
-                .alter_table(
-                    Table::alter()
-                        .table(Turn::Table)
-                        .add_column(integer(Turn::PermissionProfileVersion).null())
                         .to_owned(),
                 )
                 .await?;
@@ -113,19 +99,6 @@ impl MigrationTrait for Migration {
                     Table::alter()
                         .table(Turn::Table)
                         .drop_column(Turn::PermissionProfileSnapshotJson)
-                        .to_owned(),
-                )
-                .await?;
-        }
-        if manager
-            .has_column("turn", "permission_profile_version")
-            .await?
-        {
-            manager
-                .alter_table(
-                    Table::alter()
-                        .table(Turn::Table)
-                        .drop_column(Turn::PermissionProfileVersion)
                         .to_owned(),
                 )
                 .await?;

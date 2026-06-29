@@ -28,7 +28,6 @@ pub struct Model {
     pub reasoning_effort: Option<String>,
     pub permission_profile_mode: Option<String>,
     pub permission_profile_source: Option<String>,
-    pub permission_profile_version: Option<i64>,
     #[sea_orm(column_type = "Text", nullable)]
     pub permission_profile_snapshot_json: Option<String>,
 }
