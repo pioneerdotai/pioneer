@@ -1,6 +1,7 @@
 mod capabilities;
 mod mode_selector;
 mod model_selector;
+mod permission_selector;
 mod view;
 
 use crate::app::root::{GatewayConnectionState, PioneerDesktop};

@@ -2,7 +2,9 @@ use super::*;
 use crate::app::skills::details::table::SkillDiagnosticsTableDelegate;
 use crate::{state, window};
 use gpui_component::table::TableState;
-use pioneer_client::composer::model_selection::default_composer_turn_mode;
+use pioneer_client::composer::{
+    model_selection::default_composer_turn_mode, permissions::default_composer_permission_mode,
+};
 
 impl PioneerDesktop {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -97,12 +99,13 @@ impl PioneerDesktop {
             composer_selected_provider: None,
             composer_selected_model: None,
             composer_selected_reasoning_effort: None,
+            composer_permission_mode: default_composer_permission_mode(),
             composer_model_selection_manually_selected: false,
             composer_model_display_cache: HashMap::new(),
             composer_model_display_loading_key: None,
             main_content_view: MainContentView::Threads,
             providers: Default::default(),
-            cli_runtime_pending_requests: Default::default(),
+            pending_requests: Default::default(),
             cli_runtime_thread_bindings: HashMap::new(),
             mcp_servers: Vec::new(),
             mcp_selected_server_id: None,
@@ -134,6 +137,7 @@ impl PioneerDesktop {
             thread_drafts: HashMap::new(),
             thread_draft_attachments: HashMap::new(),
             thread_draft_capabilities: HashMap::new(),
+            thread_draft_permission_modes: HashMap::new(),
             thread_start: ThreadStartCoordinator::default(),
             thread_start_requested: false,
             thread_timeline_scroll_handle: VirtualListScrollHandle::new(),

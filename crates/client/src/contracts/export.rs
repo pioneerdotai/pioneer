@@ -456,6 +456,55 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Provisional
         ),
         contract_type!(
+            "pending_request_action_kind.json",
+            crate::cli_runtime::approvals::PendingRequestActionKind,
+            Domain::Providers,
+            Kind::SelectorDto,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "pending_request_available_action.json",
+            crate::cli_runtime::approvals::PendingRequestAvailableAction,
+            Domain::Providers,
+            Kind::SelectorDto,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "pending_request_detail_row.json",
+            crate::cli_runtime::approvals::PendingRequestDetailRow,
+            Domain::Providers,
+            Kind::SelectorDto,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "pending_request_detail_style.json",
+            crate::cli_runtime::approvals::PendingRequestDetailStyle,
+            Domain::Providers,
+            Kind::SelectorDto,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "pending_request_presentation.json",
+            crate::cli_runtime::approvals::PendingRequestPresentation,
+            Domain::Providers,
+            Kind::SelectorDto,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "pending_request_user_input_option.json",
+            crate::cli_runtime::approvals::PendingRequestUserInputOption,
+            Domain::Providers,
+            Kind::SelectorDto,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "pending_request_user_input_question.json",
+            crate::cli_runtime::approvals::PendingRequestUserInputQuestion,
+            Domain::Providers,
+            Kind::SelectorDto,
+            Stability::Provisional
+        ),
+        contract_type!(
             "turn_permission_approval_request.json",
             pioneer_protocol::TurnPermissionApprovalRequest,
             Domain::Providers,

@@ -910,6 +910,12 @@ fn task_wait_review_detail_kind_label(kind: TaskWaitReviewDetailKind) -> String 
         TaskWaitReviewDetailKind::ReviewMode => {
             t!("timeline.task_review.details.review_mode").to_string()
         }
+        TaskWaitReviewDetailKind::PermissionMode => {
+            t!("timeline.task_review.details.permission_mode").to_string()
+        }
+        TaskWaitReviewDetailKind::PermissionSource => {
+            t!("timeline.task_review.details.permission_source").to_string()
+        }
         TaskWaitReviewDetailKind::RevisionBlocked => {
             t!("timeline.task_review.details.revision_blocked").to_string()
         }

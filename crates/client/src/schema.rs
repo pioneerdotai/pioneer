@@ -555,6 +555,22 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             crate::cli_runtime::approvals::PendingRequest
         ),
         schema_doc!(
+            "pending_request_action_kind.json",
+            crate::cli_runtime::approvals::PendingRequestActionKind
+        ),
+        schema_doc!(
+            "pending_request_available_action.json",
+            crate::cli_runtime::approvals::PendingRequestAvailableAction
+        ),
+        schema_doc!(
+            "pending_request_detail_row.json",
+            crate::cli_runtime::approvals::PendingRequestDetailRow
+        ),
+        schema_doc!(
+            "pending_request_detail_style.json",
+            crate::cli_runtime::approvals::PendingRequestDetailStyle
+        ),
+        schema_doc!(
             "pending_request_kind.json",
             crate::cli_runtime::approvals::PendingRequestKind
         ),
@@ -569,6 +585,18 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "pending_request_resolution.json",
             crate::cli_runtime::approvals::PendingRequestResolution
+        ),
+        schema_doc!(
+            "pending_request_presentation.json",
+            crate::cli_runtime::approvals::PendingRequestPresentation
+        ),
+        schema_doc!(
+            "pending_request_user_input_option.json",
+            crate::cli_runtime::approvals::PendingRequestUserInputOption
+        ),
+        schema_doc!(
+            "pending_request_user_input_question.json",
+            crate::cli_runtime::approvals::PendingRequestUserInputQuestion
         ),
         schema_doc!(
             "turn_permission_approval_request.json",

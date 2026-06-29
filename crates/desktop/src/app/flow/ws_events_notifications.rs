@@ -107,8 +107,11 @@ impl PioneerDesktop {
                 self.apply_cli_runtime_refresh_reduction(reduction, cx);
             }
             ClientRuntimeNotification::CLIRuntimePendingRequests { refresh, reduction } => {
-                self.apply_cli_runtime_pending_requests_reduction(reduction, cx);
+                self.apply_pending_requests_reduction(reduction, cx);
                 self.apply_cli_runtime_refresh_reduction(refresh, cx);
+            }
+            ClientRuntimeNotification::PendingRequests { reduction } => {
+                self.apply_pending_requests_reduction(reduction, cx);
             }
             ClientRuntimeNotification::GatewayRemoteAccessStatusChanged(notification) => {
                 self.apply_remote_access_status_changed(notification.status, cx);
@@ -215,8 +218,8 @@ impl PioneerDesktop {
         if reduction.sync_composer_model_selection {
             self.sync_composer_model_selection_for_active_thread();
         }
-        if let Some(pending_reduction) = reduction.cli_runtime_pending_requests
-            && self.cli_runtime_pending_requests.apply(pending_reduction)
+        if let Some(pending_reduction) = reduction.pending_requests
+            && self.pending_requests.apply(pending_reduction)
             && let Some(cx) = cx.as_deref_mut()
         {
             cx.notify();
@@ -240,12 +243,9 @@ impl PioneerDesktop {
     }
 
     fn apply_thread_closed_reduction(&mut self, reduction: ThreadClosedReduction) {
-        let pending_reduction =
-            pioneer_client::cli_runtime::approvals::reduce_cli_runtime_thread_closed_cleanup(
-                reduction.workspace_id.clone(),
-                reduction.thread_id.clone(),
-            );
-        self.cli_runtime_pending_requests.apply(pending_reduction);
+        if let Some(pending_reduction) = reduction.pending_requests {
+            self.pending_requests.apply(pending_reduction);
+        }
         if reduction.remove_thread_conversation {
             self.remove_thread_conversation(reduction.thread_id.as_str());
         }
@@ -397,12 +397,12 @@ impl PioneerDesktop {
         }
     }
 
-    fn apply_cli_runtime_pending_requests_reduction(
+    fn apply_pending_requests_reduction(
         &mut self,
-        reduction: pioneer_client::cli_runtime::approvals::CLIRuntimePendingRequestsReduction,
+        reduction: pioneer_client::cli_runtime::approvals::PendingRequestsReduction,
         cx: &mut Context<Self>,
     ) {
-        if self.cli_runtime_pending_requests.apply(reduction) {
+        if self.pending_requests.apply(reduction) {
             cx.notify();
         }
     }

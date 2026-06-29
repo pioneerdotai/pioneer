@@ -1,6 +1,10 @@
 use super::super::root::{ComposerCapability, PioneerDesktop};
 use crate::gateway::DesktopGatewayWsCommandSenderExt;
 use gpui::{prelude::*, *};
+use pioneer_client::cli_runtime::approvals::{
+    PendingRequest, PendingRequestResolution, PendingRequestResponseAction,
+    PendingRequestsReduction, plan_pending_request_response,
+};
 use pioneer_client::composer::attachments as composer_attachments;
 use pioneer_client::composer::capabilities as composer_capabilities;
 use pioneer_client::composer::turn_prepare::{
@@ -8,10 +12,7 @@ use pioneer_client::composer::turn_prepare::{
 };
 use pioneer_client::providers::list as provider_list;
 use pioneer_client::turns::{cancel as turn_cancel, start as turn_start, steer as turn_steer};
-use pioneer_protocol::{
-    ArtifactRef, CLIRuntimeRequestResolution, CLIRuntimeRequestResolvedNotification,
-    CLIRuntimeRequestRespondParams,
-};
+use pioneer_protocol::{ArtifactRef, CLIRuntimeRequestResolvedNotification};
 use std::path::PathBuf;
 use tracing::warn;
 
@@ -75,53 +76,92 @@ impl PioneerDesktop {
         .detach();
     }
 
-    pub(super) fn respond_cli_runtime_pending_request(
+    pub(super) fn respond_pending_request(
         &mut self,
-        entry: crate::app::root::CLIRuntimePendingRequestEntry,
-        resolution: CLIRuntimeRequestResolution,
+        request: PendingRequest,
+        resolution: PendingRequestResolution,
         cx: &mut Context<Self>,
     ) {
-        let ws_sender = self.gateway.ws_command_sender.clone();
-        let params = CLIRuntimeRequestRespondParams {
-            workspace_id: entry.workspace_id.clone(),
-            runtime_id: entry.runtime_id.clone(),
-            request_id: entry.request_id.clone(),
-            resolution,
+        let action = match plan_pending_request_response(&request, resolution) {
+            Ok(action) => action,
+            Err(error) => {
+                warn!(
+                    request_id = request.request_id.as_str(),
+                    error = ?error,
+                    "failed to plan pending request response"
+                );
+                return;
+            }
         };
+        let ws_sender = self.gateway.ws_command_sender.clone();
 
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             async move {
-                let result = cx
-                    .background_spawn(async move { ws_sender.cli_runtime_request_respond(params) })
-                    .await;
+                match action {
+                    PendingRequestResponseAction::CLIRuntime { params, .. } => {
+                        let request_id = params.request_id.clone();
+                        let runtime_id = params.runtime_id.clone();
+                        let result = cx
+                            .background_spawn(async move {
+                                ws_sender.cli_runtime_request_respond(params)
+                            })
+                            .await;
 
-                let _ = this.update(&mut cx, |view, cx| match result {
-                    Ok(response) => {
-                        let reduction =
-                            pioneer_client::cli_runtime::approvals::reduce_cli_runtime_request_resolved_notification(
-                                CLIRuntimeRequestResolvedNotification {
-                                    workspace_id: response.workspace_id,
-                                    runtime_id: response.runtime_id,
-                                    request_id: response.request_id,
-                                    thread_id: response.thread_id,
-                                    turn_id: response.turn_id,
-                                    item_id: response.item_id,
-                                    resolution: response.resolution,
-                                },
-                            );
-                        view.cli_runtime_pending_requests.apply(reduction);
-                        cx.notify();
+                        let _ = this.update(&mut cx, |view, cx| match result {
+                            Ok(response) => {
+                                let reduction =
+                                    pioneer_client::cli_runtime::approvals::reduce_cli_runtime_request_resolved_notification(
+                                        CLIRuntimeRequestResolvedNotification {
+                                            workspace_id: response.workspace_id,
+                                            runtime_id: response.runtime_id,
+                                            request_id: response.request_id,
+                                            thread_id: response.thread_id,
+                                            turn_id: response.turn_id,
+                                            item_id: response.item_id,
+                                            resolution: response.resolution,
+                                        },
+                                    );
+                                view.pending_requests.apply(reduction);
+                                cx.notify();
+                            }
+                            Err(error) => {
+                                warn!(
+                                    request_id = request_id.as_str(),
+                                    runtime_id = runtime_id.as_str(),
+                                    error = %format!("{error:#}"),
+                                    "failed to respond to CLI runtime pending request"
+                                );
+                            }
+                        });
                     }
-                    Err(error) => {
-                        warn!(
-                            request_id = entry.request_id.as_str(),
-                            runtime_id = entry.runtime_id.as_str(),
-                            error = %format!("{error:#}"),
-                            "failed to respond to CLI runtime pending request"
-                        );
+                    PendingRequestResponseAction::NativePermissionGate { params, .. } => {
+                        let request_id = params.request_id.clone();
+                        let result = cx
+                            .background_spawn(async move {
+                                ws_sender.turn_permission_request_respond(params)
+                            })
+                            .await;
+
+                        let _ = this.update(&mut cx, |view, cx| match result {
+                            Ok(response) => {
+                                view.pending_requests.apply(
+                                    PendingRequestsReduction::Resolved {
+                                        request_id: response.request_id,
+                                    },
+                                );
+                                cx.notify();
+                            }
+                            Err(error) => {
+                                warn!(
+                                    request_id = request_id.as_str(),
+                                    error = %format!("{error:#}"),
+                                    "failed to respond to native pending request"
+                                );
+                            }
+                        });
                     }
-                });
+                }
             }
         })
         .detach();
@@ -200,6 +240,7 @@ impl PioneerDesktop {
 
         let composer_state = self.composer_state.clone();
         let selected_mode = self.composer_turn_mode;
+        let selected_permission_mode = self.composer_permission_mode;
         let selected_model = self.composer_selected_model.clone();
         let selected_provider = self.composer_selected_provider.clone();
         let selected_reasoning_effort = self.composer_selected_reasoning_effort.clone();
@@ -326,6 +367,7 @@ impl PioneerDesktop {
                                     selected_provider: selected_provider.clone(),
                                     turn_model_provider: turn_model_provider.clone(),
                                     selected_mode: Some(selected_mode),
+                                    permission_mode: selected_permission_mode,
                                     execution_backend: selected_cli_runtime_backend.clone(),
                                     selected_reasoning_effort: selected_reasoning_effort.clone(),
                                     cli_runtime_options: None,

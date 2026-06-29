@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PendingRequestUserInputQuestion",
+  "type": "object",
+  "properties": {
+    "header": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "id": {
+      "type": "string"
+    },
+    "is_secret": {
+      "type": "boolean"
+    },
+    "options": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/PendingRequestUserInputOption"
+      }
+    },
+    "question": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "question",
+    "options",
+    "is_secret"
+  ],
+  "$defs": {
+    "PendingRequestUserInputOption": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "label": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "label"
+      ]
+    }
+  }
+}

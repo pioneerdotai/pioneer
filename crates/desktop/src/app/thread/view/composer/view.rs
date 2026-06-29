@@ -132,6 +132,7 @@ impl PioneerDesktop {
                                         .gap_2()
                                         .child(self.render_composer_add_menu(cx))
                                         .child(self.render_composer_mode_selector(cx))
+                                        .child(self.render_composer_permission_selector(cx))
                                         .child(self.render_composer_model_selector(cx)),
                                 )
                                 .child(

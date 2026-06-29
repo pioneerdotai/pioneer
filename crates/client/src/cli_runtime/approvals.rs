@@ -7,6 +7,7 @@ use pioneer_protocol::{
     TurnPermissionApprovalResolution, TurnPermissionRequestOpenedNotification,
     TurnPermissionRequestResolvedNotification, TurnPermissionRequestRespondParams,
 };
+use serde_json::{Map as JsonMap, Value as JsonValue};
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -144,6 +145,165 @@ pub enum PendingRequestResolution {
     Expired,
 }
 
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingRequestActionKind {
+    CancelTurn,
+    Deny,
+    Allow,
+    AllowForTurn,
+    Answer,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PendingRequestAvailableAction {
+    pub kind: PendingRequestActionKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<PendingRequestResolution>,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingRequestDetailStyle {
+    Field,
+    Diff,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PendingRequestDetailRow {
+    pub label: String,
+    pub value: String,
+    pub monospace: bool,
+    pub style: PendingRequestDetailStyle,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PendingRequestUserInputQuestion {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    pub question: String,
+    pub options: Vec<PendingRequestUserInputOption>,
+    pub is_secret: bool,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PendingRequestUserInputOption {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PendingRequestPresentation {
+    pub origin_label: String,
+    pub kind_label: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    pub details: Vec<PendingRequestDetailRow>,
+    pub user_input_questions: Vec<PendingRequestUserInputQuestion>,
+    pub actions: Vec<PendingRequestAvailableAction>,
+}
+
+pub fn present_pending_request(request: &PendingRequest) -> PendingRequestPresentation {
+    PendingRequestPresentation {
+        origin_label: pending_request_origin_label(&request.origin).to_owned(),
+        kind_label: pending_request_kind_label(request.kind).to_owned(),
+        title: request
+            .title
+            .clone()
+            .unwrap_or_else(|| pending_request_kind_label(request.kind).to_owned()),
+        message: request.message.clone(),
+        details: pending_request_detail_rows(request),
+        user_input_questions: pending_request_user_input_questions(request),
+        actions: pending_request_available_actions(request),
+    }
+}
+
+pub fn pending_request_available_actions(
+    request: &PendingRequest,
+) -> Vec<PendingRequestAvailableAction> {
+    use PendingRequestActionKind as Kind;
+
+    let kinds = match (&request.origin, request.kind) {
+        (PendingRequestOrigin::NativePermissionGate, _) => &[
+            Kind::CancelTurn,
+            Kind::Deny,
+            Kind::AllowForTurn,
+            Kind::Allow,
+        ][..],
+        (PendingRequestOrigin::CLIRuntime { .. }, PendingRequestKind::CommandApproval)
+        | (PendingRequestOrigin::CLIRuntime { .. }, PendingRequestKind::FileChangeApproval) => &[
+            Kind::CancelTurn,
+            Kind::Deny,
+            Kind::AllowForTurn,
+            Kind::Allow,
+        ][..],
+        (PendingRequestOrigin::CLIRuntime { .. }, PendingRequestKind::UserInput) => {
+            &[Kind::CancelTurn, Kind::Answer][..]
+        }
+        (PendingRequestOrigin::CLIRuntime { .. }, PendingRequestKind::Other) => {
+            &[Kind::CancelTurn, Kind::Allow][..]
+        }
+    };
+
+    kinds
+        .iter()
+        .copied()
+        .map(|kind| PendingRequestAvailableAction {
+            kind,
+            resolution: pending_request_action_resolution(request, kind),
+        })
+        .collect()
+}
+
+pub fn pending_request_action_resolution(
+    request: &PendingRequest,
+    kind: PendingRequestActionKind,
+) -> Option<PendingRequestResolution> {
+    match kind {
+        PendingRequestActionKind::CancelTurn => Some(PendingRequestResolution::Cancel),
+        PendingRequestActionKind::Deny => Some(PendingRequestResolution::Deny { reason: None }),
+        PendingRequestActionKind::Allow => Some(PendingRequestResolution::Allow),
+        PendingRequestActionKind::AllowForTurn => match (&request.origin, request.kind) {
+            (PendingRequestOrigin::NativePermissionGate, _) => {
+                Some(PendingRequestResolution::AllowForTurn)
+            }
+            (
+                PendingRequestOrigin::CLIRuntime { .. },
+                PendingRequestKind::CommandApproval | PendingRequestKind::FileChangeApproval,
+            ) => Some(PendingRequestResolution::AllowForSession),
+            (PendingRequestOrigin::CLIRuntime { .. }, _) => None,
+        },
+        PendingRequestActionKind::Answer => None,
+    }
+}
+
+pub fn pending_request_answered_resolution(
+    answers: impl IntoIterator<Item = (String, String)>,
+) -> PendingRequestResolution {
+    let mut answer_map = JsonMap::new();
+    for (id, answer) in answers {
+        answer_map.insert(id, JsonValue::String(answer));
+    }
+
+    PendingRequestResolution::Answered {
+        response: Some(JsonValue::Object(
+            [("answers".to_owned(), JsonValue::Object(answer_map))]
+                .into_iter()
+                .collect(),
+        )),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum PendingRequestResponseAction {
     CLIRuntime {
@@ -177,16 +337,23 @@ pub fn plan_pending_request_response(
     match (&request.origin, &request.payload) {
         (
             PendingRequestOrigin::CLIRuntime { runtime_id },
-            PendingRequestPayload::CLIRuntime { .. },
-        ) => Ok(PendingRequestResponseAction::CLIRuntime {
-            method: pioneer_protocol::constants::methods::CLI_RUNTIME_REQUEST_RESPOND.to_owned(),
-            params: CLIRuntimeRequestRespondParams {
-                workspace_id: request.workspace_id.clone(),
-                runtime_id: runtime_id.clone(),
-                request_id: request.request_id.clone(),
-                resolution: cli_runtime_resolution_from_pending_resolution(resolution),
+            PendingRequestPayload::CLIRuntime {
+                request: cli_request,
             },
-        }),
+        ) => {
+            let resolution =
+                cli_runtime_resolution_from_pending_resolution(cli_request.kind, resolution)?;
+            Ok(PendingRequestResponseAction::CLIRuntime {
+                method: pioneer_protocol::constants::methods::CLI_RUNTIME_REQUEST_RESPOND
+                    .to_owned(),
+                params: CLIRuntimeRequestRespondParams {
+                    workspace_id: request.workspace_id.clone(),
+                    runtime_id: runtime_id.clone(),
+                    request_id: request.request_id.clone(),
+                    resolution,
+                },
+            })
+        }
         (
             PendingRequestOrigin::NativePermissionGate,
             PendingRequestPayload::NativePermissionGate { .. },
@@ -206,22 +373,55 @@ pub fn plan_pending_request_response(
 }
 
 fn cli_runtime_resolution_from_pending_resolution(
+    kind: CLIRuntimeRequestKind,
     resolution: PendingRequestResolution,
-) -> CLIRuntimeRequestResolution {
-    match resolution {
-        PendingRequestResolution::Allow => CLIRuntimeRequestResolution::Approved,
-        PendingRequestResolution::AllowForTurn => CLIRuntimeRequestResolution::Answered {
-            response: Some(serde_json::json!({ "decision": "allow_for_turn" })),
-        },
-        PendingRequestResolution::AllowForSession => CLIRuntimeRequestResolution::Answered {
-            response: Some(serde_json::json!({ "decision": "allow_for_session" })),
-        },
-        PendingRequestResolution::Deny { reason } => CLIRuntimeRequestResolution::Denied { reason },
-        PendingRequestResolution::Cancel => CLIRuntimeRequestResolution::Cancelled,
-        PendingRequestResolution::Answered { response } => {
-            CLIRuntimeRequestResolution::Answered { response }
+) -> Result<CLIRuntimeRequestResolution, PendingRequestResponsePlanError> {
+    match kind {
+        CLIRuntimeRequestKind::CommandApproval | CLIRuntimeRequestKind::FileChangeApproval => {
+            match resolution {
+                PendingRequestResolution::Allow => Ok(CLIRuntimeRequestResolution::Approved),
+                PendingRequestResolution::Deny { reason } => {
+                    Ok(CLIRuntimeRequestResolution::Denied { reason })
+                }
+                PendingRequestResolution::Cancel => Ok(CLIRuntimeRequestResolution::Cancelled),
+                PendingRequestResolution::Expired => Ok(CLIRuntimeRequestResolution::Expired),
+                PendingRequestResolution::AllowForSession => {
+                    Ok(CLIRuntimeRequestResolution::Answered {
+                        response: Some(serde_json::json!({ "decision": "allow_for_session" })),
+                    })
+                }
+                PendingRequestResolution::AllowForTurn
+                | PendingRequestResolution::Answered { .. } => {
+                    Err(PendingRequestResponsePlanError::UnsupportedResolutionForOrigin)
+                }
+            }
         }
-        PendingRequestResolution::Expired => CLIRuntimeRequestResolution::Expired,
+        CLIRuntimeRequestKind::UserInput => match resolution {
+            PendingRequestResolution::Answered { response } => {
+                Ok(CLIRuntimeRequestResolution::Answered { response })
+            }
+            PendingRequestResolution::Cancel => Ok(CLIRuntimeRequestResolution::Cancelled),
+            PendingRequestResolution::Expired => Ok(CLIRuntimeRequestResolution::Expired),
+            PendingRequestResolution::Allow
+            | PendingRequestResolution::AllowForTurn
+            | PendingRequestResolution::AllowForSession
+            | PendingRequestResolution::Deny { .. } => {
+                Err(PendingRequestResponsePlanError::UnsupportedResolutionForOrigin)
+            }
+        },
+        CLIRuntimeRequestKind::Other => match resolution {
+            PendingRequestResolution::Allow => Ok(CLIRuntimeRequestResolution::Approved),
+            PendingRequestResolution::Deny { reason } => {
+                Ok(CLIRuntimeRequestResolution::Denied { reason })
+            }
+            PendingRequestResolution::Cancel => Ok(CLIRuntimeRequestResolution::Cancelled),
+            PendingRequestResolution::Expired => Ok(CLIRuntimeRequestResolution::Expired),
+            PendingRequestResolution::AllowForTurn
+            | PendingRequestResolution::AllowForSession
+            | PendingRequestResolution::Answered { .. } => {
+                Err(PendingRequestResponsePlanError::UnsupportedResolutionForOrigin)
+            }
+        },
     }
 }
 
@@ -456,6 +656,256 @@ impl CLIRuntimePendingRequestEntry {
     }
 }
 
+pub fn pending_request_detail_rows(request: &PendingRequest) -> Vec<PendingRequestDetailRow> {
+    if let Some(entry) = CLIRuntimePendingRequestEntry::from_pending_request(request) {
+        return match entry.request.kind {
+            CLIRuntimeRequestKind::CommandApproval => {
+                cli_runtime_command_detail_rows(entry.request.payload.as_ref())
+            }
+            CLIRuntimeRequestKind::FileChangeApproval => {
+                cli_runtime_file_change_detail_rows(entry.request.payload.as_ref())
+            }
+            CLIRuntimeRequestKind::UserInput | CLIRuntimeRequestKind::Other => Vec::new(),
+        };
+    }
+
+    match &request.payload {
+        PendingRequestPayload::NativePermissionGate { request } => {
+            native_permission_detail_rows(request)
+        }
+        PendingRequestPayload::CLIRuntime { .. } | PendingRequestPayload::Other { .. } => {
+            Vec::new()
+        }
+    }
+}
+
+pub fn pending_request_user_input_questions(
+    request: &PendingRequest,
+) -> Vec<PendingRequestUserInputQuestion> {
+    let Some(entry) = CLIRuntimePendingRequestEntry::from_pending_request(request) else {
+        return Vec::new();
+    };
+    if entry.request.kind != CLIRuntimeRequestKind::UserInput {
+        return Vec::new();
+    }
+
+    cli_runtime_user_input_questions(entry.request.payload.as_ref())
+}
+
+pub fn pending_request_origin_label(origin: &PendingRequestOrigin) -> &'static str {
+    match origin {
+        PendingRequestOrigin::CLIRuntime { .. } => "CLI provider request",
+        PendingRequestOrigin::NativePermissionGate => "Native agent request",
+    }
+}
+
+pub fn pending_request_kind_label(kind: PendingRequestKind) -> &'static str {
+    match kind {
+        PendingRequestKind::CommandApproval => "Command approval",
+        PendingRequestKind::FileChangeApproval => "File change approval",
+        PendingRequestKind::UserInput => "Input requested",
+        PendingRequestKind::Other => "Pending request",
+    }
+}
+
+fn cli_runtime_command_detail_rows(payload: Option<&JsonValue>) -> Vec<PendingRequestDetailRow> {
+    let command = payload
+        .and_then(|payload| string_field(payload, &["command"]))
+        .or_else(|| payload.and_then(command_from_argv));
+    let cwd = payload.and_then(|payload| string_field(payload, &["cwd"]));
+    let reason = payload.and_then(|payload| string_field(payload, &["reason"]));
+
+    let mut rows = Vec::new();
+    if let Some(command) = command {
+        rows.push(detail_row("Command", command, true));
+    }
+    if let Some(cwd) = cwd {
+        rows.push(detail_row("Directory", cwd, true));
+    }
+    if let Some(reason) = reason {
+        rows.push(detail_row("Reason", reason, false));
+    }
+    rows
+}
+
+fn cli_runtime_file_change_detail_rows(
+    payload: Option<&JsonValue>,
+) -> Vec<PendingRequestDetailRow> {
+    let mut rows = Vec::new();
+
+    if let Some(grant_root) = payload.and_then(|payload| string_field(payload, &["grantRoot"])) {
+        rows.push(detail_row("Root", grant_root, true));
+    }
+
+    if let Some(files) = payload.and_then(|payload| string_array_field(payload, "changedFiles"))
+        && !files.is_empty()
+    {
+        rows.push(detail_row("Files", files.join("\n"), true));
+    }
+
+    if let Some(reason) = payload.and_then(|payload| string_field(payload, &["reason"])) {
+        rows.push(detail_row("Reason", reason, false));
+    }
+
+    if let Some(diff_preview) = payload.and_then(diff_preview_text) {
+        rows.push(PendingRequestDetailRow {
+            label: "Diff".to_owned(),
+            value: diff_preview,
+            monospace: true,
+            style: PendingRequestDetailStyle::Diff,
+        });
+    }
+
+    rows
+}
+
+fn native_permission_detail_rows(
+    request: &TurnPermissionApprovalRequest,
+) -> Vec<PendingRequestDetailRow> {
+    let mut rows = vec![
+        detail_row("Tool", request.tool_name.clone(), true),
+        detail_row("Action", request.action.as_str().to_owned(), true),
+    ];
+    rows.extend(
+        request
+            .details
+            .iter()
+            .map(|detail| PendingRequestDetailRow {
+                label: detail.label.clone(),
+                value: detail.value.clone(),
+                monospace: detail.monospace,
+                style: PendingRequestDetailStyle::Field,
+            }),
+    );
+    rows.push(detail_row("Scope", request.scope_hash.clone(), true));
+    rows.push(detail_row(
+        "Reason",
+        request.reason.as_str().to_owned(),
+        false,
+    ));
+    if let Some(summary) = request.summary.clone() {
+        rows.push(detail_row("Summary", summary, false));
+    }
+    rows
+}
+
+fn detail_row(label: impl Into<String>, value: String, monospace: bool) -> PendingRequestDetailRow {
+    PendingRequestDetailRow {
+        label: label.into(),
+        value,
+        monospace,
+        style: PendingRequestDetailStyle::Field,
+    }
+}
+
+fn string_field(payload: &JsonValue, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| payload.get(*key).and_then(JsonValue::as_str))
+        .map(str::to_owned)
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn command_from_argv(payload: &JsonValue) -> Option<String> {
+    payload
+        .get("argv")
+        .and_then(JsonValue::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(JsonValue::as_str)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn string_array_field(payload: &JsonValue, key: &str) -> Option<Vec<String>> {
+    payload.get(key).and_then(JsonValue::as_array).map(|items| {
+        items
+            .iter()
+            .filter_map(JsonValue::as_str)
+            .map(str::to_owned)
+            .filter(|value| !value.trim().is_empty())
+            .collect::<Vec<_>>()
+    })
+}
+
+fn diff_preview_text(payload: &JsonValue) -> Option<String> {
+    payload
+        .get("diffPreview")
+        .and_then(|preview| preview.get("text"))
+        .and_then(JsonValue::as_str)
+        .map(str::to_owned)
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn cli_runtime_user_input_questions(
+    payload: Option<&JsonValue>,
+) -> Vec<PendingRequestUserInputQuestion> {
+    let Some(payload) = payload else {
+        return Vec::new();
+    };
+    let Some(questions) = payload.get("questions").and_then(JsonValue::as_array) else {
+        return Vec::new();
+    };
+
+    questions
+        .iter()
+        .enumerate()
+        .map(|(ix, value)| {
+            let id = value
+                .get("id")
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned)
+                .filter(|id| !id.trim().is_empty())
+                .unwrap_or_else(|| format!("question_{}", ix + 1));
+            let header = value
+                .get("header")
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned)
+                .filter(|header| !header.trim().is_empty());
+            let question = value
+                .get("question")
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned)
+                .filter(|question| !question.trim().is_empty())
+                .or_else(|| header.clone())
+                .unwrap_or_else(|| id.clone());
+            let options = value
+                .get("options")
+                .and_then(JsonValue::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|option| {
+                    let label = option
+                        .get("label")
+                        .and_then(JsonValue::as_str)
+                        .map(str::to_owned)
+                        .filter(|label| !label.trim().is_empty())?;
+                    let description = option
+                        .get("description")
+                        .and_then(JsonValue::as_str)
+                        .map(str::to_owned)
+                        .filter(|description| !description.trim().is_empty());
+                    Some(PendingRequestUserInputOption { label, description })
+                })
+                .collect();
+            let is_secret = value
+                .get("isSecret")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false);
+
+            PendingRequestUserInputQuestion {
+                id,
+                header,
+                question,
+                options,
+                is_secret,
+            }
+        })
+        .collect()
+}
+
 pub type CLIRuntimePendingRequestsReduction = PendingRequestsReduction;
 pub type CLIRuntimePendingRequestState = PendingRequestState;
 
@@ -586,6 +1036,45 @@ mod tests {
                 payload: Some(serde_json::json!({
                     "changedFiles": ["src/main.rs"],
                     "diffPreview": { "text": "-old\n+new" }
+                })),
+            },
+        }
+    }
+
+    fn user_input_request_opened(
+        request_id: &str,
+        workspace_id: &str,
+        runtime_id: &str,
+        thread_id: Option<&str>,
+        turn_id: Option<&str>,
+    ) -> CLIRuntimeRequestOpenedNotification {
+        CLIRuntimeRequestOpenedNotification {
+            workspace_id: workspace_id.to_owned(),
+            runtime_id: runtime_id.to_owned(),
+            request_id: request_id.to_owned(),
+            thread_id: thread_id.map(str::to_owned),
+            turn_id: turn_id.map(str::to_owned),
+            item_id: Some("item_input".to_owned()),
+            request: CLIRuntimePendingRequest {
+                kind: CLIRuntimeRequestKind::UserInput,
+                title: Some("Input requested".to_owned()),
+                message: Some("Pick a target".to_owned()),
+                native_request_id: Some(format!("native_{request_id}")),
+                payload: Some(serde_json::json!({
+                    "questions": [
+                        {
+                            "id": "target",
+                            "header": "Target",
+                            "question": "Pick a target",
+                            "options": [
+                                {
+                                    "label": "A",
+                                    "description": "Use target A"
+                                }
+                            ],
+                            "isSecret": true
+                        }
+                    ]
                 })),
             },
         }
@@ -742,9 +1231,36 @@ mod tests {
             "pwd",
         ));
 
+        let action = plan_pending_request_response(&pending, PendingRequestResolution::Allow)
+            .expect("plan CLI response");
+
+        let PendingRequestResponseAction::CLIRuntime { method, params } = action else {
+            panic!("expected CLI runtime action");
+        };
+        assert_eq!(
+            method,
+            pioneer_protocol::constants::methods::CLI_RUNTIME_REQUEST_RESPOND
+        );
+        assert_eq!(params.workspace_id, "ws");
+        assert_eq!(params.runtime_id, "codex");
+        assert_eq!(params.request_id, "req");
+        assert_eq!(params.resolution, CLIRuntimeRequestResolution::Approved);
+    }
+
+    #[test]
+    fn response_planner_routes_cli_runtime_session_request_to_cli_rpc_params() {
+        let pending = PendingRequest::from_cli_runtime_opened_notification(request_opened(
+            "req",
+            "ws",
+            "codex",
+            Some("thread"),
+            Some("turn"),
+            "pwd",
+        ));
+
         let action =
             plan_pending_request_response(&pending, PendingRequestResolution::AllowForSession)
-                .expect("plan CLI response");
+                .expect("plan CLI session response");
 
         let PendingRequestResponseAction::CLIRuntime { method, params } = action else {
             panic!("expected CLI runtime action");
@@ -788,6 +1304,26 @@ mod tests {
     }
 
     #[test]
+    fn response_planner_rejects_turn_resolution_for_cli_runtime_request() {
+        let pending = PendingRequest::from_cli_runtime_opened_notification(request_opened(
+            "req",
+            "ws",
+            "codex",
+            Some("thread"),
+            Some("turn"),
+            "pwd",
+        ));
+
+        let error = plan_pending_request_response(&pending, PendingRequestResolution::AllowForTurn)
+            .expect_err("CLI runtime approvals do not use native turn scope");
+
+        assert_eq!(
+            error,
+            PendingRequestResponsePlanError::UnsupportedResolutionForOrigin
+        );
+    }
+
+    #[test]
     fn response_planner_rejects_session_resolution_for_native_permission_request() {
         let pending =
             PendingRequest::from_native_permission_request(native_permission_request("req_native"));
@@ -819,6 +1355,128 @@ mod tests {
             error,
             PendingRequestResponsePlanError::UnsupportedResolutionForOrigin
         );
+    }
+
+    #[test]
+    fn pending_request_actions_are_scoped_by_origin_and_kind() {
+        let cli_command = PendingRequest::from_cli_runtime_opened_notification(request_opened(
+            "req",
+            "ws",
+            "codex",
+            Some("thread"),
+            Some("turn"),
+            "pwd",
+        ));
+        let native =
+            PendingRequest::from_native_permission_request(native_permission_request("req_native"));
+        let user_input = PendingRequest::from_cli_runtime_opened_notification(
+            user_input_request_opened("req_input", "ws", "codex", Some("thread"), Some("turn")),
+        );
+
+        assert_eq!(
+            pending_request_available_actions(&cli_command)
+                .into_iter()
+                .map(|action| action.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                PendingRequestActionKind::CancelTurn,
+                PendingRequestActionKind::Deny,
+                PendingRequestActionKind::AllowForTurn,
+                PendingRequestActionKind::Allow,
+            ]
+        );
+        assert_eq!(
+            pending_request_available_actions(&native)
+                .into_iter()
+                .map(|action| action.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                PendingRequestActionKind::CancelTurn,
+                PendingRequestActionKind::Deny,
+                PendingRequestActionKind::AllowForTurn,
+                PendingRequestActionKind::Allow,
+            ]
+        );
+        assert_eq!(
+            pending_request_available_actions(&user_input)
+                .into_iter()
+                .map(|action| action.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                PendingRequestActionKind::CancelTurn,
+                PendingRequestActionKind::Answer,
+            ]
+        );
+    }
+
+    #[test]
+    fn allow_for_turn_action_maps_to_origin_specific_resolution() {
+        let cli_command = PendingRequest::from_cli_runtime_opened_notification(request_opened(
+            "req",
+            "ws",
+            "codex",
+            Some("thread"),
+            Some("turn"),
+            "pwd",
+        ));
+        let native =
+            PendingRequest::from_native_permission_request(native_permission_request("req_native"));
+
+        let cli_allow_for_turn = pending_request_available_actions(&cli_command)
+            .into_iter()
+            .find(|action| action.kind == PendingRequestActionKind::AllowForTurn)
+            .expect("CLI command approvals expose a scoped allow action");
+        let native_allow_for_turn = pending_request_available_actions(&native)
+            .into_iter()
+            .find(|action| action.kind == PendingRequestActionKind::AllowForTurn)
+            .expect("native approvals expose a scoped allow action");
+
+        assert_eq!(
+            cli_allow_for_turn.resolution,
+            Some(PendingRequestResolution::AllowForSession)
+        );
+        assert_eq!(
+            native_allow_for_turn.resolution,
+            Some(PendingRequestResolution::AllowForTurn)
+        );
+    }
+
+    #[test]
+    fn pending_request_presentation_projects_details_and_questions() {
+        let file_change = PendingRequest::from_cli_runtime_opened_notification(
+            file_change_request_opened("req_file", "ws", "codex", Some("thread"), Some("turn")),
+        );
+        let file_presentation = present_pending_request(&file_change);
+
+        assert_eq!(file_presentation.origin_label, "CLI provider request");
+        assert_eq!(file_presentation.kind_label, "File change approval");
+        assert!(
+            file_presentation
+                .details
+                .iter()
+                .any(|row| { row.label == "Files" && row.value == "src/main.rs" && row.monospace })
+        );
+        assert!(
+            file_presentation
+                .details
+                .iter()
+                .any(|row| { row.label == "Diff" && row.style == PendingRequestDetailStyle::Diff })
+        );
+
+        let user_input = PendingRequest::from_cli_runtime_opened_notification(
+            user_input_request_opened("req_input", "ws", "codex", Some("thread"), Some("turn")),
+        );
+        let input_presentation = present_pending_request(&user_input);
+
+        assert_eq!(input_presentation.user_input_questions.len(), 1);
+        assert_eq!(input_presentation.user_input_questions[0].id, "target");
+        assert_eq!(
+            input_presentation.user_input_questions[0].options[0]
+                .description
+                .as_deref(),
+            Some("Use target A")
+        );
+        assert!(input_presentation.user_input_questions[0].is_secret);
     }
 
     #[test]

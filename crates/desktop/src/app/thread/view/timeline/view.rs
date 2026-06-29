@@ -8,7 +8,7 @@ use super::{
 };
 use crate::app::{
     conversation::ConversationViewState,
-    root::{CLIRuntimePendingRequestEntry, PioneerDesktop},
+    root::{PendingRequest, PioneerDesktop},
 };
 use gpui::{prelude::*, *};
 use gpui_component::{Icon, IconName, h_flex, scroll::Scrollbar, v_flex, v_virtual_list};
@@ -23,14 +23,14 @@ impl PioneerDesktop {
         &self,
         active_thread_id: Option<&str>,
         model: TimelineRenderModel,
-        pending_cli_runtime_requests: Vec<CLIRuntimePendingRequestEntry>,
+        pending_requests: Vec<PendingRequest>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         self.sync_timeline_layout_width(cx);
         let projection = model.projection.clone();
 
-        if model.rows.is_empty() && pending_cli_runtime_requests.is_empty() {
+        if model.rows.is_empty() && pending_requests.is_empty() {
             return v_flex()
                 .w_full()
                 .h_full()
@@ -53,10 +53,7 @@ impl PioneerDesktop {
         );
 
         let rows = self.hydrate_running_turn_render_rows(model.rows, cx);
-        let rows = Rc::new(merge_pending_timeline_render_rows(
-            rows,
-            pending_cli_runtime_requests,
-        ));
+        let rows = Rc::new(merge_pending_timeline_render_rows(rows, pending_requests));
         let rows_layout_hash =
             model_signature_hash ^ timeline_render_rows_layout_hash(rows.as_ref());
 
@@ -200,11 +197,13 @@ impl PioneerDesktop {
                 let Some(item_view) = projection.item_for_timeline_entry(entry) else {
                     return div().into_any_element();
                 };
+                let permission_profile = projection.turn_permission_profile(entry.turn_id.as_str());
 
                 self.render_turn_item_entry(
                     entry,
                     item_view,
                     &item_view.item,
+                    permission_profile,
                     is_first_row,
                     is_last_row,
                     content_width,
@@ -242,7 +241,7 @@ impl PioneerDesktop {
                 cx,
             ),
             TimelineRenderRow::PendingRequest(row) => {
-                let content = self.render_cli_runtime_pending_request_card(row.entry.clone(), cx);
+                let content = self.render_pending_request_card(row.request.clone(), cx);
                 self.render_item_row(is_first_row, is_last_row, content_width, content)
             }
         }
@@ -385,9 +384,9 @@ fn coalesced_tools_label(group: &TimelineCoalescedToolsRow) -> String {
     }
 }
 
-fn merge_pending_timeline_render_rows(
+pub(in crate::app::thread::view::timeline) fn merge_pending_timeline_render_rows(
     rows: Rc<Vec<TimelineRenderRow>>,
-    pending_requests: Vec<CLIRuntimePendingRequestEntry>,
+    pending_requests: Vec<PendingRequest>,
 ) -> Vec<TimelineRenderRow> {
     if pending_requests.is_empty() {
         return rows.as_ref().clone();
@@ -412,10 +411,10 @@ fn merge_pending_timeline_render_rows(
 
     let mut render_rows = Vec::with_capacity(rows.len() + pending_requests.len());
     render_rows.extend(rows[..running_index].iter().cloned());
-    render_rows.extend(pending_requests.into_iter().filter_map(|entry| {
-        let key = format!("timeline-cli-runtime-request::{}", entry.request_id);
+    render_rows.extend(pending_requests.into_iter().filter_map(|request| {
+        let key = format!("timeline-pending-request::{}", request.request_id);
         (!existing_keys.contains(key.as_str())).then_some(TimelineRenderRow::PendingRequest(
-            TimelinePendingRequestRow { key, entry },
+            TimelinePendingRequestRow { key, request },
         ))
     }));
     render_rows.extend(rows[running_index..].iter().cloned());
@@ -459,15 +458,12 @@ fn timeline_render_rows_layout_hash(rows: &[TimelineRenderRow]) -> u64 {
     for row in rows {
         row.key().hash(&mut hasher);
         if let TimelineRenderRow::PendingRequest(row) = row {
-            row.entry.request_id.hash(&mut hasher);
-            row.entry.request.title.hash(&mut hasher);
-            row.entry.request.message.hash(&mut hasher);
-            row.entry
-                .request
-                .payload
-                .as_ref()
-                .map(serde_json::Value::to_string)
-                .hash(&mut hasher);
+            row.request.request_id.hash(&mut hasher);
+            row.request.title.hash(&mut hasher);
+            row.request.message.hash(&mut hasher);
+            format!("{:?}", row.request.origin).hash(&mut hasher);
+            format!("{:?}", row.request.kind).hash(&mut hasher);
+            format!("{:?}", row.request.payload).hash(&mut hasher);
         }
     }
     hasher.finish()

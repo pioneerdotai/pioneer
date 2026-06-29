@@ -225,7 +225,7 @@ impl PioneerDesktop {
         }
 
         let force_follow_active = self.semantic_timeline_has_running_turn_row()
-            || !self.active_thread_cli_runtime_pending_requests().is_empty();
+            || !self.active_thread_pending_requests().is_empty();
         if !force_follow_active {
             return;
         }

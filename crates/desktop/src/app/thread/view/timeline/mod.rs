@@ -11,8 +11,8 @@ use self::model::{TimelineRow, TimelineRowKind};
 use crate::app::{
     conversation::{ConversationViewState, ItemView},
     root::{
-        CLIRuntimePendingRequestEntry, CachedTimelineEntryLayout, PioneerDesktop,
-        ThreadTimelineViewState, TimelineScrollAnchor,
+        CachedTimelineEntryLayout, PendingRequest, PioneerDesktop, ThreadTimelineViewState,
+        TimelineScrollAnchor,
     },
 };
 use gpui::{prelude::*, *};
@@ -25,7 +25,7 @@ use std::{
 #[derive(Clone)]
 pub(crate) struct TimelinePendingRequestRow {
     pub key: String,
-    pub entry: CLIRuntimePendingRequestEntry,
+    pub request: PendingRequest,
 }
 
 #[derive(Clone)]
@@ -267,15 +267,9 @@ impl PioneerDesktop {
         match row {
             TimelineRenderRow::Timeline(row) => model::timeline_row_text_len(projection, row),
             TimelineRenderRow::PendingRequest(row) => {
-                row.entry.request.title.as_deref().unwrap_or_default().len()
-                    + row
-                        .entry
-                        .request
-                        .message
-                        .as_deref()
-                        .unwrap_or_default()
-                        .len()
-                    + row.entry.request_id.len()
+                row.request.title.as_deref().unwrap_or_default().len()
+                    + row.request.message.as_deref().unwrap_or_default().len()
+                    + row.request.request_id.len()
             }
         }
     }
@@ -290,20 +284,15 @@ impl PioneerDesktop {
 
 fn timeline_pending_request_layout_hash(row: &TimelinePendingRequestRow) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    row.entry.workspace_id.hash(&mut hasher);
-    row.entry.runtime_id.hash(&mut hasher);
-    row.entry.request_id.hash(&mut hasher);
-    row.entry.thread_id.hash(&mut hasher);
-    row.entry.turn_id.hash(&mut hasher);
-    row.entry.item_id.hash(&mut hasher);
-    format!("{:?}", row.entry.request.kind).hash(&mut hasher);
-    row.entry.request.title.hash(&mut hasher);
-    row.entry.request.message.hash(&mut hasher);
-    row.entry
-        .request
-        .payload
-        .as_ref()
-        .map(serde_json::Value::to_string)
-        .hash(&mut hasher);
+    row.request.workspace_id.hash(&mut hasher);
+    row.request.request_id.hash(&mut hasher);
+    row.request.thread_id.hash(&mut hasher);
+    row.request.turn_id.hash(&mut hasher);
+    row.request.item_id.hash(&mut hasher);
+    format!("{:?}", row.request.origin).hash(&mut hasher);
+    format!("{:?}", row.request.kind).hash(&mut hasher);
+    row.request.title.hash(&mut hasher);
+    row.request.message.hash(&mut hasher);
+    format!("{:?}", row.request.payload).hash(&mut hasher);
     hasher.finish()
 }

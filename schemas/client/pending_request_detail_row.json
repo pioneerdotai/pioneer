@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PendingRequestDetailRow",
+  "type": "object",
+  "properties": {
+    "label": {
+      "type": "string"
+    },
+    "monospace": {
+      "type": "boolean"
+    },
+    "style": {
+      "$ref": "#/$defs/PendingRequestDetailStyle"
+    },
+    "value": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "label",
+    "value",
+    "monospace",
+    "style"
+  ],
+  "$defs": {
+    "PendingRequestDetailStyle": {
+      "type": "string",
+      "enum": [
+        "field",
+        "diff"
+      ]
+    }
+  }
+}

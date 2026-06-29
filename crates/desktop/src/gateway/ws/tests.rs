@@ -12,8 +12,9 @@ use pioneer_client::gateway::types::GatewayEndpointKind;
 use pioneer_client::transport::ws::event_connection_id;
 use pioneer_protocol::{
     AgentExecutionBackend, CLIAgentRuntimeKind, GatewayNotification, ThreadStartParams,
-    ThreadUnsubscribeStatus, TurnCLIRuntimeOptions, TurnReasoningSelection, TurnStartParams,
-    TurnStatus, UserInput, constants::events, generate_id,
+    ThreadUnsubscribeStatus, TurnCLIRuntimeOptions, TurnPermissionMode,
+    TurnPermissionProfileSelection, TurnReasoningSelection, TurnStartParams, TurnStatus, UserInput,
+    constants::events, generate_id,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -511,6 +512,7 @@ fn turn_start_request_receives_response_and_started_notification() {
             mode: None,
             execution_backend: None,
             reasoning: None,
+            permission_profile: None,
             cli_runtime_options: None,
         })
         .expect("turn/start should succeed");
@@ -572,6 +574,7 @@ fn turn_start_request_sends_reasoning_effort() {
             reasoning: Some(TurnReasoningSelection {
                 effort: "high".to_owned(),
             }),
+            permission_profile: None,
             cli_runtime_options: None,
         })
         .expect("turn/start should succeed");
@@ -626,6 +629,7 @@ fn turn_start_request_sends_cli_runtime_effort_options() {
             reasoning: Some(TurnReasoningSelection {
                 effort: "high".to_owned(),
             }),
+            permission_profile: None,
             cli_runtime_options: Some(TurnCLIRuntimeOptions {
                 approval_policy: None,
                 sandbox: None,
@@ -649,6 +653,54 @@ fn turn_start_request_sends_cli_runtime_effort_options() {
             .pointer("/params/cli_runtime_options/effort")
             .and_then(serde_json::Value::as_str),
         Some("high")
+    );
+
+    let _ = sender.shutdown();
+    server.stop();
+}
+
+#[test]
+fn turn_start_request_sends_permission_profile_selection() {
+    let (mut server, requests) = TestWsServer::spawn_recording("127.0.0.1:0");
+    let client = GatewayWsClient::new();
+    let sender = client.command_sender();
+
+    let _connection_id = sender
+        .connect_and_wait(connect_spec(
+            "remote-turn-permissions",
+            "Remote Turn Permissions",
+            server.address.as_str(),
+        ))
+        .expect("expected connect_and_wait to succeed");
+
+    let _response = sender
+        .turn_start(TurnStartParams {
+            thread_id: "thr_test_thread_123456".to_owned(),
+            turn_id: "turn_test_permissions".to_owned(),
+            input: vec![UserInput::Text {
+                text: "Hello".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            capabilities: Vec::new(),
+            model: Some("gpt-5".to_owned()),
+            model_provider: Some("openai".to_owned()),
+            sandbox_policy: None,
+            mode: None,
+            execution_backend: None,
+            reasoning: None,
+            permission_profile: Some(TurnPermissionProfileSelection {
+                mode: TurnPermissionMode::Supervised,
+            }),
+            cli_runtime_options: None,
+        })
+        .expect("turn/start should succeed");
+
+    let request = wait_for_recorded_request(&requests, "turn/start", Duration::from_secs(2));
+    assert_eq!(
+        request
+            .pointer("/params/permission_profile/mode")
+            .and_then(serde_json::Value::as_str),
+        Some("supervised")
     );
 
     let _ = sender.shutdown();

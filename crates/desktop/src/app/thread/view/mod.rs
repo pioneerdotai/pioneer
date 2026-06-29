@@ -24,11 +24,11 @@ impl PioneerDesktop {
         let timeline_model = self.semantic_timeline_render_model(active_thread_id.as_deref());
 
         let desktop_entity = cx.entity().clone();
-        let pending_cli_runtime_requests = self.active_thread_cli_runtime_pending_requests();
+        let pending_requests = self.active_thread_pending_requests();
         let timeline = self.render_timeline(
             active_thread_id.as_deref(),
             timeline_model,
-            pending_cli_runtime_requests,
+            pending_requests,
             window,
             cx,
         );

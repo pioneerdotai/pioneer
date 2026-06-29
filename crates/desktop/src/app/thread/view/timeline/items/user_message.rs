@@ -10,7 +10,7 @@ use pioneer_client::timeline::labels::{
     ParsedUserAttachment, ParsedUserAttachmentKind, parse_user_attachments,
     stable_user_message_attachment_chip_id,
 };
-use pioneer_protocol::TurnItem;
+use pioneer_protocol::{TurnItem, TurnPermissionProfileSnapshot};
 use std::path::PathBuf;
 
 impl PioneerDesktop {
@@ -19,6 +19,7 @@ impl PioneerDesktop {
         entry: &TimelineEntry,
         item_view: &ItemView,
         item: &TurnItem,
+        permission_profile: Option<&TurnPermissionProfileSnapshot>,
         is_first_row: bool,
         is_last_row: bool,
         content_width: Pixels,
@@ -87,6 +88,14 @@ impl PioneerDesktop {
                             ))
                         })),
                 )
+                .when_some(permission_profile, |this, permission_profile| {
+                    this.child(
+                        h_flex()
+                            .pt_2()
+                            .justify_end()
+                            .child(self.render_turn_permission_badge(permission_profile, cx)),
+                    )
+                })
                 .child(
                     h_flex()
                         .h(px(30.))

@@ -13,10 +13,11 @@ use crate::app::{
     conversation::{ItemView, TimelineEntry},
     root::PioneerDesktop,
 };
+use crate::assets::PioneerIconName;
 use gpui::{prelude::*, *};
 use gpui_component::{Icon, IconName, h_flex, theme::ActiveTheme, v_flex};
 use pioneer_client::timeline::labels as timeline_labels;
-use pioneer_protocol::{TaskStatus, TurnItem};
+use pioneer_protocol::{TaskStatus, TurnItem, TurnPermissionMode, TurnPermissionProfileSnapshot};
 
 pub(super) fn format_elapsed_ms(elapsed_ms: u64) -> String {
     let total_seconds = elapsed_ms / 1_000;
@@ -77,6 +78,43 @@ fn task_status_label(status: TaskStatus) -> String {
 }
 
 impl PioneerDesktop {
+    pub(super) fn turn_permission_icon(mode: TurnPermissionMode) -> PioneerIconName {
+        match mode {
+            TurnPermissionMode::Supervised => PioneerIconName::Lock,
+            TurnPermissionMode::AutoAcceptEdits => PioneerIconName::Pencil,
+            TurnPermissionMode::FullAccess => PioneerIconName::Unlock,
+        }
+    }
+
+    pub(super) fn render_turn_permission_badge(
+        &self,
+        permission_profile: &TurnPermissionProfileSnapshot,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let display = timeline_labels::turn_permission_profile_display(permission_profile);
+        let mode = display.mode;
+
+        h_flex()
+            .h(px(22.))
+            .max_w(px(180.))
+            .items_center()
+            .gap_1()
+            .rounded_full()
+            .bg(cx.theme().muted.opacity(0.72))
+            .px_2()
+            .text_xs()
+            .opacity(0.72)
+            .child(Icon::new(Self::turn_permission_icon(mode)).size_3())
+            .child(
+                div()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .child(display.label),
+            )
+            .into_any_element()
+    }
+
     pub(super) fn timeline_favicon_url(
         &self,
         primary: Option<String>,
@@ -154,6 +192,7 @@ impl PioneerDesktop {
         entry: &TimelineEntry,
         item_view: &ItemView,
         item: &TurnItem,
+        permission_profile: Option<&TurnPermissionProfileSnapshot>,
         is_first_row: bool,
         is_last_row: bool,
         content_width: Pixels,
@@ -164,6 +203,7 @@ impl PioneerDesktop {
                 entry,
                 item_view,
                 item,
+                permission_profile,
                 is_first_row,
                 is_last_row,
                 content_width,

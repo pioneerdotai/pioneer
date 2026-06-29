@@ -174,10 +174,8 @@ impl PioneerDesktop {
         )
     }
 
-    pub(in crate::app) fn active_thread_cli_runtime_pending_requests(
-        &self,
-    ) -> Vec<CLIRuntimePendingRequestEntry> {
-        self.cli_runtime_pending_requests
+    pub(in crate::app) fn active_thread_pending_requests(&self) -> Vec<PendingRequest> {
+        self.pending_requests
             .pending_for_scope(self.active_workspace_id(), self.current_active_thread_id())
     }
 

@@ -52,6 +52,7 @@ impl PioneerDesktop {
         let live_work_started_at = live_work_started_at_by_turn(semantic_rows.rows.as_slice());
         let mut inserted_running_rows = HashSet::<String>::new();
         let mut projection = ConversationViewState::default();
+        self.merge_turn_metadata_for_timeline(active_thread_id, &mut projection);
         let mut rows = Vec::<TimelineRenderRow>::new();
         let mut semantic_row_ids = HashMap::<String, SemanticTimelineRowId>::new();
 
@@ -75,10 +76,11 @@ impl PioneerDesktop {
                 let running_key = format!("semantic-running-turn::{turn_id}");
                 rows.push(TimelineRenderRow::Timeline(TimelineRow {
                     key: running_key.clone(),
-                    kind: TimelineRowKind::RunningTurn(RunningTurnDisplay {
-                        turn_id: turn_id.to_owned(),
+                    kind: TimelineRowKind::RunningTurn(running_turn_display_for_projection(
+                        &projection,
+                        turn_id,
                         started_at_unix_ms,
-                    }),
+                    )),
                 }));
                 semantic_row_ids.insert(running_key, row.id.clone());
             }
@@ -101,6 +103,26 @@ impl PioneerDesktop {
         }
 
         model
+    }
+
+    fn merge_turn_metadata_for_timeline(
+        &self,
+        thread_id: &str,
+        projection: &mut ConversationViewState,
+    ) {
+        let Some(coordinator) = self.thread_coordinator(thread_id) else {
+            return;
+        };
+
+        projection
+            .turns
+            .extend(coordinator.conversation.projection().turns.iter().cloned());
+
+        if let Some(thread) = coordinator.thread() {
+            for turn in &thread.turns {
+                projection.upsert_turn_snapshot_metadata(turn);
+            }
+        }
     }
 }
 
@@ -126,7 +148,7 @@ fn push_semantic_row(
                 rows.push(row);
             }
         }
-        SemanticTimelineRowKind::TurnState { block } => push_turn_state(rows, block),
+        SemanticTimelineRowKind::TurnState { block } => push_turn_state(projection, rows, block),
     }
 }
 
@@ -274,7 +296,11 @@ fn push_work_item(
     );
 }
 
-fn push_turn_state(rows: &mut Vec<TimelineRenderRow>, block: &TimelineBlock) {
+fn push_turn_state(
+    projection: &ConversationViewState,
+    rows: &mut Vec<TimelineRenderRow>,
+    block: &TimelineBlock,
+) {
     let TimelineBlockKind::TurnState { state, .. } = &block.kind else {
         return;
     };
@@ -286,11 +312,24 @@ fn push_turn_state(rows: &mut Vec<TimelineRenderRow>, block: &TimelineBlock) {
     };
     rows.push(TimelineRenderRow::Timeline(TimelineRow {
         key: format!("semantic-turn-state::{turn_id}::{}", block.block_id),
-        kind: TimelineRowKind::RunningTurn(RunningTurnDisplay {
-            turn_id: turn_id.to_owned(),
-            started_at_unix_ms: block.started_at_unix_ms.or(block.updated_at_unix_ms),
-        }),
+        kind: TimelineRowKind::RunningTurn(running_turn_display_for_projection(
+            projection,
+            turn_id,
+            block.started_at_unix_ms.or(block.updated_at_unix_ms),
+        )),
     }));
+}
+
+fn running_turn_display_for_projection(
+    projection: &ConversationViewState,
+    turn_id: &str,
+    started_at_unix_ms: Option<i64>,
+) -> RunningTurnDisplay {
+    RunningTurnDisplay {
+        turn_id: turn_id.to_owned(),
+        started_at_unix_ms,
+        permission_profile: projection.turn_permission_profile(turn_id).cloned(),
+    }
 }
 
 struct ItemRowInput {
@@ -361,8 +400,8 @@ fn pending_request_row_from_block(block: &TimelineBlock) -> Option<TimelineRende
     }
     Some(TimelineRenderRow::PendingRequest(
         TimelinePendingRequestRow {
-            key: format!("timeline-cli-runtime-request::{request_id}"),
-            entry: CLIRuntimePendingRequestEntry {
+            key: format!("timeline-pending-request::{request_id}"),
+            request: CLIRuntimePendingRequestEntry {
                 workspace_id: block.workspace_id.clone(),
                 runtime_id: runtime_id.clone(),
                 request_id: request_id.clone(),
@@ -370,7 +409,8 @@ fn pending_request_row_from_block(block: &TimelineBlock) -> Option<TimelineRende
                 turn_id: block.turn_id.clone(),
                 item_id: item_id.clone(),
                 request: request.clone(),
-            },
+            }
+            .into_pending_request(),
         },
     ))
 }
@@ -470,7 +510,13 @@ fn turn_item_text_and_markdown(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pioneer_protocol::{MarkdownDocument, TimelineBlock, TimelineCursor};
+    use crate::app::thread::view::timeline::view::merge_pending_timeline_render_rows;
+    use pioneer_client::cli_runtime::approvals::PendingRequest;
+    use pioneer_protocol::{
+        CLIRuntimePendingRequest, CLIRuntimeRequestKind, MarkdownDocument, TimelineBlock,
+        TimelineCursor, Turn, TurnKind, TurnOrigin, TurnPermissionApprovalRequest,
+        TurnPermissionMode, TurnPermissionProfileSource, TurnStatus,
+    };
 
     #[test]
     fn assistant_block_preserves_final_markdown_in_desktop_projection() {
@@ -528,8 +574,13 @@ mod tests {
 
     #[test]
     fn turn_state_rows_render_only_starting_or_running() {
+        let projection = ConversationViewState::default();
         let mut rows = Vec::new();
-        push_turn_state(&mut rows, &turn_state_block(TurnWorkState::Running));
+        push_turn_state(
+            &projection,
+            &mut rows,
+            &turn_state_block(TurnWorkState::Running),
+        );
         assert_eq!(rows.len(), 1);
         assert!(matches!(
             &rows[0],
@@ -541,10 +592,105 @@ mod tests {
 
         let mut terminal_rows = Vec::new();
         push_turn_state(
+            &projection,
             &mut terminal_rows,
             &turn_state_block(TurnWorkState::Completed),
         );
         assert!(terminal_rows.is_empty());
+    }
+
+    #[test]
+    fn running_turn_display_projects_permission_profile() {
+        let mut projection = ConversationViewState::default();
+        let permission_profile = pioneer_protocol::compile_turn_permission_profile(
+            TurnPermissionMode::AutoAcceptEdits,
+            TurnPermissionProfileSource::Composer,
+        );
+        projection.upsert_turn_snapshot_metadata(&Turn {
+            id: "turn_a".to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: TurnKind::Conversation,
+            origin: TurnOrigin::User,
+            error: None,
+            prompt_manifest: None,
+            permission_profile: Some(permission_profile.clone()),
+        });
+
+        let display = running_turn_display_for_projection(&projection, "turn_a", Some(10));
+
+        assert_eq!(display.permission_profile, Some(permission_profile));
+    }
+
+    #[test]
+    fn merge_pending_timeline_render_rows_uses_one_row_type_for_cli_and_native_requests() {
+        let rows = Rc::new(vec![
+            timeline_row("item-1", TimelineRowKind::Item { timeline_index: 0 }),
+            timeline_row(
+                "running",
+                TimelineRowKind::RunningTurn(RunningTurnDisplay {
+                    turn_id: "turn_a".to_owned(),
+                    started_at_unix_ms: None,
+                    permission_profile: None,
+                }),
+            ),
+        ]);
+
+        let merged = merge_pending_timeline_render_rows(
+            rows,
+            vec![
+                native_pending_request("native_req"),
+                cli_pending_request("cli_req"),
+            ],
+        );
+
+        assert_eq!(merged.len(), 4);
+        assert_eq!(merged[0].key(), "item-1");
+        assert_eq!(merged[3].key(), "running");
+        assert!(matches!(merged[1], TimelineRenderRow::PendingRequest(_)));
+        assert!(matches!(merged[2], TimelineRenderRow::PendingRequest(_)));
+        assert_eq!(merged[1].key(), "timeline-pending-request::native_req");
+        assert_eq!(merged[2].key(), "timeline-pending-request::cli_req");
+    }
+
+    fn timeline_row(key: &str, kind: TimelineRowKind) -> TimelineRenderRow {
+        TimelineRenderRow::Timeline(TimelineRow {
+            key: key.to_owned(),
+            kind,
+        })
+    }
+
+    fn native_pending_request(request_id: &str) -> PendingRequest {
+        PendingRequest::from_native_permission_request(TurnPermissionApprovalRequest {
+            request_id: request_id.to_owned(),
+            workspace_id: "workspace_a".to_owned(),
+            thread_id: "thread_a".to_owned(),
+            turn_id: "turn_a".to_owned(),
+            tool_name: "shell".to_owned(),
+            action: pioneer_protocol::TurnPermissionActionKind::ShellCommand,
+            scope_hash: "scope_a".to_owned(),
+            reason: pioneer_protocol::TurnPermissionDecisionReason::PolicyRequiresApproval,
+            summary: Some("cargo check".to_owned()),
+            details: Vec::new(),
+        })
+    }
+
+    fn cli_pending_request(request_id: &str) -> PendingRequest {
+        CLIRuntimePendingRequestEntry {
+            workspace_id: "workspace_a".to_owned(),
+            runtime_id: "codex".to_owned(),
+            request_id: request_id.to_owned(),
+            thread_id: Some("thread_a".to_owned()),
+            turn_id: Some("turn_a".to_owned()),
+            item_id: None,
+            request: CLIRuntimePendingRequest {
+                kind: CLIRuntimeRequestKind::CommandApproval,
+                title: Some("Run command".to_owned()),
+                message: None,
+                native_request_id: None,
+                payload: None,
+            },
+        }
+        .into_pending_request()
     }
 
     fn assistant_block(markdown: Option<MarkdownDocument>) -> TimelineBlock {

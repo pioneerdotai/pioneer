@@ -125,14 +125,17 @@ impl PioneerDesktop {
             composer_draft::normalize_composer_draft_text(&self.composer_state.read(cx).value());
         let attachments = self.composer_attachments.clone();
         let capabilities = self.composer_capabilities.clone();
+        let permission_mode = self.composer_permission_mode;
         composer_draft::remember_thread_composer_draft(
             thread_id.as_str(),
             value,
             attachments,
             capabilities,
+            permission_mode,
             &mut self.thread_drafts,
             &mut self.thread_draft_attachments,
             &mut self.thread_draft_capabilities,
+            &mut self.thread_draft_permission_modes,
         );
     }
 
@@ -142,6 +145,7 @@ impl PioneerDesktop {
             &mut self.thread_drafts,
             &mut self.thread_draft_attachments,
             &mut self.thread_draft_capabilities,
+            &mut self.thread_draft_permission_modes,
         );
     }
 
@@ -156,10 +160,12 @@ impl PioneerDesktop {
             &self.thread_drafts,
             &self.thread_draft_attachments,
             &self.thread_draft_capabilities,
+            &self.thread_draft_permission_modes,
         );
         self.composer_state.update(cx, move |state, cx| {
             state.set_value(draft.text.clone(), window, cx)
         });
+        self.composer_permission_mode = draft.permission_mode;
         if self.composer_selected_provider_is_cli_runtime() {
             self.composer_attachments = draft.attachments;
             self.composer_capabilities.clear();
@@ -293,6 +299,7 @@ impl PioneerDesktop {
             &mut self.thread_drafts,
             &mut self.thread_draft_attachments,
             &mut self.thread_draft_capabilities,
+            &mut self.thread_draft_permission_modes,
             &mut self.thread_placements,
         );
         if pioneer_client::timeline::semantic::remove_thread_semantic_timeline(
@@ -304,8 +311,8 @@ impl PioneerDesktop {
         self.semantic_timeline_in_flight
             .retain(|key| !semantic_request_key_matches_thread(key, thread_id));
         if let Some(workspace_id) = workspace_id {
-            self.cli_runtime_pending_requests.apply(
-                pioneer_client::cli_runtime::approvals::reduce_cli_runtime_thread_closed_cleanup(
+            self.pending_requests.apply(
+                pioneer_client::cli_runtime::approvals::reduce_pending_request_thread_closed_cleanup(
                     workspace_id,
                     thread_id.to_owned(),
                 ),
@@ -321,8 +328,10 @@ impl PioneerDesktop {
             &mut self.thread_drafts,
             &mut self.thread_draft_attachments,
             &mut self.thread_draft_capabilities,
+            &mut self.thread_draft_permission_modes,
             &mut self.composer_attachments,
             &mut self.composer_capabilities,
+            &mut self.composer_permission_mode,
             &mut self.composer_upload_in_progress,
             &mut self.composer_upload_error,
             &mut self.composer_selected_provider,
@@ -340,7 +349,7 @@ impl PioneerDesktop {
         self.clear_composer_reasoning_effort();
         self.composer_model_display_cache.clear();
         self.composer_model_display_loading_key = None;
-        self.cli_runtime_pending_requests = Default::default();
+        self.pending_requests = Default::default();
         self.cli_runtime_thread_bindings.clear();
     }
 

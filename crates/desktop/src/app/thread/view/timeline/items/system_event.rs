@@ -91,6 +91,7 @@ fn system_event_label_text(label: &SystemEventLabel) -> String {
         SystemEventLabel::Checkpoint => t!("timeline.system.checkpoint_label").to_string(),
         SystemEventLabel::Continued => t!("timeline.system.continued_label").to_string(),
         SystemEventLabel::Paused => t!("timeline.system.paused_label").to_string(),
+        SystemEventLabel::Permissions => t!("timeline.system.permissions_label").to_string(),
     }
 }
 

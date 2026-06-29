@@ -50,9 +50,11 @@ pub enum PioneerIconName {
     GalleryVerticalEnd,
     Infinity,
     Lightbulb,
+    Lock,
     Mcp,
     MessageCircle,
     Paperclip,
+    Pencil,
     PowerOff,
     RefreshCw,
     RotateCcw,
@@ -60,6 +62,7 @@ pub enum PioneerIconName {
     SunMoon,
     Terminal,
     Trash,
+    Unlock,
     Zap,
 }
 
@@ -72,9 +75,11 @@ impl IconNamed for PioneerIconName {
             Self::GalleryVerticalEnd => "icons/gallery-vertical-end.svg",
             Self::Infinity => "icons/infinity.svg",
             Self::Lightbulb => "icons/lightbulb.svg",
+            Self::Lock => "icons/lock.svg",
             Self::Mcp => "icons/mcp.svg",
             Self::MessageCircle => "icons/message-circle.svg",
             Self::Paperclip => "icons/paperclip.svg",
+            Self::Pencil => "icons/pencil.svg",
             Self::PowerOff => "icons/power-off.svg",
             Self::RefreshCw => "icons/refresh-cw.svg",
             Self::RotateCcw => "icons/rotate-ccw.svg",
@@ -82,6 +87,7 @@ impl IconNamed for PioneerIconName {
             Self::SunMoon => "icons/sun-moon.svg",
             Self::Terminal => "icons/terminal.svg",
             Self::Trash => "icons/trash.svg",
+            Self::Unlock => "icons/unlock.svg",
             Self::Zap => "icons/zap.svg",
         }
         .into()
