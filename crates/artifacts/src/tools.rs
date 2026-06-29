@@ -1204,6 +1204,7 @@ mod tests {
             attempt_id: 1,
             idempotency_key: None,
             recovery: ToolRecoveryMetadata::default(),
+            permission_metadata: pioneer_tools::ToolPermissionMetadata::default(),
             cancellation: CancellationToken::new(),
         }
     }
