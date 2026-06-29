@@ -3468,7 +3468,7 @@ async fn materialize_child_task_prompt(
         now: now_timestamp_secs(),
         parent_context: parent_context.as_deref(),
         output_instructions: agent_spec.prompt.output_instructions.as_deref(),
-        effective_permission_profile: Some(effective_permission_profile),
+        effective_permission_profile,
         revision,
     }))
 }

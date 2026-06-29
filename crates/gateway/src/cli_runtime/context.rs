@@ -46,7 +46,7 @@ pub(crate) fn compile_cli_runtime_context_bundle(
             runtime_label: Some(input.runtime_label.to_owned()),
             model: input.model.and_then(normalized_optional).map(str::to_owned),
             cwd: input.cwd.and_then(normalized_optional).map(str::to_owned),
-            permission_profile: Some(input.permission_profile),
+            permission_profile: input.permission_profile,
             memory_recall_context: None,
             thread_context: thread_context_from_history(input.history),
         },
