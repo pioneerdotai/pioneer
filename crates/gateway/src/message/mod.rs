@@ -12,6 +12,7 @@ mod markdown;
 mod mcp;
 mod memory_handlers;
 mod notifications;
+mod permission_handlers;
 mod provider_handlers;
 mod skills;
 mod summary;
@@ -121,11 +122,13 @@ use pioneer_protocol::{
     ToolCallStatus, ToolStoragePayload, Turn, TurnBlockedNotification, TurnCancelParams,
     TurnCancelResponse, TurnCompletedNotification, TurnFailedNotification, TurnGetParams,
     TurnGetResponse, TurnItem, TurnItemEvent, TurnItemEventPayload, TurnItemType, TurnItemsParams,
-    TurnResumeParams, TurnResumeResponse, TurnStartParams, TurnStatus, Workspace,
-    WorkspaceChangeKind, WorkspaceChangedNotification, WorkspaceCreateParams,
-    WorkspaceCreateResponse, WorkspaceDefaultParams, WorkspaceDefaultResponse, WorkspaceListParams,
-    WorkspaceListResponse, WorkspaceSelectParams, WorkspaceSelectResponse, WorkspaceUpdateParams,
-    WorkspaceUpdateResponse,
+    TurnPermissionApprovalRequest, TurnPermissionApprovalResolution,
+    TurnPermissionRequestOpenedNotification, TurnPermissionRequestResolvedNotification,
+    TurnPermissionRequestRespondParams, TurnPermissionRequestRespondResponse, TurnResumeParams,
+    TurnResumeResponse, TurnStartParams, TurnStatus, Workspace, WorkspaceChangeKind,
+    WorkspaceChangedNotification, WorkspaceCreateParams, WorkspaceCreateResponse,
+    WorkspaceDefaultParams, WorkspaceDefaultResponse, WorkspaceListParams, WorkspaceListResponse,
+    WorkspaceSelectParams, WorkspaceSelectResponse, WorkspaceUpdateParams, WorkspaceUpdateResponse,
     constants::{events, methods},
     generate_id, sanitize_runtime_diagnostic_line, sanitize_runtime_diagnostic_lines,
 };
@@ -144,7 +147,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::RwLock as StdRwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, oneshot};
 use tokio::task::JoinHandle;
 
 use pioneer_cli_agent_runtime::event::RuntimeEvent;
@@ -172,6 +175,49 @@ where
     F: Future<Output = T> + Send + 'a,
 {
     Box::pin(future)
+}
+
+struct AbortOnDropMessageTask<T> {
+    handle: Option<JoinHandle<T>>,
+}
+
+impl<T> AbortOnDropMessageTask<T> {
+    fn new(handle: JoinHandle<T>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    async fn join(mut self) -> Result<T, tokio::task::JoinError> {
+        let result = self
+            .handle
+            .as_mut()
+            .expect("join handle should be present")
+            .await;
+        self.handle = None;
+        result
+    }
+}
+
+impl<T> Drop for AbortOnDropMessageTask<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take()
+            && !handle.is_finished()
+        {
+            handle.abort();
+        }
+    }
+}
+
+// Heavy CRUD/projection calls otherwise inherit a deeply nested message-handler poll stack.
+pub(crate) async fn message_fresh_task<F, T>(future: F) -> Result<T, tokio::task::JoinError>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    AbortOnDropMessageTask::new(tokio::spawn(future))
+        .join()
+        .await
 }
 
 const RESILIENCE_WORKER_POLL_INTERVAL_SECONDS: u64 = 2;
@@ -281,6 +327,9 @@ pub struct MessageProcessor {
     artifact_tool_states: Arc<Mutex<HashMap<String, Arc<ArtifactToolState>>>>,
     artifact_output_dirs: Arc<Mutex<HashMap<String, String>>>,
     turn_final_assistant_texts: Arc<Mutex<HashMap<String, String>>>,
+    native_permission_pending_requests:
+        Arc<Mutex<HashMap<String, PendingNativePermissionApprovalRequest>>>,
+    native_permission_approval_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     artifact_finalization_retry_turns: Arc<Mutex<HashSet<String>>>,
     title_job_runtime: Arc<Mutex<HashMap<String, ThreadTitleJobState>>>,
     timeout_supervisor: Arc<TimeoutSupervisor>,
@@ -342,6 +391,13 @@ struct CLIRuntimePendingTurnServerRequest {
     event: RuntimeEvent,
     received_at_unix_ms: i64,
     received_sequence: u64,
+}
+
+struct PendingNativePermissionApprovalRequest {
+    workspace_id: String,
+    thread_id: String,
+    turn_id: String,
+    respond_to: oneshot::Sender<pioneer_tools::PermissionApprovalResolution>,
 }
 
 impl MessageProcessor {
@@ -501,6 +557,8 @@ impl MessageProcessor {
             artifact_tool_states: Arc::new(Mutex::new(HashMap::new())),
             artifact_output_dirs: Arc::new(Mutex::new(HashMap::new())),
             turn_final_assistant_texts: Arc::new(Mutex::new(HashMap::new())),
+            native_permission_pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            native_permission_approval_worker: Arc::new(Mutex::new(None)),
             artifact_finalization_retry_turns: Arc::new(Mutex::new(HashSet::new())),
             title_job_runtime: Arc::new(Mutex::new(HashMap::new())),
             timeout_supervisor,
@@ -693,8 +751,49 @@ impl MessageProcessor {
     }
 
     pub async fn bind_agent_tool_bridges(self: &Arc<Self>) {
+        self.bind_permission_approval_bridge().await;
         self.bind_task_bridge().await;
         self.bind_artifact_tool_bridge().await;
+    }
+
+    async fn bind_permission_approval_bridge(self: &Arc<Self>) {
+        let mut worker = self.native_permission_approval_worker.lock().await;
+        if worker.is_some() {
+            return;
+        }
+
+        let (broker, mut request_rx) =
+            crate::permissions::GatewayPermissionApprovalBroker::channel();
+        self.agent_manager
+            .set_permission_approval_broker(Arc::new(broker))
+            .await;
+
+        let processor = Arc::downgrade(self);
+        *worker = Some(tokio::spawn(async move {
+            while let Some(event) = request_rx.recv().await {
+                let Some(processor) = processor.upgrade() else {
+                    if let crate::permissions::GatewayPermissionApprovalEvent::Open(request) = event
+                    {
+                        let _ = request
+                            .respond_to
+                            .send(pioneer_tools::PermissionApprovalResolution::Cancelled);
+                    }
+                    break;
+                };
+                match event {
+                    crate::permissions::GatewayPermissionApprovalEvent::Open(request) => {
+                        processor.open_native_permission_request(request).await;
+                    }
+                    crate::permissions::GatewayPermissionApprovalEvent::Cancelled {
+                        request_id,
+                    } => {
+                        processor
+                            .cancel_native_permission_request(request_id.as_str())
+                            .await;
+                    }
+                }
+            }
+        }));
     }
 
     pub async fn bind_memory_bridge(self: &Arc<Self>) {
@@ -1920,6 +2019,8 @@ impl MessageProcessor {
             artifact_tool_states: Arc::new(Mutex::new(HashMap::new())),
             artifact_output_dirs: Arc::new(Mutex::new(HashMap::new())),
             turn_final_assistant_texts: Arc::new(Mutex::new(HashMap::new())),
+            native_permission_pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            native_permission_approval_worker: Arc::new(Mutex::new(None)),
             artifact_finalization_retry_turns: Arc::new(Mutex::new(HashSet::new())),
             title_job_runtime: Arc::new(Mutex::new(HashMap::new())),
             timeout_supervisor,

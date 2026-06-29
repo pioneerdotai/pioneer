@@ -4120,6 +4120,52 @@ impl CrudStore {
             .await
     }
 
+    /// Persists turn/start and its caller-owned permission audit as one write-set.
+    pub async fn materialize_turn_start_with_permission_audit(
+        &self,
+        thread_model: &Thread,
+        sandbox_mode: SandboxMode,
+        turn_model: &Turn,
+        input: &[UserInput],
+        audit_event: pioneer_protocol::TurnPermissionAuditEvent,
+    ) -> Result<()> {
+        self.materialize_turn_start_with_reasoning_effort_and_permission_audit(
+            thread_model,
+            sandbox_mode,
+            turn_model,
+            input,
+            None,
+            audit_event,
+        )
+        .await
+    }
+
+    /// Persists turn/start, explicit reasoning effort, and caller-owned permission audit atomically.
+    pub async fn materialize_turn_start_with_reasoning_effort_and_permission_audit(
+        &self,
+        thread_model: &Thread,
+        sandbox_mode: SandboxMode,
+        turn_model: &Turn,
+        input: &[UserInput],
+        reasoning_effort: Option<&str>,
+        audit_event: pioneer_protocol::TurnPermissionAuditEvent,
+    ) -> Result<()> {
+        let started_event = TurnEventPayload::TurnStarted(TurnStartedEventPayload {
+            thread: thread_model.clone(),
+            sandbox_mode,
+            turn: turn_model.clone(),
+            input: input.to_vec(),
+            reasoning_effort: reasoning_effort.map(str::to_owned),
+        });
+        let audit_event = TurnEventPayload::TurnPermissionAudit(audit_event);
+
+        self.materialize_turn_events_atomically(
+            vec![started_event, audit_event],
+            thread_model.updated_at,
+        )
+        .await
+    }
+
     pub async fn materialize_item_started(
         &self,
         notification: pioneer_protocol::ItemStartedNotification,
@@ -9222,6 +9268,161 @@ impl CrudStore {
             }
             return Err(error);
         }
+
+        Ok(())
+    }
+
+    async fn materialize_turn_events_atomically(
+        &self,
+        events: Vec<TurnEventPayload>,
+        event_timestamp_secs: i64,
+    ) -> Result<()> {
+        let created_at = unix_to_datetime(event_timestamp_secs);
+        let claim_expires_at =
+            unix_to_datetime(event_timestamp_secs.saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS));
+
+        self.run_serialized_write(|| {
+            self.materialize_turn_events_atomically_once(
+                events.clone(),
+                created_at,
+                claim_expires_at,
+            )
+        })
+        .await
+    }
+
+    async fn materialize_turn_events_atomically_once(
+        &self,
+        events: Vec<TurnEventPayload>,
+        created_at: DateTimeWithTimeZone,
+        claim_expires_at: DateTimeWithTimeZone,
+    ) -> Result<()> {
+        let transaction = self
+            .connection
+            .begin()
+            .await
+            .context("failed to begin turn event batch materialization transaction")?;
+
+        for event in events {
+            if let Err(error) = validate_turn_event_for_permanent_storage(&event).await {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+
+            let projection_context = TurnEventProjectionContext::default();
+            let claim_token = generate_id(DB_ID_LEN);
+            let appended_event =
+                match turn_event::append_event(&transaction, &event, created_at).await {
+                    Ok(event) => event,
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        return Err(error);
+                    }
+                };
+
+            let projection_context_json = match serialize_turn_event_projection_context(
+                &projection_context,
+                appended_event.id.as_str(),
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = transaction.rollback().await;
+                    return Err(error);
+                }
+            };
+
+            if let Err(error) = turn_event_projection_state::insert_claimed(
+                &transaction,
+                turn_event_projection_state::NewTurnEventProjectionState {
+                    event_id: appended_event.id.clone(),
+                    thread_id: appended_event.thread_id.clone(),
+                    turn_id: appended_event.turn_id.clone(),
+                    sequence: appended_event.sequence,
+                    projection_context_json,
+                    claim_token: claim_token.clone(),
+                    claim_expires_at,
+                    created_at,
+                },
+            )
+            .await
+            {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+
+            let has_unprojected_predecessor =
+                match turn_event_projection_state::has_unprojected_predecessor(
+                    &transaction,
+                    appended_event.turn_id.as_str(),
+                    appended_event.sequence,
+                )
+                .await
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        return Err(error);
+                    }
+                };
+            if has_unprojected_predecessor {
+                let _ = transaction.rollback().await;
+                anyhow::bail!(
+                    "turn event projection `{}` is waiting for an earlier event in turn `{}`",
+                    appended_event.id,
+                    appended_event.turn_id
+                );
+            }
+
+            if let Err(error) = self
+                .projector
+                .project(&transaction, &appended_event)
+                .await
+                .context("failed to project turn event to read models")
+            {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+
+            if let Err(error) =
+                crate::timeline_live_projection::project_semantic_timeline_live_turn_event(
+                    &transaction,
+                    &appended_event,
+                )
+                .await
+                .context("failed to project turn event to semantic timeline")
+            {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+
+            let projected = match turn_event_projection_state::mark_projected_claimed(
+                &transaction,
+                appended_event.id.as_str(),
+                claim_token.as_str(),
+                created_at,
+            )
+            .await
+            {
+                Ok(projected) => projected,
+                Err(error) => {
+                    let _ = transaction.rollback().await;
+                    return Err(error);
+                }
+            };
+
+            if !projected {
+                let _ = transaction.rollback().await;
+                anyhow::bail!(
+                    "turn event projection `{}` is no longer claimed by this worker",
+                    appended_event.id
+                );
+            }
+        }
+
+        transaction
+            .commit()
+            .await
+            .context("failed to commit turn event batch materialization transaction")?;
 
         Ok(())
     }
@@ -16511,6 +16712,116 @@ mod tests {
             )),
             "permission audit should be exposed through thread history"
         );
+    }
+
+    #[tokio::test]
+    async fn materialize_turn_start_with_permission_audit_projects_both_events_atomically() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+
+        let store = CrudStore::new(connection.clone());
+        let timestamp = 1_700_000_000;
+        let thread = Thread {
+            workspace_id: "ws_atomic_profile".to_owned(),
+            id: "thr_atomic_profile".to_owned(),
+            name: None,
+            preview: String::new(),
+            mode: ThreadMode::Agent,
+            model: "gpt-5.4".to_owned(),
+            model_provider: "openai".to_owned(),
+            reasoning_effort: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+            status: ThreadStatus::Active,
+            origin_kind: ThreadOriginKind::User,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            turns: Vec::new(),
+        };
+        let permission_profile = TurnPermissionProfileSnapshot::from_mode(
+            TurnPermissionMode::Supervised,
+            TurnPermissionProfileSource::Composer,
+        );
+        let turn = Turn {
+            id: "turn_atomic_profile".to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
+            error: None,
+            prompt_manifest: None,
+            permission_profile: Some(permission_profile.clone()),
+        };
+        let audit = pioneer_protocol::TurnPermissionAuditEvent {
+            workspace_id: thread.workspace_id.clone(),
+            thread_id: thread.id.clone(),
+            turn_id: turn.id.clone(),
+            event_kind: TurnPermissionAuditEventKind::ProfileSelected,
+            profile_mode: permission_profile.mode,
+            profile_source: permission_profile.source,
+            item_id: None,
+            tool_call_id: None,
+            tool_name: None,
+            action_kind: None,
+            request_key: None,
+            decision: None,
+            reason: None,
+            cached: false,
+        };
+
+        store
+            .materialize_turn_start_with_permission_audit(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                audit,
+            )
+            .await
+            .expect("turn start and profile audit should persist atomically");
+
+        let events = pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn.id.clone()))
+            .order_by_asc(pioneer_entity::turn_event::Column::Sequence)
+            .all(&connection)
+            .await
+            .expect("must query turn events");
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].event_type,
+            pioneer_protocol::constants::events::TURN_STARTED
+        );
+        assert_eq!(
+            events[1].event_type,
+            pioneer_protocol::constants::events::TURN_PERMISSION_AUDIT
+        );
+
+        let projection_states = pioneer_entity::turn_event_projection_state::Entity::find()
+            .filter(pioneer_entity::turn_event_projection_state::Column::TurnId.eq(turn.id.clone()))
+            .order_by_asc(pioneer_entity::turn_event_projection_state::Column::Sequence)
+            .all(&connection)
+            .await
+            .expect("must query turn event projection states");
+        assert_eq!(projection_states.len(), 2);
+        assert!(projection_states.iter().all(|state| {
+            state.status
+                == crate::repositories::turn_event_projection_state::PROJECTION_STATUS_PROJECTED
+        }));
+
+        let turn_item_events = store
+            .get_turn_item_events(thread.id.as_str(), turn.id.as_str())
+            .await
+            .expect("turn item events should load")
+            .expect("turn item events should exist");
+        assert!(turn_item_events.events.iter().any(|event| matches!(
+            &event.payload,
+            TurnItemEventPayload::TurnPermissionAudit(audit)
+                if audit.event_kind == TurnPermissionAuditEventKind::ProfileSelected
+        )));
     }
 
     #[tokio::test]

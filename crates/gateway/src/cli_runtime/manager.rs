@@ -91,6 +91,7 @@ pub(crate) struct CLIAgentRuntimeTurnSteerResult {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CLIAgentRuntimeSessionStartOptions {
     pub cwd: Option<PathBuf>,
+    pub approval_policy: Option<String>,
     pub app_server_args: Vec<String>,
     pub env: BTreeMap<String, String>,
 }
@@ -634,11 +635,13 @@ mod tests {
         let key = key("thread-a");
         let options_a = CLIAgentRuntimeSessionStartOptions {
             cwd: None,
+            approval_policy: Some("on-request".to_owned()),
             app_server_args: vec!["-c".to_owned(), "model=\"gpt-5-codex\"".to_owned()],
             env: Default::default(),
         };
         let options_b = CLIAgentRuntimeSessionStartOptions {
             cwd: None,
+            approval_policy: Some("never".to_owned()),
             app_server_args: vec!["-c".to_owned(), "model=\"gpt-5\"".to_owned()],
             env: Default::default(),
         };

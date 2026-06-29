@@ -182,6 +182,7 @@ fn durable_event_thread_id(event: &AgentDurableEvent) -> Option<&str> {
         | AgentDurableEvent::TurnFailed { thread_id, .. }
         | AgentDurableEvent::TurnBlocked { thread_id, .. }
         | AgentDurableEvent::TurnInterrupted { thread_id, .. } => Some(thread_id.as_str()),
+        AgentDurableEvent::TurnPermissionAudit { event } => Some(event.thread_id.as_str()),
         AgentDurableEvent::ItemStarted { notification } => Some(notification.thread_id.as_str()),
         AgentDurableEvent::ItemCompleted { notification } => Some(notification.thread_id.as_str()),
         AgentDurableEvent::ItemToolRetryScheduled { notification } => {
@@ -1031,6 +1032,22 @@ impl MessageProcessor {
                             "failed to persist skill dependency snapshot; continuing"
                         );
                     }
+                }
+            }
+            AgentDurableEvent::TurnPermissionAudit { event } => {
+                let event_timestamp = now_timestamp_secs();
+                if let Err(error) = self
+                    .crud_store
+                    .materialize_turn_permission_audit(event.clone(), event_timestamp)
+                    .await
+                {
+                    warn!(
+                        thread_id = event.thread_id,
+                        turn_id = event.turn_id,
+                        error = %format!("{error:#}"),
+                        "failed to persist turn permission audit event"
+                    );
+                    return false;
                 }
             }
             AgentDurableEvent::TurnLlmContextAppended {

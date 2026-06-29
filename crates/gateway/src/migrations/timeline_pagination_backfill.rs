@@ -13,7 +13,7 @@ use pioneer_entity::{
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, TransactionTrait,
+    QueryFilter, QueryOrder, QuerySelect, Statement, TransactionTrait,
 };
 use serde_json::{Value as JsonValue, json};
 use std::collections::HashMap;
@@ -21,6 +21,8 @@ use tracing::{debug, info, warn};
 
 const DEFAULT_BACKFILL_BATCH_SIZE: u64 = 256;
 const MAX_BACKFILL_BATCH_SIZE: u64 = 1024;
+const TERMINAL_APPROVAL_BLOCK_CLEANUP_KEY: &str = "semantic_timeline_terminal_approval_cleanup";
+const TERMINAL_APPROVAL_BLOCK_CLEANUP_VERSION: i64 = 1;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct SemanticTimelineBackfillSourceCounts {
@@ -186,6 +188,23 @@ fn is_stale_running_turn_item(item: &turn_item::Model, now: DateTimeWithTimeZone
 }
 
 pub(crate) async fn run(crud_store: &CrudStore) {
+    match cleanup_terminal_approval_blocks_once(crud_store).await {
+        Ok(removed) => {
+            if removed > 0 {
+                info!(
+                    removed,
+                    "removed terminal approval blocks from semantic timeline projection"
+                );
+            }
+        }
+        Err(error) => {
+            warn!(
+                error = %format!("{error:#}"),
+                "terminal approval timeline cleanup failed at startup"
+            );
+        }
+    }
+
     match backfill_once(crud_store, DEFAULT_BACKFILL_BATCH_SIZE).await {
         Ok(summary) => {
             if summary.skipped {
@@ -212,6 +231,76 @@ pub(crate) async fn run(crud_store: &CrudStore) {
             );
         }
     }
+}
+
+async fn cleanup_terminal_approval_blocks_once(crud_store: &CrudStore) -> Result<u64> {
+    let db = crud_store.database_connection();
+    if terminal_approval_cleanup_is_current(&db).await? {
+        return Ok(0);
+    }
+
+    let removed = delete_terminal_approval_blocks(&db).await?;
+    mark_terminal_approval_cleanup_complete(&db).await?;
+    Ok(removed)
+}
+
+async fn terminal_approval_cleanup_is_current(db: &DatabaseConnection) -> Result<bool> {
+    let Some(meta) =
+        timeline_repository::find_projection_meta(db, TERMINAL_APPROVAL_BLOCK_CLEANUP_KEY).await?
+    else {
+        return Ok(false);
+    };
+
+    Ok(
+        meta.projection_version == TERMINAL_APPROVAL_BLOCK_CLEANUP_VERSION
+            && meta.status == timeline_repository::PROJECTION_META_STATUS_COMPLETE,
+    )
+}
+
+async fn delete_terminal_approval_blocks(db: &DatabaseConnection) -> Result<u64> {
+    let statement = Statement::from_string(
+        db.get_database_backend(),
+        r#"
+DELETE FROM thread_timeline_block
+WHERE block_kind = 'approval'
+  AND (
+    source_key IS NULL
+    OR source_key NOT IN (
+      SELECT request_id
+      FROM cli_runtime_pending_request
+      WHERE status = 'pending'
+    )
+  )
+"#
+        .to_owned(),
+    );
+    let result = db
+        .execute_raw(statement)
+        .await
+        .context("failed to delete terminal approval timeline blocks")?;
+    Ok(result.rows_affected())
+}
+
+async fn mark_terminal_approval_cleanup_complete(db: &DatabaseConnection) -> Result<()> {
+    let now = now_datetime();
+    timeline_repository::upsert_projection_meta(
+        db,
+        ProjectionMetaRecord {
+            projection_key: TERMINAL_APPROVAL_BLOCK_CLEANUP_KEY.to_owned(),
+            projection_version: TERMINAL_APPROVAL_BLOCK_CLEANUP_VERSION,
+            status: timeline_repository::PROJECTION_META_STATUS_COMPLETE.to_owned(),
+            source_thread_count: 0,
+            source_turn_count: 0,
+            source_turn_item_count: 0,
+            source_turn_event_count: 0,
+            last_error: None,
+            backfill_started_at: Some(now),
+            backfilled_at: Some(now),
+            created_at: now,
+            updated_at: now,
+        },
+    )
+    .await
 }
 
 pub(crate) async fn backfill_once(

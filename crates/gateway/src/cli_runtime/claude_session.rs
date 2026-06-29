@@ -176,6 +176,13 @@ fn claude_process_config_from_instance(
     for (key, value) in &options.env {
         env.insert(key.clone(), value.clone());
     }
+    let permission_mode = options
+        .approval_policy
+        .as_deref()
+        .map(str::trim)
+        .filter(|mode| !mode.is_empty())
+        .unwrap_or("default")
+        .to_owned();
 
     let mut args = vec![
         "--output-format".to_owned(),
@@ -186,7 +193,7 @@ fn claude_process_config_from_instance(
         "--permission-prompt-tool".to_owned(),
         "stdio".to_owned(),
         "--permission-mode".to_owned(),
-        "default".to_owned(),
+        permission_mode,
         "--safe-mode".to_owned(),
         "--setting-sources=".to_owned(),
         "--include-partial-messages".to_owned(),
@@ -1429,6 +1436,54 @@ done
             .lines()
             .map(|line| serde_json::from_str(line).expect("logged line should be JSON"))
             .collect()
+    }
+
+    fn claude_instance(home_path: String) -> EffectiveGatewayCliAgentRuntimeInstanceConfig {
+        EffectiveGatewayCliAgentRuntimeInstanceConfig {
+            id: "claude".to_owned(),
+            kind: GatewayCliAgentRuntimeKindConfig::Claude,
+            display_name: "Claude CLI".to_owned(),
+            enabled: true,
+            binary_path: "claude".to_owned(),
+            home_path,
+            shadow_home_path: None,
+            custom_models: Vec::new(),
+            app_server_args: Vec::new(),
+            startup_probe_timeout_ms: 1_000,
+            request_timeout_ms: 1_000,
+            idle_session_ttl_secs: 60,
+            event_channel_capacity: 16,
+            stderr_ring_lines: 16,
+            debug_native_events: false,
+        }
+    }
+
+    fn arg_value_after(args: &[String], flag: &str) -> Option<String> {
+        args.windows(2)
+            .find(|pair| pair[0] == flag)
+            .map(|pair| pair[1].clone())
+    }
+
+    #[test]
+    fn claude_process_config_uses_session_permission_mode() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let instance = claude_instance(temp_dir.path().to_string_lossy().into_owned());
+
+        let config = claude_process_config_from_instance(
+            &instance,
+            &CLIAgentRuntimeSessionStartOptions {
+                cwd: None,
+                approval_policy: Some("acceptEdits".to_owned()),
+                app_server_args: Vec::new(),
+                env: Default::default(),
+            },
+        )
+        .expect("config should build");
+
+        assert_eq!(
+            arg_value_after(config.args.as_slice(), "--permission-mode").as_deref(),
+            Some("acceptEdits")
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@ pub(crate) mod config;
 pub(crate) mod context;
 pub(crate) mod input_mapping;
 pub(crate) mod manager;
+pub(crate) mod permissions;
 pub(crate) mod projector;
 pub(crate) mod thread_binding;
 pub(crate) mod turn_binding;

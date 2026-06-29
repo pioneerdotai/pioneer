@@ -11,6 +11,7 @@ use pioneer_promt::{
 };
 use pioneer_protocol::{
     PromptManifest, PromptManifestDiagnostic, PromptManifestDiagnosticCode, PromptManifestProfile,
+    TurnPermissionProfileSnapshot,
 };
 use pioneer_provider::{ChatMessage, Role};
 use std::path::Path;
@@ -27,6 +28,7 @@ pub(crate) struct CLIRuntimeContextBuildInput<'a> {
     pub runtime_label: &'a str,
     pub model: Option<&'a str>,
     pub cwd: Option<&'a str>,
+    pub permission_profile: Option<TurnPermissionProfileSnapshot>,
     pub history: &'a [ChatMessage],
 }
 
@@ -44,6 +46,7 @@ pub(crate) fn compile_cli_runtime_context_bundle(
             runtime_label: Some(input.runtime_label.to_owned()),
             model: input.model.and_then(normalized_optional).map(str::to_owned),
             cwd: input.cwd.and_then(normalized_optional).map(str::to_owned),
+            permission_profile: input.permission_profile,
             memory_recall_context: None,
             thread_context: thread_context_from_history(input.history),
         },
@@ -254,6 +257,7 @@ mod tests {
                 runtime_label: "Codex CLI",
                 model: Some("gpt-5-codex"),
                 cwd: Some("/workspace"),
+                permission_profile: None,
                 history: &[ChatMessage::user("continue from prior context")],
             },
         )
@@ -284,6 +288,7 @@ mod tests {
                 runtime_label: "Claude CLI",
                 model: None,
                 cwd: None,
+                permission_profile: None,
                 history: &[],
             },
         )
@@ -313,5 +318,43 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.code == "cli_runtime_input.pioneer_context_mapped")
         );
+    }
+
+    #[test]
+    fn cli_runtime_context_build_input_carries_restricted_permissions() {
+        let root = temp_workspace("permissions");
+        let bundle = compile_cli_runtime_context_bundle(
+            root.as_path(),
+            CLIRuntimeContextBuildInput {
+                workspace_id: "workspace_1",
+                thread_id: "thread_1",
+                turn_id: "turn_1",
+                runtime_id: "codex-default",
+                runtime_label: "Codex CLI",
+                model: Some("gpt-5-codex"),
+                cwd: Some("/workspace"),
+                permission_profile: Some(
+                    pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+                        pioneer_protocol::TurnPermissionMode::Supervised,
+                        pioneer_protocol::TurnPermissionProfileSource::Composer,
+                    ),
+                ),
+                history: &[],
+            },
+        )
+        .expect("compile bundle");
+
+        let manifest = cli_runtime_prompt_manifest_from_bundle(&bundle);
+        assert!(
+            manifest
+                .section_ids
+                .contains(&"current_permissions".to_owned())
+        );
+        assert!(
+            bundle
+                .dynamic_system_text
+                .contains("## Current Permissions")
+        );
+        assert!(bundle.dynamic_system_text.contains("- mode: supervised"));
     }
 }

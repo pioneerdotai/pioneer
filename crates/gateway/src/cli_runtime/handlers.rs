@@ -1104,11 +1104,11 @@ impl MessageProcessor {
                 }
             };
 
-            self.emit_cli_runtime_steer_accepted_timeline_event(
-                workspace_id.as_str(),
-                params.thread_id.as_str(),
-                params.turn_id.as_str(),
-                steer.native_turn_id.as_str(),
+            self.emit_cli_runtime_steer_accepted_timeline_event_fresh_task(
+                workspace_id.clone(),
+                params.thread_id.clone(),
+                params.turn_id.clone(),
+                steer.native_turn_id.clone(),
             )
             .await;
 
@@ -3648,6 +3648,37 @@ impl MessageProcessor {
             }),
         )
         .await;
+    }
+
+    async fn emit_cli_runtime_steer_accepted_timeline_event_fresh_task(
+        &self,
+        workspace_id: String,
+        thread_id: String,
+        turn_id: String,
+        native_turn_id: String,
+    ) {
+        let processor = self.clone();
+        let log_thread_id = thread_id.clone();
+        let log_turn_id = turn_id.clone();
+        let join = tokio::spawn(async move {
+            processor
+                .emit_cli_runtime_steer_accepted_timeline_event(
+                    workspace_id.as_str(),
+                    thread_id.as_str(),
+                    turn_id.as_str(),
+                    native_turn_id.as_str(),
+                )
+                .await;
+        });
+
+        if let Err(error) = join.await {
+            warn!(
+                thread_id = log_thread_id.as_str(),
+                turn_id = log_turn_id.as_str(),
+                error = %format!("{error:#}"),
+                "CLI runtime steer accepted timeline event task failed"
+            );
+        }
     }
 
     pub(super) async fn best_effort_sync_cli_runtime_thread_name(

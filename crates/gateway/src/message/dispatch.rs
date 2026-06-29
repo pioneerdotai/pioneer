@@ -20,7 +20,8 @@ use pioneer_protocol::{
     TaskPauseParams, TaskRescheduleParams, TaskResumeParams, TaskReviseParams,
     TaskTreeParams as TaskTreeTaskParams, TaskWaitParams, ThreadAgentsDocArchiveParams,
     ThreadAgentsDocGetParams, ThreadAgentsDocResolveForThreadParams, ThreadAgentsDocSaveParams,
-    ThreadTimelinePageParams, TurnCancelParams, TurnResumeParams, TurnWorkPageParams,
+    ThreadTimelinePageParams, TurnCancelParams, TurnPermissionRequestRespondParams,
+    TurnResumeParams, TurnWorkPageParams,
 };
 
 impl MessageProcessor {
@@ -793,6 +794,30 @@ impl MessageProcessor {
                                     format!(
                                         "invalid params for `{}`: {error}",
                                         methods::TURN_ITEMS
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::TURN_PERMISSION_REQUEST_RESPOND => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<TurnPermissionRequestRespondParams>(params_value)
+                    {
+                        Ok(params) => {
+                            self.turn_permission_request_respond(connection_id, request.id, params)
+                                .await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{}`: {error}",
+                                        methods::TURN_PERMISSION_REQUEST_RESPOND
                                     ),
                                 ),
                             )
@@ -2227,7 +2252,10 @@ impl MessageProcessor {
                 methods::TASK_REVISE => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TaskReviseParams>(params_value) {
-                        Ok(params) => self.task_revise(connection_id, request.id, params).await,
+                        Ok(params) => {
+                            message_future(self.task_revise(connection_id, request.id, params))
+                                .await
+                        }
                         Err(error) => {
                             self.send_error(
                                 connection_id,

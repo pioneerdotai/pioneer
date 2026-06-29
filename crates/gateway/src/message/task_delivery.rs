@@ -172,16 +172,19 @@ impl MessageProcessor {
                 mode: None,
                 execution_backend: None,
                 reasoning: None,
+                permission_profile: None,
                 cli_runtime_options: None,
             })
             .await?;
+        let profile_selected_audit = self.turn_profile_selected_audit_event(&turn_outcome);
         if let Err(error) = self
             .crud_store
-            .materialize_turn_start(
+            .materialize_turn_start_with_permission_audit(
                 &turn_outcome.materialization.thread,
                 turn_outcome.materialization.sandbox_mode,
                 &turn_outcome.materialization.turn,
                 &turn_outcome.materialization.input,
+                profile_selected_audit,
             )
             .await
         {

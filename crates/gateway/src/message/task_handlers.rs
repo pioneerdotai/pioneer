@@ -211,7 +211,13 @@ impl MessageProcessor {
         .await
         {
             Ok(revised) => {
-                message_future(self.task_agent_executor.dispatch_revision_turn(revised)).await
+                let task_agent_executor = self.task_agent_executor.clone();
+                message_fresh_task(async move {
+                    task_agent_executor.dispatch_revision_turn(revised).await
+                })
+                .await
+                .context("task revision dispatch task failed")
+                .and_then(|result| result)
             }
             Err(error) => Err(error),
         };

@@ -403,10 +403,29 @@ impl ThreadManager {
         self.turn_start_for_actor(None, params).await
     }
 
+    pub async fn system_turn_start_with_permission_profile(
+        &self,
+        params: TurnStartParams,
+        permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot,
+    ) -> Result<TurnStartOutcome> {
+        self.turn_start_for_actor_with_permission_profile(None, params, Some(permission_profile))
+            .await
+    }
+
     async fn turn_start_for_actor(
         &self,
         connection_id: Option<ConnectionId>,
         params: TurnStartParams,
+    ) -> Result<TurnStartOutcome> {
+        self.turn_start_for_actor_with_permission_profile(connection_id, params, None)
+            .await
+    }
+
+    async fn turn_start_for_actor_with_permission_profile(
+        &self,
+        connection_id: Option<ConnectionId>,
+        params: TurnStartParams,
+        resolved_permission_profile: Option<pioneer_protocol::TurnPermissionProfileSnapshot>,
     ) -> Result<TurnStartOutcome> {
         let thread_id = params.thread_id.trim();
         if thread_id.is_empty() {
@@ -442,6 +461,9 @@ impl ThreadManager {
         };
 
         let requested_mode = params.mode;
+        let permission_profile = resolved_permission_profile.unwrap_or_else(|| {
+            pioneer_protocol::resolve_turn_permission_profile(params.permission_profile.as_ref())
+        });
         let requested_sandbox_mode = params.sandbox_policy.map(|policy| policy.mode);
 
         let now = unix_timestamp_secs()? as i64;
@@ -504,6 +526,7 @@ impl ThreadManager {
             origin: Default::default(),
             error: None,
             prompt_manifest: None,
+            permission_profile: Some(permission_profile),
         };
 
         if entry.thread.preview.is_empty() {
@@ -886,9 +909,10 @@ impl ThreadManager {
 mod tests {
     use super::ThreadManager;
     use pioneer_protocol::{
-        Thread, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStartParams,
-        ThreadStatus, ThreadUnsubscribeStatus, TurnReasoningSelection, TurnStartParams, TurnStatus,
-        UserInput,
+        PermissionBehavior, Thread, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility,
+        ThreadStartParams, ThreadStatus, ThreadUnsubscribeStatus, ToolPermissionPolicySnapshot,
+        TurnPermissionMode, TurnPermissionProfileSelection, TurnPermissionProfileSource,
+        TurnReasoningSelection, TurnStartParams, TurnStatus, UserInput,
     };
 
     fn start_params(thread_id: &str) -> ThreadStartParams {
@@ -1011,6 +1035,7 @@ mod tests {
                 origin: Default::default(),
                 error: None,
                 prompt_manifest: None,
+                permission_profile: None,
             }],
         };
 
@@ -1136,6 +1161,7 @@ mod tests {
                     mode: None,
                     execution_backend: None,
                     reasoning: None,
+                    permission_profile: None,
                     cli_runtime_options: None,
                 },
             )
@@ -1270,6 +1296,7 @@ mod tests {
                     mode: None,
                     execution_backend: None,
                     reasoning: None,
+                    permission_profile: None,
                     cli_runtime_options: None,
                 },
             )
@@ -1280,6 +1307,21 @@ mod tests {
         assert_eq!(
             turn_outcome.started_notification.turn.status,
             TurnStatus::InProgress
+        );
+        let permission_profile = turn_outcome
+            .response
+            .turn
+            .permission_profile
+            .as_ref()
+            .expect("turn should expose defaulted permission profile");
+        assert_eq!(permission_profile.mode, TurnPermissionMode::FullAccess);
+        assert_eq!(
+            permission_profile.source,
+            TurnPermissionProfileSource::Defaulted
+        );
+        assert_eq!(
+            permission_profile.effective_policy,
+            ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow)
         );
     }
 
@@ -1314,6 +1356,7 @@ mod tests {
                     reasoning: Some(TurnReasoningSelection {
                         effort: "high".to_owned(),
                     }),
+                    permission_profile: None,
                     cli_runtime_options: None,
                 },
             )
@@ -1336,6 +1379,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn turn_start_uses_composer_permission_profile_selection() {
+        let manager = ThreadManager::new("o4-mini", "openai");
+        let thread_outcome = manager
+            .thread_start(
+                10,
+                "ws_000000000000000001".to_owned(),
+                start_params("thr_000000000000000013"),
+            )
+            .await
+            .expect("thread start should succeed");
+
+        let turn_outcome = manager
+            .turn_start(
+                10,
+                TurnStartParams {
+                    thread_id: thread_outcome.response.thread.id.clone(),
+                    turn_id: "turn_000000000000000013".to_owned(),
+                    input: Vec::new(),
+                    capabilities: Vec::new(),
+                    model: None,
+                    model_provider: None,
+                    sandbox_policy: None,
+                    mode: None,
+                    execution_backend: None,
+                    reasoning: None,
+                    permission_profile: Some(TurnPermissionProfileSelection {
+                        mode: TurnPermissionMode::Supervised,
+                    }),
+                    cli_runtime_options: None,
+                },
+            )
+            .await
+            .expect("turn start should succeed");
+
+        let permission_profile = turn_outcome
+            .response
+            .turn
+            .permission_profile
+            .as_ref()
+            .expect("turn should expose selected permission profile");
+        assert_eq!(permission_profile.mode, TurnPermissionMode::Supervised);
+        assert_eq!(
+            permission_profile.source,
+            TurnPermissionProfileSource::Composer
+        );
+        assert_eq!(
+            permission_profile.effective_policy.default_behavior,
+            PermissionBehavior::Ask
+        );
+        assert_eq!(
+            permission_profile.effective_policy.file_read,
+            PermissionBehavior::Allow
+        );
+        assert_eq!(
+            turn_outcome
+                .materialization
+                .turn
+                .permission_profile
+                .as_ref()
+                .map(|profile| profile.mode),
+            Some(TurnPermissionMode::Supervised)
+        );
+    }
+
+    #[tokio::test]
     async fn turn_start_rejects_when_thread_missing() {
         let manager = ThreadManager::new("o4-mini", "openai");
 
@@ -1353,6 +1461,7 @@ mod tests {
                     mode: None,
                     execution_backend: None,
                     reasoning: None,
+                    permission_profile: None,
                     cli_runtime_options: None,
                 },
             )
@@ -1396,6 +1505,7 @@ mod tests {
                     reasoning: Some(TurnReasoningSelection {
                         effort: "high".to_owned(),
                     }),
+                    permission_profile: None,
                     cli_runtime_options: None,
                 },
             )
@@ -1437,6 +1547,7 @@ mod tests {
                     mode: None,
                     execution_backend: None,
                     reasoning: None,
+                    permission_profile: None,
                     cli_runtime_options: None,
                 },
             )

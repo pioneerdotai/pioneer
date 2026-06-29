@@ -167,14 +167,16 @@ impl MessageProcessor {
                 .await;
                 return;
             }
+            let profile_selected_audit = self.turn_profile_selected_audit_event(&outcome);
             if let Err(error) = message_future(
                 self.crud_store
-                    .materialize_turn_start_with_reasoning_effort(
+                    .materialize_turn_start_with_reasoning_effort_and_permission_audit(
                         &outcome.materialization.thread,
                         outcome.materialization.sandbox_mode,
                         &outcome.materialization.turn,
                         &outcome.materialization.input,
                         effective_reasoning_effort.as_deref(),
+                        profile_selected_audit,
                     ),
             )
             .await
@@ -188,7 +190,9 @@ impl MessageProcessor {
                     JsonRpcErrorResponse::new(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
-                        format!("failed to persist turn/start state: {error:#}"),
+                        format!(
+                            "failed to persist turn/start state and permission audit: {error:#}"
+                        ),
                     ),
                 )
                 .await;
@@ -354,9 +358,17 @@ impl MessageProcessor {
                 .await;
                 return;
             }
+            let permission_profile = outcome
+                .materialization
+                .turn
+                .permission_profile
+                .clone()
+                .unwrap_or_else(pioneer_protocol::default_turn_permission_profile_snapshot);
+            self.finish_turn_start_success(connection_id, request_id, &outcome)
+                .await;
             if let Err(error) = self
                 .agent_manager
-                .start_turn_with_resolved_artifacts_environment_and_reasoning(
+                .start_turn_with_resolved_artifacts_environment_reasoning_and_permission_profile(
                     outcome.started_notification.thread_id.as_str(),
                     outcome.started_notification.turn.id.as_str(),
                     outcome.materialization.thread.mode,
@@ -369,6 +381,7 @@ impl MessageProcessor {
                     runtime_environment,
                     history,
                     effective_reasoning_effort.as_deref(),
+                    permission_profile,
                 )
                 .await
             {
@@ -379,20 +392,7 @@ impl MessageProcessor {
                     format!("failed to dispatch turn to agent runtime: {error}"),
                 )
                 .await;
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to dispatch turn: {error}"),
-                    ),
-                )
-                .await;
-                return;
             }
-
-            self.finish_turn_start_success(connection_id, request_id, &outcome)
-                .await;
         })
     }
 
@@ -589,6 +589,22 @@ impl MessageProcessor {
                     return;
                 }
             };
+            let permission_adapter =
+                crate::cli_runtime::permissions::adapt_cli_runtime_permissions_for_turn(
+                    runtime_kind,
+                    params.permission_profile.as_ref(),
+                    params.cli_runtime_options.take(),
+                );
+            debug!(
+                runtime_id = runtime_id.as_str(),
+                runtime_kind = cli_runtime_protocol_kind_label(runtime_kind),
+                pioneer_permission_mode = permission_adapter.output.profile.mode.as_str(),
+                provider_permission_mode = permission_adapter.output.provider_mode_label.as_str(),
+                mapping_quality = ?permission_adapter.output.mapping_quality,
+                notes = ?permission_adapter.output.notes,
+                "adapted Pioneer turn permission profile for CLI runtime"
+            );
+            params.cli_runtime_options = Some(permission_adapter.options.clone());
             let sandbox_json = match params
                 .cli_runtime_options
                 .as_ref()
@@ -685,14 +701,16 @@ impl MessageProcessor {
                 .await;
                 return;
             }
+            let profile_selected_audit = self.turn_profile_selected_audit_event(&outcome);
             if let Err(error) = message_future(
                 self.crud_store
-                    .materialize_turn_start_with_reasoning_effort(
+                    .materialize_turn_start_with_reasoning_effort_and_permission_audit(
                         &outcome.materialization.thread,
                         outcome.materialization.sandbox_mode,
                         &outcome.materialization.turn,
                         &outcome.materialization.input,
                         effective_cli_runtime_effort.as_deref(),
+                        profile_selected_audit,
                     ),
             )
             .await
@@ -706,7 +724,9 @@ impl MessageProcessor {
                     JsonRpcErrorResponse::new(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
-                        format!("failed to persist CLI runtime turn/start state: {error:#}"),
+                        format!(
+                            "failed to persist CLI runtime turn/start state and permission audit: {error:#}"
+                        ),
                     ),
                 )
                 .await;
@@ -772,6 +792,7 @@ impl MessageProcessor {
                     session_key.clone(),
                     crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
                         cwd: Some(std::path::PathBuf::from(native_cwd.as_str())),
+                        approval_policy: Some(effective_approval_policy.clone()),
                         ..Default::default()
                     },
                 )
@@ -920,79 +941,6 @@ impl MessageProcessor {
                     return;
                 }
             };
-            let native_turn = match cli_session
-                .start_turn(
-                    crate::cli_runtime::manager::CLIAgentRuntimeTurnStartParams {
-                        native_thread_id: native_thread.binding.native_thread_id.clone(),
-                        input: native_turn_input,
-                        cwd: native_thread.binding.native_cwd.clone(),
-                        approval_policy: Some(effective_approval_policy),
-                        sandbox: sandbox_policy_value,
-                        model: Some(outcome.materialization.thread.model.clone()),
-                        effort: effective_cli_runtime_effort,
-                        personality: cli_runtime_personality,
-                        summary: cli_runtime_summary,
-                    },
-                    std::time::Duration::from_millis(runtime_config.request_timeout_ms),
-                )
-                .await
-            {
-                Ok(native_turn) => native_turn,
-                Err(error) => {
-                    self.mark_turn_blocked(
-                        outcome.started_notification.thread_id.clone(),
-                        outcome.started_notification.turn.id.clone(),
-                        format!("failed to start CLI runtime turn: {error:#}"),
-                    )
-                    .await;
-                    self.send_error(
-                        connection_id,
-                        JsonRpcErrorResponse::new(
-                            Some(request_id.clone()),
-                            INVALID_REQUEST_CODE,
-                            format!("failed to start CLI runtime turn: {error:#}"),
-                        ),
-                    )
-                    .await;
-                    return;
-                }
-            };
-            let native_turn_id = native_turn.native_turn_id.clone();
-            if let Err(error) =
-            crate::cli_runtime::turn_binding::persist_cli_runtime_turn_binding_after_native_start(
-                self.crud_store.as_ref(),
-                crate::cli_runtime::turn_binding::CLIAgentRuntimeNativeTurnStarted {
-                    turn_id: outcome.started_notification.turn.id.clone(),
-                    native_turn_id: native_turn_id.clone(),
-                    request_id: None,
-                    started_at: chrono::Utc::now().fixed_offset(),
-                },
-            )
-            .await
-        {
-            self.mark_turn_blocked(
-                outcome.started_notification.thread_id.clone(),
-                outcome.started_notification.turn.id.clone(),
-                format!("failed to persist CLI runtime native turn id: {error:#}"),
-            )
-            .await;
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id.clone()),
-                    INVALID_REQUEST_CODE,
-                    format!("failed to persist CLI runtime native turn id: {error:#}"),
-                ),
-            )
-            .await;
-            return;
-        }
-            self.flush_cli_runtime_events_for_native_turn(
-                &session_key,
-                native_thread.binding.native_thread_id.as_str(),
-                native_turn_id.as_str(),
-            )
-            .await;
             if let Err(error) = self
                 .persist_cli_runtime_prompt_manifest(
                     outcome.started_notification.thread_id.as_str(),
@@ -1020,6 +968,61 @@ impl MessageProcessor {
             }
             self.finish_turn_start_success(connection_id, request_id, &outcome)
                 .await;
+            let native_turn = match cli_session
+                .start_turn(
+                    crate::cli_runtime::manager::CLIAgentRuntimeTurnStartParams {
+                        native_thread_id: native_thread.binding.native_thread_id.clone(),
+                        input: native_turn_input,
+                        cwd: native_thread.binding.native_cwd.clone(),
+                        approval_policy: Some(effective_approval_policy),
+                        sandbox: sandbox_policy_value,
+                        model: Some(outcome.materialization.thread.model.clone()),
+                        effort: effective_cli_runtime_effort,
+                        personality: cli_runtime_personality,
+                        summary: cli_runtime_summary,
+                    },
+                    std::time::Duration::from_millis(runtime_config.request_timeout_ms),
+                )
+                .await
+            {
+                Ok(native_turn) => native_turn,
+                Err(error) => {
+                    self.mark_turn_blocked(
+                        outcome.started_notification.thread_id.clone(),
+                        outcome.started_notification.turn.id.clone(),
+                        format!("failed to start CLI runtime turn: {error:#}"),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let native_turn_id = native_turn.native_turn_id.clone();
+            if let Err(error) =
+            crate::cli_runtime::turn_binding::persist_cli_runtime_turn_binding_after_native_start(
+                self.crud_store.as_ref(),
+                crate::cli_runtime::turn_binding::CLIAgentRuntimeNativeTurnStarted {
+                    turn_id: outcome.started_notification.turn.id.clone(),
+                    native_turn_id: native_turn_id.clone(),
+                    request_id: None,
+                    started_at: chrono::Utc::now().fixed_offset(),
+                },
+            )
+            .await
+        {
+            self.mark_turn_blocked(
+                outcome.started_notification.thread_id.clone(),
+                outcome.started_notification.turn.id.clone(),
+                format!("failed to persist CLI runtime native turn id: {error:#}"),
+            )
+            .await;
+            return;
+        }
+            self.flush_cli_runtime_events_for_native_turn(
+                &session_key,
+                native_thread.binding.native_thread_id.as_str(),
+                native_turn_id.as_str(),
+            )
+            .await;
         })
     }
 
@@ -1206,6 +1209,45 @@ impl MessageProcessor {
         Ok(None)
     }
 
+    pub(super) fn turn_profile_selected_audit_event(
+        &self,
+        outcome: &crate::thread::TurnStartOutcome,
+    ) -> pioneer_protocol::TurnPermissionAuditEvent {
+        self.turn_profile_selected_audit_event_for_turn(
+            outcome.started_notification.workspace_id.as_str(),
+            outcome.started_notification.thread_id.as_str(),
+            outcome.started_notification.turn.id.as_str(),
+            outcome.materialization.turn.permission_profile.clone(),
+        )
+    }
+
+    pub(super) fn turn_profile_selected_audit_event_for_turn(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        permission_profile: Option<pioneer_protocol::TurnPermissionProfileSnapshot>,
+    ) -> pioneer_protocol::TurnPermissionAuditEvent {
+        let permission_profile = permission_profile
+            .unwrap_or_else(pioneer_protocol::default_turn_permission_profile_snapshot);
+        pioneer_protocol::TurnPermissionAuditEvent {
+            workspace_id: workspace_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            event_kind: pioneer_protocol::TurnPermissionAuditEventKind::ProfileSelected,
+            profile_mode: permission_profile.mode,
+            profile_source: permission_profile.source,
+            item_id: None,
+            tool_call_id: None,
+            tool_name: None,
+            action_kind: None,
+            request_key: None,
+            decision: None,
+            reason: None,
+            cached: false,
+        }
+    }
+
     async fn compile_cli_runtime_context_bundle_for_turn(
         &self,
         runtime_id: &str,
@@ -1234,6 +1276,7 @@ impl MessageProcessor {
                 runtime_label: cli_runtime_context_label(runtime_kind),
                 model: Some(outcome.materialization.thread.model.as_str()),
                 cwd: native_cwd.as_deref(),
+                permission_profile: outcome.started_notification.turn.permission_profile.clone(),
                 history: history.as_slice(),
             },
         )

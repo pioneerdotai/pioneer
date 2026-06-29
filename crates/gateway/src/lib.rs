@@ -22,6 +22,7 @@ mod memory_tools;
 mod message;
 mod migrations;
 mod operations;
+mod permissions;
 mod prompt_hooks;
 mod resilience;
 mod secrets;

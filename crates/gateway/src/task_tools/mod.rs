@@ -987,6 +987,7 @@ impl TaskToolHandler {
             input: prompt_input,
             output_instructions,
         };
+        let permission_cap = current_turn_permission_cap(&self.processor, &self.context).await?;
         let agent_spec = (executor_kind == TaskExecutorKind::Agent).then_some(TaskAgentSpecInput {
             agent_role: input.agent_role,
             agent_nickname: input.agent_nickname,
@@ -995,6 +996,7 @@ impl TaskToolHandler {
             prompt,
             context_policy: input.context_policy,
             tool_policy: input.tool_policy,
+            permission_cap: Some(permission_cap),
             result_contract: input.result_contract,
             review_policy: None,
             depth: 0,
@@ -2408,6 +2410,31 @@ async fn current_thread_model_identity(
     Ok((model.to_owned(), model_provider.to_owned()))
 }
 
+async fn current_turn_permission_cap(
+    processor: &Arc<MessageProcessor>,
+    context: &TaskTurnContext,
+) -> Result<pioneer_protocol::TurnPermissionProfileCap, ToolError> {
+    let turn = processor
+        .crud_store
+        .get_turn(context.thread_id.as_str(), context.turn_id.as_str())
+        .await
+        .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
+
+    let Some((_, turn)) = turn else {
+        return Err(ToolError::execution_failed(format!(
+            "turn `{}`/`{}` is missing while resolving task permission cap",
+            context.thread_id, context.turn_id
+        )));
+    };
+
+    let profile = turn
+        .permission_profile
+        .unwrap_or_else(pioneer_protocol::default_turn_permission_profile_snapshot);
+    Ok(pioneer_protocol::task_permission_cap_from_snapshot(
+        &profile,
+    ))
+}
+
 async fn inherited_max_depth(
     processor: &Arc<MessageProcessor>,
     parent_task_id: Option<&str>,
@@ -3110,6 +3137,8 @@ fn review_required_item_output(item: &pioneer_protocol::TaskWaitReviewItem) -> J
         "diagnostics": candidate.diagnostics,
         "childThreadId": item.item.child_thread_id,
         "childTurnId": item.item.child_turn_id,
+        "permissionMode": item.item.permission_profile.as_ref().map(|profile| profile.mode.as_str()),
+        "permissionSource": item.item.permission_profile.as_ref().map(|profile| profile.source.as_str()),
         "maxRevisionRounds": item.max_revision_rounds,
         "remainingRevisionRounds": item.remaining_revision_rounds,
         "allowedActions": allowed_actions,
@@ -3687,6 +3716,7 @@ mod tests {
                     run: Some(sample_run(TaskRunStatus::WaitingReview)),
                     child_thread_id: Some("thread_child12345678".to_owned()),
                     child_turn_id: Some("turn_child123456789".to_owned()),
+                    permission_profile: None,
                 },
                 candidate: sample_review_candidate(candidate_status, 2),
                 review_policy: Some(
@@ -4192,6 +4222,7 @@ mod tests {
             attempt_id: 0,
             idempotency_key: None,
             recovery: ToolRecoveryMetadata::default(),
+            permission_metadata: pioneer_tools::ToolPermissionMetadata::default(),
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
     }

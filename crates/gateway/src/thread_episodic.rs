@@ -4968,6 +4968,7 @@ mod tests {
             origin: TurnOrigin::User,
             error: None,
             prompt_manifest: None,
+            permission_profile: None,
         };
         crud_store
             .materialize_turn_start(

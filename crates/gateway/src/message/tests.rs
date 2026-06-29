@@ -2106,6 +2106,7 @@ fn test_task_create_params(
             },
             context_policy: None,
             tool_policy: None,
+            permission_cap: None,
             result_contract: None,
             review_policy: None,
             depth: 0,
@@ -2650,6 +2651,7 @@ async fn setup_progress_delta_harness(
         origin: Default::default(),
         error: None,
         prompt_manifest: None,
+        permission_profile: None,
     };
     crud_store
         .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
@@ -3022,6 +3024,7 @@ async fn long_russian_first_message_generates_parent_title_successfully() {
         origin: Default::default(),
         error: None,
         prompt_manifest: None,
+        permission_profile: None,
     };
     let long_russian = "Очень длинное русскоязычное сообщение ".repeat(120);
     crud_store
@@ -3099,6 +3102,7 @@ async fn repeated_title_triggers_are_singleflight_per_thread() {
         origin: Default::default(),
         error: None,
         prompt_manifest: None,
+        permission_profile: None,
     };
     crud_store
         .materialize_turn_start(
@@ -3182,6 +3186,7 @@ async fn title_generation_retries_after_transient_failure() {
         origin: Default::default(),
         error: None,
         prompt_manifest: None,
+        permission_profile: None,
     };
     crud_store
         .materialize_turn_start(
@@ -3265,6 +3270,7 @@ async fn child_thread_scope_skips_auto_title_generation() {
         origin: Default::default(),
         error: None,
         prompt_manifest: None,
+        permission_profile: None,
     };
     crud_store
         .materialize_turn_start(&thread, SandboxMode::FullAccess, &seed_turn, &[])
@@ -3463,6 +3469,7 @@ async fn setup_write_file_artifact_registration_gateway(
                 origin: Default::default(),
                 error: None,
                 prompt_manifest: None,
+                permission_profile: None,
             },
             &[],
         )
@@ -3639,6 +3646,7 @@ async fn materialize_artifact_api_thread(
         origin: Default::default(),
         error: None,
         prompt_manifest: None,
+        permission_profile: None,
     };
     crud_store
         .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
@@ -5784,6 +5792,7 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery() {
         origin: Default::default(),
         error: None,
         prompt_manifest: None,
+        permission_profile: None,
     };
     crud_store
         .materialize_turn_start(
@@ -6178,9 +6187,8 @@ async fn task_revise_rpc_rejects_candidate_and_dispatches_same_thread_revision()
             "additionalInstructions": ["Preserve the original task objective."]
         }
     });
-    processor
-        .process_request(connection_id, &request.to_string())
-        .await;
+    let request_payload = request.to_string();
+    message_future(processor.process_request(connection_id, &request_payload)).await;
     let rpc_response = recv_response_by_id(&mut rx, request_id.as_str()).await;
     let revised: TaskReviseResponse =
         serde_json::from_value(rpc_response.result).expect("task/revise response should decode");
@@ -7562,6 +7570,7 @@ async fn blocked_execution_window_recovery_blocks_child_task_run_without_failure
             task_id: response.task.id.clone(),
             execution_id: Some(execution.id.clone()),
             worker_id: "task-window-block-recovery".to_owned(),
+            permission_profile: None,
         },
         current_run,
         handle,
@@ -8017,6 +8026,7 @@ async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn() {
         origin: Default::default(),
         error: None,
         prompt_manifest: None,
+        permission_profile: None,
     };
     crud_store
         .materialize_turn_start(
@@ -8697,7 +8707,7 @@ async fn task_create_tool_persists_anchor_and_rejects_legacy_timeline_impl() {
     ));
     processor.start_resilience_workers().await;
 
-    start_thread_and_turn(
+    start_thread_and_turn_with_permission_profile(
         &processor,
         connection_id,
         &mut rx,
@@ -8706,6 +8716,7 @@ async fn task_create_tool_persists_anchor_and_rejects_legacy_timeline_impl() {
         "turn_task_tool_anchor",
         "Agent",
         "parent",
+        Some(json!({ "mode": "full_access" })),
     )
     .await;
     let _ = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
@@ -8760,6 +8771,21 @@ async fn task_create_tool_persists_anchor_and_rejects_legacy_timeline_impl() {
         .await
         .expect("task_get should succeed")
         .expect("task should exist");
+    let permission_cap = task_response
+        .agent_specs
+        .first()
+        .and_then(|spec| spec.permission_cap.as_ref())
+        .expect("task_create tool should persist the creating turn permission cap");
+    assert_eq!(
+        permission_cap.mode,
+        pioneer_protocol::TurnPermissionMode::FullAccess
+    );
+    assert_eq!(
+        permission_cap.effective_policy,
+        pioneer_protocol::ToolPermissionPolicySnapshot::all(
+            pioneer_protocol::PermissionBehavior::Allow
+        )
+    );
     let lineage = task_response.thread_lineage;
     assert!(
         !lineage.is_empty(),
@@ -8922,6 +8948,7 @@ async fn task_delivery_worker_uses_lineage_parent_turn_for_owner_thread() {
         origin: TurnOrigin::ScheduledTask,
         error: None,
         prompt_manifest: None,
+        permission_profile: None,
     };
     processor
         .crud_store
@@ -9572,20 +9599,8 @@ async fn thread_start_returns_response_and_started_notification() {
         .process_request(connection_id, &request.to_string())
         .await;
 
-    let response = rx.recv().await.expect("expected thread/start response");
-    let notification = rx
-        .recv()
-        .await
-        .expect("expected thread/started notification");
-
-    assert!(matches!(notification, Message::Text(_)));
-
-    let response_payload = match response {
-        Message::Text(payload) => payload.to_string(),
-        other => panic!("expected text response, got {other:?}"),
-    };
-    let rpc_response: JsonRpcResponse =
-        serde_json::from_str(&response_payload).expect("response should decode");
+    let rpc_response = recv_response_by_id(&mut rx, "aaaaaaaaaaaaaaaaaaaaa").await;
+    let _notification = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
     let thread_response: ThreadStartResponse = serde_json::from_value(rpc_response.result)
         .expect("thread/start response payload should decode");
     assert!(!thread_response.thread.workspace_id.is_empty());
@@ -9625,11 +9640,8 @@ async fn thread_started_notification_is_not_broadcast_to_foreign_connections() {
         .process_request(connection_a, &request.to_string())
         .await;
 
-    let _response = rx_a.recv().await.expect("expected thread/start response");
-    let _notification = rx_a
-        .recv()
-        .await
-        .expect("expected thread/started notification");
+    let _response = recv_response_by_id(&mut rx_a, "aaaaaaaaaaaaaaaaaaaaa").await;
+    let _notification = recv_notification_by_method(&mut rx_a, events::THREAD_STARTED).await;
 
     let foreign_message = timeout(Duration::from_millis(150), rx_b.recv()).await;
     assert!(
@@ -9744,18 +9756,12 @@ async fn connection_closed_removes_empty_thread_started_by_connection() {
         .process_request(connection_id, &request.to_string())
         .await;
 
-    let response = rx.recv().await.expect("expected thread/start response");
-    let response_payload = match response {
-        Message::Text(payload) => payload.to_string(),
-        other => panic!("expected text response, got {other:?}"),
-    };
-    let rpc_response: JsonRpcResponse =
-        serde_json::from_str(&response_payload).expect("response should decode");
+    let rpc_response = recv_response_by_id(&mut rx, "aaaaaaaaaaaaaaaaaaaaa").await;
     let thread_response: ThreadStartResponse = serde_json::from_value(rpc_response.result)
         .expect("thread/start response payload should decode");
     let thread_id = thread_response.thread.id;
 
-    let _started_notification = rx.recv().await.expect("expected started notification");
+    let _started_notification = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
 
     assert!(
         thread_manager.has_thread(&thread_id).await,
@@ -10006,6 +10012,7 @@ async fn direct_durable_item_completed_persists_before_committed_notification() 
                 origin: Default::default(),
                 error: None,
                 prompt_manifest: None,
+                permission_profile: None,
             },
             &[],
         )
@@ -10129,6 +10136,7 @@ async fn user_message_lifecycle_ingests_thread_episodic_source_after_commit() {
                 origin: Default::default(),
                 error: None,
                 prompt_manifest: None,
+                permission_profile: None,
             },
             &[],
         )
@@ -10179,6 +10187,163 @@ async fn user_message_lifecycle_ingests_thread_episodic_source_after_commit() {
         call.source_context,
         pioneer_protocol::ThreadEpisodicSourceContext::UserVisibleThreadItem
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_start_persists_profile_selected_audit_with_default_full_access() {
+    let (tx, mut rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = Arc::new(MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    ));
+
+    let thread_id = "thr_default_permission_profile_audit";
+    let turn_id = "turn_default_permission_profile_audit";
+    start_thread_and_turn(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+        "Agent",
+        "openai",
+    )
+    .await;
+
+    let turn_items = crud_store
+        .get_turn_item_events(thread_id, turn_id)
+        .await
+        .expect("turn item events should load")
+        .expect("turn item events should exist");
+    let audit = turn_items
+        .events
+        .iter()
+        .find_map(|event| match &event.payload {
+            TurnItemEventPayload::TurnPermissionAudit(audit)
+                if audit.event_kind
+                    == pioneer_protocol::TurnPermissionAuditEventKind::ProfileSelected =>
+            {
+                Some(audit)
+            }
+            _ => None,
+        })
+        .expect("turn/start should persist profile selected audit");
+    assert_eq!(
+        audit.profile_mode,
+        pioneer_protocol::TurnPermissionMode::FullAccess
+    );
+    assert_eq!(
+        audit.profile_source,
+        pioneer_protocol::TurnPermissionProfileSource::Defaulted
+    );
+    assert!(audit.request_key.is_none());
+    assert!(audit.decision.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_message_lifecycle_survives_permission_profile_audit_event() {
+    let session_manager = Arc::new(SessionManager::new());
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let agent_manager = Arc::new(AgentManager::new(test_provider(), test_tool_loop_config()));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = MessageProcessor::with_agent_manager(
+        thread_manager.clone(),
+        agent_manager,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+    );
+    let ingestor = Arc::new(RecordingThreadEpisodicIngestor::default());
+    processor
+        .set_thread_episodic_ingestor_for_test(ingestor.clone())
+        .await;
+
+    let thread_id = "thr_permission_profile_user_message_lifecycle";
+    let turn_id = "turn_permission_profile_user_message_lifecycle";
+    let thread = Thread {
+        workspace_id: workspace_id.clone(),
+        id: thread_id.to_owned(),
+        name: None,
+        preview: String::new(),
+        mode: ThreadMode::Agent,
+        model: "o4-mini".to_owned(),
+        model_provider: "openai".to_owned(),
+        reasoning_effort: None,
+        created_at: 1,
+        updated_at: 1,
+        status: ThreadStatus::Active,
+        origin_kind: ThreadOriginKind::User,
+        sidebar_visibility: ThreadSidebarVisibility::Visible,
+        agent_nickname: None,
+        agent_role: None,
+        turns: Vec::new(),
+    };
+    crud_store
+        .materialize_turn_start(
+            &thread,
+            SandboxMode::FullAccess,
+            &Turn {
+                id: turn_id.to_owned(),
+                status: TurnStatus::InProgress,
+                turn_kind: Default::default(),
+                origin: Default::default(),
+                error: None,
+                prompt_manifest: None,
+                permission_profile: Some(
+                    pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+                        pioneer_protocol::TurnPermissionMode::FullAccess,
+                        pioneer_protocol::TurnPermissionProfileSource::Composer,
+                    ),
+                ),
+            },
+            &[],
+        )
+        .await
+        .expect("turn start should persist");
+
+    processor
+        .emit_user_message_item_lifecycle(
+            workspace_id.as_str(),
+            thread_id,
+            turn_id,
+            &[UserInput::Text {
+                text: "permission profile lifecycle smoke".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            &[],
+        )
+        .await;
+
+    let item_events = crud_store
+        .get_turn_item_events(thread_id, turn_id)
+        .await
+        .expect("turn item events should be readable")
+        .expect("turn item events should exist");
+    assert!(
+        item_events.events.iter().any(|event| matches!(
+            &event.payload,
+            TurnItemEventPayload::ItemCompleted {
+                item: TurnItem::UserMessage { text, .. },
+                ..
+            } if text == "permission profile lifecycle smoke"
+        )),
+        "user message must still be committed after profile audit event"
+    );
+
+    let calls = ingestor.calls.lock().await;
+    assert_eq!(calls.len(), 1);
 }
 
 #[test]
@@ -10259,6 +10424,7 @@ async fn direct_durable_item_completed_ingestion_failure_does_not_block_commit()
                 origin: Default::default(),
                 error: None,
                 prompt_manifest: None,
+                permission_profile: None,
             },
             &[],
         )
@@ -10570,6 +10736,7 @@ async fn direct_durable_execution_window_lifecycle_updates_rows() {
             mode: None,
             execution_backend: None,
             reasoning: None,
+            permission_profile: None,
             cli_runtime_options: None,
         })
         .await
@@ -10586,6 +10753,7 @@ async fn direct_durable_execution_window_lifecycle_updates_rows() {
                 origin: Default::default(),
                 error: None,
                 prompt_manifest: None,
+                permission_profile: None,
             },
             &[],
         )
@@ -10959,18 +11127,8 @@ async fn direct_durable_execution_window_lifecycle_updates_rows() {
         "total budget exhausted"
     );
 
-    let blocked_live_payload = recv_text_timeout_context(
-        &mut rx,
-        Duration::from_secs(2),
-        "turn/execution_window/blocked live notification",
-    )
-    .await;
-    let blocked_live_rpc: JsonRpcNotification =
-        serde_json::from_str(&blocked_live_payload).expect("blocked notification should decode");
-    assert_eq!(
-        blocked_live_rpc.method,
-        events::TURN_EXECUTION_WINDOW_BLOCKED
-    );
+    let blocked_live_rpc =
+        recv_notification_by_method(&mut rx, events::TURN_EXECUTION_WINDOW_BLOCKED).await;
     let blocked_live_params = blocked_live_rpc
         .params
         .expect("blocked notification should include params");
@@ -11149,6 +11307,7 @@ async fn setup_execution_window_terminal_turn(
             mode: None,
             execution_backend: None,
             reasoning: None,
+            permission_profile: None,
             cli_runtime_options: None,
         })
         .await
@@ -11164,6 +11323,7 @@ async fn setup_execution_window_terminal_turn(
                 origin: Default::default(),
                 error: None,
                 prompt_manifest: None,
+                permission_profile: None,
             },
             &[],
         )
@@ -11594,11 +11754,9 @@ async fn connection_closed_keeps_active_turn_running_without_subscribers() {
         .process_request(connection_id, &thread_start_request.to_string())
         .await;
 
-    let _thread_start_response = rx.recv().await.expect("expected thread/start response");
-    let _thread_started_notification = rx
-        .recv()
-        .await
-        .expect("expected thread/started notification");
+    let _thread_start_response = recv_response_by_id(&mut rx, "aaaaaaaaaaaaaaaaaaaaa").await;
+    let _thread_started_notification =
+        recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
 
     let turn_start_request = json!({
         "jsonrpc": "2.0",
@@ -11619,8 +11777,9 @@ async fn connection_closed_keeps_active_turn_running_without_subscribers() {
         .process_request(connection_id, &turn_start_request.to_string())
         .await;
 
-    let _turn_start_response = rx.recv().await.expect("expected turn/start response");
-    let _turn_started_notification = rx.recv().await.expect("expected turn/started notification");
+    let _turn_start_response = recv_response_by_id(&mut rx, "bbbbbbbbbbbbbbbbbbbbb").await;
+    let _turn_started_notification =
+        recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
 
     processor.connection_closed(connection_id).await;
 
@@ -11666,18 +11825,12 @@ async fn thread_unsubscribe_returns_status_and_closed_notification() {
         .process_request(connection_id, &start_request.to_string())
         .await;
 
-    let start_response = rx.recv().await.expect("expected thread/start response");
-    let start_response_payload = match start_response {
-        Message::Text(payload) => payload.to_string(),
-        other => panic!("expected text response, got {other:?}"),
-    };
-    let start_rpc_response: JsonRpcResponse =
-        serde_json::from_str(&start_response_payload).expect("response should decode");
+    let start_rpc_response = recv_response_by_id(&mut rx, "aaaaaaaaaaaaaaaaaaaaa").await;
     let thread_response: ThreadStartResponse = serde_json::from_value(start_rpc_response.result)
         .expect("thread/start response payload should decode");
     let thread_id = thread_response.thread.id;
     let workspace_id = thread_response.thread.workspace_id;
-    let _started_notification = rx.recv().await.expect("expected started notification");
+    let _started_notification = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
 
     let unsubscribe_request = json!({
         "jsonrpc": "2.0",
@@ -12340,20 +12493,12 @@ async fn turn_start_returns_response_and_started_notification() {
         .process_request(connection_id, &thread_start_request.to_string())
         .await;
 
-    let thread_start_response = rx.recv().await.expect("expected thread/start response");
-    let thread_start_response_payload = match thread_start_response {
-        Message::Text(payload) => payload.to_string(),
-        other => panic!("expected text response, got {other:?}"),
-    };
-    let thread_start_rpc_response: JsonRpcResponse =
-        serde_json::from_str(&thread_start_response_payload).expect("response should decode");
+    let thread_start_rpc_response = recv_response_by_id(&mut rx, "aaaaaaaaaaaaaaaaaaaaa").await;
     let thread_response: ThreadStartResponse =
         serde_json::from_value(thread_start_rpc_response.result)
             .expect("thread/start response payload should decode");
-    let _thread_started_notification = rx
-        .recv()
-        .await
-        .expect("expected thread/started notification");
+    let _thread_started_notification =
+        recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
 
     let turn_start_request = json!({
         "jsonrpc": "2.0",
@@ -12374,28 +12519,14 @@ async fn turn_start_returns_response_and_started_notification() {
         .process_request(connection_id, &turn_start_request.to_string())
         .await;
 
-    let turn_response = rx.recv().await.expect("expected turn/start response");
-    let turn_started_notification = rx.recv().await.expect("expected turn/started notification");
-
-    let turn_response_payload = match turn_response {
-        Message::Text(payload) => payload.to_string(),
-        other => panic!("expected text response, got {other:?}"),
-    };
-    let turn_rpc_response: JsonRpcResponse =
-        serde_json::from_str(&turn_response_payload).expect("response should decode");
+    let turn_rpc_response = recv_response_by_id(&mut rx, "bbbbbbbbbbbbbbbbbbbbb").await;
+    let notification = recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
     let turn_result: TurnStartResponse = serde_json::from_value(turn_rpc_response.result)
         .expect("turn/start response payload should decode");
     assert_eq!(
         turn_result.turn.status,
         pioneer_protocol::TurnStatus::InProgress
     );
-
-    let turn_notification_payload = match turn_started_notification {
-        Message::Text(payload) => payload.to_string(),
-        other => panic!("expected text notification, got {other:?}"),
-    };
-    let notification: JsonRpcNotification =
-        serde_json::from_str(&turn_notification_payload).expect("notification should decode");
     assert_eq!(notification.method, "turn/started");
 }
 
@@ -13048,6 +13179,7 @@ async fn codex_thread_ops_name_sync_failure_does_not_break_pioneer_rename() {
         origin: Default::default(),
         error: None,
         prompt_manifest: None,
+        permission_profile: None,
     };
     crud_store
         .materialize_turn_start(&started.thread, SandboxMode::FullAccess, &turn, &[])
@@ -13463,6 +13595,7 @@ async fn cli_runtime_turn_start_blocker_reconciles_db_only_terminal_binding() {
                     origin: TurnOrigin::User,
                     error: None,
                     prompt_manifest: None,
+                    permission_profile: None,
                 },
             },
             chrono::Utc::now().timestamp(),
@@ -13879,6 +14012,7 @@ async fn cli_runtime_stale_db_only_running_binding_marks_turn_failed() {
         origin: TurnOrigin::User,
         error: None,
         prompt_manifest: None,
+        permission_profile: None,
     };
     crud_store
         .materialize_turn_start(
@@ -13995,6 +14129,7 @@ async fn cli_runtime_stale_scan_reconciles_db_only_terminal_binding() {
                     origin: TurnOrigin::User,
                     error: None,
                     prompt_manifest: None,
+                    permission_profile: None,
                 },
             },
             chrono::Utc::now().timestamp(),
@@ -14626,6 +14761,183 @@ async fn cli_runtime_native_request_resolved_cancels_matching_pending_request() 
             .response_json
             .as_deref()
             .is_some_and(|payload| payload.contains("cancelled"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_permission_request_respond_resolves_native_pending_request_and_broadcasts_notifications()
+ {
+    let (tx, mut rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+    let (respond_tx, respond_rx) = tokio::sync::oneshot::channel();
+
+    processor
+        .open_native_permission_request(crate::permissions::GatewayPermissionApprovalRequest {
+            request_id: "perm-approval-request-1".to_owned(),
+            workspace_id: Some(workspace_id.clone()),
+            thread_id: Some("thread_native_permission".to_owned()),
+            turn_id: Some("turn_native_permission".to_owned()),
+            tool_name: "exec_command".to_owned(),
+            key: pioneer_tools::PermissionRequestKey {
+                profile_mode: pioneer_protocol::TurnPermissionMode::Supervised,
+                tool_name: "exec_command".to_owned(),
+                action: pioneer_tools::PermissionActionKind::ShellCommand,
+                normalized_scope_hash: "scope-hash-1".to_owned(),
+                turn_id: "turn_native_permission".to_owned(),
+            },
+            reason: pioneer_tools::PermissionDecisionReason::PolicyRequiresApproval,
+            summary: Some("run shell command".to_owned()),
+            details: Vec::new(),
+            respond_to: respond_tx,
+        })
+        .await;
+
+    let opened = recv_notification_by_method(&mut rx, events::TURN_PERMISSION_REQUEST_OPENED).await;
+    assert_eq!(opened.method, events::TURN_PERMISSION_REQUEST_OPENED);
+    let opened_params = opened.params.as_ref().expect("opened params");
+    assert_eq!(
+        opened_params["request"]["request_id"],
+        serde_json::json!("perm-approval-request-1")
+    );
+    assert_eq!(
+        opened_params["request"]["action"],
+        serde_json::json!("shell_command")
+    );
+
+    let respond_payload = json!({
+        "jsonrpc": "2.0",
+        "id": "permissionrespond0001",
+        "method": pioneer_protocol::constants::methods::TURN_PERMISSION_REQUEST_RESPOND,
+        "params": {
+            "request_id": "perm-approval-request-1",
+            "resolution": "allow_for_turn"
+        }
+    })
+    .to_string();
+    message_future(processor.process_request(connection_id, &respond_payload)).await;
+
+    let (response, resolved) = recv_response_and_notification_by_id_method(
+        &mut rx,
+        "permissionrespond0001",
+        events::TURN_PERMISSION_REQUEST_RESOLVED,
+    )
+    .await;
+    assert_eq!(
+        response.result["resolution"],
+        serde_json::json!("allow_for_turn")
+    );
+    let resolved_params = resolved.params.as_ref().expect("resolved params");
+    assert_eq!(
+        resolved_params["request_id"],
+        serde_json::json!("perm-approval-request-1")
+    );
+    assert_eq!(
+        resolved_params["resolution"],
+        serde_json::json!("allow_for_turn")
+    );
+
+    let resolution = respond_rx
+        .await
+        .expect("native permission broker should receive response");
+    assert_eq!(
+        resolution,
+        pioneer_tools::PermissionApprovalResolution::AllowForTurn
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_permission_request_cancellation_resolves_and_removes_pending_request() {
+    let (tx, mut rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+    let (respond_tx, respond_rx) = tokio::sync::oneshot::channel();
+
+    processor
+        .open_native_permission_request(crate::permissions::GatewayPermissionApprovalRequest {
+            request_id: "perm-approval-cancelled-1".to_owned(),
+            workspace_id: Some(workspace_id.clone()),
+            thread_id: Some("thread_native_permission_cancelled".to_owned()),
+            turn_id: Some("turn_native_permission_cancelled".to_owned()),
+            tool_name: "exec_command".to_owned(),
+            key: pioneer_tools::PermissionRequestKey {
+                profile_mode: pioneer_protocol::TurnPermissionMode::Supervised,
+                tool_name: "exec_command".to_owned(),
+                action: pioneer_tools::PermissionActionKind::ShellCommand,
+                normalized_scope_hash: "scope-hash-cancelled".to_owned(),
+                turn_id: "turn_native_permission_cancelled".to_owned(),
+            },
+            reason: pioneer_tools::PermissionDecisionReason::PolicyRequiresApproval,
+            summary: Some("run shell command".to_owned()),
+            details: Vec::new(),
+            respond_to: respond_tx,
+        })
+        .await;
+
+    let opened = recv_notification_by_method(&mut rx, events::TURN_PERMISSION_REQUEST_OPENED).await;
+    assert_eq!(opened.method, events::TURN_PERMISSION_REQUEST_OPENED);
+
+    processor
+        .cancel_native_permission_request("perm-approval-cancelled-1")
+        .await;
+
+    let resolved =
+        recv_notification_by_method(&mut rx, events::TURN_PERMISSION_REQUEST_RESOLVED).await;
+    let resolved_params = resolved.params.as_ref().expect("resolved params");
+    assert_eq!(
+        resolved_params["request_id"],
+        serde_json::json!("perm-approval-cancelled-1")
+    );
+    assert_eq!(
+        resolved_params["resolution"],
+        serde_json::json!("cancelled")
+    );
+
+    let resolution = respond_rx
+        .await
+        .expect("native permission broker should receive cancellation");
+    assert_eq!(
+        resolution,
+        pioneer_tools::PermissionApprovalResolution::Cancelled
+    );
+    assert!(
+        !processor
+            .native_permission_pending_requests
+            .lock()
+            .await
+            .contains_key("perm-approval-cancelled-1")
     );
 }
 
@@ -15487,6 +15799,7 @@ async fn cli_runtime_human_wait_without_turn_binding_does_not_defer_timeout() {
         origin: TurnOrigin::User,
         error: None,
         prompt_manifest: None,
+        permission_profile: None,
     };
     crud_store
         .materialize_turn_start(
@@ -15980,6 +16293,7 @@ async fn seed_cli_runtime_approval_turn(
         origin: TurnOrigin::User,
         error: None,
         prompt_manifest: None,
+        permission_profile: None,
     };
     crud_store
         .materialize_turn_start(
@@ -16200,20 +16514,12 @@ async fn turn_start_succeeds_when_skill_roots_are_missing() {
         .process_request(connection_id, &thread_start_request.to_string())
         .await;
 
-    let thread_start_response = rx.recv().await.expect("expected thread/start response");
-    let thread_start_response_payload = match thread_start_response {
-        Message::Text(payload) => payload.to_string(),
-        other => panic!("expected text response, got {other:?}"),
-    };
-    let thread_start_rpc_response: JsonRpcResponse =
-        serde_json::from_str(&thread_start_response_payload).expect("response should decode");
+    let thread_start_rpc_response = recv_response_by_id(&mut rx, "aaaaaaaaaaaaaaaaaaaaa").await;
     let thread_response: ThreadStartResponse =
         serde_json::from_value(thread_start_rpc_response.result)
             .expect("thread/start response payload should decode");
-    let _thread_started_notification = rx
-        .recv()
-        .await
-        .expect("expected thread/started notification");
+    let _thread_started_notification =
+        recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
 
     let turn_start_request = json!({
         "jsonrpc": "2.0",
@@ -16234,15 +16540,9 @@ async fn turn_start_succeeds_when_skill_roots_are_missing() {
         .process_request(connection_id, &turn_start_request.to_string())
         .await;
 
-    let turn_response = rx.recv().await.expect("expected turn/start response");
-    let _turn_started_notification = rx.recv().await.expect("expected turn/started notification");
-
-    let turn_response_payload = match turn_response {
-        Message::Text(payload) => payload.to_string(),
-        other => panic!("expected text response, got {other:?}"),
-    };
-    let turn_rpc_response: JsonRpcResponse =
-        serde_json::from_str(&turn_response_payload).expect("response should decode");
+    let turn_rpc_response = recv_response_by_id(&mut rx, "bbbbbbbbbbbbbbbbbbbbb").await;
+    let _turn_started_notification =
+        recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
     let turn_result: TurnStartResponse = serde_json::from_value(turn_rpc_response.result)
         .expect("turn/start response payload should decode");
     assert_eq!(turn_result.turn.status, TurnStatus::InProgress);
@@ -16915,20 +17215,12 @@ async fn turn_start_materializes_thread_and_turn_state() {
         .process_request(connection_id, &thread_start_request.to_string())
         .await;
 
-    let thread_start_response = rx.recv().await.expect("expected thread/start response");
-    let thread_start_response_payload = match thread_start_response {
-        Message::Text(payload) => payload.to_string(),
-        other => panic!("expected text response, got {other:?}"),
-    };
-    let thread_start_rpc_response: JsonRpcResponse =
-        serde_json::from_str(&thread_start_response_payload).expect("response should decode");
+    let thread_start_rpc_response = recv_response_by_id(&mut rx, "aaaaaaaaaaaaaaaaaaaaa").await;
     let thread_response: ThreadStartResponse =
         serde_json::from_value(thread_start_rpc_response.result)
             .expect("thread/start response payload should decode");
-    let _thread_started_notification = rx
-        .recv()
-        .await
-        .expect("expected thread/started notification");
+    let _thread_started_notification =
+        recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
 
     let turn_start_request = json!({
         "jsonrpc": "2.0",
@@ -16949,15 +17241,9 @@ async fn turn_start_materializes_thread_and_turn_state() {
         .process_request(connection_id, &turn_start_request.to_string())
         .await;
 
-    let turn_response = rx.recv().await.expect("expected turn/start response");
-    let _turn_started_notification = rx.recv().await.expect("expected turn/started notification");
-
-    let turn_response_payload = match turn_response {
-        Message::Text(payload) => payload.to_string(),
-        other => panic!("expected text response, got {other:?}"),
-    };
-    let turn_rpc_response: JsonRpcResponse =
-        serde_json::from_str(&turn_response_payload).expect("response should decode");
+    let turn_rpc_response = recv_response_by_id(&mut rx, "bbbbbbbbbbbbbbbbbbbbb").await;
+    let _turn_started_notification =
+        recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
     let turn_result: TurnStartResponse = serde_json::from_value(turn_rpc_response.result)
         .expect("turn/start response payload should decode");
 
@@ -19749,6 +20035,7 @@ async fn setup_live_semantic_timeline_harness(case_id: &str) -> LiveSemanticTime
             mode: None,
             execution_backend: None,
             reasoning: None,
+            permission_profile: None,
             cli_runtime_options: None,
         })
         .await
@@ -19765,6 +20052,7 @@ async fn setup_live_semantic_timeline_harness(case_id: &str) -> LiveSemanticTime
                 origin: Default::default(),
                 error: None,
                 prompt_manifest: None,
+                permission_profile: None,
             },
             &[UserInput::Text {
                 text: format!("semantic live {case_id} input"),
@@ -20676,6 +20964,7 @@ fn semantic_fixture_turn(turn_id: &str, status: TurnStatus) -> Turn {
         origin: Default::default(),
         error: None,
         prompt_manifest: None,
+        permission_profile: None,
     }
 }
 
@@ -20743,6 +21032,7 @@ async fn recovery_lifecycle_notification_is_persisted_for_history_replay() {
         origin: Default::default(),
         error: None,
         prompt_manifest: None,
+        permission_profile: None,
     };
     crud_store
         .materialize_turn_start(
@@ -26715,6 +27005,7 @@ fn phase_13_turn(turn_id: &str, status: TurnStatus) -> Turn {
         origin: Default::default(),
         error: None,
         prompt_manifest: None,
+        permission_profile: None,
     }
 }
 
@@ -28469,6 +28760,7 @@ async fn memory_provider_recall_calls_memory_service() {
                 origin: Default::default(),
                 error: None,
                 prompt_manifest: None,
+                permission_profile: None,
             },
             &[],
         )
@@ -29179,6 +29471,31 @@ async fn start_thread_and_turn(
     mode: &str,
     model_provider: &str,
 ) {
+    start_thread_and_turn_with_permission_profile(
+        processor,
+        connection_id,
+        rx,
+        workspace_id,
+        thread_id,
+        turn_id,
+        mode,
+        model_provider,
+        None,
+    )
+    .await;
+}
+
+async fn start_thread_and_turn_with_permission_profile(
+    processor: &Arc<MessageProcessor>,
+    connection_id: u64,
+    rx: &mut mpsc::Receiver<Message>,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    mode: &str,
+    model_provider: &str,
+    permission_profile: Option<serde_json::Value>,
+) {
     let thread_request_id = "req_thread_start_0001";
     let thread_start_request = json!({
         "jsonrpc": "2.0",
@@ -29199,7 +29516,7 @@ async fn start_thread_and_turn(
     let _ = recv_notification_by_method(rx, events::THREAD_STARTED).await;
 
     let turn_request_id = "req_turn_start_000001";
-    let turn_start_request = json!({
+    let mut turn_start_request = json!({
         "jsonrpc": "2.0",
         "id": turn_request_id,
         "method": "turn/start",
@@ -29217,6 +29534,9 @@ async fn start_thread_and_turn(
             ]
         }
     });
+    if let Some(permission_profile) = permission_profile {
+        turn_start_request["params"]["permission_profile"] = permission_profile;
+    }
     processor
         .process_request(connection_id, &turn_start_request.to_string())
         .await;

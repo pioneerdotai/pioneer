@@ -5,17 +5,20 @@ use async_trait::async_trait;
 use pioneer_agent::{AgentTurnHookRuntimeContext, ExecutionCheckpointContext};
 use pioneer_promt::{TaskRevisionPromptInput, TaskRunPromptCompiler, TaskRunPromptInput};
 use pioneer_protocol::{
-    ExecutionCheckpointPayload, ItemCompletedNotification, ItemStartedNotification, SandboxMode,
-    Task, TaskAgentContext, TaskAgentContextMode, TaskAgentInput, TaskAgentResultContract,
-    TaskAgentResultFormat, TaskAgentReviewPolicy, TaskAgentSpec, TaskAttachmentMode, TaskError,
-    TaskErrorClass, TaskExecutorKind, TaskGetResponse, TaskResult, TaskResultCandidate,
-    TaskResultCandidateStatus, TaskResultReviewDecision, TaskResultReviewEvent,
-    TaskResultReviewEventKind, TaskResultReviewerKind, TaskResultReviewerSpec, TaskReviseResponse,
-    TaskRun, TaskRunExecution, TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding,
-    TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskThreadLineage,
-    TaskTrigger, TaskTriggerKind, TaskValue, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility,
-    ThreadStatus, Turn, TurnBlockedNotification, TurnCompletedNotification, TurnFailedNotification,
-    TurnKind, TurnOrigin, TurnStartParams, TurnStartedNotification, TurnStatus, UserInput,
+    ExecutionCheckpointPayload, ItemCompletedNotification, ItemStartedNotification,
+    PermissionBehavior, SandboxMode, Task, TaskAgentContext, TaskAgentContextMode, TaskAgentInput,
+    TaskAgentResultContract, TaskAgentResultFormat, TaskAgentReviewPolicy, TaskAgentSpec,
+    TaskAgentToolPolicy, TaskAgentWriteMode, TaskAttachmentMode, TaskError, TaskErrorClass,
+    TaskExecutorKind, TaskGetResponse, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
+    TaskResultReviewDecision, TaskResultReviewEvent, TaskResultReviewEventKind,
+    TaskResultReviewerKind, TaskResultReviewerSpec, TaskReviseResponse, TaskRun, TaskRunExecution,
+    TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind,
+    TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskThreadLineage, TaskTrigger,
+    TaskTriggerKind, TaskValue, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility,
+    ThreadStatus, ToolPermissionPolicySnapshot, Turn, TurnBlockedNotification,
+    TurnCompletedNotification, TurnFailedNotification, TurnKind, TurnOrigin,
+    TurnPermissionProfileSnapshot, TurnPermissionProfileSource, TurnStartParams,
+    TurnStartedNotification, TurnStatus, UserInput,
 };
 use pioneer_tasks::{
     CreateTaskResultReviewerContextParams, RecordTaskResultReviewEventParams,
@@ -89,6 +92,7 @@ impl TaskAgentExecutor {
             return self
                 .recover_existing_child_turn(
                     &processor,
+                    &context,
                     &task_response,
                     &run,
                     &agent_spec,
@@ -107,8 +111,18 @@ impl TaskAgentExecutor {
             TaskExecutorStartOutcome::Started => {}
             outcome => return Ok(outcome),
         }
-        let parent =
-            ensure_task_run_occurrence_context(&processor, &task_response, &run, parent).await?;
+        let occurrence_permission_profile = effective_task_child_permission_profile(
+            &agent_spec,
+            context.permission_profile.as_ref(),
+        );
+        let parent = ensure_task_run_occurrence_context(
+            &processor,
+            &task_response,
+            &run,
+            parent,
+            &occurrence_permission_profile,
+        )
+        .await?;
         self.start_new_child_turn(
             &processor,
             &context,
@@ -225,6 +239,10 @@ impl TaskAgentExecutor {
         let child_thread_id = child_runtime.task_run_turn.thread_id.clone();
         let child_turn_id = child_runtime.task_run_turn.turn_id.clone();
         let effective_model = effective_agent_model(agent_spec)?;
+        let child_permission_profile = effective_task_child_permission_profile(
+            agent_spec,
+            context.permission_profile.as_ref(),
+        );
         let thread_params = pioneer_protocol::ThreadStartParams {
             thread_id: child_thread_id.clone(),
             workspace_id: context.workspace_id.clone(),
@@ -244,25 +262,36 @@ impl TaskAgentExecutor {
             .await
             .context("failed to create hidden task thread")?;
 
-        let prompt =
-            materialize_child_task_prompt(processor, task_response, run, agent_spec, parent, None)
-                .await?;
+        let prompt = materialize_child_task_prompt(
+            processor,
+            task_response,
+            run,
+            agent_spec,
+            parent,
+            None,
+            &child_permission_profile,
+        )
+        .await?;
         let child_input = materialize_child_task_input(prompt, agent_spec);
         let turn_outcome = processor
             .thread_manager
-            .system_turn_start(TurnStartParams {
-                thread_id: child_thread_id.clone(),
-                turn_id: child_turn_id.clone(),
-                input: child_input,
-                capabilities: Vec::new(),
-                model: Some(effective_model.model),
-                model_provider: Some(effective_model.model_provider),
-                sandbox_policy: None,
-                mode: Some(ThreadMode::Agent),
-                execution_backend: None,
-                reasoning: None,
-                cli_runtime_options: None,
-            })
+            .system_turn_start_with_permission_profile(
+                TurnStartParams {
+                    thread_id: child_thread_id.clone(),
+                    turn_id: child_turn_id.clone(),
+                    input: child_input,
+                    capabilities: Vec::new(),
+                    model: Some(effective_model.model),
+                    model_provider: Some(effective_model.model_provider),
+                    sandbox_policy: None,
+                    mode: Some(ThreadMode::Agent),
+                    execution_backend: None,
+                    reasoning: None,
+                    permission_profile: None,
+                    cli_runtime_options: None,
+                },
+                child_permission_profile,
+            )
             .await
             .context("failed to create hidden task turn")?;
 
@@ -280,15 +309,25 @@ impl TaskAgentExecutor {
             return Err(error).context("failed to validate hidden task artifact input");
         }
 
-        if let Err(error) = processor
-            .crud_store
-            .materialize_turn_start(
-                &turn_outcome.materialization.thread,
-                turn_outcome.materialization.sandbox_mode,
-                &turn_outcome.materialization.turn,
-                &turn_outcome.materialization.input,
-            )
-            .await
+        let turn_permission_profile = turn_outcome.materialization.turn.permission_profile.clone();
+        let profile_selected_audit = processor.turn_profile_selected_audit_event_for_turn(
+            context.workspace_id.as_str(),
+            child_thread_id.as_str(),
+            child_turn_id.as_str(),
+            turn_permission_profile.clone(),
+        );
+        if let Err(error) = message_future(
+            processor
+                .crud_store
+                .materialize_turn_start_with_permission_audit(
+                    &turn_outcome.materialization.thread,
+                    turn_outcome.materialization.sandbox_mode,
+                    &turn_outcome.materialization.turn,
+                    &turn_outcome.materialization.input,
+                    profile_selected_audit,
+                ),
+        )
+        .await
         {
             processor
                 .thread_manager
@@ -375,9 +414,11 @@ impl TaskAgentExecutor {
                 .await;
             return Ok(TaskExecutorStartOutcome::Started);
         }
+        let runtime_permission_profile = turn_permission_profile
+            .unwrap_or_else(pioneer_protocol::default_turn_permission_profile_snapshot);
         if let Err(error) = processor
             .agent_manager
-            .start_turn_with_hook_context(
+            .start_turn_with_hook_context_and_permission_profile(
                 child_thread_id.as_str(),
                 child_turn_id.as_str(),
                 ThreadMode::Agent,
@@ -390,6 +431,7 @@ impl TaskAgentExecutor {
                 resolved_artifacts,
                 runtime_environment,
                 Vec::new(),
+                runtime_permission_profile,
             )
             .await
         {
@@ -488,7 +530,6 @@ impl TaskAgentExecutor {
             TaskExecutorStartOutcome::Queued => return Ok(()),
             TaskExecutorStartOutcome::Rejected => return Ok(()),
         }
-
         if let Some((_, turn)) = processor
             .crud_store
             .get_turn(child_thread_id.as_str(), child_turn_id.as_str())
@@ -594,6 +635,7 @@ impl TaskAgentExecutor {
             )
             .await
             .context("failed to restore revision task thread")?;
+        let child_permission_profile = effective_task_child_permission_profile(agent_spec, None);
         let input = materialize_child_task_input(
             materialize_child_task_prompt(
                 processor,
@@ -602,25 +644,30 @@ impl TaskAgentExecutor {
                 agent_spec,
                 &parent,
                 Some(&child_runtime.task_run_turn),
+                &child_permission_profile,
             )
             .await?,
             agent_spec,
         );
         let turn_outcome = match processor
             .thread_manager
-            .system_turn_start(TurnStartParams {
-                thread_id: child_runtime.task_run_turn.thread_id.clone(),
-                turn_id: child_runtime.task_run_turn.turn_id.clone(),
-                input,
-                capabilities: Vec::new(),
-                model: Some(effective_model.model),
-                model_provider: Some(effective_model.model_provider),
-                sandbox_policy: None,
-                mode: Some(ThreadMode::Agent),
-                execution_backend: None,
-                reasoning: None,
-                cli_runtime_options: None,
-            })
+            .system_turn_start_with_permission_profile(
+                TurnStartParams {
+                    thread_id: child_runtime.task_run_turn.thread_id.clone(),
+                    turn_id: child_runtime.task_run_turn.turn_id.clone(),
+                    input,
+                    capabilities: Vec::new(),
+                    model: Some(effective_model.model),
+                    model_provider: Some(effective_model.model_provider),
+                    sandbox_policy: None,
+                    mode: Some(ThreadMode::Agent),
+                    execution_backend: None,
+                    reasoning: None,
+                    permission_profile: None,
+                    cli_runtime_options: None,
+                },
+                child_permission_profile,
+            )
             .await
         {
             Ok(outcome) => outcome,
@@ -663,7 +710,6 @@ impl TaskAgentExecutor {
                 return Ok(());
             }
         };
-
         if let Err(error) = processor
             .validate_artifact_user_inputs(
                 task.workspace_id.as_str(),
@@ -689,13 +735,21 @@ impl TaskAgentExecutor {
             .await?;
             return Ok(());
         }
+        let turn_permission_profile = turn_outcome.materialization.turn.permission_profile.clone();
+        let profile_selected_audit = processor.turn_profile_selected_audit_event_for_turn(
+            task.workspace_id.as_str(),
+            child_thread_id.as_str(),
+            child_turn_id.as_str(),
+            turn_permission_profile.clone(),
+        );
         if let Err(error) = processor
             .crud_store
-            .materialize_turn_start(
+            .materialize_turn_start_with_permission_audit(
                 &turn_outcome.materialization.thread,
                 turn_outcome.materialization.sandbox_mode,
                 &turn_outcome.materialization.turn,
                 &turn_outcome.materialization.input,
+                profile_selected_audit,
             )
             .await
         {
@@ -717,7 +771,6 @@ impl TaskAgentExecutor {
             .await?;
             return Ok(());
         }
-
         processor.ensure_hook_runtime_with_run_store().await;
         processor
             .agent_manager
@@ -801,9 +854,11 @@ impl TaskAgentExecutor {
             .await?;
             return Ok(());
         }
+        let runtime_permission_profile = turn_permission_profile
+            .unwrap_or_else(pioneer_protocol::default_turn_permission_profile_snapshot);
         if let Err(error) = processor
             .agent_manager
-            .start_turn_with_hook_context_and_execution_checkpoint(
+            .start_turn_with_hook_context_and_execution_checkpoint_and_permission_profile(
                 child_thread_id.as_str(),
                 child_turn_id.as_str(),
                 ThreadMode::Agent,
@@ -817,6 +872,7 @@ impl TaskAgentExecutor {
                 runtime_environment,
                 Vec::new(),
                 execution_checkpoint_context,
+                runtime_permission_profile,
             )
             .await
         {
@@ -855,6 +911,7 @@ impl TaskAgentExecutor {
     async fn recover_existing_child_turn(
         &self,
         processor: &Arc<MessageProcessor>,
+        context: &TaskExecutionContext,
         task_response: &TaskGetResponse,
         run: &TaskRun,
         agent_spec: &TaskAgentSpec,
@@ -916,6 +973,7 @@ impl TaskAgentExecutor {
                     agent_spec,
                     execution,
                     &child_runtime,
+                    context.permission_profile.as_ref(),
                     handle,
                 )
                 .await
@@ -931,6 +989,7 @@ impl TaskAgentExecutor {
         agent_spec: &TaskAgentSpec,
         execution: &TaskRunExecution,
         child_runtime: &TaskRunChildRuntime,
+        launch_permission_profile: Option<&TurnPermissionProfileSnapshot>,
         handle: TaskExecutionHandle,
     ) -> Result<TaskExecutorStartOutcome> {
         let task = &task_response.task;
@@ -990,6 +1049,8 @@ impl TaskAgentExecutor {
             )
             .await
             .context("failed to restore hidden task thread")?;
+        let child_permission_profile =
+            effective_task_child_permission_profile(agent_spec, launch_permission_profile);
         let input = materialize_child_task_input(
             materialize_child_task_prompt(
                 processor,
@@ -998,25 +1059,30 @@ impl TaskAgentExecutor {
                 agent_spec,
                 &parent,
                 Some(&child_runtime.task_run_turn),
+                &child_permission_profile,
             )
             .await?,
             agent_spec,
         );
         let turn_outcome = match processor
             .thread_manager
-            .system_turn_start(TurnStartParams {
-                thread_id: child_runtime.task_run_turn.thread_id.clone(),
-                turn_id: child_runtime.task_run_turn.turn_id.clone(),
-                input,
-                capabilities: Vec::new(),
-                model: Some(effective_model.model),
-                model_provider: Some(effective_model.model_provider),
-                sandbox_policy: None,
-                mode: Some(ThreadMode::Agent),
-                execution_backend: None,
-                reasoning: None,
-                cli_runtime_options: None,
-            })
+            .system_turn_start_with_permission_profile(
+                TurnStartParams {
+                    thread_id: child_runtime.task_run_turn.thread_id.clone(),
+                    turn_id: child_runtime.task_run_turn.turn_id.clone(),
+                    input,
+                    capabilities: Vec::new(),
+                    model: Some(effective_model.model),
+                    model_provider: Some(effective_model.model_provider),
+                    sandbox_policy: None,
+                    mode: Some(ThreadMode::Agent),
+                    execution_backend: None,
+                    reasoning: None,
+                    permission_profile: None,
+                    cli_runtime_options: None,
+                },
+                child_permission_profile,
+            )
             .await
         {
             Ok(outcome) => outcome,
@@ -1112,9 +1178,15 @@ impl TaskAgentExecutor {
             )
             .await
             .context("failed to persist restored task turn runtime snapshot")?;
+        let runtime_permission_profile = turn_outcome
+            .materialization
+            .turn
+            .permission_profile
+            .clone()
+            .unwrap_or_else(pioneer_protocol::default_turn_permission_profile_snapshot);
         processor
             .agent_manager
-            .start_turn_with_hook_context_and_execution_checkpoint(
+            .start_turn_with_hook_context_and_execution_checkpoint_and_permission_profile(
                 child_thread_id,
                 child_turn_id,
                 ThreadMode::Agent,
@@ -1128,6 +1200,7 @@ impl TaskAgentExecutor {
                 runtime_environment,
                 Vec::new(),
                 execution_checkpoint_context,
+                runtime_permission_profile,
             )
             .await
             .map_err(|error| anyhow!("failed to redispatch child task turn: {error}"))?;
@@ -1681,21 +1754,26 @@ impl TaskAgentExecutor {
             text: prompt,
             text_elements: Vec::new(),
         }];
+        let reviewer_permission_profile = effective_task_child_permission_profile(agent_spec, None);
         let turn_outcome = processor
             .thread_manager
-            .system_turn_start(TurnStartParams {
-                thread_id: task_run_turn.thread_id.clone(),
-                turn_id: task_run_turn.turn_id.clone(),
-                input,
-                capabilities: Vec::new(),
-                model: Some(effective_model.model),
-                model_provider: Some(effective_model.model_provider),
-                sandbox_policy: None,
-                mode: Some(ThreadMode::Agent),
-                execution_backend: None,
-                reasoning: None,
-                cli_runtime_options: None,
-            })
+            .system_turn_start_with_permission_profile(
+                TurnStartParams {
+                    thread_id: task_run_turn.thread_id.clone(),
+                    turn_id: task_run_turn.turn_id.clone(),
+                    input,
+                    capabilities: Vec::new(),
+                    model: Some(effective_model.model),
+                    model_provider: Some(effective_model.model_provider),
+                    sandbox_policy: None,
+                    mode: Some(ThreadMode::Agent),
+                    execution_backend: None,
+                    reasoning: None,
+                    permission_profile: None,
+                    cli_runtime_options: None,
+                },
+                reviewer_permission_profile,
+            )
             .await
             .context("failed to create hidden reviewer turn")?;
 
@@ -1712,13 +1790,21 @@ impl TaskAgentExecutor {
                 .await;
             return Err(error).context("failed to validate hidden reviewer input");
         }
+        let turn_permission_profile = turn_outcome.materialization.turn.permission_profile.clone();
+        let profile_selected_audit = processor.turn_profile_selected_audit_event_for_turn(
+            task.workspace_id.as_str(),
+            task_run_turn.thread_id.as_str(),
+            task_run_turn.turn_id.as_str(),
+            turn_permission_profile.clone(),
+        );
         if let Err(error) = processor
             .crud_store
-            .materialize_turn_start(
+            .materialize_turn_start_with_permission_audit(
                 &turn_outcome.materialization.thread,
                 turn_outcome.materialization.sandbox_mode,
                 &turn_outcome.materialization.turn,
                 &turn_outcome.materialization.input,
+                profile_selected_audit,
             )
             .await
         {
@@ -1784,9 +1870,11 @@ impl TaskAgentExecutor {
                 .await;
             return Ok(());
         }
+        let runtime_permission_profile = turn_permission_profile
+            .unwrap_or_else(pioneer_protocol::default_turn_permission_profile_snapshot);
         if let Err(error) = processor
             .agent_manager
-            .start_turn_with_hook_context(
+            .start_turn_with_hook_context_and_permission_profile(
                 task_run_turn.thread_id.as_str(),
                 task_run_turn.turn_id.as_str(),
                 ThreadMode::Agent,
@@ -1799,6 +1887,7 @@ impl TaskAgentExecutor {
                 resolved_artifacts,
                 runtime_environment,
                 Vec::new(),
+                runtime_permission_profile,
             )
             .await
         {
@@ -2137,6 +2226,7 @@ async fn ensure_task_run_occurrence_context(
     task_response: &TaskGetResponse,
     run: &TaskRun,
     mut parent: TaskParentRuntimeContext,
+    permission_profile: &TurnPermissionProfileSnapshot,
 ) -> Result<TaskParentRuntimeContext> {
     let Some(origin) = task_run_occurrence_origin(task_response, run) else {
         return Ok(parent);
@@ -2147,6 +2237,7 @@ async fn ensure_task_run_occurrence_context(
         parent.parent_thread_id.as_str(),
         run,
         origin,
+        permission_profile,
     )
     .await?;
     ensure_task_run_occurrence_anchor(
@@ -2199,6 +2290,7 @@ async fn ensure_task_run_occurrence_turn(
     parent_thread_id: &str,
     run: &TaskRun,
     origin: TurnOrigin,
+    permission_profile: &TurnPermissionProfileSnapshot,
 ) -> Result<()> {
     if processor
         .crud_store
@@ -2231,19 +2323,32 @@ async fn ensure_task_run_occurrence_turn(
         origin,
         error: None,
         prompt_manifest: None,
+        permission_profile: Some(permission_profile.clone()),
     };
     let sandbox_mode = processor
         .crud_store
         .get_thread_sandbox_mode(parent_thread_id)
         .await?
         .unwrap_or(SandboxMode::FullAccess);
+    let profile_selected_audit = processor.turn_profile_selected_audit_event_for_turn(
+        task.workspace_id.as_str(),
+        parent_thread_id,
+        run.id.as_str(),
+        occurrence_turn.permission_profile.clone(),
+    );
     processor
         .crud_store
-        .materialize_turn_start(&parent_thread, sandbox_mode, &occurrence_turn, &[])
+        .materialize_turn_start_with_permission_audit(
+            &parent_thread,
+            sandbox_mode,
+            &occurrence_turn,
+            &[],
+            profile_selected_audit,
+        )
         .await
         .with_context(|| {
             format!(
-                "failed to persist task run occurrence turn `{}` for task `{}`",
+                "failed to persist task run occurrence turn and permission audit `{}` for task `{}`",
                 run.id, task.id
             )
         })?;
@@ -3081,6 +3186,78 @@ fn effective_agent_model(agent_spec: &TaskAgentSpec) -> Result<EffectiveAgentMod
     })
 }
 
+fn effective_task_child_permission_profile(
+    agent_spec: &TaskAgentSpec,
+    launch_profile: Option<&TurnPermissionProfileSnapshot>,
+) -> TurnPermissionProfileSnapshot {
+    let cap = agent_spec.permission_cap.clone().unwrap_or_else(|| {
+        pioneer_protocol::task_permission_cap_from_snapshot(
+            &pioneer_protocol::default_turn_permission_profile_snapshot(),
+        )
+    });
+    let cap_profile = pioneer_protocol::task_permission_cap_snapshot(&cap);
+    let launcher = launch_profile
+        .cloned()
+        .unwrap_or_else(pioneer_protocol::default_turn_permission_profile_snapshot);
+    let mut profile = pioneer_protocol::intersect_turn_permission_profiles(
+        &cap_profile,
+        &launcher,
+        TurnPermissionProfileSource::TaskPermissionCap,
+    );
+    if let Some(tool_policy) = agent_spec.tool_policy.as_ref() {
+        apply_task_tool_policy_to_permission_profile(&mut profile, tool_policy);
+    }
+    profile
+}
+
+fn apply_task_tool_policy_to_permission_profile(
+    profile: &mut TurnPermissionProfileSnapshot,
+    tool_policy: &TaskAgentToolPolicy,
+) {
+    let task_policy = task_tool_policy_permission_snapshot(tool_policy);
+    profile.effective_policy = pioneer_protocol::intersect_tool_permission_policies(
+        &profile.effective_policy,
+        &task_policy,
+    );
+}
+
+fn task_tool_policy_permission_snapshot(
+    tool_policy: &TaskAgentToolPolicy,
+) -> ToolPermissionPolicySnapshot {
+    let mut policy = ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow);
+    match tool_policy.write_mode {
+        TaskAgentWriteMode::ReadOnly => {
+            policy.file_write = PermissionBehavior::Deny;
+        }
+        TaskAgentWriteMode::WorkspaceWrite | TaskAgentWriteMode::ScopedWrite => {}
+        TaskAgentWriteMode::FullAccess => {}
+    }
+    if !tool_policy.network_access {
+        policy.network = PermissionBehavior::Deny;
+    }
+    policy.allowed_tools = normalized_task_policy_values(&tool_policy.allowed_tools);
+    policy.denied_tools = normalized_task_policy_values(&tool_policy.denied_tools);
+    policy.allowed_paths = normalized_task_policy_values(&tool_policy.allowed_paths);
+    policy
+}
+
+fn normalized_task_policy_values(values: &[String]) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !normalized
+            .iter()
+            .any(|existing: &String| existing == trimmed)
+        {
+            normalized.push(trimmed.to_owned());
+        }
+    }
+    normalized
+}
+
 fn select_agent_spec(response: &TaskGetResponse, run_id: &str) -> Option<TaskAgentSpec> {
     response
         .agent_specs
@@ -3222,6 +3399,7 @@ async fn materialize_child_task_prompt(
     agent_spec: &TaskAgentSpec,
     parent: &TaskParentRuntimeContext,
     task_run_turn: Option<&TaskRunTurn>,
+    effective_permission_profile: &TurnPermissionProfileSnapshot,
 ) -> Result<String> {
     let parent_context = render_context_policy(
         processor,
@@ -3256,6 +3434,7 @@ async fn materialize_child_task_prompt(
         now: now_timestamp_secs(),
         parent_context: parent_context.as_deref(),
         output_instructions: agent_spec.prompt.output_instructions.as_deref(),
+        effective_permission_profile: Some(effective_permission_profile),
         revision,
     }))
 }
@@ -4389,6 +4568,152 @@ mod tests {
         }
     }
 
+    fn permission_test_agent_spec(
+        permission_cap: Option<pioneer_protocol::TurnPermissionProfileCap>,
+        tool_policy: Option<TaskAgentToolPolicy>,
+    ) -> TaskAgentSpec {
+        TaskAgentSpec {
+            id: "agent_spec_permission".to_owned(),
+            task_id: "task_permission".to_owned(),
+            run_id: None,
+            agent_role: None,
+            agent_nickname: None,
+            model: Some("test-model".to_owned()),
+            model_provider: Some("openai".to_owned()),
+            prompt: pioneer_protocol::TaskAgentPrompt {
+                goal: "Do the task".to_owned(),
+                instructions: Vec::new(),
+                input: None,
+                output_instructions: None,
+            },
+            context_policy: None,
+            tool_policy,
+            permission_cap,
+            result_contract: None,
+            review_policy: None,
+            depth: 0,
+            max_depth: 3,
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    #[test]
+    fn task_child_permission_profile_defaults_legacy_cap_to_full_access() {
+        let agent_spec = permission_test_agent_spec(None, None);
+        let profile = effective_task_child_permission_profile(&agent_spec, None);
+
+        assert_eq!(
+            profile.mode,
+            pioneer_protocol::TurnPermissionMode::FullAccess
+        );
+        assert_eq!(
+            profile.effective_policy,
+            ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow)
+        );
+    }
+
+    #[test]
+    fn task_child_permission_profile_inherits_parent_cap_modes() {
+        for mode in [
+            pioneer_protocol::TurnPermissionMode::FullAccess,
+            pioneer_protocol::TurnPermissionMode::AutoAcceptEdits,
+            pioneer_protocol::TurnPermissionMode::Supervised,
+        ] {
+            let agent_spec = permission_test_agent_spec(
+                Some(pioneer_protocol::task_permission_cap_from_snapshot(
+                    &pioneer_protocol::inherited_turn_permission_profile_snapshot(mode),
+                )),
+                None,
+            );
+            let profile = effective_task_child_permission_profile(&agent_spec, None);
+
+            assert_eq!(profile.mode, mode);
+            assert_eq!(
+                profile.source,
+                TurnPermissionProfileSource::TaskPermissionCap
+            );
+        }
+    }
+
+    #[test]
+    fn task_child_permission_profile_uses_most_restrictive_cap_and_launch_mode() {
+        let agent_spec = permission_test_agent_spec(
+            Some(pioneer_protocol::task_permission_cap_for_mode(
+                pioneer_protocol::TurnPermissionMode::AutoAcceptEdits,
+            )),
+            None,
+        );
+        let launch_profile = pioneer_protocol::inherited_turn_permission_profile_snapshot(
+            pioneer_protocol::TurnPermissionMode::Supervised,
+        );
+        let profile = effective_task_child_permission_profile(&agent_spec, Some(&launch_profile));
+
+        assert_eq!(
+            profile.mode,
+            pioneer_protocol::TurnPermissionMode::Supervised
+        );
+        assert_eq!(profile.effective_policy.file_write, PermissionBehavior::Ask);
+    }
+
+    #[test]
+    fn delayed_task_permission_cap_cannot_be_broadened_by_full_access_launch() {
+        let agent_spec = permission_test_agent_spec(
+            Some(pioneer_protocol::task_permission_cap_for_mode(
+                pioneer_protocol::TurnPermissionMode::Supervised,
+            )),
+            None,
+        );
+        let launch_profile = pioneer_protocol::system_turn_permission_profile_snapshot(
+            pioneer_protocol::TurnPermissionMode::FullAccess,
+        );
+        let profile = effective_task_child_permission_profile(&agent_spec, Some(&launch_profile));
+
+        assert_eq!(
+            profile.mode,
+            pioneer_protocol::TurnPermissionMode::Supervised
+        );
+    }
+
+    #[test]
+    fn task_tool_policy_narrows_effective_child_permission_profile() {
+        let agent_spec = permission_test_agent_spec(
+            Some(pioneer_protocol::task_permission_cap_for_mode(
+                pioneer_protocol::TurnPermissionMode::FullAccess,
+            )),
+            Some(TaskAgentToolPolicy {
+                allowed_tools: vec!["read_file".to_owned()],
+                denied_tools: vec!["exec_command".to_owned()],
+                write_mode: TaskAgentWriteMode::ReadOnly,
+                allowed_paths: vec!["/workspace/src".to_owned()],
+                network_access: false,
+            }),
+        );
+        let profile = effective_task_child_permission_profile(&agent_spec, None);
+
+        assert_eq!(
+            profile.mode,
+            pioneer_protocol::TurnPermissionMode::FullAccess
+        );
+        assert_eq!(
+            profile.effective_policy.file_write,
+            PermissionBehavior::Deny
+        );
+        assert_eq!(profile.effective_policy.network, PermissionBehavior::Deny);
+        assert_eq!(
+            profile.effective_policy.allowed_tools,
+            vec!["read_file".to_owned()]
+        );
+        assert_eq!(
+            profile.effective_policy.denied_tools,
+            vec!["exec_command".to_owned()]
+        );
+        assert_eq!(
+            profile.effective_policy.allowed_paths,
+            vec!["/workspace/src".to_owned()]
+        );
+    }
+
     #[test]
     fn background_context_frame_prevents_parent_request_from_becoming_current_command() {
         let framed = frame_background_context(
@@ -4718,6 +5043,7 @@ mod tests {
             },
             context_policy: None,
             tool_policy: None,
+            permission_cap: None,
             result_contract: None,
             review_policy: None,
             depth: 0,

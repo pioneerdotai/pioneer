@@ -2988,6 +2988,7 @@ mod tests {
             origin: Default::default(),
             error: None,
             prompt_manifest: None,
+            permission_profile: None,
         };
 
         crud_store
@@ -4186,6 +4187,7 @@ mod tests {
             origin: Default::default(),
             error: None,
             prompt_manifest: None,
+            permission_profile: None,
         };
         let item_id = "reasoning_terminal_backfill";
 
@@ -4253,6 +4255,7 @@ mod tests {
                         origin: Default::default(),
                         error: None,
                         prompt_manifest: None,
+                        permission_profile: None,
                     },
                 },
                 timestamp + 4,

@@ -443,6 +443,7 @@ mod tests {
             origin: Default::default(),
             error: None,
             prompt_manifest: None,
+            permission_profile: None,
         };
         store
             .materialize_turn_start(
