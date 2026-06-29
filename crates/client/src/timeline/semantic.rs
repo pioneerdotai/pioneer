@@ -1170,6 +1170,7 @@ fn apply_item_started_to_semantic_timeline(
             );
         }
         LiveItemPlacement::TopLevelAssistant => {
+            remove_turn_work_item(thread, turn_id, item.item_id());
             upsert_assistant_message_block(
                 thread,
                 workspace_id,
@@ -1271,16 +1272,16 @@ fn apply_item_delta_to_semantic_timeline(
             let item = TurnItem::AgentMessage {
                 id: item_id.to_owned(),
                 text: delta.to_owned(),
-                phase: AgentMessagePhase::FinalAnswer,
+                phase: AgentMessagePhase::Commentary,
                 markdown: markdown.cloned(),
                 markdown_version: None,
             };
-            upsert_assistant_message_block(
+            upsert_turn_work_item(
                 thread,
                 workspace_id,
                 thread_id,
                 turn_id,
-                &item,
+                item,
                 TurnWorkItemStatus::Running,
                 now_unix_ms,
             );
@@ -1290,7 +1291,7 @@ fn apply_item_delta_to_semantic_timeline(
                 thread_id,
                 turn_id,
                 TurnWorkState::Running,
-                TurnWorkPresentation::CollapsedAfterFinal,
+                current_or_live_work_presentation(thread, turn_id),
                 None,
                 now_unix_ms,
             );
@@ -1472,6 +1473,11 @@ pub fn apply_work_range_page(
 ) -> bool {
     let before = range.clone();
     let was_empty = range.ordered_item_ids.is_empty();
+    let live_running_items = if merge_mode == WorkPageMergeMode::Reset {
+        live_running_work_items(range)
+    } else {
+        Vec::new()
+    };
 
     if merge_mode == WorkPageMergeMode::Reset {
         range.items_by_id.clear();
@@ -1491,11 +1497,42 @@ pub fn apply_work_range_page(
         range.stale_work_item_ids.remove(item.work_item_id.as_str());
         range.items_by_id.insert(item.work_item_id.clone(), item);
     }
+    restore_missing_live_running_work_items(range, live_running_items);
     sort_work_items(range);
     merge_work_loaded_range(range, &page.page, merge_mode, was_empty);
     range.request_status = TimelineRequestStatus::Ready;
 
     before != *range
+}
+
+fn live_running_work_items(range: &TurnWorkRangeCache) -> Vec<TurnWorkItem> {
+    range
+        .ordered_item_ids
+        .iter()
+        .filter_map(|work_item_id| range.items_by_id.get(work_item_id.as_str()))
+        .filter(|item| item.status == TurnWorkItemStatus::Running)
+        .cloned()
+        .collect()
+}
+
+fn restore_missing_live_running_work_items(
+    range: &mut TurnWorkRangeCache,
+    items: Vec<TurnWorkItem>,
+) {
+    for item in items {
+        if range.items_by_id.contains_key(item.work_item_id.as_str()) {
+            continue;
+        }
+        if range
+            .items_by_id
+            .values()
+            .any(|existing| existing.item_id == item.item_id)
+        {
+            continue;
+        }
+        range.stale_work_item_ids.remove(item.work_item_id.as_str());
+        range.items_by_id.insert(item.work_item_id.clone(), item);
+    }
 }
 
 fn remove_existing_work_items_for_item_id(
@@ -2503,6 +2540,87 @@ mod tests {
         assert!(
             matches!(&item.item, TurnItem::AgentMessage { text, phase, .. }
                 if text == "thinking more" && *phase == AgentMessagePhase::Commentary)
+        );
+    }
+
+    #[test]
+    fn turn_work_reset_preserves_live_running_items() {
+        let mut state = SemanticTimelineState::default();
+
+        assert!(apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::ItemStarted {
+                thread_id: "thread_a".to_owned(),
+                turn_id: "turn_a".to_owned(),
+                item: TurnItem::AgentMessage {
+                    id: "item_comment".to_owned(),
+                    text: "thinking".to_owned(),
+                    phase: AgentMessagePhase::Commentary,
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            10,
+        ));
+
+        assert!(apply_turn_work_page(
+            &mut state,
+            work_page(vec![work_item("work_a", "001")]),
+            WorkPageMergeMode::Reset
+        ));
+
+        let thread = state.thread("thread_a").expect("thread cache should exist");
+        let range = thread
+            .work_range("turn_a")
+            .expect("work range should exist");
+        assert!(
+            range
+                .items_by_id
+                .contains_key("turn:turn_a:work:item_comment"),
+            "resetting a paged work range must not drop live running commentary"
+        );
+        assert!(
+            range.items_by_id.contains_key("work_a"),
+            "server page item should still be merged"
+        );
+    }
+
+    #[test]
+    fn unknown_agent_message_delta_is_work_item_not_final_block() {
+        let mut state = SemanticTimelineState::default();
+
+        assert!(apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::ItemDelta {
+                thread_id: "thread_a".to_owned(),
+                turn_id: "turn_a".to_owned(),
+                item_id: "item_comment".to_owned(),
+                delta: "thinking".to_owned(),
+                stream: Some(ItemDeltaStream::AgentMessage),
+                payload: None,
+                markdown: None,
+                markdown_version: None,
+            },
+            10,
+        ));
+
+        let thread = state.thread("thread_a").expect("thread cache should exist");
+        assert!(
+            thread
+                .top_level
+                .ordered_blocks()
+                .all(|block| !matches!(block.kind, TimelineBlockKind::AssistantMessage { .. })),
+            "agent-message deltas without an existing final block must not create final answers"
+        );
+        let item = thread
+            .work_range("turn_a")
+            .and_then(|range| range.items_by_id.get("turn:turn_a:work:item_comment"))
+            .expect("unknown agent-message delta should be recovered as turn work");
+        assert!(
+            matches!(&item.item, TurnItem::AgentMessage { text, phase, .. }
+                if text == "thinking" && *phase == AgentMessagePhase::Commentary)
         );
     }
 
