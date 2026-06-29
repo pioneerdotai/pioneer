@@ -399,10 +399,6 @@ impl ThreadManager {
         self.turn_start_for_actor(Some(connection_id), params).await
     }
 
-    pub async fn system_turn_start(&self, params: TurnStartParams) -> Result<TurnStartOutcome> {
-        self.turn_start_for_actor(None, params).await
-    }
-
     pub async fn system_turn_start_with_permission_profile(
         &self,
         params: TurnStartParams,
@@ -526,7 +522,7 @@ impl ThreadManager {
             origin: Default::default(),
             error: None,
             prompt_manifest: None,
-            permission_profile: Some(permission_profile),
+            permission_profile,
         };
 
         if entry.thread.preview.is_empty() {
@@ -1035,7 +1031,7 @@ mod tests {
                 origin: Default::default(),
                 error: None,
                 prompt_manifest: None,
-                permission_profile: None,
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
             }],
         };
 
@@ -1308,12 +1304,7 @@ mod tests {
             turn_outcome.started_notification.turn.status,
             TurnStatus::InProgress
         );
-        let permission_profile = turn_outcome
-            .response
-            .turn
-            .permission_profile
-            .as_ref()
-            .expect("turn should expose defaulted permission profile");
+        let permission_profile = &turn_outcome.response.turn.permission_profile;
         assert_eq!(permission_profile.mode, TurnPermissionMode::FullAccess);
         assert_eq!(
             permission_profile.source,
@@ -1413,12 +1404,7 @@ mod tests {
             .await
             .expect("turn start should succeed");
 
-        let permission_profile = turn_outcome
-            .response
-            .turn
-            .permission_profile
-            .as_ref()
-            .expect("turn should expose selected permission profile");
+        let permission_profile = &turn_outcome.response.turn.permission_profile;
         assert_eq!(permission_profile.mode, TurnPermissionMode::Supervised);
         assert_eq!(
             permission_profile.source,
@@ -1433,13 +1419,8 @@ mod tests {
             PermissionBehavior::Allow
         );
         assert_eq!(
-            turn_outcome
-                .materialization
-                .turn
-                .permission_profile
-                .as_ref()
-                .map(|profile| profile.mode),
-            Some(TurnPermissionMode::Supervised)
+            turn_outcome.materialization.turn.permission_profile.mode,
+            TurnPermissionMode::Supervised
         );
     }
 

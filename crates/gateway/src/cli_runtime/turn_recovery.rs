@@ -443,7 +443,7 @@ mod tests {
             origin: Default::default(),
             error: None,
             prompt_manifest: None,
-            permission_profile: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
         };
         store
             .materialize_turn_start(

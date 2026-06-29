@@ -2108,6 +2108,7 @@ impl RecoveryCoordinator {
         let mut request =
             match crate::turn_runtime_snapshot::restored_recovery_turn_request_from_snapshot(
                 &snapshot,
+                turn.permission_profile,
             ) {
                 Ok(request) => request,
                 Err(error) => {
@@ -2754,7 +2755,8 @@ mod tests {
         ToolCallStatus, ToolDisplayPayload, ToolOutputPolicySnapshot, ToolRecoveryIdempotencyMode,
         ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass, ToolStoragePayload, TurnCapability,
         TurnCapabilityKind, TurnCompletedNotification, TurnItem, TurnItemTimeoutReason,
-        TurnItemType, TurnStatus, UserInput, build_execution_checkpoint_payload,
+        TurnItemType, TurnPermissionMode, TurnPermissionProfileSnapshot,
+        TurnPermissionProfileSource, TurnStatus, UserInput, build_execution_checkpoint_payload,
     };
     use pioneer_provider::{
         ChatMessage, InputContentType, MessageAttachment, ProviderRegistry, providers::EchoProvider,
@@ -2962,6 +2964,27 @@ mod tests {
         item_id: &str,
         recovery_policy: Option<ToolRecoveryPolicySnapshot>,
     ) {
+        materialize_turn_with_tool_item_and_permission_profile(
+            crud_store,
+            workspace_id,
+            thread_id,
+            turn_id,
+            item_id,
+            pioneer_protocol::default_turn_permission_profile_snapshot(),
+            recovery_policy,
+        )
+        .await;
+    }
+
+    async fn materialize_turn_with_tool_item_and_permission_profile(
+        crud_store: &CrudStore,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        item_id: &str,
+        permission_profile: TurnPermissionProfileSnapshot,
+        recovery_policy: Option<ToolRecoveryPolicySnapshot>,
+    ) {
         let timestamp = 1_700_000_000;
         let thread = Thread {
             workspace_id: workspace_id.to_owned(),
@@ -2988,7 +3011,7 @@ mod tests {
             origin: Default::default(),
             error: None,
             prompt_manifest: None,
-            permission_profile: None,
+            permission_profile,
         };
 
         crud_store
@@ -3119,12 +3142,17 @@ mod tests {
         let workspace_id = "ws_restore_snapshot";
         let thread_id = "thr_restore_snapshot";
         let turn_id = "turn_restore_snapshot";
-        materialize_turn_with_tool_item(
+        let permission_profile = TurnPermissionProfileSnapshot::from_mode(
+            TurnPermissionMode::Supervised,
+            TurnPermissionProfileSource::Composer,
+        );
+        materialize_turn_with_tool_item_and_permission_profile(
             crud_store.as_ref(),
             workspace_id,
             thread_id,
             turn_id,
             "tool_restore_snapshot",
+            permission_profile.clone(),
             None,
         )
         .await;
@@ -3155,6 +3183,7 @@ mod tests {
             Some("/tmp/pioneer-snapshot-output")
         );
         assert_eq!(restored.history.len(), 2);
+        assert_eq!(restored.permission_profile, permission_profile);
     }
 
     #[tokio::test]
@@ -4187,7 +4216,7 @@ mod tests {
             origin: Default::default(),
             error: None,
             prompt_manifest: None,
-            permission_profile: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
         };
         let item_id = "reasoning_terminal_backfill";
 
@@ -4255,7 +4284,8 @@ mod tests {
                         origin: Default::default(),
                         error: None,
                         prompt_manifest: None,
-                        permission_profile: None,
+                        permission_profile:
+                            pioneer_protocol::default_turn_permission_profile_snapshot(),
                     },
                 },
                 timestamp + 4,

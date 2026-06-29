@@ -4968,7 +4968,7 @@ mod tests {
             origin: TurnOrigin::User,
             error: None,
             prompt_manifest: None,
-            permission_profile: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
         };
         crud_store
             .materialize_turn_start(

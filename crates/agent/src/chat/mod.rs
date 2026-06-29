@@ -56,9 +56,9 @@ use pioneer_promt::{
     CompiledPromptBundle, ExecutionContinuationRuntimeFactsInput, PromptCompileInput,
     PromptDiagnosticCode, PromptDynamicSectionId, PromptLimits, PromptProfile,
     PromptRuntimeBuiltInSectionId, PromptRuntimeSectionId, PromptRuntimeSectionInput,
-    ToolRetryInstructionKind, compile_prompt, execution_continuation_section_with_runtime_facts,
-    render_tool_retry_instruction, runtime_sections_with_request_tools_catalog,
-    tool_loop_final_answer_instruction,
+    ToolRetryInstructionKind, compile_prompt, current_permission_guidance,
+    execution_continuation_section_with_runtime_facts, render_tool_retry_instruction,
+    runtime_sections_with_request_tools_catalog, tool_loop_final_answer_instruction,
 };
 use pioneer_protocol::{
     AgentDurableEvent, AgentProgressEvent, EXECUTION_CHECKPOINT_DEFAULT_TOOL_DETAIL_LIMIT,
@@ -72,8 +72,8 @@ use pioneer_protocol::{
     RecoveryAttemptContext, ThreadMode, ToolRecoveryPolicySnapshot, TurnAcceptedCapability,
     TurnCapability, TurnCapabilityAcceptedReason, TurnCapabilityKind, TurnCapabilityRejectedReason,
     TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowExhaustedNotification,
-    TurnExecutionWindowStartedNotification, TurnItem, TurnItemType, TurnRejectedCapability,
-    UserInput, build_execution_checkpoint_original_request_summary,
+    TurnExecutionWindowStartedNotification, TurnItem, TurnItemType, TurnPermissionProfileSnapshot,
+    TurnRejectedCapability, UserInput, build_execution_checkpoint_original_request_summary,
     build_execution_checkpoint_payload, build_execution_checkpoint_provider_budget_summary,
     generate_id,
 };
@@ -88,11 +88,12 @@ use pioneer_skills::{
     SkillResolvedReason,
 };
 use pioneer_tools::{
-    FinalToolVisibility, PreflightToolIndex, REQUEST_TOOLS_TOOL_NAME, RawToolCall,
-    RequestToolsResult, ToolErrorClass, ToolLoopBudgetExceeded, ToolLoopBudgetReason,
-    ToolLoopGuard, ToolLoopGuardDecision, ToolLoopRoundAction, ToolOutcome, ToolOutcomeStatus,
-    ToolRecoveryView, ToolResultEnvelope, ToolResultView, ToolRetryController, ToolRetryDecision,
-    ToolRetryObservation, build_builtin_tools, build_tools_with_environment, classify_tool_error,
+    FinalToolVisibility, PermissionApprovalBroker, PermissionEvaluationContext, PreflightToolIndex,
+    REQUEST_TOOLS_TOOL_NAME, RawToolCall, RequestToolsResult, ToolErrorClass,
+    ToolLoopBudgetExceeded, ToolLoopBudgetReason, ToolLoopGuard, ToolLoopGuardDecision,
+    ToolLoopRoundAction, ToolOutcome, ToolOutcomeStatus, ToolRecoveryView, ToolResultEnvelope,
+    ToolResultView, ToolRetryController, ToolRetryDecision, ToolRetryObservation,
+    build_builtin_tools, build_tools_with_environment, classify_tool_error,
 };
 use serde_json::{Value as JsonValue, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -1709,6 +1710,7 @@ fn compile_agent_prompt_bundle(
     skills_prompt: Option<String>,
     retry_instruction: Option<String>,
     runtime_sections: &[PromptRuntimeSectionInput],
+    permission_profile: &TurnPermissionProfileSnapshot,
     include_task_orchestration_policy: bool,
     include_request_tools_catalog: bool,
     continue_generation_hint: bool,
@@ -1727,6 +1729,7 @@ fn compile_agent_prompt_bundle(
         skills_prompt,
         retry_instruction,
         runtime_sections,
+        permission_profile,
         include_task_orchestration_policy,
         include_request_tools_catalog,
         continue_generation_hint,
@@ -1740,6 +1743,7 @@ fn compile_agent_prompt_bundle_with_prompt_root(
     skills_prompt: Option<String>,
     retry_instruction: Option<String>,
     runtime_sections: &[PromptRuntimeSectionInput],
+    permission_profile: &TurnPermissionProfileSnapshot,
     include_task_orchestration_policy: bool,
     include_request_tools_catalog: bool,
     continue_generation_hint: bool,
@@ -1755,8 +1759,10 @@ fn compile_agent_prompt_bundle_with_prompt_root(
         std::env::consts::OS,
     );
 
+    let runtime_sections =
+        runtime_sections_with_current_permissions(runtime_sections, permission_profile);
     let runtime_sections = runtime_sections_with_request_tools_catalog(
-        runtime_sections,
+        runtime_sections.as_slice(),
         include_request_tools_catalog,
     );
 
@@ -1786,6 +1792,25 @@ fn compile_agent_prompt_bundle_with_prompt_root(
     }
 
     Ok(bundle)
+}
+
+fn runtime_sections_with_current_permissions(
+    runtime_sections: &[PromptRuntimeSectionInput],
+    permission_profile: &TurnPermissionProfileSnapshot,
+) -> Vec<PromptRuntimeSectionInput> {
+    let Some(content) = current_permission_guidance(permission_profile) else {
+        return runtime_sections.to_vec();
+    };
+
+    let mut sections = runtime_sections.to_vec();
+    sections.push(PromptRuntimeSectionInput {
+        id: PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::CurrentPermissions),
+        title: None,
+        content,
+        max_chars: Some(1_500),
+        truncated: false,
+    });
+    sections
 }
 
 fn compiled_prompt_payload_from_bundle(bundle: &CompiledPromptBundle) -> CompiledPromptPayload {
@@ -2152,6 +2177,7 @@ pub(super) async fn execute_chat_turn_flow(
     retained_llm_context: Vec<RetainedToolLlmContext>,
     execution_window_index: u32,
     execution_checkpoint_context: Option<ExecutionCheckpointContext>,
+    permission_profile: TurnPermissionProfileSnapshot,
     force_non_stream: bool,
     disable_tool_calling: bool,
     continue_generation_hint: bool,
@@ -2162,6 +2188,7 @@ pub(super) async fn execute_chat_turn_flow(
     task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
     hook_runtime: Option<Arc<HookRuntime>>,
     tool_bundle_artifacts: Option<Arc<AgentToolBundleArtifactStore>>,
+    permission_approval_broker: Arc<dyn PermissionApprovalBroker>,
     turn_control: TurnExecutionControl,
     recovery: Option<RecoveryAttemptContext>,
     event_tx: Arc<AgentEventHub>,
@@ -2205,6 +2232,7 @@ pub(super) async fn execute_chat_turn_flow(
                 retained_llm_context,
                 execution_window_index,
                 execution_checkpoint_context,
+                permission_profile,
                 force_non_stream,
                 disable_tool_calling,
                 continue_generation_hint,
@@ -2215,6 +2243,7 @@ pub(super) async fn execute_chat_turn_flow(
                 task_tool_provider,
                 hook_runtime,
                 tool_bundle_artifacts,
+                permission_approval_broker,
                 turn_control.clone(),
                 recovery,
                 &workspace_id,
@@ -2776,6 +2805,7 @@ async fn execute_agent_provider_response(
     retained_llm_context: Vec<RetainedToolLlmContext>,
     execution_window_index: u32,
     execution_checkpoint_context: Option<ExecutionCheckpointContext>,
+    permission_profile: TurnPermissionProfileSnapshot,
     force_non_stream: bool,
     disable_tool_calling: bool,
     continue_generation_hint: bool,
@@ -2786,6 +2816,7 @@ async fn execute_agent_provider_response(
     task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
     hook_runtime: Option<Arc<HookRuntime>>,
     tool_bundle_artifacts: Option<Arc<AgentToolBundleArtifactStore>>,
+    permission_approval_broker: Arc<dyn PermissionApprovalBroker>,
     turn_control: TurnExecutionControl,
     mut recovery: Option<RecoveryAttemptContext>,
     workspace_id: &str,
@@ -3077,6 +3108,7 @@ async fn execute_agent_provider_response(
             skills_prompt.clone(),
             None,
             prompt_runtime_sections.as_slice(),
+            &permission_profile,
             include_task_orchestration_policy,
             false,
             continue_generation_hint,
@@ -3271,6 +3303,12 @@ async fn execute_agent_provider_response(
 
     let extension_bundles = effective_tool_bundle_set.bundles().to_vec();
 
+    let permission_context = PermissionEvaluationContext::for_turn(
+        workspace_id,
+        thread_id,
+        turn_id,
+        permission_profile.clone(),
+    );
     let runtime_environment = runtime_environment.into_iter().collect::<BTreeMap<_, _>>();
     let tools = match build_tools_with_environment(
         workdir.clone(),
@@ -3305,7 +3343,9 @@ async fn execute_agent_provider_response(
                 )
             })
         }
-    };
+    }
+    .with_permission_context(permission_context)
+    .with_permission_approval_broker(permission_approval_broker);
 
     skill_tool_materialization
         .bind_function_proxy_runtime(tools.router.clone(), tools.runtime.clone())
@@ -3442,6 +3482,7 @@ async fn execute_agent_provider_response(
         skills_prompt.clone(),
         None,
         prompt_runtime_sections.as_slice(),
+        &permission_profile,
         include_task_orchestration_policy,
         true,
         continue_generation_hint,
@@ -3725,6 +3766,7 @@ async fn execute_agent_provider_response(
                         skills_prompt.clone(),
                         next_retry_instruction.clone(),
                         prompt_runtime_sections.as_slice(),
+                        &permission_profile,
                         include_task_orchestration_policy,
                         round_plan.tools_enabled,
                         continue_generation_hint,
@@ -3817,6 +3859,7 @@ async fn execute_agent_provider_response(
                     skills_prompt.clone(),
                     applied_retry_instruction.clone(),
                     no_tool_runtime_sections.as_slice(),
+                    &permission_profile,
                     include_task_orchestration_policy,
                     false,
                     continue_generation_hint,
@@ -4032,6 +4075,7 @@ async fn execute_agent_provider_response(
                             skills_prompt.clone(),
                             pending_retry_instruction.clone(),
                             prompt_runtime_sections.as_slice(),
+                            &permission_profile,
                             include_task_orchestration_policy,
                             false,
                             continue_generation_hint,
@@ -4940,6 +4984,7 @@ async fn execute_agent_provider_response(
                     skills_prompt.clone(),
                     next_retry_instruction.clone(),
                     prompt_runtime_sections.as_slice(),
+                    &permission_profile,
                     include_task_orchestration_policy,
                     next_round_tools_enabled,
                     continue_generation_hint,
@@ -7019,6 +7064,7 @@ mod tests {
             None,
             None,
             &[],
+            &pioneer_protocol::default_turn_permission_profile_snapshot(),
             false,
             false,
             false,
@@ -7031,6 +7077,12 @@ mod tests {
         assert!(bundle.full_system_text.contains("runtime identity"));
         assert!(!bundle.full_system_text.contains("workspace soul"));
         assert!(!bundle.full_system_text.contains("workspace identity"));
+        assert!(
+            !bundle
+                .sections
+                .iter()
+                .any(|section| section.id == PromptSectionId::CurrentPermissions)
+        );
     }
 
     #[test]
@@ -7049,6 +7101,7 @@ mod tests {
             None,
             None,
             &[agents_section],
+            &pioneer_protocol::default_turn_permission_profile_snapshot(),
             false,
             false,
             false,
@@ -7068,6 +7121,52 @@ mod tests {
     }
 
     #[test]
+    fn current_permissions_section_is_compiled_for_restricted_prompt_bundle() {
+        let runtime_home = temp_dir("current_permissions_prompt");
+        let profile = pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+            pioneer_protocol::TurnPermissionMode::Supervised,
+            pioneer_protocol::TurnPermissionProfileSource::Composer,
+        );
+
+        let bundle = compile_agent_prompt_bundle_with_prompt_root(
+            runtime_home.as_path(),
+            None,
+            None,
+            &[],
+            &profile,
+            false,
+            true,
+            false,
+            "thread_permissions",
+            "turn_permissions",
+        )
+        .expect("compile prompt bundle");
+
+        let permissions_section = bundle
+            .sections
+            .iter()
+            .find(|section| section.id == PromptSectionId::CurrentPermissions)
+            .expect("current permissions section should be compiled");
+        assert_eq!(permissions_section.title, "Current Permissions");
+        assert!(
+            bundle
+                .dynamic_system_text
+                .contains("## Current Permissions")
+        );
+        assert!(bundle.dynamic_system_text.contains("- mode: supervised"));
+        assert!(
+            bundle
+                .dynamic_system_text
+                .contains("may require user approval")
+        );
+        assert!(
+            !bundle
+                .dynamic_system_text
+                .contains("ToolPermissionPolicySnapshot")
+        );
+    }
+
+    #[test]
     fn request_tools_catalog_is_compiled_for_tool_enabled_prompt_bundle() {
         let runtime_home = temp_dir("request_tools_catalog_prompt");
 
@@ -7076,6 +7175,7 @@ mod tests {
             None,
             None,
             &[],
+            &pioneer_protocol::default_turn_permission_profile_snapshot(),
             false,
             true,
             false,
@@ -7126,6 +7226,7 @@ mod tests {
             None,
             None,
             &[],
+            &pioneer_protocol::default_turn_permission_profile_snapshot(),
             false,
             false,
             false,

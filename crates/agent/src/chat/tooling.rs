@@ -89,6 +89,11 @@ pub(super) async fn forward_tool_event_to_agent(
                     .await?;
             }
         }
+        ToolEventPayload::PermissionAudit(audit_event) => {
+            event_tx
+                .publish_durable(AgentDurableEvent::TurnPermissionAudit { event: audit_event })
+                .await?;
+        }
         ToolEventPayload::OutputDelta(delta_event) => {
             let (
                 tool_name,

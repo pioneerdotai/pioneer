@@ -16,7 +16,7 @@ use pioneer_protocol::{
     AgentDurableEvent, AgentProgressEvent, ExecutionCheckpointPayload,
     ExecutionWindowExhaustionReason, ItemDeltaNotification, ItemDeltaStream, McpScopeKind,
     ProgressCoalescingKey, ProviderFailureDetails, ThreadMode, TurnCapability, TurnItemType,
-    UserInput,
+    TurnPermissionProfileSnapshot, UserInput,
 };
 #[cfg(test)]
 use pioneer_protocol::{
@@ -60,8 +60,8 @@ pub use pioneer_memory::hooks::{
     MemoryTurnPolicyContext, MemoryTurnPolicyOverride, MemoryTurnPolicyRequest,
 };
 use pioneer_tools::{
-    ComputerUseToolsConfig, ExecutionWindowsConfig, ToolLoopBudgetConfig, ToolRetryBudgetConfig,
-    WebToolsConfig,
+    ComputerUseToolsConfig, ExecutionWindowsConfig, PermissionApprovalBroker,
+    StaticPermissionApprovalBroker, ToolLoopBudgetConfig, ToolRetryBudgetConfig, WebToolsConfig,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1412,6 +1412,7 @@ pub struct RestoredRecoveryTurnRequest {
     pub resolved_artifacts: Vec<ResolvedArtifactInput>,
     pub runtime_environment: HashMap<String, String>,
     pub history: Vec<ChatMessage>,
+    pub permission_profile: TurnPermissionProfileSnapshot,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1454,6 +1455,7 @@ struct ActiveTurnRequest {
     execution_checkpoint_context: Option<ExecutionCheckpointContext>,
     execution_usage: TurnExecutionUsageCounters,
     execution_options: TurnExecutionOptions,
+    permission_profile: TurnPermissionProfileSnapshot,
 }
 
 #[derive(Debug, Clone)]
@@ -1503,6 +1505,7 @@ enum AgentCommand {
         runtime_environment: HashMap<String, String>,
         history: Vec<ChatMessage>,
         execution_checkpoint_context: Option<ExecutionCheckpointContext>,
+        permission_profile: TurnPermissionProfileSnapshot,
         ack: oneshot::Sender<Result<(), AgentStartError>>,
     },
     TurnTaskFinished {
@@ -1676,6 +1679,7 @@ pub struct AgentManager {
     hook_runtime: RwLock<Option<Arc<HookRuntime>>>,
     tool_bundle_artifacts: Arc<AgentToolBundleArtifactStore>,
     post_turn_hook_dispatch_policy: RwLock<AgentPostTurnHookDispatchPolicy>,
+    permission_approval_broker: Arc<RwLock<Arc<dyn PermissionApprovalBroker>>>,
 }
 
 impl AgentManager {
@@ -1713,7 +1717,14 @@ impl AgentManager {
             hook_runtime: RwLock::new(None),
             tool_bundle_artifacts: Arc::new(AgentToolBundleArtifactStore::new()),
             post_turn_hook_dispatch_policy: RwLock::new(AgentPostTurnHookDispatchPolicy::default()),
+            permission_approval_broker: Arc::new(RwLock::new(Arc::new(
+                StaticPermissionApprovalBroker::default(),
+            ))),
         }
+    }
+
+    pub async fn set_permission_approval_broker(&self, broker: Arc<dyn PermissionApprovalBroker>) {
+        *self.permission_approval_broker.write().await = broker;
     }
 
     pub async fn set_task_tool_provider(&self, provider: Option<Arc<dyn TaskToolProvider>>) {
@@ -1828,8 +1839,7 @@ impl AgentManager {
         let tool_bundle_artifacts = hook_runtime
             .as_ref()
             .map(|_| self.tool_bundle_artifacts.clone());
-
-        let loop_handle = tokio::spawn(agent_loop::run_agent_loop(
+        let loop_handle = tokio::spawn(Box::pin(agent_loop::run_agent_loop(
             thread_id_owned,
             workspace_id_owned.clone(),
             self.provider_registry.clone(),
@@ -1840,11 +1850,12 @@ impl AgentManager {
             self.task_tool_provider.read().await.clone(),
             hook_runtime,
             tool_bundle_artifacts,
+            self.permission_approval_broker.clone(),
             *self.post_turn_hook_dispatch_policy.read().await,
             command_tx.clone(),
             command_rx,
             event_hub.clone(),
-        ));
+        )));
 
         self.state.write().await.threads.insert(
             thread_id.to_owned(),
@@ -1859,123 +1870,8 @@ impl AgentManager {
         Ok(())
     }
 
-    pub async fn start_turn(
-        &self,
-        thread_id: &str,
-        turn_id: &str,
-        mode: ThreadMode,
-        model: &str,
-        provider_name: &str,
-        workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
-        input: Vec<UserInput>,
-        history: Vec<ChatMessage>,
-    ) -> Result<(), AgentStartError> {
-        self.start_turn_with_capabilities(
-            thread_id,
-            turn_id,
-            mode,
-            model,
-            provider_name,
-            workspace_skill_policies,
-            input,
-            Vec::new(),
-            history,
-        )
-        .await
-    }
-
     #[allow(clippy::too_many_arguments)]
-    pub async fn start_turn_with_capabilities(
-        &self,
-        thread_id: &str,
-        turn_id: &str,
-        mode: ThreadMode,
-        model: &str,
-        provider_name: &str,
-        workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
-        input: Vec<UserInput>,
-        capabilities: Vec<TurnCapability>,
-        history: Vec<ChatMessage>,
-    ) -> Result<(), AgentStartError> {
-        self.start_turn_with_resolved_artifacts_and_environment(
-            thread_id,
-            turn_id,
-            mode,
-            model,
-            provider_name,
-            workspace_skill_policies,
-            input,
-            capabilities,
-            Vec::new(),
-            HashMap::new(),
-            history,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn start_turn_with_resolved_artifacts(
-        &self,
-        thread_id: &str,
-        turn_id: &str,
-        mode: ThreadMode,
-        model: &str,
-        provider_name: &str,
-        workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
-        input: Vec<UserInput>,
-        resolved_artifacts: Vec<ResolvedArtifactInput>,
-        history: Vec<ChatMessage>,
-    ) -> Result<(), AgentStartError> {
-        self.start_turn_with_resolved_artifacts_and_environment(
-            thread_id,
-            turn_id,
-            mode,
-            model,
-            provider_name,
-            workspace_skill_policies,
-            input,
-            Vec::new(),
-            resolved_artifacts,
-            HashMap::new(),
-            history,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn start_turn_with_resolved_artifacts_and_environment(
-        &self,
-        thread_id: &str,
-        turn_id: &str,
-        mode: ThreadMode,
-        model: &str,
-        provider_name: &str,
-        workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
-        input: Vec<UserInput>,
-        capabilities: Vec<TurnCapability>,
-        resolved_artifacts: Vec<ResolvedArtifactInput>,
-        runtime_environment: HashMap<String, String>,
-        history: Vec<ChatMessage>,
-    ) -> Result<(), AgentStartError> {
-        self.start_turn_with_resolved_artifacts_environment_and_reasoning(
-            thread_id,
-            turn_id,
-            mode,
-            model,
-            provider_name,
-            workspace_skill_policies,
-            input,
-            capabilities,
-            resolved_artifacts,
-            runtime_environment,
-            history,
-            None,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn start_turn_with_resolved_artifacts_environment_and_reasoning(
+    pub async fn start_turn_with_resolved_artifacts_environment_reasoning_and_permission_profile(
         &self,
         thread_id: &str,
         turn_id: &str,
@@ -1989,6 +1885,7 @@ impl AgentManager {
         runtime_environment: HashMap<String, String>,
         history: Vec<ChatMessage>,
         reasoning_effort: Option<&str>,
+        permission_profile: TurnPermissionProfileSnapshot,
     ) -> Result<(), AgentStartError> {
         let reasoning = reasoning_config_from_effort(reasoning_effort)?;
         self.start_turn_with_hook_context_and_execution_checkpoint_and_reasoning(
@@ -2006,12 +1903,13 @@ impl AgentManager {
             history,
             None,
             reasoning,
+            permission_profile,
         )
         .await
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn start_turn_with_hook_context(
+    pub async fn start_turn_with_hook_context_and_permission_profile(
         &self,
         thread_id: &str,
         turn_id: &str,
@@ -2025,8 +1923,9 @@ impl AgentManager {
         resolved_artifacts: Vec<ResolvedArtifactInput>,
         runtime_environment: HashMap<String, String>,
         history: Vec<ChatMessage>,
+        permission_profile: TurnPermissionProfileSnapshot,
     ) -> Result<(), AgentStartError> {
-        self.start_turn_with_hook_context_and_execution_checkpoint(
+        self.start_turn_with_hook_context_and_execution_checkpoint_and_permission_profile(
             thread_id,
             turn_id,
             mode,
@@ -2040,12 +1939,13 @@ impl AgentManager {
             runtime_environment,
             history,
             None,
+            permission_profile,
         )
         .await
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn start_turn_with_hook_context_and_execution_checkpoint(
+    pub async fn start_turn_with_hook_context_and_execution_checkpoint_and_permission_profile(
         &self,
         thread_id: &str,
         turn_id: &str,
@@ -2060,6 +1960,7 @@ impl AgentManager {
         runtime_environment: HashMap<String, String>,
         history: Vec<ChatMessage>,
         execution_checkpoint_context: Option<ExecutionCheckpointContext>,
+        permission_profile: TurnPermissionProfileSnapshot,
     ) -> Result<(), AgentStartError> {
         self.start_turn_with_hook_context_and_execution_checkpoint_and_reasoning(
             thread_id,
@@ -2076,6 +1977,7 @@ impl AgentManager {
             history,
             execution_checkpoint_context,
             None,
+            permission_profile,
         )
         .await
     }
@@ -2097,6 +1999,7 @@ impl AgentManager {
         history: Vec<ChatMessage>,
         execution_checkpoint_context: Option<ExecutionCheckpointContext>,
         reasoning: Option<ReasoningConfig>,
+        permission_profile: TurnPermissionProfileSnapshot,
     ) -> Result<(), AgentStartError> {
         let command_tx = {
             let state = self.state.read().await;
@@ -2123,6 +2026,7 @@ impl AgentManager {
                 runtime_environment,
                 history,
                 execution_checkpoint_context,
+                permission_profile,
                 ack: ack_tx,
             })
             .await

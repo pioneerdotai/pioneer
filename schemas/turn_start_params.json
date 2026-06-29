@@ -233,12 +233,6 @@
     "TurnCLIRuntimeOptions": {
       "type": "object",
       "properties": {
-        "approval_policy": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "effort": {
           "type": [
             "string",

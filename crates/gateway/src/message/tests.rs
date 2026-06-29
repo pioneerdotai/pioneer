@@ -143,6 +143,10 @@ use tokio::sync::{Mutex as TokioMutex, Notify, mpsc};
 use tokio::time::{Duration, sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
 
+fn default_test_permission_profile() -> pioneer_protocol::TurnPermissionProfileSnapshot {
+    pioneer_protocol::default_turn_permission_profile_snapshot()
+}
+
 #[derive(Default)]
 struct RecordingThreadEpisodicIngestor {
     calls: TokioMutex<Vec<ThreadEpisodicCommittedItem>>,
@@ -2651,7 +2655,7 @@ async fn setup_progress_delta_harness(
         origin: Default::default(),
         error: None,
         prompt_manifest: None,
-        permission_profile: None,
+        permission_profile: default_test_permission_profile(),
     };
     crud_store
         .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
@@ -3024,7 +3028,7 @@ async fn long_russian_first_message_generates_parent_title_successfully() {
         origin: Default::default(),
         error: None,
         prompt_manifest: None,
-        permission_profile: None,
+        permission_profile: default_test_permission_profile(),
     };
     let long_russian = "Очень длинное русскоязычное сообщение ".repeat(120);
     crud_store
@@ -3102,7 +3106,7 @@ async fn repeated_title_triggers_are_singleflight_per_thread() {
         origin: Default::default(),
         error: None,
         prompt_manifest: None,
-        permission_profile: None,
+        permission_profile: default_test_permission_profile(),
     };
     crud_store
         .materialize_turn_start(
@@ -3186,7 +3190,7 @@ async fn title_generation_retries_after_transient_failure() {
         origin: Default::default(),
         error: None,
         prompt_manifest: None,
-        permission_profile: None,
+        permission_profile: default_test_permission_profile(),
     };
     crud_store
         .materialize_turn_start(
@@ -3270,7 +3274,7 @@ async fn child_thread_scope_skips_auto_title_generation() {
         origin: Default::default(),
         error: None,
         prompt_manifest: None,
-        permission_profile: None,
+        permission_profile: default_test_permission_profile(),
     };
     crud_store
         .materialize_turn_start(&thread, SandboxMode::FullAccess, &seed_turn, &[])
@@ -3469,7 +3473,7 @@ async fn setup_write_file_artifact_registration_gateway(
                 origin: Default::default(),
                 error: None,
                 prompt_manifest: None,
-                permission_profile: None,
+                permission_profile: default_test_permission_profile(),
             },
             &[],
         )
@@ -3646,7 +3650,7 @@ async fn materialize_artifact_api_thread(
         origin: Default::default(),
         error: None,
         prompt_manifest: None,
-        permission_profile: None,
+        permission_profile: default_test_permission_profile(),
     };
     crud_store
         .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
@@ -5792,7 +5796,7 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery() {
         origin: Default::default(),
         error: None,
         prompt_manifest: None,
-        permission_profile: None,
+        permission_profile: default_test_permission_profile(),
     };
     crud_store
         .materialize_turn_start(
@@ -8026,7 +8030,7 @@ async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn() {
         origin: Default::default(),
         error: None,
         prompt_manifest: None,
-        permission_profile: None,
+        permission_profile: default_test_permission_profile(),
     };
     crud_store
         .materialize_turn_start(
@@ -8948,7 +8952,7 @@ async fn task_delivery_worker_uses_lineage_parent_turn_for_owner_thread() {
         origin: TurnOrigin::ScheduledTask,
         error: None,
         prompt_manifest: None,
-        permission_profile: None,
+        permission_profile: default_test_permission_profile(),
     };
     processor
         .crud_store
@@ -10012,7 +10016,7 @@ async fn direct_durable_item_completed_persists_before_committed_notification() 
                 origin: Default::default(),
                 error: None,
                 prompt_manifest: None,
-                permission_profile: None,
+                permission_profile: default_test_permission_profile(),
             },
             &[],
         )
@@ -10136,7 +10140,7 @@ async fn user_message_lifecycle_ingests_thread_episodic_source_after_commit() {
                 origin: Default::default(),
                 error: None,
                 prompt_manifest: None,
-                permission_profile: None,
+                permission_profile: default_test_permission_profile(),
             },
             &[],
         )
@@ -10301,11 +10305,9 @@ async fn user_message_lifecycle_survives_permission_profile_audit_event() {
                 origin: Default::default(),
                 error: None,
                 prompt_manifest: None,
-                permission_profile: Some(
-                    pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
-                        pioneer_protocol::TurnPermissionMode::FullAccess,
-                        pioneer_protocol::TurnPermissionProfileSource::Composer,
-                    ),
+                permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+                    pioneer_protocol::TurnPermissionMode::FullAccess,
+                    pioneer_protocol::TurnPermissionProfileSource::Composer,
                 ),
             },
             &[],
@@ -10424,7 +10426,7 @@ async fn direct_durable_item_completed_ingestion_failure_does_not_block_commit()
                 origin: Default::default(),
                 error: None,
                 prompt_manifest: None,
-                permission_profile: None,
+                permission_profile: default_test_permission_profile(),
             },
             &[],
         )
@@ -10725,20 +10727,25 @@ async fn direct_durable_execution_window_lifecycle_updates_rows() {
         "connection should subscribe to execution window notifications"
     );
     thread_manager
-        .system_turn_start(pioneer_protocol::TurnStartParams {
-            thread_id: thread_id.to_owned(),
-            turn_id: turn_id.to_owned(),
-            input: Vec::new(),
-            capabilities: Vec::new(),
-            model: None,
-            model_provider: None,
-            sandbox_policy: None,
-            mode: None,
-            execution_backend: None,
-            reasoning: None,
-            permission_profile: None,
-            cli_runtime_options: None,
-        })
+        .system_turn_start_with_permission_profile(
+            pioneer_protocol::TurnStartParams {
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                input: Vec::new(),
+                capabilities: Vec::new(),
+                model: None,
+                model_provider: None,
+                sandbox_policy: None,
+                mode: None,
+                execution_backend: None,
+                reasoning: None,
+                permission_profile: None,
+                cli_runtime_options: None,
+            },
+            pioneer_protocol::system_turn_permission_profile_snapshot(
+                pioneer_protocol::TurnPermissionMode::FullAccess,
+            ),
+        )
         .await
         .expect("turn should start in thread manager");
 
@@ -10753,7 +10760,7 @@ async fn direct_durable_execution_window_lifecycle_updates_rows() {
                 origin: Default::default(),
                 error: None,
                 prompt_manifest: None,
-                permission_profile: None,
+                permission_profile: default_test_permission_profile(),
             },
             &[],
         )
@@ -11296,20 +11303,25 @@ async fn setup_execution_window_terminal_turn(
         .await
         .expect("thread should start");
     thread_manager
-        .system_turn_start(pioneer_protocol::TurnStartParams {
-            thread_id: thread_id.to_owned(),
-            turn_id: turn_id.to_owned(),
-            input: Vec::new(),
-            capabilities: Vec::new(),
-            model: None,
-            model_provider: None,
-            sandbox_policy: None,
-            mode: None,
-            execution_backend: None,
-            reasoning: None,
-            permission_profile: None,
-            cli_runtime_options: None,
-        })
+        .system_turn_start_with_permission_profile(
+            pioneer_protocol::TurnStartParams {
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                input: Vec::new(),
+                capabilities: Vec::new(),
+                model: None,
+                model_provider: None,
+                sandbox_policy: None,
+                mode: None,
+                execution_backend: None,
+                reasoning: None,
+                permission_profile: None,
+                cli_runtime_options: None,
+            },
+            pioneer_protocol::system_turn_permission_profile_snapshot(
+                pioneer_protocol::TurnPermissionMode::FullAccess,
+            ),
+        )
         .await
         .expect("turn should start in thread manager");
     crud_store
@@ -11323,7 +11335,7 @@ async fn setup_execution_window_terminal_turn(
                 origin: Default::default(),
                 error: None,
                 prompt_manifest: None,
-                permission_profile: None,
+                permission_profile: default_test_permission_profile(),
             },
             &[],
         )
@@ -13179,7 +13191,7 @@ async fn codex_thread_ops_name_sync_failure_does_not_break_pioneer_rename() {
         origin: Default::default(),
         error: None,
         prompt_manifest: None,
-        permission_profile: None,
+        permission_profile: default_test_permission_profile(),
     };
     crud_store
         .materialize_turn_start(&started.thread, SandboxMode::FullAccess, &turn, &[])
@@ -13595,7 +13607,7 @@ async fn cli_runtime_turn_start_blocker_reconciles_db_only_terminal_binding() {
                     origin: TurnOrigin::User,
                     error: None,
                     prompt_manifest: None,
-                    permission_profile: None,
+                    permission_profile: default_test_permission_profile(),
                 },
             },
             chrono::Utc::now().timestamp(),
@@ -14012,7 +14024,7 @@ async fn cli_runtime_stale_db_only_running_binding_marks_turn_failed() {
         origin: TurnOrigin::User,
         error: None,
         prompt_manifest: None,
-        permission_profile: None,
+        permission_profile: default_test_permission_profile(),
     };
     crud_store
         .materialize_turn_start(
@@ -14129,7 +14141,7 @@ async fn cli_runtime_stale_scan_reconciles_db_only_terminal_binding() {
                     origin: TurnOrigin::User,
                     error: None,
                     prompt_manifest: None,
-                    permission_profile: None,
+                    permission_profile: default_test_permission_profile(),
                 },
             },
             chrono::Utc::now().timestamp(),
@@ -15799,7 +15811,7 @@ async fn cli_runtime_human_wait_without_turn_binding_does_not_defer_timeout() {
         origin: TurnOrigin::User,
         error: None,
         prompt_manifest: None,
-        permission_profile: None,
+        permission_profile: default_test_permission_profile(),
     };
     crud_store
         .materialize_turn_start(
@@ -16293,7 +16305,7 @@ async fn seed_cli_runtime_approval_turn(
         origin: TurnOrigin::User,
         error: None,
         prompt_manifest: None,
-        permission_profile: None,
+        permission_profile: default_test_permission_profile(),
     };
     crud_store
         .materialize_turn_start(
@@ -20021,23 +20033,28 @@ async fn setup_live_semantic_timeline_harness(case_id: &str) -> LiveSemanticTime
         "live semantic connection should subscribe to the thread"
     );
     thread_manager
-        .system_turn_start(pioneer_protocol::TurnStartParams {
-            thread_id: thread_id.clone(),
-            turn_id: turn_id.clone(),
-            input: vec![UserInput::Text {
-                text: format!("semantic live {case_id} input"),
-                text_elements: Vec::new(),
-            }],
-            capabilities: Vec::new(),
-            model: None,
-            model_provider: None,
-            sandbox_policy: None,
-            mode: None,
-            execution_backend: None,
-            reasoning: None,
-            permission_profile: None,
-            cli_runtime_options: None,
-        })
+        .system_turn_start_with_permission_profile(
+            pioneer_protocol::TurnStartParams {
+                thread_id: thread_id.clone(),
+                turn_id: turn_id.clone(),
+                input: vec![UserInput::Text {
+                    text: format!("semantic live {case_id} input"),
+                    text_elements: Vec::new(),
+                }],
+                capabilities: Vec::new(),
+                model: None,
+                model_provider: None,
+                sandbox_policy: None,
+                mode: None,
+                execution_backend: None,
+                reasoning: None,
+                permission_profile: None,
+                cli_runtime_options: None,
+            },
+            pioneer_protocol::system_turn_permission_profile_snapshot(
+                pioneer_protocol::TurnPermissionMode::FullAccess,
+            ),
+        )
         .await
         .expect("live semantic turn should start in thread manager");
 
@@ -20052,7 +20069,7 @@ async fn setup_live_semantic_timeline_harness(case_id: &str) -> LiveSemanticTime
                 origin: Default::default(),
                 error: None,
                 prompt_manifest: None,
-                permission_profile: None,
+                permission_profile: default_test_permission_profile(),
             },
             &[UserInput::Text {
                 text: format!("semantic live {case_id} input"),
@@ -20964,7 +20981,7 @@ fn semantic_fixture_turn(turn_id: &str, status: TurnStatus) -> Turn {
         origin: Default::default(),
         error: None,
         prompt_manifest: None,
-        permission_profile: None,
+        permission_profile: default_test_permission_profile(),
     }
 }
 
@@ -21032,7 +21049,7 @@ async fn recovery_lifecycle_notification_is_persisted_for_history_replay() {
         origin: Default::default(),
         error: None,
         prompt_manifest: None,
-        permission_profile: None,
+        permission_profile: default_test_permission_profile(),
     };
     crud_store
         .materialize_turn_start(
@@ -27005,7 +27022,7 @@ fn phase_13_turn(turn_id: &str, status: TurnStatus) -> Turn {
         origin: Default::default(),
         error: None,
         prompt_manifest: None,
-        permission_profile: None,
+        permission_profile: default_test_permission_profile(),
     }
 }
 
@@ -28760,7 +28777,7 @@ async fn memory_provider_recall_calls_memory_service() {
                 origin: Default::default(),
                 error: None,
                 prompt_manifest: None,
-                permission_profile: None,
+                permission_profile: default_test_permission_profile(),
             },
             &[],
         )

@@ -5,7 +5,7 @@ use pioneer_agent::{
 };
 use pioneer_crud::{NewTurnRuntimeSnapshot, TurnRuntimeSnapshotRecord};
 use pioneer_protocol::ReasoningEffort;
-use pioneer_protocol::{ThreadMode, TurnCapability, UserInput};
+use pioneer_protocol::{ThreadMode, TurnCapability, TurnPermissionProfileSnapshot, UserInput};
 use pioneer_provider::{ChatMessage, ReasoningConfig};
 use pioneer_skills::SkillPolicyKey;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -64,6 +64,7 @@ pub(crate) fn new_turn_runtime_snapshot(
 
 pub(crate) fn restored_recovery_turn_request_from_snapshot(
     snapshot: &TurnRuntimeSnapshotRecord,
+    permission_profile: TurnPermissionProfileSnapshot,
 ) -> Result<RestoredRecoveryTurnRequest> {
     Ok(RestoredRecoveryTurnRequest {
         turn_id: snapshot.turn_id.clone(),
@@ -94,6 +95,7 @@ pub(crate) fn restored_recovery_turn_request_from_snapshot(
             "runtime environment",
         )?,
         history: from_snapshot_json(&snapshot.history_json, "conversation history")?,
+        permission_profile,
     })
 }
 

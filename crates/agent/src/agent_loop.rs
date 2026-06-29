@@ -10,16 +10,19 @@ use crate::hooks::{
     AgentTurnPostTurnHookDispatch, AgentTurnPostTurnSummary, EffectiveTurnPolicySet,
     EffectiveTurnPromptContextSet, run_agent_turn_post_turn_hook_phase,
 };
+use futures_util::FutureExt;
 use pioneer_hooks::{HookRuntime, TurnPostTurnStatus};
 use pioneer_protocol::{
     AgentDurableEvent, ExecutionWindowStatus, RecoveryAttemptContext, ThreadMode, TurnCapability,
-    TurnExecutionWindowBlockedNotification, TurnExecutionWindowContinuedNotification, UserInput,
+    TurnExecutionWindowBlockedNotification, TurnExecutionWindowContinuedNotification,
+    TurnPermissionProfileSnapshot, UserInput,
 };
 use pioneer_provider::{ChatMessage, Provider, ProviderRegistry};
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep};
 use tracing::{debug, error};
@@ -196,6 +199,7 @@ pub(super) async fn run_agent_loop(
     task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
     hook_runtime: Option<Arc<HookRuntime>>,
     tool_bundle_artifacts: Option<Arc<AgentToolBundleArtifactStore>>,
+    permission_approval_broker: Arc<RwLock<Arc<dyn pioneer_tools::PermissionApprovalBroker>>>,
     post_turn_hook_dispatch_policy: AgentPostTurnHookDispatchPolicy,
     command_tx: mpsc::Sender<AgentCommand>,
     mut command_rx: mpsc::Receiver<AgentCommand>,
@@ -226,6 +230,7 @@ pub(super) async fn run_agent_loop(
                 runtime_environment,
                 history,
                 execution_checkpoint_context,
+                permission_profile,
                 ack,
             } => {
                 if active_turn_id.is_some() {
@@ -260,6 +265,7 @@ pub(super) async fn run_agent_loop(
                     execution_checkpoint_context,
                     execution_usage,
                     execution_options: super::TurnExecutionOptions::default(),
+                    permission_profile,
                 };
 
                 let provider = match provider_registry
@@ -301,6 +307,7 @@ pub(super) async fn run_agent_loop(
                     task_tool_provider.clone(),
                     hook_runtime.clone(),
                     tool_bundle_artifacts.clone(),
+                    permission_approval_broker.clone(),
                     provider,
                     turn_request,
                     turn_control,
@@ -554,6 +561,7 @@ pub(super) async fn run_agent_loop(
                             task_tool_provider.clone(),
                             hook_runtime.clone(),
                             tool_bundle_artifacts.clone(),
+                            permission_approval_broker.clone(),
                             provider,
                             next_turn_request,
                             turn_control,
@@ -857,6 +865,7 @@ pub(super) async fn run_agent_loop(
                         task_tool_provider.clone(),
                         hook_runtime.clone(),
                         tool_bundle_artifacts.clone(),
+                        permission_approval_broker.clone(),
                         provider,
                         turn_request,
                         turn_control,
@@ -951,6 +960,7 @@ pub(super) async fn run_agent_loop(
                     task_tool_provider.clone(),
                     hook_runtime.clone(),
                     tool_bundle_artifacts.clone(),
+                    permission_approval_broker.clone(),
                     provider,
                     turn_request,
                     turn_control,
@@ -992,6 +1002,7 @@ pub(super) async fn run_agent_loop(
                     execution_checkpoint_context: None,
                     execution_usage: super::TurnExecutionUsageCounters::default(),
                     execution_options: super::TurnExecutionOptions::default(),
+                    permission_profile: turn_request.permission_profile,
                 };
 
                 super::apply_recovery_adjustments(&mut active_request, &recovery_request);
@@ -1039,6 +1050,7 @@ pub(super) async fn run_agent_loop(
                     task_tool_provider.clone(),
                     hook_runtime.clone(),
                     tool_bundle_artifacts.clone(),
+                    permission_approval_broker.clone(),
                     provider,
                     active_request,
                     turn_control,
@@ -1071,15 +1083,17 @@ fn spawn_turn_task(
     task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
     hook_runtime: Option<Arc<HookRuntime>>,
     tool_bundle_artifacts: Option<Arc<AgentToolBundleArtifactStore>>,
+    permission_approval_broker: Arc<RwLock<Arc<dyn pioneer_tools::PermissionApprovalBroker>>>,
     provider: Arc<dyn Provider>,
     turn_request: ActiveTurnRequest,
     turn_control: TurnExecutionControl,
     recovery: Option<RecoveryAttemptContext>,
     run_id: u64,
 ) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let result = turn_flow_future(execute_turn_flow(
-            thread_id,
+    tokio::spawn(turn_flow_future(async move {
+        let permission_approval_broker = permission_approval_broker.read().await.clone();
+        let result = AssertUnwindSafe(turn_flow_future(execute_turn_flow(
+            thread_id.clone(),
             turn_request.turn_id.clone(),
             workspace_id,
             turn_request.mode,
@@ -1097,6 +1111,7 @@ fn spawn_turn_task(
             turn_request.retained_llm_context,
             turn_request.execution_window_index,
             turn_request.execution_checkpoint_context,
+            turn_request.permission_profile,
             turn_request.execution_options.force_non_stream,
             turn_request.execution_options.disable_tool_calling,
             turn_request.execution_options.continue_generation_hint,
@@ -1107,11 +1122,28 @@ fn spawn_turn_task(
             task_tool_provider,
             hook_runtime,
             tool_bundle_artifacts,
+            permission_approval_broker,
             turn_control,
             recovery,
             event_hub,
-        ))
-        .await;
+        )))
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|panic| {
+            let message = panic_payload_message(panic.as_ref());
+            error!(
+                thread_id = %thread_id,
+                turn_id = %turn_request.turn_id,
+                message,
+                "agent turn task panicked"
+            );
+            TurnTaskCompletion {
+                result: Err(TurnTaskFailure::Terminal(format!(
+                    "agent turn task panicked: {message}"
+                ))),
+                post_turn_dispatch: None,
+            }
+        });
 
         let _ = command_tx
             .send(AgentCommand::TurnTaskFinished {
@@ -1120,7 +1152,17 @@ fn spawn_turn_task(
                 completion: result,
             })
             .await;
-    })
+    }))
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_owned();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "non-string panic payload".to_owned()
 }
 
 fn recovery_context(request: &super::RecoveryAttemptRequest) -> RecoveryAttemptContext {
@@ -1152,6 +1194,7 @@ async fn execute_turn_flow(
     retained_llm_context: Vec<super::RetainedToolLlmContext>,
     execution_window_index: u32,
     execution_checkpoint_context: Option<super::ExecutionCheckpointContext>,
+    permission_profile: TurnPermissionProfileSnapshot,
     force_non_stream: bool,
     disable_tool_calling: bool,
     continue_generation_hint: bool,
@@ -1162,6 +1205,7 @@ async fn execute_turn_flow(
     task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
     hook_runtime: Option<Arc<HookRuntime>>,
     tool_bundle_artifacts: Option<Arc<AgentToolBundleArtifactStore>>,
+    permission_approval_broker: Arc<dyn pioneer_tools::PermissionApprovalBroker>,
     turn_control: TurnExecutionControl,
     recovery: Option<RecoveryAttemptContext>,
     event_hub: Arc<AgentEventHub>,
@@ -1186,6 +1230,7 @@ async fn execute_turn_flow(
             retained_llm_context,
             execution_window_index,
             execution_checkpoint_context,
+            permission_profile,
             force_non_stream,
             disable_tool_calling,
             continue_generation_hint,
@@ -1196,6 +1241,7 @@ async fn execute_turn_flow(
             task_tool_provider,
             hook_runtime,
             tool_bundle_artifacts,
+            permission_approval_broker,
             turn_control,
             recovery,
             event_hub,
@@ -1254,9 +1300,9 @@ fn maybe_spawn_post_turn_hook_dispatch(
         return;
     }
 
-    tokio::spawn(async move {
+    tokio::spawn(turn_flow_future(async move {
         run_agent_turn_post_turn_hook_phase(hook_runtime.as_ref(), dispatch).await;
-    });
+    }));
 }
 
 fn synthesize_post_turn_failure_dispatch(

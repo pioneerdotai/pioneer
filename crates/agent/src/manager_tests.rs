@@ -5,9 +5,10 @@ use super::{
     AgentTurnHookRuntimeContext, MemoryExtractionPolicy, MemoryRecallItem, MemoryRecallRequest,
     MemoryRecallSnapshot, MemoryToolMaterialization, MemoryTurnContext, MemoryTurnPolicy,
     MemoryTurnPolicyContext, MemoryTurnPolicyRequest, PendingAttachedTask, RecoveryAttemptRequest,
-    ReviewRequiredTaskObservation, TaskToolMaterialization, TaskToolProvider, TaskTurnContext,
-    ToolLoopConfig, TurnExecutionControl, TurnFinalizationContext, TurnFinalizationDecision,
-    TurnFinalizationProvider, TurnToolContext, TurnToolMaterialization, TurnToolProvider,
+    ResolvedArtifactInput, ReviewRequiredTaskObservation, TaskToolMaterialization,
+    TaskToolProvider, TaskTurnContext, ToolLoopConfig, TurnExecutionControl,
+    TurnFinalizationContext, TurnFinalizationDecision, TurnFinalizationProvider, TurnToolContext,
+    TurnToolMaterialization, TurnToolProvider, WorkspaceSkillPolicy,
 };
 use futures_util::StreamExt;
 use pioneer_hooks::{
@@ -35,11 +36,11 @@ use pioneer_protocol::{
 };
 use pioneer_provider::providers::EchoProvider;
 use pioneer_provider::{
-    AttachmentDataSource, ChatRequest, ChatResponse, InputTypeSupport, MessageContentPart,
-    Provider, ProviderCapabilities, ProviderInputCapabilities, ProviderRegistry, ProviderToolCall,
-    ReasoningConfig, ReasoningEffort, Role, StreamChunk,
+    AttachmentDataSource, ChatMessage, ChatRequest, ChatResponse, InputTypeSupport,
+    MessageContentPart, Provider, ProviderCapabilities, ProviderInputCapabilities,
+    ProviderRegistry, ProviderToolCall, ReasoningConfig, ReasoningEffort, Role, StreamChunk,
 };
-use pioneer_skills::{SkillAuditAction, SkillAuditDecision, SkillTrustLevel};
+use pioneer_skills::{SkillAuditAction, SkillAuditDecision, SkillPolicyKey, SkillTrustLevel};
 use pioneer_tools::{
     ComputerUseToolsConfig, ConfiguredToolSpec, ExecutionClass, ExecutionWindowsConfig,
     FunctionToolOutput, PayloadKind, ToolError, ToolEventTrace, ToolExtensionBundle, ToolHandler,
@@ -138,6 +139,132 @@ fn test_tool_loop_config() -> ToolLoopConfig {
         budget: ToolLoopBudgetConfig::default(),
         execution_windows: ExecutionWindowsConfig::default(),
         retry: ToolRetryBudgetConfig::default(),
+    }
+}
+
+impl AgentManager {
+    async fn start_test_turn_with_default_profile(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        mode: ThreadMode,
+        model: &str,
+        provider_name: &str,
+        workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
+        input: Vec<UserInput>,
+        history: Vec<ChatMessage>,
+    ) -> Result<(), AgentStartError> {
+        self.start_test_turn_with_default_profile_and_capabilities(
+            thread_id,
+            turn_id,
+            mode,
+            model,
+            provider_name,
+            workspace_skill_policies,
+            input,
+            Vec::new(),
+            history,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_test_turn_with_default_profile_and_capabilities(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        mode: ThreadMode,
+        model: &str,
+        provider_name: &str,
+        workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
+        input: Vec<UserInput>,
+        capabilities: Vec<TurnCapability>,
+        history: Vec<ChatMessage>,
+    ) -> Result<(), AgentStartError> {
+        self.start_turn_with_resolved_artifacts_environment_reasoning_and_permission_profile(
+            thread_id,
+            turn_id,
+            mode,
+            model,
+            provider_name,
+            workspace_skill_policies,
+            input,
+            capabilities,
+            Vec::new(),
+            HashMap::new(),
+            history,
+            None,
+            pioneer_protocol::default_turn_permission_profile_snapshot(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_test_turn_with_default_profile_artifacts_environment_and_reasoning(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        mode: ThreadMode,
+        model: &str,
+        provider_name: &str,
+        workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
+        input: Vec<UserInput>,
+        capabilities: Vec<TurnCapability>,
+        resolved_artifacts: Vec<ResolvedArtifactInput>,
+        runtime_environment: HashMap<String, String>,
+        history: Vec<ChatMessage>,
+        reasoning_effort: Option<&str>,
+    ) -> Result<(), AgentStartError> {
+        self.start_turn_with_resolved_artifacts_environment_reasoning_and_permission_profile(
+            thread_id,
+            turn_id,
+            mode,
+            model,
+            provider_name,
+            workspace_skill_policies,
+            input,
+            capabilities,
+            resolved_artifacts,
+            runtime_environment,
+            history,
+            reasoning_effort,
+            pioneer_protocol::default_turn_permission_profile_snapshot(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_test_turn_with_default_profile_hook_context(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        mode: ThreadMode,
+        hook_runtime_context: AgentTurnHookRuntimeContext,
+        model: &str,
+        provider_name: &str,
+        workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
+        input: Vec<UserInput>,
+        capabilities: Vec<TurnCapability>,
+        resolved_artifacts: Vec<ResolvedArtifactInput>,
+        runtime_environment: HashMap<String, String>,
+        history: Vec<ChatMessage>,
+    ) -> Result<(), AgentStartError> {
+        self.start_turn_with_hook_context_and_permission_profile(
+            thread_id,
+            turn_id,
+            mode,
+            hook_runtime_context,
+            model,
+            provider_name,
+            workspace_skill_policies,
+            input,
+            capabilities,
+            resolved_artifacts,
+            runtime_environment,
+            history,
+            pioneer_protocol::default_turn_permission_profile_snapshot(),
+        )
+        .await
     }
 }
 
@@ -2947,7 +3074,8 @@ fn test_agent_event_from_durable(event: AgentDurableEvent) -> Option<AgentEvent>
         | AgentDurableEvent::TurnExecutionWindowExhausted { .. }
         | AgentDurableEvent::TurnExecutionWindowCheckpointed { .. }
         | AgentDurableEvent::TurnExecutionWindowContinued { .. }
-        | AgentDurableEvent::TurnExecutionWindowBlocked { .. } => None,
+        | AgentDurableEvent::TurnExecutionWindowBlocked { .. }
+        | AgentDurableEvent::TurnPermissionAudit { .. } => None,
         AgentDurableEvent::ProviderFailureDetected {
             thread_id,
             turn_id,
@@ -3196,7 +3324,7 @@ async fn start_simple_turn(
         .expect("thread should be created");
     let mut events = subscribe_agent_events(manager, thread_id).await;
     manager
-        .start_turn_with_capabilities(
+        .start_test_turn_with_default_profile_and_capabilities(
             thread_id,
             turn_id,
             mode,
@@ -3574,7 +3702,7 @@ async fn third_consecutive_empty_no_tool_round_surfaces_provider_failure() {
         .expect("thread should be created");
     let mut events = subscribe_agent_events(&manager, thread_id).await;
     manager
-        .start_turn_with_capabilities(
+        .start_test_turn_with_default_profile_and_capabilities(
             thread_id,
             turn_id,
             ThreadMode::Agent,
@@ -3661,7 +3789,7 @@ async fn third_consecutive_tool_schema_dump_no_tool_round_surfaces_provider_fail
         .expect("thread should be created");
     let mut events = subscribe_agent_events(&manager, thread_id).await;
     manager
-        .start_turn_with_capabilities(
+        .start_test_turn_with_default_profile_and_capabilities(
             thread_id,
             turn_id,
             ThreadMode::Agent,
@@ -3742,7 +3870,7 @@ async fn context_isolation_old_task_local_constraint_stays_historical() {
     let mut events = subscribe_agent_events(&manager, thread_id).await;
 
     manager
-        .start_turn_with_capabilities(
+        .start_test_turn_with_default_profile_and_capabilities(
             thread_id,
             "context_isolation_turn_1",
             ThreadMode::Agent,
@@ -3762,7 +3890,7 @@ async fn context_isolation_old_task_local_constraint_stays_historical() {
     assert_turn_completed(&first_observed);
 
     manager
-        .start_turn_with_capabilities(
+        .start_test_turn_with_default_profile_and_capabilities(
             thread_id,
             "context_isolation_turn_2",
             ThreadMode::Agent,
@@ -4064,7 +4192,7 @@ async fn chat_mode_request_includes_selected_reasoning_effort() {
     let mut events = subscribe_agent_events(&manager, thread_id).await;
 
     manager
-        .start_turn_with_resolved_artifacts_environment_and_reasoning(
+        .start_test_turn_with_default_profile_artifacts_environment_and_reasoning(
             thread_id,
             turn_id,
             ThreadMode::Chat,
@@ -4119,7 +4247,7 @@ async fn agent_tool_loop_requests_include_selected_reasoning_effort_each_round()
     let mut events = subscribe_agent_events(&manager, thread_id).await;
 
     manager
-        .start_turn_with_resolved_artifacts_environment_and_reasoning(
+        .start_test_turn_with_default_profile_artifacts_environment_and_reasoning(
             thread_id,
             turn_id,
             ThreadMode::Agent,
@@ -4310,7 +4438,7 @@ async fn task_runtime_turn_hook_context_marks_post_turn_as_task_owned() {
     let mut events = subscribe_agent_events(&manager, "thr_task_runtime_hook").await;
 
     manager
-        .start_turn_with_hook_context(
+        .start_test_turn_with_default_profile_hook_context(
             "thr_task_runtime_hook",
             "turn_task_runtime_hook",
             ThreadMode::Agent,
@@ -6998,7 +7126,7 @@ async fn memory_provider_receives_task_runtime_context_for_task_turn() {
     let mut events = subscribe_agent_events(&manager, "thr_memory_task_context").await;
 
     manager
-        .start_turn_with_hook_context(
+        .start_test_turn_with_default_profile_hook_context(
             "thr_memory_task_context",
             "turn_memory_task_context",
             ThreadMode::Agent,
@@ -8721,7 +8849,7 @@ async fn start_loop_budget_turn(
         .expect("thread should be created");
     let events = subscribe_agent_events(manager, thread_id).await;
     manager
-        .start_turn_with_capabilities(
+        .start_test_turn_with_default_profile_and_capabilities(
             thread_id,
             turn_id,
             ThreadMode::Agent,
@@ -9158,7 +9286,7 @@ async fn max_windows_cap_blocks_continuation_without_turn_failed() {
         .expect("thread should expose one durable receiver");
 
     manager
-        .start_turn_with_capabilities(
+        .start_test_turn_with_default_profile_and_capabilities(
             thread_id,
             turn_id,
             ThreadMode::Agent,
@@ -9250,7 +9378,7 @@ async fn total_tool_call_cap_blocks_continuation_without_turn_failed() {
         .expect("thread should expose one durable receiver");
 
     manager
-        .start_turn_with_capabilities(
+        .start_test_turn_with_default_profile_and_capabilities(
             thread_id,
             turn_id,
             ThreadMode::Agent,
@@ -9335,7 +9463,7 @@ async fn consecutive_failed_window_cap_blocks_continuation_without_turn_failed()
         .expect("thread should expose one durable receiver");
 
     manager
-        .start_turn_with_capabilities(
+        .start_test_turn_with_default_profile_and_capabilities(
             thread_id,
             turn_id,
             ThreadMode::Agent,
@@ -9928,7 +10056,7 @@ async fn resolved_tool_items_emit_matching_recovery_policy_snapshots() {
     let mut events = subscribe_agent_events(&manager, thread_id).await;
 
     manager
-        .start_turn_with_capabilities(
+        .start_test_turn_with_default_profile_and_capabilities(
             thread_id,
             turn_id,
             ThreadMode::Agent,
@@ -10006,7 +10134,7 @@ async fn start_turn_emits_lifecycle_events() {
     let mut events = subscribe_agent_events(&manager, "thr_000000000000000001").await;
 
     manager
-        .start_turn_with_capabilities(
+        .start_test_turn_with_default_profile_and_capabilities(
             "thr_000000000000000001",
             "turn_000000000000000001",
             ThreadMode::Agent,
@@ -10083,7 +10211,7 @@ async fn start_turn_initializes_first_execution_window_index() {
         .expect("thread should expose one durable receiver");
 
     manager
-        .start_turn_with_capabilities(
+        .start_test_turn_with_default_profile_and_capabilities(
             thread_id,
             turn_id,
             ThreadMode::Agent,
@@ -10135,7 +10263,7 @@ async fn start_turn_rejects_second_running_turn() {
         .expect("thread should be created");
 
     manager
-        .start_turn_with_capabilities(
+        .start_test_turn_with_default_profile_and_capabilities(
             "thr_000000000000000002",
             "turn_000000000000000002",
             ThreadMode::Chat,
@@ -10153,7 +10281,7 @@ async fn start_turn_rejects_second_running_turn() {
         .expect("first turn should start");
 
     let error = manager
-        .start_turn(
+        .start_test_turn_with_default_profile(
             "thr_000000000000000002",
             "turn_000000000000000003",
             ThreadMode::Chat,
@@ -10191,7 +10319,7 @@ async fn cancel_turn_emits_interrupted_durable_event() {
         .expect("thread should expose one durable receiver");
 
     manager
-        .start_turn(
+        .start_test_turn_with_default_profile(
             thread_id,
             turn_id,
             ThreadMode::Chat,
@@ -10264,7 +10392,7 @@ async fn non_tool_recovery_request_restarts_turn_without_failing() {
     let mut events = subscribe_agent_events(&manager, thread_id).await;
 
     manager
-        .start_turn(
+        .start_test_turn_with_default_profile(
             thread_id,
             turn_id,
             ThreadMode::Chat,
@@ -10362,7 +10490,7 @@ async fn continue_generation_recovery_is_compiled_into_system_prompt() {
     let mut events = subscribe_agent_events(&manager, thread_id).await;
 
     manager
-        .start_turn_with_capabilities(
+        .start_test_turn_with_default_profile_and_capabilities(
             thread_id,
             turn_id,
             ThreadMode::Agent,
@@ -10486,7 +10614,7 @@ async fn provider_recovery_success_boundary_clears_recovery_before_later_provide
     let mut events = subscribe_agent_events(&manager, thread_id).await;
 
     manager
-        .start_turn_with_capabilities(
+        .start_test_turn_with_default_profile_and_capabilities(
             thread_id,
             turn_id,
             ThreadMode::Agent,
@@ -10632,7 +10760,7 @@ async fn explicit_skill_input_injects_compact_skill_prompt_and_binding() {
     let mut events = subscribe_agent_events(&manager, thread_id).await;
 
     manager
-        .start_turn_with_capabilities(
+        .start_test_turn_with_default_profile_and_capabilities(
             thread_id,
             turn_id,
             ThreadMode::Agent,
@@ -10747,7 +10875,7 @@ async fn rejected_capability_emits_event_warning_and_manifest_diagnostic() {
     let mut events = subscribe_agent_events(&manager, thread_id).await;
 
     manager
-        .start_turn_with_capabilities(
+        .start_test_turn_with_default_profile_and_capabilities(
             thread_id,
             turn_id,
             ThreadMode::Agent,
@@ -10887,7 +11015,7 @@ async fn explicit_skill_input_injects_compact_prompt_for_non_tool_calling_provid
     let mut events = subscribe_agent_events(&manager, thread_id).await;
 
     manager
-        .start_turn_with_capabilities(
+        .start_test_turn_with_default_profile_and_capabilities(
             thread_id,
             turn_id,
             ThreadMode::Agent,
@@ -11039,7 +11167,7 @@ async fn active_skill_contributes_dynamic_tool_definition_to_model_request() {
     let mut events = subscribe_agent_events(&manager, "thr_000000000000000120").await;
 
     manager
-        .start_turn_with_capabilities(
+        .start_test_turn_with_default_profile_and_capabilities(
             "thr_000000000000000120",
             "turn_000000000000000120",
             ThreadMode::Agent,
@@ -11107,7 +11235,7 @@ async fn explicit_mcp_tool_contributes_dynamic_tool_definition_without_prompt_se
     let mut events = subscribe_agent_events(&manager, thread_id).await;
 
     manager
-        .start_turn_with_capabilities(
+        .start_test_turn_with_default_profile_and_capabilities(
             thread_id,
             turn_id,
             ThreadMode::Agent,
@@ -11238,7 +11366,7 @@ async fn text_file_skill_and_mcp_capabilities_survive_single_turn_prompt_gate() 
     let mut events = subscribe_agent_events(&manager, thread_id).await;
 
     manager
-        .start_turn_with_capabilities(
+        .start_test_turn_with_default_profile_and_capabilities(
             thread_id,
             turn_id,
             ThreadMode::Agent,
@@ -11430,7 +11558,7 @@ async fn dynamic_skill_tool_executes_and_emits_dynamic_tool_call() {
     let mut events = subscribe_agent_events(&manager, thread_id).await;
 
     manager
-        .start_turn_with_capabilities(
+        .start_test_turn_with_default_profile_and_capabilities(
             thread_id,
             turn_id,
             ThreadMode::Agent,
@@ -11582,7 +11710,7 @@ async fn tool_recovery_succeeds_at_tool_attempt_boundary() {
     let mut events = subscribe_agent_events(&manager, thread_id).await;
 
     manager
-        .start_turn_with_capabilities(
+        .start_test_turn_with_default_profile_and_capabilities(
             thread_id,
             turn_id,
             ThreadMode::Agent,
@@ -11720,7 +11848,7 @@ runtime:
         .expect("thread should be created");
 
     manager
-        .start_turn_with_capabilities(
+        .start_test_turn_with_default_profile_and_capabilities(
             thread_id,
             turn_id,
             ThreadMode::Agent,
@@ -11806,7 +11934,7 @@ async fn skill_resolution_emits_allowed_and_blocked_audit_events() {
     let mut events = subscribe_agent_events(&manager, thread_id).await;
 
     manager
-        .start_turn_with_capabilities(
+        .start_test_turn_with_default_profile_and_capabilities(
             thread_id,
             turn_id,
             ThreadMode::Agent,
@@ -11910,7 +12038,7 @@ async fn read_skill_returns_active_skill_body() {
     let mut events = subscribe_agent_events(&manager, "thr_000000000000000122").await;
 
     manager
-        .start_turn_with_capabilities(
+        .start_test_turn_with_default_profile_and_capabilities(
             "thr_000000000000000122",
             "turn_000000000000000122",
             ThreadMode::Agent,
@@ -12049,7 +12177,7 @@ async fn read_skill_rejects_non_active_slug() {
     let mut events = subscribe_agent_events(&manager, "thr_000000000000000123").await;
 
     manager
-        .start_turn_with_capabilities(
+        .start_test_turn_with_default_profile_and_capabilities(
             "thr_000000000000000123",
             "turn_000000000000000123",
             ThreadMode::Agent,
@@ -12154,7 +12282,7 @@ async fn invalid_skill_runtime_config_fails_open_to_builtin_tools() {
     let mut events = subscribe_agent_events(&manager, "thr_000000000000000124").await;
 
     manager
-        .start_turn_with_capabilities(
+        .start_test_turn_with_default_profile_and_capabilities(
             "thr_000000000000000124",
             "turn_000000000000000124",
             ThreadMode::Agent,
@@ -12245,7 +12373,7 @@ async fn invalid_skill_runtime_tool_is_excluded_per_tool() {
     let mut events = subscribe_agent_events(&manager, "thr_000000000000000125").await;
 
     manager
-        .start_turn_with_capabilities(
+        .start_test_turn_with_default_profile_and_capabilities(
             "thr_000000000000000125",
             "turn_000000000000000125",
             ThreadMode::Agent,

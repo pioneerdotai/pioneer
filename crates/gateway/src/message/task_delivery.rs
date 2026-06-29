@@ -161,22 +161,37 @@ impl MessageProcessor {
         let turn_id = pioneer_protocol::generate_id(DELIVERY_TURN_ID_LEN);
         let turn_outcome = self
             .thread_manager
-            .system_turn_start(TurnStartParams {
-                thread_id: thread_id.to_owned(),
-                turn_id: turn_id.clone(),
-                input: Vec::new(),
-                capabilities: Vec::new(),
-                model: None,
-                model_provider: None,
-                sandbox_policy: None,
-                mode: None,
-                execution_backend: None,
-                reasoning: None,
-                permission_profile: None,
-                cli_runtime_options: None,
-            })
+            .system_turn_start_with_permission_profile(
+                TurnStartParams {
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.clone(),
+                    input: Vec::new(),
+                    capabilities: Vec::new(),
+                    model: None,
+                    model_provider: None,
+                    sandbox_policy: None,
+                    mode: None,
+                    execution_backend: None,
+                    reasoning: None,
+                    permission_profile: None,
+                    cli_runtime_options: None,
+                },
+                pioneer_protocol::system_turn_permission_profile_snapshot(
+                    pioneer_protocol::TurnPermissionMode::FullAccess,
+                ),
+            )
             .await?;
-        let profile_selected_audit = self.turn_profile_selected_audit_event(&turn_outcome);
+        let profile_selected_audit = match self.turn_profile_selected_audit_event(&turn_outcome) {
+            Ok(event) => event,
+            Err(error) => {
+                self.thread_manager
+                    .rollback_turn_start(turn_outcome.rollback_context)
+                    .await;
+                return Err(anyhow!(
+                    "failed to resolve delivery turn permission profile: {error:#}"
+                ));
+            }
+        };
         if let Err(error) = self
             .crud_store
             .materialize_turn_start_with_permission_audit(

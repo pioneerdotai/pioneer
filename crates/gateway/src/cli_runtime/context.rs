@@ -28,7 +28,7 @@ pub(crate) struct CLIRuntimeContextBuildInput<'a> {
     pub runtime_label: &'a str,
     pub model: Option<&'a str>,
     pub cwd: Option<&'a str>,
-    pub permission_profile: Option<TurnPermissionProfileSnapshot>,
+    pub permission_profile: TurnPermissionProfileSnapshot,
     pub history: &'a [ChatMessage],
 }
 
@@ -46,7 +46,7 @@ pub(crate) fn compile_cli_runtime_context_bundle(
             runtime_label: Some(input.runtime_label.to_owned()),
             model: input.model.and_then(normalized_optional).map(str::to_owned),
             cwd: input.cwd.and_then(normalized_optional).map(str::to_owned),
-            permission_profile: input.permission_profile,
+            permission_profile: Some(input.permission_profile),
             memory_recall_context: None,
             thread_context: thread_context_from_history(input.history),
         },
@@ -257,7 +257,7 @@ mod tests {
                 runtime_label: "Codex CLI",
                 model: Some("gpt-5-codex"),
                 cwd: Some("/workspace"),
-                permission_profile: None,
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
                 history: &[ChatMessage::user("continue from prior context")],
             },
         )
@@ -288,7 +288,7 @@ mod tests {
                 runtime_label: "Claude CLI",
                 model: None,
                 cwd: None,
-                permission_profile: None,
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
                 history: &[],
             },
         )
@@ -333,11 +333,9 @@ mod tests {
                 runtime_label: "Codex CLI",
                 model: Some("gpt-5-codex"),
                 cwd: Some("/workspace"),
-                permission_profile: Some(
-                    pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
-                        pioneer_protocol::TurnPermissionMode::Supervised,
-                        pioneer_protocol::TurnPermissionProfileSource::Composer,
-                    ),
+                permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+                    pioneer_protocol::TurnPermissionMode::Supervised,
+                    pioneer_protocol::TurnPermissionProfileSource::Composer,
                 ),
                 history: &[],
             },

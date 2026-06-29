@@ -2427,11 +2427,8 @@ async fn current_turn_permission_cap(
         )));
     };
 
-    let profile = turn
-        .permission_profile
-        .unwrap_or_else(pioneer_protocol::default_turn_permission_profile_snapshot);
     Ok(pioneer_protocol::task_permission_cap_from_snapshot(
-        &profile,
+        &turn.permission_profile,
     ))
 }
 

@@ -309,7 +309,18 @@ impl TaskAgentExecutor {
             return Err(error).context("failed to validate hidden task artifact input");
         }
 
-        let turn_permission_profile = turn_outcome.materialization.turn.permission_profile.clone();
+        let turn_permission_profile = match processor
+            .materialized_turn_permission_profile(&turn_outcome.materialization.turn)
+        {
+            Ok(permission_profile) => permission_profile,
+            Err(error) => {
+                processor
+                    .thread_manager
+                    .rollback_turn_start(turn_outcome.rollback_context)
+                    .await;
+                return Err(error).context("failed to resolve hidden task permission profile");
+            }
+        };
         let profile_selected_audit = processor.turn_profile_selected_audit_event_for_turn(
             context.workspace_id.as_str(),
             child_thread_id.as_str(),
@@ -414,8 +425,7 @@ impl TaskAgentExecutor {
                 .await;
             return Ok(TaskExecutorStartOutcome::Started);
         }
-        let runtime_permission_profile = turn_permission_profile
-            .unwrap_or_else(pioneer_protocol::default_turn_permission_profile_snapshot);
+        let runtime_permission_profile = turn_permission_profile;
         if let Err(error) = processor
             .agent_manager
             .start_turn_with_hook_context_and_permission_profile(
@@ -735,7 +745,30 @@ impl TaskAgentExecutor {
             .await?;
             return Ok(());
         }
-        let turn_permission_profile = turn_outcome.materialization.turn.permission_profile.clone();
+        let turn_permission_profile = match processor
+            .materialized_turn_permission_profile(&turn_outcome.materialization.turn)
+        {
+            Ok(permission_profile) => permission_profile,
+            Err(error) => {
+                processor
+                    .thread_manager
+                    .rollback_turn_start(turn_outcome.rollback_context)
+                    .await;
+                self.block_revision_dispatch_turn(
+                    processor,
+                    child_runtime,
+                    handle,
+                    task_error(
+                        "revision_permission_profile_missing",
+                        format!("failed to resolve revision task permission profile: {error:#}"),
+                        TaskErrorClass::Internal,
+                        Some(run.id.clone()),
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
         let profile_selected_audit = processor.turn_profile_selected_audit_event_for_turn(
             task.workspace_id.as_str(),
             child_thread_id.as_str(),
@@ -854,8 +887,7 @@ impl TaskAgentExecutor {
             .await?;
             return Ok(());
         }
-        let runtime_permission_profile = turn_permission_profile
-            .unwrap_or_else(pioneer_protocol::default_turn_permission_profile_snapshot);
+        let runtime_permission_profile = turn_permission_profile;
         if let Err(error) = processor
             .agent_manager
             .start_turn_with_hook_context_and_execution_checkpoint_and_permission_profile(
@@ -1178,12 +1210,9 @@ impl TaskAgentExecutor {
             )
             .await
             .context("failed to persist restored task turn runtime snapshot")?;
-        let runtime_permission_profile = turn_outcome
-            .materialization
-            .turn
-            .permission_profile
-            .clone()
-            .unwrap_or_else(pioneer_protocol::default_turn_permission_profile_snapshot);
+        let runtime_permission_profile = processor
+            .materialized_turn_permission_profile(&turn_outcome.materialization.turn)
+            .context("failed to resolve restored task permission profile")?;
         processor
             .agent_manager
             .start_turn_with_hook_context_and_execution_checkpoint_and_permission_profile(
@@ -1790,7 +1819,18 @@ impl TaskAgentExecutor {
                 .await;
             return Err(error).context("failed to validate hidden reviewer input");
         }
-        let turn_permission_profile = turn_outcome.materialization.turn.permission_profile.clone();
+        let turn_permission_profile = match processor
+            .materialized_turn_permission_profile(&turn_outcome.materialization.turn)
+        {
+            Ok(permission_profile) => permission_profile,
+            Err(error) => {
+                processor
+                    .thread_manager
+                    .rollback_turn_start(turn_outcome.rollback_context)
+                    .await;
+                return Err(error).context("failed to resolve reviewer task permission profile");
+            }
+        };
         let profile_selected_audit = processor.turn_profile_selected_audit_event_for_turn(
             task.workspace_id.as_str(),
             task_run_turn.thread_id.as_str(),
@@ -1870,8 +1910,7 @@ impl TaskAgentExecutor {
                 .await;
             return Ok(());
         }
-        let runtime_permission_profile = turn_permission_profile
-            .unwrap_or_else(pioneer_protocol::default_turn_permission_profile_snapshot);
+        let runtime_permission_profile = turn_permission_profile;
         if let Err(error) = processor
             .agent_manager
             .start_turn_with_hook_context_and_permission_profile(
@@ -2323,7 +2362,7 @@ async fn ensure_task_run_occurrence_turn(
         origin,
         error: None,
         prompt_manifest: None,
-        permission_profile: Some(permission_profile.clone()),
+        permission_profile: permission_profile.clone(),
     };
     let sandbox_mode = processor
         .crud_store
@@ -2334,7 +2373,7 @@ async fn ensure_task_run_occurrence_turn(
         task.workspace_id.as_str(),
         parent_thread_id,
         run.id.as_str(),
-        occurrence_turn.permission_profile.clone(),
+        permission_profile.clone(),
     );
     processor
         .crud_store
@@ -4599,7 +4638,7 @@ mod tests {
     }
 
     #[test]
-    fn task_child_permission_profile_defaults_legacy_cap_to_full_access() {
+    fn task_child_permission_profile_defaults_missing_cap_to_full_access() {
         let agent_spec = permission_test_agent_spec(None, None);
         let profile = effective_task_child_permission_profile(&agent_spec, None);
 

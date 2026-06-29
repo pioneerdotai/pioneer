@@ -167,7 +167,24 @@ impl MessageProcessor {
                 .await;
                 return;
             }
-            let profile_selected_audit = self.turn_profile_selected_audit_event(&outcome);
+            let profile_selected_audit = match self.turn_profile_selected_audit_event(&outcome) {
+                Ok(event) => event,
+                Err(error) => {
+                    self.thread_manager
+                        .rollback_turn_start(outcome.rollback_context.clone())
+                        .await;
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!("failed to resolve turn permission profile: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
             if let Err(error) = message_future(
                 self.crud_store
                     .materialize_turn_start_with_reasoning_effort_and_permission_audit(
@@ -358,12 +375,29 @@ impl MessageProcessor {
                 .await;
                 return;
             }
-            let permission_profile = outcome
-                .materialization
-                .turn
-                .permission_profile
-                .clone()
-                .unwrap_or_else(pioneer_protocol::default_turn_permission_profile_snapshot);
+            let permission_profile =
+                match self.materialized_turn_permission_profile(&outcome.materialization.turn) {
+                    Ok(permission_profile) => permission_profile,
+                    Err(error) => {
+                        self.report_turn_failure(
+                            outcome.started_notification.thread_id.clone(),
+                            outcome.started_notification.turn.id.clone(),
+                            TurnFailureRecoveryKind::TurnStart,
+                            format!("failed to resolve turn permission profile: {error:#}"),
+                        )
+                        .await;
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request_id),
+                                INVALID_REQUEST_CODE,
+                                format!("failed to resolve turn permission profile: {error:#}"),
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                };
             self.finish_turn_start_success(connection_id, request_id, &outcome)
                 .await;
             if let Err(error) = self
@@ -629,12 +663,7 @@ impl MessageProcessor {
                 },
                 None => None,
             };
-            let approval_policy = params
-                .cli_runtime_options
-                .as_ref()
-                .and_then(|options| options.approval_policy.as_ref())
-                .map(|policy| policy.0.clone());
-            let effective_approval_policy = cli_runtime_approval_policy(&params);
+            let effective_approval_policy = permission_adapter.output.approval_policy.clone();
             let sandbox_policy_value = cli_runtime_sandbox_policy_value(&params);
             let requested_reasoning_effort = requested_reasoning_effort(&params);
             let cli_runtime_effort = cli_runtime_effort(&params);
@@ -701,7 +730,24 @@ impl MessageProcessor {
                 .await;
                 return;
             }
-            let profile_selected_audit = self.turn_profile_selected_audit_event(&outcome);
+            let profile_selected_audit = match self.turn_profile_selected_audit_event(&outcome) {
+                Ok(event) => event,
+                Err(error) => {
+                    self.thread_manager
+                        .rollback_turn_start(outcome.rollback_context.clone())
+                        .await;
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!("failed to resolve turn permission profile: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
             if let Err(error) = message_future(
                 self.crud_store
                     .materialize_turn_start_with_reasoning_effort_and_permission_audit(
@@ -898,7 +944,7 @@ impl MessageProcessor {
                     runtime_kind,
                     input_mapping_json,
                     sandbox_json,
-                    approval_policy,
+                    Some(effective_approval_policy.clone()),
                     &outcome,
                 )
                 .await
@@ -1209,16 +1255,25 @@ impl MessageProcessor {
         Ok(None)
     }
 
+    pub(super) fn materialized_turn_permission_profile(
+        &self,
+        turn: &pioneer_protocol::Turn,
+    ) -> anyhow::Result<pioneer_protocol::TurnPermissionProfileSnapshot> {
+        Ok(turn.permission_profile.clone())
+    }
+
     pub(super) fn turn_profile_selected_audit_event(
         &self,
         outcome: &crate::thread::TurnStartOutcome,
-    ) -> pioneer_protocol::TurnPermissionAuditEvent {
-        self.turn_profile_selected_audit_event_for_turn(
+    ) -> anyhow::Result<pioneer_protocol::TurnPermissionAuditEvent> {
+        let permission_profile =
+            self.materialized_turn_permission_profile(&outcome.materialization.turn)?;
+        Ok(self.turn_profile_selected_audit_event_for_turn(
             outcome.started_notification.workspace_id.as_str(),
             outcome.started_notification.thread_id.as_str(),
             outcome.started_notification.turn.id.as_str(),
-            outcome.materialization.turn.permission_profile.clone(),
-        )
+            permission_profile,
+        ))
     }
 
     pub(super) fn turn_profile_selected_audit_event_for_turn(
@@ -1226,10 +1281,8 @@ impl MessageProcessor {
         workspace_id: &str,
         thread_id: &str,
         turn_id: &str,
-        permission_profile: Option<pioneer_protocol::TurnPermissionProfileSnapshot>,
+        permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot,
     ) -> pioneer_protocol::TurnPermissionAuditEvent {
-        let permission_profile = permission_profile
-            .unwrap_or_else(pioneer_protocol::default_turn_permission_profile_snapshot);
         pioneer_protocol::TurnPermissionAuditEvent {
             workspace_id: workspace_id.to_owned(),
             thread_id: thread_id.to_owned(),
@@ -1266,6 +1319,8 @@ impl MessageProcessor {
                 outcome.started_notification.turn.id.as_str(),
             )
             .await;
+        let permission_profile =
+            self.materialized_turn_permission_profile(&outcome.materialization.turn)?;
         crate::cli_runtime::context::compile_cli_runtime_context_bundle(
             self.artifact_runtime_home.as_path(),
             crate::cli_runtime::context::CLIRuntimeContextBuildInput {
@@ -1276,7 +1331,7 @@ impl MessageProcessor {
                 runtime_label: cli_runtime_context_label(runtime_kind),
                 model: Some(outcome.materialization.thread.model.as_str()),
                 cwd: native_cwd.as_deref(),
-                permission_profile: outcome.started_notification.turn.permission_profile.clone(),
+                permission_profile,
                 history: history.as_slice(),
             },
         )
@@ -2674,17 +2729,6 @@ fn provider_model_from_runtime_model_for_reasoning_lookup(
         family: model.family,
         lifecycle_status: None,
     }
-}
-
-fn cli_runtime_approval_policy(params: &TurnStartParams) -> String {
-    params
-        .cli_runtime_options
-        .as_ref()
-        .and_then(|options| options.approval_policy.as_ref())
-        .map(|policy| policy.0.trim())
-        .filter(|policy| !policy.is_empty())
-        .unwrap_or("on-request")
-        .to_owned()
 }
 
 fn requested_reasoning_effort(params: &TurnStartParams) -> Option<String> {

@@ -5992,7 +5992,7 @@ impl CrudStore {
                 origin: turn_origin_from_db(turn_model.origin.as_str()).unwrap_or_default(),
                 error: turn_model.error,
                 prompt_manifest,
-                permission_profile: Some(permission_profile),
+                permission_profile,
             },
         )))
     }
@@ -6042,7 +6042,7 @@ impl CrudStore {
                         origin: turn_origin_from_db(turn_model.origin.as_str()).unwrap_or_default(),
                         error: None,
                         prompt_manifest,
-                        permission_profile: Some(permission_profile),
+                        permission_profile,
                     },
                 },
                 event_timestamp_secs,
@@ -10839,7 +10839,7 @@ fn thread_snapshot_turn_from_db_model(model: pioneer_entity::turn::Model) -> Res
         origin: turn_origin_from_db(model.origin.as_str()).unwrap_or_default(),
         error: model.error,
         prompt_manifest: None,
-        permission_profile: Some(permission_profile),
+        permission_profile,
     }))
 }
 
@@ -13281,7 +13281,7 @@ mod tests {
             origin: Default::default(),
             error: None,
             prompt_manifest: None,
-            permission_profile: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
         }
     }
 
@@ -13840,7 +13840,7 @@ mod tests {
             origin: Default::default(),
             error: None,
             prompt_manifest: None,
-            permission_profile: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
         };
 
         store
@@ -14543,7 +14543,8 @@ mod tests {
                         origin: Default::default(),
                         error: None,
                         prompt_manifest: None,
-                        permission_profile: None,
+                        permission_profile:
+                            pioneer_protocol::default_turn_permission_profile_snapshot(),
                     },
                 },
                 timestamp + 2,
@@ -15462,7 +15463,7 @@ mod tests {
                 origin: Default::default(),
                 error: None,
                 prompt_manifest: None,
-                permission_profile: None,
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
             };
             store
                 .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
@@ -15482,7 +15483,8 @@ mod tests {
                         origin: Default::default(),
                         error: None,
                         prompt_manifest: None,
-                        permission_profile: None,
+                        permission_profile:
+                            pioneer_protocol::default_turn_permission_profile_snapshot(),
                     },
                 },
                 timestamp + 1,
@@ -15659,7 +15661,7 @@ mod tests {
             origin: Default::default(),
             error: None,
             prompt_manifest: None,
-            permission_profile: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
         };
 
         store
@@ -15906,7 +15908,7 @@ mod tests {
             origin: Default::default(),
             error: None,
             prompt_manifest: None,
-            permission_profile: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
         };
         let budgets = vec![ToolRetryBudgetUsage {
             kind: ToolRetryBudgetKind::Episode,
@@ -16489,7 +16491,7 @@ mod tests {
             origin: Default::default(),
             error: None,
             prompt_manifest: None,
-            permission_profile: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
         };
         let input = vec![UserInput::Text {
             text: "hello".to_owned(),
@@ -16511,10 +16513,7 @@ mod tests {
         assert_eq!(fetched_turn.id, turn.id);
         assert_eq!(fetched_turn.status, TurnStatus::InProgress);
         assert_eq!(fetched_turn.prompt_manifest, None);
-        let permission_profile = fetched_turn
-            .permission_profile
-            .as_ref()
-            .expect("missing turn profile should read as defaulted full access");
+        let permission_profile = &fetched_turn.permission_profile;
         assert_eq!(permission_profile.mode, TurnPermissionMode::FullAccess);
         assert_eq!(
             permission_profile.source,
@@ -16532,9 +16531,15 @@ mod tests {
             .expect("persisted turn should exist");
         assert_eq!(persisted_turn.prompt_manifest_json, "{}");
         assert_eq!(persisted_turn.reasoning_effort, None);
-        assert_eq!(persisted_turn.permission_profile_mode, None);
-        assert_eq!(persisted_turn.permission_profile_source, None);
-        assert_eq!(persisted_turn.permission_profile_snapshot_json, None);
+        assert_eq!(
+            persisted_turn.permission_profile_mode.as_deref(),
+            Some("full_access")
+        );
+        assert_eq!(
+            persisted_turn.permission_profile_source.as_deref(),
+            Some("defaulted")
+        );
+        assert!(persisted_turn.permission_profile_snapshot_json.is_some());
     }
 
     #[tokio::test]
@@ -16577,7 +16582,7 @@ mod tests {
             origin: Default::default(),
             error: None,
             prompt_manifest: None,
-            permission_profile: Some(permission_profile.clone()),
+            permission_profile: permission_profile.clone(),
         };
 
         store
@@ -16590,10 +16595,7 @@ mod tests {
             .await
             .expect("must read turn")
             .expect("turn should exist");
-        assert_eq!(
-            fetched_turn.permission_profile.as_ref(),
-            Some(&permission_profile)
-        );
+        assert_eq!(fetched_turn.permission_profile, permission_profile);
 
         let persisted_turn = pioneer_entity::turn::Entity::find_by_id(turn.id.clone())
             .one(&connection)
@@ -16754,7 +16756,7 @@ mod tests {
             origin: Default::default(),
             error: None,
             prompt_manifest: None,
-            permission_profile: Some(permission_profile.clone()),
+            permission_profile: permission_profile.clone(),
         };
         let audit = pioneer_protocol::TurnPermissionAuditEvent {
             workspace_id: thread.workspace_id.clone(),
@@ -16873,10 +16875,7 @@ mod tests {
             .await
             .expect("must read old turn")
             .expect("turn should exist");
-        let permission_profile = fetched_turn
-            .permission_profile
-            .as_ref()
-            .expect("old turn should map to defaulted profile");
+        let permission_profile = &fetched_turn.permission_profile;
         assert_eq!(permission_profile.mode, TurnPermissionMode::FullAccess);
         assert_eq!(
             permission_profile.source,
@@ -16940,10 +16939,7 @@ mod tests {
             .await
             .expect("must read turn with unknown permission columns")
             .expect("turn should exist");
-        let permission_profile = fetched_turn
-            .permission_profile
-            .as_ref()
-            .expect("unknown columns should map to an explicit defaulted profile");
+        let permission_profile = &fetched_turn.permission_profile;
         assert_eq!(permission_profile.mode, TurnPermissionMode::FullAccess);
         assert_eq!(
             permission_profile.source,
@@ -16991,7 +16987,7 @@ mod tests {
             origin: Default::default(),
             error: None,
             prompt_manifest: None,
-            permission_profile: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
         };
 
         store
@@ -17049,7 +17045,7 @@ mod tests {
             origin: TurnOrigin::ScheduledTask,
             error: None,
             prompt_manifest: None,
-            permission_profile: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
         };
 
         store
@@ -17122,7 +17118,7 @@ mod tests {
             origin: Default::default(),
             error: None,
             prompt_manifest: None,
-            permission_profile: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
         };
         store
             .materialize_turn_start_with_reasoning_effort(
@@ -17148,7 +17144,7 @@ mod tests {
             origin: Default::default(),
             error: None,
             prompt_manifest: None,
-            permission_profile: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
         };
         store
             .materialize_turn_start_with_reasoning_effort(
@@ -17222,7 +17218,7 @@ mod tests {
             origin: Default::default(),
             error: None,
             prompt_manifest: None,
-            permission_profile: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
         };
 
         store

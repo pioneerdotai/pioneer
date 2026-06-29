@@ -17,14 +17,7 @@
       "default": "user"
     },
     "permission_profile": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/TurnPermissionProfileSnapshot"
-        },
-        {
-          "type": "null"
-        }
-      ]
+      "$ref": "#/$defs/TurnPermissionProfileSnapshot"
     },
     "prompt_manifest": {
       "anyOf": [
@@ -46,7 +39,8 @@
   },
   "required": [
     "id",
-    "status"
+    "status",
+    "permission_profile"
   ],
   "$defs": {
     "PermissionBehavior": {
