@@ -1,13 +1,15 @@
 use crate::{
     CompiledPromptBundle, PromptCompileInput, PromptLimits, PromptProfile,
     PromptRuntimeBuiltInSectionId, PromptRuntimeSectionId, PromptRuntimeSectionInput,
-    compile_prompt,
+    compile_prompt, current_permission_guidance,
 };
+use pioneer_protocol::TurnPermissionProfileSnapshot;
 use std::path::Path;
 
 const PIONEER_CONTEXT_MAX_CHARS: usize = 4_000;
 const MEMORY_CONTEXT_MAX_CHARS: usize = 6_000;
 const THREAD_CONTEXT_MAX_CHARS: usize = 6_000;
+const CURRENT_PERMISSIONS_CONTEXT_MAX_CHARS: usize = 1_500;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliRuntimeContextInput {
@@ -18,6 +20,7 @@ pub struct CliRuntimeContextInput {
     pub runtime_label: Option<String>,
     pub model: Option<String>,
     pub cwd: Option<String>,
+    pub permission_profile: TurnPermissionProfileSnapshot,
     pub memory_recall_context: Option<CliRuntimeContextText>,
     pub thread_context: Option<CliRuntimeContextText>,
 }
@@ -49,7 +52,7 @@ pub fn compile_cli_runtime_context_bundle(
 }
 
 fn cli_runtime_context_sections(input: &CliRuntimeContextInput) -> Vec<PromptRuntimeSectionInput> {
-    vec![
+    let mut sections = vec![
         builtin_section(
             PromptRuntimeBuiltInSectionId::PioneerCliRuntimeContext,
             render_pioneer_context(input),
@@ -74,7 +77,16 @@ fn cli_runtime_context_sections(input: &CliRuntimeContextInput) -> Vec<PromptRun
                 .as_ref()
                 .is_some_and(|context| context.truncated),
         ),
-    ]
+    ];
+    if let Some(content) = current_permission_guidance(&input.permission_profile) {
+        sections.push(builtin_section(
+            PromptRuntimeBuiltInSectionId::CurrentPermissions,
+            content,
+            Some(CURRENT_PERMISSIONS_CONTEXT_MAX_CHARS),
+            false,
+        ));
+    }
+    sections
 }
 
 fn builtin_section(
@@ -153,6 +165,7 @@ mod tests {
             runtime_label: Some("Codex CLI".to_owned()),
             model: Some("gpt-5-codex".to_owned()),
             cwd: Some("/workspace".to_owned()),
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
             memory_recall_context: None,
             thread_context: None,
         }
@@ -226,6 +239,39 @@ mod tests {
                     && diagnostic.code == crate::PromptDiagnosticCode::DynamicSectionTruncated
             }),
             "thread context truncation should be visible in diagnostics"
+        );
+    }
+
+    #[test]
+    fn cli_runtime_context_includes_restricted_current_permissions() {
+        let root = temp_workspace("current_permissions");
+        let mut input = base_input();
+        input.permission_profile = pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+            pioneer_protocol::TurnPermissionMode::Supervised,
+            pioneer_protocol::TurnPermissionProfileSource::Composer,
+        );
+
+        let bundle =
+            compile_cli_runtime_context_bundle(root.as_path(), input).expect("compile context");
+
+        assert!(
+            bundle
+                .dynamic_system_text
+                .contains("## Current Permissions")
+        );
+        assert!(bundle.dynamic_system_text.contains("- mode: supervised"));
+        assert!(
+            bundle
+                .dynamic_system_text
+                .contains("may require user approval")
+        );
+        assert_eq!(
+            bundle
+                .sections
+                .iter()
+                .map(|section| section.id.manifest_id())
+                .collect::<Vec<_>>(),
+            vec!["pioneer_cli_runtime_context", "current_permissions"]
         );
     }
 }

@@ -328,7 +328,8 @@ fn runtime_section_default_max_chars(id: &PromptRuntimeSectionId) -> usize {
             PromptRuntimeBuiltInSectionId::PioneerCliRuntimeContext,
         )
         | PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::ThreadContext)
-        | PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::SelectedCapabilities) => {
+        | PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::SelectedCapabilities)
+        | PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::CurrentPermissions) => {
             DEFAULT_DYNAMIC_PROMPT_SECTION_MAX_CHARS
         }
         PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::AgentsMd) => {
@@ -349,8 +350,9 @@ fn runtime_section_order(id: &PromptRuntimeSectionId) -> u8 {
         PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::MemoryRecall) => 2,
         PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::ThreadContext) => 3,
         PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::SelectedCapabilities) => 4,
-        PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::ExecutionContinuation) => 5,
-        PromptRuntimeSectionId::Dynamic(_) => 6,
+        PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::CurrentPermissions) => 5,
+        PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::ExecutionContinuation) => 6,
+        PromptRuntimeSectionId::Dynamic(_) => 7,
     }
 }
 

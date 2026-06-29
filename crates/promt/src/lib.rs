@@ -28,6 +28,7 @@ pub use hooks::{
 };
 pub use profile::PromptProfile;
 pub use render::{
+    current_permissions::{current_permission_guidance, effective_permission_summary},
     execution_continuation::{
         ExecutionContinuationRuntimeFactsInput, execution_continuation_section,
         execution_continuation_section_with_runtime_facts, render_execution_continuation_prompt,

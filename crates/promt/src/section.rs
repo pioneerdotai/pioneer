@@ -60,6 +60,7 @@ pub enum PromptRuntimeBuiltInSectionId {
     MemoryRecall,
     ThreadContext,
     SelectedCapabilities,
+    CurrentPermissions,
     ExecutionContinuation,
 }
 
@@ -71,6 +72,7 @@ impl PromptRuntimeBuiltInSectionId {
             "memory_recall" => Some(Self::MemoryRecall),
             "thread_context" => Some(Self::ThreadContext),
             "selected_capabilities" => Some(Self::SelectedCapabilities),
+            "current_permissions" => Some(Self::CurrentPermissions),
             "execution_continuation" => Some(Self::ExecutionContinuation),
             _ => None,
         }
@@ -83,6 +85,7 @@ impl PromptRuntimeBuiltInSectionId {
             Self::MemoryRecall => "memory_recall",
             Self::ThreadContext => "thread_context",
             Self::SelectedCapabilities => "selected_capabilities",
+            Self::CurrentPermissions => "current_permissions",
             Self::ExecutionContinuation => "execution_continuation",
         }
     }
@@ -94,6 +97,7 @@ impl PromptRuntimeBuiltInSectionId {
             Self::MemoryRecall => PromptSectionId::MemoryRecall,
             Self::ThreadContext => PromptSectionId::ThreadContext,
             Self::SelectedCapabilities => PromptSectionId::SelectedCapabilities,
+            Self::CurrentPermissions => PromptSectionId::CurrentPermissions,
             Self::ExecutionContinuation => PromptSectionId::ExecutionContinuation,
         }
     }
@@ -107,6 +111,7 @@ impl PromptRuntimeBuiltInSectionId {
             Self::MemoryRecall => crate::content::SECTION_TITLE_MEMORY_RECALL,
             Self::ThreadContext => crate::content::SECTION_TITLE_THREAD_CONTEXT,
             Self::SelectedCapabilities => crate::content::SECTION_TITLE_SELECTED_CAPABILITIES,
+            Self::CurrentPermissions => crate::content::SECTION_TITLE_CURRENT_PERMISSIONS,
             Self::ExecutionContinuation => crate::content::SECTION_TITLE_EXECUTION_CONTINUATION,
         }
     }
@@ -161,6 +166,7 @@ pub enum PromptSectionId {
     MemoryRecall,
     ThreadContext,
     SelectedCapabilities,
+    CurrentPermissions,
     RecoveryContinuation,
     ExecutionContinuation,
     SkillsRuntimePrompt,
@@ -189,6 +195,7 @@ impl PromptSectionId {
             Self::MemoryRecall => "memory_recall",
             Self::ThreadContext => "thread_context",
             Self::SelectedCapabilities => "selected_capabilities",
+            Self::CurrentPermissions => "current_permissions",
             Self::RecoveryContinuation => "recovery_continuation",
             Self::ExecutionContinuation => "execution_continuation",
             Self::SkillsRuntimePrompt => "skills_runtime_prompt",
@@ -219,6 +226,7 @@ impl PromptSectionId {
                 | "memory_recall"
                 | "thread_context"
                 | "selected_capabilities"
+                | "current_permissions"
                 | "recovery_continuation"
                 | "execution_continuation"
                 | "skills_runtime_prompt"

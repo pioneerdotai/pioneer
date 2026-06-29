@@ -1,8 +1,9 @@
+use crate::render::current_permissions::effective_permission_summary;
 use chrono::{DateTime, Utc};
 use pioneer_protocol::{
     Task, TaskAgentInput, TaskAgentPrompt, TaskAgentResultContract, TaskAgentSpec,
     TaskAgentToolPolicy, TaskResultCandidate, TaskResultReviewEvent, TaskRun, TaskRunTurn,
-    TaskTrigger, TaskTriggerSpec, TaskValue,
+    TaskTrigger, TaskTriggerSpec, TaskValue, TurnPermissionProfileSnapshot,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -14,6 +15,7 @@ pub struct TaskRunPromptInput<'a> {
     pub now: i64,
     pub parent_context: Option<&'a str>,
     pub output_instructions: Option<&'a str>,
+    pub effective_permission_profile: &'a TurnPermissionProfileSnapshot,
     pub revision: Option<TaskRevisionPromptInput<'a>>,
 }
 
@@ -49,6 +51,10 @@ impl TaskRunPromptCompiler {
         sections.push(render_tool_and_capability_guidance(
             input.agent_spec.tool_policy.as_ref(),
         ));
+        if let Some(permissions) = render_effective_permissions(input.effective_permission_profile)
+        {
+            sections.push(permissions);
+        }
         sections.push(render_subtask_orchestration_rules(input));
         if let Some(output) = render_output_instructions(input.output_instructions) {
             sections.push(output);
@@ -234,6 +240,15 @@ fn render_tool_and_capability_guidance(tool_policy: Option<&TaskAgentToolPolicy>
         ]);
     }
     format!("TOOL AND CAPABILITY GUIDANCE\n{}", lines.join("\n"))
+}
+
+fn render_effective_permissions(
+    permission_profile: &TurnPermissionProfileSnapshot,
+) -> Option<String> {
+    Some(format!(
+        "EFFECTIVE PERMISSIONS\n{}",
+        effective_permission_summary(permission_profile)?
+    ))
 }
 
 fn render_subtask_orchestration_rules(input: TaskRunPromptInput<'_>) -> String {
@@ -478,6 +493,7 @@ mod tests {
                 allowed_paths: Vec::new(),
                 network_access: true,
             }),
+            permission_cap: Some(test_permission_cap()),
             result_contract: None,
             review_policy: None,
             depth,
@@ -485,6 +501,14 @@ mod tests {
             created_at: NOW,
             updated_at: NOW,
         }
+    }
+
+    fn test_permission_cap() -> pioneer_protocol::TurnPermissionProfileCap {
+        pioneer_protocol::task_permission_cap_from_snapshot(&test_permission_profile())
+    }
+
+    fn test_permission_profile() -> TurnPermissionProfileSnapshot {
+        pioneer_protocol::default_turn_permission_profile_snapshot()
     }
 
     fn compile(
@@ -502,6 +526,7 @@ mod tests {
             now: NOW,
             parent_context,
             output_instructions: agent_spec.prompt.output_instructions.as_deref(),
+            effective_permission_profile: &test_permission_profile(),
             revision: None,
         })
     }
@@ -615,8 +640,46 @@ mod tests {
             now: NOW,
             parent_context: Some("Parent thread asked for a weather report."),
             output_instructions: agent_spec.prompt.output_instructions.as_deref(),
+            effective_permission_profile: &test_permission_profile(),
             revision: Some(revision),
         })
+    }
+
+    #[test]
+    fn prompt_includes_effective_permission_profile_summary() {
+        let task = sample_task();
+        let run = sample_run();
+        let trigger = sample_trigger();
+        let agent_spec = sample_agent_spec(0, 3);
+        let cap = pioneer_protocol::task_permission_cap_for_mode(
+            pioneer_protocol::TurnPermissionMode::Supervised,
+        );
+        let mut profile = pioneer_protocol::task_permission_cap_snapshot(&cap);
+        profile.effective_policy.network = pioneer_protocol::PermissionBehavior::Deny;
+        profile.effective_policy.allowed_tools = vec!["read_file".to_owned()];
+        profile.effective_policy.denied_tools = vec!["exec_command".to_owned()];
+        profile.effective_policy.allowed_paths = vec!["/workspace/src".to_owned()];
+
+        let prompt = TaskRunPromptCompiler::new().compile(TaskRunPromptInput {
+            task: &task,
+            run: &run,
+            trigger: Some(&trigger),
+            agent_spec: &agent_spec,
+            now: NOW,
+            parent_context: None,
+            output_instructions: agent_spec.prompt.output_instructions.as_deref(),
+            effective_permission_profile: &profile,
+            revision: None,
+        });
+
+        assert!(prompt.contains("EFFECTIVE PERMISSIONS"));
+        assert!(prompt.contains("- mode: supervised"));
+        assert!(prompt.contains("- source: task_permission_cap"));
+        assert!(prompt.contains("- file_read: allow"));
+        assert!(prompt.contains("- network: deny"));
+        assert!(prompt.contains("- allowed_tools: read_file"));
+        assert!(prompt.contains("- denied_tools: exec_command"));
+        assert!(prompt.contains("- allowed_paths: /workspace/src"));
     }
 
     #[test]

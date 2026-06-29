@@ -12,6 +12,7 @@ pub const SECTION_TITLE_PIONEER_CLI_RUNTIME_CONTEXT: &str = "Pioneer Context";
 pub const SECTION_TITLE_MEMORY_RECALL: &str = "Memory Recall";
 pub const SECTION_TITLE_THREAD_CONTEXT: &str = "Thread Context";
 pub const SECTION_TITLE_SELECTED_CAPABILITIES: &str = "Selected Capabilities";
+pub const SECTION_TITLE_CURRENT_PERMISSIONS: &str = "Current Permissions";
 pub const SECTION_TITLE_AGENTS_MD: &str = "AGENTS.md";
 pub const SECTION_TITLE_RECOVERY_CONTINUATION: &str = "Recovery Continuation";
 pub const SECTION_TITLE_EXECUTION_CONTINUATION: &str = "Execution Continuation";
