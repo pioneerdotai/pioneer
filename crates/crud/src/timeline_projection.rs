@@ -133,19 +133,191 @@ impl TurnItemProjectionClassification {
 }
 
 pub fn classify_turn_item_row(row: &turn_item::Model) -> TurnItemProjectionClassification {
-    match serde_json::from_str::<TurnItem>(row.payload.as_str()) {
-        Ok(item) => classify_turn_item_with_db_status(&item, row.status.as_deref()),
-        Err(error) => TurnItemProjectionClassification {
-            item_id: row.item_id.clone(),
-            item_type: row.item_type.clone(),
+    let item_id = row.item_id.clone();
+    let item_type = row.item_type.clone();
+    let db_status = db_status_to_work_status(row.status.as_deref());
+
+    match normalized_item_type(row.item_type.as_str()).as_str() {
+        "usermessage" => TurnItemProjectionClassification {
+            item_id,
+            item_type,
+            visibility: ProjectionVisibility::Visible,
+            placement: ProjectionPlacement::TopLevelUserMessage,
+            classification: WorkItemClassification::UserMessage,
+            status: db_status,
+            audit: false,
+            audit_reason: None,
+        },
+        "agentmessage" => {
+            let phase = match parse_turn_item_payload(row) {
+                Ok(payload) => payload
+                    .get("phase")
+                    .and_then(JsonValue::as_str)
+                    .map(normalized_wire_value),
+                Err(error) => return invalid_payload(row, error),
+            };
+            if phase.as_deref().is_none_or(|phase| phase == "finalanswer") {
+                TurnItemProjectionClassification {
+                    item_id,
+                    item_type,
+                    visibility: ProjectionVisibility::Visible,
+                    placement: ProjectionPlacement::TopLevelAssistantMessage,
+                    classification: WorkItemClassification::FinalAssistantMessage,
+                    status: db_status,
+                    audit: false,
+                    audit_reason: None,
+                }
+            } else {
+                visible_work(
+                    item_id,
+                    item_type,
+                    WorkItemClassification::AgentCommentary,
+                    db_status,
+                )
+            }
+        }
+        "reasoning" => visible_work(
+            item_id,
+            item_type,
+            WorkItemClassification::Reasoning,
+            db_status,
+        ),
+        "task" => visible_work(item_id, item_type, WorkItemClassification::Task, db_status),
+        "commandexecution" => visible_work(
+            item_id,
+            item_type,
+            WorkItemClassification::CommandExecution,
+            tool_status_from_payload(row).unwrap_or(db_status),
+        ),
+        "filechange" => visible_work(
+            item_id,
+            item_type,
+            WorkItemClassification::FileChange,
+            tool_status_from_payload(row).unwrap_or(db_status),
+        ),
+        "websearch" => visible_work(
+            item_id,
+            item_type,
+            WorkItemClassification::WebSearch,
+            tool_status_from_payload(row).unwrap_or(db_status),
+        ),
+        "webfetch" => visible_work(
+            item_id,
+            item_type,
+            WorkItemClassification::WebFetch,
+            tool_status_from_payload(row).unwrap_or(db_status),
+        ),
+        "download" => visible_work(
+            item_id,
+            item_type,
+            WorkItemClassification::Download,
+            tool_status_from_payload(row).unwrap_or(db_status),
+        ),
+        "dynamictoolcall" => visible_work(
+            item_id,
+            item_type,
+            WorkItemClassification::DynamicToolCall,
+            tool_status_from_payload(row).unwrap_or(db_status),
+        ),
+        "systemevent" => {
+            let payload = match parse_turn_item_payload(row) {
+                Ok(payload) => payload,
+                Err(error) => return invalid_payload(row, error),
+            };
+            let level = payload
+                .get("level")
+                .and_then(JsonValue::as_str)
+                .and_then(system_event_level_from_wire);
+            let Some(level) = level else {
+                return invalid_payload(row, "missing or invalid system event level");
+            };
+            let Some(message) = payload.get("message").and_then(JsonValue::as_str) else {
+                return invalid_payload(row, "missing system event message");
+            };
+            let status = system_event_work_status(level);
+            classify_system_event(
+                item_id,
+                item_type,
+                level,
+                message,
+                payload.get("code").and_then(JsonValue::as_str),
+                payload.get("details"),
+                status,
+            )
+        }
+        _ => TurnItemProjectionClassification {
+            item_id,
+            item_type,
             visibility: ProjectionVisibility::Hidden,
             placement: ProjectionPlacement::Hidden,
             classification: WorkItemClassification::InvalidPayload,
-            status: db_status_to_work_status(row.status.as_deref()),
+            status: db_status,
             audit: true,
-            audit_reason: Some(format!("failed to decode turn item payload: {error}")),
+            audit_reason: Some(format!("unknown turn item type `{}`", row.item_type)),
         },
     }
+}
+
+fn parse_turn_item_payload(row: &turn_item::Model) -> std::result::Result<JsonValue, String> {
+    serde_json::from_str::<JsonValue>(row.payload.as_str()).map_err(|error| error.to_string())
+}
+
+fn invalid_payload(
+    row: &turn_item::Model,
+    reason: impl Into<String>,
+) -> TurnItemProjectionClassification {
+    TurnItemProjectionClassification {
+        item_id: row.item_id.clone(),
+        item_type: row.item_type.clone(),
+        visibility: ProjectionVisibility::Hidden,
+        placement: ProjectionPlacement::Hidden,
+        classification: WorkItemClassification::InvalidPayload,
+        status: db_status_to_work_status(row.status.as_deref()),
+        audit: true,
+        audit_reason: Some(format!(
+            "failed to classify turn item payload: {}",
+            reason.into()
+        )),
+    }
+}
+
+fn tool_status_from_payload(row: &turn_item::Model) -> Option<&'static str> {
+    let payload = parse_turn_item_payload(row).ok()?;
+    let status = payload.get("status").and_then(JsonValue::as_str)?;
+    match normalized_wire_value(status).as_str() {
+        "inprogress" => Some(WORK_ITEM_STATUS_RUNNING),
+        "completed" => Some(WORK_ITEM_STATUS_COMPLETED),
+        "failed" => Some(WORK_ITEM_STATUS_FAILED),
+        _ => None,
+    }
+}
+
+fn system_event_level_from_wire(value: &str) -> Option<SystemEventLevel> {
+    match normalized_wire_value(value).as_str() {
+        "info" => Some(SystemEventLevel::Info),
+        "warning" => Some(SystemEventLevel::Warning),
+        "error" => Some(SystemEventLevel::Error),
+        _ => None,
+    }
+}
+
+fn system_event_work_status(level: SystemEventLevel) -> &'static str {
+    match level {
+        SystemEventLevel::Info | SystemEventLevel::Warning => WORK_ITEM_STATUS_COMPLETED,
+        SystemEventLevel::Error => WORK_ITEM_STATUS_FAILED,
+    }
+}
+
+fn normalized_item_type(value: &str) -> String {
+    normalized_wire_value(value)
+}
+
+fn normalized_wire_value(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase()
 }
 
 pub fn classify_turn_item_with_db_status(
@@ -532,6 +704,7 @@ fn turn_item_type_label(item: &TurnItem) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use pioneer_entity::turn_item;
     use pioneer_protocol::{AgentMessagePhase, SystemEventLevel, TurnItem};
     use serde_json::json;
 
@@ -545,6 +718,80 @@ mod tests {
             code: code.map(str::to_owned),
             details,
         }
+    }
+
+    fn turn_item_row(item_type: &str, status: Option<&str>, payload: &str) -> turn_item::Model {
+        let now = chrono::Utc::now().into();
+        turn_item::Model {
+            id: "row_1".to_owned(),
+            turn_id: "turn_1".to_owned(),
+            item_id: "item_1".to_owned(),
+            item_type: item_type.to_owned(),
+            status: status.map(str::to_owned),
+            payload: payload.to_owned(),
+            active_attempt_number: 0,
+            active_attempt_status: None,
+            active_attempt_id: None,
+            last_heartbeat_at: None,
+            lease_expires_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn row_classification_uses_canonical_columns_for_user_message() {
+        let row = turn_item_row("user_message", Some("completed"), "not a turn item json");
+        let classified = classify_turn_item_row(&row);
+
+        assert_eq!(
+            classified.placement,
+            ProjectionPlacement::TopLevelUserMessage
+        );
+        assert_eq!(
+            classified.classification,
+            WorkItemClassification::UserMessage
+        );
+        assert!(!classified.audit);
+    }
+
+    #[test]
+    fn row_classification_uses_lightweight_payload_fields_for_work_items() {
+        let row = turn_item_row(
+            "agent_message",
+            Some("completed"),
+            r#"{"type":"agentMessage","id":"commentary","text":"checking","phase":"commentary"}"#,
+        );
+        let classified = classify_turn_item_row(&row);
+        assert_eq!(classified.placement, ProjectionPlacement::TurnWork);
+        assert_eq!(
+            classified.classification,
+            WorkItemClassification::AgentCommentary
+        );
+
+        let row = turn_item_row(
+            "command_execution",
+            Some("completed"),
+            r#"{"type":"commandExecution","id":"cmd","status":"failed"}"#,
+        );
+        let classified = classify_turn_item_row(&row);
+        assert_eq!(
+            classified.classification,
+            WorkItemClassification::CommandExecution
+        );
+        assert_eq!(classified.status, WORK_ITEM_STATUS_FAILED);
+
+        let row = turn_item_row(
+            "system_event",
+            Some("completed"),
+            r#"{"type":"systemEvent","id":"sys","level":"info","message":"Runtime event: thread/tokenUsage/updated","code":"agent_runtime_event","details":{"nativeMethod":"thread/tokenUsage/updated"}}"#,
+        );
+        let classified = classify_turn_item_row(&row);
+        assert_eq!(classified.visibility, ProjectionVisibility::Hidden);
+        assert_eq!(
+            classified.classification,
+            WorkItemClassification::InternalTokenUsage
+        );
     }
 
     #[test]
