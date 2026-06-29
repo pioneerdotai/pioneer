@@ -169,13 +169,6 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Stable
         ),
         contract_type!(
-            "cli_agent_runtime_approval_policy.json",
-            pioneer_protocol::CLIAgentRuntimeApprovalPolicy,
-            Domain::Providers,
-            Kind::SelectorDto,
-            Stability::Provisional
-        ),
-        contract_type!(
             "cli_agent_runtime_kind.json",
             pioneer_protocol::CLIAgentRuntimeKind,
             Domain::Providers,
@@ -428,6 +421,90 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Provisional
         ),
         contract_type!(
+            "pending_request.json",
+            crate::cli_runtime::approvals::PendingRequest,
+            Domain::Providers,
+            Kind::Snapshot,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "pending_request_kind.json",
+            crate::cli_runtime::approvals::PendingRequestKind,
+            Domain::Providers,
+            Kind::SelectorDto,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "pending_request_origin.json",
+            crate::cli_runtime::approvals::PendingRequestOrigin,
+            Domain::Providers,
+            Kind::SelectorDto,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "pending_request_payload.json",
+            crate::cli_runtime::approvals::PendingRequestPayload,
+            Domain::Providers,
+            Kind::SelectorDto,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "pending_request_resolution.json",
+            crate::cli_runtime::approvals::PendingRequestResolution,
+            Domain::Providers,
+            Kind::Command,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "turn_permission_approval_request.json",
+            pioneer_protocol::TurnPermissionApprovalRequest,
+            Domain::Providers,
+            Kind::Snapshot,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "turn_permission_approval_request_detail.json",
+            pioneer_protocol::TurnPermissionApprovalRequestDetail,
+            Domain::Providers,
+            Kind::Snapshot,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "turn_permission_approval_resolution.json",
+            pioneer_protocol::TurnPermissionApprovalResolution,
+            Domain::Providers,
+            Kind::SelectorDto,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "turn_permission_request_opened_notification.json",
+            pioneer_protocol::TurnPermissionRequestOpenedNotification,
+            Domain::Providers,
+            Kind::Event,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "turn_permission_request_resolved_notification.json",
+            pioneer_protocol::TurnPermissionRequestResolvedNotification,
+            Domain::Providers,
+            Kind::Event,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "turn_permission_request_respond_params.json",
+            pioneer_protocol::TurnPermissionRequestRespondParams,
+            Domain::Providers,
+            Kind::Command,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "turn_permission_request_respond_response.json",
+            pioneer_protocol::TurnPermissionRequestRespondResponse,
+            Domain::Providers,
+            Kind::Snapshot,
+            Stability::Provisional
+        ),
+        contract_type!(
             "cli_runtime_refresh_params.json",
             pioneer_protocol::CLIRuntimeRefreshParams,
             Domain::Providers,
@@ -519,6 +596,13 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             >,
             Domain::Composer,
             Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "composer_permission_mode_option.json",
+            crate::composer::permissions::ComposerPermissionModeOption,
+            Domain::Composer,
+            Kind::SelectorDto,
             Stability::Stable
         ),
         contract_type!(
@@ -1782,7 +1866,6 @@ mod tests {
         for expected in [
             "agent_execution_backend.json",
             "cli_agent_runtime_kind.json",
-            "cli_agent_runtime_approval_policy.json",
             "cli_agent_runtime_sandbox_policy.json",
             "turn_cli_runtime_options.json",
             "runtime_summary.json",

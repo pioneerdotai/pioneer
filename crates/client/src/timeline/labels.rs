@@ -1,11 +1,12 @@
 //! UI-neutral timeline labels and status codes.
 
-use crate::conversation::{
-    ConversationViewState, ItemView, TimelineEntryStatus, reducer::TurnPhase,
+use crate::{
+    composer::permissions::{self as composer_permissions, TurnPermissionModeDisplay},
+    conversation::{ConversationViewState, ItemView, TimelineEntryStatus, reducer::TurnPhase},
 };
 use pioneer_protocol::{
     AgentMessagePhase, ArtifactRef, SystemEventLevel, ToolDisplayPayload, ToolMetadataValue,
-    ToolStoragePayload, TurnItem, UserMessageAttachment,
+    ToolStoragePayload, TurnItem, TurnPermissionProfileSnapshot, UserMessageAttachment,
 };
 use serde_json::Value as JsonValue;
 use std::{
@@ -51,6 +52,14 @@ pub fn format_item_elapsed(item_view: &ItemView) -> Option<String> {
 pub struct RunningTurnDisplay {
     pub turn_id: String,
     pub started_at_unix_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_profile: Option<TurnPermissionProfileSnapshot>,
+}
+
+pub fn turn_permission_profile_display(
+    profile: &TurnPermissionProfileSnapshot,
+) -> TurnPermissionModeDisplay {
+    composer_permissions::turn_permission_mode_display(profile.mode)
 }
 
 pub fn running_turn_display(projection: &ConversationViewState) -> Option<RunningTurnDisplay> {
@@ -80,6 +89,7 @@ pub fn running_turn_display(projection: &ConversationViewState) -> Option<Runnin
         started_at_unix_ms: active_turn
             .started_at_unix_ms
             .or_else(|| first_turn_item_started_at(projection, active_turn.id.as_str())),
+        permission_profile: active_turn.permission_profile.clone(),
     })
 }
 
@@ -659,6 +669,8 @@ pub struct TaskWaitReviewDisplayItem {
     pub candidate_id: String,
     pub candidate_status: Option<String>,
     pub review_mode: Option<String>,
+    pub permission_mode: Option<String>,
+    pub permission_source: Option<String>,
     pub user_approval_required: bool,
     pub round: Option<u32>,
     pub summary: Option<String>,
@@ -711,6 +723,8 @@ pub enum TaskWaitReviewDetailKind {
     CandidateStatus,
     Round,
     ReviewMode,
+    PermissionMode,
+    PermissionSource,
     RevisionBlocked,
     Summary,
     ResultPreview,
@@ -841,6 +855,18 @@ impl TaskWaitReviewDisplayItem {
             rows.push(TaskWaitReviewDetailRow::Field {
                 kind: TaskWaitReviewDetailKind::ReviewMode,
                 value: review_mode.to_owned(),
+            });
+        }
+        if let Some(permission_mode) = self.permission_mode.as_deref() {
+            rows.push(TaskWaitReviewDetailRow::Field {
+                kind: TaskWaitReviewDetailKind::PermissionMode,
+                value: permission_mode.to_owned(),
+            });
+        }
+        if let Some(permission_source) = self.permission_source.as_deref() {
+            rows.push(TaskWaitReviewDetailRow::Field {
+                kind: TaskWaitReviewDetailKind::PermissionSource,
+                value: permission_source.to_owned(),
             });
         }
         if self.user_approval_required {
@@ -984,6 +1010,8 @@ fn task_wait_review_display_item(value: &JsonValue) -> Option<TaskWaitReviewDisp
         candidate_id,
         candidate_status: json_string(value, "candidateStatus"),
         review_mode: json_string(value, "reviewMode"),
+        permission_mode: json_string(value, "permissionMode"),
+        permission_source: json_string(value, "permissionSource"),
         user_approval_required: json_bool(value, "userApprovalRequired").unwrap_or(false),
         round: json_u32(value, "round"),
         summary: json_string(value, "summary"),
@@ -1099,6 +1127,7 @@ pub enum SystemEventLabel {
     Checkpoint,
     Continued,
     Paused,
+    Permissions,
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -1504,6 +1533,10 @@ pub fn system_event_presentation(
             message: SystemEventMessage::ToolLoopBudgetExceeded,
             label: system_event_label(level),
         },
+        Some("turn_permission_audit") => SystemEventPresentation {
+            message: SystemEventMessage::Raw(message.to_owned()),
+            label: SystemEventLabel::Permissions,
+        },
         code if execution_window_code(code) => SystemEventPresentation {
             message: SystemEventMessage::Raw(message.to_owned()),
             label: execution_window_presentation_label(code, level, details),
@@ -1859,6 +1892,8 @@ mod tests {
                         "runId": "run_1",
                         "candidateId": "candidate_1",
                         "reviewMode": "user_approval",
+                        "permissionMode": "supervised",
+                        "permissionSource": "task_permission_cap",
                         "userApprovalRequired": true,
                         "allowedActions": ["task_accept", "task_revise"]
                     }]
@@ -1870,6 +1905,23 @@ mod tests {
         assert_eq!(review.review_required_count, 1);
         assert!(review.items[0].user_controls_allowed());
         assert!(review.items[0].allows_action("task_accept"));
+        assert_eq!(
+            review.items[0].permission_mode.as_deref(),
+            Some("supervised")
+        );
+        assert_eq!(
+            review.items[0].permission_source.as_deref(),
+            Some("task_permission_cap")
+        );
+        assert!(review.items[0].detail_rows().iter().any(|row| {
+            matches!(
+                row,
+                TaskWaitReviewDetailRow::Field {
+                    kind: TaskWaitReviewDetailKind::PermissionMode,
+                    value,
+                } if value == "supervised"
+            )
+        }));
         assert_eq!(
             task_review_action_key("candidate_1", "accept"),
             "task-review:candidate_1:accept"
@@ -2031,6 +2083,7 @@ mod tests {
                 started_at_unix_ms: Some(42),
                 completed_at_unix_ms: None,
                 error: None,
+                permission_profile: None,
                 resume: None,
             }],
             in_flight_turn_id: Some("turn_1".to_owned()),
@@ -2042,6 +2095,7 @@ mod tests {
             Some(RunningTurnDisplay {
                 turn_id: "turn_1".to_owned(),
                 started_at_unix_ms: Some(42),
+                permission_profile: None,
             })
         );
     }
@@ -2055,6 +2109,7 @@ mod tests {
                 started_at_unix_ms: Some(42),
                 completed_at_unix_ms: None,
                 error: None,
+                permission_profile: None,
                 resume: None,
             }],
             items: vec![ItemView {

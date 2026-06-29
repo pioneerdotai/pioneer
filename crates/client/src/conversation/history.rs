@@ -546,6 +546,14 @@ impl Conversation {
                     event.created_at,
                 );
             }
+            ThreadHistoryEventPayload::TurnPermissionAudit(audit_event) => {
+                let conversation_event = ConversationEvent::TurnPermissionAudit {
+                    event: audit_event.clone(),
+                };
+                self.apply_history_conversation_event(conversation_event, event.created_at);
+                self.projector
+                    .apply_permission_audit_event(audit_event, event.created_at);
+            }
             ThreadHistoryEventPayload::TurnCompleted {
                 thread_id, turn, ..
             } => {
@@ -620,6 +628,7 @@ mod tests {
             origin: Default::default(),
             error: error.map(str::to_owned),
             prompt_manifest: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
         }
     }
 

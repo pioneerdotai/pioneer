@@ -8,8 +8,10 @@
 
 use crate::{
     cli_runtime::approvals::{
-        CLIRuntimePendingRequestsReduction, reduce_cli_runtime_request_opened_notification,
+        PendingRequestsReduction, reduce_cli_runtime_request_opened_notification,
         reduce_cli_runtime_request_resolved_notification,
+        reduce_native_permission_request_opened_notification,
+        reduce_native_permission_request_resolved_notification,
     },
     notifications::router::{
         ArtifactDeletedRefreshReduction, ArtifactThreadRefreshReduction,
@@ -126,7 +128,10 @@ pub enum ClientRuntimeNotification {
     CLIRuntimeRefresh(CLIRuntimeRefreshReduction),
     CLIRuntimePendingRequests {
         refresh: CLIRuntimeRefreshReduction,
-        reduction: CLIRuntimePendingRequestsReduction,
+        reduction: PendingRequestsReduction,
+    },
+    PendingRequests {
+        reduction: PendingRequestsReduction,
     },
     SemanticTimeline(SemanticTimelineLiveUpdate),
     GatewayRemoteAccessStatusChanged(GatewayRemoteAccessStatusChangedNotification),
@@ -591,6 +596,16 @@ pub fn reduce_gateway_notification(
             let reduction = reduce_cli_runtime_request_resolved_notification(notification);
             Some(ClientRuntimeNotification::CLIRuntimePendingRequests { refresh, reduction })
         }
+        GatewayNotification::TurnPermissionRequestOpened(notification) => {
+            Some(ClientRuntimeNotification::PendingRequests {
+                reduction: reduce_native_permission_request_opened_notification(notification),
+            })
+        }
+        GatewayNotification::TurnPermissionRequestResolved(notification) => {
+            Some(ClientRuntimeNotification::PendingRequests {
+                reduction: reduce_native_permission_request_resolved_notification(notification),
+            })
+        }
         GatewayNotification::CLIRuntimeAppsChanged(notification) => {
             Some(ClientRuntimeNotification::CLIRuntimeRefresh(
                 reduce_cli_runtime_apps_changed_notification(
@@ -672,6 +687,8 @@ mod tests {
         GatewayRemoteAccessErrorKind, GatewayRemoteAccessState,
         GatewayRemoteAccessStatusChangedNotification, GatewayRemoteAccessStatusSnapshot,
         SkillsChangedNotification, ThreadTimelineBlocksChangedNotification, TimelineChangeReason,
+        TurnPermissionApprovalRequest, TurnPermissionApprovalResolution,
+        TurnPermissionRequestOpenedNotification, TurnPermissionRequestResolvedNotification,
         UnknownGatewayNotification, Workspace, WorkspaceChangeKind, WorkspaceChangedNotification,
     };
     use serde_json::json;
@@ -974,6 +991,53 @@ mod tests {
         };
         assert_eq!(reduction.workspace_id, "ws_a");
         assert!(reduction.queue_skills_refresh);
+    }
+
+    #[test]
+    fn runtime_reduces_native_permission_request_notifications() {
+        let opened = GatewayNotification::TurnPermissionRequestOpened(
+            TurnPermissionRequestOpenedNotification {
+                request: TurnPermissionApprovalRequest {
+                    request_id: "req_native".to_owned(),
+                    workspace_id: "ws_a".to_owned(),
+                    thread_id: "thread_a".to_owned(),
+                    turn_id: "turn_a".to_owned(),
+                    tool_name: "shell".to_owned(),
+                    action: pioneer_protocol::TurnPermissionActionKind::ShellCommand,
+                    scope_hash: "scope_a".to_owned(),
+                    reason: pioneer_protocol::TurnPermissionDecisionReason::PolicyRequiresApproval,
+                    summary: Some("cargo check".to_owned()),
+                    details: Vec::new(),
+                },
+            },
+        );
+
+        let reduced =
+            reduce_gateway_notification(opened, ClientRuntimeNotificationContext::default());
+        let Some(ClientRuntimeNotification::PendingRequests { reduction }) = reduced else {
+            panic!("expected pending request reduction");
+        };
+        let mut state = crate::cli_runtime::approvals::PendingRequestState::default();
+        state.apply(reduction);
+        assert_eq!(state.requests().len(), 1);
+        assert_eq!(state.requests()[0].request_id, "req_native");
+
+        let resolved = GatewayNotification::TurnPermissionRequestResolved(
+            TurnPermissionRequestResolvedNotification {
+                request_id: "req_native".to_owned(),
+                workspace_id: "ws_a".to_owned(),
+                thread_id: "thread_a".to_owned(),
+                turn_id: "turn_a".to_owned(),
+                resolution: TurnPermissionApprovalResolution::AllowForTurn,
+            },
+        );
+        let reduced =
+            reduce_gateway_notification(resolved, ClientRuntimeNotificationContext::default());
+        let Some(ClientRuntimeNotification::PendingRequests { reduction }) = reduced else {
+            panic!("expected pending request resolved reduction");
+        };
+        state.apply(reduction);
+        assert!(state.requests().is_empty());
     }
 
     #[test]

@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnPermissionRequestRespondParams",
+  "type": "object",
+  "properties": {
+    "request_id": {
+      "type": "string"
+    },
+    "resolution": {
+      "$ref": "#/$defs/TurnPermissionApprovalResolution"
+    }
+  },
+  "required": [
+    "request_id",
+    "resolution"
+  ],
+  "$defs": {
+    "TurnPermissionApprovalResolution": {
+      "type": "string",
+      "enum": [
+        "allow_once",
+        "allow_for_turn",
+        "deny",
+        "cancelled",
+        "expired"
+      ]
+    }
+  }
+}

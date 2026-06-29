@@ -324,6 +324,7 @@ impl TurnStateMachine {
                     };
                 }
             }
+            ConversationEvent::TurnPermissionAudit { .. } => {}
         }
     }
 
@@ -505,6 +506,7 @@ mod tests {
             origin: TurnOrigin::User,
             error,
             prompt_manifest: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
         }
     }
 }

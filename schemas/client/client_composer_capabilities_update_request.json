@@ -1,0 +1,195 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ClientComposerCapabilitiesUpdateRequest",
+  "type": "object",
+  "properties": {
+    "action": {
+      "$ref": "#/$defs/ClientComposerCapabilitiesUpdateAction"
+    },
+    "capabilities": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ComposerCapability"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "capabilities",
+    "action"
+  ],
+  "$defs": {
+    "ClientComposerCapabilitiesUpdateAction": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "Add": {
+              "type": "object",
+              "properties": {
+                "capability": {
+                  "$ref": "#/$defs/ComposerCapability"
+                }
+              },
+              "required": [
+                "capability"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Add"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Remove": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Remove"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "RemoveAt": {
+              "type": "object",
+              "properties": {
+                "index": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "index"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "RemoveAt"
+          ]
+        }
+      ]
+    },
+    "ComposerCapability": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ComposerCapabilityKind"
+        },
+        "label": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "kind"
+      ]
+    },
+    "ComposerCapabilityKind": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "Skill": {
+              "type": "object",
+              "properties": {
+                "slug": {
+                  "type": "string"
+                },
+                "source_kind": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "slug",
+                "source_kind"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Skill"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "McpServer": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "scope_kind": {
+                  "$ref": "#/$defs/McpScopeKind"
+                }
+              },
+              "required": [
+                "name",
+                "scope_kind"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "McpServer"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "McpTool": {
+              "type": "object",
+              "properties": {
+                "raw_tool_name": {
+                  "type": "string"
+                },
+                "scope_kind": {
+                  "$ref": "#/$defs/McpScopeKind"
+                },
+                "server_name": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "server_name",
+                "raw_tool_name",
+                "scope_kind"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "McpTool"
+          ]
+        }
+      ]
+    },
+    "McpScopeKind": {
+      "type": "string",
+      "enum": [
+        "workspace",
+        "user"
+      ]
+    }
+  }
+}

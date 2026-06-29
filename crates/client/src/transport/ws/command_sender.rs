@@ -52,8 +52,9 @@ use pioneer_protocol::{
     ThreadTimelinePageParams, ThreadTimelinePageResponse, ThreadTreeParams, ThreadTreeResponse,
     ThreadUnsubscribeParams, ThreadUnsubscribeResponse, ThreadUpdateParams, ThreadUpdateResponse,
     TurnCancelParams, TurnCancelResponse, TurnGetParams, TurnGetResponse, TurnItemsParams,
-    TurnItemsResponse, TurnStartParams, TurnStartResponse, TurnWorkPageParams,
-    TurnWorkPageResponse, WorkspaceCreateParams, WorkspaceCreateResponse, WorkspaceDefaultParams,
+    TurnItemsResponse, TurnPermissionRequestRespondParams, TurnPermissionRequestRespondResponse,
+    TurnStartParams, TurnStartResponse, TurnWorkPageParams, TurnWorkPageResponse,
+    WorkspaceCreateParams, WorkspaceCreateResponse, WorkspaceDefaultParams,
     WorkspaceDefaultResponse, WorkspaceListParams, WorkspaceListResponse, WorkspaceSelectParams,
     WorkspaceSelectResponse, WorkspaceUpdateParams, WorkspaceUpdateResponse,
 };
@@ -534,6 +535,27 @@ where
     send_json_rpc_request_typed(
         transport,
         methods::TURN_WORK_PAGE,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn turn_permission_request_respond<TTransport>(
+    transport: &TTransport,
+    params: TurnPermissionRequestRespondParams,
+) -> Result<TurnPermissionRequestRespondResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.request_id.as_str(),
+        "request_id",
+        methods::TURN_PERMISSION_REQUEST_RESPOND,
+    )?;
+
+    send_json_rpc_request_typed(
+        transport,
+        methods::TURN_PERMISSION_REQUEST_RESPOND,
         &params,
         RPC_REQUEST_TIMEOUT,
     )
@@ -2286,6 +2308,7 @@ mod tests {
                         mode: None,
                         execution_backend: None,
                         reasoning: None,
+                        permission_profile: None,
                         cli_runtime_options: None,
                     },
                 )
@@ -2309,6 +2332,7 @@ mod tests {
                         mode: None,
                         execution_backend: None,
                         reasoning: None,
+                        permission_profile: None,
                         cli_runtime_options: None,
                     },
                 )

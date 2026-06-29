@@ -38,6 +38,18 @@
       "format": "uint32",
       "minimum": 0
     },
+    "permission_mode": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "permission_source": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "remaining_revision_rounds": {
       "type": [
         "integer",

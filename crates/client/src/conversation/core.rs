@@ -442,6 +442,10 @@ impl Conversation {
                     ts_unix_ms,
                 );
             }
+            ConversationEvent::TurnPermissionAudit { event } => {
+                self.projector
+                    .apply_permission_audit_event(&event, ts_unix_ms);
+            }
             ConversationEvent::ItemCompleted { turn_id, item, .. } => {
                 self.item_handlers.apply_completed(
                     &mut self.projector,

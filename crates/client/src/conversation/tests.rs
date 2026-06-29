@@ -12,13 +12,20 @@ use pioneer_protocol::{
     TurnBlockedResumeMetadata, TurnExecutionWindowBlockedNotification,
     TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
     TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification, TurnItem,
-    TurnItemTimeoutReason, TurnItemType, TurnStatus, UserInput, UserMessageAttachment,
+    TurnItemTimeoutReason, TurnItemType, TurnPermissionActionKind, TurnPermissionAuditDecision,
+    TurnPermissionAuditEvent, TurnPermissionAuditEventKind, TurnPermissionAuditRequestKey,
+    TurnPermissionDecisionReason, TurnPermissionMode, TurnPermissionProfileSource, TurnStatus,
+    UserInput, UserMessageAttachment,
 };
 
 const THREAD_ID: &str = "thr_000000000000000001";
 const TURN_ID: &str = "turn_000000000000000001";
 const PENDING_REQUEST_ID: &str = "req_000000000000000001";
 const WORKSPACE_ID: &str = "ws_000000000000000001";
+
+fn default_test_permission_profile() -> pioneer_protocol::TurnPermissionProfileSnapshot {
+    pioneer_protocol::default_turn_permission_profile_snapshot()
+}
 
 fn pending_request_id(conversation: &Conversation) -> Option<&str> {
     conversation.pending_request_id()
@@ -34,8 +41,147 @@ fn apply_in_progress_turn(conversation: &mut Conversation) {
             origin: Default::default(),
             error: None,
             prompt_manifest: None,
+            permission_profile: default_test_permission_profile(),
         },
     });
+}
+
+fn permission_audit_event(
+    event_kind: TurnPermissionAuditEventKind,
+    decision: Option<TurnPermissionAuditDecision>,
+) -> TurnPermissionAuditEvent {
+    TurnPermissionAuditEvent {
+        workspace_id: WORKSPACE_ID.to_owned(),
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
+        event_kind,
+        profile_mode: TurnPermissionMode::Supervised,
+        profile_source: TurnPermissionProfileSource::Composer,
+        item_id: Some("item_tool".to_owned()),
+        tool_call_id: Some("tool_call_1".to_owned()),
+        tool_name: Some("shell".to_owned()),
+        action_kind: Some(TurnPermissionActionKind::ShellCommand),
+        request_key: Some(TurnPermissionAuditRequestKey {
+            action_kind: TurnPermissionActionKind::ShellCommand,
+            scope_hash: "scope_hash_only".to_owned(),
+        }),
+        decision,
+        reason: Some(TurnPermissionDecisionReason::PolicyRequiresApproval),
+        cached: false,
+    }
+}
+
+#[test]
+fn turn_started_projection_preserves_permission_profile() {
+    let mut conversation = Conversation::new(THREAD_ID);
+    let permission_profile = pioneer_protocol::compile_turn_permission_profile(
+        TurnPermissionMode::Supervised,
+        TurnPermissionProfileSource::Composer,
+    );
+
+    conversation.apply(ConversationEvent::TurnStarted {
+        thread_id: THREAD_ID.to_owned(),
+        turn: Turn {
+            id: TURN_ID.to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
+            error: None,
+            prompt_manifest: None,
+            permission_profile: permission_profile.clone(),
+        },
+    });
+
+    assert_eq!(
+        conversation.projection().turn_permission_profile(TURN_ID),
+        Some(&permission_profile)
+    );
+}
+
+#[test]
+fn permission_audit_projection_stores_sanitized_decision_history() {
+    let mut conversation = Conversation::new(THREAD_ID);
+    apply_in_progress_turn(&mut conversation);
+
+    let event = permission_audit_event(
+        TurnPermissionAuditEventKind::ApprovalRequested,
+        Some(TurnPermissionAuditDecision::Ask),
+    );
+    conversation.apply(ConversationEvent::TurnPermissionAudit { event });
+
+    let audit = conversation.projection().permission_audit_for_turn(TURN_ID);
+    assert_eq!(audit.len(), 1);
+    assert_eq!(
+        audit[0].request_scope_hash.as_deref(),
+        Some("scope_hash_only")
+    );
+    assert_eq!(audit[0].tool_name.as_deref(), Some("shell"));
+    assert_eq!(
+        conversation
+            .projection()
+            .permission_decision_history_for_turn(TURN_ID)
+            .len(),
+        1
+    );
+
+    let (_, details) = system_event_details(&conversation, "turn_permission_audit");
+    let details_text = details.to_string();
+    assert!(details_text.contains("scope_hash_only"));
+    assert!(details_text.contains("policy_requires_approval"));
+}
+
+#[test]
+fn permission_audit_history_hydrates_shared_projection_and_timeline_row() {
+    let mut conversation = Conversation::new(THREAD_ID);
+    let events = vec![
+        ThreadHistoryEvent {
+            turn_id: TURN_ID.to_owned(),
+            sequence: 1,
+            created_at: 1_000,
+            payload: ThreadHistoryEventPayload::TurnStarted {
+                workspace_id: WORKSPACE_ID.to_owned(),
+                thread_id: THREAD_ID.to_owned(),
+                turn: Turn {
+                    id: TURN_ID.to_owned(),
+                    status: TurnStatus::InProgress,
+                    turn_kind: Default::default(),
+                    origin: Default::default(),
+                    error: None,
+                    prompt_manifest: None,
+                    permission_profile: default_test_permission_profile(),
+                },
+                input: Vec::new(),
+            },
+        },
+        ThreadHistoryEvent {
+            turn_id: TURN_ID.to_owned(),
+            sequence: 2,
+            created_at: 2_000,
+            payload: ThreadHistoryEventPayload::TurnPermissionAudit(permission_audit_event(
+                TurnPermissionAuditEventKind::ApprovalResolved,
+                Some(TurnPermissionAuditDecision::AllowOnce),
+            )),
+        },
+    ];
+
+    conversation.hydrate_history(&events);
+
+    let audit = conversation.projection().permission_audit_for_turn(TURN_ID);
+    assert_eq!(audit.len(), 1);
+    assert_eq!(
+        audit[0].decision,
+        Some(TurnPermissionAuditDecision::AllowOnce)
+    );
+    assert!(conversation.projection().items.iter().any(|item| matches!(
+        &item.item,
+        TurnItem::SystemEvent {
+            code: Some(code),
+            details: Some(details),
+            ..
+        } if code == "turn_permission_audit"
+            && details["decision"] == "allow_once"
+            && details.get("request_scope_hash").is_some()
+    )));
 }
 
 fn system_event_details<'a>(
@@ -239,6 +385,8 @@ fn send_stays_blocked_until_terminal_event() {
             error: None,
 
             prompt_manifest: None,
+
+            permission_profile: default_test_permission_profile(),
         },
     });
     assert!(!conversation.can_submit_message());
@@ -253,6 +401,8 @@ fn send_stays_blocked_until_terminal_event() {
             error: None,
 
             prompt_manifest: None,
+
+            permission_profile: default_test_permission_profile(),
         },
     });
 
@@ -461,6 +611,8 @@ fn send_unlocks_only_on_terminal_failed_or_cancelled() {
             error: Some("network".to_owned()),
 
             prompt_manifest: None,
+
+            permission_profile: default_test_permission_profile(),
         },
     });
 
@@ -486,6 +638,8 @@ fn send_unlocks_only_on_terminal_failed_or_cancelled() {
             error: Some("cancelled".to_owned()),
 
             prompt_manifest: None,
+
+            permission_profile: default_test_permission_profile(),
         },
     });
 
@@ -555,6 +709,8 @@ fn cancel_request_locks_until_rejected_or_interrupted() {
             error: Some("stopped by user".to_owned()),
 
             prompt_manifest: None,
+
+            permission_profile: default_test_permission_profile(),
         },
     });
     conversation.apply(ConversationEvent::LocalTurnCancelRejected {
@@ -715,6 +871,7 @@ fn conversation_codex_reasoning_summary_does_not_overwrite_agent_message_text() 
             origin: Default::default(),
             error: None,
             prompt_manifest: None,
+            permission_profile: default_test_permission_profile(),
         },
     });
 
@@ -1104,6 +1261,7 @@ fn terminal_turn_stamps_running_items_completed_at() {
             origin: Default::default(),
             error: None,
             prompt_manifest: None,
+            permission_profile: default_test_permission_profile(),
         },
     });
 
@@ -1414,6 +1572,7 @@ fn history_hydration_preserves_tool_recovery_policy_snapshot() {
                     origin: Default::default(),
                     error: None,
                     prompt_manifest: None,
+                    permission_profile: default_test_permission_profile(),
                 },
                 input: Vec::new(),
             },
@@ -1485,6 +1644,7 @@ fn history_hydration_keeps_dynamic_model_only_body_out_of_desktop_state() {
                     origin: Default::default(),
                     error: None,
                     prompt_manifest: None,
+                    permission_profile: default_test_permission_profile(),
                 },
                 input: Vec::new(),
             },
@@ -1684,6 +1844,7 @@ fn history_hydration_restores_recovery_events_without_terminal_duplicate() {
                     origin: Default::default(),
                     error: None,
                     prompt_manifest: None,
+                    permission_profile: default_test_permission_profile(),
                 },
                 input: Vec::new(),
             },
@@ -1751,6 +1912,7 @@ fn history_hydration_restores_recovery_events_without_terminal_duplicate() {
                         "recovery failed for item `{item_id}`: recovery policy marks this failure as terminal"
                     )),
                     prompt_manifest: None,
+                    permission_profile: default_test_permission_profile(),
                 },
             },
         },
@@ -1792,6 +1954,8 @@ fn foreign_thread_events_do_not_modify_local_projection() {
             error: None,
 
             prompt_manifest: None,
+
+            permission_profile: default_test_permission_profile(),
         },
     });
 
@@ -1814,6 +1978,8 @@ fn replay_style_sequence_restores_final_state() {
             error: None,
 
             prompt_manifest: None,
+
+            permission_profile: default_test_permission_profile(),
         },
     });
     conversation.apply(ConversationEvent::ItemStarted {
@@ -1876,6 +2042,8 @@ fn replay_style_sequence_restores_final_state() {
             error: None,
 
             prompt_manifest: None,
+
+            permission_profile: default_test_permission_profile(),
         },
     });
     assert_eq!(conversation.status_label(), "completing");
@@ -1906,6 +2074,8 @@ fn duplicate_turn_completed_event_is_ignored_after_terminal_completion() {
             error: None,
 
             prompt_manifest: None,
+
+            permission_profile: default_test_permission_profile(),
         },
     });
 
@@ -1919,6 +2089,8 @@ fn duplicate_turn_completed_event_is_ignored_after_terminal_completion() {
             error: None,
 
             prompt_manifest: None,
+
+            permission_profile: default_test_permission_profile(),
         },
     });
     assert_eq!(conversation.status_label(), "completing");
@@ -1935,6 +2107,8 @@ fn duplicate_turn_completed_event_is_ignored_after_terminal_completion() {
             error: None,
 
             prompt_manifest: None,
+
+            permission_profile: default_test_permission_profile(),
         },
     });
 
@@ -1964,6 +2138,8 @@ fn turn_completed_finalizes_projection_even_when_flow_is_not_in_flight() {
             error: None,
 
             prompt_manifest: None,
+
+            permission_profile: default_test_permission_profile(),
         },
     });
 
@@ -2203,6 +2379,7 @@ fn execution_window_events_project_runtime_rows_without_ending_turn() {
             origin: Default::default(),
             error: None,
             prompt_manifest: None,
+            permission_profile: default_test_permission_profile(),
         },
     });
 
@@ -2287,6 +2464,7 @@ fn turn_blocked_resume_metadata_projects_live_and_history() {
         origin: Default::default(),
         error: Some("model unavailable".to_owned()),
         prompt_manifest: None,
+        permission_profile: default_test_permission_profile(),
     };
 
     let mut live = Conversation::new(THREAD_ID);
@@ -2336,6 +2514,7 @@ fn turn_blocked_resume_metadata_projects_live_and_history() {
                     origin: Default::default(),
                     error: None,
                     prompt_manifest: None,
+                    permission_profile: default_test_permission_profile(),
                 },
                 input: Vec::new(),
             },
@@ -2419,6 +2598,7 @@ fn history_hydration_replays_tool_retry_events_like_live_events() {
                     origin: Default::default(),
                     error: None,
                     prompt_manifest: None,
+                    permission_profile: default_test_permission_profile(),
                 },
                 input: Vec::new(),
             },
@@ -2520,6 +2700,7 @@ fn history_hydration_replays_execution_window_events_like_live_events() {
                     origin: Default::default(),
                     error: None,
                     prompt_manifest: None,
+                    permission_profile: default_test_permission_profile(),
                 },
                 input: Vec::new(),
             },
@@ -2620,6 +2801,8 @@ fn hydrate_history_restores_all_items_and_thinking_duration() {
                     error: None,
 
                     prompt_manifest: None,
+
+                    permission_profile: default_test_permission_profile(),
                 },
                 input: vec![UserInput::Text {
                     text: "history prompt".to_owned(),
@@ -2752,6 +2935,8 @@ fn hydrate_history_restores_all_items_and_thinking_duration() {
                     error: None,
 
                     prompt_manifest: None,
+
+                    permission_profile: default_test_permission_profile(),
                 },
             },
         },
@@ -2829,6 +3014,8 @@ fn hydrate_history_preserves_reasoning_delta_text_when_completed_payload_is_empt
                     error: None,
 
                     prompt_manifest: None,
+
+                    permission_profile: default_test_permission_profile(),
                 },
                 input: vec![UserInput::Text {
                     text: "reasoning test".to_owned(),
@@ -2897,6 +3084,8 @@ fn hydrate_history_preserves_reasoning_delta_text_when_completed_payload_is_empt
                     error: None,
 
                     prompt_manifest: None,
+
+                    permission_profile: default_test_permission_profile(),
                 },
             },
         },

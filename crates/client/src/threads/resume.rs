@@ -768,6 +768,13 @@ pub fn turn_item_payload_to_conversation_event(
             )
             .then_some(ConversationEvent::TurnExecutionWindowBlocked { notification })
         }
+        TurnItemEventPayload::TurnPermissionAudit(event) => turn_item_event_matches_snapshot(
+            event.workspace_id.as_str(),
+            event.thread_id.as_str(),
+            snapshot_workspace_id,
+            snapshot_thread_id,
+        )
+        .then_some(ConversationEvent::TurnPermissionAudit { event }),
     }
 }
 
@@ -1007,6 +1014,7 @@ mod tests {
             origin: TurnOrigin::User,
             error: None,
             prompt_manifest: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
         };
         match turn_resume_terminal_event("thread_a".to_owned(), completed) {
             Some(ConversationEvent::TurnCompleted { thread_id, turn }) => {
@@ -1023,6 +1031,7 @@ mod tests {
             origin: TurnOrigin::User,
             error: None,
             prompt_manifest: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
         };
         match turn_resume_terminal_event("thread_b".to_owned(), failed) {
             Some(ConversationEvent::TurnFailed { thread_id, turn }) => {
@@ -1039,6 +1048,7 @@ mod tests {
             origin: TurnOrigin::User,
             error: Some("needs review".to_owned()),
             prompt_manifest: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
         };
         match turn_resume_terminal_event("thread_blocked".to_owned(), blocked) {
             Some(ConversationEvent::TurnBlocked {
@@ -1058,6 +1068,7 @@ mod tests {
             origin: TurnOrigin::User,
             error: None,
             prompt_manifest: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
         };
         assert!(turn_resume_terminal_event("thread_c".to_owned(), in_progress).is_none());
     }
@@ -1074,6 +1085,7 @@ mod tests {
                 origin: TurnOrigin::User,
                 error: None,
                 prompt_manifest: None,
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
             },
         };
         let item_snapshot = TurnItemsResponse {
@@ -1110,6 +1122,7 @@ mod tests {
                 origin: TurnOrigin::User,
                 error: None,
                 prompt_manifest: None,
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
             },
         };
         let item_snapshot = TurnItemsResponse {
@@ -1173,6 +1186,7 @@ mod tests {
                 origin: TurnOrigin::User,
                 error: None,
                 prompt_manifest: None,
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
             },
         };
         let item_snapshot = TurnItemsResponse {
@@ -1223,6 +1237,7 @@ mod tests {
                 origin: TurnOrigin::User,
                 error: None,
                 prompt_manifest: None,
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
             },
         };
         let item_snapshot = TurnItemsResponse {

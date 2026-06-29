@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnPermissionRequestResolvedNotification",
+  "type": "object",
+  "properties": {
+    "request_id": {
+      "type": "string"
+    },
+    "resolution": {
+      "$ref": "#/$defs/TurnPermissionApprovalResolution"
+    },
+    "thread_id": {
+      "type": "string"
+    },
+    "turn_id": {
+      "type": "string"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "request_id",
+    "workspace_id",
+    "thread_id",
+    "turn_id",
+    "resolution"
+  ],
+  "$defs": {
+    "TurnPermissionApprovalResolution": {
+      "type": "string",
+      "enum": [
+        "allow_once",
+        "allow_for_turn",
+        "deny",
+        "cancelled",
+        "expired"
+      ]
+    }
+  }
+}

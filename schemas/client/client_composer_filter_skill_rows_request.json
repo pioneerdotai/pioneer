@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ClientComposerFilterSkillRowsRequest",
+  "type": "object",
+  "properties": {
+    "query": {
+      "type": "string",
+      "default": ""
+    },
+    "rows": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/SelectableSkillCapability"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "rows"
+  ],
+  "$defs": {
+    "SelectableSkillCapability": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "selectable": {
+          "type": "boolean"
+        },
+        "slug": {
+          "type": "string"
+        },
+        "source_kind": {
+          "type": "string"
+        },
+        "unavailable_reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SkillCapabilityUnavailableReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "key",
+        "label",
+        "description",
+        "slug",
+        "source_kind",
+        "selectable"
+      ]
+    },
+    "SkillCapabilityUnavailableReason": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "DisabledByPolicy"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Inactive": {
+              "type": "object",
+              "properties": {
+                "status_reason": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Inactive"
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -9,6 +9,7 @@ use crate::{
         ComposerCapability, turn_capabilities_from_composer_capabilities,
         user_message_attachments_from_composer_capabilities,
     },
+    composer::permissions as composer_permissions,
     gateway::types::GatewayEndpointKind,
     platform::{ClientFileSystem, ClientPath},
     turns::start as turn_start,
@@ -16,7 +17,8 @@ use crate::{
 use anyhow::{Context as _, Result, anyhow};
 use pioneer_protocol::{
     AgentExecutionBackend, ArtifactCapabilitiesParams, ArtifactCapabilitiesResponse, ArtifactRef,
-    ThreadMode, TurnCLIRuntimeOptions, TurnCapability, UserInput, UserMessageAttachment,
+    ThreadMode, TurnCLIRuntimeOptions, TurnCapability, TurnPermissionMode, UserInput,
+    UserMessageAttachment,
 };
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -58,6 +60,7 @@ pub struct PreparedComposerTurnSubmitContext {
     pub selected_provider: Option<String>,
     pub turn_model_provider: Option<String>,
     pub selected_mode: Option<ThreadMode>,
+    pub permission_mode: TurnPermissionMode,
     pub execution_backend: Option<AgentExecutionBackend>,
     pub selected_reasoning_effort: Option<String>,
     pub cli_runtime_options: Option<TurnCLIRuntimeOptions>,
@@ -260,6 +263,10 @@ pub fn reduce_prepared_composer_turn_submit_success(
             mode: context.selected_mode,
             execution_backend: context.execution_backend,
             reasoning,
+            permission_profile:
+                composer_permissions::turn_permission_profile_selection_from_composer_mode(
+                    context.permission_mode,
+                ),
             cli_runtime_options,
         },
         send_context,
@@ -277,7 +284,6 @@ fn cli_runtime_options_with_reasoning_effort(
     };
 
     let mut options = options.unwrap_or(TurnCLIRuntimeOptions {
-        approval_policy: None,
         sandbox: None,
         effort: None,
         personality: None,
@@ -907,6 +913,7 @@ mod tests {
                 selected_provider: Some("openai".to_owned()),
                 turn_model_provider: Some("openai".to_owned()),
                 selected_mode: Some(ThreadMode::Agent),
+                permission_mode: TurnPermissionMode::Supervised,
                 execution_backend: None,
                 selected_reasoning_effort: None,
                 cli_runtime_options: None,
@@ -969,6 +976,10 @@ mod tests {
             reduction.turn_start_params_plan.mode,
             Some(ThreadMode::Agent)
         );
+        assert_eq!(
+            reduction.turn_start_params_plan.permission_profile.mode,
+            TurnPermissionMode::Supervised
+        );
         assert_eq!(reduction.turn_start_params_plan.capabilities, Vec::new());
         assert_eq!(reduction.turn_start_params_plan.input.len(), 2);
         assert!(matches!(
@@ -995,6 +1006,7 @@ mod tests {
                 selected_provider: Some("openai".to_owned()),
                 turn_model_provider: Some("openai".to_owned()),
                 selected_mode: Some(ThreadMode::Agent),
+                permission_mode: TurnPermissionMode::AutoAcceptEdits,
                 execution_backend: None,
                 selected_reasoning_effort: Some(" high ".to_owned()),
                 cli_runtime_options: None,
@@ -1032,6 +1044,7 @@ mod tests {
                 selected_provider: Some("cli_runtime:codex".to_owned()),
                 turn_model_provider: None,
                 selected_mode: Some(ThreadMode::Agent),
+                permission_mode: TurnPermissionMode::Supervised,
                 execution_backend: Some(AgentExecutionBackend::CLIAgentRuntime {
                     runtime_id: "codex".to_owned(),
                     runtime_kind: pioneer_protocol::CLIAgentRuntimeKind::Codex,
@@ -1058,6 +1071,10 @@ mod tests {
                 .as_ref()
                 .and_then(|options| options.effort.as_deref()),
             Some("high")
+        );
+        assert_eq!(
+            reduction.turn_start_params_plan.permission_profile.mode,
+            TurnPermissionMode::Supervised
         );
     }
 

@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PendingRequestOrigin",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "origin": {
+          "type": "string",
+          "const": "cli_runtime"
+        },
+        "runtime_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "origin",
+        "runtime_id"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "origin": {
+          "type": "string",
+          "const": "native_permission_gate"
+        }
+      },
+      "required": [
+        "origin"
+      ]
+    }
+  ]
+}

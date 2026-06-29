@@ -129,6 +129,10 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             >
         ),
         schema_doc!(
+            "composer_permission_mode_option.json",
+            crate::composer::permissions::ComposerPermissionModeOption
+        ),
+        schema_doc!(
             "composer_model_selection.json",
             crate::composer::model_selection::ComposerModelSelection
         ),
@@ -383,10 +387,6 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             pioneer_protocol::CLIAgentRuntimeKind
         ),
         schema_doc!(
-            "cli_agent_runtime_approval_policy.json",
-            pioneer_protocol::CLIAgentRuntimeApprovalPolicy
-        ),
-        schema_doc!(
             "cli_agent_runtime_sandbox_policy.json",
             pioneer_protocol::CLIAgentRuntimeSandboxPolicy
         ),
@@ -549,6 +549,54 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "cli_runtime_request_respond_response.json",
             pioneer_protocol::CLIRuntimeRequestRespondResponse
+        ),
+        schema_doc!(
+            "pending_request.json",
+            crate::cli_runtime::approvals::PendingRequest
+        ),
+        schema_doc!(
+            "pending_request_kind.json",
+            crate::cli_runtime::approvals::PendingRequestKind
+        ),
+        schema_doc!(
+            "pending_request_origin.json",
+            crate::cli_runtime::approvals::PendingRequestOrigin
+        ),
+        schema_doc!(
+            "pending_request_payload.json",
+            crate::cli_runtime::approvals::PendingRequestPayload
+        ),
+        schema_doc!(
+            "pending_request_resolution.json",
+            crate::cli_runtime::approvals::PendingRequestResolution
+        ),
+        schema_doc!(
+            "turn_permission_approval_request.json",
+            pioneer_protocol::TurnPermissionApprovalRequest
+        ),
+        schema_doc!(
+            "turn_permission_approval_request_detail.json",
+            pioneer_protocol::TurnPermissionApprovalRequestDetail
+        ),
+        schema_doc!(
+            "turn_permission_approval_resolution.json",
+            pioneer_protocol::TurnPermissionApprovalResolution
+        ),
+        schema_doc!(
+            "turn_permission_request_opened_notification.json",
+            pioneer_protocol::TurnPermissionRequestOpenedNotification
+        ),
+        schema_doc!(
+            "turn_permission_request_resolved_notification.json",
+            pioneer_protocol::TurnPermissionRequestResolvedNotification
+        ),
+        schema_doc!(
+            "turn_permission_request_respond_params.json",
+            pioneer_protocol::TurnPermissionRequestRespondParams
+        ),
+        schema_doc!(
+            "turn_permission_request_respond_response.json",
+            pioneer_protocol::TurnPermissionRequestRespondResponse
         ),
         schema_doc!(
             "cli_runtime_apps_changed_notification.json",

@@ -17,7 +17,9 @@ use std::collections::VecDeque;
 
 pub use self::display::tool_display_text;
 pub use self::events::ConversationEvent;
-pub use self::reducer::{ConversationViewState, ItemView, TimelineEntry, TimelineEntryStatus};
+pub use self::reducer::{
+    ConversationViewState, ItemView, PermissionAuditDisplayItem, TimelineEntry, TimelineEntryStatus,
+};
 
 #[cfg(test)]
 pub use self::reducer::{TurnPhase, TurnView};
@@ -70,6 +72,9 @@ fn history_event_thread_id(payload: &ThreadHistoryEventPayload) -> &str {
         )
         | ThreadHistoryEventPayload::TurnExecutionWindowBlocked(
             pioneer_protocol::TurnExecutionWindowBlockedNotification { thread_id, .. },
+        )
+        | ThreadHistoryEventPayload::TurnPermissionAudit(
+            pioneer_protocol::TurnPermissionAuditEvent { thread_id, .. },
         )
         | ThreadHistoryEventPayload::TurnCompleted { thread_id, .. }
         | ThreadHistoryEventPayload::TurnFailed { thread_id, .. }

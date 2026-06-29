@@ -392,6 +392,13 @@ impl GatewayWsCommandSender {
         client_ws_commands::cli_runtime_request_respond(self, params)
     }
 
+    pub fn turn_permission_request_respond(
+        &self,
+        params: TurnPermissionRequestRespondParams,
+    ) -> Result<TurnPermissionRequestRespondResponse> {
+        client_ws_commands::turn_permission_request_respond(self, params)
+    }
+
     pub fn gateway_settings_get(&self) -> Result<GatewaySettingsGetResponse> {
         client_ws_commands::gateway_settings_get(self)
     }

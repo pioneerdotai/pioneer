@@ -50,6 +50,11 @@ pub fn timeline_row_layout_hash(
             3u8.hash(&mut hasher);
             running_turn.turn_id.hash(&mut hasher);
             running_turn.started_at_unix_ms.hash(&mut hasher);
+            running_turn
+                .permission_profile
+                .as_ref()
+                .map(|profile| profile.mode)
+                .hash(&mut hasher);
         }
         TimelineRowKind::Item { timeline_index } => {
             0u8.hash(&mut hasher);
@@ -60,6 +65,10 @@ pub fn timeline_row_layout_hash(
                 entry.turn_id.hash(&mut hasher);
                 entry.item_id.hash(&mut hasher);
                 entry.item_index.hash(&mut hasher);
+                projection
+                    .turn_permission_profile(entry.turn_id.as_str())
+                    .map(|profile| profile.mode)
+                    .hash(&mut hasher);
 
                 if let Some(item_view) = projection.item_for_timeline_entry(entry) {
                     item_view.item_type.hash(&mut hasher);
@@ -102,7 +111,19 @@ pub fn timeline_row_text_len(projection: &ConversationViewState, row: &TimelineR
             .timeline
             .get(*timeline_index)
             .and_then(|entry| projection.item_for_timeline_entry(entry))
-            .map(|item_view| timeline_entry_text(item_view).len())
+            .map(|item_view| {
+                let permission_len = projection
+                    .turn_permission_profile(item_view.turn_id.as_str())
+                    .map(|profile| {
+                        crate::composer::permissions::turn_permission_mode_display(profile.mode)
+                            .label
+                            .len()
+                    })
+                    .unwrap_or_default();
+                timeline_entry_text(item_view)
+                    .len()
+                    .saturating_add(permission_len)
+            })
             .unwrap_or_default(),
         TimelineRowKind::TurnWorkToggle(group) => {
             let mut len = TURN_WORK_GROUP_COMPLETED_TEXT_LEN_ESTIMATE;
@@ -112,7 +133,18 @@ pub fn timeline_row_text_len(projection: &ConversationViewState, row: &TimelineR
             len
         }
         TimelineRowKind::CoalescedTools(group) => coalesced_tools_text_len_estimate(group),
-        TimelineRowKind::RunningTurn(_) => RUNNING_TURN_TEXT_LEN_ESTIMATE,
+        TimelineRowKind::RunningTurn(running_turn) => {
+            let permission_len = running_turn
+                .permission_profile
+                .as_ref()
+                .map(|profile| {
+                    crate::composer::permissions::turn_permission_mode_display(profile.mode)
+                        .label
+                        .len()
+                })
+                .unwrap_or_default();
+            RUNNING_TURN_TEXT_LEN_ESTIMATE.saturating_add(permission_len)
+        }
     }
 }
 

@@ -1,0 +1,655 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ClientThreadTreeLevel",
+  "type": "object",
+  "properties": {
+    "agents_doc_summary": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ThreadAgentsDocSummary"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "folder": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ThreadFolder"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "folder_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "folder_path": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "folders": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ThreadFolder"
+      }
+    },
+    "parent_folder_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "threads": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Thread"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "folder_path",
+    "folders",
+    "threads"
+  ],
+  "$defs": {
+    "PermissionBehavior": {
+      "type": "string",
+      "enum": [
+        "allow",
+        "ask",
+        "deny"
+      ]
+    },
+    "PromptManifest": {
+      "type": "object",
+      "properties": {
+        "compiler_version": {
+          "type": "string"
+        },
+        "diagnostics": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/PromptManifestDiagnostic"
+          }
+        },
+        "fingerprint_dynamic": {
+          "type": "string"
+        },
+        "fingerprint_full": {
+          "type": "string"
+        },
+        "fingerprint_stable": {
+          "type": "string"
+        },
+        "hook_sources": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/PromptManifestHookSourceEntry"
+          }
+        },
+        "profile": {
+          "$ref": "#/$defs/PromptManifestProfile"
+        },
+        "section_ids": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "compiler_version",
+        "profile",
+        "fingerprint_stable",
+        "fingerprint_dynamic",
+        "fingerprint_full"
+      ]
+    },
+    "PromptManifestDiagnostic": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/PromptManifestDiagnosticCode"
+        },
+        "file": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hook_source": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PromptManifestHookSource"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "section_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ]
+    },
+    "PromptManifestDiagnosticCode": {
+      "type": "string",
+      "enum": [
+        "missing_file",
+        "file_read_error",
+        "file_truncated",
+        "total_budget_truncated",
+        "file_filtered_by_profile",
+        "dynamic_section_truncated",
+        "dynamic_section_omitted",
+        "hook_diagnostic",
+        "hook_best_effort_failed",
+        "capability_rejected"
+      ]
+    },
+    "PromptManifestHookContributionKind": {
+      "type": "string",
+      "enum": [
+        "prompt_context",
+        "thread_context",
+        "prompt_section",
+        "prompt_manifest_diagnostic",
+        "runtime_failure"
+      ]
+    },
+    "PromptManifestHookPhase": {
+      "type": "string",
+      "enum": [
+        "turn_pre_prompt_context",
+        "turn_post_preflight_prompt_context",
+        "turn_pre_prompt_compile",
+        "runtime_turn_pre_context"
+      ]
+    },
+    "PromptManifestHookSource": {
+      "type": "object",
+      "properties": {
+        "contribution_hash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "contribution_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hook_id": {
+          "type": "string"
+        },
+        "phase": {
+          "$ref": "#/$defs/PromptManifestHookPhase"
+        },
+        "subscription_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "hook_id",
+        "subscription_id",
+        "phase"
+      ]
+    },
+    "PromptManifestHookSourceEntry": {
+      "type": "object",
+      "properties": {
+        "contribution_kind": {
+          "$ref": "#/$defs/PromptManifestHookContributionKind"
+        },
+        "priority": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        },
+        "section_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "$ref": "#/$defs/PromptManifestHookSource"
+        },
+        "source_count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "truncation": {
+          "$ref": "#/$defs/PromptManifestHookTruncation"
+        }
+      },
+      "required": [
+        "source",
+        "contribution_kind",
+        "truncation"
+      ]
+    },
+    "PromptManifestHookTruncation": {
+      "type": "string",
+      "enum": [
+        "none",
+        "hook",
+        "prompt",
+        "hook_and_prompt",
+        "unknown"
+      ]
+    },
+    "PromptManifestProfile": {
+      "type": "string",
+      "enum": [
+        "assistant_full",
+        "assistant_minimal",
+        "assistant_none",
+        "cli_runtime"
+      ]
+    },
+    "Thread": {
+      "type": "object",
+      "properties": {
+        "agent_nickname": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agent_role": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "created_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "id": {
+          "type": "string"
+        },
+        "mode": {
+          "$ref": "#/$defs/ThreadMode"
+        },
+        "model": {
+          "type": "string"
+        },
+        "model_provider": {
+          "type": "string"
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "origin_kind": {
+          "$ref": "#/$defs/ThreadOriginKind",
+          "default": "user"
+        },
+        "preview": {
+          "type": "string"
+        },
+        "reasoning_effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sidebar_visibility": {
+          "$ref": "#/$defs/ThreadSidebarVisibility",
+          "default": "visible"
+        },
+        "status": {
+          "$ref": "#/$defs/ThreadStatus"
+        },
+        "turns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Turn"
+          }
+        },
+        "updated_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "id",
+        "preview",
+        "mode",
+        "model",
+        "model_provider",
+        "created_at",
+        "updated_at",
+        "status",
+        "turns"
+      ]
+    },
+    "ThreadAgentsDocStatus": {
+      "type": "string",
+      "enum": [
+        "draft",
+        "active",
+        "archived"
+      ]
+    },
+    "ThreadAgentsDocSummary": {
+      "type": "object",
+      "properties": {
+        "char_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "content_sha256": {
+          "type": "string"
+        },
+        "folder_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/ThreadAgentsDocStatus"
+        },
+        "updated_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "version": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "workspace_id",
+        "status",
+        "content_sha256",
+        "version",
+        "char_count",
+        "updated_at"
+      ]
+    },
+    "ThreadFolder": {
+      "type": "object",
+      "properties": {
+        "created_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "parent_folder_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "updated_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "workspace_id",
+        "name",
+        "created_at",
+        "updated_at"
+      ]
+    },
+    "ThreadMode": {
+      "type": "string",
+      "enum": [
+        "Chat",
+        "Agent"
+      ]
+    },
+    "ThreadOriginKind": {
+      "type": "string",
+      "enum": [
+        "user",
+        "task_run",
+        "system"
+      ]
+    },
+    "ThreadSidebarVisibility": {
+      "type": "string",
+      "enum": [
+        "visible",
+        "hidden"
+      ]
+    },
+    "ThreadStatus": {
+      "type": "string",
+      "enum": [
+        "Active",
+        "Idle",
+        "Closed"
+      ]
+    },
+    "ToolPermissionPolicySnapshot": {
+      "type": "object",
+      "properties": {
+        "allowed_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "allowed_tools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "computer_use": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "default_behavior": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "denied_tools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "dynamic_skill_tool": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "file_read": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "file_write": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "mcp_read": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "mcp_write_or_unknown": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "network": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "shell_command": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "task_subagent": {
+          "$ref": "#/$defs/PermissionBehavior"
+        }
+      },
+      "required": [
+        "default_behavior",
+        "file_read",
+        "file_write",
+        "shell_command",
+        "network",
+        "mcp_read",
+        "mcp_write_or_unknown",
+        "dynamic_skill_tool",
+        "computer_use",
+        "task_subagent"
+      ]
+    },
+    "Turn": {
+      "type": "object",
+      "properties": {
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "origin": {
+          "$ref": "#/$defs/TurnOrigin",
+          "default": "user"
+        },
+        "permission_profile": {
+          "$ref": "#/$defs/TurnPermissionProfileSnapshot"
+        },
+        "prompt_manifest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PromptManifest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/TurnStatus"
+        },
+        "turn_kind": {
+          "$ref": "#/$defs/TurnKind",
+          "default": "conversation"
+        }
+      },
+      "required": [
+        "id",
+        "status",
+        "permission_profile"
+      ]
+    },
+    "TurnKind": {
+      "type": "string",
+      "enum": [
+        "conversation",
+        "task_run"
+      ]
+    },
+    "TurnOrigin": {
+      "type": "string",
+      "enum": [
+        "user",
+        "scheduled_task",
+        "detached_task",
+        "attached_task"
+      ]
+    },
+    "TurnPermissionMode": {
+      "type": "string",
+      "enum": [
+        "full_access",
+        "auto_accept_edits",
+        "supervised"
+      ]
+    },
+    "TurnPermissionProfileSnapshot": {
+      "type": "object",
+      "properties": {
+        "effective_policy": {
+          "$ref": "#/$defs/ToolPermissionPolicySnapshot"
+        },
+        "mode": {
+          "$ref": "#/$defs/TurnPermissionMode"
+        },
+        "source": {
+          "$ref": "#/$defs/TurnPermissionProfileSource"
+        }
+      },
+      "required": [
+        "mode",
+        "source",
+        "effective_policy"
+      ]
+    },
+    "TurnPermissionProfileSource": {
+      "type": "string",
+      "enum": [
+        "composer",
+        "defaulted",
+        "inherited_from_parent_turn",
+        "task_permission_cap",
+        "system"
+      ]
+    },
+    "TurnStatus": {
+      "type": "string",
+      "enum": [
+        "InProgress",
+        "Completed",
+        "Failed",
+        "Interrupted",
+        "Blocked"
+      ]
+    }
+  }
+}

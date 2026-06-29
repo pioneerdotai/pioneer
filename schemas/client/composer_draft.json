@@ -15,6 +15,10 @@
         "$ref": "#/$defs/ComposerCapability"
       }
     },
+    "permission_mode": {
+      "$ref": "#/$defs/TurnPermissionMode",
+      "default": "full_access"
+    },
     "text": {
       "type": "string"
     }
@@ -368,6 +372,14 @@
       "enum": [
         "workspace",
         "user"
+      ]
+    },
+    "TurnPermissionMode": {
+      "type": "string",
+      "enum": [
+        "full_access",
+        "auto_accept_edits",
+        "supervised"
       ]
     }
   }

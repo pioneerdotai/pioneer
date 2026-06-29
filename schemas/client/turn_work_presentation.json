@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnWorkPresentation",
+  "type": "string",
+  "enum": [
+    "expanded_live",
+    "collapsed_after_final",
+    "expanded_terminal_no_final"
+  ]
+}

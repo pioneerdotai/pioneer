@@ -1,0 +1,193 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PendingRequestPayload",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "request": {
+          "$ref": "#/$defs/CLIRuntimePendingRequest"
+        },
+        "source": {
+          "type": "string",
+          "const": "cli_runtime"
+        }
+      },
+      "required": [
+        "source",
+        "request"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "request": {
+          "$ref": "#/$defs/TurnPermissionApprovalRequest"
+        },
+        "source": {
+          "type": "string",
+          "const": "native_permission_gate"
+        }
+      },
+      "required": [
+        "source",
+        "request"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "payload": true,
+        "source": {
+          "type": "string",
+          "const": "other"
+        }
+      },
+      "required": [
+        "source"
+      ]
+    }
+  ],
+  "$defs": {
+    "CLIRuntimePendingRequest": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/CLIRuntimeRequestKind"
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "native_request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "payload": true,
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
+    "CLIRuntimeRequestKind": {
+      "type": "string",
+      "enum": [
+        "command_approval",
+        "file_change_approval",
+        "user_input",
+        "other"
+      ]
+    },
+    "TurnPermissionActionKind": {
+      "type": "string",
+      "enum": [
+        "file_read",
+        "file_write",
+        "shell_command",
+        "network",
+        "mcp_read",
+        "mcp_write_or_unknown",
+        "dynamic_skill_tool",
+        "computer_use",
+        "task_subagent",
+        "internal",
+        "unknown"
+      ]
+    },
+    "TurnPermissionApprovalRequest": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/TurnPermissionActionKind"
+        },
+        "details": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TurnPermissionApprovalRequestDetail"
+          }
+        },
+        "reason": {
+          "$ref": "#/$defs/TurnPermissionDecisionReason"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "scope_hash": {
+          "type": "string"
+        },
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "tool_name": {
+          "type": "string"
+        },
+        "turn_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "request_id",
+        "workspace_id",
+        "thread_id",
+        "turn_id",
+        "tool_name",
+        "action",
+        "scope_hash",
+        "reason"
+      ]
+    },
+    "TurnPermissionApprovalRequestDetail": {
+      "type": "object",
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "monospace": {
+          "type": "boolean",
+          "default": false
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "label",
+        "value"
+      ]
+    },
+    "TurnPermissionDecisionReason": {
+      "type": "string",
+      "enum": [
+        "full_access",
+        "policy_allows_action",
+        "policy_requires_approval",
+        "policy_denies_action",
+        "cached_approval",
+        "user_approved",
+        "user_denied",
+        "cancelled",
+        "expired",
+        "unknown_action_default"
+      ]
+    }
+  }
+}

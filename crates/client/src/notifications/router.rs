@@ -2,7 +2,8 @@
 
 use crate::{
     cli_runtime::approvals::{
-        CLIRuntimePendingRequestsReduction, reduce_cli_runtime_terminal_turn_cleanup,
+        PendingRequestsReduction, reduce_pending_request_terminal_turn_cleanup,
+        reduce_pending_request_thread_closed_cleanup,
     },
     conversation::ConversationEvent,
 };
@@ -73,7 +74,7 @@ pub struct TurnLifecycleReduction {
     pub reset_thread_resume: bool,
     pub refresh_thread_artifacts: bool,
     pub sync_composer_model_selection: bool,
-    pub cli_runtime_pending_requests: Option<CLIRuntimePendingRequestsReduction>,
+    pub pending_requests: Option<PendingRequestsReduction>,
 }
 
 #[derive(Clone, Debug)]
@@ -91,6 +92,7 @@ pub struct ThreadClosedReduction {
     pub remove_thread_conversation: bool,
     pub clear_active_thread_if_matches: bool,
     pub queue_thread_list_refresh: bool,
+    pub pending_requests: Option<PendingRequestsReduction>,
 }
 
 #[derive(Clone, Debug)]
@@ -200,7 +202,7 @@ pub fn reduce_turn_started_notification(
         reset_thread_resume: true,
         refresh_thread_artifacts: false,
         sync_composer_model_selection: true,
-        cli_runtime_pending_requests: None,
+        pending_requests: None,
     }
 }
 
@@ -226,7 +228,7 @@ pub fn reduce_turn_completed_notification(
         reset_thread_resume: true,
         refresh_thread_artifacts: true,
         sync_composer_model_selection: false,
-        cli_runtime_pending_requests: Some(reduce_cli_runtime_terminal_turn_cleanup(
+        pending_requests: Some(reduce_pending_request_terminal_turn_cleanup(
             workspace_id,
             thread_id,
             turn_id,
@@ -256,7 +258,7 @@ pub fn reduce_turn_failed_notification(
         reset_thread_resume: true,
         refresh_thread_artifacts: false,
         sync_composer_model_selection: false,
-        cli_runtime_pending_requests: Some(reduce_cli_runtime_terminal_turn_cleanup(
+        pending_requests: Some(reduce_pending_request_terminal_turn_cleanup(
             workspace_id,
             thread_id,
             turn_id,
@@ -273,13 +275,13 @@ pub fn reduce_turn_blocked_notification(
 
     TurnLifecycleReduction {
         thread_id: thread_id.clone(),
-        workspace_id,
-        turn_id,
+        workspace_id: workspace_id.clone(),
+        turn_id: turn_id.clone(),
         promote_thread_from_draft: false,
         queue_thread_list_refresh: false,
         thread_status: Some(ThreadStatus::Idle),
         conversation_event: ConversationEvent::TurnBlocked {
-            thread_id,
+            thread_id: thread_id.clone(),
             turn: notification.turn,
             resume: notification.resume,
         },
@@ -287,7 +289,11 @@ pub fn reduce_turn_blocked_notification(
         reset_thread_resume: true,
         refresh_thread_artifacts: false,
         sync_composer_model_selection: false,
-        cli_runtime_pending_requests: None,
+        pending_requests: Some(reduce_pending_request_terminal_turn_cleanup(
+            workspace_id,
+            thread_id,
+            turn_id,
+        )),
     }
 }
 
@@ -678,13 +684,20 @@ pub fn reduce_thread_closed_notification(
     notification: ThreadClosedNotification,
     matches_thread_workspace: bool,
 ) -> ThreadClosedReduction {
+    let workspace_id = notification.workspace_id;
+    let thread_id = notification.thread_id;
+
     ThreadClosedReduction {
-        thread_id: notification.thread_id,
-        workspace_id: notification.workspace_id,
+        thread_id: thread_id.clone(),
+        workspace_id: workspace_id.clone(),
         matches_thread_workspace,
         remove_thread_conversation: matches_thread_workspace,
         clear_active_thread_if_matches: matches_thread_workspace,
         queue_thread_list_refresh: matches_thread_workspace,
+        pending_requests: Some(reduce_pending_request_thread_closed_cleanup(
+            workspace_id,
+            thread_id,
+        )),
     }
 }
 
@@ -1057,6 +1070,7 @@ mod tests {
             origin: Default::default(),
             error: None,
             prompt_manifest: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
         }
     }
 

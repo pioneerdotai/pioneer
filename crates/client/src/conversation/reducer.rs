@@ -6,7 +6,9 @@ use pioneer_protocol::{
     TurnBlockedResumeMetadata, TurnExecutionWindowBlockedNotification,
     TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
     TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification, TurnItem,
-    TurnItemTimeoutReason, TurnItemType, TurnStatus, UserMessageAttachment,
+    TurnItemTimeoutReason, TurnItemType, TurnPermissionAuditDecision, TurnPermissionAuditEvent,
+    TurnPermissionAuditEventKind, TurnPermissionMode, TurnPermissionProfileSnapshot,
+    TurnPermissionProfileSource, TurnStatus, UserMessageAttachment,
 };
 use serde_json::Value as JsonValue;
 use std::{
@@ -97,7 +99,38 @@ pub struct TurnView {
     pub completed_at_unix_ms: Option<i64>,
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_profile: Option<TurnPermissionProfileSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume: Option<TurnBlockedResumeMetadata>,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct PermissionAuditDisplayItem {
+    pub id: String,
+    pub turn_id: String,
+    pub created_at_unix_ms: i64,
+    pub event_kind: TurnPermissionAuditEventKind,
+    pub profile_mode: TurnPermissionMode,
+    pub profile_source: TurnPermissionProfileSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_scope_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<TurnPermissionAuditDecision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub cached: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeline_item_id: Option<String>,
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -140,6 +173,8 @@ pub struct ConversationViewState {
     pub pending_request_id: Option<String>,
     pub phase_label: String,
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub permission_audit: Vec<PermissionAuditDisplayItem>,
 }
 
 impl ConversationViewState {
@@ -152,6 +187,57 @@ impl ConversationViewState {
             .get(entry.item_index)
             .filter(|item| item.id == entry.item_id)
             .or_else(|| self.item_by_id(entry.item_id.as_str()))
+    }
+
+    pub fn turn_by_id(&self, turn_id: &str) -> Option<&TurnView> {
+        self.turns.iter().find(|turn| turn.id == turn_id)
+    }
+
+    pub fn turn_permission_profile(&self, turn_id: &str) -> Option<&TurnPermissionProfileSnapshot> {
+        self.turn_by_id(turn_id)
+            .and_then(|turn| turn.permission_profile.as_ref())
+    }
+
+    pub fn permission_audit_for_turn(&self, turn_id: &str) -> Vec<&PermissionAuditDisplayItem> {
+        self.permission_audit
+            .iter()
+            .filter(|event| event.turn_id == turn_id)
+            .collect()
+    }
+
+    pub fn permission_decision_history_for_turn(
+        &self,
+        turn_id: &str,
+    ) -> Vec<&PermissionAuditDisplayItem> {
+        self.permission_audit
+            .iter()
+            .filter(|event| event.turn_id == turn_id && event.decision.is_some())
+            .collect()
+    }
+
+    pub fn upsert_turn_snapshot_metadata(&mut self, turn: &Turn) {
+        if let Some(existing) = self
+            .turns
+            .iter_mut()
+            .find(|existing| existing.id == turn.id)
+        {
+            existing.phase = turn_phase_for_status(turn.status);
+            if turn.error.is_some() {
+                existing.error = turn.error.clone();
+            }
+            existing.permission_profile = Some(turn.permission_profile.clone());
+            return;
+        }
+
+        self.turns.push(TurnView {
+            id: turn.id.clone(),
+            phase: turn_phase_for_status(turn.status),
+            started_at_unix_ms: None,
+            completed_at_unix_ms: None,
+            error: turn.error.clone(),
+            permission_profile: Some(turn.permission_profile.clone()),
+            resume: None,
+        });
     }
 }
 
@@ -290,6 +376,33 @@ impl ConversationProjector {
             None,
             turn.error.clone(),
         );
+        self.set_turn_permission_profile(turn.id.as_str(), turn.permission_profile.clone());
+    }
+
+    pub fn apply_permission_audit_event(
+        &mut self,
+        event: &TurnPermissionAuditEvent,
+        ts_unix_ms: i64,
+    ) {
+        let id = self.next_synthetic_item_id("permission_audit");
+        let mut display = permission_audit_display_item(id, event, ts_unix_ms);
+
+        if permission_audit_should_render_timeline_row(event.event_kind) {
+            let details = permission_audit_timeline_details(&display);
+            let item_id = self.next_synthetic_item_id("permission_audit_event");
+            display.timeline_item_id = Some(item_id.clone());
+            self.push_system_event_item_with_id(
+                item_id,
+                event.turn_id.as_str(),
+                permission_audit_system_level(display.decision),
+                permission_audit_timeline_message(&display),
+                Some("turn_permission_audit".to_owned()),
+                Some(details),
+                ts_unix_ms,
+            );
+        }
+
+        self.view_state.permission_audit.push(display);
     }
 
     pub fn apply_turn_completed(&mut self, turn: &Turn, ts_unix_ms: i64) {
@@ -300,6 +413,7 @@ impl ConversationProjector {
             None,
             turn.error.clone(),
         );
+        self.set_turn_permission_profile(turn.id.as_str(), turn.permission_profile.clone());
         self.mark_turn_items_terminal(turn.id.as_str(), TimelineEntryStatus::Completed, ts_unix_ms);
     }
 
@@ -331,6 +445,7 @@ impl ConversationProjector {
             Some(ts_unix_ms),
             turn.error.clone(),
         );
+        self.set_turn_permission_profile(turn.id.as_str(), turn.permission_profile.clone());
         self.mark_turn_items_terminal(turn.id.as_str(), item_status, ts_unix_ms);
         self.view_state.last_error = turn.error.clone();
 
@@ -1076,10 +1191,23 @@ impl ConversationProjector {
             started_at_unix_ms,
             completed_at_unix_ms,
             error,
+            permission_profile: None,
             resume: None,
         });
         let index = self.view_state.turns.len().saturating_sub(1);
         self.turn_index.insert(turn_id.to_owned(), index);
+    }
+
+    fn set_turn_permission_profile(
+        &mut self,
+        turn_id: &str,
+        permission_profile: TurnPermissionProfileSnapshot,
+    ) {
+        if let Some(index) = self.turn_index.get(turn_id).copied()
+            && let Some(turn) = self.view_state.turns.get_mut(index)
+        {
+            turn.permission_profile = Some(permission_profile);
+        }
     }
 
     fn mark_turn_items_terminal(
@@ -1279,6 +1407,188 @@ fn item_sort_at(item: &ItemView) -> i64 {
         .or(item.updated_at_unix_ms)
         .or(item.completed_at_unix_ms)
         .unwrap_or(i64::MAX)
+}
+
+fn permission_audit_display_item(
+    id: String,
+    event: &TurnPermissionAuditEvent,
+    created_at_unix_ms: i64,
+) -> PermissionAuditDisplayItem {
+    PermissionAuditDisplayItem {
+        id,
+        turn_id: event.turn_id.clone(),
+        created_at_unix_ms,
+        event_kind: event.event_kind,
+        profile_mode: event.profile_mode,
+        profile_source: event.profile_source,
+        item_id: event.item_id.clone(),
+        tool_call_id: event.tool_call_id.clone(),
+        tool_name: event.tool_name.clone(),
+        action_kind: event.action_kind.map(|action| action.as_str().to_owned()),
+        request_scope_hash: event
+            .request_key
+            .as_ref()
+            .map(|request_key| request_key.scope_hash.clone()),
+        decision: event.decision,
+        reason: permission_audit_safe_reason(event.reason.map(|reason| reason.as_str())),
+        cached: event.cached,
+        timeline_item_id: None,
+    }
+}
+
+fn permission_audit_should_render_timeline_row(kind: TurnPermissionAuditEventKind) -> bool {
+    matches!(
+        kind,
+        TurnPermissionAuditEventKind::ApprovalRequested
+            | TurnPermissionAuditEventKind::ApprovalResolved
+            | TurnPermissionAuditEventKind::DecisionDenied
+    )
+}
+
+fn permission_audit_system_level(
+    decision: Option<TurnPermissionAuditDecision>,
+) -> SystemEventLevel {
+    match decision {
+        Some(
+            TurnPermissionAuditDecision::Deny
+            | TurnPermissionAuditDecision::Cancelled
+            | TurnPermissionAuditDecision::Expired,
+        ) => SystemEventLevel::Warning,
+        _ => SystemEventLevel::Info,
+    }
+}
+
+fn permission_audit_timeline_message(event: &PermissionAuditDisplayItem) -> String {
+    match (event.event_kind, event.decision) {
+        (TurnPermissionAuditEventKind::ApprovalRequested, _) => "Permission approval requested",
+        (
+            TurnPermissionAuditEventKind::ApprovalResolved,
+            Some(TurnPermissionAuditDecision::Deny),
+        ) => "Permission denied",
+        (
+            TurnPermissionAuditEventKind::ApprovalResolved,
+            Some(TurnPermissionAuditDecision::Cancelled),
+        ) => "Permission request cancelled",
+        (
+            TurnPermissionAuditEventKind::ApprovalResolved,
+            Some(TurnPermissionAuditDecision::Expired),
+        ) => "Permission request expired",
+        (TurnPermissionAuditEventKind::ApprovalResolved, _) => "Permission approved",
+        (TurnPermissionAuditEventKind::DecisionDenied, _) => "Permission denied",
+        (TurnPermissionAuditEventKind::DecisionAllowed, _) => "Permission allowed",
+        (TurnPermissionAuditEventKind::ProfileSelected, _) => "Permission profile selected",
+    }
+    .to_owned()
+}
+
+fn permission_audit_timeline_details(event: &PermissionAuditDisplayItem) -> JsonValue {
+    let mut details = serde_json::Map::new();
+    details.insert(
+        "event_kind".to_owned(),
+        JsonValue::String(permission_audit_event_kind_label(event.event_kind).to_owned()),
+    );
+    details.insert(
+        "profile_mode".to_owned(),
+        JsonValue::String(permission_mode_label(event.profile_mode).to_owned()),
+    );
+    details.insert(
+        "profile_source".to_owned(),
+        JsonValue::String(permission_profile_source_label(event.profile_source).to_owned()),
+    );
+    insert_optional_string(&mut details, "item_id", event.item_id.as_deref());
+    insert_optional_string(&mut details, "tool_call_id", event.tool_call_id.as_deref());
+    insert_optional_string(&mut details, "tool_name", event.tool_name.as_deref());
+    insert_optional_string(&mut details, "action_kind", event.action_kind.as_deref());
+    insert_optional_string(
+        &mut details,
+        "request_scope_hash",
+        event.request_scope_hash.as_deref(),
+    );
+    insert_optional_string(
+        &mut details,
+        "decision",
+        event.decision.map(permission_audit_decision_label),
+    );
+    insert_optional_string(&mut details, "reason", event.reason.as_deref());
+    if event.cached {
+        details.insert("cached".to_owned(), JsonValue::Bool(true));
+    }
+    JsonValue::Object(details)
+}
+
+fn permission_audit_safe_reason(reason: Option<&str>) -> Option<String> {
+    let reason = reason?.trim();
+    if reason.is_empty() || reason.len() > 96 {
+        return None;
+    }
+    reason
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'))
+        .then(|| reason.to_owned())
+}
+
+fn insert_optional_string(
+    object: &mut serde_json::Map<String, JsonValue>,
+    key: &str,
+    value: Option<&str>,
+) {
+    let Some(value) = value else {
+        return;
+    };
+    if value.trim().is_empty() {
+        return;
+    }
+    object.insert(key.to_owned(), JsonValue::String(value.to_owned()));
+}
+
+fn permission_audit_event_kind_label(kind: TurnPermissionAuditEventKind) -> &'static str {
+    match kind {
+        TurnPermissionAuditEventKind::ProfileSelected => "profile_selected",
+        TurnPermissionAuditEventKind::ApprovalRequested => "approval_requested",
+        TurnPermissionAuditEventKind::ApprovalResolved => "approval_resolved",
+        TurnPermissionAuditEventKind::DecisionAllowed => "decision_allowed",
+        TurnPermissionAuditEventKind::DecisionDenied => "decision_denied",
+    }
+}
+
+fn permission_audit_decision_label(decision: TurnPermissionAuditDecision) -> &'static str {
+    match decision {
+        TurnPermissionAuditDecision::Allow => "allow",
+        TurnPermissionAuditDecision::Ask => "ask",
+        TurnPermissionAuditDecision::Deny => "deny",
+        TurnPermissionAuditDecision::AllowOnce => "allow_once",
+        TurnPermissionAuditDecision::AllowForTurn => "allow_for_turn",
+        TurnPermissionAuditDecision::Cancelled => "cancelled",
+        TurnPermissionAuditDecision::Expired => "expired",
+    }
+}
+
+fn permission_mode_label(mode: TurnPermissionMode) -> &'static str {
+    match mode {
+        TurnPermissionMode::FullAccess => "full_access",
+        TurnPermissionMode::AutoAcceptEdits => "auto_accept_edits",
+        TurnPermissionMode::Supervised => "supervised",
+    }
+}
+
+fn permission_profile_source_label(source: TurnPermissionProfileSource) -> &'static str {
+    match source {
+        TurnPermissionProfileSource::Composer => "composer",
+        TurnPermissionProfileSource::Defaulted => "defaulted",
+        TurnPermissionProfileSource::InheritedFromParentTurn => "inherited_from_parent_turn",
+        TurnPermissionProfileSource::TaskPermissionCap => "task_permission_cap",
+        TurnPermissionProfileSource::System => "system",
+    }
+}
+
+fn turn_phase_for_status(status: TurnStatus) -> TurnPhase {
+    match status {
+        TurnStatus::InProgress => TurnPhase::Running,
+        TurnStatus::Completed => TurnPhase::Completed,
+        TurnStatus::Failed => TurnPhase::Failed,
+        TurnStatus::Interrupted => TurnPhase::Cancelled,
+        TurnStatus::Blocked => TurnPhase::Blocked,
+    }
 }
 
 fn is_terminal_timeline_status(status: TimelineEntryStatus) -> bool {

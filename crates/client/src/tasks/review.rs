@@ -237,6 +237,8 @@ mod tests {
             candidate_id: "candidate_1".to_owned(),
             candidate_status: Some("pending".to_owned()),
             review_mode: Some("user_approval".to_owned()),
+            permission_mode: None,
+            permission_source: None,
             user_approval_required: true,
             round: Some(1),
             summary: None,

@@ -1,0 +1,194 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ClientPendingRequestResponsePlanResult",
+  "type": "object",
+  "properties": {
+    "action": {
+      "$ref": "#/$defs/ClientPendingRequestResponseAction"
+    }
+  },
+  "required": [
+    "action"
+  ],
+  "$defs": {
+    "CLIRuntimeRequestResolution": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "approved"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "status": {
+              "type": "string",
+              "const": "denied"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "cancelled"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "response": true,
+            "status": {
+              "type": "string",
+              "const": "answered"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "expired"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string",
+              "const": "error"
+            }
+          },
+          "required": [
+            "status",
+            "message"
+          ]
+        }
+      ]
+    },
+    "CLIRuntimeRequestRespondParams": {
+      "type": "object",
+      "properties": {
+        "request_id": {
+          "type": "string"
+        },
+        "resolution": {
+          "$ref": "#/$defs/CLIRuntimeRequestResolution"
+        },
+        "runtime_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "runtime_id",
+        "request_id",
+        "resolution"
+      ]
+    },
+    "ClientPendingRequestResponseAction": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "method": {
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/$defs/CLIRuntimeRequestRespondParams"
+            },
+            "target": {
+              "type": "string",
+              "const": "cli_runtime"
+            }
+          },
+          "required": [
+            "target",
+            "method",
+            "params"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "method": {
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/$defs/TurnPermissionRequestRespondParams"
+            },
+            "target": {
+              "type": "string",
+              "const": "native_permission_gate"
+            }
+          },
+          "required": [
+            "target",
+            "method",
+            "params"
+          ]
+        }
+      ]
+    },
+    "TurnPermissionApprovalResolution": {
+      "type": "string",
+      "enum": [
+        "allow_once",
+        "allow_for_turn",
+        "deny",
+        "cancelled",
+        "expired"
+      ]
+    },
+    "TurnPermissionRequestRespondParams": {
+      "type": "object",
+      "properties": {
+        "request_id": {
+          "type": "string"
+        },
+        "resolution": {
+          "$ref": "#/$defs/TurnPermissionApprovalResolution"
+        }
+      },
+      "required": [
+        "request_id",
+        "resolution"
+      ]
+    }
+  }
+}

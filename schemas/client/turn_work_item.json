@@ -1,0 +1,2903 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnWorkItem",
+  "type": "object",
+  "properties": {
+    "completedAtUnixMs": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "item": {
+      "$ref": "#/$defs/TurnItem"
+    },
+    "itemId": {
+      "type": "string"
+    },
+    "itemType": {
+      "$ref": "#/$defs/TurnItemType"
+    },
+    "metadata": true,
+    "orderKey": {
+      "type": "string"
+    },
+    "startedAtUnixMs": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "status": {
+      "$ref": "#/$defs/TurnWorkItemStatus"
+    },
+    "turnId": {
+      "type": "string"
+    },
+    "workItemId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workItemId",
+    "itemId",
+    "turnId",
+    "orderKey",
+    "itemType",
+    "status",
+    "item"
+  ],
+  "$defs": {
+    "AgentMessagePhase": {
+      "type": "string",
+      "enum": [
+        "final_answer",
+        "commentary"
+      ]
+    },
+    "ArtifactKind": {
+      "type": "string",
+      "enum": [
+        "file",
+        "text",
+        "image",
+        "audio",
+        "video",
+        "pdf",
+        "spreadsheet",
+        "archive",
+        "json",
+        "generated_image",
+        "screenshot",
+        "workspace_file",
+        "directory_manifest",
+        "unknown"
+      ]
+    },
+    "ArtifactPreviewRef": {
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "type": "string"
+        },
+        "blob_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mime_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "projection_kind": {
+          "$ref": "#/$defs/ArtifactProjectionKind"
+        },
+        "sha256": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "size_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "status": {
+          "$ref": "#/$defs/ArtifactProjectionStatus"
+        },
+        "version_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "projection_kind",
+        "status",
+        "artifact_id",
+        "version_id"
+      ]
+    },
+    "ArtifactProjectionKind": {
+      "type": "string",
+      "enum": [
+        "plain_text",
+        "thumbnail",
+        "json_summary",
+        "pdf_text"
+      ]
+    },
+    "ArtifactProjectionStatus": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "ready",
+        "failed",
+        "stale"
+      ]
+    },
+    "ArtifactRef": {
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ArtifactKind"
+        },
+        "mime_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "preview": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArtifactPreviewRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sha256": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "size_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "status": {
+          "$ref": "#/$defs/ArtifactStatus"
+        },
+        "version_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "artifact_id",
+        "display_name",
+        "kind",
+        "status"
+      ]
+    },
+    "ArtifactStatus": {
+      "type": "string",
+      "enum": [
+        "ready",
+        "pending",
+        "quarantined",
+        "deleted",
+        "missing_external_source",
+        "failed"
+      ]
+    },
+    "DeltaOutputPolicy": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "max_chunk_bytes": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "max_total_bytes": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "mode": {
+              "type": "string",
+              "const": "persist_and_display"
+            }
+          },
+          "required": [
+            "mode",
+            "max_chunk_bytes",
+            "max_total_bytes"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "progress_only"
+            }
+          },
+          "required": [
+            "mode"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "disabled"
+            }
+          },
+          "required": [
+            "mode"
+          ]
+        }
+      ]
+    },
+    "DiagnosticExcerptPolicy": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "disabled"
+            }
+          },
+          "required": [
+            "mode"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "max_chars": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "mode": {
+              "type": "string",
+              "const": "errors_only"
+            }
+          },
+          "required": [
+            "mode",
+            "max_chars"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "max_chars": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "mode": {
+              "type": "string",
+              "const": "output"
+            }
+          },
+          "required": [
+            "mode",
+            "max_chars"
+          ]
+        }
+      ]
+    },
+    "LlmOutputPolicy": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "max_bytes": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "mode": {
+              "type": "string",
+              "const": "full"
+            }
+          },
+          "required": [
+            "mode",
+            "max_bytes"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "max_bytes": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "mode": {
+              "type": "string",
+              "const": "structured"
+            }
+          },
+          "required": [
+            "mode",
+            "max_bytes"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "summary_only"
+            }
+          },
+          "required": [
+            "mode"
+          ]
+        }
+      ]
+    },
+    "LlmRetentionPolicy": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "max_bytes": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "mode": {
+              "type": "string",
+              "const": "until_turn_terminal"
+            }
+          },
+          "required": [
+            "mode",
+            "max_bytes"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "do_not_retain"
+            }
+          },
+          "required": [
+            "mode"
+          ]
+        }
+      ]
+    },
+    "MarkdownBlock": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "paragraph"
+            }
+          },
+          "$ref": "#/$defs/MarkdownInline",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "content": {
+              "$ref": "#/$defs/MarkdownInline"
+            },
+            "level": {
+              "type": "integer",
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "heading"
+            }
+          },
+          "required": [
+            "type",
+            "level",
+            "content"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "list"
+            }
+          },
+          "$ref": "#/$defs/MarkdownList",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "blocks": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/MarkdownBlock"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "quote"
+            }
+          },
+          "required": [
+            "type",
+            "blocks"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "language": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "code"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "rule"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        }
+      ]
+    },
+    "MarkdownDocument": {
+      "type": "object",
+      "properties": {
+        "blocks": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/MarkdownBlock"
+          }
+        }
+      }
+    },
+    "MarkdownInline": {
+      "type": "object",
+      "properties": {
+        "marks": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/MarkdownMark"
+          }
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ]
+    },
+    "MarkdownList": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/MarkdownListItem"
+          }
+        },
+        "ordered": {
+          "type": "boolean"
+        },
+        "start": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "ordered",
+        "start"
+      ]
+    },
+    "MarkdownListItem": {
+      "type": "object",
+      "properties": {
+        "blocks": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/MarkdownBlock"
+          }
+        },
+        "checked": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "MarkdownMark": {
+      "type": "object",
+      "properties": {
+        "end": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "kind": {
+          "$ref": "#/$defs/MarkdownMarkKind"
+        },
+        "start": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "start",
+        "end",
+        "kind"
+      ]
+    },
+    "MarkdownMarkKind": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "bold"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "italic"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "strike"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "code"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "link"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
+        }
+      ]
+    },
+    "McpScopeKind": {
+      "type": "string",
+      "enum": [
+        "workspace",
+        "user"
+      ]
+    },
+    "RecoveryAction": {
+      "type": "string",
+      "enum": [
+        "retry_attempt",
+        "retry_with_backoff",
+        "restart_turn",
+        "replay_durable_event",
+        "rehydrate_turn_state",
+        "open_next_execution_window",
+        "adapt_provider_request",
+        "refresh_provider_auth",
+        "compact_history",
+        "disable_streaming",
+        "disable_unsupported_capability",
+        "repair_artifact_finalization",
+        "requeue_task_dispatch",
+        "block_resumable",
+        "fallback",
+        "mark_failed"
+      ]
+    },
+    "RecoveryOutputPolicy": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "diagnostic_excerpt": {
+              "$ref": "#/$defs/DiagnosticExcerptPolicy"
+            },
+            "include_error_class": {
+              "type": "boolean"
+            },
+            "include_exit_status": {
+              "type": "boolean"
+            },
+            "include_fingerprints": {
+              "type": "boolean"
+            },
+            "include_retry_hint": {
+              "type": "boolean"
+            },
+            "mode": {
+              "type": "string",
+              "const": "evidence"
+            }
+          },
+          "required": [
+            "mode",
+            "include_exit_status",
+            "include_error_class",
+            "include_retry_hint",
+            "diagnostic_excerpt",
+            "include_fingerprints"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "metadata_only"
+            }
+          },
+          "required": [
+            "mode"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "none"
+            }
+          },
+          "required": [
+            "mode"
+          ]
+        }
+      ]
+    },
+    "StorageOutputPolicy": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "max_bytes": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "mode": {
+              "type": "string",
+              "const": "full"
+            }
+          },
+          "required": [
+            "mode",
+            "max_bytes"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "max_chars": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "mode": {
+              "type": "string",
+              "const": "summary"
+            }
+          },
+          "required": [
+            "mode",
+            "max_chars"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "metadata_only"
+            }
+          },
+          "required": [
+            "mode"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "none"
+            }
+          },
+          "required": [
+            "mode"
+          ]
+        }
+      ]
+    },
+    "SystemEventLevel": {
+      "type": "string",
+      "enum": [
+        "info",
+        "warning",
+        "error"
+      ]
+    },
+    "TaskExecutorKind": {
+      "type": "string",
+      "enum": [
+        "agent",
+        "tool",
+        "workflow",
+        "webhook",
+        "system"
+      ]
+    },
+    "TaskStatus": {
+      "type": "string",
+      "enum": [
+        "draft",
+        "scheduled",
+        "queued",
+        "running",
+        "waiting",
+        "waiting_review",
+        "completed",
+        "failed",
+        "blocked",
+        "cancelled"
+      ]
+    },
+    "TaskTriggerKind": {
+      "type": "string",
+      "enum": [
+        "immediate",
+        "scheduled_at",
+        "interval",
+        "cron",
+        "manual",
+        "external",
+        "dependency"
+      ]
+    },
+    "TimelineOutputPolicy": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "max_bytes": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "mode": {
+              "type": "string",
+              "const": "full"
+            }
+          },
+          "required": [
+            "mode",
+            "max_bytes"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "max_chars": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "mode": {
+              "type": "string",
+              "const": "summary"
+            }
+          },
+          "required": [
+            "mode",
+            "max_chars"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "metadata_only"
+            }
+          },
+          "required": [
+            "mode"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "hidden"
+            }
+          },
+          "required": [
+            "mode"
+          ]
+        }
+      ]
+    },
+    "ToolCallStatus": {
+      "type": "string",
+      "enum": [
+        "in_progress",
+        "completed",
+        "failed"
+      ]
+    },
+    "ToolDisplayPayload": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "aggregated_output": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "duration_ms": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            },
+            "exit_code": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int32"
+            },
+            "kind": {
+              "type": "string",
+              "const": "shell"
+            },
+            "stderr": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "stdout": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "timed_out": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "truncated": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "truncated"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "summary"
+            }
+          },
+          "$ref": "#/$defs/ToolOutputSummary",
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "progress"
+            },
+            "metadata": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/$defs/ToolMetadataValue"
+              }
+            },
+            "stage": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "stage",
+            "metadata"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "hidden"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "ToolErrorClass": {
+      "type": "string",
+      "enum": [
+        "invalid_arguments",
+        "not_found",
+        "tool_not_visible",
+        "permission_denied",
+        "command_not_found",
+        "timeout",
+        "cancelled",
+        "execution_failed",
+        "needs_narrowing",
+        "internal",
+        "output_truncated",
+        "unknown"
+      ]
+    },
+    "ToolMetadataRawKind": {
+      "type": "string",
+      "enum": [
+        "content",
+        "body",
+        "blob",
+        "base64",
+        "bytes",
+        "data",
+        "html",
+        "image",
+        "output",
+        "screenshot",
+        "stdout",
+        "stderr",
+        "text",
+        "unknown"
+      ]
+    },
+    "ToolMetadataValue": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "null"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "bool"
+            },
+            "value": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "number"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "string"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "array"
+            },
+            "values": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/ToolMetadataValue"
+              }
+            }
+          },
+          "required": [
+            "kind",
+            "values"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "fields": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/$defs/ToolMetadataValue"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "const": "object"
+            }
+          },
+          "required": [
+            "kind",
+            "fields"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "bytes": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "kind": {
+              "type": "string",
+              "const": "redacted_raw"
+            },
+            "raw_kind": {
+              "$ref": "#/$defs/ToolMetadataRawKind"
+            },
+            "sha256": {
+              "type": "string"
+            },
+            "value_kind": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "raw_kind",
+            "sha256",
+            "bytes",
+            "value_kind"
+          ]
+        }
+      ]
+    },
+    "ToolObservation": {
+      "type": "object",
+      "properties": {
+        "attemptId": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "eventSeq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "monoNs": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "pipelineStage": {
+          "type": "string"
+        },
+        "toolCallId": {
+          "type": "string"
+        },
+        "traceId": {
+          "type": "string"
+        },
+        "tsUnixMs": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "turnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "traceId",
+        "turnId",
+        "toolCallId",
+        "attemptId",
+        "pipelineStage",
+        "tsUnixMs",
+        "monoNs",
+        "eventSeq"
+      ]
+    },
+    "ToolOutcome": {
+      "type": "object",
+      "properties": {
+        "errorClass": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ToolErrorClass"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "incomplete": {
+          "type": "boolean"
+        },
+        "incompleteReason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "retryHint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "shouldRetry": {
+          "type": "boolean"
+        },
+        "status": {
+          "$ref": "#/$defs/ToolOutcomeStatus"
+        }
+      },
+      "required": [
+        "status",
+        "shouldRetry",
+        "incomplete"
+      ]
+    },
+    "ToolOutcomeStatus": {
+      "type": "string",
+      "enum": [
+        "ok",
+        "recoverable_error",
+        "fatal_error",
+        "partial_success"
+      ]
+    },
+    "ToolOutputPolicySnapshot": {
+      "type": "object",
+      "properties": {
+        "deltas": {
+          "$ref": "#/$defs/DeltaOutputPolicy"
+        },
+        "llm": {
+          "$ref": "#/$defs/LlmOutputPolicy"
+        },
+        "llmRetention": {
+          "$ref": "#/$defs/LlmRetentionPolicy"
+        },
+        "recovery": {
+          "$ref": "#/$defs/RecoveryOutputPolicy"
+        },
+        "storage": {
+          "$ref": "#/$defs/StorageOutputPolicy"
+        },
+        "timeline": {
+          "$ref": "#/$defs/TimelineOutputPolicy"
+        }
+      },
+      "required": [
+        "llm",
+        "llmRetention",
+        "timeline",
+        "storage",
+        "recovery",
+        "deltas"
+      ]
+    },
+    "ToolOutputSummary": {
+      "type": "object",
+      "properties": {
+        "lines": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/ToolMetadataValue"
+          }
+        },
+        "title": {
+          "type": "string"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "title",
+        "metadata",
+        "truncated"
+      ]
+    },
+    "ToolRecoveryIdempotencyMode": {
+      "type": "string",
+      "enum": [
+        "none",
+        "safe",
+        "requires_key",
+        "session_bound"
+      ]
+    },
+    "ToolRecoveryPolicySnapshot": {
+      "type": "object",
+      "properties": {
+        "baseBackoffSecs": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "canResume": {
+          "type": "boolean"
+        },
+        "idempotencyMode": {
+          "$ref": "#/$defs/ToolRecoveryIdempotencyMode"
+        },
+        "maxAttempts": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        },
+        "maxWallClockSecs": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "noProgressLimit": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "resolvedAction": {
+          "$ref": "#/$defs/RecoveryAction"
+        },
+        "retryClass": {
+          "$ref": "#/$defs/ToolRecoveryRetryClass"
+        }
+      },
+      "required": [
+        "retryClass",
+        "idempotencyMode",
+        "maxAttempts",
+        "canResume",
+        "resolvedAction",
+        "baseBackoffSecs",
+        "maxWallClockSecs",
+        "noProgressLimit"
+      ]
+    },
+    "ToolRecoveryRetryClass": {
+      "type": "string",
+      "enum": [
+        "never",
+        "transient",
+        "arguments",
+        "session",
+        "network"
+      ]
+    },
+    "ToolRecoveryView": {
+      "type": "object",
+      "properties": {
+        "contentFingerprint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "continuation": true,
+        "diagnosticExcerpt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "diagnosticSummary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "errorClass": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "incompleteReason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "outputFingerprint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "retryHint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "wasTruncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "wasTruncated"
+      ]
+    },
+    "ToolStoragePayload": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "aggregated_output": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "duration_ms": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            },
+            "exit_code": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int32"
+            },
+            "kind": {
+              "type": "string",
+              "const": "shell"
+            },
+            "stderr": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "stdout": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "timed_out": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "truncated": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "truncated"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "summary"
+            }
+          },
+          "$ref": "#/$defs/ToolOutputSummary",
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "metadata"
+            },
+            "metadata": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/$defs/ToolMetadataValue"
+              }
+            }
+          },
+          "required": [
+            "kind",
+            "metadata"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "none"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "TurnItem": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "attachments": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/UserMessageAttachment"
+              }
+            },
+            "id": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "userMessage"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "text"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "markdown": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/MarkdownDocument"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "markdownVersion": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0
+            },
+            "phase": {
+              "$ref": "#/$defs/AgentMessagePhase"
+            },
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "agentMessage"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "text"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "content": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "type": "string"
+              }
+            },
+            "id": {
+              "type": "string"
+            },
+            "summary": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "type": "string"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "reasoning"
+            }
+          },
+          "required": [
+            "type",
+            "id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "details": true,
+            "id": {
+              "type": "string"
+            },
+            "level": {
+              "$ref": "#/$defs/SystemEventLevel"
+            },
+            "message": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "systemEvent"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "level",
+            "message"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "agentRole": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "childThreadId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "childTurnId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "createdAt": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "depth": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "errorPreview": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "executorKind": {
+              "$ref": "#/$defs/TaskExecutorKind"
+            },
+            "id": {
+              "type": "string"
+            },
+            "maxDepth": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "nextFireAt": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            },
+            "parentTaskId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "resultPreview": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "rootTaskId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "runId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "status": {
+              "$ref": "#/$defs/TaskStatus"
+            },
+            "taskId": {
+              "type": "string"
+            },
+            "title": {
+              "type": "string"
+            },
+            "triggerKind": {
+              "$ref": "#/$defs/TaskTriggerKind"
+            },
+            "type": {
+              "type": "string",
+              "const": "task"
+            },
+            "updatedAt": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "taskId",
+            "title",
+            "status",
+            "triggerKind",
+            "executorKind",
+            "depth",
+            "maxDepth",
+            "createdAt",
+            "updatedAt"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "arguments": true,
+            "command": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "type": "string"
+              }
+            },
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "display": {
+              "$ref": "#/$defs/ToolDisplayPayload"
+            },
+            "id": {
+              "type": "string"
+            },
+            "observation": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ToolObservation"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "outcome": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ToolOutcome"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "outputPolicy": {
+              "$ref": "#/$defs/ToolOutputPolicySnapshot"
+            },
+            "recovery": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ToolRecoveryView"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "recoveryPolicy": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ToolRecoveryPolicySnapshot"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "status": {
+              "$ref": "#/$defs/ToolCallStatus"
+            },
+            "storage": {
+              "$ref": "#/$defs/ToolStoragePayload"
+            },
+            "success": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "toolName": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "commandExecution"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "toolName",
+            "arguments",
+            "status",
+            "outputPolicy",
+            "display",
+            "storage"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "arguments": true,
+            "changedFiles": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "type": "string"
+              }
+            },
+            "display": {
+              "$ref": "#/$defs/ToolDisplayPayload"
+            },
+            "exitCode": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int32"
+            },
+            "id": {
+              "type": "string"
+            },
+            "observation": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ToolObservation"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "outcome": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ToolOutcome"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "outputPolicy": {
+              "$ref": "#/$defs/ToolOutputPolicySnapshot"
+            },
+            "recovery": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ToolRecoveryView"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "recoveryPolicy": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ToolRecoveryPolicySnapshot"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "status": {
+              "$ref": "#/$defs/ToolCallStatus"
+            },
+            "stderr": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "stdout": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "storage": {
+              "$ref": "#/$defs/ToolStoragePayload"
+            },
+            "success": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "toolName": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "fileChange"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "toolName",
+            "arguments",
+            "status",
+            "outputPolicy",
+            "display",
+            "storage"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "arguments": true,
+            "display": {
+              "$ref": "#/$defs/ToolDisplayPayload"
+            },
+            "id": {
+              "type": "string"
+            },
+            "observation": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ToolObservation"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "outcome": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ToolOutcome"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "outputPolicy": {
+              "$ref": "#/$defs/ToolOutputPolicySnapshot"
+            },
+            "provider": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "query": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "recovery": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ToolRecoveryView"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "recoveryPolicy": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ToolRecoveryPolicySnapshot"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "resultCount": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint",
+              "minimum": 0
+            },
+            "results": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/WebSearchResultItem"
+              }
+            },
+            "status": {
+              "$ref": "#/$defs/ToolCallStatus"
+            },
+            "storage": {
+              "$ref": "#/$defs/ToolStoragePayload"
+            },
+            "success": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "tookMs": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            },
+            "toolName": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "webSearch"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "toolName",
+            "arguments",
+            "status",
+            "outputPolicy",
+            "display",
+            "storage"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "arguments": true,
+            "bytesReceived": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint",
+              "minimum": 0
+            },
+            "contentType": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "display": {
+              "$ref": "#/$defs/ToolDisplayPayload"
+            },
+            "elapsedMs": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            },
+            "extractMode": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "finalUrl": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "links": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/WebFetchLink"
+              }
+            },
+            "observation": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ToolObservation"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "outcome": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ToolOutcome"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "outputPolicy": {
+              "$ref": "#/$defs/ToolOutputPolicySnapshot"
+            },
+            "recovery": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ToolRecoveryView"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "recoveryPolicy": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ToolRecoveryPolicySnapshot"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "resolvedMode": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "status": {
+              "$ref": "#/$defs/ToolCallStatus"
+            },
+            "statusCode": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0
+            },
+            "storage": {
+              "$ref": "#/$defs/ToolStoragePayload"
+            },
+            "success": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "toolName": {
+              "type": "string"
+            },
+            "truncated": true,
+            "type": {
+              "type": "string",
+              "const": "webFetch"
+            },
+            "url": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "wordCount": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "toolName",
+            "arguments",
+            "status",
+            "outputPolicy",
+            "display",
+            "storage"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "arguments": true,
+            "bytesWritten": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            },
+            "contentType": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "display": {
+              "$ref": "#/$defs/ToolDisplayPayload"
+            },
+            "elapsedMs": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            },
+            "finalUrl": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "observation": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ToolObservation"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "outcome": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ToolOutcome"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "outputPolicy": {
+              "$ref": "#/$defs/ToolOutputPolicySnapshot"
+            },
+            "path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "recovery": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ToolRecoveryView"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "recoveryPolicy": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ToolRecoveryPolicySnapshot"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "sha256": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "status": {
+              "$ref": "#/$defs/ToolCallStatus"
+            },
+            "statusCode": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0
+            },
+            "storage": {
+              "$ref": "#/$defs/ToolStoragePayload"
+            },
+            "success": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "toolName": {
+              "type": "string"
+            },
+            "truncated": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "download"
+            },
+            "url": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "toolName",
+            "arguments",
+            "status",
+            "outputPolicy",
+            "display",
+            "storage"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "arguments": true,
+            "display": {
+              "$ref": "#/$defs/ToolDisplayPayload"
+            },
+            "id": {
+              "type": "string"
+            },
+            "observation": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ToolObservation"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "outcome": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ToolOutcome"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "outputPolicy": {
+              "$ref": "#/$defs/ToolOutputPolicySnapshot"
+            },
+            "recovery": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ToolRecoveryView"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "recoveryPolicy": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ToolRecoveryPolicySnapshot"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "status": {
+              "$ref": "#/$defs/ToolCallStatus"
+            },
+            "storage": {
+              "$ref": "#/$defs/ToolStoragePayload"
+            },
+            "success": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "toolName": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "dynamicToolCall"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "toolName",
+            "arguments",
+            "status",
+            "outputPolicy",
+            "display",
+            "storage"
+          ]
+        }
+      ]
+    },
+    "TurnItemType": {
+      "type": "string",
+      "enum": [
+        "user_message",
+        "agent_message",
+        "reasoning",
+        "system_event",
+        "task",
+        "command_execution",
+        "file_change",
+        "web_search",
+        "web_fetch",
+        "download",
+        "dynamic_tool_call"
+      ]
+    },
+    "TurnMcpServerCapabilitySummary": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "scopeKind": {
+          "$ref": "#/$defs/McpScopeKind"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "name",
+        "scopeKind"
+      ]
+    },
+    "TurnMcpToolCapabilitySummary": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "rawToolName": {
+          "type": "string"
+        },
+        "scopeKind": {
+          "$ref": "#/$defs/McpScopeKind"
+        },
+        "serverName": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "serverName",
+        "rawToolName",
+        "scopeKind"
+      ]
+    },
+    "TurnSkillCapabilitySummary": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "slug": {
+          "type": "string"
+        },
+        "sourceKind": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "slug",
+        "sourceKind"
+      ]
+    },
+    "TurnWorkItemStatus": {
+      "type": "string",
+      "enum": [
+        "running",
+        "completed",
+        "blocked",
+        "failed",
+        "cancelled"
+      ]
+    },
+    "UserMessageAttachment": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "image"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "localImage"
+            }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "file"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "localFile"
+            }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "audio"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "localAudio"
+            }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "video"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "localVideo"
+            }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "artifact": {
+              "$ref": "#/$defs/ArtifactRef"
+            },
+            "type": {
+              "type": "string",
+              "const": "artifact"
+            }
+          },
+          "required": [
+            "type",
+            "artifact"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "capability": {
+              "$ref": "#/$defs/TurnSkillCapabilitySummary"
+            },
+            "type": {
+              "type": "string",
+              "const": "skill"
+            }
+          },
+          "required": [
+            "type",
+            "capability"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "capability": {
+              "$ref": "#/$defs/TurnMcpServerCapabilitySummary"
+            },
+            "type": {
+              "type": "string",
+              "const": "mcpServer"
+            }
+          },
+          "required": [
+            "type",
+            "capability"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "capability": {
+              "$ref": "#/$defs/TurnMcpToolCapabilitySummary"
+            },
+            "type": {
+              "type": "string",
+              "const": "mcpTool"
+            }
+          },
+          "required": [
+            "type",
+            "capability"
+          ]
+        }
+      ]
+    },
+    "WebFetchLink": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "text",
+        "url"
+      ]
+    },
+    "WebSearchResultItem": {
+      "type": "object",
+      "properties": {
+        "publishedAt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rank": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "snippet": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "rank",
+        "title",
+        "url",
+        "snippet",
+        "source"
+      ]
+    }
+  }
+}

@@ -3,8 +3,8 @@
 use crate::conversation::events::ConversationEvent;
 use pioneer_protocol::{
     AgentExecutionBackend, REQUEST_ID_LEN, Thread, ThreadMode, TurnCLIRuntimeOptions,
-    TurnCapability, TurnReasoningSelection, TurnStartParams, TurnStartResponse, UserInput,
-    UserMessageAttachment, generate_id,
+    TurnCapability, TurnPermissionProfileSelection, TurnReasoningSelection, TurnStartParams,
+    TurnStartResponse, UserInput, UserMessageAttachment, generate_id,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -34,6 +34,7 @@ pub struct TurnStartParamsPlan {
     pub mode: Option<ThreadMode>,
     pub execution_backend: Option<AgentExecutionBackend>,
     pub reasoning: Option<TurnReasoningSelection>,
+    pub permission_profile: TurnPermissionProfileSelection,
     pub cli_runtime_options: Option<TurnCLIRuntimeOptions>,
 }
 
@@ -92,6 +93,7 @@ pub fn turn_start_params_from_plan(plan: TurnStartParamsPlan) -> TurnStartParams
         mode: plan.mode,
         execution_backend: plan.execution_backend,
         reasoning: plan.reasoning,
+        permission_profile: Some(plan.permission_profile),
         cli_runtime_options: plan.cli_runtime_options,
     }
 }
@@ -211,8 +213,8 @@ pub fn local_turn_start_rejected_event(
 mod tests {
     use super::*;
     use pioneer_protocol::{
-        McpScopeKind, Turn, TurnCapabilityKind, TurnKind, TurnOrigin, TurnStartResponse,
-        TurnStatus, UserMessageAttachment,
+        McpScopeKind, Turn, TurnCapabilityKind, TurnKind, TurnOrigin, TurnPermissionMode,
+        TurnStartResponse, TurnStatus, UserMessageAttachment,
     };
 
     fn skill_capability() -> TurnCapability {
@@ -224,6 +226,10 @@ mod tests {
                 source_kind: "user".to_owned(),
             },
         }
+    }
+
+    fn permission_profile_selection(mode: TurnPermissionMode) -> TurnPermissionProfileSelection {
+        TurnPermissionProfileSelection { mode }
     }
 
     #[test]
@@ -264,6 +270,7 @@ mod tests {
             mode: Some(ThreadMode::Agent),
             execution_backend: None,
             reasoning: None,
+            permission_profile: permission_profile_selection(TurnPermissionMode::FullAccess),
             cli_runtime_options: None,
         });
 
@@ -277,6 +284,10 @@ mod tests {
         assert_eq!(params.sandbox_policy, None);
         assert_eq!(params.execution_backend, None);
         assert_eq!(params.reasoning, None);
+        assert_eq!(
+            params.permission_profile,
+            Some(permission_profile_selection(TurnPermissionMode::FullAccess))
+        );
         assert_eq!(params.cli_runtime_options, None);
     }
 
@@ -292,6 +303,7 @@ mod tests {
             mode: None,
             execution_backend: None,
             reasoning: turn_reasoning_selection_from_effort(Some(" high ".to_owned())),
+            permission_profile: permission_profile_selection(TurnPermissionMode::FullAccess),
             cli_runtime_options: None,
         });
 
@@ -301,6 +313,28 @@ mod tests {
                 .as_ref()
                 .map(|selection| selection.effort.as_str()),
             Some("high")
+        );
+    }
+
+    #[test]
+    fn turn_start_params_from_plan_preserves_permission_profile_selection() {
+        let params = turn_start_params_from_plan(TurnStartParamsPlan {
+            thread_id: "thread".to_owned(),
+            turn_id: "turn".to_owned(),
+            input: Vec::new(),
+            capabilities: Vec::new(),
+            model: None,
+            model_provider: None,
+            mode: None,
+            execution_backend: None,
+            reasoning: None,
+            permission_profile: permission_profile_selection(TurnPermissionMode::Supervised),
+            cli_runtime_options: None,
+        });
+
+        assert_eq!(
+            params.permission_profile,
+            Some(permission_profile_selection(TurnPermissionMode::Supervised))
         );
     }
 
@@ -445,6 +479,7 @@ mod tests {
             origin: TurnOrigin::User,
             error: None,
             prompt_manifest: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
         };
 
         let reduction = reduce_turn_start_send_success(

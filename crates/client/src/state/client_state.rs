@@ -1,7 +1,7 @@
 //! Aggregate client state.
 
 use crate::{
-    cli_runtime::approvals::CLIRuntimePendingRequestState,
+    cli_runtime::approvals::PendingRequestState,
     mcp::list::McpListState,
     providers::list::ProviderListState,
     skills::catalog::SkillCatalogState,
@@ -22,7 +22,7 @@ pub struct ClientState {
     pub workspaces: WorkspacesState,
     pub gateway: GatewayClientState,
     pub providers: ProvidersState,
-    pub cli_runtime_pending_requests: CLIRuntimePendingRequestState,
+    pub pending_requests: PendingRequestState,
     pub mcp: McpState,
     pub skills: SkillsState,
     pub semantic_timelines: SemanticTimelineState,

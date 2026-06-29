@@ -2,9 +2,11 @@
 
 use crate::{
     agents_doc::scope as agents_doc_scope,
+    cli_runtime::approvals::PendingRequest,
     composer::model_selection::{
         self as composer_model_selection, ComposerModelSelection, ComposerModelSelectionCandidate,
     },
+    composer::permissions::{self as composer_permissions, ComposerPermissionModeOption},
     conversation::{Conversation, state_machine::TurnFlowState},
     state::{
         client_state::{ClientState, ThreadAgentsDocSummaryKey, WorkspaceThreadState},
@@ -13,7 +15,9 @@ use crate::{
     threads::{coordinator::ThreadCoordinator, tree as thread_tree},
     workspaces::selectors as workspace_selectors,
 };
-use pioneer_protocol::{Thread, ThreadAgentsDocSummary, ThreadFolder, ThreadPlacement, Workspace};
+use pioneer_protocol::{
+    Thread, ThreadAgentsDocSummary, ThreadFolder, ThreadPlacement, TurnPermissionMode, Workspace,
+};
 use std::collections::HashMap;
 
 pub fn current_active_thread_id(state: &ClientState) -> Option<&str> {
@@ -37,6 +41,16 @@ pub fn workspace_by_id<'a>(
     workspace_id: &str,
 ) -> Option<&'a Workspace> {
     workspace_selectors::workspace_by_id(workspaces, workspace_id)
+}
+
+pub fn pending_requests(state: &ClientState) -> &[PendingRequest] {
+    state.pending_requests.requests()
+}
+
+pub fn active_thread_pending_requests(state: &ClientState) -> Vec<PendingRequest> {
+    state
+        .pending_requests
+        .pending_for_scope(active_workspace_id(state), current_active_thread_id(state))
 }
 
 pub fn active_workspace_id<'a>(state: &'a ClientState) -> Option<&'a str> {
@@ -67,6 +81,20 @@ pub fn has_in_flight_thread_start(state: &ClientState) -> bool {
         state.threads.start.in_progress,
         state.threads.start.pending_thread_id.as_deref(),
     )
+}
+
+pub fn current_composer_permission_mode(
+    selected_mode: Option<TurnPermissionMode>,
+) -> TurnPermissionMode {
+    selected_mode.unwrap_or_else(composer_permissions::default_composer_permission_mode)
+}
+
+pub fn composer_permission_mode_options() -> [ComposerPermissionModeOption; 3] {
+    composer_permissions::composer_permission_mode_options()
+}
+
+pub fn composer_permission_mode_option(mode: TurnPermissionMode) -> ComposerPermissionModeOption {
+    composer_permissions::composer_permission_mode_option(mode)
 }
 
 pub fn remembered_thread_for_workspace<'a>(
@@ -408,9 +436,11 @@ pub fn restore_workspace_thread_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli_runtime::approvals::{PendingRequest, PendingRequestsReduction};
     use crate::conversation::ConversationEvent;
     use pioneer_protocol::{
         Thread, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus,
+        TurnPermissionApprovalRequest,
     };
 
     fn workspace(id: &str, is_active: bool, is_current: bool) -> Workspace {
@@ -449,6 +479,21 @@ mod tests {
         ThreadCoordinator::new(thread(thread_id, workspace_id, updated_at))
     }
 
+    fn pending_request(request_id: &str, workspace_id: &str, thread_id: &str) -> PendingRequest {
+        PendingRequest::from_native_permission_request(TurnPermissionApprovalRequest {
+            request_id: request_id.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            turn_id: "turn".to_owned(),
+            tool_name: "exec_command".to_owned(),
+            action: pioneer_protocol::TurnPermissionActionKind::ShellCommand,
+            scope_hash: format!("{request_id}_scope"),
+            reason: pioneer_protocol::TurnPermissionDecisionReason::PolicyRequiresApproval,
+            summary: None,
+            details: Vec::new(),
+        })
+    }
+
     #[test]
     fn resolve_active_workspace_prefers_valid_persisted_id() {
         let workspaces = vec![
@@ -473,6 +518,36 @@ mod tests {
             resolve_active_workspace_id(Some("missing"), workspaces.as_slice()),
             Some("ws_2")
         );
+    }
+
+    #[test]
+    fn active_thread_pending_requests_selects_shared_scope() {
+        let mut state = ClientState::default();
+        state.workspaces.preferred_workspace_id = Some("ws_a".to_owned());
+        state.workspaces.workspaces = vec![workspace("ws_a", true, true)];
+        state.threads.active_thread_id = Some("thread_a".to_owned());
+
+        state
+            .pending_requests
+            .apply(PendingRequestsReduction::Opened(pending_request(
+                "req_a", "ws_a", "thread_a",
+            )));
+        state
+            .pending_requests
+            .apply(PendingRequestsReduction::Opened(pending_request(
+                "req_b", "ws_a", "thread_b",
+            )));
+        state
+            .pending_requests
+            .apply(PendingRequestsReduction::Opened(pending_request(
+                "req_c", "ws_b", "thread_a",
+            )));
+
+        let requests = active_thread_pending_requests(&state);
+
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].request_id, "req_a");
+        assert_eq!(pending_requests(&state).len(), 3);
     }
 
     #[test]
@@ -551,6 +626,32 @@ mod tests {
         assert_eq!(
             model_selector_workspace_id_from(Some("ws_selected"), Some("thread_a"), &coordinators),
             "ws_selected"
+        );
+    }
+
+    #[test]
+    fn composer_permission_selector_defaults_to_full_access() {
+        assert_eq!(
+            current_composer_permission_mode(None),
+            TurnPermissionMode::FullAccess
+        );
+        assert_eq!(
+            current_composer_permission_mode(Some(TurnPermissionMode::Supervised)),
+            TurnPermissionMode::Supervised
+        );
+    }
+
+    #[test]
+    fn composer_permission_selector_exposes_display_metadata() {
+        let options = composer_permission_mode_options();
+
+        assert_eq!(options.len(), 3);
+        assert_eq!(options[0].mode, TurnPermissionMode::Supervised);
+        assert_eq!(options[1].mode, TurnPermissionMode::AutoAcceptEdits);
+        assert_eq!(options[2].mode, TurnPermissionMode::FullAccess);
+        assert_eq!(
+            composer_permission_mode_option(TurnPermissionMode::AutoAcceptEdits).label,
+            "Auto-accept edits"
         );
     }
 

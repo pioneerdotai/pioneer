@@ -45,10 +45,11 @@ use pioneer_protocol::{
     ThreadMoveResponse, ThreadStartParams, ThreadStartResponse, ThreadTimelinePageParams,
     ThreadTimelinePageResponse, ThreadTreeParams, ThreadTreeResponse, ThreadUnsubscribeResponse,
     ThreadUpdateParams, ThreadUpdateResponse, TurnCancelParams, TurnCancelResponse, TurnGetParams,
-    TurnGetResponse, TurnItemsParams, TurnItemsResponse, TurnStartParams, TurnStartResponse,
-    TurnWorkPageParams, TurnWorkPageResponse, WorkspaceCreateParams, WorkspaceCreateResponse,
-    WorkspaceDefaultResponse, WorkspaceListResponse, WorkspaceSelectParams,
-    WorkspaceSelectResponse, WorkspaceUpdateParams, WorkspaceUpdateResponse,
+    TurnGetResponse, TurnItemsParams, TurnItemsResponse, TurnPermissionRequestRespondParams,
+    TurnPermissionRequestRespondResponse, TurnStartParams, TurnStartResponse, TurnWorkPageParams,
+    TurnWorkPageResponse, WorkspaceCreateParams, WorkspaceCreateResponse, WorkspaceDefaultResponse,
+    WorkspaceListResponse, WorkspaceSelectParams, WorkspaceSelectResponse, WorkspaceUpdateParams,
+    WorkspaceUpdateResponse,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value as JsonValue;

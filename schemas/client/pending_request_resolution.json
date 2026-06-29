@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PendingRequestResolution",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "resolution": {
+          "type": "string",
+          "const": "allow"
+        }
+      },
+      "required": [
+        "resolution"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "resolution": {
+          "type": "string",
+          "const": "allow_for_turn"
+        }
+      },
+      "required": [
+        "resolution"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "resolution": {
+          "type": "string",
+          "const": "allow_for_session"
+        }
+      },
+      "required": [
+        "resolution"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "resolution": {
+          "type": "string",
+          "const": "deny"
+        }
+      },
+      "required": [
+        "resolution"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "resolution": {
+          "type": "string",
+          "const": "cancel"
+        }
+      },
+      "required": [
+        "resolution"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "resolution": {
+          "type": "string",
+          "const": "answered"
+        },
+        "response": true
+      },
+      "required": [
+        "resolution"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "resolution": {
+          "type": "string",
+          "const": "expired"
+        }
+      },
+      "required": [
+        "resolution"
+      ]
+    }
+  ]
+}

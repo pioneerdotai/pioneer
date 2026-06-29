@@ -4,7 +4,8 @@ use pioneer_protocol::{
     TurnBlockedResumeMetadata, TurnExecutionWindowBlockedNotification,
     TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
     TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification, TurnItem,
-    TurnItemTimeoutReason, TurnItemType, TurnStatus, UserMessageAttachment,
+    TurnItemTimeoutReason, TurnItemType, TurnPermissionAuditEvent, TurnStatus,
+    UserMessageAttachment,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
@@ -40,6 +41,7 @@ pub enum EventKind {
     TurnExecutionWindowCheckpointed,
     TurnExecutionWindowContinued,
     TurnExecutionWindowBlocked,
+    TurnPermissionAudit,
     ItemCompleted,
     ItemUpdated,
 }
@@ -235,6 +237,9 @@ pub enum ConversationEvent {
     TurnExecutionWindowBlocked {
         notification: TurnExecutionWindowBlockedNotification,
     },
+    TurnPermissionAudit {
+        event: TurnPermissionAuditEvent,
+    },
     ItemCompleted {
         thread_id: String,
         turn_id: String,
@@ -289,6 +294,7 @@ impl ConversationEvent {
             Self::TurnExecutionWindowBlocked { notification } => {
                 Some(notification.thread_id.as_str())
             }
+            Self::TurnPermissionAudit { event } => Some(event.thread_id.as_str()),
         }
     }
 
@@ -329,6 +335,7 @@ impl ConversationEvent {
             Self::TurnExecutionWindowBlocked { notification } => {
                 Some(notification.turn_id.as_str())
             }
+            Self::TurnPermissionAudit { event } => Some(event.turn_id.as_str()),
             Self::TurnStarted { turn, .. }
             | Self::TurnCompleted { turn, .. }
             | Self::TurnFailed { turn, .. }
@@ -366,7 +373,8 @@ impl ConversationEvent {
             | Self::TurnExecutionWindowExhausted { .. }
             | Self::TurnExecutionWindowCheckpointed { .. }
             | Self::TurnExecutionWindowContinued { .. }
-            | Self::TurnExecutionWindowBlocked { .. } => None,
+            | Self::TurnExecutionWindowBlocked { .. }
+            | Self::TurnPermissionAudit { .. } => None,
         }
     }
 
@@ -407,6 +415,7 @@ impl ConversationEvent {
             }
             Self::TurnExecutionWindowContinued { .. } => EventKind::TurnExecutionWindowContinued,
             Self::TurnExecutionWindowBlocked { .. } => EventKind::TurnExecutionWindowBlocked,
+            Self::TurnPermissionAudit { .. } => EventKind::TurnPermissionAudit,
             Self::ItemCompleted { .. } => EventKind::ItemCompleted,
             Self::ItemUpdated { .. } => EventKind::ItemUpdated,
         }
