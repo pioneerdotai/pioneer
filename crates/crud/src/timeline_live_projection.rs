@@ -10,7 +10,9 @@ use sea_orm::{
 use serde_json::json;
 
 use crate::events::{AppendedTurnEvent, TurnEventPayload, TurnStartedEventPayload};
-use crate::repositories::cli_runtime_binding::CliRuntimePendingRequestRecord;
+use crate::repositories::cli_runtime_binding::{
+    CliRuntimePendingRequestRecord, CliRuntimePendingRequestStatus,
+};
 use crate::repositories::thread_timeline_projection as timeline_repository;
 use crate::repositories::{thread, turn};
 use crate::timeline_projection::{ProjectionPlacement, classify_turn_item_row};
@@ -76,7 +78,8 @@ pub(crate) async fn project_semantic_timeline_live_turn_event<C: ConnectionTrait
         | TurnEventPayload::TurnExecutionWindowExhausted(_)
         | TurnEventPayload::TurnExecutionWindowCheckpointed(_)
         | TurnEventPayload::TurnExecutionWindowContinued(_)
-        | TurnEventPayload::TurnExecutionWindowBlocked(_) => {}
+        | TurnEventPayload::TurnExecutionWindowBlocked(_)
+        | TurnEventPayload::TurnPermissionAudit(_) => {}
     }
 
     Ok(())
@@ -97,6 +100,16 @@ pub(crate) async fn project_cli_runtime_pending_request<C: ConnectionTrait>(
         return Ok(());
     };
 
+    if request.status != CliRuntimePendingRequestStatus::Pending {
+        timeline_repository::delete_thread_timeline_block(
+            db,
+            approval_block_id(turn_model.id.as_str(), request.request_id.as_str()).as_str(),
+        )
+        .await?;
+        return refresh_turn_work_summary(db, &thread_model, &turn_model, 0, request.updated_at)
+            .await;
+    }
+
     timeline_repository::upsert_thread_timeline_block(
         db,
         ThreadTimelineBlockRecord {
@@ -105,11 +118,7 @@ pub(crate) async fn project_cli_runtime_pending_request<C: ConnectionTrait>(
             thread_id: thread_model.id.clone(),
             turn_id: Some(turn_model.id.clone()),
             block_kind: timeline_repository::BLOCK_KIND_APPROVAL.to_owned(),
-            sort_key: turn_block_sort_key(
-                &turn_model,
-                150,
-                format!("approval:{}", request.request_id).as_str(),
-            ),
+            sort_key: approval_block_sort_key(&turn_model, request),
             source_kind: Some("cli_runtime_pending_request".to_owned()),
             source_key: Some(request.request_id.clone()),
             started_at: Some(request.created_at),
@@ -128,6 +137,18 @@ pub(crate) async fn project_cli_runtime_pending_request<C: ConnectionTrait>(
     .await?;
 
     refresh_turn_work_summary(db, &thread_model, &turn_model, 0, request.updated_at).await
+}
+
+fn approval_block_sort_key(
+    turn_model: &turn_entity::Model,
+    request: &CliRuntimePendingRequestRecord,
+) -> String {
+    format!(
+        "{:020}:{}:150:approval:{}",
+        request.created_at.timestamp_millis().max(0),
+        turn_model.id,
+        request.request_id
+    )
 }
 
 async fn project_turn_started<C: ConnectionTrait>(
@@ -224,7 +245,15 @@ async fn project_turn_item_event<C: ConnectionTrait>(
         .await;
     };
 
+    let refresh_work_summary = !matches!(
+        classify_turn_item_row(&item_model).placement,
+        ProjectionPlacement::TopLevelUserMessage
+    );
+
     project_turn_item_row(db, &thread_model, &turn_model, &item_model, event).await?;
+    if !refresh_work_summary {
+        return Ok(());
+    }
     refresh_turn_work_summary(
         db,
         &thread_model,
@@ -296,25 +325,13 @@ async fn project_turn_item_row<C: ConnectionTrait>(
     event: &AppendedTurnEvent,
 ) -> Result<()> {
     let classification = classify_turn_item_row(item_model);
-    let source_order =
-        resolve_item_source_order(db, turn_model.id.as_str(), item_model, event).await?;
-    let order_key = work_item_order_key(item_model, Some(&source_order));
 
     match classification.placement {
-        ProjectionPlacement::TopLevelUserMessage => {
-            timeline_repository::delete_turn_work_item_projection_for_item(
-                db,
-                turn_model.id.as_str(),
-                item_model.item_id.as_str(),
-            )
-            .await?;
-            timeline_repository::delete_thread_timeline_block(
-                db,
-                assistant_block_id(turn_model.id.as_str(), item_model.item_id.as_str()).as_str(),
-            )
-            .await?;
-        }
+        ProjectionPlacement::TopLevelUserMessage => {}
         ProjectionPlacement::TopLevelAssistantMessage => {
+            let source_order =
+                resolve_item_source_order(db, turn_model.id.as_str(), item_model, event).await?;
+            let order_key = work_item_order_key(item_model, Some(&source_order));
             timeline_repository::delete_turn_work_item_projection_for_item(
                 db,
                 turn_model.id.as_str(),
@@ -350,6 +367,9 @@ async fn project_turn_item_row<C: ConnectionTrait>(
             .await?;
         }
         ProjectionPlacement::TurnWork | ProjectionPlacement::Hidden => {
+            let source_order =
+                resolve_item_source_order(db, turn_model.id.as_str(), item_model, event).await?;
+            let order_key = work_item_order_key(item_model, Some(&source_order));
             timeline_repository::delete_thread_timeline_block(
                 db,
                 assistant_block_id(turn_model.id.as_str(), item_model.item_id.as_str()).as_str(),
@@ -537,7 +557,9 @@ async fn refresh_turn_work_summary<C: ConnectionTrait>(
             updated_at: summary_updated_at,
         },
     )
-    .await
+    .await?;
+
+    Ok(())
 }
 
 async fn first_or_last_visible_work_item_id<C: ConnectionTrait>(
@@ -645,6 +667,7 @@ fn payload_item_id(payload: &TurnEventPayload) -> Option<&str> {
         | TurnEventPayload::TurnExecutionWindowCheckpointed(_)
         | TurnEventPayload::TurnExecutionWindowContinued(_)
         | TurnEventPayload::TurnExecutionWindowBlocked(_)
+        | TurnEventPayload::TurnPermissionAudit(_)
         | TurnEventPayload::TurnCompleted(_)
         | TurnEventPayload::TurnFailed(_)
         | TurnEventPayload::TurnBlocked(_) => None,

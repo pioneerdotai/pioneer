@@ -10,7 +10,7 @@ use sea_orm::{
 
 use crate::convention::{
     input_type_and_text, turn_item_id_and_type_to_db, turn_kind_to_db, turn_origin_to_db,
-    turn_status_to_db,
+    turn_permission_mode_to_db, turn_permission_profile_source_to_db, turn_status_to_db,
 };
 
 const DB_ID_LEN: usize = 21;
@@ -23,6 +23,13 @@ pub struct TurnPromptManifestColumns {
     pub prompt_fingerprint_stable: String,
     pub prompt_fingerprint_dynamic: String,
     pub prompt_fingerprint_full: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TurnPermissionProfileColumns {
+    mode: String,
+    source: String,
+    snapshot_json: String,
 }
 
 pub async fn find_turn_by_id<C: ConnectionTrait>(
@@ -59,6 +66,24 @@ pub async fn upsert_turn<C: ConnectionTrait>(
     created_at: DateTimeWithTimeZone,
     updated_at: DateTimeWithTimeZone,
 ) -> Result<()> {
+    let permission_profile_columns = build_turn_permission_profile_columns(turn_model)?;
+    let should_update_permission_profile = permission_profile_columns.is_some();
+    let mut update_columns = vec![
+        turn::Column::ThreadId,
+        turn::Column::Status,
+        turn::Column::TurnKind,
+        turn::Column::Origin,
+        turn::Column::Error,
+        turn::Column::UpdatedAt,
+    ];
+    if should_update_permission_profile {
+        update_columns.extend([
+            turn::Column::PermissionProfileMode,
+            turn::Column::PermissionProfileSource,
+            turn::Column::PermissionProfileSnapshotJson,
+        ]);
+    }
+
     turn::Entity::insert(turn::ActiveModel {
         id: Set(turn_id.to_owned()),
         thread_id: Set(thread_id.to_owned()),
@@ -83,19 +108,21 @@ pub async fn upsert_turn<C: ConnectionTrait>(
             prompt_manifest.map(|manifest| manifest.prompt_fingerprint_full.clone())
         ),
         reasoning_effort: Set(reasoning_effort.map(str::to_owned)),
+        permission_profile_mode: Set(permission_profile_columns
+            .as_ref()
+            .map(|columns| columns.mode.clone())),
+        permission_profile_source: Set(permission_profile_columns
+            .as_ref()
+            .map(|columns| columns.source.clone())),
+        permission_profile_snapshot_json: Set(permission_profile_columns
+            .as_ref()
+            .map(|columns| columns.snapshot_json.clone())),
         created_at: Set(created_at),
         updated_at: Set(updated_at),
     })
     .on_conflict(
         OnConflict::column(turn::Column::Id)
-            .update_columns([
-                turn::Column::ThreadId,
-                turn::Column::Status,
-                turn::Column::TurnKind,
-                turn::Column::Origin,
-                turn::Column::Error,
-                turn::Column::UpdatedAt,
-            ])
+            .update_columns(update_columns)
             .to_owned(),
     )
     .exec(db)
@@ -103,6 +130,22 @@ pub async fn upsert_turn<C: ConnectionTrait>(
     .context("failed to upsert turn")?;
 
     Ok(())
+}
+
+fn build_turn_permission_profile_columns(
+    turn_model: &Turn,
+) -> Result<Option<TurnPermissionProfileColumns>> {
+    let Some(snapshot) = turn_model.permission_profile.as_ref() else {
+        return Ok(None);
+    };
+    let snapshot_json = serde_json::to_string(&snapshot)
+        .context("failed to serialize turn permission profile snapshot to json")?;
+
+    Ok(Some(TurnPermissionProfileColumns {
+        mode: turn_permission_mode_to_db(snapshot.mode).to_owned(),
+        source: turn_permission_profile_source_to_db(snapshot.source).to_owned(),
+        snapshot_json,
+    }))
 }
 
 pub async fn update_turn_prompt_manifest<C: ConnectionTrait>(

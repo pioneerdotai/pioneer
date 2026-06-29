@@ -13,7 +13,7 @@ use pioneer_protocol::{
     TaskRunTurnKind, TaskRunTurnStatus, TaskStatus, TaskTriggerKind, TaskTriggerStatus,
     TaskWriteLockScopeKind, TaskWriteLockStatus, ThreadMode, ThreadOriginKind,
     ThreadSidebarVisibility, ThreadStatus, TurnItem, TurnItemAttemptStatus, TurnItemTimeoutReason,
-    TurnItemType, TurnStatus, UserInput,
+    TurnItemType, TurnPermissionMode, TurnPermissionProfileSource, TurnStatus, UserInput,
 };
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -868,6 +868,44 @@ pub fn turn_origin_from_db(value: &str) -> Option<pioneer_protocol::TurnOrigin> 
         "scheduled_task" => Some(pioneer_protocol::TurnOrigin::ScheduledTask),
         "detached_task" => Some(pioneer_protocol::TurnOrigin::DetachedTask),
         "attached_task" => Some(pioneer_protocol::TurnOrigin::AttachedTask),
+        _ => None,
+    }
+}
+
+pub fn turn_permission_mode_to_db(mode: TurnPermissionMode) -> &'static str {
+    match mode {
+        TurnPermissionMode::FullAccess => "full_access",
+        TurnPermissionMode::AutoAcceptEdits => "auto_accept_edits",
+        TurnPermissionMode::Supervised => "supervised",
+    }
+}
+
+pub fn turn_permission_mode_from_db(value: &str) -> Option<TurnPermissionMode> {
+    match value {
+        "full_access" => Some(TurnPermissionMode::FullAccess),
+        "auto_accept_edits" => Some(TurnPermissionMode::AutoAcceptEdits),
+        "supervised" => Some(TurnPermissionMode::Supervised),
+        _ => None,
+    }
+}
+
+pub fn turn_permission_profile_source_to_db(source: TurnPermissionProfileSource) -> &'static str {
+    match source {
+        TurnPermissionProfileSource::Composer => "composer",
+        TurnPermissionProfileSource::Defaulted => "defaulted",
+        TurnPermissionProfileSource::InheritedFromParentTurn => "inherited_from_parent_turn",
+        TurnPermissionProfileSource::TaskPermissionCap => "task_permission_cap",
+        TurnPermissionProfileSource::System => "system",
+    }
+}
+
+pub fn turn_permission_profile_source_from_db(value: &str) -> Option<TurnPermissionProfileSource> {
+    match value {
+        "composer" => Some(TurnPermissionProfileSource::Composer),
+        "defaulted" => Some(TurnPermissionProfileSource::Defaulted),
+        "inherited_from_parent_turn" => Some(TurnPermissionProfileSource::InheritedFromParentTurn),
+        "task_permission_cap" => Some(TurnPermissionProfileSource::TaskPermissionCap),
+        "system" => Some(TurnPermissionProfileSource::System),
         _ => None,
     }
 }

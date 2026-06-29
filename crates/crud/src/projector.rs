@@ -134,7 +134,8 @@ impl TurnProjector {
             | TurnEventPayload::TurnExecutionWindowExhausted(_)
             | TurnEventPayload::TurnExecutionWindowCheckpointed(_)
             | TurnEventPayload::TurnExecutionWindowContinued(_)
-            | TurnEventPayload::TurnExecutionWindowBlocked(_) => project_future(async { Ok(()) }),
+            | TurnEventPayload::TurnExecutionWindowBlocked(_)
+            | TurnEventPayload::TurnPermissionAudit(_) => project_future(async { Ok(()) }),
             TurnEventPayload::TurnCompleted(payload) => project_future(async move {
                 self.close_running_attempts_for_terminal_turn(
                     db,

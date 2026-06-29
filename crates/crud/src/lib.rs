@@ -27,7 +27,7 @@ use pioneer_protocol::{
     Thread, ThreadFolder, ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadPlacement,
     TimelineOutputPolicy, ToolCallStatus, ToolDisplayPayload, ToolStoragePayload, Turn, TurnItem,
     TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType, TurnItemsResponse,
-    TurnStatus, UserInput, generate_id,
+    TurnPermissionProfileSnapshot, TurnPermissionProfileSource, TurnStatus, UserInput, generate_id,
 };
 use pioneer_sqlite::{SqliteWriteCoordinator, is_anyhow_sqlite_lock};
 use sea_orm::{
@@ -58,8 +58,8 @@ use crate::convention::{
     task_status_from_db, task_status_to_db, task_trigger_kind_from_db, task_trigger_status_from_db,
     task_write_lock_scope_kind_from_db, task_write_lock_status_from_db, thread_mode_from_db,
     thread_origin_kind_from_db, thread_sidebar_visibility_from_db, thread_status_from_db,
-    turn_item_type_from_db, turn_kind_from_db, turn_origin_from_db, turn_status_from_db,
-    turn_status_to_db,
+    turn_item_type_from_db, turn_kind_from_db, turn_origin_from_db, turn_permission_mode_from_db,
+    turn_permission_profile_source_from_db, turn_status_from_db, turn_status_to_db,
 };
 use crate::events::{TurnEventPayload, TurnStartedEventPayload};
 use crate::projector::TurnProjector;
@@ -4363,6 +4363,18 @@ impl CrudStore {
         .await
     }
 
+    pub async fn materialize_turn_permission_audit(
+        &self,
+        event: pioneer_protocol::TurnPermissionAuditEvent,
+        event_timestamp_secs: i64,
+    ) -> Result<()> {
+        self.materialize_turn_event(
+            TurnEventPayload::TurnPermissionAudit(event),
+            event_timestamp_secs,
+        )
+        .await
+    }
+
     pub async fn materialize_turn_completed(
         &self,
         notification: pioneer_protocol::TurnCompletedNotification,
@@ -5923,6 +5935,7 @@ impl CrudStore {
         };
 
         let prompt_manifest = parse_turn_prompt_manifest(&turn_model)?;
+        let permission_profile = parse_turn_permission_profile(&turn_model)?;
 
         Ok(Some((
             thread_model.workspace_id,
@@ -5933,6 +5946,7 @@ impl CrudStore {
                 origin: turn_origin_from_db(turn_model.origin.as_str()).unwrap_or_default(),
                 error: turn_model.error,
                 prompt_manifest,
+                permission_profile: Some(permission_profile),
             },
         )))
     }
@@ -5969,6 +5983,7 @@ impl CrudStore {
             };
 
             let prompt_manifest = parse_turn_prompt_manifest(&turn_model)?;
+            let permission_profile = parse_turn_permission_profile(&turn_model)?;
             self.materialize_turn_completed(
                 pioneer_protocol::TurnCompletedNotification {
                     workspace_id: thread_model.workspace_id,
@@ -5981,6 +5996,7 @@ impl CrudStore {
                         origin: turn_origin_from_db(turn_model.origin.as_str()).unwrap_or_default(),
                         error: None,
                         prompt_manifest,
+                        permission_profile: Some(permission_profile),
                     },
                 },
                 event_timestamp_secs,
@@ -6355,6 +6371,9 @@ impl CrudStore {
                 }
                 TurnEventPayload::TurnExecutionWindowBlocked(notification) => {
                     TurnItemEventPayload::TurnExecutionWindowBlocked(notification)
+                }
+                TurnEventPayload::TurnPermissionAudit(event) => {
+                    TurnItemEventPayload::TurnPermissionAudit(event)
                 }
                 TurnEventPayload::TurnStarted(_)
                 | TurnEventPayload::TurnCompleted(_)
@@ -7392,7 +7411,7 @@ impl CrudStore {
         };
 
         let reasoning_effort = turn_model.reasoning_effort.clone();
-        if let Some(turn) = thread_snapshot_turn_from_db_model(turn_model) {
+        if let Some(turn) = thread_snapshot_turn_from_db_model(turn_model)? {
             thread.reasoning_effort = reasoning_effort;
             thread.turns.push(turn);
         }
@@ -8093,6 +8112,9 @@ impl CrudStore {
                 }
                 TurnEventPayload::TurnExecutionWindowBlocked(notification) => {
                     ThreadHistoryEventPayload::TurnExecutionWindowBlocked(notification)
+                }
+                TurnEventPayload::TurnPermissionAudit(event) => {
+                    ThreadHistoryEventPayload::TurnPermissionAudit(event)
                 }
                 TurnEventPayload::TurnCompleted(notification) => {
                     ThreadHistoryEventPayload::TurnCompleted {
@@ -10149,6 +10171,7 @@ fn task_agent_spec_from_db_model(
         prompt: typed_json_from_db(model.prompt_json)?,
         context_policy: optional_typed_json_from_db(model.context_policy_json)?,
         tool_policy: optional_typed_json_from_db(model.tool_policy_json)?,
+        permission_cap: optional_typed_json_from_db(model.permission_cap_json)?,
         result_contract: optional_typed_json_from_db(model.result_contract_json)?,
         review_policy: optional_typed_json_from_db(model.review_policy_json)?,
         depth: model.depth,
@@ -10602,17 +10625,21 @@ fn thread_from_db_model(model: pioneer_entity::thread::Model) -> Option<Thread> 
     })
 }
 
-fn thread_snapshot_turn_from_db_model(model: pioneer_entity::turn::Model) -> Option<Turn> {
-    let status = turn_status_from_db(model.status.as_str())?;
+fn thread_snapshot_turn_from_db_model(model: pioneer_entity::turn::Model) -> Result<Option<Turn>> {
+    let Some(status) = turn_status_from_db(model.status.as_str()) else {
+        return Ok(None);
+    };
+    let permission_profile = parse_turn_permission_profile(&model)?;
 
-    Some(Turn {
+    Ok(Some(Turn {
         id: model.id,
         status,
         turn_kind: turn_kind_from_db(model.turn_kind.as_str()).unwrap_or_default(),
         origin: turn_origin_from_db(model.origin.as_str()).unwrap_or_default(),
         error: model.error,
         prompt_manifest: None,
-    })
+        permission_profile: Some(permission_profile),
+    }))
 }
 
 fn thread_folder_from_db_model(model: pioneer_entity::thread_folder::Model) -> ThreadFolder {
@@ -10652,6 +10679,41 @@ fn parse_turn_prompt_manifest(
     })?;
 
     Ok(Some(manifest))
+}
+
+fn parse_turn_permission_profile(
+    model: &pioneer_entity::turn::Model,
+) -> Result<TurnPermissionProfileSnapshot> {
+    if let Some(snapshot_json) = model
+        .permission_profile_snapshot_json
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "{}" && *value != "null")
+    {
+        return serde_json::from_str::<TurnPermissionProfileSnapshot>(snapshot_json).with_context(
+            || {
+                format!(
+                    "failed to decode permission profile snapshot for turn `{}` in thread `{}`",
+                    model.id, model.thread_id
+                )
+            },
+        );
+    }
+
+    let Some(mode) = model
+        .permission_profile_mode
+        .as_deref()
+        .and_then(turn_permission_mode_from_db)
+    else {
+        return Ok(pioneer_protocol::resolve_turn_permission_profile(None));
+    };
+    let source = model
+        .permission_profile_source
+        .as_deref()
+        .and_then(turn_permission_profile_source_from_db)
+        .unwrap_or(TurnPermissionProfileSource::Defaulted);
+
+    Ok(TurnPermissionProfileSnapshot::from_mode(mode, source))
 }
 
 fn build_turn_prompt_manifest_columns(
@@ -10759,25 +10821,27 @@ mod tests {
         ItemRecoverySucceededNotification, ItemRetryAttemptStartedNotification,
         ItemRetryScheduledNotification, ItemStartedNotification, ItemTimeoutDetectedNotification,
         ItemToolRetryExhaustedNotification, ItemToolRetryResolvedNotification,
-        ItemToolRetryScheduledNotification, PromptManifest, PromptManifestDiagnostic,
-        PromptManifestDiagnosticCode, PromptManifestHookContributionKind, PromptManifestHookPhase,
-        PromptManifestHookSource, PromptManifestHookSourceEntry, PromptManifestHookTruncation,
-        PromptManifestProfile, RecoveryAction, RecoveryJobStatus, RecoveryTrigger, SandboxMode,
-        Task, TaskAgentPrompt, TaskAgentResultContract, TaskAgentResultFormat, TaskAgentSpec,
-        TaskExecutorKind, TaskMetadata, TaskOwnerKind, TaskResult, TaskResultCandidate,
-        TaskResultCandidateStatus, TaskResultReviewDecision, TaskResultReviewEvent,
-        TaskResultReviewEventKind, TaskResultReviewerKind, TaskRun, TaskRunExecutionStatus,
-        TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn,
-        TaskRunTurnKind, TaskRunTurnStatus, TaskSchema, TaskStatus, TaskTrigger, TaskTriggerSpec,
-        TaskTriggerStatus, TaskValue, Thread, ThreadEpisodicSourceContext,
+        ItemToolRetryScheduledNotification, PermissionBehavior, PromptManifest,
+        PromptManifestDiagnostic, PromptManifestDiagnosticCode, PromptManifestHookContributionKind,
+        PromptManifestHookPhase, PromptManifestHookSource, PromptManifestHookSourceEntry,
+        PromptManifestHookTruncation, PromptManifestProfile, RecoveryAction, RecoveryJobStatus,
+        RecoveryTrigger, SandboxMode, Task, TaskAgentPrompt, TaskAgentResultContract,
+        TaskAgentResultFormat, TaskAgentSpec, TaskExecutorKind, TaskMetadata, TaskOwnerKind,
+        TaskResult, TaskResultCandidate, TaskResultCandidateStatus, TaskResultReviewDecision,
+        TaskResultReviewEvent, TaskResultReviewEventKind, TaskResultReviewerKind, TaskRun,
+        TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind,
+        TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskSchema, TaskStatus, TaskTrigger,
+        TaskTriggerSpec, TaskTriggerStatus, TaskValue, Thread, ThreadEpisodicSourceContext,
         ThreadHistoryEventPayload, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility,
         ThreadStatus, ToolCallStatus, ToolDisplayPayload, ToolLoopBudgetAction,
         ToolLoopBudgetLimitKind, ToolMetadata, ToolOutputPolicySnapshot,
-        ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass,
-        ToolRetryBudgetKind, ToolRetryBudgetUsage, ToolRetryErrorClass, ToolRetryExhaustionKind,
-        ToolRetryResolution, ToolStoragePayload, Turn, TurnCompletedNotification, TurnItem,
-        TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType, TurnKind, TurnOrigin,
-        TurnStatus, TurnToolLoopBudgetExceededNotification, UserInput,
+        ToolPermissionPolicySnapshot, ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot,
+        ToolRecoveryRetryClass, ToolRetryBudgetKind, ToolRetryBudgetUsage, ToolRetryErrorClass,
+        ToolRetryExhaustionKind, ToolRetryResolution, ToolStoragePayload, Turn,
+        TurnCompletedNotification, TurnItem, TurnItemEventPayload, TurnItemTimeoutReason,
+        TurnItemType, TurnKind, TurnOrigin, TurnPermissionAuditEventKind, TurnPermissionMode,
+        TurnPermissionProfileSnapshot, TurnPermissionProfileSource, TurnStatus,
+        TurnToolLoopBudgetExceededNotification, UserInput,
     };
     use sea_orm::{
         ColumnTrait, ConnectionTrait, Database, DatabaseBackend, EntityTrait, QueryFilter,
@@ -13016,6 +13080,7 @@ mod tests {
             origin: Default::default(),
             error: None,
             prompt_manifest: None,
+            permission_profile: None,
         }
     }
 
@@ -13114,6 +13179,7 @@ mod tests {
             },
             context_policy: None,
             tool_policy: None,
+            permission_cap: None,
             result_contract: Some(TaskAgentResultContract {
                 format: TaskAgentResultFormat::Json,
                 required: true,
@@ -13573,6 +13639,7 @@ mod tests {
             origin: Default::default(),
             error: None,
             prompt_manifest: None,
+            permission_profile: None,
         };
 
         store
@@ -14275,6 +14342,7 @@ mod tests {
                         origin: Default::default(),
                         error: None,
                         prompt_manifest: None,
+                        permission_profile: None,
                     },
                 },
                 timestamp + 2,
@@ -15193,6 +15261,7 @@ mod tests {
                 origin: Default::default(),
                 error: None,
                 prompt_manifest: None,
+                permission_profile: None,
             };
             store
                 .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
@@ -15212,6 +15281,7 @@ mod tests {
                         origin: Default::default(),
                         error: None,
                         prompt_manifest: None,
+                        permission_profile: None,
                     },
                 },
                 timestamp + 1,
@@ -15388,6 +15458,7 @@ mod tests {
             origin: Default::default(),
             error: None,
             prompt_manifest: None,
+            permission_profile: None,
         };
 
         store
@@ -15634,6 +15705,7 @@ mod tests {
             origin: Default::default(),
             error: None,
             prompt_manifest: None,
+            permission_profile: None,
         };
         let budgets = vec![ToolRetryBudgetUsage {
             kind: ToolRetryBudgetKind::Episode,
@@ -16216,6 +16288,7 @@ mod tests {
             origin: Default::default(),
             error: None,
             prompt_manifest: None,
+            permission_profile: None,
         };
         let input = vec![UserInput::Text {
             text: "hello".to_owned(),
@@ -16237,6 +16310,19 @@ mod tests {
         assert_eq!(fetched_turn.id, turn.id);
         assert_eq!(fetched_turn.status, TurnStatus::InProgress);
         assert_eq!(fetched_turn.prompt_manifest, None);
+        let permission_profile = fetched_turn
+            .permission_profile
+            .as_ref()
+            .expect("missing turn profile should read as defaulted full access");
+        assert_eq!(permission_profile.mode, TurnPermissionMode::FullAccess);
+        assert_eq!(
+            permission_profile.source,
+            TurnPermissionProfileSource::Defaulted
+        );
+        assert_eq!(
+            permission_profile.effective_policy,
+            ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow)
+        );
 
         let persisted_turn = pioneer_entity::turn::Entity::find_by_id(turn.id.clone())
             .one(&connection)
@@ -16245,6 +16331,317 @@ mod tests {
             .expect("persisted turn should exist");
         assert_eq!(persisted_turn.prompt_manifest_json, "{}");
         assert_eq!(persisted_turn.reasoning_effort, None);
+        assert_eq!(persisted_turn.permission_profile_mode, None);
+        assert_eq!(persisted_turn.permission_profile_source, None);
+        assert_eq!(persisted_turn.permission_profile_snapshot_json, None);
+    }
+
+    #[tokio::test]
+    async fn materialize_turn_start_persists_explicit_permission_profile() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+
+        let store = CrudStore::new(connection.clone());
+        let timestamp = 1_700_000_000;
+        let thread = Thread {
+            workspace_id: "ws_permission_profile".to_owned(),
+            id: "thr_permission_profile".to_owned(),
+            name: None,
+            preview: String::new(),
+            mode: ThreadMode::Agent,
+            model: "gpt-5.4".to_owned(),
+            model_provider: "openai".to_owned(),
+            reasoning_effort: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+            status: ThreadStatus::Active,
+            origin_kind: ThreadOriginKind::User,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            turns: Vec::new(),
+        };
+        let permission_profile = TurnPermissionProfileSnapshot::from_mode(
+            TurnPermissionMode::Supervised,
+            TurnPermissionProfileSource::Composer,
+        );
+        let turn = Turn {
+            id: "turn_permission_profile".to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
+            error: None,
+            prompt_manifest: None,
+            permission_profile: Some(permission_profile.clone()),
+        };
+
+        store
+            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+            .await
+            .expect("turn start with profile should persist");
+
+        let (_, fetched_turn) = store
+            .get_turn(thread.id.as_str(), turn.id.as_str())
+            .await
+            .expect("must read turn")
+            .expect("turn should exist");
+        assert_eq!(
+            fetched_turn.permission_profile.as_ref(),
+            Some(&permission_profile)
+        );
+
+        let persisted_turn = pioneer_entity::turn::Entity::find_by_id(turn.id.clone())
+            .one(&connection)
+            .await
+            .expect("must query persisted turn")
+            .expect("persisted turn should exist");
+        assert_eq!(
+            persisted_turn.permission_profile_mode.as_deref(),
+            Some("supervised")
+        );
+        assert_eq!(
+            persisted_turn.permission_profile_source.as_deref(),
+            Some("composer")
+        );
+        assert_eq!(
+            serde_json::from_str::<TurnPermissionProfileSnapshot>(
+                persisted_turn
+                    .permission_profile_snapshot_json
+                    .as_deref()
+                    .expect("permission profile snapshot should persist")
+            )
+            .expect("snapshot should decode"),
+            permission_profile
+        );
+
+        let audit_events_before_explicit_audit = pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn.id.clone()))
+            .filter(
+                pioneer_entity::turn_event::Column::EventType
+                    .eq(pioneer_protocol::constants::events::TURN_PERMISSION_AUDIT),
+            )
+            .all(&connection)
+            .await
+            .expect("must query turn permission audit events");
+        assert!(
+            audit_events_before_explicit_audit.is_empty(),
+            "CRUD must not synthesize profile-selected audit events during turn/start"
+        );
+
+        store
+            .materialize_turn_permission_audit(
+                pioneer_protocol::TurnPermissionAuditEvent {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn_id: turn.id.clone(),
+                    event_kind: TurnPermissionAuditEventKind::ProfileSelected,
+                    profile_mode: permission_profile.mode,
+                    profile_source: permission_profile.source,
+                    item_id: None,
+                    tool_call_id: None,
+                    tool_name: None,
+                    action_kind: None,
+                    request_key: None,
+                    decision: None,
+                    reason: None,
+                    cached: false,
+                },
+                timestamp,
+            )
+            .await
+            .expect("explicit profile-selected audit should persist");
+
+        let audit_events = pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn.id.clone()))
+            .filter(
+                pioneer_entity::turn_event::Column::EventType
+                    .eq(pioneer_protocol::constants::events::TURN_PERMISSION_AUDIT),
+            )
+            .order_by_asc(pioneer_entity::turn_event::Column::Sequence)
+            .all(&connection)
+            .await
+            .expect("must query turn permission audit events");
+        assert_eq!(audit_events.len(), 1);
+        let audit_payload: crate::events::TurnEventPayload =
+            serde_json::from_str(audit_events[0].payload.as_str())
+                .expect("audit event payload should decode");
+        let crate::events::TurnEventPayload::TurnPermissionAudit(audit) = audit_payload else {
+            panic!("expected turn permission audit event");
+        };
+        assert_eq!(
+            audit.event_kind,
+            TurnPermissionAuditEventKind::ProfileSelected
+        );
+        assert_eq!(audit.workspace_id, thread.workspace_id);
+        assert_eq!(audit.thread_id, thread.id);
+        assert_eq!(audit.turn_id, turn.id);
+        assert_eq!(audit.profile_mode, TurnPermissionMode::Supervised);
+        assert_eq!(audit.profile_source, TurnPermissionProfileSource::Composer);
+        assert!(audit.tool_name.is_none());
+        assert!(audit.request_key.is_none());
+
+        let turn_item_events = store
+            .get_turn_item_events(thread.id.as_str(), turn.id.as_str())
+            .await
+            .expect("turn item events should load")
+            .expect("turn item events should exist");
+        assert!(
+            turn_item_events.events.iter().any(|event| matches!(
+                &event.payload,
+                TurnItemEventPayload::TurnPermissionAudit(audit)
+                    if audit.event_kind == TurnPermissionAuditEventKind::ProfileSelected
+            )),
+            "permission audit should be exposed through turn item event replay"
+        );
+
+        let history = store
+            .get_thread_history(thread.id.as_str(), Some(16))
+            .await
+            .expect("thread history should load")
+            .expect("thread history should exist");
+        assert!(
+            history.events.iter().any(|event| matches!(
+                &event.payload,
+                ThreadHistoryEventPayload::TurnPermissionAudit(audit)
+                    if audit.event_kind == TurnPermissionAuditEventKind::ProfileSelected
+            )),
+            "permission audit should be exposed through thread history"
+        );
+    }
+
+    #[tokio::test]
+    async fn old_turn_without_permission_profile_reads_as_defaulted_full_access() {
+        let store = test_store_with_workspace("ws_old_permission_profile").await;
+        let timestamp = 1_700_000_000;
+        let thread = Thread {
+            workspace_id: "ws_old_permission_profile".to_owned(),
+            id: "thr_old_permission_profile".to_owned(),
+            name: None,
+            preview: String::new(),
+            mode: ThreadMode::Agent,
+            model: "gpt-5.4".to_owned(),
+            model_provider: "openai".to_owned(),
+            reasoning_effort: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+            status: ThreadStatus::Active,
+            origin_kind: ThreadOriginKind::User,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            turns: Vec::new(),
+        };
+        store
+            .upsert_thread_model(&thread)
+            .await
+            .expect("thread should persist");
+
+        let now = unix_to_datetime(timestamp);
+        pioneer_entity::turn::Entity::insert(pioneer_entity::turn::ActiveModel {
+            id: Set("turn_old_permission_profile".to_owned()),
+            thread_id: Set(thread.id.clone()),
+            status: Set("in_progress".to_owned()),
+            turn_kind: Set("conversation".to_owned()),
+            origin: Set("user".to_owned()),
+            error: Set(None),
+            prompt_manifest_json: Set("{}".to_owned()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        })
+        .exec(&store.connection)
+        .await
+        .expect("old-style turn insert should succeed");
+
+        let (_, fetched_turn) = store
+            .get_turn(thread.id.as_str(), "turn_old_permission_profile")
+            .await
+            .expect("must read old turn")
+            .expect("turn should exist");
+        let permission_profile = fetched_turn
+            .permission_profile
+            .as_ref()
+            .expect("old turn should map to defaulted profile");
+        assert_eq!(permission_profile.mode, TurnPermissionMode::FullAccess);
+        assert_eq!(
+            permission_profile.source,
+            TurnPermissionProfileSource::Defaulted
+        );
+        assert_eq!(
+            permission_profile.effective_policy,
+            ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow)
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_permission_profile_columns_read_as_defaulted_full_access() {
+        let store = test_store_with_workspace("ws_unknown_permission_profile").await;
+        let timestamp = 1_700_000_000;
+        let thread = Thread {
+            workspace_id: "ws_unknown_permission_profile".to_owned(),
+            id: "thr_unknown_permission_profile".to_owned(),
+            name: None,
+            preview: String::new(),
+            mode: ThreadMode::Agent,
+            model: "gpt-5.4".to_owned(),
+            model_provider: "openai".to_owned(),
+            reasoning_effort: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+            status: ThreadStatus::Active,
+            origin_kind: ThreadOriginKind::User,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            turns: Vec::new(),
+        };
+        store
+            .upsert_thread_model(&thread)
+            .await
+            .expect("thread should persist");
+
+        let now = unix_to_datetime(timestamp);
+        pioneer_entity::turn::Entity::insert(pioneer_entity::turn::ActiveModel {
+            id: Set("turn_unknown_permission_profile".to_owned()),
+            thread_id: Set(thread.id.clone()),
+            status: Set("in_progress".to_owned()),
+            turn_kind: Set("conversation".to_owned()),
+            origin: Set("user".to_owned()),
+            error: Set(None),
+            prompt_manifest_json: Set("{}".to_owned()),
+            permission_profile_mode: Set(Some("future_mode".to_owned())),
+            permission_profile_source: Set(Some("future_source".to_owned())),
+            permission_profile_snapshot_json: Set(Some("{}".to_owned())),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        })
+        .exec(&store.connection)
+        .await
+        .expect("future-style turn insert should succeed");
+
+        let (_, fetched_turn) = store
+            .get_turn(thread.id.as_str(), "turn_unknown_permission_profile")
+            .await
+            .expect("must read turn with unknown permission columns")
+            .expect("turn should exist");
+        let permission_profile = fetched_turn
+            .permission_profile
+            .as_ref()
+            .expect("unknown columns should map to an explicit defaulted profile");
+        assert_eq!(permission_profile.mode, TurnPermissionMode::FullAccess);
+        assert_eq!(
+            permission_profile.source,
+            TurnPermissionProfileSource::Defaulted
+        );
+        assert_eq!(
+            permission_profile.effective_policy,
+            ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow)
+        );
     }
 
     #[tokio::test]
@@ -16283,6 +16680,7 @@ mod tests {
             origin: Default::default(),
             error: None,
             prompt_manifest: None,
+            permission_profile: None,
         };
 
         store
@@ -16340,6 +16738,7 @@ mod tests {
             origin: TurnOrigin::ScheduledTask,
             error: None,
             prompt_manifest: None,
+            permission_profile: None,
         };
 
         store
@@ -16412,6 +16811,7 @@ mod tests {
             origin: Default::default(),
             error: None,
             prompt_manifest: None,
+            permission_profile: None,
         };
         store
             .materialize_turn_start_with_reasoning_effort(
@@ -16437,6 +16837,7 @@ mod tests {
             origin: Default::default(),
             error: None,
             prompt_manifest: None,
+            permission_profile: None,
         };
         store
             .materialize_turn_start_with_reasoning_effort(
@@ -16510,6 +16911,7 @@ mod tests {
             origin: Default::default(),
             error: None,
             prompt_manifest: None,
+            permission_profile: None,
         };
 
         store
