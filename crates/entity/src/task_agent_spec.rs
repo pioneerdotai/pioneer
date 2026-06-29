@@ -29,6 +29,8 @@ pub struct Model {
     pub max_depth: i64,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub permission_cap_json: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}
