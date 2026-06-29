@@ -22,7 +22,23 @@
       "thread_id": "thr_phase29",
       "turn": {
         "id": "turn_phase29",
-        "status": "InProgress"
+        "status": "InProgress",
+        "permission_profile": {
+          "mode": "full_access",
+          "source": "defaulted",
+          "effective_policy": {
+            "default_behavior": "allow",
+            "file_read": "allow",
+            "file_write": "allow",
+            "shell_command": "allow",
+            "network": "allow",
+            "mcp_read": "allow",
+            "mcp_write_or_unknown": "allow",
+            "dynamic_skill_tool": "allow",
+            "computer_use": "allow",
+            "task_subagent": "allow"
+          }
+        }
       }
     }
   },

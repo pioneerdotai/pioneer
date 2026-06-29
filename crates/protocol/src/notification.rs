@@ -745,7 +745,23 @@ mod tests {
                 "thread_id": "thr_123",
                 "turn": {
                     "id": "turn_123",
-                    "status": "InProgress"
+                    "status": "InProgress",
+                    "permission_profile": {
+                        "mode": "full_access",
+                        "source": "defaulted",
+                        "effective_policy": {
+                            "default_behavior": "allow",
+                            "file_read": "allow",
+                            "file_write": "allow",
+                            "shell_command": "allow",
+                            "network": "allow",
+                            "mcp_read": "allow",
+                            "mcp_write_or_unknown": "allow",
+                            "dynamic_skill_tool": "allow",
+                            "computer_use": "allow",
+                            "task_subagent": "allow"
+                        }
+                    }
                 }
             }
         }))

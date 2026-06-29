@@ -631,7 +631,6 @@ fn turn_start_request_sends_cli_runtime_effort_options() {
             }),
             permission_profile: None,
             cli_runtime_options: Some(TurnCLIRuntimeOptions {
-                approval_policy: None,
                 sandbox: None,
                 effort: Some("high".to_owned()),
                 personality: None,
@@ -901,6 +900,33 @@ fn thread_start_params() -> ThreadStartParams {
         agent_nickname: None,
         agent_role: None,
     }
+}
+
+fn turn_permission_profile_json(request: &serde_json::Value) -> serde_json::Value {
+    let mode = match request
+        .pointer("/params/permission_profile/mode")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("full_access") | None => TurnPermissionMode::FullAccess,
+        Some("auto_accept_edits") => TurnPermissionMode::AutoAcceptEdits,
+        Some("supervised") => TurnPermissionMode::Supervised,
+        Some(other) => panic!("unexpected permission profile mode {other}"),
+    };
+    let source = if request.pointer("/params/permission_profile").is_some() {
+        pioneer_protocol::TurnPermissionProfileSource::Composer
+    } else {
+        pioneer_protocol::TurnPermissionProfileSource::Defaulted
+    };
+
+    serde_json::to_value(pioneer_protocol::compile_turn_permission_profile(
+        mode, source,
+    ))
+    .expect("permission profile should encode")
+}
+
+fn default_turn_permission_profile_json() -> serde_json::Value {
+    serde_json::to_value(pioneer_protocol::default_turn_permission_profile_snapshot())
+        .expect("permission profile should encode")
 }
 
 fn reserve_unused_local_address() -> String {
@@ -1472,6 +1498,8 @@ impl TestWsServer {
                                                                 .await;
                                                             continue;
                                                         };
+                                                        let permission_profile =
+                                                            turn_permission_profile_json(&request);
                                                         let response = json!({
                                                             "jsonrpc": "2.0",
                                                             "id": request_id,
@@ -1479,7 +1507,8 @@ impl TestWsServer {
                                                                 "turn": {
                                                                     "id": turn_id,
                                                                     "status": "InProgress",
-                                                                    "error": null
+                                                                    "error": null,
+                                                                    "permission_profile": permission_profile.clone()
                                                                 }
                                                             }
                                                         });
@@ -1492,7 +1521,8 @@ impl TestWsServer {
                                                                 "turn": {
                                                                     "id": turn_id,
                                                                     "status": "InProgress",
-                                                                    "error": null
+                                                                    "error": null,
+                                                                    "permission_profile": permission_profile
                                                                 }
                                                             }
                                                         });
@@ -1521,6 +1551,8 @@ impl TestWsServer {
                                                         else {
                                                             continue;
                                                         };
+                                                        let permission_profile =
+                                                            default_turn_permission_profile_json();
 
                                                         let response = json!({
                                                             "jsonrpc": "2.0",
@@ -1531,7 +1563,8 @@ impl TestWsServer {
                                                                 "turn": {
                                                                     "id": turn_id,
                                                                     "status": "Completed",
-                                                                    "error": null
+                                                                    "error": null,
+                                                                    "permission_profile": permission_profile
                                                                 }
                                                             }
                                                         });

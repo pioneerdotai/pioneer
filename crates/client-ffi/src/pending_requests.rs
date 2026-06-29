@@ -1,6 +1,6 @@
 use pioneer_client::cli_runtime::approvals::{
-    PendingRequest, PendingRequestResolution, PendingRequestResponseAction,
-    plan_pending_request_response,
+    PendingRequest, PendingRequestPresentation, PendingRequestResolution,
+    PendingRequestResponseAction, plan_pending_request_response, present_pending_request,
 };
 use pioneer_protocol::{CLIRuntimeRequestRespondParams, TurnPermissionRequestRespondParams};
 use serde::{Deserialize, Serialize};
@@ -11,6 +11,19 @@ use serde::{Deserialize, Serialize};
 pub struct ClientPendingRequestResponsePlanRequest {
     pub request: PendingRequest,
     pub resolution: PendingRequestResolution,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientPendingRequestPresentationRequest {
+    pub request: PendingRequest,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct ClientPendingRequestPresentationResult {
+    pub presentation: PendingRequestPresentation,
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -42,6 +55,14 @@ pub fn plan_pending_request_response_for_bridge(
 
     Ok(ClientPendingRequestResponsePlanResult {
         action: action.into(),
+    })
+}
+
+pub fn pending_request_presentation_for_bridge(
+    request: ClientPendingRequestPresentationRequest,
+) -> Result<ClientPendingRequestPresentationResult, String> {
+    Ok(ClientPendingRequestPresentationResult {
+        presentation: present_pending_request(&request.request),
     })
 }
 
@@ -102,5 +123,21 @@ mod tests {
             params.resolution,
             TurnPermissionApprovalResolution::AllowForTurn
         );
+    }
+
+    #[test]
+    fn pending_request_presentation_bridge_uses_client_renderer() {
+        let result =
+            pending_request_presentation_for_bridge(ClientPendingRequestPresentationRequest {
+                request: native_pending_request(),
+            })
+            .expect("bridge should present request");
+
+        assert_eq!(result.presentation.origin_label, "Native agent request");
+        assert!(result.presentation.actions.iter().any(|action| {
+            action.kind
+                == pioneer_client::cli_runtime::approvals::PendingRequestActionKind::AllowForTurn
+                && action.resolution == Some(PendingRequestResolution::AllowForTurn)
+        }));
     }
 }

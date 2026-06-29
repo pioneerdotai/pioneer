@@ -39,10 +39,8 @@ fn cli_runtime_turn_start_fixture_roundtrips_backend_and_options() {
         .as_ref()
         .expect("CLI runtime options should decode");
     assert_eq!(
-        options
-            .approval_policy
-            .as_ref()
-            .map(|policy| policy.0.as_str()),
+        raw.pointer("/cli_runtime_options/approval_policy")
+            .and_then(JsonValue::as_str),
         Some("unlessTrusted")
     );
     assert_eq!(options.effort.as_deref(), Some("medium"));
@@ -50,6 +48,11 @@ fn cli_runtime_turn_start_fixture_roundtrips_backend_and_options() {
 
     let encoded = serde_json::to_value(params).expect("turn/start fixture should encode");
     assert_eq!(encoded["execution_backend"], raw["execution_backend"]);
+    assert!(
+        encoded
+            .pointer("/cli_runtime_options/approval_policy")
+            .is_none()
+    );
     assert_eq!(
         encoded["cli_runtime_options"]["sandbox"],
         raw["cli_runtime_options"]["sandbox"]

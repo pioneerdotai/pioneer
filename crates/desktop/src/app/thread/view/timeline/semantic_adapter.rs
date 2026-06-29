@@ -613,7 +613,7 @@ mod tests {
             origin: TurnOrigin::User,
             error: None,
             prompt_manifest: None,
-            permission_profile: Some(permission_profile.clone()),
+            permission_profile: permission_profile.clone(),
         });
 
         let display = running_turn_display_for_projection(&projection, "turn_a", Some(10));

@@ -51,8 +51,9 @@ use gateway::{
     validate_remote_gateway_request,
 };
 use pending_requests::{
+    ClientPendingRequestPresentationRequest, ClientPendingRequestPresentationResult,
     ClientPendingRequestResponsePlanRequest, ClientPendingRequestResponsePlanResult,
-    plan_pending_request_response_for_bridge,
+    pending_request_presentation_for_bridge, plan_pending_request_response_for_bridge,
 };
 use pioneer_client::{
     agents_doc::content::{
@@ -510,6 +511,18 @@ impl ClientFfiRuntime {
         })?;
 
         plan_pending_request_response_for_bridge(request)
+    }
+
+    fn pending_request_presentation(
+        &self,
+        input_json: &str,
+    ) -> Result<ClientPendingRequestPresentationResult, String> {
+        let request = serde_json::from_str::<ClientPendingRequestPresentationRequest>(input_json)
+            .map_err(|error| {
+            format!("invalid pending request presentation request: {error}")
+        })?;
+
+        pending_request_presentation_for_bridge(request)
     }
 
     fn provider_list_models(&self, input_json: &str) -> Result<ProviderListModelsResponse, String> {
@@ -1080,6 +1093,10 @@ ffi_client_json_method!(
 ffi_client_json_method!(
     pioneer_client_ffi_pending_request_response_plan,
     pending_request_response_plan
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_pending_request_presentation,
+    pending_request_presentation
 );
 ffi_client_json_method!(
     pioneer_client_ffi_provider_list_models,

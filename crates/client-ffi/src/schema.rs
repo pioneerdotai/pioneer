@@ -156,6 +156,14 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             crate::pending_requests::ClientPendingRequestResponseAction
         ),
         schema_doc!(
+            "client_pending_request_presentation_request.json",
+            crate::pending_requests::ClientPendingRequestPresentationRequest
+        ),
+        schema_doc!(
+            "client_pending_request_presentation_result.json",
+            crate::pending_requests::ClientPendingRequestPresentationResult
+        ),
+        schema_doc!(
             "client_pending_request_response_plan_request.json",
             crate::pending_requests::ClientPendingRequestResponsePlanRequest
         ),
