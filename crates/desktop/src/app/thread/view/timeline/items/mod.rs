@@ -81,9 +81,9 @@ fn task_status_label(status: TaskStatus) -> String {
 impl PioneerDesktop {
     pub(super) fn turn_permission_icon(mode: TurnPermissionMode) -> PioneerIconName {
         match mode {
-            TurnPermissionMode::Supervised => PioneerIconName::Lock,
-            TurnPermissionMode::AutoAcceptEdits => PioneerIconName::Pencil,
-            TurnPermissionMode::FullAccess => PioneerIconName::Unlock,
+            TurnPermissionMode::FullAccess => PioneerIconName::ShieldCheck,
+            TurnPermissionMode::AutoAcceptEdits => PioneerIconName::ShieldAlert,
+            TurnPermissionMode::Supervised => PioneerIconName::ShieldX,
         }
     }
 

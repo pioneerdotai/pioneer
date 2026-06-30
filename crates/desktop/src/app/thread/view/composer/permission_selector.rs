@@ -14,9 +14,9 @@ use pioneer_protocol::TurnPermissionMode;
 impl PioneerDesktop {
     fn composer_permission_icon(mode: TurnPermissionMode) -> PioneerIconName {
         match mode {
-            TurnPermissionMode::Supervised => PioneerIconName::Lock,
-            TurnPermissionMode::AutoAcceptEdits => PioneerIconName::Pencil,
-            TurnPermissionMode::FullAccess => PioneerIconName::Unlock,
+            TurnPermissionMode::FullAccess => PioneerIconName::ShieldCheck,
+            TurnPermissionMode::AutoAcceptEdits => PioneerIconName::ShieldAlert,
+            TurnPermissionMode::Supervised => PioneerIconName::ShieldX,
         }
     }
 
@@ -116,7 +116,7 @@ impl PioneerDesktop {
                                 h_flex()
                                     .w_full()
                                     .items_center()
-                                    .gap_2()
+                                    .gap_3()
                                     .child(Icon::new(Self::composer_permission_icon(mode)).size_4())
                                     .child(
                                         v_flex()

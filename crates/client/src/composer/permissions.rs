@@ -19,9 +19,9 @@ pub fn default_composer_permission_mode() -> TurnPermissionMode {
 pub fn composer_permission_mode_options() -> [ComposerPermissionModeOption; 3] {
     [
         ComposerPermissionModeOption {
-            mode: TurnPermissionMode::Supervised,
-            label: "Supervised".to_owned(),
-            description: "Ask before commands and file changes.".to_owned(),
+            mode: TurnPermissionMode::FullAccess,
+            label: "Full access".to_owned(),
+            description: "Allow commands and edits without prompts.".to_owned(),
         },
         ComposerPermissionModeOption {
             mode: TurnPermissionMode::AutoAcceptEdits,
@@ -29,9 +29,9 @@ pub fn composer_permission_mode_options() -> [ComposerPermissionModeOption; 3] {
             description: "Auto-approve edits, ask before other actions.".to_owned(),
         },
         ComposerPermissionModeOption {
-            mode: TurnPermissionMode::FullAccess,
-            label: "Full access".to_owned(),
-            description: "Allow commands and edits without prompts.".to_owned(),
+            mode: TurnPermissionMode::Supervised,
+            label: "Supervised".to_owned(),
+            description: "Ask before commands and file changes.".to_owned(),
         },
     ]
 }

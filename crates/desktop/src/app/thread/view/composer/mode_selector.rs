@@ -106,7 +106,7 @@ impl PioneerDesktop {
                             h_flex()
                                 .w_full()
                                 .items_center()
-                                .gap_2()
+                                .gap_3()
                                 .child(Icon::new(icon).size_4())
                                 .child(
                                     v_flex()
