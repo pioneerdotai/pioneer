@@ -281,9 +281,9 @@ dependencies = [
 
 [[package]]
 name = "arc-swap"
-version = "1.9.1"
+version = "1.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a3a1fd6f75306b68087b831f025c712524bcb19aad54e557b1129cfa0a2b207"
+checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
 dependencies = [
  "rustversion",
 ]
@@ -4050,9 +4050,9 @@ dependencies = [
 
 [[package]]
 name = "gpu-alloc"
-version = "0.6.0"
+version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fbcd2dba93594b227a1f57ee09b8b9da8892c34d55aa332e034a228d0fe6a171"
+checksum = "45cf04b2726f02df5508c6de726acdc90cdf97ac771a9a0ffd8ba10a6e696bf9"
 dependencies = [
  "bitflags 2.13.0",
  "gpu-alloc-types",
@@ -4060,9 +4060,9 @@ dependencies = [
 
 [[package]]
 name = "gpu-alloc-ash"
-version = "0.7.0"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cbda7a18a29bc98c2e0de0435c347df935bf59489935d0cbd0b73f1679b6f79a"
+checksum = "643756f08ef6def813c776199e4766596395a4c6530373c9a4374a64de2f53a1"
 dependencies = [
  "ash",
  "gpu-alloc-types",
@@ -4071,9 +4071,9 @@ dependencies = [
 
 [[package]]
 name = "gpu-alloc-types"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "98ff03b468aa837d70984d55f5d3f846f6ec31fe34bbb97c4f85219caeee1ca4"
+checksum = "b2bbed164dd10ed526c2e4fe3e721ca4a71c61730e5aafac6844b417b3227058"
 dependencies = [
  "bitflags 2.13.0",
 ]
@@ -5125,9 +5125,9 @@ dependencies = [
 
 [[package]]
 name = "io-uring"
-version = "0.7.12"
+version = "0.7.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d09b98f7eace8982db770e4408e7470b028ce513ac28fecdc6bf4c30fe92b62"
+checksum = "9080b15e63775b9a2ac7dca720f7050a8b955e092ea0f6020a4a80f69998cdc0"
 dependencies = [
  "bitflags 2.13.0",
  "cfg-if",
@@ -5209,9 +5209,9 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jiff"
-version = "0.2.29"
+version = "0.2.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34f877a98676d2fb664698d74cc6a51ce6c484ce8c770f05d0108ec9090aeb46"
+checksum = "ccfe6121cbe750cf81efa362d85c0bde7ea298ec43092d3a193baca59cdbd634"
 dependencies = [
  "defmt",
  "jiff-static",
@@ -5225,9 +5225,9 @@ dependencies = [
 
 [[package]]
 name = "jiff-static"
-version = "0.2.29"
+version = "0.2.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0666b5ab5ecaca213fc2a85b8c0083d9004e84ee2d5f9a7e0017aaf50986f25f"
+checksum = "e165e897f662d428f3cd3828a919dbe067c2d42bb1031eede74ef9d27ecdedd2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6953,13 +6953,12 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "open"
-version = "5.3.5"
+version = "5.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2fbaa89d2ddc8473c78a3adf69eea8cffa28c483b8e02a971ef31527cd0fc92c"
+checksum = "cd8d3b65c44123a56e0133d2cd06ce4361bd3ca99d41198b2f25e3c3db9b8b4a"
 dependencies = [
  "is-wsl",
  "libc",
- "pathdiff",
 ]
 
 [[package]]
@@ -7486,7 +7485,7 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 
 [[package]]
 name = "pioneer-agent"
-version = "0.19.1"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7510,7 +7509,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-artifacts"
-version = "0.19.1"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7536,7 +7535,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-cli"
-version = "0.19.1"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
@@ -7559,7 +7558,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-cli-agent-runtime"
-version = "0.19.1"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -7572,7 +7571,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-client"
-version = "0.19.1"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -7595,7 +7594,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-client-ffi"
-version = "0.19.1"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "pioneer-client",
@@ -7609,7 +7608,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-config"
-version = "0.19.1"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "config",
@@ -7620,7 +7619,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-crud"
-version = "0.19.1"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7640,7 +7639,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop"
-version = "0.19.1"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -7676,7 +7675,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-entity"
-version = "0.19.1"
+version = "0.20.0"
 dependencies = [
  "sea-orm",
  "serde",
@@ -7684,7 +7683,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-gateway"
-version = "0.19.1"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7737,7 +7736,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-hooks"
-version = "0.19.1"
+version = "0.20.0"
 dependencies = [
  "async-trait",
  "futures-timer",
@@ -7752,7 +7751,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-keystore"
-version = "0.19.1"
+version = "0.20.0"
 dependencies = [
  "db-keystore",
  "keyring-core",
@@ -7765,7 +7764,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-mcp"
-version = "0.19.1"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7786,7 +7785,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-memory"
-version = "0.19.1"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7809,7 +7808,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-migration"
-version = "0.19.1"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "pioneer-entity",
@@ -7820,7 +7819,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-observability"
-version = "0.19.1"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "dotenvy",
@@ -7831,7 +7830,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-promt"
-version = "0.19.1"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7849,7 +7848,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-protocol"
-version = "0.19.1"
+version = "0.20.0"
 dependencies = [
  "hex",
  "nanoid",
@@ -7861,7 +7860,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-provider"
-version = "0.19.1"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7884,7 +7883,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-skills"
-version = "0.19.1"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "hex",
@@ -7900,7 +7899,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-sqlite"
-version = "0.19.1"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "sea-orm",
@@ -7909,7 +7908,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-tasks"
-version = "0.19.1"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7930,7 +7929,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-tools"
-version = "0.19.1"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7958,7 +7957,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-tunnel"
-version = "0.19.1"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "pioneer-config",
@@ -11410,9 +11409,9 @@ dependencies = [
 
 [[package]]
 name = "time"
-version = "0.3.51"
+version = "0.3.52"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85c17d80feb7334b40c484e45ed1a5273dfd8bfda537c3be2e74a06a6686f327"
+checksum = "0e48db7b415311b615f910b3dcaa4557bcd4bf1982379c95c223fd8c2a20e210"
 dependencies = [
  "deranged",
  "num-conv",
@@ -11430,9 +11429,9 @@ checksum = "9e1c906769ad99c88eaa54e728060edef082f8e358ff32030cb7c7d315e81109"
 
 [[package]]
 name = "time-macros"
-version = "0.2.30"
+version = "0.2.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dcef1a61bdb119096e153208ec5cbec23944ce8bca13be5c7f60c634f7403935"
+checksum = "c431b87111666e491a90baa837f914fb45cd5dc3c268591b0220ff5057f2085f"
 dependencies = [
  "num-conv",
  "time-core",
@@ -11867,9 +11866,9 @@ dependencies = [
 
 [[package]]
 name = "triomphe"
-version = "0.1.15"
+version = "0.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd69c5aa8f924c7519d6372789a74eac5b94fb0f8fcf0d4a97eb0bfc3e785f39"
+checksum = "b40688ea6389c8171614b25491f71d4a27946e0c7ce2da1c6de27e25abf1a0ae"
 dependencies = [
  "arc-swap",
  "serde",
@@ -12821,7 +12820,7 @@ dependencies = [
 [[package]]
 name = "webclaw-core"
 version = "0.6.14"
-source = "git+https://github.com/0xMassi/webclaw#a3d3744104d8c1f58f0f2abc3d24572dbe05a674"
+source = "git+https://github.com/0xMassi/webclaw#a869b0af699d72a56b6eaf29c1a5c3e7ba062b05"
 dependencies = [
  "ego-tree 0.10.0",
  "once_cell",
