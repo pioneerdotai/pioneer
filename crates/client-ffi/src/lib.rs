@@ -1475,7 +1475,7 @@ mod tests {
         assert_eq!(options.len(), 3);
         assert_eq!(
             options[0].mode,
-            pioneer_protocol::TurnPermissionMode::Supervised
+            pioneer_protocol::TurnPermissionMode::FullAccess
         );
         assert_eq!(
             options[1].mode,
@@ -1483,7 +1483,7 @@ mod tests {
         );
         assert_eq!(
             options[2].mode,
-            pioneer_protocol::TurnPermissionMode::FullAccess
+            pioneer_protocol::TurnPermissionMode::Supervised
         );
     }
 

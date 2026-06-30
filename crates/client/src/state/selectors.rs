@@ -646,9 +646,9 @@ mod tests {
         let options = composer_permission_mode_options();
 
         assert_eq!(options.len(), 3);
-        assert_eq!(options[0].mode, TurnPermissionMode::Supervised);
+        assert_eq!(options[0].mode, TurnPermissionMode::FullAccess);
         assert_eq!(options[1].mode, TurnPermissionMode::AutoAcceptEdits);
-        assert_eq!(options[2].mode, TurnPermissionMode::FullAccess);
+        assert_eq!(options[2].mode, TurnPermissionMode::Supervised);
         assert_eq!(
             composer_permission_mode_option(TurnPermissionMode::AutoAcceptEdits).label,
             "Auto-accept edits"
