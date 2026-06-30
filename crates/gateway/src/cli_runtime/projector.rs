@@ -10,9 +10,10 @@ use pioneer_cli_agent_runtime::event::{
 };
 use pioneer_protocol::{
     AgentDurableEvent, AgentMessagePhase, AgentProgressEvent, ItemCompletedNotification,
-    ItemDeltaNotification, ItemDeltaStream, ItemStartedNotification, StorageOutputPolicy,
-    SystemEventLevel, TimelineOutputPolicy, ToolCallStatus, ToolDisplayPayload, ToolMetadata,
-    ToolOutputPolicySnapshot, ToolOutputSummary, ToolStoragePayload, TurnItem,
+    ItemDeltaNotification, ItemDeltaStream, ItemStartedNotification, ItemUpdatedNotification,
+    StorageOutputPolicy, SystemEventLevel, TimelineOutputPolicy, ToolCallStatus,
+    ToolDisplayPayload, ToolMetadata, ToolOutputPolicySnapshot, ToolOutputSummary,
+    ToolStoragePayload, TurnItem,
 };
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
@@ -26,14 +27,32 @@ pub(crate) struct CLIRuntimeProjectorContext {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct CLIRuntimeProjectedEvents {
     pub durable: Vec<AgentDurableEvent>,
+    pub snapshot: Vec<AgentSnapshotEvent>,
     pub progress: Vec<AgentProgressEvent>,
     pub ignored: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum AgentSnapshotEvent {
+    ItemUpdated {
+        notification: ItemUpdatedNotification,
+    },
 }
 
 impl CLIRuntimeProjectedEvents {
     fn durable(event: AgentDurableEvent) -> Self {
         Self {
             durable: vec![event],
+            snapshot: Vec::new(),
+            progress: Vec::new(),
+            ignored: Vec::new(),
+        }
+    }
+
+    fn snapshot(event: AgentSnapshotEvent) -> Self {
+        Self {
+            durable: Vec::new(),
+            snapshot: vec![event],
             progress: Vec::new(),
             ignored: Vec::new(),
         }
@@ -42,6 +61,7 @@ impl CLIRuntimeProjectedEvents {
     fn progress(event: AgentProgressEvent) -> Self {
         Self {
             durable: Vec::new(),
+            snapshot: Vec::new(),
             progress: vec![event],
             ignored: Vec::new(),
         }
@@ -50,6 +70,7 @@ impl CLIRuntimeProjectedEvents {
     fn ignored(reason: impl Into<String>) -> Self {
         Self {
             durable: Vec::new(),
+            snapshot: Vec::new(),
             progress: Vec::new(),
             ignored: vec![reason.into()],
         }
@@ -300,10 +321,7 @@ fn project_diff_updated(
     context: &CLIRuntimeProjectorContext,
     diff: &RuntimeDiffUpdated,
 ) -> CLIRuntimeProjectedEvents {
-    let item_id = format!(
-        "agent_diff_{}",
-        normalize_kind(diff.native_turn_id.as_str())
-    );
+    let item_id = agent_diff_item_id_for_native_turn_id(diff.native_turn_id.as_str());
     let item = generic_agent_system_item(
         item_id.as_str(),
         "turn/diff/updated",
@@ -314,14 +332,18 @@ fn project_diff_updated(
         diff.diff_redacted.as_ref(),
     );
 
-    CLIRuntimeProjectedEvents::durable(AgentDurableEvent::ItemCompleted {
-        notification: ItemCompletedNotification {
+    CLIRuntimeProjectedEvents::snapshot(AgentSnapshotEvent::ItemUpdated {
+        notification: ItemUpdatedNotification {
             workspace_id: context.workspace_id.clone(),
             thread_id: context.thread_id.clone(),
             turn_id: context.turn_id.clone(),
             item,
         },
     })
+}
+
+pub(crate) fn agent_diff_item_id_for_native_turn_id(native_turn_id: &str) -> String {
+    format!("agent_diff_{}", normalize_kind(native_turn_id))
 }
 
 fn project_thread_state_changed(
@@ -2083,9 +2105,11 @@ mod tests {
             Some(&json!([{"step": "Inspect state", "status": "inProgress"}]))
         );
 
-        let AgentDurableEvent::ItemCompleted { notification: diff } = &diff.durable[0] else {
-            panic!("expected diff system item");
-        };
+        assert!(
+            diff.durable.is_empty(),
+            "diff snapshots should not be appended to the durable turn_event log"
+        );
+        let super::AgentSnapshotEvent::ItemUpdated { notification: diff } = &diff.snapshot[0];
         let TurnItem::SystemEvent {
             id, code, details, ..
         } = &diff.item

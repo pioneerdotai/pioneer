@@ -2461,7 +2461,8 @@ impl MessageProcessor {
         turn_binding: pioneer_crud::CliRuntimeTurnBindingRecord,
         event: RuntimeEvent,
     ) {
-        let native_turn_id = cli_runtime_native_turn_id_for_event(&event).unwrap_or("<none>");
+        let native_turn_id = cli_runtime_native_turn_id_for_event(&event);
+        let native_turn_id_label = native_turn_id.unwrap_or("<none>");
         let native_thread_id = cli_runtime_native_thread_id_for_event(&event);
         let event_label = cli_runtime_event_log_label(&event);
         if !self
@@ -2478,7 +2479,7 @@ impl MessageProcessor {
                 runtime_id = key.runtime_id.as_str(),
                 thread_id = key.thread_id.as_str(),
                 turn_id = turn_binding.turn_id.as_str(),
-                native_turn_id,
+                native_turn_id = native_turn_id_label,
                 event = %event_label,
                 binding_status = turn_binding.status.as_str(),
                 "ignored CLI runtime event for non-active Pioneer turn"
@@ -2491,8 +2492,17 @@ impl MessageProcessor {
             turn_id: turn_binding.turn_id.clone(),
         };
         let projected = crate::cli_runtime::projector::project_cli_runtime_event(&context, &event);
+        if cli_runtime_turn_status_for_terminal_event(&event).is_some()
+            && let Some(native_turn_id) = native_turn_id
+        {
+            self.commit_cli_runtime_final_diff_snapshot(key, &turn_binding, native_turn_id)
+                .await;
+        }
         for durable in projected.durable {
             self.handle_durable_agent_event(durable).await;
+        }
+        for snapshot in projected.snapshot {
+            self.handle_snapshot_agent_event(snapshot).await;
         }
         for progress in projected.progress {
             self.handle_progress_agent_event(progress).await;
@@ -2506,6 +2516,75 @@ impl MessageProcessor {
                 event_label.as_str(),
             )
             .await;
+        }
+    }
+
+    async fn commit_cli_runtime_final_diff_snapshot(
+        &self,
+        key: &CLIAgentRuntimeSessionKey,
+        turn_binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+        native_turn_id: &str,
+    ) {
+        let item_id =
+            crate::cli_runtime::projector::agent_diff_item_id_for_native_turn_id(native_turn_id);
+        let item = match self
+            .crud_store
+            .get_turn_item(turn_binding.turn_id.as_str(), item_id.as_str())
+            .await
+        {
+            Ok(Some(item)) => item,
+            Ok(None) => return,
+            Err(error) => {
+                warn!(
+                    workspace_id = key.workspace_id.as_str(),
+                    runtime_id = key.runtime_id.as_str(),
+                    thread_id = key.thread_id.as_str(),
+                    turn_id = turn_binding.turn_id.as_str(),
+                    item_id = item_id.as_str(),
+                    error = %format!("{error:#}"),
+                    "failed to load CLI runtime final diff snapshot item"
+                );
+                return;
+            }
+        };
+
+        let event_timestamp = now_timestamp_secs();
+        match message_future(
+            self.crud_store
+                .materialize_agent_diff_final_snapshot_if_changed(
+                    ItemCompletedNotification {
+                        workspace_id: key.workspace_id.clone(),
+                        thread_id: key.thread_id.clone(),
+                        turn_id: turn_binding.turn_id.clone(),
+                        item,
+                    },
+                    event_timestamp,
+                ),
+        )
+        .await
+        {
+            Ok(true) => {
+                debug!(
+                    workspace_id = key.workspace_id.as_str(),
+                    runtime_id = key.runtime_id.as_str(),
+                    thread_id = key.thread_id.as_str(),
+                    turn_id = turn_binding.turn_id.as_str(),
+                    item_id = item_id.as_str(),
+                    "committed final CLI runtime diff snapshot"
+                );
+            }
+            Ok(false) => {}
+            Err(error) => {
+                warn!(
+                    workspace_id = key.workspace_id.as_str(),
+                    runtime_id = key.runtime_id.as_str(),
+                    thread_id = key.thread_id.as_str(),
+                    turn_id = turn_binding.turn_id.as_str(),
+                    item_id = item_id.as_str(),
+                    error = %format!("{error:#}"),
+                    "failed to commit final CLI runtime diff snapshot"
+                );
+            }
         }
     }
 

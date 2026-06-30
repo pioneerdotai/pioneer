@@ -31,10 +31,10 @@ use pioneer_protocol::{
 };
 use pioneer_sqlite::{SqliteWriteCoordinator, is_anyhow_sqlite_lock};
 use sea_orm::{
-    ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect, TransactionTrait,
+    ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, DatabaseConnection, DbErr,
+    EntityTrait, QueryFilter, QueryOrder, QuerySelect, Statement, TransactionTrait,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 
 use crate::convention::{
@@ -192,6 +192,34 @@ pub struct TaskRuntimeInvariantStaleAttemptRecord {
     pub attempt_id: String,
     pub attempt_status: String,
     pub attempt_number: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TurnEventCompactionSummary {
+    pub dry_run: bool,
+    pub batch_limit: u64,
+    pub candidate_rows: u64,
+    pub deleted_rows: u64,
+    pub payload_bytes: u64,
+    pub turns_touched: u64,
+    pub latest_snapshots_kept: u64,
+    pub skipped_unprojected: u64,
+    pub skipped_failed: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentDiffCompactionCandidate {
+    event_id: String,
+    turn_id: String,
+    item_id: String,
+    payload_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AgentDiffCompactionStats {
+    latest_snapshots_kept: u64,
+    skipped_unprojected: u64,
+    skipped_failed: u64,
 }
 
 pub use crate::repositories::artifact::{
@@ -4205,6 +4233,36 @@ impl CrudStore {
         .await
     }
 
+    pub async fn materialize_agent_diff_final_snapshot_if_changed(
+        &self,
+        notification: pioneer_protocol::ItemCompletedNotification,
+        event_timestamp_secs: i64,
+    ) -> Result<bool> {
+        if !is_agent_diff_updated_item(&notification.item) {
+            anyhow::bail!(
+                "final diff snapshot expected agent_diff_updated item, got `{}`",
+                notification.item.item_id()
+            );
+        }
+
+        let item_payload_json = serde_json::to_string(&notification.item)
+            .context("failed to serialize final agent diff snapshot payload")?;
+        let latest_raw_payload = latest_agent_diff_raw_payload_for_item(
+            &self.connection,
+            notification.thread_id.as_str(),
+            notification.turn_id.as_str(),
+            notification.item.item_id(),
+        )
+        .await?;
+        if latest_raw_payload.as_deref() == Some(item_payload_json.as_str()) {
+            return Ok(false);
+        }
+
+        self.materialize_item_completed(notification, event_timestamp_secs)
+            .await?;
+        Ok(true)
+    }
+
     pub async fn materialize_item_updated(
         &self,
         notification: pioneer_protocol::ItemUpdatedNotification,
@@ -4214,6 +4272,99 @@ impl CrudStore {
             TurnEventPayload::ItemUpdated(notification),
             event_timestamp_secs,
         )
+        .await
+    }
+
+    pub async fn materialize_item_snapshot_updated(
+        &self,
+        notification: pioneer_protocol::ItemUpdatedNotification,
+        event_timestamp_secs: i64,
+    ) -> Result<()> {
+        let updated_at = unix_to_datetime(event_timestamp_secs);
+        self.run_serialized_write(|| {
+            let notification = notification.clone();
+            let connection = self.connection.clone();
+            async move {
+                let transaction = connection
+                    .begin()
+                    .await
+                    .context("failed to begin item snapshot update transaction")?;
+
+                let result: Result<()> = async {
+                    let Some(_turn_model) = turn::find_turn_by_thread_and_id(
+                        &transaction,
+                        notification.thread_id.as_str(),
+                        notification.turn_id.as_str(),
+                    )
+                    .await?
+                    else {
+                        anyhow::bail!(
+                            "item snapshot update cannot find turn `{}` in thread `{}`",
+                            notification.turn_id,
+                            notification.thread_id
+                        );
+                    };
+                    let Some(thread_model) =
+                        thread::find_thread_by_id(&transaction, notification.thread_id.as_str())
+                            .await?
+                    else {
+                        anyhow::bail!(
+                            "item snapshot update cannot find thread `{}`",
+                            notification.thread_id
+                        );
+                    };
+                    if thread_model.workspace_id != notification.workspace_id {
+                        anyhow::bail!(
+                            "item snapshot update workspace mismatch for thread `{}`: expected `{}`, got `{}`",
+                            notification.thread_id,
+                            thread_model.workspace_id,
+                            notification.workspace_id
+                        );
+                    }
+
+                    let source_sequence = turn_event::latest_event_for_turn(
+                        &transaction,
+                        notification.turn_id.as_str(),
+                    )
+                    .await?
+                    .map(|event| event.sequence)
+                    .unwrap_or(0);
+                    let status =
+                        crate::turn_item_terminal::terminal_turn_item_status_from_payload(
+                            &notification.item,
+                        );
+                    turn::upsert_turn_item(
+                        &transaction,
+                        notification.turn_id.as_str(),
+                        &notification.item,
+                        Some(status),
+                        updated_at,
+                        updated_at,
+                    )
+                    .await?;
+                    crate::timeline_live_projection::project_semantic_timeline_snapshot_turn_item(
+                        &transaction,
+                        notification.turn_id.as_str(),
+                        notification.item.item_id(),
+                        source_sequence,
+                        updated_at,
+                    )
+                    .await
+                }
+                .await;
+
+                match result {
+                    Ok(()) => transaction
+                        .commit()
+                        .await
+                        .context("failed to commit item snapshot update transaction"),
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        Err(error)
+                    }
+                }
+            }
+        })
         .await
     }
 
@@ -6213,18 +6364,9 @@ impl CrudStore {
         let events_rows =
             turn_event::list_events_for_turn(&self.connection, thread_id, turn_id).await?;
 
-        if events_rows.is_empty() {
-            return Ok(Some(TurnItemsResponse {
-                thread_id: thread_id.to_owned(),
-                workspace_id,
-                turn_id: turn_id.to_owned(),
-                events: Vec::new(),
-                last_sequence: 0,
-            }));
-        }
-
         let mut events = Vec::new();
         let mut last_sequence = 0i64;
+        let mut latest_agent_diff_payload_by_item_id = HashMap::<String, String>::new();
 
         for row in events_rows {
             last_sequence = row.sequence;
@@ -6240,6 +6382,10 @@ impl CrudStore {
                     item: notification.item,
                 },
                 TurnEventPayload::ItemCompleted(notification) => {
+                    remember_agent_diff_snapshot_payload(
+                        &mut latest_agent_diff_payload_by_item_id,
+                        &notification.item,
+                    )?;
                     TurnItemEventPayload::ItemCompleted {
                         workspace_id: workspace_id.clone(),
                         thread_id: notification.thread_id,
@@ -6247,12 +6393,18 @@ impl CrudStore {
                         item: notification.item,
                     }
                 }
-                TurnEventPayload::ItemUpdated(notification) => TurnItemEventPayload::ItemUpdated {
-                    workspace_id: workspace_id.clone(),
-                    thread_id: notification.thread_id,
-                    turn_id: notification.turn_id,
-                    item: notification.item,
-                },
+                TurnEventPayload::ItemUpdated(notification) => {
+                    remember_agent_diff_snapshot_payload(
+                        &mut latest_agent_diff_payload_by_item_id,
+                        &notification.item,
+                    )?;
+                    TurnItemEventPayload::ItemUpdated {
+                        workspace_id: workspace_id.clone(),
+                        thread_id: notification.thread_id,
+                        turn_id: notification.turn_id,
+                        item: notification.item,
+                    }
+                }
                 TurnEventPayload::ItemTimeoutDetected(notification) => {
                     TurnItemEventPayload::ItemTimeoutDetected {
                         workspace_id: workspace_id.clone(),
@@ -6434,6 +6586,17 @@ impl CrudStore {
             });
         }
 
+        append_agent_diff_snapshot_turn_item_events(
+            &self.connection,
+            &mut events,
+            &latest_agent_diff_payload_by_item_id,
+            workspace_id.as_str(),
+            thread_id,
+            turn_id,
+            last_sequence,
+        )
+        .await?;
+
         Ok(Some(TurnItemsResponse {
             thread_id: thread_id.to_owned(),
             workspace_id,
@@ -6441,6 +6604,216 @@ impl CrudStore {
             events,
             last_sequence,
         }))
+    }
+
+    pub async fn compact_superseded_agent_diff_turn_events(
+        &self,
+        batch_limit: u64,
+        dry_run: bool,
+    ) -> Result<TurnEventCompactionSummary> {
+        let batch_limit = batch_limit.max(1);
+        let stats = self.agent_diff_turn_event_compaction_stats().await?;
+        let candidates = self
+            .superseded_agent_diff_turn_event_candidates(batch_limit)
+            .await?;
+        let turns_touched = candidates
+            .iter()
+            .map(|candidate| candidate.turn_id.as_str())
+            .collect::<HashSet<_>>()
+            .len() as u64;
+        let mut summary = TurnEventCompactionSummary {
+            dry_run,
+            batch_limit,
+            candidate_rows: candidates.len() as u64,
+            deleted_rows: 0,
+            payload_bytes: candidates
+                .iter()
+                .map(|candidate| candidate.payload_bytes)
+                .sum(),
+            turns_touched,
+            latest_snapshots_kept: stats.latest_snapshots_kept,
+            skipped_unprojected: stats.skipped_unprojected,
+            skipped_failed: stats.skipped_failed,
+        };
+
+        if dry_run || candidates.is_empty() {
+            return Ok(summary);
+        }
+
+        let deleted_rows = self
+            .run_serialized_write(|| {
+                let candidates = candidates.clone();
+                let connection = self.connection.clone();
+                async move {
+                    let transaction = connection
+                        .begin()
+                        .await
+                        .context("failed to begin turn_event compaction transaction")?;
+
+                    let result: Result<u64> = async {
+                        let mut deleted_rows = 0u64;
+                        for candidate in candidates {
+                            turn_event_projection_state::delete_by_event_id(
+                                &transaction,
+                                candidate.event_id.as_str(),
+                            )
+                            .await?;
+                            deleted_rows = deleted_rows.saturating_add(
+                                turn_event::delete_event_by_id(
+                                    &transaction,
+                                    candidate.event_id.as_str(),
+                                )
+                                .await?,
+                            );
+                        }
+                        Ok(deleted_rows)
+                    }
+                    .await;
+
+                    match result {
+                        Ok(deleted_rows) => {
+                            transaction
+                                .commit()
+                                .await
+                                .context("failed to commit turn_event compaction transaction")?;
+                            Ok(deleted_rows)
+                        }
+                        Err(error) => {
+                            let _ = transaction.rollback().await;
+                            Err(error)
+                        }
+                    }
+                }
+            })
+            .await?;
+
+        summary.deleted_rows = deleted_rows;
+        Ok(summary)
+    }
+
+    async fn superseded_agent_diff_turn_event_candidates(
+        &self,
+        batch_limit: u64,
+    ) -> Result<Vec<AgentDiffCompactionCandidate>> {
+        let rows = self
+            .connection
+            .query_all_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                r#"
+WITH ranked_diff_events AS (
+    SELECT
+        e.id AS event_id,
+        e.turn_id AS turn_id,
+        e.sequence AS sequence,
+        json_extract(e.payload, '$.payload.item.id') AS item_id,
+        length(e.payload) AS payload_bytes,
+        COALESCE(ps.status, 'missing') AS projection_status,
+        ROW_NUMBER() OVER (
+            PARTITION BY e.turn_id, json_extract(e.payload, '$.payload.item.id')
+            ORDER BY e.sequence DESC, e.id DESC
+        ) AS row_rank
+    FROM turn_event e
+    LEFT JOIN turn_event_projection_state ps ON ps.event_id = e.id
+    WHERE json_extract(e.payload, '$.kind') = 'item_completed'
+      AND json_extract(e.payload, '$.payload.item.type') = 'systemEvent'
+      AND json_extract(e.payload, '$.payload.item.code') = 'agent_diff_updated'
+      AND json_extract(e.payload, '$.payload.item.id') IS NOT NULL
+)
+SELECT event_id, turn_id, item_id, payload_bytes
+FROM ranked_diff_events
+WHERE row_rank > 1
+  AND projection_status = 'projected'
+ORDER BY turn_id ASC, sequence ASC
+LIMIT ?
+"#,
+                [batch_limit.into()],
+            ))
+            .await
+            .context("failed to query superseded agent diff turn events")?;
+
+        rows.into_iter()
+            .map(|row| {
+                let event_id = row
+                    .try_get::<String>("", "event_id")
+                    .context("failed to decode compactable turn_event id")?;
+                let turn_id = row
+                    .try_get::<String>("", "turn_id")
+                    .context("failed to decode compactable turn_event turn id")?;
+                let item_id = row
+                    .try_get::<String>("", "item_id")
+                    .context("failed to decode compactable turn_event item id")?;
+                let payload_bytes = row
+                    .try_get::<i64>("", "payload_bytes")
+                    .context("failed to decode compactable turn_event payload size")?
+                    .max(0) as u64;
+                Ok(AgentDiffCompactionCandidate {
+                    event_id,
+                    turn_id,
+                    item_id,
+                    payload_bytes,
+                })
+            })
+            .collect()
+    }
+
+    async fn agent_diff_turn_event_compaction_stats(&self) -> Result<AgentDiffCompactionStats> {
+        let Some(row) = self
+            .connection
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                r#"
+WITH ranked_diff_events AS (
+    SELECT
+        e.id AS event_id,
+        e.turn_id AS turn_id,
+        e.sequence AS sequence,
+        json_extract(e.payload, '$.payload.item.id') AS item_id,
+        COALESCE(ps.status, 'missing') AS projection_status,
+        ROW_NUMBER() OVER (
+            PARTITION BY e.turn_id, json_extract(e.payload, '$.payload.item.id')
+            ORDER BY e.sequence DESC, e.id DESC
+        ) AS row_rank
+    FROM turn_event e
+    LEFT JOIN turn_event_projection_state ps ON ps.event_id = e.id
+    WHERE json_extract(e.payload, '$.kind') = 'item_completed'
+      AND json_extract(e.payload, '$.payload.item.type') = 'systemEvent'
+      AND json_extract(e.payload, '$.payload.item.code') = 'agent_diff_updated'
+      AND json_extract(e.payload, '$.payload.item.id') IS NOT NULL
+)
+SELECT
+    COALESCE(SUM(CASE WHEN row_rank = 1 THEN 1 ELSE 0 END), 0) AS latest_snapshots_kept,
+    COALESCE(SUM(CASE
+        WHEN row_rank > 1
+         AND projection_status IN ('pending', 'projecting', 'missing')
+        THEN 1 ELSE 0 END), 0) AS skipped_unprojected,
+    COALESCE(SUM(CASE
+        WHEN row_rank > 1
+         AND projection_status IN ('failed', 'exhausted')
+        THEN 1 ELSE 0 END), 0) AS skipped_failed
+FROM ranked_diff_events
+"#
+                .to_owned(),
+            ))
+            .await
+            .context("failed to query agent diff compaction stats")?
+        else {
+            return Ok(AgentDiffCompactionStats::default());
+        };
+
+        Ok(AgentDiffCompactionStats {
+            latest_snapshots_kept: row
+                .try_get::<i64>("", "latest_snapshots_kept")
+                .context("failed to decode latest agent diff snapshots kept")?
+                .max(0) as u64,
+            skipped_unprojected: row
+                .try_get::<i64>("", "skipped_unprojected")
+                .context("failed to decode skipped unprojected agent diff snapshots")?
+                .max(0) as u64,
+            skipped_failed: row
+                .try_get::<i64>("", "skipped_failed")
+                .context("failed to decode skipped failed agent diff snapshots")?
+                .max(0) as u64,
+        })
     }
 
     pub async fn get_thread_conversation_history(
@@ -10028,6 +10401,104 @@ fn deserialize_turn_event_projection_context(
     })
 }
 
+fn remember_agent_diff_snapshot_payload(
+    latest_agent_diff_payload_by_item_id: &mut HashMap<String, String>,
+    item: &TurnItem,
+) -> Result<()> {
+    if !is_agent_diff_updated_item(item) {
+        return Ok(());
+    }
+
+    let payload_json =
+        serde_json::to_string(item).context("failed to serialize agent diff turn item payload")?;
+    latest_agent_diff_payload_by_item_id.insert(item.item_id().to_owned(), payload_json);
+    Ok(())
+}
+
+async fn latest_agent_diff_raw_payload_for_item<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    turn_id: &str,
+    item_id: &str,
+) -> Result<Option<String>> {
+    let rows = turn_event::list_events_for_turn(db, thread_id, turn_id).await?;
+    let mut latest_payload = None;
+
+    for row in rows {
+        let payload = serde_json::from_str::<TurnEventPayload>(row.payload.as_str())
+            .with_context(|| format!("failed to decode turn_event payload `{}`", row.id))?;
+        let item = match payload {
+            TurnEventPayload::ItemCompleted(notification) => notification.item,
+            TurnEventPayload::ItemUpdated(notification) => notification.item,
+            _ => continue,
+        };
+        if item.item_id() != item_id || !is_agent_diff_updated_item(&item) {
+            continue;
+        }
+        latest_payload = Some(
+            serde_json::to_string(&item)
+                .context("failed to serialize raw agent diff turn item payload")?,
+        );
+    }
+
+    Ok(latest_payload)
+}
+
+async fn append_agent_diff_snapshot_turn_item_events<C: ConnectionTrait>(
+    db: &C,
+    events: &mut Vec<TurnItemEvent>,
+    latest_agent_diff_payload_by_item_id: &HashMap<String, String>,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    last_sequence: i64,
+) -> Result<()> {
+    let rows = turn::list_turn_items_by_type(db, turn_id, "system_event").await?;
+    for row in rows {
+        let item = serde_json::from_str::<TurnItem>(row.payload.as_str()).with_context(|| {
+            format!(
+                "failed to decode snapshot turn_item payload for turn `{turn_id}` item `{}`",
+                row.item_id
+            )
+        })?;
+        if !is_agent_diff_updated_item(&item) {
+            continue;
+        }
+
+        let payload_json = serde_json::to_string(&item)
+            .context("failed to serialize snapshot agent diff turn item payload")?;
+        if latest_agent_diff_payload_by_item_id
+            .get(item.item_id())
+            .is_some_and(|latest_payload| latest_payload == &payload_json)
+        {
+            continue;
+        }
+
+        events.push(TurnItemEvent {
+            sequence: last_sequence,
+            created_at: row.updated_at.timestamp_millis(),
+            payload: TurnItemEventPayload::ItemUpdated {
+                workspace_id: workspace_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                item,
+            },
+        });
+    }
+
+    Ok(())
+}
+
+fn is_agent_diff_updated_item(item: &TurnItem) -> bool {
+    matches!(
+        item,
+        TurnItem::SystemEvent {
+            code: Some(code),
+            ..
+        } if code == "agent_diff_updated"
+    )
+}
+
 fn memory_event_for_record(
     event: Option<NewAgentMemoryEvent>,
     memory_id: String,
@@ -11022,17 +11493,18 @@ mod tests {
         ItemRecoverySucceededNotification, ItemRetryAttemptStartedNotification,
         ItemRetryScheduledNotification, ItemStartedNotification, ItemTimeoutDetectedNotification,
         ItemToolRetryExhaustedNotification, ItemToolRetryResolvedNotification,
-        ItemToolRetryScheduledNotification, PermissionBehavior, PromptManifest,
-        PromptManifestDiagnostic, PromptManifestDiagnosticCode, PromptManifestHookContributionKind,
-        PromptManifestHookPhase, PromptManifestHookSource, PromptManifestHookSourceEntry,
-        PromptManifestHookTruncation, PromptManifestProfile, RecoveryAction, RecoveryJobStatus,
-        RecoveryTrigger, SandboxMode, Task, TaskAgentPrompt, TaskAgentResultContract,
-        TaskAgentResultFormat, TaskAgentSpec, TaskExecutorKind, TaskMetadata, TaskOwnerKind,
-        TaskResult, TaskResultCandidate, TaskResultCandidateStatus, TaskResultReviewDecision,
-        TaskResultReviewEvent, TaskResultReviewEventKind, TaskResultReviewerKind, TaskRun,
-        TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind,
-        TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskSchema, TaskStatus, TaskTrigger,
-        TaskTriggerSpec, TaskTriggerStatus, TaskValue, Thread, ThreadEpisodicSourceContext,
+        ItemToolRetryScheduledNotification, ItemUpdatedNotification, PermissionBehavior,
+        PromptManifest, PromptManifestDiagnostic, PromptManifestDiagnosticCode,
+        PromptManifestHookContributionKind, PromptManifestHookPhase, PromptManifestHookSource,
+        PromptManifestHookSourceEntry, PromptManifestHookTruncation, PromptManifestProfile,
+        RecoveryAction, RecoveryJobStatus, RecoveryTrigger, SandboxMode, SystemEventLevel, Task,
+        TaskAgentPrompt, TaskAgentResultContract, TaskAgentResultFormat, TaskAgentSpec,
+        TaskExecutorKind, TaskMetadata, TaskOwnerKind, TaskResult, TaskResultCandidate,
+        TaskResultCandidateStatus, TaskResultReviewDecision, TaskResultReviewEvent,
+        TaskResultReviewEventKind, TaskResultReviewerKind, TaskRun, TaskRunExecutionStatus,
+        TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn,
+        TaskRunTurnKind, TaskRunTurnStatus, TaskSchema, TaskStatus, TaskTrigger, TaskTriggerSpec,
+        TaskTriggerStatus, TaskValue, Thread, ThreadEpisodicSourceContext,
         ThreadHistoryEventPayload, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility,
         ThreadStatus, ToolCallStatus, ToolDisplayPayload, ToolLoopBudgetAction,
         ToolLoopBudgetLimitKind, ToolMetadata, ToolOutputPolicySnapshot,
@@ -13619,6 +14091,428 @@ mod tests {
             outcome: None,
             observation: None,
         }
+    }
+
+    #[tokio::test]
+    async fn item_snapshot_update_does_not_append_turn_event_but_surfaces_in_turn_items() {
+        let workspace_id = "ws_diff_snapshot";
+        let thread_id = "thr_diff_snapshot";
+        let turn_id = "turn_diff_snapshot";
+        let timestamp = 1_700_000_000;
+        let store = test_store_with_workspace(workspace_id).await;
+        let thread = Thread {
+            workspace_id: workspace_id.to_owned(),
+            id: thread_id.to_owned(),
+            name: None,
+            preview: String::new(),
+            mode: ThreadMode::Agent,
+            model: "gpt-5.4".to_owned(),
+            model_provider: "openai".to_owned(),
+            reasoning_effort: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+            status: ThreadStatus::Active,
+            origin_kind: ThreadOriginKind::User,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            turns: Vec::new(),
+        };
+        let turn = Turn {
+            id: turn_id.to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
+            error: None,
+            prompt_manifest: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+        };
+        store
+            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+            .await
+            .expect("turn start should persist");
+
+        let first_diff = TurnItem::SystemEvent {
+            id: "agent_diff_native_turn".to_owned(),
+            level: SystemEventLevel::Info,
+            message: "Diff updated".to_owned(),
+            code: Some("agent_diff_updated".to_owned()),
+            details: Some(serde_json::json!({"payload": "first diff"})),
+        };
+        store
+            .materialize_item_snapshot_updated(
+                ItemUpdatedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: first_diff,
+                },
+                timestamp + 1,
+            )
+            .await
+            .expect("first snapshot should persist");
+
+        let second_diff = TurnItem::SystemEvent {
+            id: "agent_diff_native_turn".to_owned(),
+            level: SystemEventLevel::Info,
+            message: "Diff updated".to_owned(),
+            code: Some("agent_diff_updated".to_owned()),
+            details: Some(serde_json::json!({"payload": "second diff"})),
+        };
+        store
+            .materialize_item_snapshot_updated(
+                ItemUpdatedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: second_diff,
+                },
+                timestamp + 2,
+            )
+            .await
+            .expect("second snapshot should persist");
+
+        let raw_events = pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn_id.to_owned()))
+            .all(&store.connection)
+            .await
+            .expect("raw events should query");
+        assert_eq!(
+            raw_events.len(),
+            1,
+            "snapshot updates must not append extra turn_event rows"
+        );
+
+        let response = store
+            .get_turn_item_events(thread_id, turn_id)
+            .await
+            .expect("turn items should load")
+            .expect("turn should exist");
+        assert_eq!(response.events.len(), 1);
+        let TurnItemEventPayload::ItemUpdated { item, .. } = &response.events[0].payload else {
+            panic!("snapshot should surface as item/updated");
+        };
+        let TurnItem::SystemEvent { details, .. } = item else {
+            panic!("snapshot should be a system event");
+        };
+        assert_eq!(
+            details.as_ref().and_then(|details| details.get("payload")),
+            Some(&serde_json::json!("second diff"))
+        );
+        assert_eq!(response.last_sequence, raw_events[0].sequence);
+
+        let current_diff = store
+            .get_turn_item(turn_id, "agent_diff_native_turn")
+            .await
+            .expect("current diff should load")
+            .expect("current diff should exist");
+        let committed = store
+            .materialize_agent_diff_final_snapshot_if_changed(
+                ItemCompletedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: current_diff.clone(),
+                },
+                timestamp + 3,
+            )
+            .await
+            .expect("final diff snapshot should persist");
+        assert!(committed, "first final snapshot should append raw event");
+        let skipped = store
+            .materialize_agent_diff_final_snapshot_if_changed(
+                ItemCompletedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: current_diff,
+                },
+                timestamp + 4,
+            )
+            .await
+            .expect("duplicate final diff snapshot should compare payload");
+        assert!(!skipped, "unchanged final snapshot should be skipped");
+
+        let raw_events = pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn_id.to_owned()))
+            .all(&store.connection)
+            .await
+            .expect("raw events should query after final snapshot");
+        assert_eq!(
+            raw_events.len(),
+            2,
+            "turn/start plus one final diff snapshot should remain"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_superseded_agent_diff_events_removes_only_old_projected_snapshots() {
+        let workspace_id = "ws_diff_compaction";
+        let thread_id = "thr_diff_compaction";
+        let turn_id = "turn_diff_compaction";
+        let timestamp = 1_700_000_000;
+        let store = test_store_with_workspace(workspace_id).await;
+        let thread = Thread {
+            workspace_id: workspace_id.to_owned(),
+            id: thread_id.to_owned(),
+            name: None,
+            preview: String::new(),
+            mode: ThreadMode::Agent,
+            model: "gpt-5.4".to_owned(),
+            model_provider: "openai".to_owned(),
+            reasoning_effort: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+            status: ThreadStatus::Active,
+            origin_kind: ThreadOriginKind::User,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            turns: Vec::new(),
+        };
+        let turn = Turn {
+            id: turn_id.to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
+            error: None,
+            prompt_manifest: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+        };
+        store
+            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+            .await
+            .expect("turn start should persist");
+
+        for (index, payload) in ["first diff", "second diff", "third diff"]
+            .into_iter()
+            .enumerate()
+        {
+            store
+                .materialize_item_completed(
+                    ItemCompletedNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item: TurnItem::SystemEvent {
+                            id: "agent_diff_native_turn".to_owned(),
+                            level: SystemEventLevel::Info,
+                            message: "Diff updated".to_owned(),
+                            code: Some("agent_diff_updated".to_owned()),
+                            details: Some(serde_json::json!({"payload": payload})),
+                        },
+                    },
+                    timestamp + 1 + index as i64,
+                )
+                .await
+                .expect("historical diff event should persist");
+        }
+
+        let dry_run = store
+            .compact_superseded_agent_diff_turn_events(100, true)
+            .await
+            .expect("dry run should succeed");
+        assert_eq!(dry_run.candidate_rows, 2);
+        assert_eq!(dry_run.deleted_rows, 0);
+        assert!(dry_run.payload_bytes > 0);
+        assert_eq!(dry_run.latest_snapshots_kept, 1);
+        assert_eq!(dry_run.skipped_unprojected, 0);
+        assert_eq!(dry_run.skipped_failed, 0);
+
+        let compacted = store
+            .compact_superseded_agent_diff_turn_events(100, false)
+            .await
+            .expect("compaction should succeed");
+        assert_eq!(compacted.candidate_rows, 2);
+        assert_eq!(compacted.deleted_rows, 2);
+        assert_eq!(compacted.latest_snapshots_kept, 1);
+
+        let raw_events = pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn_id.to_owned()))
+            .order_by_asc(pioneer_entity::turn_event::Column::Sequence)
+            .all(&store.connection)
+            .await
+            .expect("raw events should query");
+        assert_eq!(
+            raw_events.len(),
+            2,
+            "turn/start and the latest diff event should remain"
+        );
+
+        let response = store
+            .get_turn_item_events(thread_id, turn_id)
+            .await
+            .expect("turn items should load")
+            .expect("turn should exist");
+        assert_eq!(response.events.len(), 1);
+        let TurnItemEventPayload::ItemCompleted { item, .. } = &response.events[0].payload else {
+            panic!("latest historical diff should remain durable");
+        };
+        let TurnItem::SystemEvent { details, .. } = item else {
+            panic!("latest diff should be a system event");
+        };
+        assert_eq!(
+            details.as_ref().and_then(|details| details.get("payload")),
+            Some(&serde_json::json!("third diff"))
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_agent_diff_summary_counts_skipped_projection_states() {
+        let workspace_id = "ws_diff_compaction_skips";
+        let thread_id = "thr_diff_compaction_skips";
+        let turn_id = "turn_diff_compaction_skips";
+        let timestamp = 1_700_000_000;
+        let store = test_store_with_workspace(workspace_id).await;
+        let thread = Thread {
+            workspace_id: workspace_id.to_owned(),
+            id: thread_id.to_owned(),
+            name: None,
+            preview: String::new(),
+            mode: ThreadMode::Agent,
+            model: "gpt-5.4".to_owned(),
+            model_provider: "openai".to_owned(),
+            reasoning_effort: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+            status: ThreadStatus::Active,
+            origin_kind: ThreadOriginKind::User,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            turns: Vec::new(),
+        };
+        let turn = Turn {
+            id: turn_id.to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
+            error: None,
+            prompt_manifest: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+        };
+        store
+            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+            .await
+            .expect("turn start should persist");
+
+        for (index, payload) in [
+            "failed old diff",
+            "pending old diff",
+            "projected old diff",
+            "latest diff",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            store
+                .materialize_item_completed(
+                    ItemCompletedNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item: TurnItem::SystemEvent {
+                            id: "agent_diff_native_turn".to_owned(),
+                            level: SystemEventLevel::Info,
+                            message: "Diff updated".to_owned(),
+                            code: Some("agent_diff_updated".to_owned()),
+                            details: Some(serde_json::json!({"payload": payload})),
+                        },
+                    },
+                    timestamp + 1 + index as i64,
+                )
+                .await
+                .expect("historical diff event should persist");
+        }
+
+        let raw_events = pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn_id.to_owned()))
+            .order_by_asc(pioneer_entity::turn_event::Column::Sequence)
+            .all(&store.connection)
+            .await
+            .expect("raw events should query");
+        assert_eq!(raw_events.len(), 5);
+
+        for (event, status) in [
+            (
+                &raw_events[1],
+                crate::repositories::turn_event_projection_state::PROJECTION_STATUS_FAILED,
+            ),
+            (
+                &raw_events[2],
+                crate::repositories::turn_event_projection_state::PROJECTION_STATUS_PENDING,
+            ),
+        ] {
+            pioneer_entity::turn_event_projection_state::Entity::update_many()
+                .col_expr(
+                    pioneer_entity::turn_event_projection_state::Column::Status,
+                    sea_orm::sea_query::Expr::value(status.to_owned()),
+                )
+                .filter(
+                    pioneer_entity::turn_event_projection_state::Column::EventId
+                        .eq(event.id.clone()),
+                )
+                .exec(&store.connection)
+                .await
+                .expect("projection state status should update");
+        }
+
+        let dry_run = store
+            .compact_superseded_agent_diff_turn_events(100, true)
+            .await
+            .expect("dry run should succeed");
+        assert_eq!(dry_run.candidate_rows, 1);
+        assert_eq!(dry_run.deleted_rows, 0);
+        assert_eq!(dry_run.latest_snapshots_kept, 1);
+        assert_eq!(dry_run.skipped_unprojected, 1);
+        assert_eq!(dry_run.skipped_failed, 1);
+
+        let compacted = store
+            .compact_superseded_agent_diff_turn_events(100, false)
+            .await
+            .expect("compaction should succeed");
+        assert_eq!(compacted.candidate_rows, 1);
+        assert_eq!(compacted.deleted_rows, 1);
+        assert_eq!(compacted.skipped_unprojected, 1);
+        assert_eq!(compacted.skipped_failed, 1);
+
+        let remaining_events = pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn_id.to_owned()))
+            .order_by_asc(pioneer_entity::turn_event::Column::Sequence)
+            .all(&store.connection)
+            .await
+            .expect("remaining raw events should query");
+        let sequences = remaining_events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sequences,
+            vec![1, 2, 3, 5],
+            "compaction must leave sequence gaps instead of renumbering"
+        );
+
+        let response = store
+            .get_turn_item_events(thread_id, turn_id)
+            .await
+            .expect("turn items should load")
+            .expect("turn should exist");
+        assert_eq!(response.events.len(), 3);
+        let TurnItemEventPayload::ItemCompleted { item, .. } = &response
+            .events
+            .last()
+            .expect("latest event should exist")
+            .payload
+        else {
+            panic!("latest raw snapshot should remain durable");
+        };
+        let TurnItem::SystemEvent { details, .. } = item else {
+            panic!("latest diff should be a system event");
+        };
+        assert_eq!(
+            details.as_ref().and_then(|details| details.get("payload")),
+            Some(&serde_json::json!("latest diff"))
+        );
     }
 
     #[tokio::test]

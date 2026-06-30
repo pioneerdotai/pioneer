@@ -783,6 +783,54 @@ impl MessageProcessor {
         }
     }
 
+    pub(super) async fn handle_snapshot_agent_event(
+        &self,
+        event: crate::cli_runtime::projector::AgentSnapshotEvent,
+    ) {
+        match event {
+            crate::cli_runtime::projector::AgentSnapshotEvent::ItemUpdated { notification } => {
+                let thread_id = notification.thread_id.clone();
+                let turn_id = notification.turn_id.clone();
+                let event_timestamp = now_timestamp_secs();
+                if let Err(error) = message_future(
+                    self.crud_store
+                        .materialize_item_snapshot_updated(notification.clone(), event_timestamp),
+                )
+                .await
+                {
+                    self.report_legacy_turn_failure(
+                        thread_id,
+                        turn_id,
+                        format!("failed to persist item snapshot update: {error:#}"),
+                    )
+                    .await;
+                    return;
+                }
+
+                self.send_notification_to_thread_subscribers(
+                    notification.thread_id.as_str(),
+                    events::ITEM_UPDATED,
+                    &notification,
+                )
+                .await;
+                self.notify_semantic_timeline_item_changed(
+                    notification.workspace_id.as_str(),
+                    notification.thread_id.as_str(),
+                    notification.turn_id.as_str(),
+                    &notification.item,
+                    None,
+                )
+                .await;
+                self.notify_parent_timeline_changed_for_child_turn(
+                    notification.thread_id.as_str(),
+                    notification.turn_id.as_str(),
+                    Some(notification.workspace_id.as_str()),
+                )
+                .await;
+            }
+        }
+    }
+
     async fn ingest_committed_thread_item(
         &self,
         notification: &pioneer_protocol::ItemCompletedNotification,

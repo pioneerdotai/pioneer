@@ -89,6 +89,14 @@ pub async fn find_event_by_id<C: ConnectionTrait>(
         .transpose()
 }
 
+pub async fn delete_event_by_id<C: ConnectionTrait>(db: &C, event_id: &str) -> Result<u64> {
+    turn_event::Entity::delete_by_id(event_id.to_owned())
+        .exec(db)
+        .await
+        .with_context(|| format!("failed to delete turn_event `{event_id}`"))
+        .map(|result| result.rows_affected)
+}
+
 pub async fn latest_event_for_turn<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,

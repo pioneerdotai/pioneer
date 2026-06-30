@@ -264,6 +264,61 @@ async fn project_turn_item_event<C: ConnectionTrait>(
     .await
 }
 
+pub(crate) async fn project_semantic_timeline_snapshot_turn_item<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    item_id: &str,
+    source_sequence: i64,
+    refreshed_at: DateTimeWithTimeZone,
+) -> Result<()> {
+    let Some(turn_model) = turn::find_turn_by_id(db, turn_id).await? else {
+        anyhow::bail!("semantic timeline snapshot cannot find turn `{turn_id}`");
+    };
+    let Some(thread_model) = thread::find_thread_by_id(db, turn_model.thread_id.as_str()).await?
+    else {
+        anyhow::bail!(
+            "semantic timeline snapshot cannot find thread `{}`",
+            turn_model.thread_id
+        );
+    };
+    let Some(item_model) = turn::find_turn_item(db, turn_model.id.as_str(), item_id).await? else {
+        return refresh_turn_work_summary(
+            db,
+            &thread_model,
+            &turn_model,
+            source_sequence,
+            refreshed_at,
+        )
+        .await;
+    };
+
+    let refresh_work_summary = !matches!(
+        classify_turn_item_row(&item_model).placement,
+        ProjectionPlacement::TopLevelUserMessage
+    );
+
+    project_snapshot_turn_item_row(
+        db,
+        &thread_model,
+        &turn_model,
+        &item_model,
+        source_sequence,
+        refreshed_at,
+    )
+    .await?;
+    if !refresh_work_summary {
+        return Ok(());
+    }
+    refresh_turn_work_summary(
+        db,
+        &thread_model,
+        &turn_model,
+        source_sequence,
+        refreshed_at,
+    )
+    .await
+}
+
 async fn project_terminal_turn_event<C: ConnectionTrait>(
     db: &C,
     event: &AppendedTurnEvent,
@@ -407,6 +462,109 @@ async fn project_turn_item_row<C: ConnectionTrait>(
     Ok(())
 }
 
+async fn project_snapshot_turn_item_row<C: ConnectionTrait>(
+    db: &C,
+    thread_model: &thread_entity::Model,
+    turn_model: &turn_entity::Model,
+    item_model: &turn_item_entity::Model,
+    source_sequence: i64,
+    refreshed_at: DateTimeWithTimeZone,
+) -> Result<()> {
+    let classification = classify_turn_item_row(item_model);
+
+    match classification.placement {
+        ProjectionPlacement::TopLevelUserMessage => {}
+        ProjectionPlacement::TopLevelAssistantMessage => {
+            let source_order = resolve_snapshot_item_source_order(
+                db,
+                turn_model.id.as_str(),
+                item_model,
+                source_sequence,
+            )
+            .await?;
+            let order_key = work_item_order_key(item_model, Some(&source_order));
+            timeline_repository::delete_turn_work_item_projection_for_item(
+                db,
+                turn_model.id.as_str(),
+                item_model.item_id.as_str(),
+            )
+            .await?;
+            timeline_repository::upsert_thread_timeline_block(
+                db,
+                ThreadTimelineBlockRecord {
+                    block_id: assistant_block_id(
+                        turn_model.id.as_str(),
+                        item_model.item_id.as_str(),
+                    ),
+                    workspace_id: thread_model.workspace_id.clone(),
+                    thread_id: thread_model.id.clone(),
+                    turn_id: Some(turn_model.id.clone()),
+                    block_kind: timeline_repository::BLOCK_KIND_ASSISTANT_MESSAGE.to_owned(),
+                    sort_key: turn_block_sort_key(&turn_model, 200, order_key.as_str()),
+                    source_kind: Some("turn_item".to_owned()),
+                    source_key: Some(item_model.item_id.clone()),
+                    started_at: Some(item_model.created_at),
+                    completed_at: Some(item_model.updated_at),
+                    metadata_json: json!({
+                        "turnId": turn_model.id,
+                        "itemId": item_model.item_id,
+                        "classification": classification.classification_str(),
+                    })
+                    .to_string(),
+                    created_at: item_model.created_at,
+                    updated_at: refreshed_at,
+                },
+            )
+            .await?;
+        }
+        ProjectionPlacement::TurnWork | ProjectionPlacement::Hidden => {
+            let source_order = resolve_snapshot_item_source_order(
+                db,
+                turn_model.id.as_str(),
+                item_model,
+                source_sequence,
+            )
+            .await?;
+            let order_key = work_item_order_key(item_model, Some(&source_order));
+            let source_event_id =
+                (!source_order.event_id.is_empty()).then(|| source_order.event_id.clone());
+            timeline_repository::delete_thread_timeline_block(
+                db,
+                assistant_block_id(turn_model.id.as_str(), item_model.item_id.as_str()).as_str(),
+            )
+            .await?;
+            timeline_repository::upsert_turn_work_item_projection(
+                db,
+                TurnWorkItemProjectionRecord {
+                    work_item_id: work_item_projection_id(
+                        turn_model.id.as_str(),
+                        item_model.item_id.as_str(),
+                    ),
+                    workspace_id: thread_model.workspace_id.clone(),
+                    thread_id: thread_model.id.clone(),
+                    turn_id: turn_model.id.clone(),
+                    item_id: item_model.item_id.clone(),
+                    source_event_id,
+                    source_sequence: source_order.sequence,
+                    order_key,
+                    item_type: item_model.item_type.clone(),
+                    visibility: classification.visibility_str().to_owned(),
+                    classification: classification.classification_str().to_owned(),
+                    status: classification.status.to_owned(),
+                    started_at: Some(item_model.created_at),
+                    completed_at: Some(item_model.updated_at),
+                    metadata_json: classification_metadata_json(&classification),
+                    created_at: item_model.created_at,
+                    updated_at: refreshed_at,
+                },
+            )
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
 async fn resolve_item_source_order<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
@@ -427,6 +585,29 @@ async fn resolve_item_source_order<C: ConnectionTrait>(
     Ok(ItemEventOrder {
         event_id: event.id.clone(),
         sequence: event.sequence,
+    })
+}
+
+async fn resolve_snapshot_item_source_order<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    item_model: &turn_item_entity::Model,
+    fallback_sequence: i64,
+) -> Result<ItemEventOrder> {
+    let work_item_id = work_item_projection_id(turn_id, item_model.item_id.as_str());
+    if let Some(existing) =
+        timeline_repository::find_turn_work_item_projection(db, work_item_id.as_str()).await?
+        && existing.source_sequence > 0
+    {
+        return Ok(ItemEventOrder {
+            event_id: existing.source_event_id.unwrap_or_default(),
+            sequence: existing.source_sequence,
+        });
+    }
+
+    Ok(ItemEventOrder {
+        event_id: String::new(),
+        sequence: fallback_sequence.max(0),
     })
 }
 

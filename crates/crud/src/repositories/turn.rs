@@ -329,6 +329,21 @@ pub async fn find_turn_item<C: ConnectionTrait>(
         .context("failed to query turn item row")
 }
 
+pub async fn list_turn_items_by_type<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    item_type: &str,
+) -> Result<Vec<turn_item::Model>> {
+    turn_item::Entity::find()
+        .filter(turn_item::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(turn_item::Column::ItemType.eq(item_type.to_owned()))
+        .order_by_asc(turn_item::Column::CreatedAt)
+        .order_by_asc(turn_item::Column::ItemId)
+        .all(db)
+        .await
+        .context("failed to query turn item rows by type")
+}
+
 pub async fn find_terminal_turns_for_thread<C: ConnectionTrait>(
     db: &C,
     thread_id: &str,

@@ -1,3 +1,4 @@
+mod agent_diff_event_compaction;
 mod task_anchor_backfill;
 mod timeline_pagination_backfill;
 
@@ -8,6 +9,7 @@ pub(crate) fn spawn_gateway_startup_migrations(crud_store: Arc<CrudStore>) {
     let _handle = tokio::spawn(async move {
         task_anchor_backfill::run(crud_store.as_ref()).await;
         timeline_pagination_backfill::run(crud_store.as_ref()).await;
+        agent_diff_event_compaction::run(crud_store.as_ref()).await;
     });
 }
 
