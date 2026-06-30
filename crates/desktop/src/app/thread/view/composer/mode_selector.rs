@@ -19,7 +19,10 @@ impl PioneerDesktop {
         }
     }
 
-    pub(super) fn render_composer_mode_selector(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(in crate::app::thread::view) fn render_composer_mode_selector(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let selected_mode = self.composer_turn_mode;
         let trigger_icon = Self::composer_mode_icon(selected_mode);
         let trigger_label = match selected_mode {
@@ -46,7 +49,7 @@ impl PioneerDesktop {
         let foreground = cx.theme().foreground;
 
         Popover::new("composer-mode-popover")
-            .anchor(Corner::BottomLeft)
+            .anchor(Corner::TopRight)
             .trigger(
                 Button::new("composer-mode-trigger")
                     .small()

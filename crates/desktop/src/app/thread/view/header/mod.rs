@@ -22,6 +22,8 @@ impl PioneerDesktop {
                         .map(|_| thread_id.to_owned())
                 })
         };
+        let show_mode_selector = self.has_complete_composer_model_selection()
+            && !self.composer_selected_provider_is_cli_runtime();
 
         h_flex()
             .justify_between()
@@ -60,7 +62,15 @@ impl PioneerDesktop {
                             .child(thread_title),
                     ),
             )
-            .child(self.render_thread_title_menu(active_thread_id, cx))
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_1()
+                    .when(show_mode_selector, |this| {
+                        this.child(self.render_composer_mode_selector(cx))
+                    })
+                    .child(self.render_thread_title_menu(active_thread_id, cx)),
+            )
             .into_any_element()
     }
 
