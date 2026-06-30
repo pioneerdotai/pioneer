@@ -2239,6 +2239,12 @@
                 "null"
               ]
             },
+            "progressPreview": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "resultPreview": {
               "type": [
                 "string",
