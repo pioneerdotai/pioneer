@@ -6335,6 +6335,24 @@ impl CrudStore {
         Ok(Some(parsed))
     }
 
+    pub async fn list_turn_items_by_type(
+        &self,
+        turn_id: &str,
+        item_type: &str,
+    ) -> Result<Vec<TurnItem>> {
+        let rows = turn::list_turn_items_by_type(&self.connection, turn_id, item_type).await?;
+        rows.into_iter()
+            .map(|model| {
+                serde_json::from_str::<TurnItem>(model.payload.as_str()).with_context(|| {
+                    format!(
+                        "failed to decode turn item payload for turn `{turn_id}` item `{}`",
+                        model.item_id
+                    )
+                })
+            })
+            .collect()
+    }
+
     pub async fn list_completed_agent_messages(&self, turn_id: &str) -> Result<Vec<TurnItem>> {
         let rows = turn::find_completed_turn_items(&self.connection, turn_id).await?;
         rows.into_iter()

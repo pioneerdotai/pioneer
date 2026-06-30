@@ -4469,6 +4469,51 @@ async fn turn_start_with_capabilities_materializes_user_message_attachments() {
                 && capability.raw_tool_name == "send_email"
                 && capability.scope_kind == McpScopeKind::Workspace
     ));
+
+    let timeline_request_id = generate_test_request_id("turncapmsg", "timeline");
+    let timeline_request = json!({
+        "jsonrpc": "2.0",
+        "id": timeline_request_id.clone(),
+        "method": "thread/timeline/page",
+        "params": {
+            "threadId": thread.thread.id,
+            "anchor": { "kind": "oldest" },
+            "limit": 10
+        }
+    });
+    processor
+        .process_request(connection_id, &timeline_request.to_string())
+        .await;
+    let timeline_response = recv_response_by_id(&mut rx, timeline_request_id.as_str()).await;
+    let page: pioneer_protocol::ThreadTimelinePageResponse =
+        serde_json::from_value(timeline_response.result)
+            .expect("thread/timeline/page should decode");
+    let timeline_attachments = page
+        .blocks
+        .iter()
+        .find_map(|block| match &block.kind {
+            pioneer_protocol::TimelineBlockKind::UserMessage { attachments, .. } => {
+                Some(attachments)
+            }
+            _ => None,
+        })
+        .expect("semantic page should include user message block");
+    assert!(
+        timeline_attachments.iter().any(|attachment| matches!(
+            attachment,
+            UserMessageAttachment::Skill { capability }
+                if capability.id == "skill:user:weather"
+        )),
+        "semantic timeline user block must preserve skill chips"
+    );
+    assert!(
+        timeline_attachments.iter().any(|attachment| matches!(
+            attachment,
+            UserMessageAttachment::McpTool { capability }
+                if capability.id == "mcp-tool:workspace:resend:send_email"
+        )),
+        "semantic timeline user block must preserve MCP chips"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

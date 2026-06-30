@@ -14,8 +14,9 @@ use pioneer_entity::{thread_timeline_block, turn_work_item_projection, turn_work
 use pioneer_protocol::{
     CLIRuntimePendingRequest, CLIRuntimePendingRequestStatus, CLIRuntimeRequestKind,
     ThreadTimelinePageParams, ThreadTimelinePageResponse, TimelineBlock, TimelineBlockKind,
-    TimelinePageInfo, TurnWorkBlock, TurnWorkItem, TurnWorkItemStatus, TurnWorkPageParams,
-    TurnWorkPageResponse, TurnWorkPresentation, TurnWorkState, UserInput, UserMessageAttachment,
+    TimelinePageInfo, TurnItem, TurnWorkBlock, TurnWorkItem, TurnWorkItemStatus,
+    TurnWorkPageParams, TurnWorkPageResponse, TurnWorkPresentation, TurnWorkState, UserInput,
+    UserMessageAttachment,
 };
 
 struct ThreadTimelineRowsPage {
@@ -869,13 +870,35 @@ impl MessageProcessor {
             .or(row.source_key.as_deref())
             .context("user message timeline block is missing turn_id")?;
         let inputs = self.crud_store.get_turn_inputs(turn_id).await?;
-        let (text, attachments) = user_message_text_and_attachments(inputs.as_slice());
+        let (text, input_attachments) = user_message_text_and_attachments(inputs.as_slice());
+        let item_attachments = self.user_message_item_attachments(turn_id).await?;
         Ok(TimelineBlockKind::UserMessage {
             item_id: None,
             inputs,
             text,
-            attachments,
+            attachments: merge_user_message_attachments(input_attachments, item_attachments),
         })
+    }
+
+    async fn user_message_item_attachments(
+        &self,
+        turn_id: &str,
+    ) -> Result<Vec<UserMessageAttachment>> {
+        let items = self
+            .crud_store
+            .list_turn_items_by_type(turn_id, "user_message")
+            .await?;
+        let mut attachments = Vec::new();
+        for item in items {
+            if let TurnItem::UserMessage {
+                attachments: item_attachments,
+                ..
+            } = item
+            {
+                attachments.extend(item_attachments);
+            }
+        }
+        Ok(attachments)
     }
 
     async fn turn_work_timeline_block_kind(
@@ -1123,6 +1146,18 @@ fn user_message_text_and_attachments(input: &[UserInput]) -> (String, Vec<UserMe
     }
 
     (text_parts.join("\n"), attachments)
+}
+
+fn merge_user_message_attachments(
+    mut primary: Vec<UserMessageAttachment>,
+    secondary: Vec<UserMessageAttachment>,
+) -> Vec<UserMessageAttachment> {
+    for attachment in secondary {
+        if !primary.contains(&attachment) {
+            primary.push(attachment);
+        }
+    }
+    primary
 }
 
 fn parse_turn_work_presentation(value: &str) -> TurnWorkPresentation {

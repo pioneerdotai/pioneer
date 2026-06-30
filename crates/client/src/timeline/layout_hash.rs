@@ -1,10 +1,11 @@
 //! Stable timeline layout hash helpers.
 
 use super::{
-    labels::{format_elapsed_ms, timeline_entry_text},
+    labels::{display_name_from_attachment, format_elapsed_ms, timeline_entry_text},
     rows::{TimelineCoalescedToolsKind, TimelineCoalescedToolsRow, TimelineRow, TimelineRowKind},
 };
 use crate::conversation::ConversationViewState;
+use pioneer_protocol::TurnItem;
 use std::{
     collections::HashSet,
     hash::{Hash, Hasher},
@@ -95,6 +96,13 @@ pub fn timeline_row_layout_hash(
                     if let Some(markdown) = &item_view.final_markdown {
                         markdown.blocks.len().hash(&mut hasher);
                     }
+
+                    if let TurnItem::UserMessage { attachments, .. } = &item_view.item {
+                        attachments.len().hash(&mut hasher);
+                        for attachment in attachments {
+                            display_name_from_attachment(attachment).hash(&mut hasher);
+                        }
+                    }
                 }
 
                 expanded.contains(entry.id.as_str()).hash(&mut hasher);
@@ -122,6 +130,7 @@ pub fn timeline_row_text_len(projection: &ConversationViewState, row: &TimelineR
                     .unwrap_or_default();
                 timeline_entry_text(item_view)
                     .len()
+                    .saturating_add(user_message_attachments_text_len(&item_view.item))
                     .saturating_add(permission_len)
             })
             .unwrap_or_default(),
@@ -150,6 +159,21 @@ pub fn timeline_row_text_len(projection: &ConversationViewState, row: &TimelineR
 
 const TURN_WORK_GROUP_COMPLETED_TEXT_LEN_ESTIMATE: usize = 9;
 const RUNNING_TURN_TEXT_LEN_ESTIMATE: usize = 12;
+
+fn user_message_attachments_text_len(item: &TurnItem) -> usize {
+    let TurnItem::UserMessage { attachments, .. } = item else {
+        return 0;
+    };
+
+    attachments
+        .iter()
+        .map(|attachment| {
+            display_name_from_attachment(attachment)
+                .len()
+                .saturating_add(1)
+        })
+        .sum()
+}
 
 fn coalesced_tools_text_len_estimate(group: &TimelineCoalescedToolsRow) -> usize {
     let count_len = group.count.to_string().len();
