@@ -4,6 +4,7 @@ use pioneer_agent::{
     PendingAttachedTask, ReviewRequiredTaskObservation, TaskToolMaterialization, TaskToolProvider,
     TaskTurnContext, TerminalTaskObservation,
 };
+use pioneer_crud::CrudStore;
 use pioneer_protocol::{
     ItemCompletedNotification, ItemUpdatedNotification, Task, TaskAcceptParams, TaskAcceptResponse,
     TaskAgentContextPolicy, TaskAgentInput, TaskAgentPrompt, TaskAgentResultContract,
@@ -3347,12 +3348,21 @@ pub(crate) async fn task_turn_item_from_response(
     processor: &MessageProcessor,
     response: &TaskGetResponse,
 ) -> anyhow::Result<TaskTurnItem> {
+    task_turn_item_from_response_with_progress(processor, response, None).await
+}
+
+pub(crate) async fn task_turn_item_from_response_with_progress(
+    processor: &MessageProcessor,
+    response: &TaskGetResponse,
+    progress_preview: Option<String>,
+) -> anyhow::Result<TaskTurnItem> {
     let run = select_task_anchor_run(response);
     task_turn_item_from_response_with_run(
-        processor,
+        processor.crud_store.as_ref(),
         response,
         run,
         task_anchor_id(response.task.id.as_str()),
+        progress_preview,
     )
     .await
 }
@@ -3363,8 +3373,40 @@ pub(crate) async fn task_turn_item_from_response_for_run(
     run_id: &str,
     item_id: String,
 ) -> anyhow::Result<TaskTurnItem> {
+    task_turn_item_from_response_for_run_with_progress(processor, response, run_id, item_id, None)
+        .await
+}
+
+pub(crate) async fn task_turn_item_from_response_for_run_with_progress(
+    processor: &MessageProcessor,
+    response: &TaskGetResponse,
+    run_id: &str,
+    item_id: String,
+    progress_preview: Option<String>,
+) -> anyhow::Result<TaskTurnItem> {
     let run = response.runs.iter().find(|run| run.id == run_id);
-    task_turn_item_from_response_with_run(processor, response, run, item_id).await
+    task_turn_item_from_response_with_run(
+        processor.crud_store.as_ref(),
+        response,
+        run,
+        item_id,
+        progress_preview,
+    )
+    .await
+}
+
+pub(crate) async fn task_turn_item_from_response_with_store(
+    crud_store: &CrudStore,
+    response: &TaskGetResponse,
+    run_id: Option<&str>,
+    item_id: String,
+    progress_preview: Option<String>,
+) -> anyhow::Result<TaskTurnItem> {
+    let run = run_id
+        .and_then(|run_id| response.runs.iter().find(|run| run.id == run_id))
+        .or_else(|| select_task_anchor_run(response));
+    task_turn_item_from_response_with_run(crud_store, response, run, item_id, progress_preview)
+        .await
 }
 
 pub(crate) fn task_anchor_id(task_id: &str) -> String {
@@ -3376,10 +3418,11 @@ pub(crate) fn task_run_anchor_id(run_id: &str) -> String {
 }
 
 async fn task_turn_item_from_response_with_run(
-    processor: &MessageProcessor,
+    crud_store: &CrudStore,
     response: &TaskGetResponse,
     run: Option<&TaskRun>,
     item_id: String,
+    progress_preview: Option<String>,
 ) -> anyhow::Result<TaskTurnItem> {
     let task = &response.task;
     let trigger = run
@@ -3395,8 +3438,7 @@ async fn task_turn_item_from_response_with_run(
     let agent_spec = select_anchor_agent_spec(response, run);
     let child_anchor = match run {
         Some(run) => {
-            processor
-                .crud_store
+            crud_store
                 .get_task_run_child_anchor(run.id.as_str())
                 .await?
         }
@@ -3422,6 +3464,7 @@ async fn task_turn_item_from_response_with_run(
             .map(|spec| spec.max_depth)
             .unwrap_or(DEFAULT_ROOT_MAX_DEPTH),
         next_fire_at: trigger.and_then(|trigger| trigger.next_fire_at),
+        progress_preview,
         result_preview: result_preview(
             run.and_then(|run| run.result.as_ref())
                 .or(task.result.as_ref()),
@@ -3485,6 +3528,15 @@ fn result_preview(result: Option<&TaskResult>) -> Option<String> {
 
 fn error_preview(error: Option<&TaskError>) -> Option<String> {
     error.map(|error| bounded_preview(error.message.as_str(), 240))
+}
+
+pub(crate) fn task_progress_preview(message: &str) -> Option<String> {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    Some(bounded_preview(trimmed, 240))
 }
 
 fn bounded_preview(value: &str, max_chars: usize) -> String {
@@ -4057,6 +4109,7 @@ mod tests {
             depth: 1,
             max_depth: 3,
             next_fire_at: Some(1_000),
+            progress_preview: None,
             result_preview: None,
             error_preview: None,
             created_at: 100,

@@ -18,6 +18,7 @@ use gpui::{prelude::*, *};
 use gpui_component::{Icon, IconName, h_flex, theme::ActiveTheme, v_flex};
 use pioneer_client::timeline::labels as timeline_labels;
 use pioneer_protocol::{TaskStatus, TurnItem, TurnPermissionMode, TurnPermissionProfileSnapshot};
+use std::hash::{Hash, Hasher};
 
 pub(super) fn format_elapsed_ms(elapsed_ms: u64) -> String {
     let total_seconds = elapsed_ms / 1_000;
@@ -89,21 +90,15 @@ impl PioneerDesktop {
     pub(super) fn render_turn_permission_badge(
         &self,
         permission_profile: &TurnPermissionProfileSnapshot,
-        cx: &mut Context<Self>,
+        _: &mut Context<Self>,
     ) -> AnyElement {
         let display = timeline_labels::turn_permission_profile_display(permission_profile);
         let mode = display.mode;
 
         h_flex()
-            .h(px(22.))
-            .max_w(px(180.))
             .items_center()
             .gap_1()
-            .rounded_full()
-            .bg(cx.theme().muted.opacity(0.72))
-            .px_2()
             .text_xs()
-            .opacity(0.72)
             .child(Icon::new(Self::turn_permission_icon(mode)).size_3())
             .child(
                 div()
@@ -237,7 +232,7 @@ impl PioneerDesktop {
                 cx,
             ),
             TurnItem::Task { item: task_item } => {
-                self.render_item_task(task_item, is_first_row, is_last_row, content_width)
+                self.render_item_task(task_item, is_first_row, is_last_row, content_width, cx)
             }
             TurnItem::CommandExecution { .. } => self.render_item_command_execution(
                 entry,
@@ -302,8 +297,19 @@ impl PioneerDesktop {
         is_first_row: bool,
         is_last_row: bool,
         content_width: Pixels,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
         let status = task_status_label(task_item.status);
+        let detail = task_item
+            .error_preview
+            .as_ref()
+            .or(task_item.progress_preview.as_ref())
+            .cloned();
+        let child_thread_id = task_item.child_thread_id.clone();
+        let title = task_item.title.clone();
+        let mut row_id_hasher = std::collections::hash_map::DefaultHasher::new();
+        task_item.id.hash(&mut row_id_hasher);
+        let row_id = row_id_hasher.finish();
         let content = h_flex()
             .w_full()
             .items_center()
@@ -321,9 +327,35 @@ impl PioneerDesktop {
                             .text_ellipsis()
                             .child(task_item.title.clone()),
                     )
-                    .child(div().text_xs().opacity(0.7).child(status)),
+                    .child(div().text_xs().opacity(0.6).child(status))
+                    .when_some(detail, |this, detail| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .line_height(relative(1.35))
+                                .opacity(0.6)
+                                .child(Self::truncate_for_card(detail.as_str(), 160)),
+                        )
+                    }),
             )
-            .into_any_element();
+            .when(child_thread_id.is_some(), |this| {
+                this.child(Icon::new(IconName::ChevronRight).size_4().opacity(0.6))
+            });
+
+        let content = if let Some(child_thread_id) = child_thread_id {
+            content
+                .id(("task-anchor-open-child", row_id))
+                .rounded_md()
+                .px_2()
+                .py_1()
+                .hover(|this| this.bg(cx.theme().muted.opacity(0.6)))
+                .on_click(cx.listener(move |view, _, window, cx| {
+                    view.open_task_child_thread(child_thread_id.clone(), title.clone(), window, cx);
+                }))
+                .into_any_element()
+        } else {
+            content.into_any_element()
+        };
 
         self.render_item_row(is_first_row, is_last_row, content_width, content)
     }

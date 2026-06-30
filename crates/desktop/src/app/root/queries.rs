@@ -19,6 +19,15 @@ impl PioneerDesktop {
         self.draft_thread_id.as_deref()
     }
 
+    pub(in crate::app) fn active_task_thread_navigation(
+        &self,
+    ) -> Option<&TaskThreadNavigationEntry> {
+        let active_thread_id = self.current_active_thread_id()?;
+        self.task_thread_navigation_stack
+            .last()
+            .filter(|entry| entry.child_thread_id == active_thread_id)
+    }
+
     pub(in crate::app) fn preferred_workspace_id(&self) -> Option<&str> {
         self.preferred_workspace_id.as_deref()
     }
@@ -82,7 +91,15 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn thread_workspace_id(&self, thread_id: &str) -> Option<&str> {
-        client_selectors::thread_workspace_id_from(&self.thread_coordinators, thread_id)
+        client_selectors::thread_workspace_id_from(&self.thread_coordinators, thread_id).or_else(
+            || {
+                self.task_thread_navigation_stack
+                    .iter()
+                    .rev()
+                    .find(|entry| entry.child_thread_id == thread_id)
+                    .map(|entry| entry.workspace_id.as_str())
+            },
+        )
     }
 
     pub(in crate::app) fn cli_runtime_binding_for_thread(
@@ -145,11 +162,18 @@ impl PioneerDesktop {
         &self,
         workspace_id: &str,
     ) -> Vec<String> {
-        thread_tree::sorted_thread_ids_from_coordinators(
+        let mut thread_ids = thread_tree::sorted_thread_ids_from_coordinators(
             &self.thread_coordinators,
             self.draft_thread_id(),
             Some(workspace_id),
-        )
+        );
+        thread_ids.retain(|thread_id| {
+            !self
+                .task_thread_navigation_stack
+                .iter()
+                .any(|entry| entry.child_thread_id == *thread_id)
+        });
+        thread_ids
     }
 
     pub(in crate::app) fn has_known_threads_for_workspace(&self, workspace_id: &str) -> bool {

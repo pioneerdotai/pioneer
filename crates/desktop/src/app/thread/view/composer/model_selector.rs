@@ -39,6 +39,7 @@ impl PioneerDesktop {
             .small()
             .ghost()
             .compact()
+            .disabled(self.active_task_thread_navigation().is_some())
             .child(
                 h_flex()
                     .items_center()

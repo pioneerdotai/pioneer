@@ -187,6 +187,14 @@ pub(super) struct CachedTimelineTerminal {
     pub(super) view: Entity<TerminalView>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct TaskThreadNavigationEntry {
+    pub(super) parent_thread_id: String,
+    pub(super) child_thread_id: String,
+    pub(super) workspace_id: String,
+    pub(super) title: String,
+}
+
 pub struct PioneerDesktop {
     pub(super) thread_coordinators: HashMap<String, ThreadCoordinator>,
     pub(super) thread_folders: HashMap<String, ThreadFolder>,
@@ -208,6 +216,7 @@ pub struct PioneerDesktop {
     pub(super) thread_list_refresh_requested: bool,
     pub(super) active_thread_id: Option<String>,
     pub(super) draft_thread_id: Option<String>,
+    pub(super) task_thread_navigation_stack: Vec<TaskThreadNavigationEntry>,
     pub(super) preferred_workspace_id: Option<String>,
     pub(super) workspaces: Vec<Workspace>,
     pub(super) workspaces_loading: bool,

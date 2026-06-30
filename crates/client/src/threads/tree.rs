@@ -5,7 +5,8 @@ use crate::threads::coordinator::ThreadCoordinator;
 use pioneer_protocol::{
     Thread, ThreadAgentsDocSummary, ThreadFolder, ThreadFolderCreateParams,
     ThreadFolderDeleteParams, ThreadFolderMoveParams, ThreadMoveParams, ThreadPlacement,
-    ThreadTreeParams, ThreadTreeResponse, ThreadUpdateParams, ThreadUpdateResponse,
+    ThreadSidebarVisibility, ThreadTreeParams, ThreadTreeResponse, ThreadUpdateParams,
+    ThreadUpdateResponse,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -637,6 +638,9 @@ pub fn sorted_thread_ids_from_coordinators(
         .filter(|(thread_id, coordinator)| {
             Some(thread_id.as_str()) != draft_thread_id
                 && workspace_id.is_none_or(|workspace_id| coordinator.workspace_id == workspace_id)
+                && coordinator.thread().is_none_or(|thread| {
+                    thread.sidebar_visibility == ThreadSidebarVisibility::Visible
+                })
         })
         .map(|(thread_id, _)| thread_id.clone())
         .collect();
@@ -1160,6 +1164,17 @@ mod tests {
         ThreadCoordinator::new(thread(thread_id, workspace_id, updated_at))
     }
 
+    fn coordinator_with_visibility(
+        thread_id: &str,
+        workspace_id: &str,
+        updated_at: i64,
+        sidebar_visibility: ThreadSidebarVisibility,
+    ) -> ThreadCoordinator {
+        let mut thread = thread(thread_id, workspace_id, updated_at);
+        thread.sidebar_visibility = sidebar_visibility;
+        ThreadCoordinator::new(thread)
+    }
+
     #[test]
     fn thread_tree_refresh_queue_batches_until_taken() {
         let mut requested = false;
@@ -1441,6 +1456,15 @@ mod tests {
             (
                 "thread_a_draft".to_owned(),
                 coordinator("thread_a_draft", "ws_a", 40),
+            ),
+            (
+                "thread_a_hidden".to_owned(),
+                coordinator_with_visibility(
+                    "thread_a_hidden",
+                    "ws_a",
+                    50,
+                    ThreadSidebarVisibility::Hidden,
+                ),
             ),
             (
                 "thread_b_newer".to_owned(),

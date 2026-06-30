@@ -2773,6 +2773,8 @@ pub struct TaskTurnItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_fire_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_preview: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_preview: Option<String>,
@@ -2873,6 +2875,7 @@ mod tests {
             depth: 0,
             max_depth: 3,
             next_fire_at: Some(1_700_000_000),
+            progress_preview: None,
             result_preview: None,
             error_preview: None,
             created_at: 1_700_000_000,

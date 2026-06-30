@@ -23,14 +23,16 @@ impl PioneerDesktop {
         let attachments = self.composer_attachments.clone();
         let capabilities = self.composer_capabilities.clone();
         let upload_error = self.composer_upload_error.clone();
+        let task_child_locked = self.active_task_thread_navigation().is_some();
         let can_send = self.can_submit_message(cx);
         let cli_runtime_selected = self.composer_selected_provider_is_cli_runtime();
         let active_thread_snapshot = self.client_snapshot().active_thread;
         let gateway_connected =
             self.gateway.connection_state == crate::app::root::GatewayConnectionState::Connected;
-        let is_cancelling = active_thread_snapshot.is_cancelling_turn();
-        let can_stop = active_thread_snapshot.can_request_turn_cancel(gateway_connected);
-        let has_in_flight_turn = active_thread_snapshot.has_in_flight_turn();
+        let is_cancelling = !task_child_locked && active_thread_snapshot.is_cancelling_turn();
+        let can_stop =
+            !task_child_locked && active_thread_snapshot.can_request_turn_cancel(gateway_connected);
+        let has_in_flight_turn = !task_child_locked && active_thread_snapshot.has_in_flight_turn();
         let composer_text = composer_state.read(cx).value().trim().to_owned();
         let cli_runtime_thread_binding = if has_in_flight_turn {
             active_thread_snapshot
@@ -51,6 +53,7 @@ impl PioneerDesktop {
             });
         let can_steer_cli_runtime_turn = has_cli_runtime_steer_target
             && gateway_connected
+            && !task_child_locked
             && !is_cancelling
             && !self.composer_upload_in_progress
             && attachments.is_empty()
@@ -116,7 +119,11 @@ impl PioneerDesktop {
                                             ),
                                     )
                                 })
-                                .child(Input::new(&composer_state).appearance(false)),
+                                .child(
+                                    Input::new(&composer_state)
+                                        .appearance(false)
+                                        .disabled(task_child_locked),
+                                ),
                         )
                         .child(
                             h_flex()
@@ -196,7 +203,8 @@ impl PioneerDesktop {
 
     fn render_composer_add_menu(&self, cx: &mut Context<Self>) -> AnyElement {
         let desktop_entity = cx.entity().clone();
-        let disabled = self.composer_upload_in_progress;
+        let disabled =
+            self.composer_upload_in_progress || self.active_task_thread_navigation().is_some();
         let cli_runtime_selected = self.composer_selected_provider_is_cli_runtime();
 
         Button::new("composer-add-attachment")

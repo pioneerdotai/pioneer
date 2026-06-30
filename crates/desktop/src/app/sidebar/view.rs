@@ -65,6 +65,8 @@ impl PioneerDesktop {
         ) {
             let selected_node_id = if self.main_content_view == MainContentView::AgentsDoc {
                 self.selected_thread_tree_node_id().map(str::to_owned)
+            } else if let Some(navigation) = self.active_task_thread_navigation() {
+                Some(thread_node_key(navigation.parent_thread_id.as_str()))
             } else {
                 self.current_active_thread_id()
                     .map(thread_node_key)

@@ -160,10 +160,7 @@ impl PioneerDesktop {
                             .pt_1()
                             .font_semibold()
                             .child(t!("timeline.running.turn").to_string()),
-                    )
-                    .when_some(running_turn.permission_profile.as_ref(), |this, profile| {
-                        this.child(self.render_turn_permission_badge(profile, cx))
-                    }),
+                    ),
             )
             .child(div().id(elapsed_id).pt_1().font_semibold().child(elapsed))
             .into_any_element();

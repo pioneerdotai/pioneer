@@ -37,7 +37,7 @@ impl MessageProcessor {
         let is_terminal_event = event.payload.is_terminal();
         if is_progress_event {
             self.publish_parent_task_progress_snapshot(&task_response, &event.payload)
-                .await;
+                .await?;
         } else if is_terminal_event {
             self.flush_parent_task_progress_snapshot(&task_response, &event.payload)
                 .await;
@@ -504,26 +504,47 @@ impl MessageProcessor {
         turn_id: &str,
         run_id: Option<&str>,
     ) -> Result<bool> {
+        self.refresh_task_anchor_in_turn_with_progress(response, thread_id, turn_id, run_id, None)
+            .await
+    }
+
+    async fn refresh_task_anchor_in_turn_with_progress(
+        &self,
+        response: &TaskGetResponse,
+        thread_id: &str,
+        turn_id: &str,
+        run_id: Option<&str>,
+        progress_preview: Option<String>,
+    ) -> Result<bool> {
         let item = match run_id {
             Some(run_id) if task_run_uses_creation_anchor(response, run_id) => {
-                crate::task_tools::task_turn_item_from_response_for_run(
+                crate::task_tools::task_turn_item_from_response_for_run_with_progress(
                     self,
                     response,
                     run_id,
                     crate::task_tools::task_anchor_id(response.task.id.as_str()),
+                    progress_preview,
                 )
                 .await?
             }
             Some(run_id) => {
-                crate::task_tools::task_turn_item_from_response_for_run(
+                crate::task_tools::task_turn_item_from_response_for_run_with_progress(
                     self,
                     response,
                     run_id,
                     crate::task_tools::task_run_anchor_id(run_id),
+                    progress_preview,
                 )
                 .await?
             }
-            None => crate::task_tools::task_turn_item_from_response(self, response).await?,
+            None => {
+                crate::task_tools::task_turn_item_from_response_with_progress(
+                    self,
+                    response,
+                    progress_preview,
+                )
+                .await?
+            }
         };
         let Some(existing) = self
             .crud_store
@@ -566,7 +587,7 @@ impl MessageProcessor {
         &self,
         response: &TaskGetResponse,
         payload: &TaskEventPayload,
-    ) {
+    ) -> Result<()> {
         let TaskEventPayload::Progress {
             task_id,
             run_id,
@@ -574,12 +595,12 @@ impl MessageProcessor {
             ..
         } = payload
         else {
-            return;
+            return Ok(());
         };
         let Some((parent_thread_id, parent_turn_id)) =
             self.task_progress_parent_target(response, payload).await
         else {
-            return;
+            return Ok(());
         };
         let item_id = parent_task_anchor_item_id(response, run_id.as_deref());
         if !self
@@ -592,7 +613,18 @@ impl MessageProcessor {
                 parent_turn_id,
                 "dropped task progress snapshot because target turn has no durable task anchor"
             );
-            return;
+            return Ok(());
+        }
+        let progress_preview = crate::task_tools::task_progress_preview(message);
+        if progress_preview.is_some() {
+            self.refresh_task_anchor_in_turn_with_progress(
+                response,
+                parent_thread_id.as_str(),
+                parent_turn_id.as_str(),
+                run_id.as_deref(),
+                progress_preview,
+            )
+            .await?;
         }
         let published = self
             .agent_manager
@@ -617,6 +649,7 @@ impl MessageProcessor {
                 "dropped task progress snapshot because parent agent thread is not active"
             );
         }
+        Ok(())
     }
 
     async fn flush_parent_task_progress_snapshot(

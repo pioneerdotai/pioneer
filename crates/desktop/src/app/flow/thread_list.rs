@@ -78,6 +78,7 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.task_thread_navigation_stack.clear();
         self.set_main_content_view(MainContentView::Threads, cx);
         self.activate_thread_with_draft_restore(thread_id.clone(), window, cx);
 
@@ -103,6 +104,91 @@ impl PioneerDesktop {
 
         self.ensure_thread_semantic_timeline_loaded(thread_id.as_str(), cx);
         self.rebuild_sidebar_tree_state(cx);
+    }
+
+    pub(crate) fn open_task_child_thread(
+        &mut self,
+        child_thread_id: String,
+        title: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(parent_thread_id) = self.current_active_thread_id().map(str::to_owned) else {
+            return;
+        };
+        if parent_thread_id == child_thread_id {
+            return;
+        }
+        let Some(workspace_id) = self
+            .thread_workspace_id(parent_thread_id.as_str())
+            .or_else(|| self.active_workspace_id())
+            .map(str::to_owned)
+        else {
+            return;
+        };
+
+        self.remember_active_thread_draft(cx);
+        self.thread_coordinators.remove(child_thread_id.as_str());
+        self.task_thread_navigation_stack
+            .retain(|entry| entry.child_thread_id != child_thread_id);
+        self.task_thread_navigation_stack
+            .push(TaskThreadNavigationEntry {
+                parent_thread_id,
+                child_thread_id: child_thread_id.clone(),
+                workspace_id: workspace_id.clone(),
+                title,
+            });
+        self.set_main_content_view(MainContentView::Threads, cx);
+        self.set_active_thread_id(Some(child_thread_id.clone()));
+        self.clear_composer(window, cx);
+        self.set_preferred_workspace_id(Some(workspace_id.clone()));
+
+        if let Some(connection_id) = self.gateway.ws_connection_id {
+            self.ensure_thread_subscription(
+                child_thread_id.clone(),
+                workspace_id.clone(),
+                connection_id,
+                cx,
+            );
+            self.refresh_cli_runtime_thread_binding(
+                child_thread_id.clone(),
+                workspace_id,
+                connection_id,
+                cx,
+            );
+        }
+
+        self.ensure_thread_semantic_timeline_loaded(child_thread_id.as_str(), cx);
+        cx.notify();
+    }
+
+    pub(crate) fn close_task_child_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(entry) = self.task_thread_navigation_stack.pop() else {
+            return;
+        };
+        self.thread_coordinators
+            .remove(entry.child_thread_id.as_str());
+        self.set_active_thread_id(Some(entry.parent_thread_id.clone()));
+        self.restore_thread_draft(entry.parent_thread_id.as_str(), window, cx);
+        self.set_preferred_workspace_id(Some(entry.workspace_id.clone()));
+
+        if let Some(connection_id) = self.gateway.ws_connection_id {
+            self.ensure_thread_subscription(
+                entry.parent_thread_id.clone(),
+                entry.workspace_id.clone(),
+                connection_id,
+                cx,
+            );
+            self.refresh_cli_runtime_thread_binding(
+                entry.parent_thread_id.clone(),
+                entry.workspace_id,
+                connection_id,
+                cx,
+            );
+        }
+
+        self.ensure_thread_semantic_timeline_loaded(entry.parent_thread_id.as_str(), cx);
+        cx.notify();
     }
 
     pub(crate) fn refresh_thread_list(&mut self, cx: &mut Context<Self>) {

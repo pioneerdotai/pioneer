@@ -21,7 +21,7 @@ mod ws_events_pump;
 
 use super::root::{
     GatewayConnectionState, GatewayOperationSource, GatewaySetupAction, GatewayStatusLevel,
-    MainContentView, PioneerDesktop,
+    MainContentView, PioneerDesktop, TaskThreadNavigationEntry,
 };
 use crate::app::gateway_setup::GatewaySetupFormState;
 use crate::gateway::{GatewayInstallWarning, GatewayRuntime};

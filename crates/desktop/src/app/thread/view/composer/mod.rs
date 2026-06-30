@@ -12,6 +12,10 @@ use pioneer_client::composer::turn_prepare::{
 
 impl PioneerDesktop {
     pub(in crate::app::thread) fn can_submit_message(&self, cx: &Context<Self>) -> bool {
+        if self.active_task_thread_navigation().is_some() {
+            return false;
+        }
+
         let composer_text = self.composer_state.read(cx).value();
         let cli_runtime_selected = self.composer_selected_provider_is_cli_runtime();
         can_submit_composer_message(ComposerSubmitAvailabilityInput {

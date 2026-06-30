@@ -64,11 +64,11 @@ use pioneer_protocol::{
     CLIRuntimeThreadForkResponse, CLIRuntimeTurnSteerResponse, ExecutionWindowExhaustionReason,
     ExecutionWindowStatus, INVALID_REQUEST_CODE, ItemCompletedNotification, ItemDeltaNotification,
     ItemDeltaStream, ItemStartedNotification, ItemToolRetryScheduledNotification,
-    JsonRpcErrorResponse, JsonRpcNotification, JsonRpcResponse, METHOD_NOT_FOUND_CODE,
-    McpChangedAction, McpChangedNotification, McpInstallResponse, McpInstallResultStatus,
-    McpInstallStatus, McpListResponse, McpPolicySetResponse, McpRuntimeState, McpScopeKind,
-    McpServerDetailsResponse, McpServerStatus, McpSourceKind, McpTransportSummary,
-    McpTurnBindingSummary, McpUninstallResponse, MemoryActor, MemoryActorKind,
+    ItemUpdatedNotification, JsonRpcErrorResponse, JsonRpcNotification, JsonRpcResponse,
+    METHOD_NOT_FOUND_CODE, McpChangedAction, McpChangedNotification, McpInstallResponse,
+    McpInstallResultStatus, McpInstallStatus, McpListResponse, McpPolicySetResponse,
+    McpRuntimeState, McpScopeKind, McpServerDetailsResponse, McpServerStatus, McpSourceKind,
+    McpTransportSummary, McpTurnBindingSummary, McpUninstallResponse, MemoryActor, MemoryActorKind,
     MemoryCandidateDecision, MemoryCandidateStatus, MemoryCandidatesDecideParams,
     MemoryCandidatesDecideResponse, MemoryCandidatesListParams, MemoryCandidatesListResponse,
     MemoryCategory, MemoryChangeKind, MemoryChangedNotification, MemoryForgetParams,
@@ -8815,6 +8815,80 @@ async fn task_create_tool_persists_anchor_and_rejects_legacy_timeline_impl() {
         ThreadSidebarVisibility::Hidden
     );
     assert_eq!(child_thread.name.as_deref(), Some(child_title));
+    let run = task_response
+        .runs
+        .last()
+        .expect("attached task should have an immediate run");
+    let child_anchor = crud_store
+        .get_task_run_child_anchor(run.id.as_str())
+        .await
+        .expect("child anchor lookup should succeed");
+    let anchor_item_id = crate::task_tools::task_anchor_id(anchor_task_id.as_str());
+    let refreshed_anchor = load_task_anchor_item(
+        crud_store.clone(),
+        "turn_task_tool_anchor",
+        anchor_item_id.as_str(),
+    )
+    .await;
+    assert_eq!(
+        refreshed_anchor.child_thread_id.as_deref(),
+        child_anchor.child_thread_id.as_deref(),
+        "parent task anchor should point at the hidden child thread"
+    );
+    assert_eq!(
+        refreshed_anchor.child_turn_id.as_deref(),
+        child_anchor.child_turn_id.as_deref(),
+        "parent task anchor should point at the hidden child turn"
+    );
+    assert!(
+        refreshed_anchor.result_preview.is_some(),
+        "terminal child result should refresh the parent task anchor preview"
+    );
+
+    let mut stale_anchor = refreshed_anchor.clone();
+    stale_anchor.child_thread_id = None;
+    stale_anchor.child_turn_id = None;
+    stale_anchor.progress_preview = Some("stale progress".to_owned());
+    stale_anchor.result_preview = None;
+    crud_store
+        .materialize_item_updated(
+            ItemUpdatedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: "thr_task_tool_anchor".to_owned(),
+                turn_id: "turn_task_tool_anchor".to_owned(),
+                item: TurnItem::Task { item: stale_anchor },
+            },
+            super::now_timestamp_secs(),
+        )
+        .await
+        .expect("stale task anchor should persist");
+
+    let backfill = crate::migrations::backfill_task_anchors_once(crud_store.as_ref())
+        .await
+        .expect("task anchor backfill should complete");
+    assert!(
+        backfill.anchors_updated >= 1,
+        "task anchor backfill should refresh stale task payloads"
+    );
+    let backfilled_anchor = load_task_anchor_item(
+        crud_store.clone(),
+        "turn_task_tool_anchor",
+        anchor_item_id.as_str(),
+    )
+    .await;
+    assert_eq!(
+        backfilled_anchor.child_thread_id.as_deref(),
+        child_anchor.child_thread_id.as_deref()
+    );
+    assert_eq!(
+        backfilled_anchor.child_turn_id.as_deref(),
+        child_anchor.child_turn_id.as_deref()
+    );
+    assert!(
+        backfilled_anchor.progress_preview.is_none(),
+        "backfill should not keep stale live progress on terminal task anchors"
+    );
+    assert!(backfilled_anchor.result_preview.is_some());
 
     let timeline_request = json!({
         "jsonrpc": "2.0",
@@ -9489,6 +9563,100 @@ fn parent_turn_cancel_cancels_attached_child_tasks_through_service() {
             parent_turn_cancel_cancels_attached_child_tasks_through_service_impl().await;
         },
     );
+}
+
+#[test]
+fn task_progress_refreshes_parent_task_anchor_preview() {
+    run_gateway_message_test(
+        "task_progress_refreshes_parent_task_anchor_preview",
+        || async {
+            task_progress_refreshes_parent_task_anchor_preview_impl().await;
+        },
+    );
+}
+
+async fn task_progress_refreshes_parent_task_anchor_preview_impl() {
+    let (tx, mut rx) = mpsc::channel(128);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "parent"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let provider = Arc::new(CreateThenHangProvider::new());
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "parent", provider,
+    ));
+    let processor = Arc::new(MessageProcessor::new(
+        thread_manager,
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    ));
+    processor.bind_task_bridge().await;
+
+    let thread_id = "thr_task_anchor_progress";
+    let turn_id = "turn_task_anchor_progress";
+    start_thread_and_turn(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+        "Agent",
+        "parent",
+    )
+    .await;
+
+    let task_id = wait_for_task_anchor(crud_store.clone(), thread_id, turn_id).await;
+    let run_id = wait_for_task_run_id(crud_store.clone(), task_id.as_str()).await;
+    let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run_id.as_str()).await;
+    assert_eq!(lineage.parent_thread_id, thread_id);
+
+    let progress_message = "TaskAgentExecutor is checking task anchor projection";
+    let progress_event = crud_store
+        .append_task_event(
+            TaskEventPayload::Progress {
+                task_id: task_id.clone(),
+                run_id: Some(run_id.clone()),
+                message: progress_message.to_owned(),
+                details: None,
+            },
+            super::now_timestamp_secs(),
+        )
+        .await
+        .expect("progress event should append");
+    processor
+        .emit_task_event(progress_event)
+        .await
+        .expect("progress event should refresh parent task anchor");
+
+    let anchor = wait_for_task_anchor_progress_preview(
+        crud_store.clone(),
+        turn_id,
+        crate::task_tools::task_anchor_id(task_id.as_str()).as_str(),
+        progress_message,
+    )
+    .await;
+    assert_eq!(anchor.run_id.as_deref(), Some(run_id.as_str()));
+    assert_eq!(
+        anchor.child_thread_id.as_deref(),
+        Some(lineage.child_thread_id.as_str())
+    );
+    assert_eq!(
+        anchor.child_turn_id.as_deref(),
+        Some(lineage.child_turn_id.as_str())
+    );
+
+    processor
+        .agent_manager
+        .cancel_turn(thread_id, turn_id, "test cleanup")
+        .await
+        .expect("parent turn cleanup should dispatch");
 }
 
 async fn parent_turn_cancel_cancels_attached_child_tasks_through_service_impl() {
@@ -10612,6 +10780,7 @@ async fn thread_episodic_store_ingestor_indexes_visible_tool_and_task_summaries_
                 depth: 0,
                 max_depth: 3,
                 next_fire_at: None,
+                progress_preview: None,
                 result_preview: Some("Proposal summary is ready".to_owned()),
                 error_preview: None,
                 created_at: 1,
@@ -29605,6 +29774,56 @@ async fn wait_for_task_anchor(
         sleep(Duration::from_millis(25)).await;
     }
     panic!("timed out waiting for task anchor");
+}
+
+async fn wait_for_task_run_id(crud_store: Arc<CrudStore>, task_id: &str) -> String {
+    for _ in 0..100 {
+        let response = crud_store
+            .get_task(task_id)
+            .await
+            .expect("task query should succeed")
+            .expect("task should exist");
+        if let Some(run) = response.runs.last() {
+            return run.id.clone();
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    panic!("timed out waiting for task run");
+}
+
+async fn load_task_anchor_item(
+    crud_store: Arc<CrudStore>,
+    turn_id: &str,
+    item_id: &str,
+) -> TaskTurnItem {
+    let Some(TurnItem::Task { item }) = crud_store
+        .get_turn_item(turn_id, item_id)
+        .await
+        .expect("turn item query should succeed")
+    else {
+        panic!("task anchor read model was not found");
+    };
+    item
+}
+
+async fn wait_for_task_anchor_progress_preview(
+    crud_store: Arc<CrudStore>,
+    turn_id: &str,
+    item_id: &str,
+    expected_progress_preview: &str,
+) -> TaskTurnItem {
+    for _ in 0..100 {
+        if let Some(TurnItem::Task { item }) = crud_store
+            .get_turn_item(turn_id, item_id)
+            .await
+            .expect("turn item query should succeed")
+            && item.progress_preview.as_deref() == Some(expected_progress_preview)
+        {
+            return item;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    load_task_anchor_item(crud_store, turn_id, item_id).await
 }
 
 struct TestChildRuntimeAnchor {

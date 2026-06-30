@@ -88,24 +88,21 @@ impl PioneerDesktop {
                             ))
                         })),
                 )
-                .when_some(permission_profile, |this, permission_profile| {
-                    this.child(
-                        h_flex()
-                            .pt_2()
-                            .justify_end()
-                            .child(self.render_turn_permission_badge(permission_profile, cx)),
-                    )
-                })
                 .child(
                     h_flex()
+                        .max_w_3_4()
+                        .min_w_0()
                         .h(px(30.))
                         .justify_end()
                         .items_center()
-                        .gap_2()
+                        .gap_2p5()
                         .text_xs()
                         .opacity(0.0)
                         .group_hover(format!("user-message-{}", item_view.id), |this| {
                             this.opacity(0.6)
+                        })
+                        .when_some(permission_profile, |this, permission_profile| {
+                            this.child(self.render_turn_permission_badge(permission_profile, cx))
                         })
                         .child(timestamp_text)
                         .child(

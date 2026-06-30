@@ -9,15 +9,19 @@ use gpui_component::{
 
 impl PioneerDesktop {
     pub(crate) fn render_thread_header(&self, cx: &mut Context<Self>) -> AnyElement {
+        let task_navigation = self.active_task_thread_navigation().cloned();
         let thread_title = self.active_thread_header_title();
-        let active_thread_id = self
-            .current_active_thread_id()
-            .filter(|thread_id| self.draft_thread_id() != Some(*thread_id))
-            .and_then(|thread_id| {
-                self.thread_coordinator(thread_id)
-                    .and_then(|coordinator| coordinator.thread())
-                    .map(|_| thread_id.to_owned())
-            });
+        let active_thread_id = if task_navigation.is_some() {
+            None
+        } else {
+            self.current_active_thread_id()
+                .filter(|thread_id| self.draft_thread_id() != Some(*thread_id))
+                .and_then(|thread_id| {
+                    self.thread_coordinator(thread_id)
+                        .and_then(|coordinator| coordinator.thread())
+                        .map(|_| thread_id.to_owned())
+                })
+        };
 
         h_flex()
             .justify_between()
@@ -28,14 +32,33 @@ impl PioneerDesktop {
             .border_b_1()
             .border_color(cx.theme().border)
             .child(
-                div()
+                h_flex()
                     .min_w_0()
                     .flex_1()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .text_sm()
-                    .font_semibold()
-                    .child(thread_title),
+                    .items_center()
+                    .gap_1p5()
+                    .when(task_navigation.is_some(), |this| {
+                        this.child(
+                            Button::new("task-child-thread-back")
+                                .small()
+                                .ghost()
+                                .compact()
+                                .p_0()
+                                .child(Icon::new(IconName::ChevronLeft).size_4())
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    view.close_task_child_thread(window, cx);
+                                })),
+                        )
+                    })
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_sm()
+                            .font_semibold()
+                            .child(thread_title),
+                    ),
             )
             .child(self.render_thread_title_menu(active_thread_id, cx))
             .into_any_element()
@@ -76,6 +99,10 @@ impl PioneerDesktop {
     }
 
     fn active_thread_header_title(&self) -> String {
+        if let Some(navigation) = self.active_task_thread_navigation() {
+            return navigation.title.clone();
+        }
+
         let Some(active_thread_id) = self.current_active_thread_id() else {
             return t!("sidebar.thread.untitled").to_string();
         };
