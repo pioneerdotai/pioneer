@@ -1,4 +1,5 @@
 mod agent_diff_event_compaction;
+mod cli_runtime_native_event_compaction;
 mod task_anchor_backfill;
 mod timeline_pagination_backfill;
 
@@ -10,6 +11,7 @@ pub(crate) fn spawn_gateway_startup_migrations(crud_store: Arc<CrudStore>) {
         task_anchor_backfill::run(crud_store.as_ref()).await;
         timeline_pagination_backfill::run(crud_store.as_ref()).await;
         agent_diff_event_compaction::run(crud_store.as_ref()).await;
+        cli_runtime_native_event_compaction::run(crud_store.as_ref()).await;
     });
 }
 
