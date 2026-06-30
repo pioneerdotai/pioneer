@@ -57,6 +57,7 @@ use pioneer_artifacts::{
 use pioneer_config::{
     GatewayArtifactsConfig, GatewayCliAgentRuntimeCommandHeartbeatConfig,
     GatewayCommandExecutionTimeoutConfig, GatewayHookRecoveryConfig,
+    GatewayProviderStreamItemTimeoutConfig,
 };
 use pioneer_crud::{
     CliRuntimePendingRequestRecord,
@@ -226,6 +227,7 @@ const RESILIENCE_WORKER_TRANSIENT_STORAGE_BACKOFF_SECONDS: u64 = 60;
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MessageProcessorResilienceConfig {
     pub command_execution_timeout: GatewayCommandExecutionTimeoutConfig,
+    pub provider_stream_item_timeout: GatewayProviderStreamItemTimeoutConfig,
     pub cli_runtime_command_heartbeat: GatewayCliAgentRuntimeCommandHeartbeatConfig,
 }
 
@@ -233,6 +235,7 @@ impl Default for MessageProcessorResilienceConfig {
     fn default() -> Self {
         Self {
             command_execution_timeout: GatewayCommandExecutionTimeoutConfig::default(),
+            provider_stream_item_timeout: GatewayProviderStreamItemTimeoutConfig::default(),
             cli_runtime_command_heartbeat: GatewayCliAgentRuntimeCommandHeartbeatConfig::default(),
         }
     }
@@ -482,6 +485,7 @@ impl MessageProcessor {
             TimeoutPolicyRegistry::with_provider_and_command_execution_timeout_policy(
                 normalized_tool_loop_config.provider,
                 resilience_config.command_execution_timeout,
+                resilience_config.provider_stream_item_timeout,
             ),
         ));
         let recovery_coordinator = Arc::new(RecoveryCoordinator::new(

@@ -456,6 +456,7 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         thread_episodic_runtime_config_from_gateway_config(&config.gateway.thread_episodic),
         MessageProcessorResilienceConfig {
             command_execution_timeout: config.gateway.resilience.command_execution,
+            provider_stream_item_timeout: config.gateway.resilience.provider_stream_items,
             cli_runtime_command_heartbeat: config.gateway.cli_agent_runtime.command_heartbeat,
         },
     );

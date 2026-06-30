@@ -234,6 +234,58 @@ impl Default for GatewayArtifactsConfig {
 pub struct GatewayResilienceConfig {
     #[serde(default)]
     pub command_execution: GatewayCommandExecutionTimeoutConfig,
+    #[serde(default)]
+    pub provider_stream_items: GatewayProviderStreamItemTimeoutConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct GatewayProviderStreamItemTimeoutConfig {
+    pub lease_secs: u64,
+    pub idle_secs: u64,
+    pub hard_secs: u64,
+}
+
+impl Default for GatewayProviderStreamItemTimeoutConfig {
+    fn default() -> Self {
+        Self {
+            lease_secs: default_provider_stream_item_lease_timeout_secs(),
+            idle_secs: default_provider_stream_item_idle_timeout_secs(),
+            hard_secs: default_provider_stream_item_hard_timeout_secs(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+struct GatewayProviderStreamItemTimeoutConfigWire {
+    #[serde(default = "default_provider_stream_item_lease_timeout_secs")]
+    lease_secs: u64,
+    #[serde(default = "default_provider_stream_item_idle_timeout_secs")]
+    idle_secs: u64,
+    #[serde(default = "default_provider_stream_item_hard_timeout_secs")]
+    hard_secs: u64,
+}
+
+impl<'de> Deserialize<'de> for GatewayProviderStreamItemTimeoutConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = GatewayProviderStreamItemTimeoutConfigWire::deserialize(deserializer)?;
+        Ok(Self {
+            lease_secs: non_zero_or_default(
+                wire.lease_secs,
+                default_provider_stream_item_lease_timeout_secs(),
+            ),
+            idle_secs: non_zero_or_default(
+                wire.idle_secs,
+                default_provider_stream_item_idle_timeout_secs(),
+            ),
+            hard_secs: non_zero_or_default(
+                wire.hard_secs,
+                default_provider_stream_item_hard_timeout_secs(),
+            ),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1955,6 +2007,18 @@ const fn default_command_execution_recovery_max_wall_clock_secs() -> u64 {
     60 * 60
 }
 
+const fn default_provider_stream_item_lease_timeout_secs() -> u64 {
+    16 * 60
+}
+
+const fn default_provider_stream_item_idle_timeout_secs() -> u64 {
+    15 * 60
+}
+
+const fn default_provider_stream_item_hard_timeout_secs() -> u64 {
+    30 * 60
+}
+
 const fn non_zero_or_default(value: u64, default_value: u64) -> u64 {
     if value == 0 { default_value } else { value }
 }
@@ -3235,6 +3299,25 @@ recovery_max_wall_clock_secs = 0
         assert_eq!(config.command_execution.idle_secs, 1_800);
         assert_eq!(config.command_execution.hard_secs, 3_600);
         assert_eq!(config.command_execution.recovery_max_wall_clock_secs, 3_600);
+    }
+
+    #[test]
+    fn gateway_resilience_config_normalizes_zero_provider_stream_item_timeouts() {
+        let config = toml::from_str::<GatewayResilienceConfig>(
+            r#"
+[provider_stream_items]
+lease_secs = 0
+idle_secs = 0
+hard_secs = 0
+"#,
+        )
+        .expect(
+            "gateway resilience config should deserialize with normalized stream item timeouts",
+        );
+
+        assert_eq!(config.provider_stream_items.lease_secs, 960);
+        assert_eq!(config.provider_stream_items.idle_secs, 900);
+        assert_eq!(config.provider_stream_items.hard_secs, 1_800);
     }
 
     #[test]

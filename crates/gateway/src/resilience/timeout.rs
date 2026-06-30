@@ -1,5 +1,7 @@
 use anyhow::Result;
-use pioneer_config::GatewayCommandExecutionTimeoutConfig;
+use pioneer_config::{
+    GatewayCommandExecutionTimeoutConfig, GatewayProviderStreamItemTimeoutConfig,
+};
 use pioneer_crud::{CrudStore, TimeoutCandidate, TurnItemAttemptDeadlines};
 use pioneer_protocol::{TurnItem, TurnItemType};
 use pioneer_provider::ProviderTimeoutPolicy;
@@ -36,6 +38,16 @@ impl From<GatewayCommandExecutionTimeoutConfig> for TimeoutPolicy {
     }
 }
 
+impl From<GatewayProviderStreamItemTimeoutConfig> for TimeoutPolicy {
+    fn from(config: GatewayProviderStreamItemTimeoutConfig) -> Self {
+        Self {
+            lease_secs: config.lease_secs,
+            idle_secs: config.idle_secs,
+            hard_secs: config.hard_secs,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TimeoutPolicyRegistry {
     by_item_type: HashMap<TurnItemType, TimeoutPolicy>,
@@ -55,19 +67,11 @@ impl Default for TimeoutPolicyRegistry {
         );
         by_item_type.insert(
             AgentMessage,
-            TimeoutPolicy {
-                lease_secs: 180,
-                idle_secs: 120,
-                hard_secs: 10 * 60,
-            },
+            TimeoutPolicy::from(GatewayProviderStreamItemTimeoutConfig::default()),
         );
         by_item_type.insert(
             Reasoning,
-            TimeoutPolicy {
-                lease_secs: 180,
-                idle_secs: 120,
-                hard_secs: 10 * 60,
-            },
+            TimeoutPolicy::from(GatewayProviderStreamItemTimeoutConfig::default()),
         );
         by_item_type.insert(
             SystemEvent,
@@ -131,12 +135,14 @@ impl TimeoutPolicyRegistry {
         Self::with_provider_and_command_execution_timeout_policy(
             provider_policy,
             GatewayCommandExecutionTimeoutConfig::default(),
+            GatewayProviderStreamItemTimeoutConfig::default(),
         )
     }
 
     pub fn with_provider_and_command_execution_timeout_policy(
-        provider_policy: ProviderTimeoutPolicy,
+        _provider_policy: ProviderTimeoutPolicy,
         command_execution_config: GatewayCommandExecutionTimeoutConfig,
+        provider_stream_item_config: GatewayProviderStreamItemTimeoutConfig,
     ) -> Self {
         use TurnItemType::{AgentMessage, Reasoning};
 
@@ -145,23 +151,7 @@ impl TimeoutPolicyRegistry {
             TurnItemType::CommandExecution,
             TimeoutPolicy::from(command_execution_config),
         );
-        let provider_idle_secs = provider_policy
-            .first_chunk_timeout
-            .as_secs()
-            .max(provider_policy.inter_chunk_idle_timeout.as_secs())
-            .saturating_add(30)
-            .max(30);
-        let lease_secs = provider_idle_secs.saturating_add(60).max(180);
-        let hard_secs = provider_policy
-            .max_stream_duration
-            .map(|duration| duration.as_secs().saturating_add(120))
-            .unwrap_or(10 * 60)
-            .max(lease_secs.saturating_add(60));
-        let timeout_policy = TimeoutPolicy {
-            lease_secs,
-            idle_secs: provider_idle_secs,
-            hard_secs,
-        };
+        let timeout_policy = TimeoutPolicy::from(provider_stream_item_config);
 
         registry.by_item_type.insert(AgentMessage, timeout_policy);
         registry.by_item_type.insert(Reasoning, timeout_policy);
@@ -381,7 +371,7 @@ mod tests {
     use pioneer_protocol::{SystemEventLevel, TurnItem, TurnItemType};
 
     #[test]
-    fn provider_timeout_policy_extends_agent_message_idle_deadlines() {
+    fn provider_stream_item_defaults_allow_quarter_hour_idle_window() {
         let provider_policy = ProviderTimeoutPolicy::from_secs(5, 180, 180, 120, None);
         let registry = TimeoutPolicyRegistry::with_provider_timeout_policy(provider_policy);
 
@@ -389,20 +379,47 @@ mod tests {
         let agent_message = registry.policy_for(TurnItemType::AgentMessage);
 
         assert_eq!(reasoning, agent_message);
-        assert_eq!(reasoning.idle_secs, 210);
-        assert!(reasoning.lease_secs > reasoning.idle_secs);
-        assert!(reasoning.hard_secs > reasoning.lease_secs);
+        assert_eq!(reasoning.lease_secs, 16 * 60);
+        assert_eq!(reasoning.idle_secs, 15 * 60);
+        assert_eq!(reasoning.hard_secs, 30 * 60);
     }
 
     #[test]
-    fn provider_timeout_policy_uses_configured_max_stream_duration_for_hard_deadline() {
+    fn provider_transport_timeout_policy_does_not_change_stream_item_deadlines() {
         let provider_policy = ProviderTimeoutPolicy::from_secs(5, 30, 45, 120, Some(900));
         let registry = TimeoutPolicyRegistry::with_provider_timeout_policy(provider_policy);
 
         let reasoning = registry.policy_for(TurnItemType::Reasoning);
 
-        assert_eq!(reasoning.idle_secs, 75);
-        assert_eq!(reasoning.hard_secs, 1020);
+        assert_eq!(reasoning.lease_secs, 16 * 60);
+        assert_eq!(reasoning.idle_secs, 15 * 60);
+        assert_eq!(reasoning.hard_secs, 30 * 60);
+    }
+
+    #[test]
+    fn provider_stream_item_timeout_config_overrides_reasoning_and_agent_message() {
+        let registry = TimeoutPolicyRegistry::with_provider_and_command_execution_timeout_policy(
+            ProviderTimeoutPolicy::from_secs(5, 30, 45, 120, Some(900)),
+            GatewayCommandExecutionTimeoutConfig::default(),
+            GatewayProviderStreamItemTimeoutConfig {
+                lease_secs: 123,
+                idle_secs: 456,
+                hard_secs: 789,
+            },
+        );
+
+        let reasoning = registry.policy_for(TurnItemType::Reasoning);
+        let agent_message = registry.policy_for(TurnItemType::AgentMessage);
+
+        assert_eq!(reasoning, agent_message);
+        assert_eq!(
+            reasoning,
+            TimeoutPolicy {
+                lease_secs: 123,
+                idle_secs: 456,
+                hard_secs: 789,
+            }
+        );
     }
 
     #[test]

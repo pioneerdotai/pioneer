@@ -46,6 +46,11 @@ idle_secs = 1800
 hard_secs = 3600
 recovery_max_wall_clock_secs = 3600
 
+[gateway.resilience.provider_stream_items]
+lease_secs = 960
+idle_secs = 900
+hard_secs = 1800
+
 [gateway.tasks.review]
 enabled = true
 allow_task_create_review_policy = false
