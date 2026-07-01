@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "VoiceSessionFinalizeParams",
+  "type": "object",
+  "properties": {
+    "session_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id"
+  ]
+}

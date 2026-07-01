@@ -33,7 +33,7 @@ use crate::{
     TurnFailedNotification, TurnPermissionRequestOpenedNotification,
     TurnPermissionRequestResolvedNotification, TurnStartedNotification,
     TurnToolLoopBudgetExceededNotification, TurnWorkItemsChangedNotification,
-    TurnWorkStateChangedNotification, WorkspaceChangedNotification,
+    TurnWorkStateChangedNotification, VoiceSessionResultNotification, WorkspaceChangedNotification,
 };
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
@@ -147,6 +147,7 @@ pub enum GatewayNotification {
     CLIRuntimeAppsChanged(CLIRuntimeAppsChangedNotification),
     #[serde(rename = "gateway_remote_access_status_changed")]
     GatewayRemoteAccessStatusChanged(GatewayRemoteAccessStatusChangedNotification),
+    VoiceSessionResult(VoiceSessionResultNotification),
     Unknown(UnknownGatewayNotification),
 }
 
@@ -424,6 +425,12 @@ impl GatewayNotification {
                     Err(_) => Some(Self::Unknown(unknown_notification(method, params))),
                 }
             }
+            events::VOICE_SESSION_RESULT => {
+                match serde_json::from_value::<VoiceSessionResultNotification>(params.clone()) {
+                    Ok(notification) => Some(Self::VoiceSessionResult(notification)),
+                    Err(_) => Some(Self::Unknown(unknown_notification(method, params))),
+                }
+            }
             events::ARTIFACT_CREATED => {
                 serde_json::from_value::<ArtifactCreatedNotification>(params)
                     .ok()
@@ -586,6 +593,7 @@ impl GatewayNotification {
                 || method.starts_with("gateway/")
                 || method.starts_with("artifact/")
                 || method.starts_with("cli_runtime/")
+                || method.starts_with("voice/")
                 || method.starts_with("thread/artifacts_") =>
             {
                 Some(Self::Unknown(unknown_notification(method, params)))
@@ -770,6 +778,37 @@ mod tests {
         let mapped =
             GatewayNotification::from_jsonrpc(notification).expect("known notification should map");
         assert!(matches!(mapped, GatewayNotification::TurnStarted(_)));
+    }
+
+    #[test]
+    fn maps_voice_session_result_notification() {
+        let notification = JsonRpcNotification::from_params(
+            events::VOICE_SESSION_RESULT,
+            &json!({
+                "session_id": "voice_123",
+                "outcome": "no_speech",
+                "turn_id": "turn_123",
+                "error": {
+                    "kind": "no_speech",
+                    "message": "No speech detected."
+                }
+            }),
+        )
+        .expect("voice result notification should encode");
+
+        let mapped =
+            GatewayNotification::from_jsonrpc(notification).expect("voice result should map");
+        match mapped {
+            GatewayNotification::VoiceSessionResult(notification) => {
+                assert_eq!(notification.session_id, "voice_123");
+                assert_eq!(notification.outcome, crate::VoiceSessionOutcome::NoSpeech);
+                assert_eq!(
+                    notification.error.as_ref().map(|error| error.kind),
+                    Some(crate::VoiceErrorKind::NoSpeech)
+                );
+            }
+            other => panic!("expected voice session result, got {other:?}"),
+        }
     }
 
     #[test]

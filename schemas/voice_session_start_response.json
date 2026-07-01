@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "VoiceSessionStartResponse",
+  "type": "object",
+  "properties": {
+    "session_id": {
+      "type": "string"
+    },
+    "status": {
+      "$ref": "#/$defs/VoiceStatus"
+    }
+  },
+  "required": [
+    "session_id",
+    "status"
+  ],
+  "$defs": {
+    "VoiceStatus": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "unavailable",
+            "model_loading",
+            "ready",
+            "busy",
+            "recording",
+            "transcribing",
+            "error"
+          ]
+        },
+        {
+          "description": "Model download is happening in the gateway background. First pass UI\nshould not infer or require detailed progress from this status.",
+          "type": "string",
+          "const": "model_downloading"
+        }
+      ]
+    }
+  }
+}

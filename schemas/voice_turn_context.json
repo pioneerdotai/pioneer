@@ -1,0 +1,590 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "VoiceTurnContext",
+  "description": "Frozen non-audio composer context for voice turn materialization.\n\n`prepared_input` is for existing prepared `UserInput` references such as\nartifacts/local attachment references. It must not contain the future voice\ntranscript; the gateway prepends the transcript as `UserInput::Text` after\nsuccessful transcription.",
+  "type": "object",
+  "properties": {
+    "capabilities": {
+      "description": "Selected skills, MCP tools/servers and related turn capabilities.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/TurnCapability"
+      }
+    },
+    "cli_runtime_options": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TurnCLIRuntimeOptions"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "execution_backend": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AgentExecutionBackend"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "mode": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ThreadMode"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "model_provider": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "permission_profile": {
+      "description": "Agent permission profile for the eventual turn.\n\nThis is not the platform microphone permission. Microphone permission\nstays client/platform-local and is reported through voice status/errors.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TurnPermissionProfileSelection"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "prepared_input": {
+      "description": "Existing prepared composer inputs such as artifact/file references.\n\nThis vector must not contain audio bytes or the future transcript. On\ncancel, dropping this context must not create a turn; already completed\nupload/cache side effects are handled by the existing attachment flow.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/UserInput"
+      }
+    },
+    "reasoning": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TurnReasoningSelection"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "sandbox_policy": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SandboxPolicy"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "thread_id": {
+      "description": "Thread that receives the gateway-created turn after transcription.",
+      "type": "string"
+    },
+    "turn_id": {
+      "description": "Client-planned turn id reserved before any audio chunk is accepted.",
+      "type": "string"
+    },
+    "workspace_id": {
+      "description": "Workspace active when the voice session starts.\n\n`TurnStartParams` is still thread-scoped; the gateway keeps the\nworkspace here to validate/session-route the frozen voice context.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_id",
+    "thread_id",
+    "turn_id"
+  ],
+  "$defs": {
+    "AgentExecutionBackend": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "provider": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "apiProvider"
+            }
+          },
+          "required": [
+            "type",
+            "provider"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "runtime_id": {
+              "type": "string"
+            },
+            "runtime_kind": {
+              "$ref": "#/$defs/CLIAgentRuntimeKind"
+            },
+            "type": {
+              "type": "string",
+              "const": "cliAgentRuntime"
+            }
+          },
+          "required": [
+            "type",
+            "runtime_id",
+            "runtime_kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "runtime_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "acpAgentRuntime"
+            }
+          },
+          "required": [
+            "type",
+            "runtime_id"
+          ]
+        }
+      ]
+    },
+    "ByteRange": {
+      "type": "object",
+      "properties": {
+        "end": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "start": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "start",
+        "end"
+      ]
+    },
+    "CLIAgentRuntimeKind": {
+      "type": "string",
+      "enum": [
+        "codex",
+        "claude"
+      ]
+    },
+    "McpScopeKind": {
+      "type": "string",
+      "enum": [
+        "workspace",
+        "user"
+      ]
+    },
+    "SandboxMode": {
+      "type": "string",
+      "enum": [
+        "FullAccess"
+      ]
+    },
+    "SandboxPolicy": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/SandboxMode"
+        }
+      },
+      "required": [
+        "mode"
+      ]
+    },
+    "TextElement": {
+      "type": "object",
+      "properties": {
+        "byte_range": {
+          "$ref": "#/$defs/ByteRange"
+        },
+        "placeholder": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "byte_range"
+      ]
+    },
+    "ThreadMode": {
+      "type": "string",
+      "enum": [
+        "Chat",
+        "Agent"
+      ]
+    },
+    "TurnCLIRuntimeOptions": {
+      "type": "object",
+      "properties": {
+        "effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "personality": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sandbox": true,
+        "steer_if_active": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "TurnCapability": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/TurnCapabilityKind"
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "kind"
+      ]
+    },
+    "TurnCapabilityKind": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "slug": {
+              "type": "string"
+            },
+            "sourceKind": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "skill"
+            }
+          },
+          "required": [
+            "type",
+            "slug",
+            "sourceKind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "scopeKind": {
+              "$ref": "#/$defs/McpScopeKind"
+            },
+            "type": {
+              "type": "string",
+              "const": "mcpServer"
+            }
+          },
+          "required": [
+            "type",
+            "name",
+            "scopeKind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "rawToolName": {
+              "type": "string"
+            },
+            "scopeKind": {
+              "$ref": "#/$defs/McpScopeKind"
+            },
+            "serverName": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "mcpTool"
+            }
+          },
+          "required": [
+            "type",
+            "serverName",
+            "rawToolName",
+            "scopeKind"
+          ]
+        }
+      ]
+    },
+    "TurnPermissionMode": {
+      "type": "string",
+      "enum": [
+        "full_access",
+        "auto_accept_edits",
+        "supervised"
+      ]
+    },
+    "TurnPermissionProfileSelection": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/TurnPermissionMode"
+        }
+      },
+      "required": [
+        "mode"
+      ]
+    },
+    "TurnReasoningSelection": {
+      "type": "object",
+      "properties": {
+        "effort": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "effort"
+      ]
+    },
+    "UserInput": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "textElements": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/TextElement"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "text"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "image"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "localImage"
+            }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "file"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "localFile"
+            }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "audio"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "localAudio"
+            }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "video"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "localVideo"
+            }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "artifactId": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "artifact"
+            },
+            "versionId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "artifactId"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "mention"
+            }
+          },
+          "required": [
+            "type",
+            "name",
+            "path"
+          ]
+        }
+      ]
+    }
+  }
+}

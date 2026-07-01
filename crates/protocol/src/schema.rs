@@ -198,7 +198,12 @@ use crate::{
     TurnPermissionRequestRespondResponse, TurnReasoningSelection, TurnRejectedCapability,
     TurnResumeParams, TurnResumeResponse, TurnSkillCapabilitySummary, TurnStartParams,
     TurnStartResponse, TurnStartedNotification, TurnStatus, TurnStatusChangedNotification,
-    TurnToolLoopBudgetExceededNotification, UnknownGatewayNotification, UserInput, Workspace,
+    TurnToolLoopBudgetExceededNotification, UnknownGatewayNotification, UserInput,
+    VoiceAudioEncoding, VoiceAudioFormat, VoiceChunkAckNotification, VoiceChunkFrameHeader,
+    VoiceError, VoiceErrorKind, VoiceSessionCancelParams, VoiceSessionCancelResponse,
+    VoiceSessionFinalizeParams, VoiceSessionFinalizeResponse, VoiceSessionOutcome,
+    VoiceSessionResultNotification, VoiceSessionStartParams, VoiceSessionStartResponse,
+    VoiceStatus, VoiceStatusParams, VoiceStatusResponse, VoiceTurnContext, Workspace,
     WorkspaceChangeKind, WorkspaceChangedNotification, WorkspaceCreateParams,
     WorkspaceCreateResponse, WorkspaceDefaultParams, WorkspaceDefaultResponse, WorkspaceListParams,
     WorkspaceListResponse, WorkspaceSelectParams, WorkspaceSelectResponse, WorkspaceUpdateParams,
@@ -978,6 +983,42 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!("prompt_manifest_profile.json", PromptManifestProfile),
         schema_doc!("turn_status.json", TurnStatus),
         schema_doc!("turn_start_params.json", TurnStartParams),
+        schema_doc!("voice_status.json", VoiceStatus),
+        schema_doc!("voice_status_params.json", VoiceStatusParams),
+        schema_doc!("voice_status_response.json", VoiceStatusResponse),
+        schema_doc!("voice_error_kind.json", VoiceErrorKind),
+        schema_doc!("voice_error.json", VoiceError),
+        schema_doc!("voice_audio_encoding.json", VoiceAudioEncoding),
+        schema_doc!("voice_audio_format.json", VoiceAudioFormat),
+        schema_doc!("voice_chunk_frame_header.json", VoiceChunkFrameHeader),
+        schema_doc!("voice_turn_context.json", VoiceTurnContext),
+        schema_doc!("voice_session_start_params.json", VoiceSessionStartParams),
+        schema_doc!(
+            "voice_session_start_response.json",
+            VoiceSessionStartResponse
+        ),
+        schema_doc!(
+            "voice_session_finalize_params.json",
+            VoiceSessionFinalizeParams
+        ),
+        schema_doc!(
+            "voice_session_finalize_response.json",
+            VoiceSessionFinalizeResponse
+        ),
+        schema_doc!("voice_session_cancel_params.json", VoiceSessionCancelParams),
+        schema_doc!(
+            "voice_session_cancel_response.json",
+            VoiceSessionCancelResponse
+        ),
+        schema_doc!("voice_session_outcome.json", VoiceSessionOutcome),
+        schema_doc!(
+            "voice_session_result_notification.json",
+            VoiceSessionResultNotification
+        ),
+        schema_doc!(
+            "voice_chunk_ack_notification.json",
+            VoiceChunkAckNotification
+        ),
         schema_doc!("turn_reasoning_selection.json", TurnReasoningSelection),
         schema_doc!("turn_permission_mode.json", TurnPermissionMode),
         schema_doc!("turn_permission_action_kind.json", TurnPermissionActionKind),

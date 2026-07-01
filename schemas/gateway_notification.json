@@ -1351,6 +1351,22 @@
       "properties": {
         "kind": {
           "type": "string",
+          "const": "voice_session_result"
+        },
+        "params": {
+          "$ref": "#/$defs/VoiceSessionResultNotification"
+        }
+      },
+      "required": [
+        "kind",
+        "params"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
           "const": "unknown"
         },
         "params": {
@@ -10954,6 +10970,79 @@
             "capability"
           ]
         }
+      ]
+    },
+    "VoiceError": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/VoiceErrorKind"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "message"
+      ]
+    },
+    "VoiceErrorKind": {
+      "type": "string",
+      "enum": [
+        "model_unavailable",
+        "microphone_permission_blocked",
+        "device_unavailable",
+        "invalid_session",
+        "stale_chunk",
+        "sequence_gap",
+        "cancelled",
+        "no_speech",
+        "transcription_failed",
+        "gateway_busy",
+        "model_downloading",
+        "unknown"
+      ]
+    },
+    "VoiceSessionOutcome": {
+      "type": "string",
+      "enum": [
+        "turn_started",
+        "cancelled",
+        "no_speech",
+        "failed"
+      ]
+    },
+    "VoiceSessionResultNotification": {
+      "description": "Voice session terminal notification.\n\nThis never carries transcript text. Successful user-message rendering comes\nfrom the normal `turn/started` and timeline notifications.",
+      "type": "object",
+      "properties": {
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VoiceError"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "outcome": {
+          "$ref": "#/$defs/VoiceSessionOutcome"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "turn_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "session_id",
+        "outcome"
       ]
     },
     "WebFetchLink": {

@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "VoiceChunkFrameHeader",
+  "description": "JSON header carried by a `VOC1` binary voice frame.\n\nThe frame payload following this header is raw audio bytes only. Finalize\nand cancel are control DTOs, not binary frame markers.",
+  "type": "object",
+  "properties": {
+    "captured_at_unix_ms": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    },
+    "channels": {
+      "type": "integer",
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0
+    },
+    "duration_ms": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0
+    },
+    "encoding": {
+      "$ref": "#/$defs/VoiceAudioEncoding"
+    },
+    "payload_len": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "sample_rate_hz": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "sequence": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "session_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id",
+    "sequence",
+    "sample_rate_hz",
+    "channels",
+    "encoding",
+    "payload_len"
+  ],
+  "$defs": {
+    "VoiceAudioEncoding": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "pcm_s16_le"
+          ]
+        },
+        {
+          "description": "Reserved for future client adapters. The initial gateway intake\ncontract accepts only `pcm_s16le`.",
+          "type": "string",
+          "const": "pcm_f32_le"
+        }
+      ]
+    }
+  }
+}

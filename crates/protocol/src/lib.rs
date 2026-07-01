@@ -20,6 +20,8 @@ mod thread_episodic;
 mod timeline;
 mod turn;
 mod turn_permissions;
+mod voice;
+pub mod voice_contract;
 mod workspace;
 
 pub use agent_event::{
@@ -284,6 +286,20 @@ pub use turn_permissions::{
     most_restrictive_turn_permission_mode, permission_policy_for_mode,
     system_turn_permission_profile_snapshot, task_permission_cap_for_mode,
     task_permission_cap_from_snapshot, task_permission_cap_snapshot,
+};
+pub use voice::{
+    DecodedVoiceChunkFrame, VOICE_AUDIO_FORMAT_CONTRACT, VOICE_AUDIO_MAX_CHUNK_BYTES,
+    VOICE_AUDIO_MAX_CHUNK_DURATION_MS, VOICE_AUDIO_TARGET_BYTES_PER_SAMPLE,
+    VOICE_AUDIO_TARGET_CHANNELS, VOICE_AUDIO_TARGET_CHUNK_BYTES,
+    VOICE_AUDIO_TARGET_CHUNK_DURATION_MS, VOICE_AUDIO_TARGET_SAMPLE_RATE_HZ,
+    VOICE_CHUNK_FRAME_MAGIC, VoiceAudioEncoding, VoiceAudioFormat, VoiceAudioFormatValidationError,
+    VoiceChunkAckNotification, VoiceChunkFrameHeader, VoiceError, VoiceErrorKind,
+    VoiceFrameDecodeError, VoiceFrameEncodeError, VoiceSessionCancelParams,
+    VoiceSessionCancelResponse, VoiceSessionFinalizeParams, VoiceSessionFinalizeResponse,
+    VoiceSessionOutcome, VoiceSessionResultNotification, VoiceSessionStartParams,
+    VoiceSessionStartResponse, VoiceStatus, VoiceStatusParams, VoiceStatusResponse,
+    VoiceTurnContext, decode_voice_chunk_frame, encode_voice_chunk_frame,
+    validate_voice_streaming_audio_format,
 };
 pub use workspace::{
     Workspace, WorkspaceChangeKind, WorkspaceChangedNotification, WorkspaceCreateParams,

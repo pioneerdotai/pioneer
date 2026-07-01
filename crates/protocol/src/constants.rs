@@ -25,6 +25,10 @@ pub mod methods {
     pub const TURN_ITEMS: &str = "turn/items";
     pub const TURN_WORK_PAGE: &str = "turn/work/page";
     pub const TURN_PERMISSION_REQUEST_RESPOND: &str = "turn/permission/request/respond";
+    pub const VOICE_STATUS: &str = "voice/status";
+    pub const VOICE_SESSION_START: &str = "voice/session/start";
+    pub const VOICE_SESSION_FINALIZE: &str = "voice/session/finalize";
+    pub const VOICE_SESSION_CANCEL: &str = "voice/session/cancel";
     pub const PROVIDER_LIST: &str = "provider/list";
     pub const PROVIDER_MODELS_LIST: &str = "provider/models/list";
     pub const PROVIDER_SET_API_KEY: &str = "provider/set_api_key";
@@ -130,6 +134,8 @@ pub mod events {
     pub const TURN_EXECUTION_WINDOW_CHECKPOINTED: &str = "turn/execution_window/checkpointed";
     pub const TURN_EXECUTION_WINDOW_CONTINUED: &str = "turn/execution_window/continued";
     pub const TURN_EXECUTION_WINDOW_BLOCKED: &str = "turn/execution_window/blocked";
+    pub const VOICE_CHUNK_ACK: &str = "voice/chunk/ack";
+    pub const VOICE_SESSION_RESULT: &str = "voice/session/result";
     pub const ITEM_STARTED: &str = "item/started";
     pub const ITEM_AGENT_MESSAGE_DELTA: &str = "item/agent_message/delta";
     pub const ITEM_COMMAND_EXECUTION_OUTPUT_DELTA: &str = "item/command_execution/output_delta";

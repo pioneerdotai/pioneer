@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "VoiceErrorKind",
+  "type": "string",
+  "enum": [
+    "model_unavailable",
+    "microphone_permission_blocked",
+    "device_unavailable",
+    "invalid_session",
+    "stale_chunk",
+    "sequence_gap",
+    "cancelled",
+    "no_speech",
+    "transcription_failed",
+    "gateway_busy",
+    "model_downloading",
+    "unknown"
+  ]
+}
