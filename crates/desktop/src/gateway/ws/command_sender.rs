@@ -2,7 +2,10 @@ use super::GatewayWsCommandSender;
 use anyhow::Result;
 use pioneer_client::{
     ClientError, ClientResult,
-    composer::turn_prepare::{PrepareComposerTurnRequest, PreparedComposerTurn},
+    composer::turn_prepare::{
+        PrepareComposerTurnRequest, PrepareVoiceComposerSnapshotRequest, PreparedComposerTurn,
+        PreparedVoiceComposerSnapshot,
+    },
     platform::{ClientFileMetadata, ClientFileSystem, ClientPath},
 };
 use std::fs;
@@ -12,6 +15,11 @@ pub(crate) trait DesktopGatewayWsCommandSenderExt {
         &self,
         request: PrepareComposerTurnRequest,
     ) -> Result<PreparedComposerTurn>;
+
+    fn prepare_voice_composer_snapshot(
+        &self,
+        request: PrepareVoiceComposerSnapshotRequest,
+    ) -> Result<PreparedVoiceComposerSnapshot>;
 }
 
 impl DesktopGatewayWsCommandSenderExt for GatewayWsCommandSender {
@@ -20,6 +28,17 @@ impl DesktopGatewayWsCommandSenderExt for GatewayWsCommandSender {
         request: PrepareComposerTurnRequest,
     ) -> Result<PreparedComposerTurn> {
         self.prepare_composer_turn_with_file_system(&DesktopClientFileSystem, request)
+    }
+
+    fn prepare_voice_composer_snapshot(
+        &self,
+        request: PrepareVoiceComposerSnapshotRequest,
+    ) -> Result<PreparedVoiceComposerSnapshot> {
+        pioneer_client::composer::turn_prepare::prepare_voice_composer_snapshot(
+            self,
+            &DesktopClientFileSystem,
+            request,
+        )
     }
 }
 

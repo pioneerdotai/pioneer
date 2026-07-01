@@ -7,7 +7,7 @@ use pioneer_config::{
     GatewayComputerUseToolsConfig, GatewayConfig, GatewayDatabaseConfig, GatewayMemoryConfig,
     GatewayProviderConfig, GatewayRuntimeConfig, GatewaySkillsConfig, GatewayThreadConfig,
     GatewayToolLoopBudgetConfig, GatewayToolRetryBudgetConfig, GatewayToolsConfig,
-    GatewayWebToolsConfig, InstallConfig,
+    GatewayVoiceConfig, GatewayWebToolsConfig, InstallConfig,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -350,11 +350,7 @@ pub(crate) fn test_config() -> AppConfig {
             cli_agent_runtime: GatewayCliAgentRuntimeConfig::default(),
             cli_agent_runtimes: GatewayCliAgentRuntimeInstancesConfig::default(),
             remote_access: Default::default(),
-            memory: GatewayMemoryConfig::default(),
-            thread_episodic: Default::default(),
-            hooks: Default::default(),
-            artifacts: GatewayArtifactsConfig::default(),
-            resilience: Default::default(),
+            voice: GatewayVoiceConfig::default(),
             provider: GatewayProviderConfig::default(),
             database: GatewayDatabaseConfig {
                 file_name: "gateway.db".to_owned(),
@@ -365,6 +361,11 @@ pub(crate) fn test_config() -> AppConfig {
                 sqlx_logging: false,
                 run_migrations_on_startup: true,
             },
+            memory: GatewayMemoryConfig::default(),
+            thread_episodic: Default::default(),
+            hooks: Default::default(),
+            artifacts: GatewayArtifactsConfig::default(),
+            resilience: Default::default(),
             auth: GatewayAuthConfig {
                 jwt_issuer: "pioneer".to_owned(),
                 jwt_audience: "pioneer-clients".to_owned(),

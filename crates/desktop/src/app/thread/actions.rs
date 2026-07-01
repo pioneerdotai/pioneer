@@ -206,6 +206,9 @@ impl PioneerDesktop {
     }
 
     pub(super) fn remove_composer_attachment_at(&mut self, index: usize) {
+        if self.desktop_voice_context_locked() {
+            return;
+        }
         if composer_attachments::remove_composer_attachment_at(
             &mut self.composer_attachments,
             index,
@@ -215,6 +218,9 @@ impl PioneerDesktop {
     }
 
     pub(super) fn remove_composer_capability_at(&mut self, index: usize) {
+        if self.desktop_voice_context_locked() {
+            return;
+        }
         composer_capabilities::remove_composer_capability_at(
             &mut self.composer_capabilities,
             index,
@@ -225,6 +231,9 @@ impl PioneerDesktop {
         &mut self,
         capabilities: impl IntoIterator<Item = ComposerCapability>,
     ) {
+        if self.desktop_voice_context_locked() {
+            return;
+        }
         for capability in capabilities {
             composer_capabilities::add_composer_capability(
                 &mut self.composer_capabilities,
@@ -566,6 +575,9 @@ impl PioneerDesktop {
     }
 
     fn append_composer_attachment_paths(&mut self, paths: Vec<PathBuf>) {
+        if self.desktop_voice_context_locked() {
+            return;
+        }
         composer_attachments::append_composer_attachment_paths(
             &mut self.composer_attachments,
             paths,
@@ -577,6 +589,9 @@ impl PioneerDesktop {
         artifact: ArtifactRef,
         cx: &mut Context<Self>,
     ) {
+        if self.desktop_voice_context_locked() {
+            return;
+        }
         if composer_attachments::add_composer_attachment_from_artifact(
             &mut self.composer_attachments,
             artifact,

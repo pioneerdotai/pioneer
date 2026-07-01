@@ -3,6 +3,7 @@ mod mode_selector;
 mod model_selector;
 mod permission_selector;
 mod view;
+mod voice;
 
 use crate::app::root::{GatewayConnectionState, PioneerDesktop};
 use gpui::prelude::*;
@@ -11,6 +12,13 @@ use pioneer_client::composer::turn_prepare::{
 };
 
 impl PioneerDesktop {
+    pub(in crate::app::thread) fn desktop_microphone_error_message(&self) -> Option<String> {
+        self.desktop_voice_error_message()
+            .map(str::to_owned)
+            .or_else(|| self.desktop_voice_status_error_message())
+            .or_else(|| self.desktop_microphone_gate.composer_error_message())
+    }
+
     pub(in crate::app::thread) fn can_submit_message(&self, cx: &Context<Self>) -> bool {
         if self.active_task_thread_navigation().is_some() {
             return false;

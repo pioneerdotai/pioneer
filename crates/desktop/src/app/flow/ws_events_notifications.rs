@@ -1,4 +1,6 @@
 use super::*;
+use crate::app::root::DesktopVoiceComposerState;
+use crate::audio::capture::DesktopVoiceCaptureErrorKind;
 use pioneer_client::notifications::router::{
     ArtifactDeletedRefreshReduction, ArtifactThreadRefreshReduction, CLIRuntimeRefreshReduction,
     ConversationEventReduction, SkillsRefreshReduction, ThreadArtifactsRefreshReduction,
@@ -7,6 +9,7 @@ use pioneer_client::notifications::router::{
 };
 use pioneer_client::runtime::{ClientRuntimeNotification, ClientRuntimeNotificationContext};
 use pioneer_client::workspaces::selectors as workspace_selectors;
+use pioneer_protocol::{VoiceError, VoiceSessionOutcome, VoiceSessionResultNotification};
 
 impl PioneerDesktop {
     pub(in crate::app::flow) fn apply_gateway_notification(
@@ -14,6 +17,11 @@ impl PioneerDesktop {
         notification: GatewayNotification,
         cx: &mut Context<Self>,
     ) {
+        if let GatewayNotification::VoiceSessionResult(notification) = notification {
+            self.apply_voice_session_result_notification(notification, cx);
+            return;
+        }
+
         let active_workspace = self.active_workspace_scope_for_notifications();
         let mcp_workspace = self.mcp_workspace_scope();
         let notification_thread_workspace_matches =
@@ -38,6 +46,32 @@ impl PioneerDesktop {
             return;
         };
         self.apply_gateway_notification_reduction(reduction, cx);
+    }
+
+    fn apply_voice_session_result_notification(
+        &mut self,
+        notification: VoiceSessionResultNotification,
+        cx: &mut Context<Self>,
+    ) {
+        match notification.outcome {
+            VoiceSessionOutcome::TurnStarted | VoiceSessionOutcome::Cancelled => {}
+            VoiceSessionOutcome::NoSpeech => {
+                self.desktop_voice_composer = DesktopVoiceComposerState::Error {
+                    kind: DesktopVoiceCaptureErrorKind::NoSpeech,
+                    message: desktop_voice_no_speech_message(notification.error.as_ref()),
+                };
+                cx.notify();
+            }
+            VoiceSessionOutcome::Failed => {
+                self.desktop_voice_composer = DesktopVoiceComposerState::Error {
+                    kind: DesktopVoiceCaptureErrorKind::GatewayFinalize,
+                    message: desktop_voice_transcription_failed_message(
+                        notification.error.as_ref(),
+                    ),
+                };
+                cx.notify();
+            }
+        }
     }
 
     fn notification_thread_workspace_matches(&self, notification: &GatewayNotification) -> bool {
@@ -419,4 +453,34 @@ impl PioneerDesktop {
             runtime_workspace_id,
         )
     }
+}
+
+fn desktop_voice_no_speech_message(error: Option<&VoiceError>) -> String {
+    let Some(details) = error.and_then(|error| desktop_voice_error_details(error.message.as_str()))
+    else {
+        return t!("chat.composer.voice.no_speech").to_string();
+    };
+
+    t!(
+        "chat.composer.voice.no_speech_with_details",
+        details = details.as_str()
+    )
+    .to_string()
+}
+
+fn desktop_voice_transcription_failed_message(error: Option<&VoiceError>) -> String {
+    let Some(error) = error else {
+        return t!("chat.composer.voice.transcription_failed").to_string();
+    };
+
+    t!(
+        "chat.composer.voice.transcription_failed_with_details",
+        error = error.message.as_str()
+    )
+    .to_string()
+}
+
+fn desktop_voice_error_details(message: &str) -> Option<String> {
+    let (_, details) = message.split_once("reason=")?;
+    Some(format!("reason={details}"))
 }

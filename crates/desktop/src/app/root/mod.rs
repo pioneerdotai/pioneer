@@ -12,6 +12,12 @@ use crate::{
         skills::details::table::SkillDiagnosticsTableDelegate,
         thread::{ThreadCoordinator, view::timeline::TimelineRenderModel},
     },
+    audio::{
+        capture::{
+            DesktopVoiceCaptureErrorKind, DesktopVoiceCaptureFlow, PlatformDesktopAudioInputBackend,
+        },
+        microphone::DesktopMicrophoneGateReport,
+    },
     gateway::{ClientRuntime, GatewayRuntime, GatewayWsCommandSender},
 };
 use gpui::{prelude::*, *};
@@ -27,8 +33,11 @@ pub(super) use pioneer_client::{
     artifacts::preview::ArtifactPreviewImagePaths as ThreadArtifactPreviewImagePaths,
     artifacts::state::{ThreadArtifactFilter, ThreadArtifactsState},
     cli_runtime::approvals::{CLIRuntimePendingRequestEntry, PendingRequest, PendingRequestState},
-    composer::attachments::{ComposerAttachment, ComposerAttachmentUploadState},
     composer::capabilities::{ComposerCapability, ComposerCapabilityKind},
+    composer::{
+        attachments::{ComposerAttachment, ComposerAttachmentUploadState},
+        turn_prepare::PreparedVoiceComposerSnapshot,
+    },
     gateway::runtime::GatewaySetupAction,
     providers::list::ProviderListState,
     providers::presentation::ProviderModelDisplayKey,
@@ -42,7 +51,7 @@ pub(super) use pioneer_client::{
 use pioneer_protocol::{
     CLIRuntimeThreadBinding, GatewaySettingsSnapshot, McpListItem, McpServerDetailsResponse,
     SkillHealthItem, SkillListItem, Thread, ThreadAgentsDocSummary, ThreadFolder, ThreadMode,
-    ThreadPlacement, TurnPermissionMode, Workspace,
+    ThreadPlacement, TurnPermissionMode, VoiceStatus, Workspace,
 };
 use std::{
     cell::RefCell,
@@ -187,6 +196,71 @@ pub(super) struct CachedTimelineTerminal {
     pub(super) view: Entity<TerminalView>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct DesktopVoiceHoldTarget {
+    pub(super) center: Point<Pixels>,
+    pub(super) radius: Pixels,
+}
+
+impl DesktopVoiceHoldTarget {
+    pub(super) fn contains(self, position: Point<Pixels>) -> bool {
+        let dx = position.x - self.center.x;
+        let dy = position.y - self.center.y;
+        let dx = f32::from(dx);
+        let dy = f32::from(dy);
+        let radius = f32::from(self.radius);
+        let distance_squared = dx * dx + dy * dy;
+        distance_squared <= radius * radius
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DesktopVoiceReleaseCandidate {
+    Send,
+    Cancel,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum DesktopVoiceComposerState {
+    Idle,
+    Preparing {
+        target: DesktopVoiceHoldTarget,
+        candidate: DesktopVoiceReleaseCandidate,
+        release_requested: bool,
+    },
+    Holding {
+        target: DesktopVoiceHoldTarget,
+        candidate: DesktopVoiceReleaseCandidate,
+    },
+    Finalizing,
+    Error {
+        kind: DesktopVoiceCaptureErrorKind,
+        message: String,
+    },
+}
+
+impl DesktopVoiceComposerState {
+    pub(super) fn is_active(&self) -> bool {
+        matches!(
+            self,
+            Self::Preparing { .. } | Self::Holding { .. } | Self::Finalizing
+        )
+    }
+
+    pub(super) fn error_message(&self) -> Option<&str> {
+        match self {
+            Self::Error { message, .. } => Some(message.as_str()),
+            _ => None,
+        }
+    }
+}
+
+impl Default for DesktopVoiceComposerState {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct TaskThreadNavigationEntry {
     pub(super) parent_thread_id: String,
@@ -234,6 +308,14 @@ pub struct PioneerDesktop {
     pub(super) composer_selected_model: Option<String>,
     pub(super) composer_selected_reasoning_effort: Option<String>,
     pub(super) composer_permission_mode: TurnPermissionMode,
+    pub(super) desktop_microphone_gate: DesktopMicrophoneGateReport,
+    pub(super) desktop_voice_status: VoiceStatus,
+    pub(super) desktop_voice_status_error: Option<String>,
+    pub(super) desktop_voice_status_poll_generation: u64,
+    pub(super) desktop_voice_composer: DesktopVoiceComposerState,
+    pub(super) desktop_voice_snapshot: Option<PreparedVoiceComposerSnapshot>,
+    pub(super) desktop_voice_capture:
+        Option<DesktopVoiceCaptureFlow<PlatformDesktopAudioInputBackend, GatewayWsCommandSender>>,
     pub(super) composer_model_selection_manually_selected: bool,
     pub(super) composer_model_display_cache: HashMap<ProviderModelDisplayKey, Option<String>>,
     pub(super) composer_model_display_loading_key: Option<ProviderModelDisplayKey>,

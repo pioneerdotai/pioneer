@@ -59,6 +59,7 @@ impl PioneerDesktop {
         });
         let client_runtime = ClientRuntime::new();
         let gateway_ws_command_sender = client_runtime.ws_command_sender();
+        let desktop_microphone_gate = DesktopMicrophoneGateReport::unknown();
         if let Ok(runtime_home) = state::runtime_home_dir() {
             let _ = gateway_ws_command_sender.set_artifact_cache_root(runtime_home);
         }
@@ -101,6 +102,13 @@ impl PioneerDesktop {
             composer_selected_model: None,
             composer_selected_reasoning_effort: None,
             composer_permission_mode: default_composer_permission_mode(),
+            desktop_microphone_gate,
+            desktop_voice_status: VoiceStatus::Unavailable,
+            desktop_voice_status_error: None,
+            desktop_voice_status_poll_generation: 0,
+            desktop_voice_composer: DesktopVoiceComposerState::Idle,
+            desktop_voice_snapshot: None,
+            desktop_voice_capture: None,
             composer_model_selection_manually_selected: false,
             composer_model_display_cache: HashMap::new(),
             composer_model_display_loading_key: None,

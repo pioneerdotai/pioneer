@@ -45,7 +45,15 @@ impl PioneerDesktop {
             self.clear_turn_resume_queue();
         }
 
+        if self.gateway.connection_state != GatewayConnectionState::Connected {
+            self.desktop_voice_status = pioneer_protocol::VoiceStatus::Unavailable;
+            self.desktop_voice_status_error = None;
+        }
+
         if let Some(cx) = cx.as_deref_mut() {
+            if self.gateway.connection_state == GatewayConnectionState::Connected {
+                self.refresh_desktop_voice_status(cx);
+            }
             execute_desktop_client_effects(self, reduction.effects, cx);
         }
     }

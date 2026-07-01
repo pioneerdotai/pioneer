@@ -23,6 +23,7 @@ impl PioneerDesktop {
         let attachments = self.composer_attachments.clone();
         let capabilities = self.composer_capabilities.clone();
         let upload_error = self.composer_upload_error.clone();
+        let microphone_error = self.desktop_microphone_error_message();
         let task_child_locked = self.active_task_thread_navigation().is_some();
         let can_send = self.can_submit_message(cx);
         let cli_runtime_selected = self.composer_selected_provider_is_cli_runtime();
@@ -59,6 +60,15 @@ impl PioneerDesktop {
             && attachments.is_empty()
             && capabilities.is_empty()
             && !composer_text.is_empty();
+        let desktop_voice_context_locked = self.desktop_voice_context_locked();
+        let desktop_voice_hold_ui_active = self.desktop_voice_hold_ui_active();
+        let desktop_voice_send_processing = self.desktop_voice_send_processing();
+        let show_desktop_voice_entry =
+            !has_in_flight_turn && self.can_show_desktop_voice_entry(composer_text.as_str());
+        let show_desktop_voice_button = desktop_voice_hold_ui_active || show_desktop_voice_entry;
+        let composer_action_loading = self.composer_upload_in_progress
+            || (has_in_flight_turn && is_cancelling)
+            || desktop_voice_send_processing;
 
         let composer_action_id = if has_in_flight_turn {
             "stop-turn"
@@ -66,7 +76,9 @@ impl PioneerDesktop {
             "send-message"
         };
 
-        let composer_action_disabled = if has_in_flight_turn {
+        let composer_action_disabled = if desktop_voice_send_processing {
+            false
+        } else if has_in_flight_turn {
             !can_stop
         } else {
             !can_send
@@ -83,6 +95,21 @@ impl PioneerDesktop {
                         .border_color(cx.theme().border)
                         .rounded_2xl()
                         .shadow_xs()
+                        .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, _, cx| {
+                            view.update_desktop_voice_hold_pointer(event.position, cx);
+                        }))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|view, event: &MouseUpEvent, _, cx| {
+                                view.release_desktop_voice_hold_at(event.position, cx);
+                            }),
+                        )
+                        .on_mouse_up_out(
+                            MouseButton::Left,
+                            cx.listener(|view, event: &MouseUpEvent, _, cx| {
+                                view.release_desktop_voice_hold_at(event.position, cx);
+                            }),
+                        )
                         .child(
                             v_flex()
                                 .bg(cx.theme().background)
@@ -119,11 +146,41 @@ impl PioneerDesktop {
                                             ),
                                     )
                                 })
-                                .child(
+                                .when_some(microphone_error, |this, error| {
+                                    this.child(
+                                        h_flex()
+                                            .mx_2()
+                                            .mb_2()
+                                            .gap_2()
+                                            .items_start()
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(cx.theme().danger.opacity(0.25))
+                                            .bg(cx.theme().danger.opacity(0.08))
+                                            .px_2()
+                                            .py_1p5()
+                                            .child(
+                                                Icon::new(IconName::TriangleAlert)
+                                                    .size_3()
+                                                    .text_color(cx.theme().danger),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .line_height(relative(1.25))
+                                                    .text_color(cx.theme().danger)
+                                                    .child(error),
+                                            ),
+                                    )
+                                })
+                                .child(if desktop_voice_hold_ui_active {
+                                    self.render_desktop_voice_hold_prompt(cx)
+                                } else {
                                     Input::new(&composer_state)
                                         .appearance(false)
-                                        .disabled(task_child_locked),
-                                ),
+                                        .disabled(task_child_locked || desktop_voice_context_locked)
+                                        .into_any_element()
+                                }),
                         )
                         .child(
                             h_flex()
@@ -166,15 +223,14 @@ impl PioneerDesktop {
                                                     )),
                                             )
                                         })
-                                        .child(
+                                        .child(if show_desktop_voice_button {
+                                            self.render_desktop_voice_idle_button(cx)
+                                        } else {
                                             Button::new(composer_action_id)
                                                 .primary()
                                                 .rounded_full()
                                                 .disabled(composer_action_disabled)
-                                                .loading(
-                                                    self.composer_upload_in_progress
-                                                        || (has_in_flight_turn && is_cancelling),
-                                                )
+                                                .loading(composer_action_loading)
                                                 .when(has_in_flight_turn, |this| {
                                                     this.icon(PioneerIconName::Square)
                                                 })
@@ -191,8 +247,9 @@ impl PioneerDesktop {
                                                             );
                                                         }
                                                     },
-                                                )),
-                                        ),
+                                                ))
+                                                .into_any_element()
+                                        }),
                                 ),
                         ),
                 ),
@@ -202,8 +259,9 @@ impl PioneerDesktop {
 
     fn render_composer_add_menu(&self, cx: &mut Context<Self>) -> AnyElement {
         let desktop_entity = cx.entity().clone();
-        let disabled =
-            self.composer_upload_in_progress || self.active_task_thread_navigation().is_some();
+        let disabled = self.composer_upload_in_progress
+            || self.active_task_thread_navigation().is_some()
+            || self.desktop_voice_context_locked();
         let cli_runtime_selected = self.composer_selected_provider_is_cli_runtime();
 
         Button::new("composer-add-attachment")
@@ -434,7 +492,9 @@ impl PioneerDesktop {
                     .xsmall()
                     .compact()
                     .icon(IconName::Close)
-                    .disabled(self.composer_upload_in_progress)
+                    .disabled(
+                        self.composer_upload_in_progress || self.desktop_voice_context_locked(),
+                    )
                     .rounded_full()
                     .on_click(cx.listener(move |view, _, _, cx| {
                         view.remove_composer_attachment_at(index);
@@ -519,7 +579,9 @@ impl PioneerDesktop {
                     .xsmall()
                     .compact()
                     .icon(IconName::Close)
-                    .disabled(self.composer_upload_in_progress)
+                    .disabled(
+                        self.composer_upload_in_progress || self.desktop_voice_context_locked(),
+                    )
                     .rounded_full()
                     .on_click(cx.listener(move |view, _, _, cx| {
                         view.remove_composer_capability_at(index);

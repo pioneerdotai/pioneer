@@ -34,6 +34,7 @@ sys-locale.workspace = true
 rust-embed.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
 image.workspace = true
+cpal.workspace = true
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
