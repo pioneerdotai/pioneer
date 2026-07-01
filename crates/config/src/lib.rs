@@ -57,6 +57,8 @@ pub struct GatewayConfig {
     pub cli_agent_runtimes: GatewayCliAgentRuntimeInstancesConfig,
     #[serde(default)]
     pub remote_access: GatewayRemoteAccessConfig,
+    #[serde(default)]
+    pub voice: GatewayVoiceConfig,
     pub provider: GatewayProviderConfig,
     pub database: GatewayDatabaseConfig,
     #[serde(default)]
@@ -70,6 +72,43 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub resilience: GatewayResilienceConfig,
     pub auth: GatewayAuthConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GatewayVoiceConfig {
+    #[serde(default = "default_gateway_voice_models_dir")]
+    pub models_dir: String,
+    #[serde(default)]
+    pub transcription_strategy: GatewayVoiceTranscriptionStrategy,
+}
+
+impl Default for GatewayVoiceConfig {
+    fn default() -> Self {
+        Self {
+            models_dir: default_gateway_voice_models_dir(),
+            transcription_strategy: GatewayVoiceTranscriptionStrategy::default(),
+        }
+    }
+}
+
+impl GatewayVoiceConfig {
+    pub fn resolve_models_root(&self, runtime_home: &Path) -> Result<PathBuf> {
+        let models_dir =
+            normalize_runtime_dir_path(self.models_dir.as_str(), "gateway.voice.models_dir")?;
+        Ok(runtime_home.join(models_dir))
+    }
+}
+
+fn default_gateway_voice_models_dir() -> String {
+    "models/voice".to_owned()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayVoiceTranscriptionStrategy {
+    #[default]
+    BufferedGatewaySession,
+    ExperimentalStreaming,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -3724,6 +3763,19 @@ active_recall_model = { source = "custom", model_provider = "legacy-provider", m
                 .expect("memory capsules root should resolve"),
             PathBuf::from("/tmp/pioneer-runtime/memory/capsules")
         );
+        assert_eq!(config.gateway.voice.models_dir, "models/voice");
+        assert_eq!(
+            config.gateway.voice.transcription_strategy,
+            super::GatewayVoiceTranscriptionStrategy::BufferedGatewaySession
+        );
+        assert_eq!(
+            config
+                .gateway
+                .voice
+                .resolve_models_root(PathBuf::from("/tmp/pioneer-runtime").as_path())
+                .expect("voice models root should resolve"),
+            PathBuf::from("/tmp/pioneer-runtime/models/voice")
+        );
         assert!(config.gateway.thread_episodic.enabled);
         assert!(config.gateway.thread_episodic.indexing_enabled);
         assert!(config.gateway.thread_episodic.recall_enabled);
@@ -3760,6 +3812,23 @@ active_recall_model = { source = "custom", model_provider = "legacy-provider", m
                     .resolve_capsules_root(PathBuf::from("/tmp/pioneer-runtime").as_path())
                     .is_err(),
                 "capsules_dir `{capsules_dir}` must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn gateway_voice_config_rejects_unsafe_model_dirs() {
+        for models_dir in ["", "/tmp/models", "../models", "models/../voice", "."] {
+            let config = super::GatewayVoiceConfig {
+                models_dir: models_dir.to_owned(),
+                ..super::GatewayVoiceConfig::default()
+            };
+
+            assert!(
+                config
+                    .resolve_models_root(PathBuf::from("/tmp/pioneer-runtime").as_path())
+                    .is_err(),
+                "models_dir `{models_dir}` must be rejected"
             );
         }
     }

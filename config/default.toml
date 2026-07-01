@@ -203,6 +203,10 @@ restart_jitter_percent = 20
 # 0 means retry indefinitely.
 max_restarts = 0
 
+[gateway.voice]
+models_dir = "models/voice"
+transcription_strategy = "buffered_gateway_session"
+
 [gateway.provider.attachments]
 max_bytes_per_attachment = 104857600
 max_total_bytes_per_request = 209715200
