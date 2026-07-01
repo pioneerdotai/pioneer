@@ -387,6 +387,8 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
   <string>${MACOS_ICON_NAME}</string>
   <key>LSMinimumSystemVersion</key>
   <string>12.0</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Pioneer uses your microphone for voice input while you hold to talk.</string>
 </dict>
 </plist>
 PLIST
