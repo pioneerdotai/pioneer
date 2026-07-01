@@ -7,6 +7,23 @@ use pioneer_cli_agent_runtime::claude::{ClaudeModelSnapshot, ClaudeProbe};
 use pioneer_cli_agent_runtime::codex::{CodexModelListProbeStatus, CodexModelSnapshot, CodexProbe};
 use pioneer_protocol::{AgentExecutionBackend, CLIAgentRuntimeKind, UserInput};
 
+pub(super) struct PreparedApiProviderTurnStart {
+    outcome: crate::thread::TurnStartOutcome,
+    workspace_skill_policies:
+        HashMap<pioneer_skills::SkillPolicyKey, pioneer_agent::WorkspaceSkillPolicy>,
+    resolved_artifacts: Vec<ResolvedArtifactInput>,
+    runtime_environment: HashMap<String, String>,
+    history: Vec<ChatMessage>,
+    effective_reasoning_effort: Option<String>,
+    permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TurnStartSuccessResponse {
+    TurnStart,
+    VoiceSessionFinalize,
+}
+
 fn cli_runtime_forbidden_input_kind(input: &UserInput) -> Option<&'static str> {
     match input {
         UserInput::Text { .. } => None,
@@ -87,6 +104,7 @@ impl MessageProcessor {
                             params,
                             runtime_id,
                             runtime_kind,
+                            TurnStartSuccessResponse::TurnStart,
                         )
                         .await;
                         return;
@@ -97,7 +115,7 @@ impl MessageProcessor {
                             JsonRpcErrorResponse::new(
                                 Some(request_id),
                                 INVALID_REQUEST_CODE,
-                                format!("ACP agent runtime `{runtime_id}` is not supported yet"),
+                                format!("ACP agent runtime `{runtime_id}` is not supported"),
                             ),
                         )
                         .await;
@@ -107,336 +125,319 @@ impl MessageProcessor {
                 }
             }
 
-            let outcome = match self.thread_manager.turn_start(connection_id, params).await {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    self.send_error(
-                        connection_id,
-                        JsonRpcErrorResponse::new(
-                            Some(request_id),
-                            INVALID_REQUEST_CODE,
-                            format!("failed to start turn: {error:#}"),
-                        ),
-                    )
-                    .await;
-                    return;
-                }
-            };
-            if let Err(message) = self
-                .validate_turn_reasoning_effort(
-                    outcome.started_notification.workspace_id.as_str(),
-                    ReasoningModelLookupBackend::ApiProvider {
-                        provider: outcome.materialization.thread.model_provider.as_str(),
-                    },
-                    outcome.materialization.thread.model.as_str(),
+            let prepared = match self
+                .prepare_api_provider_turn_start(
+                    connection_id,
+                    params,
                     requested_reasoning_effort.as_deref(),
                 )
                 .await
             {
-                self.thread_manager
-                    .rollback_turn_start(outcome.rollback_context.clone())
-                    .await;
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
-                )
-                .await;
-                return;
-            }
-            let effective_reasoning_effort = requested_reasoning_effort
-                .as_deref()
-                .map(normalized_reasoning_effort_for_comparison);
-            if let Err(error) = self
-                .validate_artifact_user_inputs(
-                    outcome.started_notification.workspace_id.as_str(),
-                    outcome.materialization.input.as_slice(),
-                )
-                .await
-            {
-                self.thread_manager
-                    .rollback_turn_start(outcome.rollback_context.clone())
-                    .await;
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to validate artifact input: {error:#}"),
-                    ),
-                )
-                .await;
-                return;
-            }
-            let profile_selected_audit = match self.turn_profile_selected_audit_event(&outcome) {
-                Ok(event) => event,
-                Err(error) => {
-                    self.thread_manager
-                        .rollback_turn_start(outcome.rollback_context.clone())
-                        .await;
+                Ok(prepared) => prepared,
+                Err(message) => {
                     self.send_error(
                         connection_id,
-                        JsonRpcErrorResponse::new(
-                            Some(request_id),
-                            INVALID_REQUEST_CODE,
-                            format!("failed to resolve turn permission profile: {error:#}"),
-                        ),
+                        JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
                     )
                     .await;
                     return;
                 }
             };
-            if let Err(error) = message_future(
-                self.crud_store
-                    .materialize_turn_start_with_reasoning_effort_and_permission_audit(
-                        &outcome.materialization.thread,
-                        outcome.materialization.sandbox_mode,
-                        &outcome.materialization.turn,
-                        &outcome.materialization.input,
-                        effective_reasoning_effort.as_deref(),
-                        profile_selected_audit,
-                    ),
-            )
-            .await
-            {
-                self.thread_manager
-                    .rollback_turn_start(outcome.rollback_context.clone())
-                    .await;
-
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!(
-                            "failed to persist turn/start state and permission audit: {error:#}"
-                        ),
-                    ),
-                )
+            self.finish_turn_start_success(connection_id, request_id, &prepared.outcome)
                 .await;
-                return;
-            }
-            self.ensure_hook_runtime_with_run_store().await;
-            if let Err(error) = self
-                .agent_manager
-                .ensure_thread(
-                    outcome.started_notification.thread_id.as_str(),
-                    outcome.started_notification.workspace_id.as_str(),
-                )
-                .await
-            {
-                self.report_turn_failure(
-                    outcome.started_notification.thread_id.clone(),
-                    outcome.started_notification.turn.id.clone(),
-                    TurnFailureRecoveryKind::TurnStart,
-                    format!("failed to prepare agent thread runtime: {error}"),
-                )
+            self.dispatch_prepared_api_provider_turn_start(prepared)
                 .await;
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to prepare agent thread runtime: {error}"),
-                    ),
-                )
-                .await;
-                return;
-            }
-            self.ensure_agent_listener_task(outcome.started_notification.thread_id.as_str())
-                .await;
-            let history = self
-                .load_conversation_history_for_workspace(
-                    outcome.started_notification.workspace_id.as_str(),
-                    outcome.started_notification.thread_id.as_str(),
-                    outcome.started_notification.turn.id.as_str(),
-                )
-                .await;
-            let workspace_skill_policies = match self
-                .crud_store
-                .list_workspace_skill_policies(outcome.started_notification.workspace_id.as_str())
-                .await
-            {
-                Ok(records) => records
-                    .into_iter()
-                    .map(|record| {
-                        (
-                            pioneer_skills::SkillPolicyKey::new(
-                                record.skill_slug,
-                                record.source_kind,
-                            ),
-                            pioneer_agent::WorkspaceSkillPolicy {
-                                enabled: record.enabled,
-                                allow_implicit_invocation: record.allow_implicit_invocation,
-                            },
-                        )
-                    })
-                    .collect::<std::collections::HashMap<_, _>>(),
-                Err(error) => {
-                    warn!(
-                        workspace_id = outcome.started_notification.workspace_id,
-                        error = %format!("{error:#}"),
-                        "failed to load workspace skill policies; continuing with defaults"
-                    );
-                    std::collections::HashMap::new()
-                }
-            };
-            let resolved_artifacts = match self
-                .resolve_provider_artifact_inputs(
-                    outcome.started_notification.workspace_id.as_str(),
-                    outcome.materialization.input.as_slice(),
-                )
-                .await
-            {
-                Ok(resolved_artifacts) => resolved_artifacts,
-                Err(error) => {
-                    self.report_turn_failure(
-                        outcome.started_notification.thread_id.clone(),
-                        outcome.started_notification.turn.id.clone(),
-                        TurnFailureRecoveryKind::TurnStart,
-                        format!("failed to resolve artifact input for provider: {error:#}"),
-                    )
-                    .await;
-                    self.send_error(
-                        connection_id,
-                        JsonRpcErrorResponse::new(
-                            Some(request_id),
-                            INVALID_REQUEST_CODE,
-                            format!("failed to resolve artifact input for provider: {error:#}"),
-                        ),
-                    )
-                    .await;
-                    return;
-                }
-            };
-            let runtime_environment = match self
-                .create_artifact_output_environment(
-                    outcome.started_notification.workspace_id.as_str(),
-                    outcome.started_notification.thread_id.as_str(),
-                    outcome.started_notification.turn.id.as_str(),
-                )
-                .await
-            {
-                Ok(runtime_environment) => runtime_environment.into_iter().collect(),
-                Err(error) => {
-                    self.report_turn_failure(
-                        outcome.started_notification.thread_id.clone(),
-                        outcome.started_notification.turn.id.clone(),
-                        TurnFailureRecoveryKind::TurnStart,
-                        format!("failed to prepare artifact output directory: {error:#}"),
-                    )
-                    .await;
-                    self.send_error(
-                        connection_id,
-                        JsonRpcErrorResponse::new(
-                            Some(request_id),
-                            INVALID_REQUEST_CODE,
-                            format!("failed to prepare artifact output directory: {error:#}"),
-                        ),
-                    )
-                    .await;
-                    return;
-                }
-            };
-            let hook_runtime_context = pioneer_agent::AgentTurnHookRuntimeContext::default();
-            if let Err(error) = self
-                .persist_turn_runtime_snapshot(
-                    outcome.started_notification.thread_id.as_str(),
-                    outcome.started_notification.workspace_id.as_str(),
-                    outcome.started_notification.turn.id.as_str(),
-                    outcome.materialization.thread.mode,
-                    &hook_runtime_context,
-                    &outcome.materialization.thread.model,
-                    &outcome.materialization.thread.model_provider,
-                    effective_reasoning_effort.as_deref(),
-                    &workspace_skill_policies,
-                    outcome.materialization.input.as_slice(),
-                    outcome.materialization.capabilities.as_slice(),
-                    resolved_artifacts.as_slice(),
-                    &runtime_environment,
-                    history.as_slice(),
-                )
-                .await
-            {
-                self.report_turn_failure(
-                    outcome.started_notification.thread_id.clone(),
-                    outcome.started_notification.turn.id.clone(),
-                    TurnFailureRecoveryKind::TurnStart,
-                    format!("failed to persist turn runtime snapshot: {error:#}"),
-                )
-                .await;
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to persist turn runtime snapshot: {error:#}"),
-                    ),
-                )
-                .await;
-                return;
-            }
-            let permission_profile =
-                match self.materialized_turn_permission_profile(&outcome.materialization.turn) {
-                    Ok(permission_profile) => permission_profile,
-                    Err(error) => {
-                        self.report_turn_failure(
-                            outcome.started_notification.thread_id.clone(),
-                            outcome.started_notification.turn.id.clone(),
-                            TurnFailureRecoveryKind::TurnStart,
-                            format!("failed to resolve turn permission profile: {error:#}"),
-                        )
-                        .await;
-                        self.send_error(
-                            connection_id,
-                            JsonRpcErrorResponse::new(
-                                Some(request_id),
-                                INVALID_REQUEST_CODE,
-                                format!("failed to resolve turn permission profile: {error:#}"),
-                            ),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-            self.finish_turn_start_success(connection_id, request_id, &outcome)
-                .await;
-            if let Err(error) = self
-                .agent_manager
-                .start_turn_with_resolved_artifacts_environment_reasoning_and_permission_profile(
-                    outcome.started_notification.thread_id.as_str(),
-                    outcome.started_notification.turn.id.as_str(),
-                    outcome.materialization.thread.mode,
-                    &outcome.materialization.thread.model,
-                    &outcome.materialization.thread.model_provider,
-                    workspace_skill_policies,
-                    outcome.materialization.input.clone(),
-                    outcome.materialization.capabilities.clone(),
-                    resolved_artifacts,
-                    runtime_environment,
-                    history,
-                    effective_reasoning_effort.as_deref(),
-                    permission_profile,
-                )
-                .await
-            {
-                self.report_turn_failure(
-                    outcome.started_notification.thread_id.clone(),
-                    outcome.started_notification.turn.id.clone(),
-                    TurnFailureRecoveryKind::TurnDispatch,
-                    format!("failed to dispatch turn to agent runtime: {error}"),
-                )
-                .await;
-            }
         })
     }
 
-    fn turn_start_cli_runtime<'a>(
+    pub(super) async fn prepare_api_provider_turn_start(
+        &self,
+        connection_id: ConnectionId,
+        params: TurnStartParams,
+        requested_reasoning_effort: Option<&str>,
+    ) -> Result<PreparedApiProviderTurnStart, String> {
+        let outcome = self
+            .thread_manager
+            .turn_start(connection_id, params)
+            .await
+            .map_err(|error| format!("failed to start turn: {error:#}"))?;
+        if let Err(message) = self
+            .validate_turn_reasoning_effort(
+                outcome.started_notification.workspace_id.as_str(),
+                ReasoningModelLookupBackend::ApiProvider {
+                    provider: outcome.materialization.thread.model_provider.as_str(),
+                },
+                outcome.materialization.thread.model.as_str(),
+                requested_reasoning_effort,
+            )
+            .await
+        {
+            self.thread_manager
+                .rollback_turn_start(outcome.rollback_context.clone())
+                .await;
+            return Err(message);
+        }
+
+        let effective_reasoning_effort =
+            requested_reasoning_effort.map(normalized_reasoning_effort_for_comparison);
+        if let Err(error) = self
+            .validate_artifact_user_inputs(
+                outcome.started_notification.workspace_id.as_str(),
+                outcome.materialization.input.as_slice(),
+            )
+            .await
+        {
+            self.thread_manager
+                .rollback_turn_start(outcome.rollback_context.clone())
+                .await;
+            return Err(format!("failed to validate artifact input: {error:#}"));
+        }
+
+        let profile_selected_audit = match self.turn_profile_selected_audit_event(&outcome) {
+            Ok(event) => event,
+            Err(error) => {
+                self.thread_manager
+                    .rollback_turn_start(outcome.rollback_context.clone())
+                    .await;
+                return Err(format!(
+                    "failed to resolve turn permission profile: {error:#}"
+                ));
+            }
+        };
+        if let Err(error) = message_future(
+            self.crud_store
+                .materialize_turn_start_with_reasoning_effort_and_permission_audit(
+                    &outcome.materialization.thread,
+                    outcome.materialization.sandbox_mode,
+                    &outcome.materialization.turn,
+                    &outcome.materialization.input,
+                    effective_reasoning_effort.as_deref(),
+                    profile_selected_audit,
+                ),
+        )
+        .await
+        {
+            self.thread_manager
+                .rollback_turn_start(outcome.rollback_context.clone())
+                .await;
+
+            return Err(format!(
+                "failed to persist turn/start state and permission audit: {error:#}"
+            ));
+        }
+
+        self.ensure_hook_runtime_with_run_store().await;
+        if let Err(error) = self
+            .agent_manager
+            .ensure_thread(
+                outcome.started_notification.thread_id.as_str(),
+                outcome.started_notification.workspace_id.as_str(),
+            )
+            .await
+        {
+            self.report_turn_failure(
+                outcome.started_notification.thread_id.clone(),
+                outcome.started_notification.turn.id.clone(),
+                TurnFailureRecoveryKind::TurnStart,
+                format!("failed to prepare agent thread runtime: {error}"),
+            )
+            .await;
+            return Err(format!("failed to prepare agent thread runtime: {error}"));
+        }
+
+        self.ensure_agent_listener_task(outcome.started_notification.thread_id.as_str())
+            .await;
+        let history = self
+            .load_conversation_history_for_workspace(
+                outcome.started_notification.workspace_id.as_str(),
+                outcome.started_notification.thread_id.as_str(),
+                outcome.started_notification.turn.id.as_str(),
+            )
+            .await;
+        let workspace_skill_policies = match self
+            .crud_store
+            .list_workspace_skill_policies(outcome.started_notification.workspace_id.as_str())
+            .await
+        {
+            Ok(records) => records
+                .into_iter()
+                .map(|record| {
+                    (
+                        pioneer_skills::SkillPolicyKey::new(record.skill_slug, record.source_kind),
+                        pioneer_agent::WorkspaceSkillPolicy {
+                            enabled: record.enabled,
+                            allow_implicit_invocation: record.allow_implicit_invocation,
+                        },
+                    )
+                })
+                .collect::<HashMap<_, _>>(),
+            Err(error) => {
+                warn!(
+                    workspace_id = outcome.started_notification.workspace_id,
+                    error = %format!("{error:#}"),
+                    "failed to load workspace skill policies; continuing with defaults"
+                );
+                HashMap::new()
+            }
+        };
+        let resolved_artifacts = match self
+            .resolve_provider_artifact_inputs(
+                outcome.started_notification.workspace_id.as_str(),
+                outcome.materialization.input.as_slice(),
+            )
+            .await
+        {
+            Ok(resolved_artifacts) => resolved_artifacts,
+            Err(error) => {
+                self.report_turn_failure(
+                    outcome.started_notification.thread_id.clone(),
+                    outcome.started_notification.turn.id.clone(),
+                    TurnFailureRecoveryKind::TurnStart,
+                    format!("failed to resolve artifact input for provider: {error:#}"),
+                )
+                .await;
+                return Err(format!(
+                    "failed to resolve artifact input for provider: {error:#}"
+                ));
+            }
+        };
+        let runtime_environment = match self
+            .create_artifact_output_environment(
+                outcome.started_notification.workspace_id.as_str(),
+                outcome.started_notification.thread_id.as_str(),
+                outcome.started_notification.turn.id.as_str(),
+            )
+            .await
+        {
+            Ok(runtime_environment) => runtime_environment.into_iter().collect::<HashMap<_, _>>(),
+            Err(error) => {
+                self.report_turn_failure(
+                    outcome.started_notification.thread_id.clone(),
+                    outcome.started_notification.turn.id.clone(),
+                    TurnFailureRecoveryKind::TurnStart,
+                    format!("failed to prepare artifact output directory: {error:#}"),
+                )
+                .await;
+                return Err(format!(
+                    "failed to prepare artifact output directory: {error:#}"
+                ));
+            }
+        };
+        let hook_runtime_context = pioneer_agent::AgentTurnHookRuntimeContext::default();
+        if let Err(error) = self
+            .persist_turn_runtime_snapshot(
+                outcome.started_notification.thread_id.as_str(),
+                outcome.started_notification.workspace_id.as_str(),
+                outcome.started_notification.turn.id.as_str(),
+                outcome.materialization.thread.mode,
+                &hook_runtime_context,
+                &outcome.materialization.thread.model,
+                &outcome.materialization.thread.model_provider,
+                effective_reasoning_effort.as_deref(),
+                &workspace_skill_policies,
+                outcome.materialization.input.as_slice(),
+                outcome.materialization.capabilities.as_slice(),
+                resolved_artifacts.as_slice(),
+                &runtime_environment,
+                history.as_slice(),
+            )
+            .await
+        {
+            self.report_turn_failure(
+                outcome.started_notification.thread_id.clone(),
+                outcome.started_notification.turn.id.clone(),
+                TurnFailureRecoveryKind::TurnStart,
+                format!("failed to persist turn runtime snapshot: {error:#}"),
+            )
+            .await;
+            return Err(format!(
+                "failed to persist turn runtime snapshot: {error:#}"
+            ));
+        }
+        let permission_profile =
+            match self.materialized_turn_permission_profile(&outcome.materialization.turn) {
+                Ok(permission_profile) => permission_profile,
+                Err(error) => {
+                    self.report_turn_failure(
+                        outcome.started_notification.thread_id.clone(),
+                        outcome.started_notification.turn.id.clone(),
+                        TurnFailureRecoveryKind::TurnStart,
+                        format!("failed to resolve turn permission profile: {error:#}"),
+                    )
+                    .await;
+                    return Err(format!(
+                        "failed to resolve turn permission profile: {error:#}"
+                    ));
+                }
+            };
+
+        Ok(PreparedApiProviderTurnStart {
+            outcome,
+            workspace_skill_policies,
+            resolved_artifacts,
+            runtime_environment,
+            history,
+            effective_reasoning_effort,
+            permission_profile,
+        })
+    }
+
+    pub(super) async fn finish_api_provider_turn_start_without_response(
+        &self,
+        connection_id: ConnectionId,
+        prepared: &PreparedApiProviderTurnStart,
+    ) {
+        self.session_manager
+            .set_connection_workspace(
+                connection_id,
+                Some(prepared.outcome.started_notification.workspace_id.clone()),
+            )
+            .await;
+        self.publish_turn_start_success(&prepared.outcome).await;
+    }
+
+    pub(super) async fn dispatch_prepared_api_provider_turn_start(
+        &self,
+        prepared: PreparedApiProviderTurnStart,
+    ) {
+        let outcome = prepared.outcome;
+        if let Err(error) = self
+            .agent_manager
+            .start_turn_with_resolved_artifacts_environment_reasoning_and_permission_profile(
+                outcome.started_notification.thread_id.as_str(),
+                outcome.started_notification.turn.id.as_str(),
+                outcome.materialization.thread.mode,
+                &outcome.materialization.thread.model,
+                &outcome.materialization.thread.model_provider,
+                prepared.workspace_skill_policies,
+                outcome.materialization.input.clone(),
+                outcome.materialization.capabilities.clone(),
+                prepared.resolved_artifacts,
+                prepared.runtime_environment,
+                prepared.history,
+                prepared.effective_reasoning_effort.as_deref(),
+                prepared.permission_profile,
+            )
+            .await
+        {
+            self.report_turn_failure(
+                outcome.started_notification.thread_id.clone(),
+                outcome.started_notification.turn.id.clone(),
+                TurnFailureRecoveryKind::TurnDispatch,
+                format!("failed to dispatch turn to agent runtime: {error}"),
+            )
+            .await;
+        }
+    }
+
+    pub(super) fn turn_start_cli_runtime<'a>(
         &'a self,
         connection_id: ConnectionId,
         request_id: RequestId,
         mut params: TurnStartParams,
         runtime_id: String,
         runtime_kind: CLIAgentRuntimeKind,
+        success_response: TurnStartSuccessResponse,
     ) -> MessageFuture<'a, ()> {
         message_future(async move {
             let Some(runtime_config) = self
@@ -1012,8 +1013,23 @@ impl MessageProcessor {
                 .await;
                 return;
             }
-            self.finish_turn_start_success(connection_id, request_id, &outcome)
-                .await;
+            let success_sent = match success_response {
+                TurnStartSuccessResponse::TurnStart => {
+                    self.finish_turn_start_success(connection_id, request_id, &outcome)
+                        .await
+                }
+                TurnStartSuccessResponse::VoiceSessionFinalize => {
+                    self.finish_voice_session_finalize_turn_start_success(
+                        connection_id,
+                        request_id,
+                        &outcome,
+                    )
+                    .await
+                }
+            };
+            if !success_sent {
+                return;
+            }
             let native_turn = match cli_session
                 .start_turn(
                     crate::cli_runtime::manager::CLIAgentRuntimeTurnStartParams {
@@ -1431,6 +1447,53 @@ impl MessageProcessor {
             );
             return false;
         }
+        self.publish_turn_start_success(outcome).await
+    }
+
+    async fn finish_voice_session_finalize_turn_start_success(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        outcome: &crate::thread::TurnStartOutcome,
+    ) -> bool {
+        self.session_manager
+            .set_connection_workspace(
+                connection_id,
+                Some(outcome.started_notification.workspace_id.clone()),
+            )
+            .await;
+        let response = match JsonRpcResponse::from_result(
+            request_id,
+            &VoiceSessionFinalizeResponse {
+                status: VoiceStatus::Ready,
+            },
+        ) {
+            Ok(response) => response,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        None,
+                        INVALID_REQUEST_CODE,
+                        format!("failed to encode voice finalize response: {error}"),
+                    ),
+                )
+                .await;
+                return false;
+            }
+        };
+        if let Err(error) = self.send_json(connection_id, &response).await {
+            warn!(
+                connection_id,
+                error = %format!("{error:#}"),
+                "failed to send voice finalize response after CLI runtime turn start"
+            );
+            return false;
+        }
+        self.publish_turn_start_success(outcome).await
+    }
+
+    async fn publish_turn_start_success(&self, outcome: &crate::thread::TurnStartOutcome) -> bool {
         let notification = match JsonRpcNotification::from_params(
             events::TURN_STARTED,
             &outcome.started_notification,
@@ -2731,7 +2794,7 @@ fn provider_model_from_runtime_model_for_reasoning_lookup(
     }
 }
 
-fn requested_reasoning_effort(params: &TurnStartParams) -> Option<String> {
+pub(super) fn requested_reasoning_effort(params: &TurnStartParams) -> Option<String> {
     params
         .reasoning
         .as_ref()

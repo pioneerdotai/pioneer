@@ -111,6 +111,7 @@ use pioneer_protocol::{
     TurnCompletedNotification, TurnFailedNotification, TurnGetResponse, TurnItem,
     TurnItemEventPayload, TurnItemType, TurnKind, TurnOrigin, TurnRejectedCapability,
     TurnSkillBinding, TurnStartResponse, TurnStatus, UserInput, UserMessageAttachment,
+    VoiceErrorKind, VoiceSessionOutcome, VoiceSessionResultNotification, VoiceStatus,
     WorkspaceChangeKind, WorkspaceChangedNotification, WorkspaceCreateResponse,
     WorkspaceDefaultResponse, WorkspaceListResponse, WorkspaceSelectResponse,
     WorkspaceUpdateResponse, constants::events,
@@ -4514,6 +4515,505 @@ async fn turn_start_with_capabilities_materializes_user_message_attachments() {
         )),
         "semantic timeline user block must preserve MCP chips"
     );
+}
+
+struct StaticGatewayVoiceTranscriber {
+    text: &'static str,
+}
+
+impl crate::voice::transcription::VoiceSpeechTranscriber for StaticGatewayVoiceTranscriber {
+    fn transcribe_speech(
+        &self,
+        _buffer: &crate::voice::transcription::PreparedSpeechBuffer,
+    ) -> Result<String, crate::voice::transcription::VoiceTranscriptionError> {
+        Ok(self.text.to_owned())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn voice_session_transcript_starts_turn_and_preserves_context_attachments() {
+    let (tx, mut rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let capture_provider = Arc::new(CaptureSummaryProvider::new("voice answer"));
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        capture_provider.clone(),
+    ));
+    let processor = MessageProcessor::new(
+        thread_manager,
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_voice_model_bootstrap(Arc::new(
+        crate::voice::model_bootstrap::VoiceModelBootstrapHandle::ready(),
+    ))
+    .with_voice_transcriber(StaticGatewayVoiceTranscriber {
+        text: "voice transcript with context",
+    });
+    let artifact =
+        ingest_user_test_artifact(&processor, workspace_id.as_str(), "voice-artifact.txt").await;
+    let thread = start_thread_for_artifact_test(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        "thr_voice_turn_context",
+    )
+    .await;
+
+    let start_request_id = generate_test_request_id("voice", "start_success");
+    let start_request = json!({
+        "jsonrpc": "2.0",
+        "id": start_request_id.clone(),
+        "method": "voice/session/start",
+        "params": {
+            "context": {
+                "workspace_id": workspace_id,
+                "thread_id": thread.thread.id,
+                "turn_id": "turn_voice_success_0001",
+                "prepared_input": [
+                    { "type": "localFile", "path": "/tmp/voice-context.txt" },
+                    {
+                        "type": "artifact",
+                        "artifactId": artifact.artifact_id.clone(),
+                        "versionId": artifact.version_id.clone()
+                    }
+                ],
+                "capabilities": [
+                    {
+                        "id": "skill:user:weather",
+                        "kind": { "type": "skill", "slug": "weather", "sourceKind": "user" },
+                        "label": "weather"
+                    },
+                    {
+                        "id": "mcp-tool:workspace:resend:send_email",
+                        "kind": {
+                            "type": "mcpTool",
+                            "serverName": "resend",
+                            "rawToolName": "send_email",
+                            "scopeKind": "workspace"
+                        },
+                        "label": "resend / Send Email"
+                    }
+                ]
+            },
+            "audio_format": {
+                "sample_rate_hz": 16000,
+                "channels": 1,
+                "encoding": "pcm_s16_le"
+            }
+        }
+    });
+    processor
+        .process_request(connection_id, &start_request.to_string())
+        .await;
+    let start_response = recv_response_by_id(&mut rx, start_request_id.as_str()).await;
+    let start_payload: pioneer_protocol::VoiceSessionStartResponse =
+        serde_json::from_value(start_response.result).expect("voice/session/start decode");
+    assert_eq!(start_payload.status, VoiceStatus::Recording);
+
+    let status_request_id = generate_test_request_id("voice", "status_active");
+    let status_request = json!({
+        "jsonrpc": "2.0",
+        "id": status_request_id.clone(),
+        "method": "voice/status",
+        "params": { "workspace_id": workspace_id }
+    });
+    processor
+        .process_request(connection_id, &status_request.to_string())
+        .await;
+    let status_response = recv_response_by_id(&mut rx, status_request_id.as_str()).await;
+    let status_payload: pioneer_protocol::VoiceStatusResponse =
+        serde_json::from_value(status_response.result).expect("voice/status decode");
+    assert_eq!(status_payload.status, VoiceStatus::Recording);
+    assert_eq!(
+        status_payload.active_session_id.as_deref(),
+        Some(start_payload.session_id.as_str())
+    );
+
+    let frame = voice_test_frame(start_payload.session_id.as_str(), 0, 960, 12_000);
+    processor
+        .process_binary_frame(connection_id, frame.as_slice())
+        .await;
+    let ack = recv_notification_by_method(&mut rx, events::VOICE_CHUNK_ACK).await;
+    let ack_payload: pioneer_protocol::VoiceChunkAckNotification =
+        serde_json::from_value(ack.params.expect("voice/chunk ack params"))
+            .expect("voice/chunk ack decode");
+    assert_eq!(ack_payload.session_id, start_payload.session_id);
+    assert_eq!(ack_payload.sequence, 0);
+
+    let finalize_request_id = generate_test_request_id("voice", "finish_success");
+    let finalize_request = json!({
+        "jsonrpc": "2.0",
+        "id": finalize_request_id.clone(),
+        "method": "voice/session/finalize",
+        "params": { "session_id": start_payload.session_id }
+    });
+    processor
+        .process_request(connection_id, &finalize_request.to_string())
+        .await;
+    let finalize_response = recv_response_by_id(&mut rx, finalize_request_id.as_str()).await;
+    let finalize_payload: pioneer_protocol::VoiceSessionFinalizeResponse =
+        serde_json::from_value(finalize_response.result).expect("voice/session/finalize decode");
+    assert_eq!(finalize_payload.status, VoiceStatus::Ready);
+
+    let turn_started = recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
+    let turn_started_payload: pioneer_protocol::TurnStartedNotification =
+        serde_json::from_value(turn_started.params.expect("turn/started params"))
+            .expect("turn/started decode");
+    assert_eq!(turn_started_payload.turn.id, "turn_voice_success_0001");
+
+    let mut user_message = None;
+    for _ in 0..10 {
+        let completed = recv_notification_by_method(&mut rx, events::ITEM_COMPLETED).await;
+        let completed_payload: pioneer_protocol::ItemCompletedNotification =
+            serde_json::from_value(completed.params.expect("item/completed params"))
+                .expect("item/completed decode");
+        if let TurnItem::UserMessage {
+            text, attachments, ..
+        } = completed_payload.item
+        {
+            user_message = Some((text, attachments));
+            break;
+        }
+    }
+    let (text, attachments) = user_message.expect("voice turn must emit a user message");
+    assert_eq!(text, "voice transcript with context");
+    assert!(
+        attachments.iter().any(|attachment| matches!(
+            attachment,
+            UserMessageAttachment::LocalFile { path }
+                if path == "/tmp/voice-context.txt"
+        )),
+        "voice turn must preserve prepared local-file attachment"
+    );
+    assert!(
+        attachments.iter().any(|attachment| matches!(
+            attachment,
+            UserMessageAttachment::Artifact { artifact: resolved }
+                if resolved.artifact_id == artifact.artifact_id
+                    && resolved.display_name == "voice-artifact.txt"
+        )),
+        "voice turn must preserve prepared artifact attachment"
+    );
+    assert!(
+        attachments.iter().any(|attachment| matches!(
+            attachment,
+            UserMessageAttachment::Skill { capability }
+                if capability.id == "skill:user:weather"
+        )),
+        "voice turn must preserve selected skill capability"
+    );
+    assert!(
+        attachments.iter().any(|attachment| matches!(
+            attachment,
+            UserMessageAttachment::McpTool { capability }
+                if capability.id == "mcp-tool:workspace:resend:send_email"
+                    && capability.scope_kind == McpScopeKind::Workspace
+        )),
+        "voice turn must preserve selected MCP tool capability"
+    );
+
+    let _turn_completed = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
+    assert_eq!(capture_provider.call_count(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn voice_session_cancel_drops_session_without_creating_turn() {
+    let (tx, mut rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_voice_model_bootstrap(Arc::new(
+        crate::voice::model_bootstrap::VoiceModelBootstrapHandle::ready(),
+    ))
+    .with_voice_transcriber(StaticGatewayVoiceTranscriber { text: "ignored" });
+    let thread = start_thread_for_artifact_test(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        "thr_voice_cancel",
+    )
+    .await;
+
+    let start_request_id = generate_test_request_id("voice", "start_cancel");
+    let start_payload = start_test_voice_session(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        thread.thread.id.as_str(),
+        "turn_voice_cancel_0001",
+        start_request_id.as_str(),
+    )
+    .await;
+    let cancel_request_id = generate_test_request_id("voice", "cancel");
+    let cancel_request = json!({
+        "jsonrpc": "2.0",
+        "id": cancel_request_id.clone(),
+        "method": "voice/session/cancel",
+        "params": {
+            "session_id": start_payload.session_id,
+            "reason": "release_outside_circle"
+        }
+    });
+    processor
+        .process_request(connection_id, &cancel_request.to_string())
+        .await;
+    let cancel_response = recv_response_by_id(&mut rx, cancel_request_id.as_str()).await;
+    let cancel_payload: pioneer_protocol::VoiceSessionCancelResponse =
+        serde_json::from_value(cancel_response.result).expect("voice/session/cancel decode");
+    assert!(cancel_payload.cancelled);
+
+    let missing_turn = crud_store
+        .get_turn("thr_voice_cancel", "turn_voice_cancel_0001")
+        .await
+        .expect("cancel turn lookup should succeed");
+    assert!(
+        missing_turn.is_none(),
+        "cancelled voice must not create a turn"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn voice_session_finalize_without_speech_does_not_create_turn() {
+    let (tx, mut rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_voice_model_bootstrap(Arc::new(
+        crate::voice::model_bootstrap::VoiceModelBootstrapHandle::ready(),
+    ))
+    .with_voice_transcriber(StaticGatewayVoiceTranscriber {
+        text: "should not run",
+    });
+    let thread = start_thread_for_artifact_test(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        "thr_voice_no_speech",
+    )
+    .await;
+    let start_request_id = generate_test_request_id("voice", "start_no_speech");
+    let start_payload = start_test_voice_session(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        thread.thread.id.as_str(),
+        "turn_voice_no_speech_0001",
+        start_request_id.as_str(),
+    )
+    .await;
+
+    let finalize_request_id = generate_test_request_id("voice", "finish_no_speech");
+    let finalize_request = json!({
+        "jsonrpc": "2.0",
+        "id": finalize_request_id.clone(),
+        "method": "voice/session/finalize",
+        "params": { "session_id": start_payload.session_id }
+    });
+    processor
+        .process_request(connection_id, &finalize_request.to_string())
+        .await;
+    let finalize_response = recv_response_by_id(&mut rx, finalize_request_id.as_str()).await;
+    let finalize_payload: pioneer_protocol::VoiceSessionFinalizeResponse =
+        serde_json::from_value(finalize_response.result).expect("voice/session/finalize decode");
+    assert_eq!(finalize_payload.status, VoiceStatus::Ready);
+
+    let result_notification =
+        recv_notification_by_method(&mut rx, events::VOICE_SESSION_RESULT).await;
+    let result_payload: VoiceSessionResultNotification = serde_json::from_value(
+        result_notification
+            .params
+            .expect("voice/session/result params"),
+    )
+    .expect("voice/session/result decode");
+    assert_eq!(result_payload.session_id, start_payload.session_id);
+    assert_eq!(result_payload.outcome, VoiceSessionOutcome::NoSpeech);
+    assert_eq!(
+        result_payload.error.as_ref().map(|error| error.kind),
+        Some(VoiceErrorKind::NoSpeech)
+    );
+    let error_message = result_payload
+        .error
+        .as_ref()
+        .map(|error| error.message.as_str())
+        .expect("no-speech result should include error message");
+    assert!(error_message.contains("rms=0.000000"));
+    assert!(error_message.contains("peak=0.000000"));
+    assert!(error_message.contains("non_zero_samples=0"));
+
+    let missing_turn = crud_store
+        .get_turn("thr_voice_no_speech", "turn_voice_no_speech_0001")
+        .await
+        .expect("no-speech turn lookup should succeed");
+    assert!(
+        missing_turn.is_none(),
+        "no-speech voice finalize must not create a transcript-only turn"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn voice_status_and_start_report_model_unavailable() {
+    let (tx, mut rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+
+    let status_request_id = generate_test_request_id("voice", "status_unavailable");
+    let status_request = json!({
+        "jsonrpc": "2.0",
+        "id": status_request_id.clone(),
+        "method": "voice/status",
+        "params": { "workspace_id": workspace_id }
+    });
+    processor
+        .process_request(connection_id, &status_request.to_string())
+        .await;
+    let status_response = recv_response_by_id(&mut rx, status_request_id.as_str()).await;
+    let status_payload: pioneer_protocol::VoiceStatusResponse =
+        serde_json::from_value(status_response.result).expect("voice/status decode");
+    assert_eq!(status_payload.status, VoiceStatus::Unavailable);
+    assert!(matches!(
+        status_payload.error,
+        Some(pioneer_protocol::VoiceError {
+            kind: VoiceErrorKind::ModelUnavailable,
+            ..
+        })
+    ));
+
+    let start_request_id = generate_test_request_id("voice", "start_unavailable");
+    let start_request = json!({
+        "jsonrpc": "2.0",
+        "id": start_request_id.clone(),
+        "method": "voice/session/start",
+        "params": {
+            "context": {
+                "workspace_id": workspace_id,
+                "thread_id": "thr_voice_unavailable",
+                "turn_id": "turn_voice_unavailable",
+                "prepared_input": [],
+                "capabilities": []
+            },
+            "audio_format": {
+                "sample_rate_hz": 16000,
+                "channels": 1,
+                "encoding": "pcm_s16_le"
+            }
+        }
+    });
+    processor
+        .process_request(connection_id, &start_request.to_string())
+        .await;
+    let start_error = recv_error_by_id(&mut rx, start_request_id.as_str()).await;
+    let voice_error: pioneer_protocol::VoiceError =
+        serde_json::from_value(start_error.error.data.expect("voice error data"))
+            .expect("voice error payload");
+    assert_eq!(voice_error.kind, VoiceErrorKind::ModelUnavailable);
+}
+
+async fn start_test_voice_session(
+    processor: &MessageProcessor,
+    connection_id: ConnectionId,
+    rx: &mut mpsc::Receiver<Message>,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    request_id: &str,
+) -> pioneer_protocol::VoiceSessionStartResponse {
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "voice/session/start",
+        "params": {
+            "context": {
+                "workspace_id": workspace_id,
+                "thread_id": thread_id,
+                "turn_id": turn_id,
+                "prepared_input": [],
+                "capabilities": []
+            },
+            "audio_format": {
+                "sample_rate_hz": 16000,
+                "channels": 1,
+                "encoding": "pcm_s16_le"
+            }
+        }
+    });
+    processor
+        .process_request(connection_id, &request.to_string())
+        .await;
+    let response = recv_response_by_id(rx, request_id).await;
+    serde_json::from_value(response.result).expect("voice/session/start decode")
+}
+
+fn voice_test_frame(session_id: &str, sequence: u64, samples: usize, sample: i16) -> Vec<u8> {
+    let mut pcm = Vec::with_capacity(samples * 2);
+    for _ in 0..samples {
+        pcm.extend_from_slice(&sample.to_le_bytes());
+    }
+    pioneer_protocol::encode_voice_chunk_frame(
+        pioneer_protocol::VoiceChunkFrameHeader {
+            session_id: session_id.to_owned(),
+            sequence,
+            sample_rate_hz: pioneer_protocol::VOICE_AUDIO_TARGET_SAMPLE_RATE_HZ,
+            channels: pioneer_protocol::VOICE_AUDIO_TARGET_CHANNELS,
+            encoding: pioneer_protocol::VoiceAudioEncoding::PcmS16Le,
+            payload_len: 0,
+            captured_at_unix_ms: Some(1_725_000_000_000),
+            duration_ms: Some(60),
+        },
+        pcm.as_slice(),
+    )
+    .expect("voice test frame should encode")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

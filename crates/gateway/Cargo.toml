@@ -55,6 +55,7 @@ flate2.workspace = true
 tar.workspace = true
 sha2.workspace = true
 hex.workspace = true
+transcribe-rs.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

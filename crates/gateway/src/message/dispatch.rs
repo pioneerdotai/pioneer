@@ -21,7 +21,8 @@ use pioneer_protocol::{
     TaskTreeParams as TaskTreeTaskParams, TaskWaitParams, ThreadAgentsDocArchiveParams,
     ThreadAgentsDocGetParams, ThreadAgentsDocResolveForThreadParams, ThreadAgentsDocSaveParams,
     ThreadTimelinePageParams, TurnCancelParams, TurnPermissionRequestRespondParams,
-    TurnResumeParams, TurnWorkPageParams,
+    TurnResumeParams, TurnWorkPageParams, VoiceSessionCancelParams, VoiceSessionFinalizeParams,
+    VoiceSessionStartParams, VoiceStatusParams,
 };
 
 impl MessageProcessor {
@@ -194,6 +195,95 @@ impl MessageProcessor {
                                     format!(
                                         "invalid params for `{}`: {error}",
                                         methods::WORKSPACE_UPDATE
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::VOICE_STATUS => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<VoiceStatusParams>(params_value) {
+                        Ok(params) => self.voice_status(connection_id, request.id, params).await,
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{}`: {error}",
+                                        methods::VOICE_STATUS
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::VOICE_SESSION_START => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<VoiceSessionStartParams>(params_value) {
+                        Ok(params) => {
+                            self.voice_session_start(connection_id, request.id, params)
+                                .await
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{}`: {error}",
+                                        methods::VOICE_SESSION_START
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::VOICE_SESSION_FINALIZE => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<VoiceSessionFinalizeParams>(params_value) {
+                        Ok(params) => {
+                            self.voice_session_finalize(connection_id, request.id, params)
+                                .await
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{}`: {error}",
+                                        methods::VOICE_SESSION_FINALIZE
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::VOICE_SESSION_CANCEL => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<VoiceSessionCancelParams>(params_value) {
+                        Ok(params) => {
+                            self.voice_session_cancel(connection_id, request.id, params)
+                                .await
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{}`: {error}",
+                                        methods::VOICE_SESSION_CANCEL
                                     ),
                                 ),
                             )
@@ -2774,6 +2864,23 @@ impl MessageProcessor {
         self.artifact_downloads
             .abort_connection(connection_id)
             .await;
+        let removed_voice_sessions = self.voice_sessions.cleanup_connection(connection_id);
+        for session in &removed_voice_sessions {
+            let _ = self
+                .voice_session_buffers
+                .remove_session(session.session_id.as_str());
+        }
+        if !removed_voice_sessions.is_empty() {
+            debug!(
+                connection_id,
+                session_ids = ?removed_voice_sessions
+                    .iter()
+                    .map(|session| session.session_id.as_str())
+                    .collect::<Vec<_>>(),
+                "removed active voice sessions after connection closed"
+            );
+        }
+
         let removed_thread_ids = self.thread_manager.connection_closed(connection_id).await;
         if removed_thread_ids.is_empty() {
             return;

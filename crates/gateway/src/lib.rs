@@ -36,6 +36,7 @@ mod thread_episodic_hooks;
 mod tokenizer;
 mod transport;
 mod turn_runtime_snapshot;
+mod voice;
 mod workspace;
 
 use anyhow::{Context, Result};
@@ -83,6 +84,9 @@ use crate::thread_episodic::{
     ThreadEpisodicRecallServiceConfig, ThreadEpisodicRuntimeConfig,
 };
 use crate::transport::spawn_server;
+use crate::voice::model_bootstrap::start_parakeet_v3_int8_bootstrap;
+use crate::voice::model_catalog::{parakeet_v3_int8_install_layout, voice_model_catalog};
+use crate::voice::parakeet_runtime::TranscribeRsParakeetSpeechTranscriber;
 use crate::workspace::WorkspaceManager;
 
 pub use crate::operations::{
@@ -116,6 +120,18 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
 
     let gateway_settings = load_gateway_settings(&runtime_home, &config)?;
     config = gateway_settings.apply_to_app_config(config);
+    let voice_models = voice_model_catalog();
+    let parakeet_layout = parakeet_v3_int8_install_layout(&config, runtime_home.as_path())
+        .context("failed to resolve local voice model install layout")?;
+    info!(
+        voice_model_count = voice_models.len(),
+        parakeet_model_dir = %parakeet_layout.install_dir.display(),
+        parakeet_archive = %parakeet_layout.archive_path.display(),
+        "local voice model catalog is ready"
+    );
+    let voice_model_bootstrap =
+        start_parakeet_v3_int8_bootstrap(config.clone(), runtime_home.clone())
+            .context("failed to start local voice model bootstrap")?;
     let gateway_secrets = Arc::new(GatewaySecrets::open(&runtime_home)?);
     let remote_access_supervisor = Arc::new(RemoteAccessSupervisor::new(
         runtime_home.as_path(),
@@ -463,6 +479,10 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
     if let Some(cli_runtime_manager) = cli_runtime_manager {
         message_processor = message_processor.with_cli_runtime_manager(cli_runtime_manager);
     }
+    message_processor = message_processor.with_voice_model_bootstrap(voice_model_bootstrap);
+    message_processor = message_processor.with_voice_transcriber(
+        TranscribeRsParakeetSpeechTranscriber::new(config.clone(), runtime_home.clone()),
+    );
     message_processor =
         message_processor.with_remote_access_supervisor(remote_access_supervisor.clone());
     let message_processor = Arc::new(message_processor);

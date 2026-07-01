@@ -29,6 +29,7 @@ mod timeline_cursor;
 mod timeline_handlers;
 mod timeline_notifications;
 mod turn_handlers;
+mod voice_handlers;
 mod workspace_handlers;
 
 pub use summary::SummaryConfig;
@@ -126,12 +127,16 @@ use pioneer_protocol::{
     TurnPermissionApprovalRequest, TurnPermissionApprovalResolution,
     TurnPermissionRequestOpenedNotification, TurnPermissionRequestResolvedNotification,
     TurnPermissionRequestRespondParams, TurnPermissionRequestRespondResponse, TurnResumeParams,
-    TurnResumeResponse, TurnStartParams, TurnStatus, Workspace, WorkspaceChangeKind,
-    WorkspaceChangedNotification, WorkspaceCreateParams, WorkspaceCreateResponse,
-    WorkspaceDefaultParams, WorkspaceDefaultResponse, WorkspaceListParams, WorkspaceListResponse,
-    WorkspaceSelectParams, WorkspaceSelectResponse, WorkspaceUpdateParams, WorkspaceUpdateResponse,
+    TurnResumeResponse, TurnStartParams, TurnStatus, VoiceError, VoiceErrorKind,
+    VoiceSessionCancelParams, VoiceSessionCancelResponse, VoiceSessionFinalizeParams,
+    VoiceSessionFinalizeResponse, VoiceSessionStartParams, VoiceSessionStartResponse, VoiceStatus,
+    VoiceStatusParams, Workspace, WorkspaceChangeKind, WorkspaceChangedNotification,
+    WorkspaceCreateParams, WorkspaceCreateResponse, WorkspaceDefaultParams,
+    WorkspaceDefaultResponse, WorkspaceListParams, WorkspaceListResponse, WorkspaceSelectParams,
+    WorkspaceSelectResponse, WorkspaceUpdateParams, WorkspaceUpdateResponse,
     constants::{events, methods},
     generate_id, sanitize_runtime_diagnostic_line, sanitize_runtime_diagnostic_lines,
+    validate_voice_streaming_audio_format,
 };
 use pioneer_provider::{ChatMessage, ProviderRegistry};
 use pioneer_sqlite::{
@@ -166,6 +171,12 @@ use crate::resilience::{
 use crate::secrets::GatewaySecrets;
 use crate::session::{ConnectionId, SessionManager};
 use crate::thread::ThreadManager;
+use crate::voice::model_bootstrap::VoiceModelBootstrapHandle;
+use crate::voice::session_buffer::GatewayVoiceSessionBufferStore;
+use crate::voice::session_store::GatewayVoiceSessionStore;
+use crate::voice::transcription::{
+    GatewayVoiceTranscriptionRuntime, UnconfiguredVoiceSpeechTranscriber, VoiceSpeechTranscriber,
+};
 use crate::workspace::{WorkspaceError, WorkspaceManager};
 
 pub(crate) type MessageFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -364,6 +375,11 @@ pub struct MessageProcessor {
     thread_episodic_index_executor: Arc<ThreadEpisodicIndexExecutor>,
     thread_episodic_recall_service: Arc<ThreadEpisodicRecallService>,
     workspace_episodic_recall_service: Arc<WorkspaceEpisodicRecallService>,
+    voice_model_bootstrap: Arc<VoiceModelBootstrapHandle>,
+    pub(crate) voice_sessions: GatewayVoiceSessionStore,
+    pub(crate) voice_session_buffers: GatewayVoiceSessionBufferStore,
+    pub(crate) voice_transcription_runtime:
+        GatewayVoiceTranscriptionRuntime<Box<dyn VoiceSpeechTranscriber>>,
 }
 
 #[derive(Clone)]
@@ -603,6 +619,15 @@ impl MessageProcessor {
             thread_episodic_index_executor,
             thread_episodic_recall_service,
             workspace_episodic_recall_service,
+            voice_model_bootstrap: Arc::new(VoiceModelBootstrapHandle::unavailable(
+                "local voice model bootstrap has not started",
+            )),
+            voice_sessions: GatewayVoiceSessionStore::default(),
+            voice_session_buffers: GatewayVoiceSessionBufferStore::default(),
+            voice_transcription_runtime: GatewayVoiceTranscriptionRuntime::new(Box::new(
+                UnconfiguredVoiceSpeechTranscriber,
+            )
+                as Box<dyn VoiceSpeechTranscriber>),
         }
     }
 
@@ -615,6 +640,25 @@ impl MessageProcessor {
         supervisor: Arc<pioneer_tunnel::RemoteAccessSupervisor>,
     ) -> Self {
         self.remote_access_supervisor = Some(supervisor);
+        self
+    }
+
+    pub(crate) fn with_voice_model_bootstrap(
+        mut self,
+        voice_model_bootstrap: Arc<VoiceModelBootstrapHandle>,
+    ) -> Self {
+        self.voice_model_bootstrap = voice_model_bootstrap;
+        self
+    }
+
+    pub(crate) fn with_voice_transcriber<T>(mut self, transcriber: T) -> Self
+    where
+        T: VoiceSpeechTranscriber + 'static,
+    {
+        self.voice_transcription_runtime = GatewayVoiceTranscriptionRuntime::new(Box::new(
+            transcriber,
+        )
+            as Box<dyn VoiceSpeechTranscriber>);
         self
     }
 
@@ -2060,6 +2104,13 @@ impl MessageProcessor {
             thread_episodic_index_executor,
             thread_episodic_recall_service,
             workspace_episodic_recall_service,
+            voice_model_bootstrap: Arc::new(VoiceModelBootstrapHandle::ready()),
+            voice_sessions: GatewayVoiceSessionStore::default(),
+            voice_session_buffers: GatewayVoiceSessionBufferStore::default(),
+            voice_transcription_runtime: GatewayVoiceTranscriptionRuntime::new(Box::new(
+                UnconfiguredVoiceSpeechTranscriber,
+            )
+                as Box<dyn VoiceSpeechTranscriber>),
         }
     }
 }

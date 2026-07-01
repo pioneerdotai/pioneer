@@ -420,6 +420,7 @@ mod tests {
                 cli_agent_runtime: GatewayCliAgentRuntimeConfig::default(),
                 cli_agent_runtimes: GatewayCliAgentRuntimeInstancesConfig::default(),
                 remote_access: Default::default(),
+                voice: Default::default(),
                 provider: GatewayProviderConfig::default(),
                 database: GatewayDatabaseConfig {
                     file_name: "gateway.db".to_owned(),
