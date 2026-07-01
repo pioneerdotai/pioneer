@@ -72,6 +72,10 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             crate::active_thread::ClientActiveThreadSendTextResult
         ),
         schema_doc!(
+            "client_prepare_voice_composer_snapshot_request.json",
+            crate::active_thread::ClientPrepareVoiceComposerSnapshotRequest
+        ),
+        schema_doc!(
             "client_active_thread_snapshot.json",
             crate::active_thread::ClientActiveThreadSnapshot
         ),
@@ -242,6 +246,65 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "turn_permission_request_respond_response.json",
             pioneer_protocol::TurnPermissionRequestRespondResponse
+        ),
+        schema_doc!(
+            "voice_audio_encoding.json",
+            pioneer_protocol::VoiceAudioEncoding
+        ),
+        schema_doc!(
+            "voice_audio_format.json",
+            pioneer_protocol::VoiceAudioFormat
+        ),
+        schema_doc!(
+            "voice_chunk_ack_notification.json",
+            pioneer_protocol::VoiceChunkAckNotification
+        ),
+        schema_doc!("voice_error.json", pioneer_protocol::VoiceError),
+        schema_doc!("voice_error_kind.json", pioneer_protocol::VoiceErrorKind),
+        schema_doc!(
+            "voice_session_cancel_params.json",
+            pioneer_protocol::VoiceSessionCancelParams
+        ),
+        schema_doc!(
+            "voice_session_cancel_response.json",
+            pioneer_protocol::VoiceSessionCancelResponse
+        ),
+        schema_doc!(
+            "voice_session_finalize_params.json",
+            pioneer_protocol::VoiceSessionFinalizeParams
+        ),
+        schema_doc!(
+            "voice_session_finalize_response.json",
+            pioneer_protocol::VoiceSessionFinalizeResponse
+        ),
+        schema_doc!(
+            "voice_session_outcome.json",
+            pioneer_protocol::VoiceSessionOutcome
+        ),
+        schema_doc!(
+            "voice_session_result_notification.json",
+            pioneer_protocol::VoiceSessionResultNotification
+        ),
+        schema_doc!(
+            "voice_session_start_params.json",
+            pioneer_protocol::VoiceSessionStartParams
+        ),
+        schema_doc!(
+            "voice_session_start_response.json",
+            pioneer_protocol::VoiceSessionStartResponse
+        ),
+        schema_doc!("voice_status.json", pioneer_protocol::VoiceStatus),
+        schema_doc!(
+            "voice_status_params.json",
+            pioneer_protocol::VoiceStatusParams
+        ),
+        schema_doc!(
+            "voice_status_response.json",
+            pioneer_protocol::VoiceStatusResponse
+        ),
+        schema_doc!(
+            "voice_turn_context.json",
+            pioneer_protocol::VoiceTurnContext
         ),
         schema_doc!(
             "thread_agents_doc_archive_params.json",

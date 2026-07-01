@@ -1,7 +1,10 @@
 //! WebSocket binary frame helpers.
 
 use anyhow::{Context as _, Result, bail};
-use pioneer_protocol::{ArtifactUploadChunkHeader, SkillsUploadChunkHeader};
+use pioneer_protocol::{
+    ArtifactUploadChunkHeader, SkillsUploadChunkHeader, VoiceAudioFormat, VoiceChunkFrameHeader,
+    encode_voice_chunk_frame,
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, sync::mpsc::Sender};
@@ -73,6 +76,28 @@ pub fn encode_artifact_upload_chunk_frame(
         chunk,
         "artifact upload chunk header",
     )
+}
+
+pub fn encode_voice_audio_chunk_frame(
+    session_id: String,
+    sequence: u64,
+    audio_format: VoiceAudioFormat,
+    captured_at_unix_ms: Option<u64>,
+    duration_ms: Option<u32>,
+    pcm_chunk: &[u8],
+) -> Result<Vec<u8>> {
+    let header = VoiceChunkFrameHeader {
+        session_id,
+        sequence,
+        sample_rate_hz: audio_format.sample_rate_hz,
+        channels: audio_format.channels,
+        encoding: audio_format.encoding,
+        payload_len: 0,
+        captured_at_unix_ms,
+        duration_ms,
+    };
+
+    Ok(encode_voice_chunk_frame(header, pcm_chunk)?)
 }
 
 fn encode_chunk_frame<THeader: Serialize>(
@@ -196,6 +221,81 @@ mod tests {
         assert_eq!(
             second_rx.recv().expect("second error"),
             Err("disconnected".to_owned())
+        );
+    }
+
+    #[test]
+    fn frames_encode_voice_audio_chunk_frame_uses_voc1_magic_and_audio_header() {
+        let frame = encode_voice_audio_chunk_frame(
+            "voice_session_1".to_owned(),
+            9,
+            VoiceAudioFormat {
+                sample_rate_hz: 16_000,
+                channels: 1,
+                encoding: pioneer_protocol::VoiceAudioEncoding::PcmS16Le,
+            },
+            Some(1_725_000_000_020),
+            Some(20),
+            b"pcm",
+        )
+        .expect("encode voice frame");
+
+        assert_eq!(&frame[0..4], pioneer_protocol::VOICE_CHUNK_FRAME_MAGIC);
+
+        let decoded =
+            pioneer_protocol::decode_voice_chunk_frame(frame.as_slice()).expect("decode frame");
+        assert_eq!(decoded.header.session_id, "voice_session_1");
+        assert_eq!(decoded.header.sequence, 9);
+        assert_eq!(decoded.header.sample_rate_hz, 16_000);
+        assert_eq!(decoded.header.channels, 1);
+        assert_eq!(decoded.header.payload_len, 3);
+        assert_eq!(decoded.header.duration_ms, Some(20));
+        assert_eq!(decoded.audio_payload, b"pcm");
+    }
+
+    #[test]
+    fn frames_reject_invalid_voice_audio_chunk_inputs() {
+        let format = VoiceAudioFormat {
+            sample_rate_hz: 16_000,
+            channels: 1,
+            encoding: pioneer_protocol::VoiceAudioEncoding::PcmS16Le,
+        };
+
+        assert!(
+            encode_voice_audio_chunk_frame(" ".to_owned(), 0, format, None, None, b"pcm")
+                .expect_err("session required")
+                .to_string()
+                .contains("voice session_id is required")
+        );
+        assert!(
+            encode_voice_audio_chunk_frame(
+                "voice_session_1".to_owned(),
+                0,
+                format,
+                None,
+                None,
+                b""
+            )
+            .expect_err("payload required")
+            .to_string()
+            .contains("voice audio payload cannot be empty")
+        );
+        assert!(
+            encode_voice_audio_chunk_frame(
+                "voice_session_1".to_owned(),
+                0,
+                VoiceAudioFormat {
+                    sample_rate_hz: 0,
+                    channels: 1,
+                    encoding: pioneer_protocol::VoiceAudioEncoding::PcmS16Le,
+                },
+                None,
+                None,
+                b"pcm",
+            )
+            .expect_err("sample rate required")
+            .to_string()
+            .contains("voice audio format is invalid")
         );
     }
 

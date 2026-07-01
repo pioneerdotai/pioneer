@@ -18,7 +18,7 @@ use anyhow::{Context as _, Result, anyhow};
 use pioneer_protocol::{
     AgentExecutionBackend, ArtifactCapabilitiesParams, ArtifactCapabilitiesResponse, ArtifactRef,
     ThreadMode, TurnCLIRuntimeOptions, TurnCapability, TurnPermissionMode, UserInput,
-    UserMessageAttachment,
+    UserMessageAttachment, VoiceTurnContext,
 };
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -49,6 +49,50 @@ pub struct PreparedComposerTurn {
     pub user_message_text: String,
     pub user_attachments: Vec<UserMessageAttachment>,
     pub attachments: Vec<PreparedComposerAttachment>,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct PrepareVoiceComposerSnapshotRequest {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub endpoint_kind: Option<GatewayEndpointKind>,
+    pub attachments: Vec<ComposerAttachment>,
+    pub capabilities: Vec<ComposerCapability>,
+    pub selected_model: Option<String>,
+    pub selected_provider: Option<String>,
+    pub turn_model_provider: Option<String>,
+    pub selected_mode: Option<ThreadMode>,
+    pub permission_mode: TurnPermissionMode,
+    pub execution_backend: Option<AgentExecutionBackend>,
+    pub selected_reasoning_effort: Option<String>,
+    pub cli_runtime_options: Option<TurnCLIRuntimeOptions>,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct PreparedVoiceComposerSnapshot {
+    pub context: VoiceTurnContext,
+    pub attachments: Vec<PreparedComposerAttachment>,
+    pub uploaded_attachment_artifacts: Vec<Option<ArtifactRef>>,
+    pub locked_attachment_count: usize,
+    pub locked_capability_count: usize,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct VoiceComposerSnapshotDiscardReduction {
+    pub discard_snapshot: bool,
+    pub clear_composer: bool,
+    pub start_turn: bool,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct VoiceComposerLockState {
+    pub attachment_edits_locked: bool,
+    pub capability_edits_locked: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -172,6 +216,149 @@ where
         prepared_attachments,
         request.capabilities,
     ))
+}
+
+pub fn prepare_voice_composer_snapshot<TTransport, TFileSystem>(
+    transport: &TTransport,
+    file_system: &TFileSystem,
+    request: PrepareVoiceComposerSnapshotRequest,
+) -> Result<PreparedVoiceComposerSnapshot>
+where
+    TTransport: ComposerTurnPrepareTransport,
+    TFileSystem: ClientFileSystem,
+{
+    let prepared = prepare_composer_turn(
+        transport,
+        file_system,
+        PrepareComposerTurnRequest {
+            workspace_id: request.workspace_id.clone(),
+            thread_id: request.thread_id.clone(),
+            turn_id: request.turn_id.clone(),
+            endpoint_kind: request.endpoint_kind,
+            text: String::new(),
+            attachments: request.attachments,
+            capabilities: request.capabilities,
+        },
+    )?;
+
+    build_prepared_voice_composer_snapshot(
+        PreparedVoiceComposerSnapshotContext {
+            workspace_id: request.workspace_id,
+            thread_id: request.thread_id,
+            turn_id: request.turn_id,
+            selected_model: request.selected_model,
+            selected_provider: request.selected_provider,
+            turn_model_provider: request.turn_model_provider,
+            selected_mode: request.selected_mode,
+            permission_mode: request.permission_mode,
+            execution_backend: request.execution_backend,
+            selected_reasoning_effort: request.selected_reasoning_effort,
+            cli_runtime_options: request.cli_runtime_options,
+        },
+        prepared,
+    )
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreparedVoiceComposerSnapshotContext {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub selected_model: Option<String>,
+    pub selected_provider: Option<String>,
+    pub turn_model_provider: Option<String>,
+    pub selected_mode: Option<ThreadMode>,
+    pub permission_mode: TurnPermissionMode,
+    pub execution_backend: Option<AgentExecutionBackend>,
+    pub selected_reasoning_effort: Option<String>,
+    pub cli_runtime_options: Option<TurnCLIRuntimeOptions>,
+}
+
+pub fn build_prepared_voice_composer_snapshot(
+    context: PreparedVoiceComposerSnapshotContext,
+    prepared: PreparedComposerTurn,
+) -> Result<PreparedVoiceComposerSnapshot> {
+    if context.workspace_id.trim().is_empty() {
+        return Err(anyhow!("workspace_id is required before starting voice"));
+    }
+    if context.thread_id.trim().is_empty() {
+        return Err(anyhow!("thread_id is required before starting voice"));
+    }
+    if context.turn_id.trim().is_empty() {
+        return Err(anyhow!("turn_id is required before starting voice"));
+    }
+    if prepared
+        .input
+        .iter()
+        .any(|input| matches!(input, UserInput::Text { .. }))
+    {
+        return Err(anyhow!(
+            "voice composer snapshot must not include text input; gateway transcript owns the user text"
+        ));
+    }
+
+    let uploaded_attachment_artifacts = prepared
+        .attachments
+        .iter()
+        .map(|prepared_attachment| prepared_attachment.artifact.clone())
+        .collect::<Vec<_>>();
+    let selected_reasoning_effort = context.selected_reasoning_effort.clone();
+    let cli_runtime_options = if matches!(
+        &context.execution_backend,
+        Some(AgentExecutionBackend::CLIAgentRuntime { .. })
+    ) {
+        cli_runtime_options_with_reasoning_effort(
+            context.cli_runtime_options,
+            selected_reasoning_effort.clone(),
+        )
+    } else {
+        context.cli_runtime_options
+    };
+    let locked_attachment_count = prepared.attachments.len();
+    let locked_capability_count = prepared.capabilities.len();
+
+    Ok(PreparedVoiceComposerSnapshot {
+        context: VoiceTurnContext {
+            workspace_id: context.workspace_id,
+            thread_id: context.thread_id,
+            turn_id: context.turn_id,
+            prepared_input: prepared.input,
+            capabilities: prepared.capabilities,
+            model: context.selected_model,
+            model_provider: context.turn_model_provider,
+            sandbox_policy: None,
+            mode: context.selected_mode,
+            execution_backend: context.execution_backend,
+            reasoning: turn_start::turn_reasoning_selection_from_effort(selected_reasoning_effort),
+            permission_profile: Some(
+                composer_permissions::turn_permission_profile_selection_from_composer_mode(
+                    context.permission_mode,
+                ),
+            ),
+            cli_runtime_options,
+        },
+        attachments: prepared.attachments,
+        uploaded_attachment_artifacts,
+        locked_attachment_count,
+        locked_capability_count,
+    })
+}
+
+pub fn reduce_prepared_voice_composer_snapshot_cancel(
+    _snapshot: PreparedVoiceComposerSnapshot,
+) -> VoiceComposerSnapshotDiscardReduction {
+    VoiceComposerSnapshotDiscardReduction {
+        discard_snapshot: true,
+        clear_composer: false,
+        start_turn: false,
+    }
+}
+
+pub fn voice_composer_lock_state(active_voice_snapshot: bool) -> VoiceComposerLockState {
+    VoiceComposerLockState {
+        attachment_edits_locked: active_voice_snapshot,
+        capability_edits_locked: active_voice_snapshot,
+    }
 }
 
 pub fn build_prepared_composer_turn(
@@ -561,6 +748,7 @@ pub fn attachment_name_from_reference(reference: &str) -> String {
 mod tests {
     use super::*;
     use crate::composer::attachments::{ComposerAttachmentKind, ComposerAttachmentUploadState};
+    use crate::composer::capabilities::ComposerCapabilityKind;
     use crate::platform::{ClientFileMetadata, ClientFileSystem, ClientPath};
     use crate::{ClientError, ClientResult};
     use pioneer_protocol::{
@@ -608,6 +796,22 @@ mod tests {
                 max_chunk_size_bytes: 1024,
                 max_concurrent_downloads: 2,
             },
+        }
+    }
+
+    fn voice_snapshot_context() -> PreparedVoiceComposerSnapshotContext {
+        PreparedVoiceComposerSnapshotContext {
+            workspace_id: "ws_1".to_owned(),
+            thread_id: "thread_1".to_owned(),
+            turn_id: "turn_1".to_owned(),
+            selected_model: Some("gpt-5".to_owned()),
+            selected_provider: Some("openai".to_owned()),
+            turn_model_provider: Some("openai".to_owned()),
+            selected_mode: Some(ThreadMode::Agent),
+            permission_mode: TurnPermissionMode::Supervised,
+            execution_backend: None,
+            selected_reasoning_effort: None,
+            cli_runtime_options: None,
         }
     }
 
@@ -889,6 +1093,139 @@ mod tests {
         assert!(matches!(
             attachments[1],
             UserMessageAttachment::LocalFile { ref path } if path == "/tmp/b.txt"
+        ));
+    }
+
+    #[test]
+    fn voice_snapshot_freezes_attachment_capability_and_turn_context() {
+        let artifact = artifact_ref("art_a");
+        let capability = ComposerCapability {
+            id: "skill_cap".to_owned(),
+            label: "Skill Cap".to_owned(),
+            kind: ComposerCapabilityKind::Skill {
+                slug: "skill-a".to_owned(),
+                source_kind: "workspace".to_owned(),
+            },
+        };
+        let prepared = build_prepared_composer_turn(
+            String::new(),
+            vec![PreparedComposerAttachment {
+                attachment: attachment("/tmp/a.txt", ComposerAttachmentUploadState::Uploading),
+                artifact: Some(artifact.clone()),
+            }],
+            vec![capability],
+        );
+
+        let snapshot = build_prepared_voice_composer_snapshot(voice_snapshot_context(), prepared)
+            .expect("voice snapshot");
+        let turn_start = snapshot
+            .context
+            .clone()
+            .into_turn_start_params_with_transcript("hello from voice".to_owned());
+
+        assert_eq!(snapshot.locked_attachment_count, 1);
+        assert_eq!(snapshot.locked_capability_count, 1);
+        assert_eq!(snapshot.context.workspace_id, "ws_1");
+        assert_eq!(snapshot.context.thread_id, "thread_1");
+        assert_eq!(snapshot.context.turn_id, "turn_1");
+        assert_eq!(snapshot.context.model.as_deref(), Some("gpt-5"));
+        assert_eq!(snapshot.context.model_provider.as_deref(), Some("openai"));
+        assert!(snapshot.context.permission_profile.is_some());
+        assert_eq!(snapshot.context.capabilities.len(), 1);
+        assert!(matches!(
+            snapshot.context.prepared_input[0],
+            UserInput::Artifact {
+                ref artifact_id,
+                ref version_id,
+            } if artifact_id == "art_a" && version_id.as_deref() == Some("art_a_v1")
+        ));
+        assert!(matches!(
+            turn_start.input[0],
+            UserInput::Text { ref text, .. } if text == "hello from voice"
+        ));
+        assert!(matches!(turn_start.input[1], UserInput::Artifact { .. }));
+    }
+
+    #[test]
+    fn voice_snapshot_rejects_text_input_because_transcript_is_gateway_owned() {
+        let prepared =
+            build_prepared_composer_turn("typed text".to_owned(), Vec::new(), Vec::new());
+
+        let error = build_prepared_voice_composer_snapshot(voice_snapshot_context(), prepared)
+            .expect_err("text input must be rejected");
+
+        assert!(
+            format!("{error:#}").contains("gateway transcript owns the user text"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn voice_snapshot_cancel_discards_context_without_turn_or_composer_clear() {
+        let snapshot = build_prepared_voice_composer_snapshot(
+            voice_snapshot_context(),
+            build_prepared_composer_turn(String::new(), Vec::new(), Vec::new()),
+        )
+        .expect("voice snapshot");
+
+        let reduction = reduce_prepared_voice_composer_snapshot_cancel(snapshot);
+        let lock_state = voice_composer_lock_state(true);
+        let unlocked_state = voice_composer_lock_state(false);
+
+        assert!(reduction.discard_snapshot);
+        assert!(!reduction.clear_composer);
+        assert!(!reduction.start_turn);
+        assert!(lock_state.attachment_edits_locked);
+        assert!(lock_state.capability_edits_locked);
+        assert!(!unlocked_state.attachment_edits_locked);
+        assert!(!unlocked_state.capability_edits_locked);
+    }
+
+    #[test]
+    fn prepare_voice_snapshot_uses_existing_attachment_upload_flow() {
+        let transport = FakeTurnPrepareTransport::new(capabilities(true));
+        let file_system = FakeTurnPrepareFileSystem {
+            bytes: b"hello".to_vec(),
+        };
+
+        let snapshot = prepare_voice_composer_snapshot(
+            &transport,
+            &file_system,
+            PrepareVoiceComposerSnapshotRequest {
+                workspace_id: "ws_1".to_owned(),
+                thread_id: "thread_1".to_owned(),
+                turn_id: "turn_1".to_owned(),
+                endpoint_kind: Some(GatewayEndpointKind::Local),
+                attachments: vec![attachment(
+                    "/tmp/report.txt",
+                    ComposerAttachmentUploadState::Local,
+                )],
+                capabilities: Vec::new(),
+                selected_model: Some("gpt-5".to_owned()),
+                selected_provider: Some("openai".to_owned()),
+                turn_model_provider: Some("openai".to_owned()),
+                selected_mode: Some(ThreadMode::Agent),
+                permission_mode: TurnPermissionMode::Supervised,
+                execution_backend: None,
+                selected_reasoning_effort: None,
+                cli_runtime_options: None,
+            },
+        )
+        .expect("voice snapshot");
+
+        assert_eq!(
+            transport.started()[0].client_attachment_id,
+            "turn_1_attachment_0"
+        );
+        assert_eq!(transport.chunks(), vec![(0, b"hello".to_vec())]);
+        assert_eq!(snapshot.uploaded_attachment_artifacts.len(), 1);
+        assert!(matches!(
+            snapshot.context.prepared_input[0],
+            UserInput::Artifact {
+                ref artifact_id,
+                ref version_id,
+            } if artifact_id == "artifact_uploaded"
+                && version_id.as_deref() == Some("version_uploaded")
         ));
     }
 

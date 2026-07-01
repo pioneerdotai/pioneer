@@ -8,7 +8,7 @@ use crate::rpc::{
     JsonRpcRequestTransport, RPC_REQUEST_TIMEOUT, RPC_UNSUBSCRIBE_TIMEOUT,
     send_json_rpc_request_typed,
 };
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use pioneer_protocol::constants::methods;
 use pioneer_protocol::{
     ArtifactBindParams, ArtifactBindResponse, ArtifactCapabilitiesParams,
@@ -53,10 +53,13 @@ use pioneer_protocol::{
     ThreadUnsubscribeParams, ThreadUnsubscribeResponse, ThreadUpdateParams, ThreadUpdateResponse,
     TurnCancelParams, TurnCancelResponse, TurnGetParams, TurnGetResponse, TurnItemsParams,
     TurnItemsResponse, TurnPermissionRequestRespondParams, TurnPermissionRequestRespondResponse,
-    TurnStartParams, TurnStartResponse, TurnWorkPageParams, TurnWorkPageResponse,
-    WorkspaceCreateParams, WorkspaceCreateResponse, WorkspaceDefaultParams,
-    WorkspaceDefaultResponse, WorkspaceListParams, WorkspaceListResponse, WorkspaceSelectParams,
-    WorkspaceSelectResponse, WorkspaceUpdateParams, WorkspaceUpdateResponse,
+    TurnStartParams, TurnStartResponse, TurnWorkPageParams, TurnWorkPageResponse, VoiceAudioFormat,
+    VoiceSessionCancelParams, VoiceSessionCancelResponse, VoiceSessionFinalizeParams,
+    VoiceSessionFinalizeResponse, VoiceSessionStartParams, VoiceSessionStartResponse,
+    VoiceStatusParams, VoiceStatusResponse, WorkspaceCreateParams, WorkspaceCreateResponse,
+    WorkspaceDefaultParams, WorkspaceDefaultResponse, WorkspaceListParams, WorkspaceListResponse,
+    WorkspaceSelectParams, WorkspaceSelectResponse, WorkspaceUpdateParams, WorkspaceUpdateResponse,
+    validate_voice_streaming_audio_format,
 };
 use pioneer_skills::is_qualified_skill_slug;
 use std::time::Duration;
@@ -538,6 +541,112 @@ where
         &params,
         RPC_REQUEST_TIMEOUT,
     )
+}
+
+pub fn voice_status<TTransport>(
+    transport: &TTransport,
+    params: VoiceStatusParams,
+) -> Result<VoiceStatusResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_optional_non_empty_field(
+        params.workspace_id.as_deref(),
+        "workspace_id",
+        methods::VOICE_STATUS,
+    )?;
+
+    send_json_rpc_request_typed(
+        transport,
+        methods::VOICE_STATUS,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn voice_session_start<TTransport>(
+    transport: &TTransport,
+    params: VoiceSessionStartParams,
+) -> Result<VoiceSessionStartResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.context.workspace_id.as_str(),
+        "workspace_id",
+        methods::VOICE_SESSION_START,
+    )?;
+    require_non_empty_field(
+        params.context.thread_id.as_str(),
+        "thread_id",
+        methods::VOICE_SESSION_START,
+    )?;
+    require_non_empty_field(
+        params.context.turn_id.as_str(),
+        "turn_id",
+        methods::VOICE_SESSION_START,
+    )?;
+    validate_voice_audio_format(&params.audio_format, methods::VOICE_SESSION_START)?;
+
+    send_json_rpc_request_typed(
+        transport,
+        methods::VOICE_SESSION_START,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn voice_session_finalize<TTransport>(
+    transport: &TTransport,
+    params: VoiceSessionFinalizeParams,
+) -> Result<VoiceSessionFinalizeResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.session_id.as_str(),
+        "session_id",
+        methods::VOICE_SESSION_FINALIZE,
+    )?;
+
+    send_json_rpc_request_typed(
+        transport,
+        methods::VOICE_SESSION_FINALIZE,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn voice_session_cancel<TTransport>(
+    transport: &TTransport,
+    params: VoiceSessionCancelParams,
+) -> Result<VoiceSessionCancelResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.session_id.as_str(),
+        "session_id",
+        methods::VOICE_SESSION_CANCEL,
+    )?;
+    require_optional_non_empty_field(
+        params.reason.as_deref(),
+        "reason",
+        methods::VOICE_SESSION_CANCEL,
+    )?;
+
+    send_json_rpc_request_typed(
+        transport,
+        methods::VOICE_SESSION_CANCEL,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+fn validate_voice_audio_format(format: &VoiceAudioFormat, method: &str) -> Result<()> {
+    validate_voice_streaming_audio_format(format)
+        .map_err(|error| anyhow!("{error} for {method}"))?;
+    Ok(())
 }
 
 pub fn turn_permission_request_respond<TTransport>(
@@ -2003,7 +2112,8 @@ mod tests {
     use crate::rpc::{JsonRpcResponseSender, WEBSOCKET_WORKER_UNAVAILABLE_MESSAGE};
     use pioneer_protocol::{
         ArtifactUploadSourceKind, JsonRpcRequest, McpScopeKind, SkillArchiveFormat,
-        SkillHealthTarget, SkillLifecycleSource, TaskCancelScope, Workspace,
+        SkillHealthTarget, SkillLifecycleSource, TaskCancelScope, VoiceAudioEncoding,
+        VoiceTurnContext, Workspace,
     };
     use serde_json::json;
 
@@ -2062,6 +2172,31 @@ mod tests {
             "created_at": 1,
             "updated_at": 2
         })
+    }
+
+    fn voice_session_start_params() -> VoiceSessionStartParams {
+        VoiceSessionStartParams {
+            context: VoiceTurnContext {
+                workspace_id: "ws_1".to_owned(),
+                thread_id: "thread_1".to_owned(),
+                turn_id: "turn_1".to_owned(),
+                prepared_input: Vec::new(),
+                capabilities: Vec::new(),
+                model: None,
+                model_provider: None,
+                sandbox_policy: None,
+                mode: None,
+                execution_backend: None,
+                reasoning: None,
+                permission_profile: None,
+                cli_runtime_options: None,
+            },
+            audio_format: VoiceAudioFormat {
+                sample_rate_hz: 16_000,
+                channels: 1,
+                encoding: VoiceAudioEncoding::PcmS16Le,
+            },
+        }
     }
 
     #[test]
@@ -2339,6 +2474,74 @@ mod tests {
                 .expect_err("turn id should be required")
             ),
             "turn_id is required for turn/start"
+        );
+    }
+
+    #[test]
+    fn ws_command_sender_voice_validation_matches_contract() {
+        assert_eq!(
+            format!(
+                "{:#}",
+                voice_status(
+                    &PanicTransport,
+                    VoiceStatusParams {
+                        workspace_id: Some(" ".to_owned()),
+                    },
+                )
+                .expect_err("workspace id should be non-empty")
+            ),
+            "workspace_id must not be empty for voice/status"
+        );
+
+        let mut start = voice_session_start_params();
+        start.context.thread_id = " ".to_owned();
+        assert_eq!(
+            format!(
+                "{:#}",
+                voice_session_start(&PanicTransport, start)
+                    .expect_err("thread id should be required")
+            ),
+            "thread_id is required for voice/session/start"
+        );
+
+        let mut start = voice_session_start_params();
+        start.audio_format.sample_rate_hz = 0;
+        assert_eq!(
+            format!(
+                "{:#}",
+                voice_session_start(&PanicTransport, start)
+                    .expect_err("sample rate should match voice target")
+            ),
+            "voice audio sample_rate_hz must be 16000, got 0 for voice/session/start"
+        );
+
+        assert_eq!(
+            format!(
+                "{:#}",
+                voice_session_finalize(
+                    &PanicTransport,
+                    VoiceSessionFinalizeParams {
+                        session_id: " ".to_owned(),
+                    },
+                )
+                .expect_err("session id should be required")
+            ),
+            "session_id is required for voice/session/finalize"
+        );
+
+        assert_eq!(
+            format!(
+                "{:#}",
+                voice_session_cancel(
+                    &PanicTransport,
+                    VoiceSessionCancelParams {
+                        session_id: "voice_session_1".to_owned(),
+                        reason: Some(" ".to_owned()),
+                    },
+                )
+                .expect_err("reason should be non-empty")
+            ),
+            "reason must not be empty for voice/session/cancel"
         );
     }
 

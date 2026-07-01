@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "VoiceComposerLockState",
+  "type": "object",
+  "properties": {
+    "attachment_edits_locked": {
+      "type": "boolean"
+    },
+    "capability_edits_locked": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "attachment_edits_locked",
+    "capability_edits_locked"
+  ]
+}

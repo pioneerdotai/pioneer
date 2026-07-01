@@ -9,8 +9,9 @@ use pioneer_client::{
         model_selection as composer_model_selection,
         turn_prepare::{
             ComposerSubmitAvailabilityInput, PrepareComposerTurnRequest,
-            PreparedComposerTurnSubmitContext, can_submit_composer_message,
-            composer_has_sendable_content, prepare_composer_turn,
+            PrepareVoiceComposerSnapshotRequest, PreparedComposerTurnSubmitContext,
+            PreparedVoiceComposerSnapshot, can_submit_composer_message,
+            composer_has_sendable_content, prepare_composer_turn, prepare_voice_composer_snapshot,
             reduce_prepared_composer_turn_submit_success,
         },
     },
@@ -118,6 +119,29 @@ pub struct ClientActiveThreadSendTextResult {
     pub pending_request_id: String,
     pub snapshot: ClientActiveThreadSnapshot,
     pub semantic_timeline_patch: SemanticTimelineCachePatch,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientPrepareVoiceComposerSnapshotRequest {
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    pub selected_model: Option<String>,
+    #[serde(default)]
+    pub selected_provider: Option<String>,
+    #[serde(default)]
+    pub selected_reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub selected_mode: Option<ThreadMode>,
+    pub permission_mode: TurnPermissionMode,
+    #[serde(default)]
+    pub attachments: Vec<ComposerAttachment>,
+    #[serde(default)]
+    pub capabilities: Vec<ComposerCapability>,
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -456,6 +480,91 @@ impl ClientFfiActiveThreadState {
             snapshot: snapshot_from_inner(&inner),
             semantic_timeline_patch,
         })
+    }
+
+    pub fn prepare_voice_composer_snapshot(
+        &self,
+        runtime: &ClientRuntime,
+        request: ClientPrepareVoiceComposerSnapshotRequest,
+    ) -> anyhow::Result<PreparedVoiceComposerSnapshot> {
+        let ClientPrepareVoiceComposerSnapshotRequest {
+            thread_id,
+            workspace_id,
+            selected_model,
+            selected_provider,
+            selected_reasoning_effort,
+            selected_mode,
+            permission_mode,
+            attachments,
+            capabilities,
+        } = request;
+
+        let requested_thread_id = non_empty_string(thread_id);
+        let thread_id = match requested_thread_id {
+            Some(thread_id) => thread_id,
+            None => self.start_thread_for_text_turn(runtime, workspace_id)?,
+        };
+        let turn_id = plan_turn_start_ids().turn_id;
+        let (workspace_id, endpoint_kind) = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
+            let coordinator = inner.coordinators.get(thread_id.as_str()).ok_or_else(|| {
+                anyhow::anyhow!("active thread must be opened before starting voice")
+            })?;
+            (coordinator.workspace_id.clone(), None)
+        };
+        let selection = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
+            resolve_voice_turn_selection(
+                &inner,
+                thread_id.as_str(),
+                selected_provider,
+                selected_model,
+                selected_mode,
+            )?
+        };
+        let selected_cli_runtime_backend = resolve_selected_cli_runtime_backend(
+            runtime,
+            workspace_id.as_str(),
+            Some(selection.selected_provider.as_str()),
+        )?;
+        let cli_runtime_selected = selected_cli_runtime_backend.is_some();
+        let capabilities = if cli_runtime_selected {
+            Vec::new()
+        } else {
+            capabilities
+        };
+        let turn_model_provider = if cli_runtime_selected {
+            None
+        } else {
+            Some(selection.selected_provider.clone())
+        };
+
+        prepare_voice_composer_snapshot(
+            &runtime.ws_command_sender(),
+            &ClientFfiFileSystem,
+            PrepareVoiceComposerSnapshotRequest {
+                workspace_id,
+                thread_id,
+                turn_id,
+                endpoint_kind,
+                attachments,
+                capabilities,
+                selected_model: Some(selection.selected_model),
+                selected_provider: Some(selection.selected_provider),
+                turn_model_provider,
+                selected_mode: Some(selection.selected_mode),
+                permission_mode,
+                execution_backend: selected_cli_runtime_backend,
+                selected_reasoning_effort,
+                cli_runtime_options: None,
+            },
+        )
     }
 
     pub fn cancel_turn(
@@ -1003,6 +1112,59 @@ fn resolve_turn_selection(
     }) {
         return Err(anyhow::anyhow!(
             "active thread is not ready to start a new turn"
+        ));
+    }
+
+    Ok(ClientActiveThreadTurnSelection {
+        selected_model: resolved_selection.model,
+        selected_provider: resolved_selection.provider,
+        selected_mode,
+    })
+}
+
+fn resolve_voice_turn_selection(
+    inner: &ClientFfiActiveThreadInner,
+    thread_id: &str,
+    requested_provider: Option<String>,
+    requested_model: Option<String>,
+    requested_mode: Option<ThreadMode>,
+) -> anyhow::Result<ClientActiveThreadTurnSelection> {
+    let requested_provider = non_empty_string(requested_provider);
+    let requested_model = non_empty_string(requested_model);
+    let requested_selection = match (requested_provider, requested_model) {
+        (Some(provider), Some(model)) => Some(composer_model_selection::ComposerModelSelection {
+            provider,
+            model,
+            selected_reasoning_effort: None,
+        }),
+        (None, None) => None,
+        _ => {
+            return Err(anyhow::anyhow!(
+                "model and provider must both be selected before starting voice"
+            ));
+        }
+    };
+    let coordinator = inner
+        .coordinators
+        .get(thread_id)
+        .ok_or_else(|| anyhow::anyhow!("active thread must be opened before starting voice"))?;
+    let resolved_selection = match requested_selection {
+        Some(selection) => selection,
+        None => client_selectors::resolve_composer_model_selection_from(
+            Some(thread_id),
+            Some(coordinator.workspace_id.as_str()),
+            &inner.coordinators,
+        )
+        .ok_or_else(|| {
+            anyhow::anyhow!("model and provider must be selected before starting voice")
+        })?,
+    };
+    let selected_mode =
+        requested_mode.unwrap_or_else(composer_model_selection::default_composer_turn_mode);
+
+    if !coordinator.conversation.can_submit_message() {
+        return Err(anyhow::anyhow!(
+            "active thread is not ready to start a new voice turn"
         ));
     }
 

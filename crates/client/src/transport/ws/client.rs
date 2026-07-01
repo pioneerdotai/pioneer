@@ -58,6 +58,9 @@ pub enum GatewayWsCommand {
         payload: Vec<u8>,
         response_tx: Sender<std::result::Result<ArtifactUploadChunkAckNotification, String>>,
     },
+    VoiceBinaryChunk {
+        payload: Vec<u8>,
+    },
     ArtifactDownloadRegisterChunk {
         download_id: String,
         offset: u64,
@@ -85,6 +88,9 @@ enum ConnectionRpcCommand {
         offset: u64,
         payload: Vec<u8>,
         response_tx: Sender<std::result::Result<ArtifactUploadChunkAckNotification, String>>,
+    },
+    VoiceBinaryChunk {
+        payload: Vec<u8>,
     },
     ArtifactDownloadRegisterChunk {
         download_id: String,
@@ -223,6 +229,15 @@ async fn run_worker(
                     let _ = fallback_tx
                         .send(Err("websocket connection task is unavailable".to_owned()));
                 }
+            }
+            GatewayWsCommand::VoiceBinaryChunk { payload } => {
+                let Some(connection_task) = connection_task.as_mut() else {
+                    continue;
+                };
+
+                let _ = connection_task
+                    .rpc_tx
+                    .send(ConnectionRpcCommand::VoiceBinaryChunk { payload });
             }
             GatewayWsCommand::ArtifactDownloadRegisterChunk {
                 download_id,
@@ -411,6 +426,11 @@ async fn monitor_connection(
                                 let _ = response_tx.send(Err(format!("websocket binary write failed: {error}")));
                             }
                             break format!("websocket binary write failed: {error}");
+                        }
+                    }
+                    Some(ConnectionRpcCommand::VoiceBinaryChunk { payload }) => {
+                        if let Err(error) = writer.send(Message::Binary(payload.into())).await {
+                            break format!("websocket voice binary write failed: {error}");
                         }
                     }
                     Some(ConnectionRpcCommand::ArtifactDownloadRegisterChunk { download_id, offset, response_tx, registered_tx }) => {

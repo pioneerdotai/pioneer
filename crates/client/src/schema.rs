@@ -371,8 +371,24 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             crate::composer::turn_prepare::PrepareComposerTurnRequest
         ),
         schema_doc!(
+            "prepare_voice_composer_snapshot_request.json",
+            crate::composer::turn_prepare::PrepareVoiceComposerSnapshotRequest
+        ),
+        schema_doc!(
             "prepared_composer_turn.json",
             crate::composer::turn_prepare::PreparedComposerTurn
+        ),
+        schema_doc!(
+            "prepared_voice_composer_snapshot.json",
+            crate::composer::turn_prepare::PreparedVoiceComposerSnapshot
+        ),
+        schema_doc!(
+            "voice_composer_snapshot_discard_reduction.json",
+            crate::composer::turn_prepare::VoiceComposerSnapshotDiscardReduction
+        ),
+        schema_doc!(
+            "voice_composer_lock_state.json",
+            crate::composer::turn_prepare::VoiceComposerLockState
         ),
         schema_doc!(
             "provider_api_key_action_unavailable.json",

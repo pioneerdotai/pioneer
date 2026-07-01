@@ -21,6 +21,7 @@ use active_thread::{
     ClientActiveThreadOpenRequest, ClientActiveThreadSendTextRequest,
     ClientActiveThreadSendTextResult, ClientActiveThreadSnapshot,
     ClientActiveThreadSnapshotRequest, ClientFfiActiveThreadState,
+    ClientPrepareVoiceComposerSnapshotRequest,
 };
 use composer::{
     ClientComposerAttachmentFromPathRequest, ClientComposerAttachmentsUpdateRequest,
@@ -98,6 +99,9 @@ use pioneer_protocol::{
     ThreadAgentsDocGetResponse, ThreadAgentsDocSaveParams, ThreadAgentsDocSaveResponse,
     ThreadTimelinePageParams, ThreadTimelinePageResponse, TurnPermissionRequestRespondParams,
     TurnPermissionRequestRespondResponse, TurnWorkPageParams, TurnWorkPageResponse,
+    VoiceAudioFormat, VoiceSessionCancelParams, VoiceSessionCancelResponse,
+    VoiceSessionFinalizeParams, VoiceSessionFinalizeResponse, VoiceSessionStartParams,
+    VoiceSessionStartResponse, VoiceStatusParams, VoiceStatusResponse,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -149,6 +153,21 @@ pub struct ClientFfiInitializeResult {
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct ClientFfiGatewayDisconnectResult {
     pub disconnected: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientFfiVoiceAudioChunkParams {
+    pub session_id: String,
+    pub sequence: u64,
+    pub audio_format: VoiceAudioFormat,
+    pub captured_at_unix_ms: Option<u64>,
+    pub duration_ms: Option<u32>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ClientFfiVoiceAudioChunkResult {
+    pub sent: bool,
 }
 
 #[derive(Serialize)]
@@ -498,6 +517,72 @@ impl ClientFfiRuntime {
         self.client_runtime
             .ws_command_sender()
             .turn_permission_request_respond(params)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn voice_status(&self, input_json: &str) -> Result<VoiceStatusResponse, String> {
+        let params = serde_json::from_str::<VoiceStatusParams>(input_json)
+            .map_err(|error| format!("invalid voice status params: {error}"))?;
+
+        self.client_runtime
+            .ws_command_sender()
+            .voice_status(params)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn voice_session_start(&self, input_json: &str) -> Result<VoiceSessionStartResponse, String> {
+        let params = serde_json::from_str::<VoiceSessionStartParams>(input_json)
+            .map_err(|error| format!("invalid voice session start params: {error}"))?;
+
+        self.client_runtime
+            .ws_command_sender()
+            .voice_session_start(params)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn voice_audio_chunk(
+        &self,
+        input_json: &str,
+        pcm_chunk: &[u8],
+    ) -> Result<ClientFfiVoiceAudioChunkResult, String> {
+        let params = serde_json::from_str::<ClientFfiVoiceAudioChunkParams>(input_json)
+            .map_err(|error| format!("invalid voice audio chunk params: {error}"))?;
+
+        self.client_runtime
+            .ws_command_sender()
+            .send_voice_audio_chunk(
+                params.session_id,
+                params.sequence,
+                params.audio_format,
+                params.captured_at_unix_ms,
+                params.duration_ms,
+                pcm_chunk.to_vec(),
+            )
+            .map_err(|error| format!("{error:#}"))?;
+
+        Ok(ClientFfiVoiceAudioChunkResult { sent: true })
+    }
+
+    fn voice_session_finalize(
+        &self,
+        input_json: &str,
+    ) -> Result<VoiceSessionFinalizeResponse, String> {
+        let params = serde_json::from_str::<VoiceSessionFinalizeParams>(input_json)
+            .map_err(|error| format!("invalid voice session finalize params: {error}"))?;
+
+        self.client_runtime
+            .ws_command_sender()
+            .voice_session_finalize(params)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn voice_session_cancel(&self, input_json: &str) -> Result<VoiceSessionCancelResponse, String> {
+        let params = serde_json::from_str::<VoiceSessionCancelParams>(input_json)
+            .map_err(|error| format!("invalid voice session cancel params: {error}"))?;
+
+        self.client_runtime
+            .ws_command_sender()
+            .voice_session_cancel(params)
             .map_err(|error| format!("{error:#}"))
     }
 
@@ -874,6 +959,18 @@ impl ClientFfiRuntime {
             .map_err(|error| format!("{error:#}"))
     }
 
+    fn prepare_voice_composer_snapshot(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_client::composer::turn_prepare::PreparedVoiceComposerSnapshot, String> {
+        let request = serde_json::from_str::<ClientPrepareVoiceComposerSnapshotRequest>(input_json)
+            .map_err(|error| format!("invalid prepare voice composer snapshot request: {error}"))?;
+
+        self.active_thread
+            .prepare_voice_composer_snapshot(&self.client_runtime, request)
+            .map_err(|error| format!("{error:#}"))
+    }
+
     fn active_thread_cancel_turn(
         &self,
         input_json: &str,
@@ -1090,6 +1187,49 @@ ffi_client_json_method!(
     pioneer_client_ffi_turn_permission_request_respond,
     turn_permission_request_respond
 );
+ffi_client_json_method!(pioneer_client_ffi_voice_status, voice_status);
+ffi_client_json_method!(pioneer_client_ffi_voice_session_start, voice_session_start);
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pioneer_client_ffi_voice_audio_chunk(
+    ptr: *mut PioneerClientFfi,
+    input_json: *const c_char,
+    pcm_ptr: *const u8,
+    pcm_len: usize,
+) -> *mut c_char {
+    let client = match unsafe { ffi_ref(ptr) } {
+        Ok(client) => client,
+        Err(error) => return into_c_string(to_json_response::<()>(Err(error))),
+    };
+    let input_json = match unsafe { read_c_string(input_json) } {
+        Ok(input_json) => input_json,
+        Err(error) => return into_c_string(to_json_response::<()>(Err(error))),
+    };
+    let pcm_chunk: &[u8] = if pcm_len == 0 {
+        &[]
+    } else if pcm_ptr.is_null() {
+        return into_c_string(to_json_response::<()>(Err(
+            "received null pcm chunk pointer".to_owned(),
+        )));
+    } else {
+        // SAFETY: the native bridge passes an ArrayBuffer pointer that stays
+        // alive for the duration of this synchronous FFI call.
+        unsafe { std::slice::from_raw_parts(pcm_ptr, pcm_len) }
+    };
+
+    into_ffi_response_with_diagnostics(&client.runtime.diagnostics, "voice_audio_chunk", || {
+        client
+            .runtime
+            .voice_audio_chunk(input_json.as_str(), pcm_chunk)
+    })
+}
+ffi_client_json_method!(
+    pioneer_client_ffi_voice_session_finalize,
+    voice_session_finalize
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_voice_session_cancel,
+    voice_session_cancel
+);
 ffi_client_json_method!(
     pioneer_client_ffi_pending_request_response_plan,
     pending_request_response_plan
@@ -1181,6 +1321,10 @@ ffi_client_json_method!(
 ffi_client_json_method!(
     pioneer_client_ffi_active_thread_send_text,
     active_thread_send_text
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_prepare_voice_composer_snapshot,
+    prepare_voice_composer_snapshot
 );
 ffi_client_json_method!(
     pioneer_client_ffi_active_thread_cancel_turn,

@@ -1012,11 +1012,39 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Stable
         ),
         contract_type!(
+            "prepare_voice_composer_snapshot_request.json",
+            crate::composer::turn_prepare::PrepareVoiceComposerSnapshotRequest,
+            Domain::Composer,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
             "prepared_composer_turn.json",
             crate::composer::turn_prepare::PreparedComposerTurn,
             Domain::Composer,
             Kind::ActionPlan,
             Stability::Stable
+        ),
+        contract_type!(
+            "prepared_voice_composer_snapshot.json",
+            crate::composer::turn_prepare::PreparedVoiceComposerSnapshot,
+            Domain::Composer,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "voice_composer_snapshot_discard_reduction.json",
+            crate::composer::turn_prepare::VoiceComposerSnapshotDiscardReduction,
+            Domain::Composer,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "voice_composer_lock_state.json",
+            crate::composer::turn_prepare::VoiceComposerLockState,
+            Domain::Composer,
+            Kind::ActionPlan,
+            Stability::Provisional
         ),
         contract_type!(
             "provider_api_key_action_unavailable.json",

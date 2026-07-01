@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "VoiceComposerSnapshotDiscardReduction",
+  "type": "object",
+  "properties": {
+    "clear_composer": {
+      "type": "boolean"
+    },
+    "discard_snapshot": {
+      "type": "boolean"
+    },
+    "start_turn": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "discard_snapshot",
+    "clear_composer",
+    "start_turn"
+  ]
+}

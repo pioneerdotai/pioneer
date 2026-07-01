@@ -307,6 +307,31 @@ impl GatewayWsCommandSender {
         client_ws_commands::turn_cancel(self, params)
     }
 
+    pub fn voice_status(&self, params: VoiceStatusParams) -> Result<VoiceStatusResponse> {
+        client_ws_commands::voice_status(self, params)
+    }
+
+    pub fn voice_session_start(
+        &self,
+        params: VoiceSessionStartParams,
+    ) -> Result<VoiceSessionStartResponse> {
+        client_ws_commands::voice_session_start(self, params)
+    }
+
+    pub fn voice_session_finalize(
+        &self,
+        params: VoiceSessionFinalizeParams,
+    ) -> Result<VoiceSessionFinalizeResponse> {
+        client_ws_commands::voice_session_finalize(self, params)
+    }
+
+    pub fn voice_session_cancel(
+        &self,
+        params: VoiceSessionCancelParams,
+    ) -> Result<VoiceSessionCancelResponse> {
+        client_ws_commands::voice_session_cancel(self, params)
+    }
+
     pub fn provider_list(&self, params: ProviderListParams) -> Result<ProviderListResponse> {
         client_ws_commands::provider_list(self, params)
     }
@@ -694,6 +719,31 @@ impl GatewayWsCommandSender {
             .map_err(|_| anyhow!("timed out waiting for artifact upload chunk ack"))?;
 
         response.map_err(anyhow::Error::msg)
+    }
+
+    pub fn send_voice_audio_chunk(
+        &self,
+        session_id: String,
+        sequence: u64,
+        audio_format: VoiceAudioFormat,
+        captured_at_unix_ms: Option<u64>,
+        duration_ms: Option<u32>,
+        pcm_chunk: Vec<u8>,
+    ) -> Result<()> {
+        let payload = crate::transport::ws::frames::encode_voice_audio_chunk_frame(
+            session_id,
+            sequence,
+            audio_format,
+            captured_at_unix_ms,
+            duration_ms,
+            pcm_chunk.as_slice(),
+        )?;
+
+        self.command_tx
+            .send(GatewayWsCommand::VoiceBinaryChunk { payload })
+            .map_err(|_| anyhow!("websocket worker is not available"))?;
+
+        Ok(())
     }
 
     pub fn prepare_composer_turn_with_file_system(

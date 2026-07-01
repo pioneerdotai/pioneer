@@ -13,6 +13,8 @@
 //!
 //! - gateway endpoint normalization, registry state, websocket request helpers,
 //!   typed RPC payloads, and notification reduction;
+//! - voice session control and audio chunk transport wrappers that remain
+//!   independent of desktop/mobile capture UI;
 //! - conversation projection, timeline rows, selectors, status/read models, and
 //!   shell-neutral presentation DTOs;
 //! - composer, turn, workspace, provider, skill, MCP, settings, artifact, and
@@ -35,6 +37,8 @@
 //!   UI-neutral timeline rows.
 //! - [`composer`], [`turns`], [`threads`], and [`workspaces`] own user workflow
 //!   planning and selector logic.
+//! - Voice control lives on [`transport::ws::GatewayWsCommandSender`] until a
+//!   broader shell-neutral voice coordinator is needed.
 //! - [`providers`], [`skills`], [`mcp`], and [`settings`] own catalog, policy,
 //!   settings, and shell-neutral presentation helpers.
 //! - [`artifacts`] and [`agents_doc`] own artifact transfer/cache helpers and

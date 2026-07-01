@@ -636,6 +636,7 @@ pub fn reduce_gateway_notification(
         | GatewayNotification::ContextCompressed(_)
         | GatewayNotification::Unknown(_)
         | GatewayNotification::SkillsUploadChunkAck(_)
+        | GatewayNotification::VoiceSessionResult(_)
         | GatewayNotification::ArtifactProjectionUpdated(_)
         | GatewayNotification::ArtifactUploadProgress(_)
         | GatewayNotification::ArtifactDownloadProgress(_)
