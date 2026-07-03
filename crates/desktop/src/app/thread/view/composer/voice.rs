@@ -19,14 +19,11 @@ use crate::{
 use gpui::{prelude::*, *};
 use gpui_component::{theme::ActiveTheme, *};
 use pioneer_client::{
-    composer::turn_prepare::{
-        PrepareVoiceComposerSnapshotRequest, reduce_prepared_voice_composer_snapshot_cancel,
-        voice_composer_lock_state,
-    },
+    composer::turn_prepare::{self, PrepareVoiceComposerSnapshotRequest},
     providers::list as provider_list,
     turns::start as turn_start,
 };
-use pioneer_protocol::{VoiceStatus, VoiceStatusParams};
+use pioneer_protocol::{VoiceSessionStartContext, VoiceStatus, VoiceStatusParams};
 use std::time::Duration;
 use tracing::warn;
 
@@ -55,10 +52,7 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn desktop_voice_context_locked(&self) -> bool {
-        let lock_state = voice_composer_lock_state(self.desktop_voice_snapshot.is_some());
-        lock_state.attachment_edits_locked
-            || lock_state.capability_edits_locked
-            || self.desktop_voice_composer.is_active()
+        self.desktop_voice_composer.is_active()
     }
 
     pub(in crate::app) fn desktop_voice_error_message(&self) -> Option<&str> {
@@ -185,7 +179,7 @@ impl PioneerDesktop {
     pub(super) fn start_desktop_voice_hold(
         &mut self,
         pointer_position: Point<Pixels>,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.desktop_voice_composer.is_active() {
@@ -277,94 +271,48 @@ impl PioneerDesktop {
             .and_then(|runtime| runtime.active_gateway().map(|gateway| gateway.kind));
         let turn_start_ids = turn_start::plan_turn_start_ids();
         let turn_id = turn_start_ids.turn_id;
-        let upload_sender = self.gateway.ws_command_sender.clone();
         let gateway_sender = self.gateway.ws_command_sender.clone();
 
-        self.composer_upload_in_progress = true;
-        cx.spawn_in(
-            window,
-            move |this: WeakEntity<Self>, cx: &mut AsyncWindowContext| {
-                let mut cx = cx.clone();
-                async move {
-                    let prepare_result = cx
-                        .background_spawn(async move {
-                            upload_sender.prepare_voice_composer_snapshot(
-                                PrepareVoiceComposerSnapshotRequest {
-                                    workspace_id,
-                                    thread_id,
-                                    turn_id,
-                                    endpoint_kind,
-                                    attachments: composer_attachments,
-                                    capabilities: composer_capabilities,
-                                    selected_model,
-                                    selected_provider,
-                                    turn_model_provider,
-                                    selected_mode: Some(selected_mode),
-                                    permission_mode: selected_permission_mode,
-                                    execution_backend: selected_cli_runtime_backend,
-                                    selected_reasoning_effort,
-                                    cli_runtime_options: None,
-                                },
-                            )
-                        })
-                        .await;
+        let prepare_request = PrepareVoiceComposerSnapshotRequest {
+            workspace_id: workspace_id.clone(),
+            thread_id: thread_id.clone(),
+            turn_id: turn_id.clone(),
+            endpoint_kind,
+            attachments: composer_attachments,
+            capabilities: composer_capabilities,
+            selected_model,
+            selected_provider,
+            turn_model_provider,
+            selected_mode: Some(selected_mode),
+            permission_mode: selected_permission_mode,
+            execution_backend: selected_cli_runtime_backend,
+            selected_reasoning_effort,
+            cli_runtime_options: None,
+        };
 
-                    let _ = this.update_in(&mut cx, move |view, _window, cx| {
-                        view.composer_upload_in_progress = false;
-                        let snapshot = match prepare_result {
-                            Ok(snapshot) => snapshot,
-                            Err(error) => {
-                                view.desktop_voice_composer = DesktopVoiceComposerState::Error {
-                                    kind: DesktopVoiceCaptureErrorKind::GatewaySession,
-                                    message: t!(
-                                        "chat.composer.voice.prepare_failed",
-                                        error = format!("{error:#}").as_str()
-                                    )
-                                    .to_string(),
-                                };
-                                cx.notify();
-                                return;
-                            }
-                        };
-
-                        if view.desktop_voice_release_was_requested_while_preparing() {
-                            let _ = reduce_prepared_voice_composer_snapshot_cancel(snapshot);
-                            view.desktop_voice_composer = DesktopVoiceComposerState::Error {
-                                kind: DesktopVoiceCaptureErrorKind::NoSpeech,
-                                message: t!("chat.composer.voice.recording_not_started")
-                                    .to_string(),
-                            };
-                            cx.notify();
-                            return;
-                        }
-
-                        let mut flow = DesktopVoiceCaptureFlow::new(
-                            PlatformDesktopAudioInputBackend,
-                            gateway_sender,
-                        );
-                        if let Err(error) = flow.start(
-                            &view.desktop_microphone_gate,
-                            DesktopVoiceCaptureConfig::default(),
-                            snapshot.context.clone(),
-                        ) {
-                            view.desktop_voice_composer =
-                                desktop_voice_error_state_from_capture_error(error);
-                            cx.notify();
-                            return;
-                        }
-
-                        view.desktop_voice_snapshot = Some(snapshot);
-                        view.desktop_voice_capture = Some(flow);
-                        view.desktop_voice_composer = DesktopVoiceComposerState::Holding {
-                            target,
-                            candidate: DesktopVoiceReleaseCandidate::Send,
-                        };
-                        cx.notify();
-                    });
-                }
+        let mut flow =
+            DesktopVoiceCaptureFlow::new(PlatformDesktopAudioInputBackend, gateway_sender);
+        if let Err(error) = flow.start(
+            &self.desktop_microphone_gate,
+            DesktopVoiceCaptureConfig::default(),
+            VoiceSessionStartContext {
+                workspace_id,
+                thread_id,
+                turn_id,
             },
-        )
-        .detach();
+        ) {
+            self.desktop_voice_composer = desktop_voice_error_state_from_capture_error(error);
+            cx.notify();
+            return;
+        }
+
+        self.desktop_voice_prepare_request = Some(prepare_request);
+        self.desktop_voice_capture = Some(flow);
+        self.desktop_voice_composer = DesktopVoiceComposerState::Holding {
+            target,
+            candidate: DesktopVoiceReleaseCandidate::Send,
+        };
+        cx.notify();
     }
 
     pub(super) fn update_desktop_voice_hold_pointer(
@@ -425,19 +373,89 @@ impl PioneerDesktop {
 
         self.desktop_voice_composer = DesktopVoiceComposerState::Finalizing;
         let Some(mut flow) = self.desktop_voice_capture.take() else {
-            self.desktop_voice_snapshot = None;
+            self.desktop_voice_prepare_request = None;
             self.desktop_voice_composer = DesktopVoiceComposerState::Idle;
             cx.notify();
             return;
         };
-        self.desktop_voice_snapshot = None;
+        let Some(prepare_request) = self.desktop_voice_prepare_request.take() else {
+            let _ = flow.release_cancel();
+            self.desktop_voice_composer = DesktopVoiceComposerState::Idle;
+            cx.notify();
+            return;
+        };
+
+        if let Err(error) = flow.stop_recording() {
+            let _ = flow.release_cancel();
+            self.desktop_voice_composer = desktop_voice_error_state_from_capture_error(error);
+            cx.notify();
+            return;
+        }
+
+        let upload_sender = self.gateway.ws_command_sender.clone();
+        self.composer_upload_in_progress = true;
+        self.composer_upload_error = None;
+        turn_prepare::mark_pending_composer_attachments_uploading(&mut self.composer_attachments);
         cx.notify();
 
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             async move {
+                let prepare_result = cx
+                    .background_spawn(async move {
+                        upload_sender.prepare_voice_composer_snapshot(prepare_request)
+                    })
+                    .await;
+
+                let snapshot = match prepare_result {
+                    Ok(snapshot) => {
+                        let uploaded_artifacts = snapshot.uploaded_attachment_artifacts.clone();
+                        let _ = this.update(&mut cx, move |view, cx| {
+                            view.composer_upload_in_progress = false;
+                            view.composer_upload_error = None;
+                            turn_prepare::apply_uploaded_composer_attachment_artifacts(
+                                &mut view.composer_attachments,
+                                uploaded_artifacts,
+                            );
+                            cx.notify();
+                        });
+                        snapshot
+                    }
+                    Err(error) => {
+                        let _ = flow.release_cancel();
+                        let message = format!("{error:#}");
+                        let _ = this.update(&mut cx, move |view, cx| {
+                            let reduction =
+                                turn_prepare::reduce_prepare_composer_turn_failure(message);
+                            view.composer_upload_in_progress =
+                                reduction.composer_upload_in_progress;
+                            view.composer_upload_error =
+                                Some(reduction.composer_upload_error.clone());
+                            turn_prepare::mark_uploading_composer_attachments_failed(
+                                &mut view.composer_attachments,
+                                reduction.mark_uploading_attachments_failed_error.as_str(),
+                            );
+                            if matches!(
+                                view.desktop_voice_composer,
+                                DesktopVoiceComposerState::Finalizing
+                            ) {
+                                view.desktop_voice_composer = DesktopVoiceComposerState::Error {
+                                    kind: DesktopVoiceCaptureErrorKind::GatewaySession,
+                                    message: t!(
+                                        "chat.composer.voice.prepare_failed",
+                                        error = reduction.composer_upload_error.as_str()
+                                    )
+                                    .to_string(),
+                                };
+                            }
+                            cx.notify();
+                        });
+                        return;
+                    }
+                };
+
                 let result = cx
-                    .background_spawn(async move { flow.release_send() })
+                    .background_spawn(async move { flow.finalize_send(snapshot.context) })
                     .await;
                 let _ = this.update(&mut cx, |view, cx| {
                     match result {
@@ -476,9 +494,7 @@ impl PioneerDesktop {
                 "failed to cancel desktop voice session"
             );
         }
-        if let Some(snapshot) = self.desktop_voice_snapshot.take() {
-            let _ = reduce_prepared_voice_composer_snapshot_cancel(snapshot);
-        }
+        self.desktop_voice_prepare_request = None;
         self.desktop_voice_composer = DesktopVoiceComposerState::Idle;
         cx.notify();
     }
@@ -566,16 +582,6 @@ impl PioneerDesktop {
             }
             _ => DesktopVoiceReleaseCandidate::Send,
         }
-    }
-
-    fn desktop_voice_release_was_requested_while_preparing(&self) -> bool {
-        matches!(
-            self.desktop_voice_composer,
-            DesktopVoiceComposerState::Preparing {
-                release_requested: true,
-                ..
-            }
-        )
     }
 }
 

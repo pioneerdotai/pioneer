@@ -116,7 +116,7 @@ impl MessageProcessor {
         }
 
         if let Err(error) = self
-            .ensure_voice_context_owned_by_connection(connection_id, &params.context)
+            .ensure_voice_start_context_owned_by_connection(connection_id, &params.context)
             .await
         {
             self.send_voice_error(
@@ -204,17 +204,53 @@ impl MessageProcessor {
         request_id: RequestId,
         params: VoiceSessionFinalizeParams,
     ) {
-        if params.session_id.trim().is_empty() {
+        if let Err(message) = validate_voice_finalize_params(&params) {
             self.send_error(
                 connection_id,
                 JsonRpcErrorResponse::new(
                     Some(request_id),
                     INVALID_PARAMS_CODE,
                     format!(
-                        "invalid params for `{}`: `session_id` is required",
+                        "invalid params for `{}`: {message}",
                         methods::VOICE_SESSION_FINALIZE
                     ),
                 ),
+            )
+            .await;
+            return;
+        }
+
+        let pending_session = match self
+            .voice_sessions
+            .lookup_session(params.session_id.as_str(), connection_id)
+        {
+            Ok(session) => session,
+            Err(error) => {
+                self.send_voice_error(
+                    connection_id,
+                    request_id,
+                    INVALID_REQUEST_CODE,
+                    methods::VOICE_SESSION_FINALIZE,
+                    error.into_voice_error(),
+                )
+                .await;
+                return;
+            }
+        };
+
+        if let Err(error) = self
+            .ensure_voice_context_owned_by_connection(connection_id, &params.context)
+            .await
+            .and_then(|_| {
+                ensure_voice_finalize_context_matches_session(&pending_session, &params.context)
+            })
+        {
+            self.send_voice_error(
+                connection_id,
+                request_id,
+                INVALID_REQUEST_CODE,
+                methods::VOICE_SESSION_FINALIZE,
+                error,
             )
             .await;
             return;
@@ -264,7 +300,7 @@ impl MessageProcessor {
                 signal_stats,
             }) => {
                 let turn_params =
-                    match voice_turn_start_params_from_transcript(&session, transcript) {
+                    match voice_turn_start_params_from_transcript(&params.context, transcript) {
                         Ok(turn_params) => turn_params,
                         Err(no_speech) => {
                             let voice_error =
@@ -537,30 +573,53 @@ impl MessageProcessor {
         }
     }
 
+    async fn ensure_voice_start_context_owned_by_connection(
+        &self,
+        connection_id: ConnectionId,
+        context: &pioneer_protocol::VoiceSessionStartContext,
+    ) -> Result<(), VoiceError> {
+        self.ensure_voice_context_scope_owned_by_connection(
+            connection_id,
+            context.workspace_id.as_str(),
+            context.thread_id.as_str(),
+        )
+        .await
+    }
+
     async fn ensure_voice_context_owned_by_connection(
         &self,
         connection_id: ConnectionId,
         context: &pioneer_protocol::VoiceTurnContext,
     ) -> Result<(), VoiceError> {
-        let Some(thread) = self
-            .thread_manager
-            .thread_get(context.thread_id.as_str())
-            .await
-        else {
+        self.ensure_voice_context_scope_owned_by_connection(
+            connection_id,
+            context.workspace_id.as_str(),
+            context.thread_id.as_str(),
+        )
+        .await
+    }
+
+    async fn ensure_voice_context_scope_owned_by_connection(
+        &self,
+        connection_id: ConnectionId,
+        workspace_id: &str,
+        thread_id: &str,
+    ) -> Result<(), VoiceError> {
+        let Some(thread) = self.thread_manager.thread_get(thread_id).await else {
             return Err(VoiceError {
                 kind: VoiceErrorKind::InvalidSession,
                 message: format!(
                     "thread `{}` is not loaded for voice session start",
-                    context.thread_id
+                    thread_id
                 ),
             });
         };
-        if thread.workspace_id != context.workspace_id {
+        if thread.workspace_id != workspace_id {
             return Err(VoiceError {
                 kind: VoiceErrorKind::InvalidSession,
                 message: format!(
                     "voice context workspace `{}` does not match thread `{}` workspace `{}`",
-                    context.workspace_id, context.thread_id, thread.workspace_id
+                    workspace_id, thread_id, thread.workspace_id
                 ),
             });
         }
@@ -569,20 +628,20 @@ impl MessageProcessor {
             .session_manager
             .connection_workspace_id(connection_id)
             .await
-            && connection_workspace_id != context.workspace_id
+            && connection_workspace_id != workspace_id
         {
             return Err(VoiceError {
                 kind: VoiceErrorKind::InvalidSession,
                 message: format!(
                     "connection workspace `{connection_workspace_id}` does not match voice context workspace `{}`",
-                    context.workspace_id
+                    workspace_id
                 ),
             });
         }
 
         let subscribed = self
             .thread_manager
-            .subscribed_connection_ids(context.thread_id.as_str())
+            .subscribed_connection_ids(thread_id)
             .await
             .contains(&connection_id);
         if !subscribed {
@@ -590,7 +649,7 @@ impl MessageProcessor {
                 kind: VoiceErrorKind::InvalidSession,
                 message: format!(
                     "connection `{connection_id}` is not subscribed to thread `{}`",
-                    context.thread_id
+                    thread_id
                 ),
             });
         }
@@ -796,7 +855,7 @@ impl VoiceSignalStats {
 }
 
 fn voice_turn_start_params_from_transcript(
-    session: &GatewayVoiceSession,
+    context: &pioneer_protocol::VoiceTurnContext,
     transcript: VoiceTranscript,
 ) -> Result<TurnStartParams, VoiceTranscriptionNoSpeech> {
     let transcript_text = transcript.text.trim();
@@ -807,8 +866,7 @@ fn voice_turn_start_params_from_transcript(
         });
     }
 
-    Ok(session
-        .context
+    Ok(context
         .clone()
         .into_turn_start_params_with_transcript(transcript_text.to_owned()))
 }
@@ -825,6 +883,42 @@ fn validate_voice_start_params(params: &VoiceSessionStartParams) -> Result<(), S
     }
     validate_voice_streaming_audio_format(&params.audio_format)
         .map_err(|error| format!("invalid `audio_format`: {error}"))?;
+    Ok(())
+}
+
+fn validate_voice_finalize_params(params: &VoiceSessionFinalizeParams) -> Result<(), String> {
+    if params.session_id.trim().is_empty() {
+        return Err("`session_id` is required".to_owned());
+    }
+    if params.context.workspace_id.trim().is_empty() {
+        return Err("`context.workspace_id` is required".to_owned());
+    }
+    if params.context.thread_id.trim().is_empty() {
+        return Err("`context.thread_id` is required".to_owned());
+    }
+    if params.context.turn_id.trim().is_empty() {
+        return Err("`context.turn_id` is required".to_owned());
+    }
+    Ok(())
+}
+
+fn ensure_voice_finalize_context_matches_session(
+    session: &GatewayVoiceSession,
+    context: &pioneer_protocol::VoiceTurnContext,
+) -> Result<(), VoiceError> {
+    if session.workspace_id != context.workspace_id
+        || session.thread_id != context.thread_id
+        || session.turn_id != context.turn_id
+    {
+        return Err(VoiceError {
+            kind: VoiceErrorKind::InvalidSession,
+            message: format!(
+                "voice finalize context does not match session `{}`",
+                session.session_id
+            ),
+        });
+    }
+
     Ok(())
 }
 
@@ -901,7 +995,7 @@ mod tests {
     };
     use pioneer_protocol::{
         AgentExecutionBackend, ThreadMode, TurnCapability, TurnCapabilityKind, UserInput,
-        VoiceAudioFormat, VoiceTurnContext,
+        VoiceTurnContext,
     };
 
     fn test_context() -> VoiceTurnContext {
@@ -933,19 +1027,6 @@ mod tests {
         }
     }
 
-    fn test_session(context: VoiceTurnContext) -> GatewayVoiceSession {
-        GatewayVoiceSession {
-            session_id: "voice_session_1".to_owned(),
-            connection_id: 7,
-            workspace_id: context.workspace_id.clone(),
-            thread_id: context.thread_id.clone(),
-            turn_id: context.turn_id.clone(),
-            state: GatewayVoiceSessionState::Transcribing,
-            context,
-            audio_format: VoiceAudioFormat::pioneer_streaming_target(),
-        }
-    }
-
     fn transcript(text: &str, total_samples: usize) -> VoiceTranscript {
         VoiceTranscript {
             text: text.to_owned(),
@@ -964,10 +1045,8 @@ mod tests {
         let context = test_context();
         let expected_attachment = context.prepared_input[0].clone();
         let expected_capabilities = context.capabilities.clone();
-        let session = test_session(context);
-
         let params = voice_turn_start_params_from_transcript(
-            &session,
+            &context,
             transcript("  create a summary  ", 16_000),
         )
         .expect("turn params");
@@ -996,9 +1075,9 @@ mod tests {
 
     #[test]
     fn empty_voice_transcript_is_no_speech_before_turn_params() {
-        let session = test_session(test_context());
+        let context = test_context();
 
-        let error = voice_turn_start_params_from_transcript(&session, transcript("  \n\t  ", 320))
+        let error = voice_turn_start_params_from_transcript(&context, transcript("  \n\t  ", 320))
             .expect_err("blank transcript should not build turn params");
 
         assert_eq!(

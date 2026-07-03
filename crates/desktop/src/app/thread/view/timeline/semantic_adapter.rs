@@ -95,7 +95,6 @@ mod tests {
     };
     use pioneer_protocol::{
         CLIRuntimePendingRequest, CLIRuntimeRequestKind, TurnPermissionApprovalRequest,
-        TurnPermissionMode, TurnPermissionProfileSource,
     };
 
     #[test]

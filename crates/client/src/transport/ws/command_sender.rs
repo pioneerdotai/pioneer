@@ -608,6 +608,21 @@ where
         "session_id",
         methods::VOICE_SESSION_FINALIZE,
     )?;
+    require_non_empty_field(
+        params.context.workspace_id.as_str(),
+        "workspace_id",
+        methods::VOICE_SESSION_FINALIZE,
+    )?;
+    require_non_empty_field(
+        params.context.thread_id.as_str(),
+        "thread_id",
+        methods::VOICE_SESSION_FINALIZE,
+    )?;
+    require_non_empty_field(
+        params.context.turn_id.as_str(),
+        "turn_id",
+        methods::VOICE_SESSION_FINALIZE,
+    )?;
 
     send_json_rpc_request_typed(
         transport,
@@ -2113,7 +2128,7 @@ mod tests {
     use pioneer_protocol::{
         ArtifactUploadSourceKind, JsonRpcRequest, McpScopeKind, SkillArchiveFormat,
         SkillHealthTarget, SkillLifecycleSource, TaskCancelScope, VoiceAudioEncoding,
-        VoiceTurnContext, Workspace,
+        VoiceSessionStartContext, VoiceTurnContext, Workspace,
     };
     use serde_json::json;
 
@@ -2176,26 +2191,34 @@ mod tests {
 
     fn voice_session_start_params() -> VoiceSessionStartParams {
         VoiceSessionStartParams {
-            context: VoiceTurnContext {
+            context: VoiceSessionStartContext {
                 workspace_id: "ws_1".to_owned(),
                 thread_id: "thread_1".to_owned(),
                 turn_id: "turn_1".to_owned(),
-                prepared_input: Vec::new(),
-                capabilities: Vec::new(),
-                model: None,
-                model_provider: None,
-                sandbox_policy: None,
-                mode: None,
-                execution_backend: None,
-                reasoning: None,
-                permission_profile: None,
-                cli_runtime_options: None,
             },
             audio_format: VoiceAudioFormat {
                 sample_rate_hz: 16_000,
                 channels: 1,
                 encoding: VoiceAudioEncoding::PcmS16Le,
             },
+        }
+    }
+
+    fn voice_turn_context() -> VoiceTurnContext {
+        VoiceTurnContext {
+            workspace_id: "ws_1".to_owned(),
+            thread_id: "thread_1".to_owned(),
+            turn_id: "turn_1".to_owned(),
+            prepared_input: Vec::new(),
+            capabilities: Vec::new(),
+            model: None,
+            model_provider: None,
+            sandbox_policy: None,
+            mode: None,
+            execution_backend: None,
+            reasoning: None,
+            permission_profile: None,
+            cli_runtime_options: None,
         }
     }
 
@@ -2522,6 +2545,7 @@ mod tests {
                     &PanicTransport,
                     VoiceSessionFinalizeParams {
                         session_id: " ".to_owned(),
+                        context: voice_turn_context(),
                     },
                 )
                 .expect_err("session id should be required")

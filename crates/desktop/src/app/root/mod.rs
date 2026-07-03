@@ -36,7 +36,7 @@ pub(super) use pioneer_client::{
     composer::capabilities::{ComposerCapability, ComposerCapabilityKind},
     composer::{
         attachments::{ComposerAttachment, ComposerAttachmentUploadState},
-        turn_prepare::PreparedVoiceComposerSnapshot,
+        turn_prepare::PrepareVoiceComposerSnapshotRequest,
     },
     gateway::runtime::GatewaySetupAction,
     providers::list::ProviderListState,
@@ -313,7 +313,7 @@ pub struct PioneerDesktop {
     pub(super) desktop_voice_status_error: Option<String>,
     pub(super) desktop_voice_status_poll_generation: u64,
     pub(super) desktop_voice_composer: DesktopVoiceComposerState,
-    pub(super) desktop_voice_snapshot: Option<PreparedVoiceComposerSnapshot>,
+    pub(super) desktop_voice_prepare_request: Option<PrepareVoiceComposerSnapshotRequest>,
     pub(super) desktop_voice_capture:
         Option<DesktopVoiceCaptureFlow<PlatformDesktopAudioInputBackend, GatewayWsCommandSender>>,
     pub(super) composer_model_selection_manually_selected: bool,

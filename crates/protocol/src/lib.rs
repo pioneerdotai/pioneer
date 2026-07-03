@@ -296,9 +296,9 @@ pub use voice::{
     VoiceChunkAckNotification, VoiceChunkFrameHeader, VoiceError, VoiceErrorKind,
     VoiceFrameDecodeError, VoiceFrameEncodeError, VoiceSessionCancelParams,
     VoiceSessionCancelResponse, VoiceSessionFinalizeParams, VoiceSessionFinalizeResponse,
-    VoiceSessionOutcome, VoiceSessionResultNotification, VoiceSessionStartParams,
-    VoiceSessionStartResponse, VoiceStatus, VoiceStatusParams, VoiceStatusResponse,
-    VoiceTurnContext, decode_voice_chunk_frame, encode_voice_chunk_frame,
+    VoiceSessionOutcome, VoiceSessionResultNotification, VoiceSessionStartContext,
+    VoiceSessionStartParams, VoiceSessionStartResponse, VoiceStatus, VoiceStatusParams,
+    VoiceStatusResponse, VoiceTurnContext, decode_voice_chunk_frame, encode_voice_chunk_frame,
     validate_voice_streaming_audio_format,
 };
 pub use workspace::{

@@ -4,7 +4,7 @@ use super::microphone::{
 use crate::gateway::GatewayWsCommandSender;
 use pioneer_protocol::{
     VoiceAudioEncoding, VoiceAudioFormat, VoiceSessionCancelParams, VoiceSessionFinalizeParams,
-    VoiceSessionStartParams, VoiceTurnContext,
+    VoiceSessionStartContext, VoiceSessionStartParams, VoiceTurnContext,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -221,7 +221,7 @@ where
 pub(crate) trait DesktopVoiceGateway {
     fn start_voice_session(
         &self,
-        context: VoiceTurnContext,
+        context: VoiceSessionStartContext,
         audio_format: VoiceAudioFormat,
     ) -> Result<String, DesktopVoiceCaptureError>;
 
@@ -235,7 +235,11 @@ pub(crate) trait DesktopVoiceGateway {
         pcm_chunk: Vec<u8>,
     ) -> Result<(), DesktopVoiceCaptureError>;
 
-    fn finalize_voice_session(&self, session_id: String) -> Result<(), DesktopVoiceCaptureError>;
+    fn finalize_voice_session(
+        &self,
+        session_id: String,
+        context: VoiceTurnContext,
+    ) -> Result<(), DesktopVoiceCaptureError>;
 
     fn cancel_voice_session(
         &self,
@@ -247,7 +251,7 @@ pub(crate) trait DesktopVoiceGateway {
 impl DesktopVoiceGateway for GatewayWsCommandSender {
     fn start_voice_session(
         &self,
-        context: VoiceTurnContext,
+        context: VoiceSessionStartContext,
         audio_format: VoiceAudioFormat,
     ) -> Result<String, DesktopVoiceCaptureError> {
         self.voice_session_start(VoiceSessionStartParams {
@@ -296,19 +300,26 @@ impl DesktopVoiceGateway for GatewayWsCommandSender {
         })
     }
 
-    fn finalize_voice_session(&self, session_id: String) -> Result<(), DesktopVoiceCaptureError> {
-        self.voice_session_finalize(VoiceSessionFinalizeParams { session_id })
-            .map(|_| ())
-            .map_err(|error| {
-                DesktopVoiceCaptureError::new(
-                    DesktopVoiceCaptureErrorKind::GatewayFinalize,
-                    t!(
-                        "chat.composer.voice.gateway_finalize_failed",
-                        error = format!("{error:#}").as_str()
-                    )
-                    .to_string(),
+    fn finalize_voice_session(
+        &self,
+        session_id: String,
+        context: VoiceTurnContext,
+    ) -> Result<(), DesktopVoiceCaptureError> {
+        self.voice_session_finalize(VoiceSessionFinalizeParams {
+            session_id,
+            context,
+        })
+        .map(|_| ())
+        .map_err(|error| {
+            DesktopVoiceCaptureError::new(
+                DesktopVoiceCaptureErrorKind::GatewayFinalize,
+                t!(
+                    "chat.composer.voice.gateway_finalize_failed",
+                    error = format!("{error:#}").as_str()
                 )
-            })
+                .to_string(),
+            )
+        })
     }
 
     fn cancel_voice_session(
@@ -365,7 +376,7 @@ where
         &mut self,
         gate: &DesktopMicrophoneGateReport,
         config: DesktopVoiceCaptureConfig,
-        context: VoiceTurnContext,
+        context: VoiceSessionStartContext,
     ) -> Result<(), DesktopVoiceCaptureError> {
         if self.active_gateway_session.is_some() || self.capture.is_capturing() {
             return Err(DesktopVoiceCaptureError::new(
@@ -467,12 +478,19 @@ where
         Ok(())
     }
 
-    pub(crate) fn release_send(&mut self) -> Result<(), DesktopVoiceCaptureError> {
-        self.capture.stop()?;
+    pub(crate) fn stop_recording(&mut self) -> Result<(), DesktopVoiceCaptureError> {
+        self.capture.stop()
+    }
+
+    pub(crate) fn finalize_send(
+        &mut self,
+        context: VoiceTurnContext,
+    ) -> Result<(), DesktopVoiceCaptureError> {
         let Some(session) = self.active_gateway_session.take() else {
             return Ok(());
         };
-        self.gateway.finalize_voice_session(session.session_id)
+        self.gateway
+            .finalize_voice_session(session.session_id, context)
     }
 
     pub(crate) fn release_cancel(&mut self) -> Result<(), DesktopVoiceCaptureError> {
@@ -1011,6 +1029,7 @@ mod tests {
         },
         Finalize {
             session_id: String,
+            turn_id: String,
         },
         Cancel {
             session_id: String,
@@ -1027,7 +1046,7 @@ mod tests {
     impl DesktopVoiceGateway for FakeGateway {
         fn start_voice_session(
             &self,
-            context: VoiceTurnContext,
+            context: VoiceSessionStartContext,
             _audio_format: VoiceAudioFormat,
         ) -> Result<String, DesktopVoiceCaptureError> {
             self.events
@@ -1064,11 +1083,15 @@ mod tests {
         fn finalize_voice_session(
             &self,
             session_id: String,
+            context: VoiceTurnContext,
         ) -> Result<(), DesktopVoiceCaptureError> {
             self.events
                 .lock()
                 .expect("events")
-                .push(GatewayEvent::Finalize { session_id });
+                .push(GatewayEvent::Finalize {
+                    session_id,
+                    turn_id: context.turn_id,
+                });
             Ok(())
         }
 
@@ -1110,6 +1133,14 @@ mod tests {
             reasoning: None,
             permission_profile: None,
             cli_runtime_options: None,
+        }
+    }
+
+    fn voice_start_context() -> VoiceSessionStartContext {
+        VoiceSessionStartContext {
+            workspace_id: "workspace_1".to_owned(),
+            thread_id: "thread_1".to_owned(),
+            turn_id: "turn_1".to_owned(),
         }
     }
 
@@ -1186,14 +1217,15 @@ mod tests {
         flow.start(
             &granted_gate(),
             DesktopVoiceCaptureConfig::default(),
-            voice_context(),
+            voice_start_context(),
         )
         .expect("start");
         flow.push_interleaved_f32_chunk(&[0.0; 320], 1, Some(100))
             .expect("chunk 0");
         flow.push_interleaved_f32_chunk(&[0.1; 320], 1, Some(120))
             .expect("chunk 1");
-        flow.release_send().expect("finalize");
+        flow.stop_recording().expect("stop recording");
+        flow.finalize_send(voice_context()).expect("finalize");
 
         assert_eq!(
             *events.lock().expect("events"),
@@ -1211,6 +1243,7 @@ mod tests {
                 },
                 GatewayEvent::Finalize {
                     session_id: "voice_session_1".to_owned(),
+                    turn_id: "turn_1".to_owned(),
                 },
             ]
         );
@@ -1229,7 +1262,7 @@ mod tests {
         flow.start(
             &granted_gate(),
             DesktopVoiceCaptureConfig::default(),
-            voice_context(),
+            voice_start_context(),
         )
         .expect("start");
 
@@ -1250,7 +1283,8 @@ mod tests {
             ]
         );
 
-        flow.release_send().expect("finalize");
+        flow.stop_recording().expect("stop recording");
+        flow.finalize_send(voice_context()).expect("finalize");
     }
 
     #[test]
@@ -1262,7 +1296,7 @@ mod tests {
         flow.start(
             &granted_gate(),
             DesktopVoiceCaptureConfig::default(),
-            voice_context(),
+            voice_start_context(),
         )
         .expect("start");
         flow.release_cancel().expect("cancel");
@@ -1294,7 +1328,7 @@ mod tests {
         flow.start(
             &granted_gate(),
             DesktopVoiceCaptureConfig::default(),
-            voice_context(),
+            voice_start_context(),
         )
         .expect("start");
         let error = flow
@@ -1331,7 +1365,11 @@ mod tests {
         };
 
         let error = flow
-            .start(&gate, DesktopVoiceCaptureConfig::default(), voice_context())
+            .start(
+                &gate,
+                DesktopVoiceCaptureConfig::default(),
+                voice_start_context(),
+            )
             .expect_err("gate failure");
 
         assert_eq!(error.kind, DesktopVoiceCaptureErrorKind::NoInputDevice);

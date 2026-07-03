@@ -166,6 +166,8 @@ pub struct ClientPrepareVoiceComposerSnapshotRequest {
     #[serde(default)]
     pub workspace_id: Option<String>,
     #[serde(default)]
+    pub turn_id: Option<String>,
+    #[serde(default)]
     pub selected_model: Option<String>,
     #[serde(default)]
     pub selected_provider: Option<String>,
@@ -667,6 +669,7 @@ impl ClientFfiActiveThreadState {
         let ClientPrepareVoiceComposerSnapshotRequest {
             thread_id,
             workspace_id: _workspace_id,
+            turn_id,
             selected_model,
             selected_provider,
             selected_reasoning_effort,
@@ -678,7 +681,15 @@ impl ClientFfiActiveThreadState {
 
         let thread_id = thread_session::require_thread_id(thread_id, "starting voice")
             .map_err(anyhow::Error::msg)?;
-        let turn_id = plan_turn_start_ids().turn_id;
+        let turn_id = match turn_id {
+            Some(turn_id) if turn_id.trim().is_empty() => {
+                return Err(anyhow::anyhow!(
+                    "turn_id is required before preparing voice context"
+                ));
+            }
+            Some(turn_id) => turn_id,
+            None => plan_turn_start_ids().turn_id,
+        };
         let (workspace_id, endpoint_kind) = {
             let inner = self
                 .inner
@@ -1797,6 +1808,22 @@ mod tests {
         }))
         .expect("request decodes");
 
+        assert_eq!(request.permission_mode, TurnPermissionMode::Supervised);
+    }
+
+    #[test]
+    fn voice_prepare_request_decodes_explicit_turn_id() {
+        let request: ClientPrepareVoiceComposerSnapshotRequest = serde_json::from_value(json!({
+            "thread_id": "thread_a",
+            "workspace_id": "ws_a",
+            "turn_id": "turn_voice_a",
+            "permission_mode": "supervised"
+        }))
+        .expect("request decodes");
+
+        assert_eq!(request.thread_id.as_deref(), Some("thread_a"));
+        assert_eq!(request.workspace_id.as_deref(), Some("ws_a"));
+        assert_eq!(request.turn_id.as_deref(), Some("turn_voice_a"));
         assert_eq!(request.permission_mode, TurnPermissionMode::Supervised);
     }
 

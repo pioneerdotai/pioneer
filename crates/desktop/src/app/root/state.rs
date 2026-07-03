@@ -107,7 +107,7 @@ impl PioneerDesktop {
             desktop_voice_status_error: None,
             desktop_voice_status_poll_generation: 0,
             desktop_voice_composer: DesktopVoiceComposerState::Idle,
-            desktop_voice_snapshot: None,
+            desktop_voice_prepare_request: None,
             desktop_voice_capture: None,
             composer_model_selection_manually_selected: false,
             composer_model_display_cache: HashMap::new(),

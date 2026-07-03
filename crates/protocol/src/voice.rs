@@ -460,6 +460,17 @@ impl VoiceTurnContext {
     }
 }
 
+/// Minimal context required to route and own a streaming voice session.
+///
+/// Full turn materialization context is provided on commit/finalize so clients can
+/// start microphone streaming before slower attachment/capability preparation.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct VoiceSessionStartContext {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq, Default)]
 pub struct VoiceStatusParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -477,7 +488,7 @@ pub struct VoiceStatusResponse {
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 pub struct VoiceSessionStartParams {
-    pub context: VoiceTurnContext,
+    pub context: VoiceSessionStartContext,
     pub audio_format: VoiceAudioFormat,
 }
 
@@ -487,9 +498,10 @@ pub struct VoiceSessionStartResponse {
     pub status: VoiceStatus,
 }
 
-#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 pub struct VoiceSessionFinalizeParams {
     pub session_id: String,
+    pub context: VoiceTurnContext,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
@@ -697,7 +709,11 @@ mod tests {
             cli_runtime_options: None,
         };
         let start = VoiceSessionStartParams {
-            context,
+            context: VoiceSessionStartContext {
+                workspace_id: context.workspace_id.clone(),
+                thread_id: context.thread_id.clone(),
+                turn_id: context.turn_id.clone(),
+            },
             audio_format: VoiceAudioFormat::pioneer_streaming_target(),
         };
         let start_round_trip: VoiceSessionStartParams =
@@ -720,6 +736,7 @@ mod tests {
 
         let finalize = VoiceSessionFinalizeParams {
             session_id: "voice_session_1".to_owned(),
+            context,
         };
         let finalize_round_trip: VoiceSessionFinalizeParams =
             serde_json::from_value(serde_json::to_value(&finalize).expect("serialize finalize"))

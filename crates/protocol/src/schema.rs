@@ -202,12 +202,12 @@ use crate::{
     VoiceAudioEncoding, VoiceAudioFormat, VoiceChunkAckNotification, VoiceChunkFrameHeader,
     VoiceError, VoiceErrorKind, VoiceSessionCancelParams, VoiceSessionCancelResponse,
     VoiceSessionFinalizeParams, VoiceSessionFinalizeResponse, VoiceSessionOutcome,
-    VoiceSessionResultNotification, VoiceSessionStartParams, VoiceSessionStartResponse,
-    VoiceStatus, VoiceStatusParams, VoiceStatusResponse, VoiceTurnContext, Workspace,
-    WorkspaceChangeKind, WorkspaceChangedNotification, WorkspaceCreateParams,
-    WorkspaceCreateResponse, WorkspaceDefaultParams, WorkspaceDefaultResponse, WorkspaceListParams,
-    WorkspaceListResponse, WorkspaceSelectParams, WorkspaceSelectResponse, WorkspaceUpdateParams,
-    WorkspaceUpdateResponse,
+    VoiceSessionResultNotification, VoiceSessionStartContext, VoiceSessionStartParams,
+    VoiceSessionStartResponse, VoiceStatus, VoiceStatusParams, VoiceStatusResponse,
+    VoiceTurnContext, Workspace, WorkspaceChangeKind, WorkspaceChangedNotification,
+    WorkspaceCreateParams, WorkspaceCreateResponse, WorkspaceDefaultParams,
+    WorkspaceDefaultResponse, WorkspaceListParams, WorkspaceListResponse, WorkspaceSelectParams,
+    WorkspaceSelectResponse, WorkspaceUpdateParams, WorkspaceUpdateResponse,
 };
 
 pub struct SchemaDocument {
@@ -992,6 +992,7 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!("voice_audio_format.json", VoiceAudioFormat),
         schema_doc!("voice_chunk_frame_header.json", VoiceChunkFrameHeader),
         schema_doc!("voice_turn_context.json", VoiceTurnContext),
+        schema_doc!("voice_session_start_context.json", VoiceSessionStartContext),
         schema_doc!("voice_session_start_params.json", VoiceSessionStartParams),
         schema_doc!(
             "voice_session_start_response.json",

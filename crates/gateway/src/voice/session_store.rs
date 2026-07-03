@@ -1,5 +1,5 @@
 use crate::session::ConnectionId;
-use pioneer_protocol::{VoiceAudioFormat, VoiceError, VoiceErrorKind, VoiceTurnContext};
+use pioneer_protocol::{VoiceAudioFormat, VoiceError, VoiceErrorKind, VoiceSessionStartContext};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -35,7 +35,6 @@ pub(crate) struct GatewayVoiceSession {
     pub(crate) thread_id: String,
     pub(crate) turn_id: String,
     pub(crate) state: GatewayVoiceSessionState,
-    pub(crate) context: VoiceTurnContext,
     pub(crate) audio_format: VoiceAudioFormat,
 }
 
@@ -88,7 +87,7 @@ impl GatewayVoiceSessionStore {
         &self,
         session_id: impl Into<String>,
         connection_id: ConnectionId,
-        context: VoiceTurnContext,
+        context: VoiceSessionStartContext,
         audio_format: VoiceAudioFormat,
     ) -> Result<GatewayVoiceSession, GatewayVoiceSessionError> {
         let session_id = session_id.into();
@@ -107,7 +106,6 @@ impl GatewayVoiceSessionStore {
             thread_id: context.thread_id.clone(),
             turn_id: context.turn_id.clone(),
             state: GatewayVoiceSessionState::Created,
-            context,
             audio_format,
         };
         sessions.insert(session_id, session.clone());
@@ -313,7 +311,6 @@ mod tests {
         assert_eq!(recording.state, GatewayVoiceSessionState::Recording);
         assert_eq!(finalizing.state, GatewayVoiceSessionState::Finalizing);
         assert_eq!(transcribing.state, GatewayVoiceSessionState::Transcribing);
-        assert_eq!(lookup.context, context);
         assert_eq!(lookup.workspace_id, "workspace_1");
         assert_eq!(lookup.thread_id, "thread_1");
         assert_eq!(lookup.turn_id, "turn_1");
@@ -384,21 +381,11 @@ mod tests {
         assert!(store.lookup_session("voice_session_3", 8).is_ok());
     }
 
-    fn test_context() -> VoiceTurnContext {
-        VoiceTurnContext {
+    fn test_context() -> VoiceSessionStartContext {
+        VoiceSessionStartContext {
             workspace_id: "workspace_1".to_owned(),
             thread_id: "thread_1".to_owned(),
             turn_id: "turn_1".to_owned(),
-            prepared_input: Vec::new(),
-            capabilities: Vec::new(),
-            model: None,
-            model_provider: None,
-            sandbox_policy: None,
-            mode: None,
-            execution_backend: None,
-            reasoning: None,
-            permission_profile: None,
-            cli_runtime_options: None,
         }
     }
 

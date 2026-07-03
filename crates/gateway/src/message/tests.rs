@@ -4570,6 +4570,38 @@ async fn voice_session_transcript_starts_turn_and_preserves_context_attachments(
     )
     .await;
 
+    let voice_turn_id = "turn_voice_success_0001";
+    let voice_context = json!({
+        "workspace_id": workspace_id,
+        "thread_id": thread.thread.id,
+        "turn_id": voice_turn_id,
+        "prepared_input": [
+            { "type": "localFile", "path": "/tmp/voice-context.txt" },
+            {
+                "type": "artifact",
+                "artifactId": artifact.artifact_id.clone(),
+                "versionId": artifact.version_id.clone()
+            }
+        ],
+        "capabilities": [
+            {
+                "id": "skill:user:weather",
+                "kind": { "type": "skill", "slug": "weather", "sourceKind": "user" },
+                "label": "weather"
+            },
+            {
+                "id": "mcp-tool:workspace:resend:send_email",
+                "kind": {
+                    "type": "mcpTool",
+                    "serverName": "resend",
+                    "rawToolName": "send_email",
+                    "scopeKind": "workspace"
+                },
+                "label": "resend / Send Email"
+            }
+        ]
+    });
+
     let start_request_id = generate_test_request_id("voice", "start_success");
     let start_request = json!({
         "jsonrpc": "2.0",
@@ -4579,32 +4611,7 @@ async fn voice_session_transcript_starts_turn_and_preserves_context_attachments(
             "context": {
                 "workspace_id": workspace_id,
                 "thread_id": thread.thread.id,
-                "turn_id": "turn_voice_success_0001",
-                "prepared_input": [
-                    { "type": "localFile", "path": "/tmp/voice-context.txt" },
-                    {
-                        "type": "artifact",
-                        "artifactId": artifact.artifact_id.clone(),
-                        "versionId": artifact.version_id.clone()
-                    }
-                ],
-                "capabilities": [
-                    {
-                        "id": "skill:user:weather",
-                        "kind": { "type": "skill", "slug": "weather", "sourceKind": "user" },
-                        "label": "weather"
-                    },
-                    {
-                        "id": "mcp-tool:workspace:resend:send_email",
-                        "kind": {
-                            "type": "mcpTool",
-                            "serverName": "resend",
-                            "rawToolName": "send_email",
-                            "scopeKind": "workspace"
-                        },
-                        "label": "resend / Send Email"
-                    }
-                ]
+                "turn_id": voice_turn_id
             },
             "audio_format": {
                 "sample_rate_hz": 16000,
@@ -4656,7 +4663,10 @@ async fn voice_session_transcript_starts_turn_and_preserves_context_attachments(
         "jsonrpc": "2.0",
         "id": finalize_request_id.clone(),
         "method": "voice/session/finalize",
-        "params": { "session_id": start_payload.session_id }
+        "params": {
+            "session_id": start_payload.session_id,
+            "context": voice_context
+        }
     });
     processor
         .process_request(connection_id, &finalize_request.to_string())
@@ -4846,7 +4856,16 @@ async fn voice_session_finalize_without_speech_does_not_create_turn() {
         "jsonrpc": "2.0",
         "id": finalize_request_id.clone(),
         "method": "voice/session/finalize",
-        "params": { "session_id": start_payload.session_id }
+        "params": {
+            "session_id": start_payload.session_id,
+            "context": {
+                "workspace_id": workspace_id,
+                "thread_id": thread.thread.id,
+                "turn_id": "turn_voice_no_speech_0001",
+                "prepared_input": [],
+                "capabilities": []
+            }
+        }
     });
     processor
         .process_request(connection_id, &finalize_request.to_string())
@@ -4939,9 +4958,7 @@ async fn voice_status_and_start_report_model_unavailable() {
             "context": {
                 "workspace_id": workspace_id,
                 "thread_id": "thr_voice_unavailable",
-                "turn_id": "turn_voice_unavailable",
-                "prepared_input": [],
-                "capabilities": []
+                "turn_id": "turn_voice_unavailable"
             },
             "audio_format": {
                 "sample_rate_hz": 16000,
@@ -4977,9 +4994,7 @@ async fn start_test_voice_session(
             "context": {
                 "workspace_id": workspace_id,
                 "thread_id": thread_id,
-                "turn_id": turn_id,
-                "prepared_input": [],
-                "capabilities": []
+                "turn_id": turn_id
             },
             "audio_format": {
                 "sample_rate_hz": 16000,
