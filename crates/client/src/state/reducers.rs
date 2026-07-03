@@ -12,7 +12,7 @@ use crate::{
     state::client_state::{ClientState, ThreadAgentsDocSummaryKey},
     threads::{
         coordinator::ThreadCoordinator,
-        resume as thread_resume,
+        resume as thread_resume, session as thread_session,
         start::{self as thread_start, ThreadStartCoordinator},
         tree as thread_tree,
     },
@@ -24,29 +24,19 @@ use pioneer_protocol::{
 use std::collections::{HashMap, HashSet, VecDeque};
 
 pub fn set_active_thread_id(state: &mut ClientState, thread_id: Option<String>) -> bool {
-    let changed = state.threads.active_thread_id != thread_id;
-    state.threads.active_thread_id = thread_id;
-    changed
+    thread_session::set_active_thread_id(&mut state.threads.active_thread_id, thread_id)
 }
 
 pub fn clear_active_thread_if_matches(state: &mut ClientState, thread_id: &str) -> bool {
-    if state.threads.active_thread_id.as_deref() == Some(thread_id) {
-        state.threads.active_thread_id = None;
-        return true;
-    }
-    false
+    thread_session::clear_active_thread_if_matches(&mut state.threads.active_thread_id, thread_id)
 }
 
 pub fn set_draft_thread_id(state: &mut ClientState, thread_id: Option<String>) {
-    state.threads.draft_thread_id = thread_id;
+    thread_session::set_draft_thread_id(&mut state.threads.draft_thread_id, thread_id);
 }
 
 pub fn clear_draft_thread_if_matches(state: &mut ClientState, thread_id: &str) -> bool {
-    if state.threads.draft_thread_id.as_deref() == Some(thread_id) {
-        state.threads.draft_thread_id = None;
-        return true;
-    }
-    false
+    thread_session::clear_draft_thread_if_matches(&mut state.threads.draft_thread_id, thread_id)
 }
 
 pub fn collect_known_thread_ids_for_unsubscribe(
@@ -779,7 +769,7 @@ pub fn remember_last_active_thread_for_workspace(
     workspace_id: &str,
     thread_id: Option<String>,
 ) {
-    thread_tree::remember_thread_for_workspace(
+    thread_session::remember_thread_for_workspace(
         &mut state.threads.last_active_thread_by_workspace,
         workspace_id,
         thread_id,
@@ -791,7 +781,7 @@ pub fn remember_draft_thread_for_workspace(
     workspace_id: &str,
     thread_id: Option<String>,
 ) {
-    thread_tree::remember_thread_for_workspace(
+    thread_session::remember_thread_for_workspace(
         &mut state.threads.draft_thread_by_workspace,
         workspace_id,
         thread_id,

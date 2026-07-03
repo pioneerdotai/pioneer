@@ -18,9 +18,11 @@ mod workspaces;
 use active_thread::{
     ClientActiveThreadCancelTurnRequest, ClientActiveThreadCancelTurnResult,
     ClientActiveThreadClearResult, ClientActiveThreadEventRequest, ClientActiveThreadEventResult,
-    ClientActiveThreadOpenRequest, ClientActiveThreadSendTextRequest,
-    ClientActiveThreadSendTextResult, ClientActiveThreadSnapshot,
-    ClientActiveThreadSnapshotRequest, ClientFfiActiveThreadState,
+    ClientActiveThreadOpenByIdRequest, ClientActiveThreadOpenRequest,
+    ClientActiveThreadSendTextRequest, ClientActiveThreadSendTextResult,
+    ClientActiveThreadSnapshot, ClientActiveThreadSnapshotRequest,
+    ClientActiveThreadUnsubscribeRequest, ClientActiveThreadUnsubscribeResult,
+    ClientEnsureWorkspaceDraftRequest, ClientFfiActiveThreadState,
     ClientPrepareVoiceComposerSnapshotRequest,
 };
 use composer::{
@@ -923,6 +925,42 @@ impl ClientFfiRuntime {
             .map_err(|error| format!("{error:#}"))
     }
 
+    fn active_thread_open_by_id(
+        &self,
+        input_json: &str,
+    ) -> Result<ClientActiveThreadSnapshot, String> {
+        let request = serde_json::from_str::<ClientActiveThreadOpenByIdRequest>(input_json)
+            .map_err(|error| format!("invalid active thread open by id request: {error}"))?;
+
+        self.active_thread
+            .open_thread_by_id(&self.client_runtime, request)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn active_thread_ensure_workspace_draft(
+        &self,
+        input_json: &str,
+    ) -> Result<ClientActiveThreadSnapshot, String> {
+        let request = serde_json::from_str::<ClientEnsureWorkspaceDraftRequest>(input_json)
+            .map_err(|error| format!("invalid active thread draft request: {error}"))?;
+
+        self.active_thread
+            .ensure_workspace_draft(&self.client_runtime, request)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn active_thread_open_or_create_new(
+        &self,
+        input_json: &str,
+    ) -> Result<ClientActiveThreadSnapshot, String> {
+        let request = serde_json::from_str::<ClientEnsureWorkspaceDraftRequest>(input_json)
+            .map_err(|error| format!("invalid active thread new request: {error}"))?;
+
+        self.active_thread
+            .open_or_create_new_thread(&self.client_runtime, request)
+            .map_err(|error| format!("{error:#}"))
+    }
+
     fn active_thread_snapshot(
         &self,
         input_json: &str,
@@ -986,6 +1024,18 @@ impl ClientFfiRuntime {
     fn active_thread_clear(&self) -> Result<ClientActiveThreadClearResult, String> {
         self.active_thread
             .clear(&self.client_runtime)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn active_thread_unsubscribe_or_close(
+        &self,
+        input_json: &str,
+    ) -> Result<ClientActiveThreadUnsubscribeResult, String> {
+        let request = serde_json::from_str::<ClientActiveThreadUnsubscribeRequest>(input_json)
+            .map_err(|error| format!("invalid active thread unsubscribe request: {error}"))?;
+
+        self.active_thread
+            .unsubscribe_or_close_thread(&self.client_runtime, request)
             .map_err(|error| format!("{error:#}"))
     }
 
@@ -1311,6 +1361,18 @@ ffi_client_json_method!(pioneer_client_ffi_agents_doc_save, agents_doc_save);
 ffi_client_json_method!(pioneer_client_ffi_agents_doc_archive, agents_doc_archive);
 ffi_client_json_method!(pioneer_client_ffi_active_thread_open, active_thread_open);
 ffi_client_json_method!(
+    pioneer_client_ffi_active_thread_open_by_id,
+    active_thread_open_by_id
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_active_thread_ensure_workspace_draft,
+    active_thread_ensure_workspace_draft
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_active_thread_open_or_create_new,
+    active_thread_open_or_create_new
+);
+ffi_client_json_method!(
     pioneer_client_ffi_active_thread_snapshot,
     active_thread_snapshot
 );
@@ -1329,6 +1391,10 @@ ffi_client_json_method!(
 ffi_client_json_method!(
     pioneer_client_ffi_active_thread_cancel_turn,
     active_thread_cancel_turn
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_active_thread_unsubscribe_or_close,
+    active_thread_unsubscribe_or_close
 );
 
 #[unsafe(no_mangle)]

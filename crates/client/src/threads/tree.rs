@@ -638,9 +638,9 @@ pub fn sorted_thread_ids_from_coordinators(
         .filter(|(thread_id, coordinator)| {
             Some(thread_id.as_str()) != draft_thread_id
                 && workspace_id.is_none_or(|workspace_id| coordinator.workspace_id == workspace_id)
-                && coordinator.thread().is_none_or(|thread| {
-                    thread.sidebar_visibility == ThreadSidebarVisibility::Visible
-                })
+                && coordinator
+                    .thread()
+                    .is_none_or(|thread| thread_should_appear_in_sidebar(thread, draft_thread_id))
         })
         .map(|(thread_id, _)| thread_id.clone())
         .collect();
@@ -656,6 +656,11 @@ pub fn sorted_thread_ids_from_coordinators(
         rhs_updated.cmp(&lhs_updated).then_with(|| lhs.cmp(rhs))
     });
     thread_ids
+}
+
+pub fn thread_should_appear_in_sidebar(thread: &Thread, draft_thread_id: Option<&str>) -> bool {
+    Some(thread.id.as_str()) != draft_thread_id
+        && thread.sidebar_visibility == ThreadSidebarVisibility::Visible
 }
 
 pub fn child_folder_ids_for_folder(

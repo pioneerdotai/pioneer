@@ -902,6 +902,36 @@ pub fn apply_semantic_timeline_live_update(
     }
 }
 
+pub fn apply_semantic_timeline_live_update_with_patch(
+    state: &mut SemanticTimelineState,
+    update: SemanticTimelineLiveUpdate,
+) -> SemanticTimelineCachePatch {
+    let (workspace_id, thread_id) = match &update {
+        SemanticTimelineLiveUpdate::ThreadTimelineBlocksChanged(notification) => (
+            notification.workspace_id.clone(),
+            notification.thread_id.clone(),
+        ),
+        SemanticTimelineLiveUpdate::TurnWorkItemsChanged(notification) => (
+            notification.workspace_id.clone(),
+            notification.thread_id.clone(),
+        ),
+        SemanticTimelineLiveUpdate::TurnWorkStateChanged(notification) => (
+            notification.workspace_id.clone(),
+            notification.thread_id.clone(),
+        ),
+    };
+    let before = state.thread(thread_id.as_str()).cloned();
+    if !apply_semantic_timeline_live_update(state, update) {
+        return SemanticTimelineCachePatch {
+            workspace_id,
+            thread_id,
+            ..SemanticTimelineCachePatch::default()
+        };
+    }
+    let after = state.thread(thread_id.as_str());
+    semantic_timeline_cache_patch_from_diff(&workspace_id, thread_id, before.as_ref(), after)
+}
+
 pub fn apply_conversation_event_to_semantic_timeline(
     state: &mut SemanticTimelineState,
     workspace_id: &str,
@@ -2660,6 +2690,48 @@ mod tests {
             patch.changed_blocks[1].kind,
             TimelineBlockKind::TurnWork { .. }
         ));
+    }
+
+    #[test]
+    fn live_timeline_update_patch_removes_stale_top_level_blocks() {
+        let mut state = SemanticTimelineState::default();
+        apply_conversation_event_to_semantic_timeline_with_patch(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::LocalTurnStartRequested {
+                thread_id: "thread_a".to_owned(),
+                turn_id: "turn_a".to_owned(),
+                pending_request_id: "pending_a".to_owned(),
+                user_text: "hello".to_owned(),
+                attachments: Vec::new(),
+            },
+            10,
+        );
+
+        let patch = apply_semantic_timeline_live_update_with_patch(
+            &mut state,
+            SemanticTimelineLiveUpdate::ThreadTimelineBlocksChanged(
+                ThreadTimelineBlocksChangedNotification {
+                    workspace_id: "workspace_a".to_owned(),
+                    thread_id: "thread_a".to_owned(),
+                    changed_block_ids: Vec::new(),
+                    removed_block_ids: vec!["turn:turn_a:work".to_owned()],
+                    before_cursor: None,
+                    after_cursor: None,
+                    reason: pioneer_protocol::TimelineChangeReason::LiveEvent,
+                },
+            ),
+        );
+
+        assert_eq!(patch.workspace_id, "workspace_a");
+        assert_eq!(patch.thread_id, "thread_a");
+        assert_eq!(patch.removed_block_ids, vec!["turn:turn_a:work"]);
+        assert!(
+            state
+                .thread("thread_a")
+                .and_then(|thread| thread.top_level.blocks_by_id.get("turn:turn_a:work"))
+                .is_none()
+        );
     }
 
     #[test]

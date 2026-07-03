@@ -1,12 +1,13 @@
 use pioneer_client::{
     composer::model_selection::ComposerModelSelection,
     rpc::JsonRpcRequestTransport,
-    threads::tree::{ThreadTreeRefreshContext, reduce_thread_tree_refresh_success},
+    threads::tree::{
+        ThreadTreeRefreshContext, reduce_thread_tree_refresh_success,
+        thread_should_appear_in_sidebar,
+    },
     transport::ws::command_sender as ws_commands,
 };
-use pioneer_protocol::{
-    Thread, ThreadAgentsDocSummary, ThreadFolder, ThreadPlacement, ThreadSidebarVisibility,
-};
+use pioneer_protocol::{Thread, ThreadAgentsDocSummary, ThreadFolder, ThreadPlacement};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -77,6 +78,8 @@ pub fn refresh_thread_tree<TTransport>(
 where
     TTransport: JsonRpcRequestTransport + ?Sized,
 {
+    let existing_draft_thread_id = request.existing_draft_thread_id;
+    let existing_draft_thread_workspace_id = request.existing_draft_thread_workspace_id;
     let response = ws_commands::thread_tree(
         transport,
         pioneer_client::threads::tree::thread_tree_params(request.workspace_id),
@@ -85,22 +88,24 @@ where
         response,
         ThreadTreeRefreshContext {
             active_thread_id: request.active_thread_id.as_deref(),
-            existing_draft_thread_id: request.existing_draft_thread_id.as_deref(),
-            existing_draft_thread_workspace_id: request
-                .existing_draft_thread_workspace_id
-                .as_deref(),
+            existing_draft_thread_id: existing_draft_thread_id.as_deref(),
+            existing_draft_thread_workspace_id: existing_draft_thread_workspace_id.as_deref(),
             has_known_threads_for_workspace: request.has_known_threads_for_workspace,
         },
     );
 
     Ok(ClientThreadTreeQueryData {
-        snapshot: client_thread_tree_snapshot_from_reduction(reduction),
+        snapshot: client_thread_tree_snapshot_from_reduction(
+            reduction,
+            existing_draft_thread_id.as_deref(),
+        ),
         composer_model_selection: None,
     })
 }
 
 pub fn client_thread_tree_snapshot_from_reduction(
     reduction: pioneer_client::threads::tree::ThreadTreeRefreshSuccessReduction,
+    draft_thread_id: Option<&str>,
 ) -> ClientThreadTreeSnapshot {
     let workspace_id = reduction.workspace_id;
     let folders = reduction.folders;
@@ -111,7 +116,7 @@ pub fn client_thread_tree_snapshot_from_reduction(
         .into_iter()
         .filter(|thread| {
             thread.workspace_id == workspace_id
-                && thread.sidebar_visibility == ThreadSidebarVisibility::Visible
+                && thread_should_appear_in_sidebar(thread, draft_thread_id)
         })
         .collect::<Vec<_>>();
     threads.sort_by(|lhs, rhs| {
@@ -307,4 +312,74 @@ fn thread_tree_folder_key(folder_id: Option<&str>, folder_id_set: &HashSet<Strin
 
 fn thread_tree_agents_doc_folder_key(folder_id: Option<&str>) -> String {
     folder_id.unwrap_or(THREAD_TREE_ROOT_FOLDER_KEY).to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pioneer_client::threads::tree::ThreadTreeRefreshSuccessReduction;
+    use pioneer_protocol::{ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus};
+
+    fn thread(thread_id: &str, workspace_id: &str, updated_at: i64) -> Thread {
+        Thread {
+            workspace_id: workspace_id.to_owned(),
+            id: thread_id.to_owned(),
+            name: None,
+            preview: String::new(),
+            mode: ThreadMode::Chat,
+            model: "gpt-5.5".to_owned(),
+            model_provider: "openai".to_owned(),
+            reasoning_effort: None,
+            created_at: updated_at,
+            updated_at,
+            status: ThreadStatus::Idle,
+            origin_kind: ThreadOriginKind::User,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            turns: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn thread_tree_snapshot_filters_existing_draft_thread() {
+        let reduction = ThreadTreeRefreshSuccessReduction {
+            workspace_id: "workspace_a".to_owned(),
+            threads: vec![
+                thread("thread_visible", "workspace_a", 10),
+                thread("thread_draft", "workspace_a", 20),
+            ],
+            folders: Vec::new(),
+            placements: Vec::new(),
+            agents_docs: Vec::new(),
+            set_active_thread_id: None,
+            set_preferred_workspace_id: None,
+            ensure_thread_subscription: None,
+            ensure_thread_timeline_loaded: None,
+            request_thread_start_if_needed: false,
+            drive_thread_start_queue: false,
+            sync_composer_model_selection: false,
+        };
+
+        let snapshot = client_thread_tree_snapshot_from_reduction(reduction, Some("thread_draft"));
+        let level = client_thread_tree_level(ThreadTreeLevelRequest {
+            snapshot,
+            folder_id: None,
+        });
+
+        assert!(
+            level
+                .threads
+                .iter()
+                .all(|thread| thread.id != "thread_draft")
+        );
+        assert_eq!(
+            level
+                .threads
+                .iter()
+                .map(|thread| thread.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["thread_visible"]
+        );
+    }
 }

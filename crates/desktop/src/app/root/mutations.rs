@@ -3,7 +3,7 @@ use crate::state;
 use pioneer_client::composer::draft as composer_draft;
 use pioneer_client::state::reducers as client_state_reducers;
 use pioneer_client::threads::{
-    resume as thread_resume, start as thread_start, tree as thread_tree,
+    resume as thread_resume, session as thread_session, start as thread_start, tree as thread_tree,
 };
 use tracing::warn;
 
@@ -18,35 +18,31 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn set_active_thread_id(&mut self, thread_id: Option<String>) {
-        let changed = self.active_thread_id != thread_id;
-        self.active_thread_id = thread_id;
+        let changed = thread_session::set_active_thread_id(&mut self.active_thread_id, thread_id);
         if changed {
             self.reset_composer_model_selection_for_active_thread();
         }
     }
 
     pub(in crate::app) fn clear_active_thread_if_matches(&mut self, thread_id: &str) -> bool {
-        if self.active_thread_id.as_deref() == Some(thread_id) {
-            self.set_active_thread_id(None);
-            return true;
+        let changed =
+            thread_session::clear_active_thread_if_matches(&mut self.active_thread_id, thread_id);
+        if changed {
+            self.reset_composer_model_selection_for_active_thread();
         }
-        false
+        changed
     }
 
     pub(in crate::app) fn set_draft_thread_id(&mut self, thread_id: Option<String>) {
-        self.draft_thread_id = thread_id;
+        thread_session::set_draft_thread_id(&mut self.draft_thread_id, thread_id);
     }
 
     pub(in crate::app) fn clear_draft_thread_if_matches(&mut self, thread_id: &str) -> bool {
-        if self.draft_thread_id.as_deref() == Some(thread_id) {
-            self.draft_thread_id = None;
-            return true;
-        }
-        false
+        thread_session::clear_draft_thread_if_matches(&mut self.draft_thread_id, thread_id)
     }
 
     pub(in crate::app) fn promote_thread_from_draft(&mut self, thread_id: &str) -> bool {
-        if !self.clear_draft_thread_if_matches(thread_id) {
+        if !thread_session::promote_thread_from_draft(&mut self.draft_thread_id, thread_id) {
             return false;
         }
 
@@ -55,12 +51,9 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn resolve_existing_draft_thread_id(&mut self) -> Option<String> {
-        let thread_id = self.draft_thread_id.clone()?;
-        if self.thread_coordinators.contains_key(thread_id.as_str()) {
-            return Some(thread_id);
-        }
-        self.draft_thread_id = None;
-        None
+        thread_session::resolve_existing_draft_thread_id(&mut self.draft_thread_id, |thread_id| {
+            self.thread_coordinators.contains_key(thread_id)
+        })
     }
 
     pub(in crate::app) fn set_preferred_workspace_id(&mut self, workspace_id: Option<String>) {
@@ -97,7 +90,7 @@ impl PioneerDesktop {
         workspace_id: &str,
         thread_id: Option<String>,
     ) {
-        thread_tree::remember_thread_for_workspace(
+        thread_session::remember_thread_for_workspace(
             &mut self.last_active_thread_by_workspace,
             workspace_id,
             thread_id,
@@ -109,7 +102,7 @@ impl PioneerDesktop {
         workspace_id: &str,
         thread_id: Option<String>,
     ) {
-        thread_tree::remember_thread_for_workspace(
+        thread_session::remember_thread_for_workspace(
             &mut self.draft_thread_by_workspace,
             workspace_id,
             thread_id,

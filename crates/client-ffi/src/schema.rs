@@ -64,6 +64,22 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             crate::active_thread::ClientActiveThreadOpenRequest
         ),
         schema_doc!(
+            "client_active_thread_open_by_id_request.json",
+            crate::active_thread::ClientActiveThreadOpenByIdRequest
+        ),
+        schema_doc!(
+            "client_ensure_workspace_draft_request.json",
+            crate::active_thread::ClientEnsureWorkspaceDraftRequest
+        ),
+        schema_doc!(
+            "client_active_thread_unsubscribe_request.json",
+            crate::active_thread::ClientActiveThreadUnsubscribeRequest
+        ),
+        schema_doc!(
+            "client_active_thread_unsubscribe_result.json",
+            crate::active_thread::ClientActiveThreadUnsubscribeResult
+        ),
+        schema_doc!(
             "client_active_thread_send_text_request.json",
             crate::active_thread::ClientActiveThreadSendTextRequest
         ),
