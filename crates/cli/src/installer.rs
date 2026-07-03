@@ -859,7 +859,6 @@ fn unpack_asset_to_binary(asset_path: &Path, target_binary: &Path) -> Result<()>
     }
 }
 
-#[cfg(not(windows))]
 fn unpack_gzip_asset(asset_path: &Path, target_binary: &Path) -> Result<()> {
     let input = File::open(asset_path)
         .with_context(|| format!("failed to open asset `{}`", asset_path.display()))?;
