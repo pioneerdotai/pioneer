@@ -32,7 +32,7 @@ pub(super) use pioneer_client::{
     artifacts::actions::ArtifactActionStatus as ThreadArtifactActionStatus,
     artifacts::preview::ArtifactPreviewImagePaths as ThreadArtifactPreviewImagePaths,
     artifacts::state::{ThreadArtifactFilter, ThreadArtifactsState},
-    cli_runtime::approvals::{CLIRuntimePendingRequestEntry, PendingRequest, PendingRequestState},
+    cli_runtime::approvals::{PendingRequest, PendingRequestState},
     composer::capabilities::{ComposerCapability, ComposerCapabilityKind},
     composer::{
         attachments::{ComposerAttachment, ComposerAttachmentUploadState},

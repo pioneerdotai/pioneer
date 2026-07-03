@@ -85,6 +85,7 @@ use pioneer_client::{
         },
     },
     runtime::ClientRuntime,
+    timeline::semantic::{TopLevelPageMergeMode, WorkPageMergeMode},
     workspaces::{
         actions::WorkspaceBootstrapSuccessReduction,
         bootstrap::{WorkspaceBootstrapRequest, bootstrap_workspace_catalog},
@@ -99,9 +100,9 @@ use pioneer_protocol::{
     ProviderListModelsParams, ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
     ThreadAgentsDocArchiveParams, ThreadAgentsDocArchiveResponse, ThreadAgentsDocGetParams,
     ThreadAgentsDocGetResponse, ThreadAgentsDocSaveParams, ThreadAgentsDocSaveResponse,
-    ThreadTimelinePageParams, ThreadTimelinePageResponse, TurnPermissionRequestRespondParams,
-    TurnPermissionRequestRespondResponse, TurnWorkPageParams, TurnWorkPageResponse,
-    VoiceAudioFormat, VoiceSessionCancelParams, VoiceSessionCancelResponse,
+    ThreadTimelinePageParams, ThreadTimelinePageResponse, TimelinePageAnchor,
+    TurnPermissionRequestRespondParams, TurnPermissionRequestRespondResponse, TurnWorkPageParams,
+    TurnWorkPageResponse, VoiceAudioFormat, VoiceSessionCancelParams, VoiceSessionCancelResponse,
     VoiceSessionFinalizeParams, VoiceSessionFinalizeResponse, VoiceSessionStartParams,
     VoiceSessionStartResponse, VoiceStatusParams, VoiceStatusResponse,
 };
@@ -854,7 +855,15 @@ impl ClientFfiRuntime {
                 )
             })?;
 
-        thread_timeline_page(&self.client_runtime.ws_command_sender(), params)
+        let merge_mode = thread_timeline_page_merge_mode(&params.anchor);
+        let page = thread_timeline_page(&self.client_runtime.ws_command_sender(), params)?;
+        self.active_thread
+            .apply_thread_timeline_page(page.clone(), merge_mode)
+            .map_err(|error| {
+                ClientFfiError::new(format!("{error:#}"), timeline::TIMELINE_ERROR_VALIDATION)
+            })?;
+
+        Ok(page)
     }
 
     fn turn_work_page(&self, input_json: &str) -> Result<TurnWorkPageResponse, ClientFfiError> {
@@ -865,7 +874,15 @@ impl ClientFfiRuntime {
             )
         })?;
 
-        turn_work_page(&self.client_runtime.ws_command_sender(), params)
+        let merge_mode = turn_work_page_merge_mode(&params.anchor);
+        let page = turn_work_page(&self.client_runtime.ws_command_sender(), params)?;
+        self.active_thread
+            .apply_turn_work_page(page.clone(), merge_mode)
+            .map_err(|error| {
+                ClientFfiError::new(format!("{error:#}"), timeline::TIMELINE_ERROR_VALIDATION)
+            })?;
+
+        Ok(page)
     }
 
     fn agents_doc_get(&self, input_json: &str) -> Result<ThreadAgentsDocGetResponse, String> {
@@ -1041,6 +1058,26 @@ impl ClientFfiRuntime {
 
     fn diagnostics_drain(&self) -> Result<Vec<ClientDiagnosticEvent>, String> {
         self.diagnostics.drain()
+    }
+}
+
+fn thread_timeline_page_merge_mode(anchor: &TimelinePageAnchor) -> TopLevelPageMergeMode {
+    match anchor {
+        TimelinePageAnchor::Before { .. } => TopLevelPageMergeMode::MergeBefore,
+        TimelinePageAnchor::After { .. } => TopLevelPageMergeMode::MergeAfter,
+        TimelinePageAnchor::Newest
+        | TimelinePageAnchor::Oldest
+        | TimelinePageAnchor::Around { .. } => TopLevelPageMergeMode::Merge,
+    }
+}
+
+fn turn_work_page_merge_mode(anchor: &TimelinePageAnchor) -> WorkPageMergeMode {
+    match anchor {
+        TimelinePageAnchor::Before { .. } => WorkPageMergeMode::MergeBefore,
+        TimelinePageAnchor::After { .. } => WorkPageMergeMode::MergeAfter,
+        TimelinePageAnchor::Newest
+        | TimelinePageAnchor::Oldest
+        | TimelinePageAnchor::Around { .. } => WorkPageMergeMode::Reset,
     }
 }
 

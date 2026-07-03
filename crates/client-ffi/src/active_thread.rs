@@ -29,11 +29,15 @@ use pioneer_client::{
         labels::now_unix_ms,
         rows::TimelineRow,
         semantic::{
-            SemanticTimelineCachePatch, SemanticTimelineState,
-            apply_conversation_event_to_semantic_timeline,
+            SemanticTimelineCachePatch, SemanticTimelineState, TopLevelPageMergeMode,
+            WorkPageMergeMode, apply_conversation_event_to_semantic_timeline,
             apply_conversation_event_to_semantic_timeline_with_patch,
-            apply_semantic_timeline_live_update_with_patch, remove_thread_semantic_timeline,
+            apply_semantic_timeline_live_update_with_patch,
+            apply_thread_timeline_page as apply_semantic_thread_timeline_page,
+            apply_turn_work_page as apply_semantic_turn_work_page, expand_turn_work,
+            flatten_semantic_timeline, remove_thread_semantic_timeline,
         },
+        semantic_render::{SEMANTIC_TURN_WORK_GROUP_PREFIX, render_semantic_timeline_rows},
     },
     transport::ws::command_sender as ws_commands,
     turns::{
@@ -48,6 +52,7 @@ use pioneer_client::{
 use pioneer_protocol::TurnPermissionMode;
 use pioneer_protocol::{
     AgentExecutionBackend, GatewayNotification, Thread, ThreadGetParams, ThreadMode,
+    ThreadTimelinePageResponse, TurnWorkPageResponse,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -258,10 +263,16 @@ impl ClientFfiActiveThreadState {
         runtime: &ClientRuntime,
         request: ClientEnsureWorkspaceDraftRequest,
     ) -> anyhow::Result<ClientActiveThreadSnapshot> {
-        let workspace_id = non_empty_string(Some(request.workspace_id))
+        let ClientEnsureWorkspaceDraftRequest {
+            workspace_id,
+            expanded_keys,
+        } = request;
+        let workspace_id = non_empty_string(Some(workspace_id))
             .ok_or_else(|| anyhow::anyhow!("workspace_id is required before starting draft"))?;
 
-        if let Some(snapshot) = self.activate_workspace_draft(workspace_id.as_str())? {
+        if let Some(snapshot) =
+            self.activate_workspace_draft(workspace_id.as_str(), expanded_keys.as_slice())?
+        {
             return Ok(snapshot);
         }
 
@@ -285,7 +296,7 @@ impl ClientFfiActiveThreadState {
         remember_workspace_draft(&mut inner, workspace_id.as_str(), Some(thread_id.clone()));
         upsert_thread_snapshot(&mut inner, reduction.thread);
 
-        Ok(snapshot_from_inner(&inner))
+        Ok(snapshot_from_inner(&inner, expanded_keys.as_slice()))
     }
 
     pub fn open_or_create_new_thread(
@@ -299,6 +310,7 @@ impl ClientFfiActiveThreadState {
     fn activate_workspace_draft(
         &self,
         workspace_id: &str,
+        expanded_keys: &[String],
     ) -> anyhow::Result<Option<ClientActiveThreadSnapshot>> {
         let mut inner = self
             .inner
@@ -316,7 +328,7 @@ impl ClientFfiActiveThreadState {
         };
 
         activate_thread(&mut inner, draft_thread_id.as_str(), Some(workspace_id));
-        Ok(Some(snapshot_from_inner(&inner)))
+        Ok(Some(snapshot_from_inner(&inner, expanded_keys)))
     }
 
     pub fn open_thread(
@@ -324,8 +336,12 @@ impl ClientFfiActiveThreadState {
         runtime: &ClientRuntime,
         request: ClientActiveThreadOpenRequest,
     ) -> anyhow::Result<ClientActiveThreadSnapshot> {
-        let thread_id = request.thread.id.clone();
-        let workspace_id = request.thread.workspace_id.clone();
+        let ClientActiveThreadOpenRequest {
+            thread,
+            expanded_keys,
+        } = request;
+        let thread_id = thread.id.clone();
+        let workspace_id = thread.workspace_id.clone();
 
         {
             let mut inner = self
@@ -333,7 +349,7 @@ impl ClientFfiActiveThreadState {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
             activate_thread(&mut inner, thread_id.as_str(), Some(workspace_id.as_str()));
-            upsert_thread_snapshot(&mut inner, request.thread.clone());
+            upsert_thread_snapshot(&mut inner, thread);
         }
 
         self.ensure_thread_subscription(runtime, thread_id.as_str(), workspace_id.clone())?;
@@ -346,7 +362,7 @@ impl ClientFfiActiveThreadState {
             coordinator.set_workspace_id(workspace_id.as_str());
         }
 
-        Ok(snapshot_from_inner(&inner))
+        Ok(snapshot_from_inner(&inner, expanded_keys.as_slice()))
     }
 
     pub fn open_thread_by_id(
@@ -370,14 +386,17 @@ impl ClientFfiActiveThreadState {
 
     pub fn snapshot(
         &self,
-        _request: ClientActiveThreadSnapshotRequest,
+        request: ClientActiveThreadSnapshotRequest,
     ) -> anyhow::Result<ClientActiveThreadSnapshot> {
         let inner = self
             .inner
             .lock()
             .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
 
-        Ok(snapshot_from_inner(&inner))
+        Ok(snapshot_from_inner(
+            &inner,
+            request.expanded_keys.as_slice(),
+        ))
     }
 
     pub fn apply_event(
@@ -418,6 +437,40 @@ impl ClientFfiActiveThreadState {
         Ok(())
     }
 
+    pub fn apply_thread_timeline_page(
+        &self,
+        page: ThreadTimelinePageResponse,
+        merge_mode: TopLevelPageMergeMode,
+    ) -> anyhow::Result<bool> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
+
+        Ok(apply_semantic_thread_timeline_page(
+            &mut inner.semantic_timelines,
+            page,
+            merge_mode,
+        ))
+    }
+
+    pub fn apply_turn_work_page(
+        &self,
+        page: TurnWorkPageResponse,
+        merge_mode: WorkPageMergeMode,
+    ) -> anyhow::Result<bool> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
+
+        Ok(apply_semantic_turn_work_page(
+            &mut inner.semantic_timelines,
+            page,
+            merge_mode,
+        ))
+    }
+
     pub fn resolve_composer_model_selection(
         &self,
         active_thread_id: Option<&str>,
@@ -451,7 +504,7 @@ impl ClientFfiActiveThreadState {
             permission_mode,
             attachments,
             capabilities,
-            expanded_keys: _,
+            expanded_keys,
         } = request;
 
         let thread_id = thread_session::require_thread_id(thread_id, "sending text")
@@ -601,7 +654,7 @@ impl ClientFfiActiveThreadState {
             thread_id,
             turn_id,
             pending_request_id,
-            snapshot: snapshot_from_inner(&inner),
+            snapshot: snapshot_from_inner(&inner, expanded_keys.as_slice()),
             semantic_timeline_patch,
         })
     }
@@ -693,8 +746,11 @@ impl ClientFfiActiveThreadState {
         runtime: &ClientRuntime,
         request: ClientActiveThreadCancelTurnRequest,
     ) -> anyhow::Result<ClientActiveThreadCancelTurnResult> {
-        let Some((thread_id, turn_id, params)) =
-            self.apply_local_turn_cancel_request(request.reason)?
+        let ClientActiveThreadCancelTurnRequest {
+            reason,
+            expanded_keys,
+        } = request;
+        let Some((thread_id, turn_id, params)) = self.apply_local_turn_cancel_request(reason)?
         else {
             let inner = self
                 .inner
@@ -705,7 +761,7 @@ impl ClientFfiActiveThreadState {
                 cancelled: false,
                 thread_id: inner.active_thread_id.clone(),
                 turn_id: None,
-                snapshot: snapshot_from_inner(&inner),
+                snapshot: snapshot_from_inner(&inner, expanded_keys.as_slice()),
             });
         };
 
@@ -728,7 +784,7 @@ impl ClientFfiActiveThreadState {
             cancelled: true,
             thread_id: Some(thread_id),
             turn_id: Some(turn_id),
-            snapshot: snapshot_from_inner(&inner),
+            snapshot: snapshot_from_inner(&inner, expanded_keys.as_slice()),
         })
     }
 
@@ -781,7 +837,7 @@ impl ClientFfiActiveThreadState {
 
         Ok(ClientActiveThreadUnsubscribeResult {
             unsubscribed_thread_id: thread_id,
-            snapshot: snapshot_from_inner(&inner),
+            snapshot: snapshot_from_inner(&inner, request.expanded_keys.as_slice()),
         })
     }
 
@@ -1207,7 +1263,10 @@ fn remove_thread_session_state(inner: &mut ClientFfiActiveThreadInner, thread_id
     }
 }
 
-fn snapshot_from_inner(inner: &ClientFfiActiveThreadInner) -> ClientActiveThreadSnapshot {
+fn snapshot_from_inner(
+    inner: &ClientFfiActiveThreadInner,
+    expanded_keys: &[String],
+) -> ClientActiveThreadSnapshot {
     let Some(thread_id) = inner.active_thread_id.as_deref() else {
         return ClientActiveThreadSnapshot {
             session_revision: inner.session_revision,
@@ -1232,10 +1291,8 @@ fn snapshot_from_inner(inner: &ClientFfiActiveThreadInner) -> ClientActiveThread
         &workspace_id,
     )
     .map(str::to_owned);
-    let mut projection = coordinator.conversation.projection().clone();
-    projection.items.clear();
-    projection.timeline.clear();
-    let rows = Vec::new();
+    let (projection, rows) =
+        render_active_thread_timeline(inner, thread_id, coordinator, expanded_keys);
 
     ClientActiveThreadSnapshot {
         thread_id: Some(thread_id.to_owned()),
@@ -1252,6 +1309,49 @@ fn snapshot_from_inner(inner: &ClientFfiActiveThreadInner) -> ClientActiveThread
         pending_requests: inner
             .pending_requests
             .pending_for_scope(Some(coordinator.workspace_id.as_str()), Some(thread_id)),
+    }
+}
+
+fn render_active_thread_timeline(
+    inner: &ClientFfiActiveThreadInner,
+    thread_id: &str,
+    coordinator: &ThreadCoordinator,
+    expanded_keys: &[String],
+) -> (ConversationViewState, Vec<TimelineRow>) {
+    let mut projection = coordinator.conversation.projection().clone();
+    projection.items.clear();
+    projection.timeline.clear();
+
+    if let Some(thread) = coordinator.thread() {
+        for turn in &thread.turns {
+            projection.upsert_turn_snapshot_metadata(turn);
+        }
+    }
+
+    let mut semantic_timelines = inner.semantic_timelines.clone();
+    apply_expanded_turn_work_keys(&mut semantic_timelines, thread_id, expanded_keys);
+
+    let Some(semantic_rows) = flatten_semantic_timeline(&semantic_timelines, thread_id) else {
+        return (projection, Vec::new());
+    };
+
+    let model = render_semantic_timeline_rows(semantic_rows.rows.as_slice(), projection);
+    (model.projection, model.rows)
+}
+
+fn apply_expanded_turn_work_keys(
+    state: &mut SemanticTimelineState,
+    thread_id: &str,
+    expanded_keys: &[String],
+) {
+    for key in expanded_keys {
+        let Some(turn_id) = key.strip_prefix(SEMANTIC_TURN_WORK_GROUP_PREFIX) else {
+            continue;
+        };
+        if turn_id.is_empty() {
+            continue;
+        }
+        expand_turn_work(state, thread_id.to_owned(), turn_id.to_owned());
     }
 }
 
@@ -1721,7 +1821,7 @@ mod tests {
                 "req_b", "ws_a", "thread_b",
             )));
 
-        let snapshot = snapshot_from_inner(&inner);
+        let snapshot = snapshot_from_inner(&inner, &[]);
 
         assert_eq!(snapshot.pending_requests.len(), 1);
         assert_eq!(snapshot.pending_requests[0].request_id, "req_a");
@@ -1740,7 +1840,7 @@ mod tests {
             .coordinators
             .insert("thread_a".to_owned(), ThreadCoordinator::new(thread));
 
-        let snapshot = snapshot_from_inner(&inner);
+        let snapshot = snapshot_from_inner(&inner, &[]);
 
         assert!(snapshot.projection.composer_locked);
         assert_eq!(
