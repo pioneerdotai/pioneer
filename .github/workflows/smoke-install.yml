@@ -25,7 +25,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --release -p pioneer-cli
+          cargo build --locked --release -p pioneer-cli
 
           smoke_dir="${RUNNER_TEMP}/pioneer-path-warning-smoke"
           mkdir -p "${smoke_dir}"
@@ -129,7 +129,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --release -p pioneer-cli
+          cargo build --locked --release -p pioneer-cli
 
           smoke_dir="${RUNNER_TEMP}/pioneer-path-warning-smoke"
           mkdir -p "${smoke_dir}"
@@ -217,7 +217,7 @@ jobs:
       - name: build-cli-and-prepare-local-assets
         shell: pwsh
         run: |
-          cargo build --release -p pioneer-cli --target x86_64-pc-windows-msvc
+          cargo build --locked --release -p pioneer-cli --target x86_64-pc-windows-msvc
 
           $smokeDir = Join-Path $env:RUNNER_TEMP "pioneer-path-warning-smoke"
           New-Item -ItemType Directory -Path $smokeDir -Force | Out-Null
@@ -330,7 +330,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --release -p pioneer-cli
+          cargo build --locked --release -p pioneer-cli
 
           smoke_dir="${RUNNER_TEMP}/pioneer-smoke"
           mkdir -p "${smoke_dir}"
@@ -416,7 +416,7 @@ jobs:
       - name: build-cli-and-prepare-local-assets
         shell: pwsh
         run: |
-          cargo build --release -p pioneer-cli --target x86_64-pc-windows-msvc
+          cargo build --locked --release -p pioneer-cli --target x86_64-pc-windows-msvc
 
           $smokeDir = Join-Path $env:RUNNER_TEMP "pioneer-smoke"
           New-Item -ItemType Directory -Path $smokeDir -Force | Out-Null
@@ -536,7 +536,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --release -p pioneer-cli
+          cargo build --locked --release -p pioneer-cli
 
           smoke_dir="${RUNNER_TEMP}/pioneer-desktop-smoke"
           mkdir -p "${smoke_dir}"
@@ -642,13 +642,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo test -p pioneer-desktop gateway::ws::tests::reconnects_after_server_returns -- --nocapture
+          cargo test --locked -p pioneer-desktop gateway::ws::tests::reconnects_after_server_returns -- --nocapture
 
       - name: desktop-path-warning-notification-test
         shell: bash
         run: |
           set -euo pipefail
-          cargo test -p pioneer-desktop app::gateway::tests::warning_notification_uses_friendly_path_message_for_path_update_warning
+          cargo test --locked -p pioneer-desktop app::gateway::tests::warning_notification_uses_friendly_path_message_for_path_update_warning
 
       - name: cleanup
         if: always()

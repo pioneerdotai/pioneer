@@ -13,5 +13,6 @@ path = "src/lib.rs"
 anyhow.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 sea-orm-migration = { workspace = true, features = ["runtime-tokio-rustls", "sqlx-sqlite"] }
+sea-schema.workspace = true
 pioneer-entity.workspace = true
 pioneer-observability.workspace = true

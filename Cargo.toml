@@ -146,6 +146,7 @@ windows-sys = "0.61"
 # Database
 sea-orm = "2.0.0-rc.41"
 sea-orm-migration = "2.0.0-rc.41"
+sea-schema = "=0.18.0"
 
 # MCP
 rmcp = { version = "1.7", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }

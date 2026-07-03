@@ -131,15 +131,15 @@ jobs:
           if [[ "${{ runner.os }}" == "Linux" && "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" && "${RUNNER_ARCH:-}" != "ARM64" ]]; then
             cargo install cargo-zigbuild --locked --quiet
             if [[ -n "${{ matrix.cargo_features }}" ]]; then
-              cargo zigbuild --release -p pioneer-cli --features "${{ matrix.cargo_features }}" --target "${{ matrix.target }}"
+              cargo zigbuild --locked --release -p pioneer-cli --features "${{ matrix.cargo_features }}" --target "${{ matrix.target }}"
             else
-              cargo zigbuild --release -p pioneer-cli --target "${{ matrix.target }}"
+              cargo zigbuild --locked --release -p pioneer-cli --target "${{ matrix.target }}"
             fi
           else
             if [[ -n "${{ matrix.cargo_features }}" ]]; then
-              cargo build --release -p pioneer-cli --features "${{ matrix.cargo_features }}" --target "${{ matrix.target }}"
+              cargo build --locked --release -p pioneer-cli --features "${{ matrix.cargo_features }}" --target "${{ matrix.target }}"
             else
-              cargo build --release -p pioneer-cli --target "${{ matrix.target }}"
+              cargo build --locked --release -p pioneer-cli --target "${{ matrix.target }}"
             fi
           fi
 
@@ -147,7 +147,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $cargoArgs = @("build", "--release", "-p", "pioneer-cli")
+          $cargoArgs = @("build", "--locked", "--release", "-p", "pioneer-cli")
           if (-not [string]::IsNullOrWhiteSpace("${{ matrix.cargo_features }}")) {
             $cargoArgs += @("--features", "${{ matrix.cargo_features }}")
           }

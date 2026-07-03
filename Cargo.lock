@@ -8068,6 +8068,7 @@ dependencies = [
  "pioneer-entity",
  "pioneer-observability",
  "sea-orm-migration",
+ "sea-schema",
  "tokio",
 ]
 
@@ -9998,9 +9999,9 @@ dependencies = [
 
 [[package]]
 name = "sea-schema"
-version = "0.18.1"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3553c77dceed56e95bece9ea876c4dd67ca879ef51055a0b97a7bb89a8ae4fed"
+checksum = "f88267b43c127956a079895d864fc8318ee37c7f280a7aa33805b714c31995f0"
 dependencies = [
  "async-trait",
  "sea-query",

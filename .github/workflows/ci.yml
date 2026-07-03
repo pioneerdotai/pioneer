@@ -66,12 +66,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo check --workspace
+          cargo check --locked --workspace
 
       - name: cargo-test-core
         if: matrix.run_tests == 'true'
         shell: bash
         run: |
           set -euo pipefail
-          cargo test -p pioneer-cli
-          cargo test -p pioneer-desktop gateway::
+          cargo test --locked -p pioneer-cli
+          cargo test --locked -p pioneer-desktop gateway::
