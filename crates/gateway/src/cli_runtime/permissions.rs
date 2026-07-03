@@ -1,8 +1,9 @@
 use pioneer_protocol::{
-    CLIAgentRuntimeKind, TurnCLIRuntimeOptions, TurnPermissionMode, TurnPermissionProfileSelection,
-    TurnPermissionProfileSnapshot, default_turn_permission_profile_snapshot,
-    resolve_turn_permission_profile,
+    CLIAgentRuntimeKind, CLIAgentRuntimeSandboxPolicy, TurnCLIRuntimeOptions, TurnPermissionMode,
+    TurnPermissionProfileSelection, TurnPermissionProfileSnapshot,
+    default_turn_permission_profile_snapshot, resolve_turn_permission_profile,
 };
+use serde_json::json;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CLIRuntimePermissionMappingQuality {
@@ -39,7 +40,8 @@ pub(crate) fn adapt_cli_runtime_permissions_for_turn(
     let notes = base.notes;
     let approval_policy = base.approval_policy.to_owned();
 
-    let options = runtime_options.unwrap_or_else(empty_cli_runtime_options);
+    let mut options = runtime_options.unwrap_or_else(empty_cli_runtime_options);
+    options.sandbox = cli_runtime_sandbox_for_profile(runtime_kind, profile.mode);
 
     CLIRuntimePermissionAdapterResult {
         output: CLIRuntimePermissionAdapterOutput {
@@ -123,6 +125,25 @@ fn empty_cli_runtime_options() -> TurnCLIRuntimeOptions {
     }
 }
 
+fn cli_runtime_sandbox_for_profile(
+    runtime_kind: CLIAgentRuntimeKind,
+    mode: TurnPermissionMode,
+) -> Option<CLIAgentRuntimeSandboxPolicy> {
+    match runtime_kind {
+        CLIAgentRuntimeKind::Codex => Some(CLIAgentRuntimeSandboxPolicy(match mode {
+            TurnPermissionMode::FullAccess => json!({ "type": "dangerFullAccess" }),
+            TurnPermissionMode::AutoAcceptEdits | TurnPermissionMode::Supervised => json!({
+                "type": "workspaceWrite",
+                "writableRoots": [],
+                "networkAccess": false,
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            }),
+        })),
+        CLIAgentRuntimeKind::Claude => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,6 +170,10 @@ mod tests {
         assert_eq!(result.output.profile.mode, TurnPermissionMode::FullAccess);
         assert_eq!(result.output.approval_policy, "never");
         assert_eq!(
+            result.options.sandbox.as_ref().map(|sandbox| &sandbox.0),
+            Some(&serde_json::json!({ "type": "dangerFullAccess" }))
+        );
+        assert_eq!(
             result.output.mapping_quality,
             CLIRuntimePermissionMappingQuality::Exact
         );
@@ -170,6 +195,15 @@ mod tests {
         );
 
         assert_eq!(result.output.approval_policy, "on-request");
+        assert_eq!(
+            result
+                .options
+                .sandbox
+                .as_ref()
+                .and_then(|sandbox| sandbox.0.get("type"))
+                .and_then(serde_json::Value::as_str),
+            Some("workspaceWrite")
+        );
     }
 
     #[test]
@@ -276,5 +310,33 @@ mod tests {
         assert_eq!(result.options.personality.as_deref(), Some("direct"));
         assert_eq!(result.options.summary.as_deref(), Some("brief"));
         assert_eq!(result.options.steer_if_active, Some(true));
+        assert_eq!(
+            result.options.sandbox.as_ref().map(|sandbox| &sandbox.0),
+            Some(&serde_json::json!({ "type": "dangerFullAccess" }))
+        );
+    }
+
+    #[test]
+    fn codex_full_access_overrides_restrictive_sandbox_option() {
+        let result = adapt_cli_runtime_permissions_for_turn(
+            CLIAgentRuntimeKind::Codex,
+            Some(&selection(TurnPermissionMode::FullAccess)),
+            Some(TurnCLIRuntimeOptions {
+                sandbox: Some(CLIAgentRuntimeSandboxPolicy(serde_json::json!({
+                    "type": "workspaceWrite",
+                    "networkAccess": false
+                }))),
+                effort: None,
+                personality: None,
+                summary: None,
+                steer_if_active: None,
+            }),
+        );
+
+        assert_eq!(result.output.approval_policy, "never");
+        assert_eq!(
+            result.options.sandbox.as_ref().map(|sandbox| &sandbox.0),
+            Some(&serde_json::json!({ "type": "dangerFullAccess" }))
+        );
     }
 }

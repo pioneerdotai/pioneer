@@ -13452,6 +13452,108 @@ async fn turn_start_cli_runtime_backend_disabled_errors_before_provider_dispatch
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_cli_full_access_sets_unrestricted_provider_sandbox() {
+    let (tx, mut rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let processor = MessageProcessor::new(
+        thread_manager.clone(),
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_cli_runtime_manager_for_tests(test_cli_runtime_manager(cli_session.clone()));
+
+    thread_manager
+        .thread_start(
+            connection_id,
+            workspace_id.clone(),
+            ThreadStartParams {
+                thread_id: "thread_codex_full_access".to_owned(),
+                workspace_id: workspace_id.clone(),
+                name: Some("Codex full access regression".to_owned()),
+                model: Some("o4-mini".to_owned()),
+                model_provider: Some("openai".to_owned()),
+                sandbox: Some(SandboxMode::FullAccess),
+                mode: Some(ThreadMode::Agent),
+                origin_kind: None,
+                sidebar_visibility: None,
+                agent_nickname: None,
+                agent_role: None,
+            },
+        )
+        .await
+        .expect("thread/start should seed Codex full access regression thread");
+
+    let execution_backend = serde_json::to_value(AgentExecutionBackend::CLIAgentRuntime {
+        runtime_id: "codex".to_owned(),
+        runtime_kind: CLIAgentRuntimeKind::Codex,
+    })
+    .expect("execution backend should serialize");
+    let turn_request_id = generate_test_request_id("codexfull", "turn");
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": turn_request_id,
+                "method": "turn/start",
+                "params": {
+                    "thread_id": "thread_codex_full_access",
+                    "turn_id": "turn_codex_full_access",
+                    "execution_backend": execution_backend,
+                    "permission_profile": {
+                        "mode": "full_access"
+                    },
+                    "input": [{
+                        "type": "text",
+                        "text": "install package over network"
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .await;
+
+    let mut websocket_messages = Vec::new();
+    while let Ok(message) = rx.try_recv() {
+        websocket_messages.push(format!("{message:?}"));
+    }
+
+    let thread_starts = cli_session.thread_starts.lock().await;
+    assert_eq!(
+        thread_starts.len(),
+        1,
+        "Codex runtime thread/start should be called; websocket_messages={websocket_messages:#?}"
+    );
+    assert_eq!(thread_starts[0].approval_policy.as_deref(), Some("never"));
+    assert_eq!(
+        thread_starts[0].sandbox.as_ref(),
+        Some(&json!("danger-full-access"))
+    );
+    drop(thread_starts);
+
+    let turn_starts = cli_session.turn_starts.lock().await;
+    assert_eq!(turn_starts.len(), 1);
+    assert_eq!(turn_starts[0].approval_policy.as_deref(), Some("never"));
+    assert_eq!(
+        turn_starts[0].sandbox.as_ref(),
+        Some(&json!({ "type": "dangerFullAccess" }))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_review_start_uncommitted_changes_is_rejected_without_runtime_call() {
     let (tx, mut rx) = mpsc::channel(16);
     let session_manager = Arc::new(SessionManager::new());
