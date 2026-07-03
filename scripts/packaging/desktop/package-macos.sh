@@ -60,6 +60,63 @@ require_cmd() {
   }
 }
 
+configure_macos_x86_64_onnxruntime() {
+  [[ "$TARGET" == "x86_64-apple-darwin" ]] || return 0
+
+  if [[ -z "${ORT_LIB_LOCATION:-}" ]] && command -v brew >/dev/null 2>&1; then
+    local brew_ort_prefix
+    brew_ort_prefix="$(brew --prefix onnxruntime 2>/dev/null || true)"
+    if [[ -n "$brew_ort_prefix" && -d "$brew_ort_prefix/lib" ]]; then
+      export ORT_LIB_LOCATION="$brew_ort_prefix/lib"
+    fi
+  fi
+
+  if [[ -z "${ORT_LIB_LOCATION:-}" ]]; then
+    echo "ORT_LIB_LOCATION is required for x86_64-apple-darwin ONNX Runtime linking" >&2
+    echo "Install ONNX Runtime and rerun with ORT_LIB_LOCATION=/path/to/onnxruntime/lib ORT_PREFER_DYNAMIC_LINK=1" >&2
+    exit 1
+  fi
+
+  export ORT_PREFER_DYNAMIC_LINK="${ORT_PREFER_DYNAMIC_LINK:-1}"
+  export PIONEER_ONNXRUNTIME_DYLIB_DIR="${PIONEER_ONNXRUNTIME_DYLIB_DIR:-$ORT_LIB_LOCATION}"
+
+  local rpath_flag="-C link-arg=-Wl,-rpath,@executable_path"
+  if [[ " ${RUSTFLAGS:-} " != *" $rpath_flag "* ]]; then
+    export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$rpath_flag"
+  fi
+}
+
+copy_macos_x86_64_onnxruntime_dylibs() {
+  local destination="$1"
+  [[ "$TARGET" == "x86_64-apple-darwin" ]] || return 0
+
+  local dylib_dir="${PIONEER_ONNXRUNTIME_DYLIB_DIR:-${ORT_LIB_LOCATION:-}}"
+  if [[ -z "$dylib_dir" || ! -d "$dylib_dir" ]]; then
+    echo "ONNX Runtime dylib directory is missing: ${dylib_dir:-<unset>}" >&2
+    exit 1
+  fi
+
+  shopt -s nullglob
+  local dylibs=("$dylib_dir"/libonnxruntime*.dylib)
+  shopt -u nullglob
+  if [[ ${#dylibs[@]} -eq 0 ]]; then
+    echo "no libonnxruntime dylibs found in $dylib_dir" >&2
+    exit 1
+  fi
+
+  local dylib copied
+  for dylib in "${dylibs[@]}"; do
+    copied="$destination/$(basename "$dylib")"
+    cp -L "$dylib" "$copied"
+    chmod 0644 "$copied"
+    if [[ -n "${MACOS_DESKTOP_SIGN_IDENTITY:-}" ]]; then
+      require_cmd codesign
+      codesign --force --timestamp --options runtime --sign "$MACOS_DESKTOP_SIGN_IDENTITY" "$copied"
+      codesign --verify --strict "$copied"
+    fi
+  done
+}
+
 apply_applications_link_icon() {
   local alias_path="$1"
   local work_dir="$2"
@@ -296,6 +353,7 @@ require_cmd cargo
 require_cmd hdiutil
 require_cmd gzip
 ensure_macos_signing_prerequisites
+configure_macos_x86_64_onnxruntime
 
 if [[ -z "$OUT_DIR" ]]; then
   OUT_DIR="$REPO_ROOT/dist"
@@ -343,8 +401,13 @@ chmod 0755 "$MACOS_DIR/${DESKTOP_EXECUTABLE_NAME}"
 
 GATEWAY_BUNDLE_DIR="$RESOURCES_DIR/gateway"
 mkdir -p "$GATEWAY_BUNDLE_DIR"
+copy_macos_x86_64_onnxruntime_dylibs "$GATEWAY_BUNDLE_DIR"
 
-GATEWAY_ASSET_NAME="pioneer-gateway-macos-${ARCH}.gz"
+if [[ "$TARGET" == "x86_64-apple-darwin" ]]; then
+  GATEWAY_ASSET_NAME="pioneer-gateway-macos-${ARCH}.zip"
+else
+  GATEWAY_ASSET_NAME="pioneer-gateway-macos-${ARCH}.gz"
+fi
 GATEWAY_ASSET_PATH="$GATEWAY_BUNDLE_DIR/$GATEWAY_ASSET_NAME"
 GATEWAY_BINARY_RAW="$WORK_DIR/pioneer-gateway-${ARCH}"
 cp "target/$TARGET/release/pioneer" "$GATEWAY_BINARY_RAW"
@@ -359,7 +422,19 @@ fi
 cp "$GATEWAY_BINARY_RAW" "$GATEWAY_BUNDLE_DIR/pioneer-bootstrap"
 chmod 0755 "$GATEWAY_BUNDLE_DIR/pioneer-bootstrap"
 
-gzip -f --stdout --best "$GATEWAY_BINARY_RAW" > "$GATEWAY_ASSET_PATH"
+if [[ "$TARGET" == "x86_64-apple-darwin" ]]; then
+  require_cmd zip
+  GATEWAY_ASSET_BINARY_PATH="$GATEWAY_BUNDLE_DIR/pioneer"
+  cp "$GATEWAY_BINARY_RAW" "$GATEWAY_ASSET_BINARY_PATH"
+  chmod 0755 "$GATEWAY_ASSET_BINARY_PATH"
+  (
+    cd "$GATEWAY_BUNDLE_DIR"
+    zip -9 "$GATEWAY_ASSET_PATH" pioneer libonnxruntime*.dylib
+  )
+  rm -f "$GATEWAY_ASSET_BINARY_PATH"
+else
+  gzip -f --stdout --best "$GATEWAY_BINARY_RAW" > "$GATEWAY_ASSET_PATH"
+fi
 
 GATEWAY_SHA256="$(sha256_file "$GATEWAY_ASSET_PATH")"
 printf 'sha256:%s %s\n' "$GATEWAY_SHA256" "$GATEWAY_ASSET_NAME" > "$GATEWAY_BUNDLE_DIR/SHA256SUMS"

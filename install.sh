@@ -194,7 +194,37 @@ run_bootstrap_installer() {
   local work_dir="$3"
 
   local installer_bin="${work_dir}/pioneer-installer"
-  gunzip -c "$asset_file" > "$installer_bin"
+  case "$asset_file" in
+    *.zip)
+      PIONEER_ASSET_FILE="$asset_file" PIONEER_INSTALLER_BIN="$installer_bin" python3 <<'PY'
+import os
+import pathlib
+import zipfile
+
+asset = pathlib.Path(os.environ["PIONEER_ASSET_FILE"])
+installer = pathlib.Path(os.environ["PIONEER_INSTALLER_BIN"])
+work_dir = installer.parent
+
+found = False
+with zipfile.ZipFile(asset) as archive:
+    for entry in archive.infolist():
+        name = pathlib.Path(entry.filename).name
+        if not name:
+            continue
+        if name == "pioneer":
+            installer.write_bytes(archive.read(entry))
+            found = True
+        elif name.startswith("libonnxruntime") and name.endswith(".dylib"):
+            (work_dir / name).write_bytes(archive.read(entry))
+
+if not found:
+    raise SystemExit(f"{asset} does not contain pioneer")
+PY
+      ;;
+    *)
+      gunzip -c "$asset_file" > "$installer_bin"
+      ;;
+  esac
   chmod 0755 "$installer_bin"
 
   local args=(
@@ -241,7 +271,11 @@ main() {
     if [[ "$COMPUTER_USE" -eq 1 ]]; then
       asset_suffix="-computer-use"
     fi
-    asset_name="pioneer-gateway-${os}-${arch}${asset_suffix}.gz"
+    local asset_ext="gz"
+    if [[ "$os" == "macos" && "$arch" == "x86_64" ]]; then
+      asset_ext="zip"
+    fi
+    asset_name="pioneer-gateway-${os}-${arch}${asset_suffix}.${asset_ext}"
     tag="$(resolve_release_tag)"
     [[ -n "$tag" ]] || fail "resolved release tag is empty"
     asset_file="${WORK_DIR}/${asset_name}"

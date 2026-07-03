@@ -156,6 +156,23 @@ jobs:
             > appimagetool
           chmod +x appimagetool
 
+      - name: install-onnx-runtime-macos-x86_64
+        if: matrix.target == 'x86_64-apple-darwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ORT_VERSION="1.24.2"
+          ORT_ARCHIVE="$RUNNER_TEMP/onnxruntime-osx-x86_64-${ORT_VERSION}.tgz"
+          ORT_DIR="$RUNNER_TEMP/onnxruntime-osx-x86_64-${ORT_VERSION}"
+          curl -fL --retry 3 --retry-delay 1 \
+            -o "$ORT_ARCHIVE" \
+            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-osx-x86_64-${ORT_VERSION}.tgz"
+          tar -xzf "$ORT_ARCHIVE" -C "$RUNNER_TEMP"
+          test -d "$ORT_DIR/lib"
+          echo "ORT_LIB_LOCATION=$ORT_DIR/lib" >> "$GITHUB_ENV"
+          echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
+          echo "PIONEER_ONNXRUNTIME_DYLIB_DIR=$ORT_DIR/lib" >> "$GITHUB_ENV"
+
       - name: package-linux-appimage
         if: matrix.package_kind == 'linux_appimage'
         shell: bash

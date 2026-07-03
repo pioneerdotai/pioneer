@@ -534,7 +534,11 @@ fn gateway_asset_file_name() -> Result<String> {
     } else {
         ""
     };
-    let ext = if os == "windows" { "zip" } else { "gz" };
+    let ext = if os == "windows" || (os == "macos" && arch == "x86_64") {
+        "zip"
+    } else {
+        "gz"
+    };
     Ok(format!("pioneer-gateway-{os}-{arch}{variant}.{ext}"))
 }
 
@@ -843,13 +847,14 @@ fn sha256_file(path: &Path) -> Result<String> {
 }
 
 fn unpack_asset_to_binary(asset_path: &Path, target_binary: &Path) -> Result<()> {
-    #[cfg(windows)]
-    {
-        unpack_zip_asset(asset_path, target_binary)
-    }
+    let is_zip = asset_path
+        .extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"));
 
-    #[cfg(not(windows))]
-    {
+    if is_zip {
+        unpack_zip_asset(asset_path, target_binary)
+    } else {
         unpack_gzip_asset(asset_path, target_binary)
     }
 }
@@ -874,14 +879,24 @@ fn unpack_gzip_asset(asset_path: &Path, target_binary: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(windows)]
 fn unpack_zip_asset(asset_path: &Path, target_binary: &Path) -> Result<()> {
     let input = File::open(asset_path)
         .with_context(|| format!("failed to open asset `{}`", asset_path.display()))?;
     let mut archive = zip::ZipArchive::new(input)
         .with_context(|| format!("failed to parse zip archive `{}`", asset_path.display()))?;
 
+    let expected_binary_name = if cfg!(windows) {
+        "pioneer.exe"
+    } else {
+        "pioneer"
+    };
+    #[cfg(target_os = "macos")]
+    let target_dir = target_binary
+        .parent()
+        .context("staged binary path has no parent directory")?;
     let mut found = false;
+    #[cfg(target_os = "macos")]
+    let mut companion_dylibs = 0usize;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).with_context(|| {
             format!(
@@ -894,30 +909,56 @@ fn unpack_zip_asset(asset_path: &Path, target_binary: &Path) -> Result<()> {
             .and_then(OsStr::to_str)
             .unwrap_or_default()
             .to_ascii_lowercase();
-        if file_name != "pioneer.exe" {
+
+        if file_name == expected_binary_name {
+            let mut output = File::create(target_binary).with_context(|| {
+                format!(
+                    "failed to create staged binary `{}`",
+                    target_binary.display()
+                )
+            })?;
+            std::io::copy(&mut entry, &mut output).with_context(|| {
+                format!(
+                    "failed to unpack {expected_binary_name} to `{}`",
+                    target_binary.display()
+                )
+            })?;
+            found = true;
             continue;
         }
 
-        let mut output = File::create(target_binary).with_context(|| {
-            format!(
-                "failed to create staged binary `{}`",
-                target_binary.display()
-            )
-        })?;
-        std::io::copy(&mut entry, &mut output).with_context(|| {
-            format!(
-                "failed to unpack pioneer.exe to `{}`",
-                target_binary.display()
-            )
-        })?;
-        found = true;
-        break;
+        #[cfg(target_os = "macos")]
+        {
+            if file_name.starts_with("libonnxruntime") && file_name.ends_with(".dylib") {
+                let dylib_path = target_dir.join(file_name.as_str());
+                let mut output = File::create(&dylib_path).with_context(|| {
+                    format!(
+                        "failed to create companion dylib `{}`",
+                        dylib_path.display()
+                    )
+                })?;
+                std::io::copy(&mut entry, &mut output).with_context(|| {
+                    format!(
+                        "failed to unpack companion dylib `{}`",
+                        dylib_path.display()
+                    )
+                })?;
+                companion_dylibs = companion_dylibs.saturating_add(1);
+            }
+        }
     }
 
     if !found {
         bail!(
-            "zip archive `{}` does not contain pioneer.exe",
-            asset_path.display()
+            "zip archive `{}` does not contain {expected_binary_name}",
+            asset_path.display(),
+        );
+    }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    if companion_dylibs == 0 {
+        bail!(
+            "zip archive `{}` does not contain libonnxruntime dylibs",
+            asset_path.display(),
         );
     }
 
@@ -1561,7 +1602,12 @@ mod tests {
         } else {
             ""
         };
-        let expected_ext = if cfg!(windows) { "zip" } else { "gz" };
+        let expected_ext =
+            if cfg!(windows) || (std::env::consts::OS == "macos" && expected_arch == "x86_64") {
+                "zip"
+            } else {
+                "gz"
+            };
 
         assert_eq!(
             asset_name,

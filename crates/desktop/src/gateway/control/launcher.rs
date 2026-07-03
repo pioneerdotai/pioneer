@@ -428,7 +428,8 @@ fn bundled_gateway_asset_file_name() -> Option<String> {
 
     #[cfg(target_os = "macos")]
     {
-        return Some(format!("pioneer-gateway-macos-{arch}.gz"));
+        let extension = if arch == "x86_64" { "zip" } else { "gz" };
+        return Some(format!("pioneer-gateway-macos-{arch}.{extension}"));
     }
 
     #[cfg(target_os = "linux")]
