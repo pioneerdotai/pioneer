@@ -70,6 +70,7 @@ pub mod turn_execution_window;
 pub mod turn_input;
 pub mod turn_item;
 pub mod turn_item_attempt;
+pub mod turn_liveness;
 pub mod turn_llm_context;
 pub mod turn_mcp_binding;
 pub mod turn_runtime_snapshot;

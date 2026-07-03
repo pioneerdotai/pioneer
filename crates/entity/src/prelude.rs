@@ -68,6 +68,7 @@ pub use super::turn_execution_window::Entity as TurnExecutionWindow;
 pub use super::turn_input::Entity as TurnInput;
 pub use super::turn_item::Entity as TurnItem;
 pub use super::turn_item_attempt::Entity as TurnItemAttempt;
+pub use super::turn_liveness::Entity as TurnLiveness;
 pub use super::turn_llm_context::Entity as TurnLlmContext;
 pub use super::turn_mcp_binding::Entity as TurnMcpBinding;
 pub use super::turn_runtime_snapshot::Entity as TurnRuntimeSnapshot;
