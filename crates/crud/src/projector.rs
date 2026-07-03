@@ -4,9 +4,9 @@ use sea_orm::ConnectionTrait;
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::convention::{TURN_ITEM_STATUS_IN_PROGRESS, turn_status_to_db};
+use crate::convention::{TURN_ITEM_STATUS_IN_PROGRESS, turn_item_type_to_db, turn_status_to_db};
 use crate::events::{AppendedTurnEvent, TurnEventPayload, TurnStartedEventPayload};
-use crate::repositories::{policy, thread, turn, turn_item_attempt};
+use crate::repositories::{policy, thread, turn, turn_item_attempt, turn_liveness};
 use crate::turn_item_terminal::{
     TurnItemTerminalState, attempt_status_from_payload, terminal_turn_item_status_from_payload,
     terminalize_turn_item_payload,
@@ -37,6 +37,9 @@ impl TurnProjector {
         event: &AppendedTurnEvent,
     ) -> Result<()> {
         let created_at = event.created_at;
+        if let Some(observation) = liveness_observation_from_event(event) {
+            turn_liveness::observe_activity(db, observation).await?;
+        }
         let future: ProjectFuture<'_> = match &event.payload {
             TurnEventPayload::TurnStarted(payload) => {
                 project_future(self.project_turn_started(db, payload))
@@ -67,6 +70,7 @@ impl TurnProjector {
                         hard_deadline_at: None,
                     },
                     created_at,
+                    Some(event.sequence),
                 )
                 .await?;
 
@@ -336,4 +340,59 @@ impl TurnProjector {
         }
         Ok(())
     }
+}
+
+fn liveness_observation_from_event(
+    event: &AppendedTurnEvent,
+) -> Option<turn_liveness::TurnLivenessObservation> {
+    let mut item_id = None;
+    let mut item_type = None;
+    let meaningful = match &event.payload {
+        TurnEventPayload::TurnStarted(_) => true,
+        TurnEventPayload::ItemStarted(payload) => {
+            item_id = Some(payload.item.item_id().to_owned());
+            item_type = Some(turn_item_type_to_db(payload.item.item_type()).to_owned());
+            true
+        }
+        TurnEventPayload::ItemCompleted(payload) => {
+            item_id = Some(payload.item.item_id().to_owned());
+            item_type = Some(turn_item_type_to_db(payload.item.item_type()).to_owned());
+            true
+        }
+        TurnEventPayload::ItemUpdated(payload) => {
+            item_id = Some(payload.item.item_id().to_owned());
+            item_type = Some(turn_item_type_to_db(payload.item.item_type()).to_owned());
+            true
+        }
+        TurnEventPayload::TurnExecutionWindowStarted(_)
+        | TurnEventPayload::TurnExecutionWindowCheckpointed(_)
+        | TurnEventPayload::TurnExecutionWindowContinued(_) => true,
+        TurnEventPayload::ItemTimeoutDetected(_)
+        | TurnEventPayload::ItemRecoveryOpened(_)
+        | TurnEventPayload::ItemRecoveryAttached(_)
+        | TurnEventPayload::ItemRetryScheduled(_)
+        | TurnEventPayload::ItemRetryAttemptStarted(_)
+        | TurnEventPayload::ItemRecoverySucceeded(_)
+        | TurnEventPayload::ItemRecoveryExhausted(_)
+        | TurnEventPayload::ItemToolRetryScheduled(_)
+        | TurnEventPayload::ItemToolRetryResolved(_)
+        | TurnEventPayload::ItemToolRetryExhausted(_)
+        | TurnEventPayload::TurnToolLoopBudgetExceeded(_)
+        | TurnEventPayload::TurnExecutionWindowExhausted(_)
+        | TurnEventPayload::TurnExecutionWindowBlocked(_)
+        | TurnEventPayload::TurnPermissionAudit(_)
+        | TurnEventPayload::TurnCompleted(_)
+        | TurnEventPayload::TurnFailed(_)
+        | TurnEventPayload::TurnBlocked(_) => false,
+    };
+
+    meaningful.then(|| turn_liveness::TurnLivenessObservation {
+        turn_id: event.turn_id.clone(),
+        thread_id: event.thread_id.clone(),
+        activity_sequence: event.sequence,
+        activity_kind: event.payload.event_type().to_owned(),
+        item_id,
+        item_type,
+        observed_at: event.created_at,
+    })
 }

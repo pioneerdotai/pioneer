@@ -19,6 +19,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::warn;
 
+use super::timeout::{
+    TIMEOUT_RECOVERY_SUPPRESSED_TURN_PROGRESS, TimeoutRecoveryClassification,
+    classify_timeout_candidate_liveness, timeout_recovery_suppression_context,
+};
+
 const RECOVERY_JOB_CLAIM_LEASE_SECS: u64 = 45;
 const ACTIVE_RECOVERY_RECHECK_SECS: i64 = 2;
 const RECOVERY_ATTEMPT_ID_LEN: usize = 21;
@@ -2250,6 +2255,27 @@ impl RecoveryCoordinator {
         let mut events = Vec::new();
 
         for candidate in candidates {
+            let liveness = self
+                .crud_store
+                .get_turn_liveness(candidate.turn_id.as_str())
+                .await?;
+            if let TimeoutRecoveryClassification::SuppressRecoveryBecauseTurnProgressed {
+                liveness,
+            } = classify_timeout_candidate_liveness(&candidate, liveness.as_ref())
+            {
+                let context = timeout_recovery_suppression_context(&candidate, &liveness);
+                let _ = self
+                    .crud_store
+                    .suppress_timeout_candidate_recovery(
+                        &candidate,
+                        TIMEOUT_RECOVERY_SUPPRESSED_TURN_PROGRESS,
+                        context,
+                        now_unix,
+                    )
+                    .await?;
+                continue;
+            }
+
             if self
                 .suppress_timeout_recovery_if_turn_not_in_progress(&candidate, now_unix)
                 .await?
@@ -2748,11 +2774,12 @@ mod tests {
         TurnExecutionCheckpointKind, TurnExecutionWindowStatsRecord,
     };
     use pioneer_protocol::{
-        ExecutionWindowExhaustionReason, ExecutionWindowStatus, ItemStartedNotification,
-        ProviderFailureClass, ProviderFailureDetails, ProviderFailureStage, ProviderTransportKind,
-        RecoveryAction, RecoveryAttemptContext, RecoveryJobStatus, RecoveryTrigger, SandboxMode,
-        Thread, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus,
-        ToolCallStatus, ToolDisplayPayload, ToolOutputPolicySnapshot, ToolRecoveryIdempotencyMode,
+        AgentMessagePhase, ExecutionWindowExhaustionReason, ExecutionWindowStatus,
+        ItemCompletedNotification, ItemStartedNotification, ProviderFailureClass,
+        ProviderFailureDetails, ProviderFailureStage, ProviderTransportKind, RecoveryAction,
+        RecoveryAttemptContext, RecoveryJobStatus, RecoveryTrigger, SandboxMode, Thread,
+        ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus, ToolCallStatus,
+        ToolDisplayPayload, ToolOutputPolicySnapshot, ToolRecoveryIdempotencyMode,
         ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass, ToolStoragePayload, TurnCapability,
         TurnCapabilityKind, TurnCompletedNotification, TurnItem, TurnItemTimeoutReason,
         TurnItemType, TurnPermissionMode, TurnPermissionProfileSnapshot,
@@ -2907,6 +2934,28 @@ mod tests {
             retry_after_ms: None,
             is_recoverable_hint: true,
             message: Some(message.to_owned()),
+        }
+    }
+
+    fn timeout_candidate(
+        attempt_id: &str,
+        turn_id: &str,
+        item_id: &str,
+        item_type: TurnItemType,
+    ) -> TimeoutCandidate {
+        TimeoutCandidate {
+            attempt_id: attempt_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            item_id: item_id.to_owned(),
+            item_type,
+            attempt_number: 1,
+            timeout_reason: TurnItemTimeoutReason::IdleDeadlineExceeded,
+            started_at_unix: 1_700_000_000,
+            started_event_sequence: Some(2),
+            last_heartbeat_at_unix: Some(1_700_000_000),
+            lease_expires_at_unix: Some(1_700_000_001),
+            idle_deadline_at_unix: Some(1_700_000_001),
+            hard_deadline_at_unix: Some(1_700_000_001),
         }
     }
 
@@ -3917,14 +3966,12 @@ mod tests {
 
         let result = coordinator
             .record_recovery_timeout_failure(
-                &TimeoutCandidate {
-                    attempt_id: "attempt_timeout_inside_recovery".to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item_id: "recovery_reasoning".to_owned(),
-                    item_type: TurnItemType::Reasoning,
-                    attempt_number: 1,
-                    timeout_reason: TurnItemTimeoutReason::IdleDeadlineExceeded,
-                },
+                &timeout_candidate(
+                    "attempt_timeout_inside_recovery",
+                    turn_id,
+                    "recovery_reasoning",
+                    TurnItemType::Reasoning,
+                ),
                 1_700_000_002,
             )
             .await
@@ -4022,14 +4069,12 @@ mod tests {
 
         let second_outcome = coordinator
             .enqueue_timeout_job(
-                &TimeoutCandidate {
-                    attempt_id: "attempt_timeout_reuse".to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item_id: "reasoning_2".to_owned(),
-                    item_type: TurnItemType::Reasoning,
-                    attempt_number: 1,
-                    timeout_reason: TurnItemTimeoutReason::IdleDeadlineExceeded,
-                },
+                &timeout_candidate(
+                    "attempt_timeout_reuse",
+                    turn_id,
+                    "reasoning_2",
+                    TurnItemType::Reasoning,
+                ),
                 1_700_000_001,
             )
             .await
@@ -4072,14 +4117,12 @@ mod tests {
 
         let job = coordinator
             .enqueue_timeout_job(
-                &TimeoutCandidate {
-                    attempt_id: "attempt_tool_policy_snapshot".to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item_id: item_id.to_owned(),
-                    item_type: TurnItemType::WebFetch,
-                    attempt_number: 1,
-                    timeout_reason: TurnItemTimeoutReason::IdleDeadlineExceeded,
-                },
+                &timeout_candidate(
+                    "attempt_tool_policy_snapshot",
+                    turn_id,
+                    item_id,
+                    TurnItemType::WebFetch,
+                ),
                 1_700_000_010,
             )
             .await
@@ -4150,14 +4193,12 @@ mod tests {
 
         let job = coordinator
             .enqueue_timeout_job(
-                &TimeoutCandidate {
-                    attempt_id: "attempt_tool_missing_policy".to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item_id: item_id.to_owned(),
-                    item_type: TurnItemType::WebFetch,
-                    attempt_number: 1,
-                    timeout_reason: TurnItemTimeoutReason::IdleDeadlineExceeded,
-                },
+                &timeout_candidate(
+                    "attempt_tool_missing_policy",
+                    turn_id,
+                    item_id,
+                    TurnItemType::WebFetch,
+                ),
                 1_700_000_010,
             )
             .await
@@ -4317,6 +4358,150 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timeout_backfill_suppresses_recovery_when_turn_progressed_after_item() {
+        let (crud_store, coordinator) = setup_coordinator().await;
+        let timestamp = 1_700_000_000;
+        let thread = Thread {
+            workspace_id: "ws_timeout_liveness".to_owned(),
+            id: "thr_timeout_liveness".to_owned(),
+            name: None,
+            preview: String::new(),
+            mode: ThreadMode::Agent,
+            model: "test-model".to_owned(),
+            model_provider: "echo".to_owned(),
+            reasoning_effort: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+            status: ThreadStatus::Active,
+            origin_kind: ThreadOriginKind::User,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            turns: Vec::new(),
+        };
+        let turn = pioneer_protocol::Turn {
+            id: "turn_timeout_liveness".to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
+            error: None,
+            prompt_manifest: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+        };
+        let stale_item_id = "reasoning_stale_frontier";
+        let later_item_id = "agent_message_after_stale_reasoning";
+
+        crud_store
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[UserInput::Text {
+                    text: "continue".to_owned(),
+                    text_elements: Vec::new(),
+                }],
+            )
+            .await
+            .expect("turn start should persist");
+        crud_store
+            .materialize_item_started(
+                ItemStartedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn_id: turn.id.clone(),
+                    item: TurnItem::Reasoning {
+                        id: stale_item_id.to_owned(),
+                        summary: Vec::new(),
+                        content: Vec::new(),
+                    },
+                },
+                timestamp + 1,
+            )
+            .await
+            .expect("stale item start should persist");
+        crud_store
+            .configure_turn_item_attempt_deadlines(
+                turn.id.as_str(),
+                stale_item_id,
+                timestamp + 1,
+                Some(timestamp + 2),
+                Some(timestamp + 2),
+                Some(timestamp + 2),
+            )
+            .await
+            .expect("deadlines should be configured");
+        let later_item = TurnItem::AgentMessage {
+            id: later_item_id.to_owned(),
+            text: "still working".to_owned(),
+            phase: AgentMessagePhase::FinalAnswer,
+            markdown: None,
+            markdown_version: None,
+        };
+        crud_store
+            .materialize_item_started(
+                ItemStartedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn_id: turn.id.clone(),
+                    item: later_item.clone(),
+                },
+                timestamp + 10,
+            )
+            .await
+            .expect("later item start should persist");
+        crud_store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn_id: turn.id.clone(),
+                    item: later_item,
+                },
+                timestamp + 11,
+            )
+            .await
+            .expect("later item completion should persist");
+
+        let candidates = crud_store
+            .list_timeout_candidates(timestamp + 12, 8)
+            .await
+            .expect("timeout candidate query should succeed");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].item_id, stale_item_id);
+        assert!(
+            crud_store
+                .transition_timeout_candidate(&candidates[0], timestamp + 12)
+                .await
+                .expect("timeout transition should succeed")
+        );
+
+        let events = coordinator
+            .run_ready_jobs(timestamp + 13, 64)
+            .await
+            .expect("recovery worker should run");
+
+        assert!(
+            events.is_empty(),
+            "live turn item timeout must not enqueue recovery"
+        );
+        assert_eq!(
+            crud_store
+                .count_recovery_jobs_for_turn(turn.id.as_str())
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(
+            crud_store
+                .list_unqueued_timeout_candidates(64)
+                .await
+                .expect("backfill candidates should reload")
+                .is_empty(),
+            "suppressed timeout should not be backfilled into recovery later"
+        );
+    }
+
+    #[tokio::test]
     async fn late_provider_failure_after_timeout_is_stale_noop() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let turn_id = "turn_late_provider_failure";
@@ -4337,14 +4522,12 @@ mod tests {
 
         let timeout_events = coordinator
             .record_recovery_timeout_failure(
-                &TimeoutCandidate {
-                    attempt_id: "attempt_timeout_before_late_provider".to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item_id: "recovery_reasoning".to_owned(),
-                    item_type: TurnItemType::Reasoning,
-                    attempt_number: 1,
-                    timeout_reason: TurnItemTimeoutReason::IdleDeadlineExceeded,
-                },
+                &timeout_candidate(
+                    "attempt_timeout_before_late_provider",
+                    turn_id,
+                    "recovery_reasoning",
+                    TurnItemType::Reasoning,
+                ),
                 1_700_000_002,
             )
             .await
@@ -4683,14 +4866,12 @@ mod tests {
         let turn_id = "turn_tool_recovery_success";
         let job = coordinator
             .enqueue_timeout_job(
-                &TimeoutCandidate {
-                    attempt_id: "attempt_tool_timeout".to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item_id: "tool_1".to_owned(),
-                    item_type: TurnItemType::DynamicToolCall,
-                    attempt_number: 1,
-                    timeout_reason: TurnItemTimeoutReason::IdleDeadlineExceeded,
-                },
+                &timeout_candidate(
+                    "attempt_tool_timeout",
+                    turn_id,
+                    "tool_1",
+                    TurnItemType::DynamicToolCall,
+                ),
                 1_700_000_000,
             )
             .await

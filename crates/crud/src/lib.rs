@@ -58,8 +58,9 @@ use crate::convention::{
     task_status_from_db, task_status_to_db, task_trigger_kind_from_db, task_trigger_status_from_db,
     task_write_lock_scope_kind_from_db, task_write_lock_status_from_db, thread_mode_from_db,
     thread_origin_kind_from_db, thread_sidebar_visibility_from_db, thread_status_from_db,
-    turn_item_type_from_db, turn_kind_from_db, turn_origin_from_db, turn_permission_mode_from_db,
-    turn_permission_profile_source_from_db, turn_status_from_db, turn_status_to_db,
+    turn_item_type_from_db, turn_item_type_to_db, turn_kind_from_db, turn_origin_from_db,
+    turn_permission_mode_from_db, turn_permission_profile_source_from_db, turn_status_from_db,
+    turn_status_to_db,
 };
 use crate::events::{TurnEventPayload, TurnStartedEventPayload};
 use crate::projector::TurnProjector;
@@ -287,7 +288,7 @@ use crate::repositories::{
     task_run_execution, task_run_thread_binding, task_run_turn, task_trigger, task_write_lock,
     thread, thread_agents_doc, thread_episodic as thread_episodic_repository, thread_lineage,
     thread_tree, turn, turn_event, turn_event_projection_state, turn_execution_window,
-    turn_item_attempt, turn_llm_context, turn_mcp_binding, turn_runtime_snapshot,
+    turn_item_attempt, turn_liveness, turn_llm_context, turn_mcp_binding, turn_runtime_snapshot,
     turn_skill_binding,
 };
 pub use crate::task_events::{AppendedTaskEvent, TaskEventAppendStatus, TaskEventPayload};
@@ -458,6 +459,23 @@ pub struct TimeoutCandidate {
     pub item_type: TurnItemType,
     pub attempt_number: i64,
     pub timeout_reason: TurnItemTimeoutReason,
+    pub started_at_unix: i64,
+    pub started_event_sequence: Option<i64>,
+    pub last_heartbeat_at_unix: Option<i64>,
+    pub lease_expires_at_unix: Option<i64>,
+    pub idle_deadline_at_unix: Option<i64>,
+    pub hard_deadline_at_unix: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnLivenessRecord {
+    pub turn_id: String,
+    pub thread_id: String,
+    pub last_activity_sequence: i64,
+    pub last_activity_kind: String,
+    pub last_activity_item_id: Option<String>,
+    pub last_activity_item_type: Option<String>,
+    pub last_activity_at_unix: i64,
 }
 
 #[derive(Debug, Clone, Copy, Default, serde::Deserialize, serde::Serialize)]
@@ -4467,7 +4485,23 @@ impl CrudStore {
                         source_sequence,
                         updated_at,
                     )
-                    .await
+                    .await?;
+                    turn_liveness::observe_activity(
+                        &transaction,
+                        turn_liveness::TurnLivenessObservation {
+                            turn_id: notification.turn_id.clone(),
+                            thread_id: notification.thread_id.clone(),
+                            activity_sequence: source_sequence,
+                            activity_kind: "item/snapshot_updated".to_owned(),
+                            item_id: Some(notification.item.item_id().to_owned()),
+                            item_type: Some(
+                                turn_item_type_to_db(notification.item.item_type()).to_owned(),
+                            ),
+                            observed_at: updated_at,
+                        },
+                    )
+                    .await?;
+                    Ok(())
                 }
                 .await;
 
@@ -8805,22 +8839,63 @@ WHERE id IN (SELECT event_id FROM candidates)
         &self,
         turn_id: &str,
         item_id: &str,
+        item_type: TurnItemType,
         heartbeat_at_unix: i64,
         lease_expires_at_unix: Option<i64>,
         idle_deadline_at_unix: Option<i64>,
     ) -> Result<bool> {
         self.run_serialized_write(|| async {
-            turn_item_attempt::heartbeat_running_attempt(
+            let heartbeat_at = unix_to_datetime(heartbeat_at_unix);
+            let updated = turn_item_attempt::heartbeat_running_attempt(
                 &self.connection,
                 turn_id,
                 item_id,
-                unix_to_datetime(heartbeat_at_unix),
+                heartbeat_at,
                 lease_expires_at_unix.map(unix_to_datetime),
                 idle_deadline_at_unix.map(unix_to_datetime),
             )
-            .await
+            .await?;
+            if !updated {
+                return Ok(false);
+            }
+
+            let Some(turn_model) = turn::find_turn_by_id(&self.connection, turn_id).await? else {
+                return Ok(true);
+            };
+            let source_sequence = turn_event::latest_event_for_turn(&self.connection, turn_id)
+                .await?
+                .map(|event| event.sequence)
+                .unwrap_or(0);
+            turn_liveness::observe_activity(
+                &self.connection,
+                turn_liveness::TurnLivenessObservation {
+                    turn_id: turn_id.to_owned(),
+                    thread_id: turn_model.thread_id,
+                    activity_sequence: source_sequence,
+                    activity_kind: "item/heartbeat".to_owned(),
+                    item_id: Some(item_id.to_owned()),
+                    item_type: Some(turn_item_type_to_db(item_type).to_owned()),
+                    observed_at: heartbeat_at,
+                },
+            )
+            .await?;
+            Ok(true)
         })
         .await
+    }
+
+    pub async fn get_turn_liveness(&self, turn_id: &str) -> Result<Option<TurnLivenessRecord>> {
+        Ok(turn_liveness::find_by_turn_id(&self.connection, turn_id)
+            .await?
+            .map(|row| TurnLivenessRecord {
+                turn_id: row.turn_id,
+                thread_id: row.thread_id,
+                last_activity_sequence: row.last_activity_sequence,
+                last_activity_kind: row.last_activity_kind,
+                last_activity_item_id: row.last_activity_item_id,
+                last_activity_item_type: row.last_activity_item_type,
+                last_activity_at_unix: row.last_activity_at.timestamp(),
+            }))
     }
 
     pub async fn list_timeout_candidates(
@@ -8849,8 +8924,36 @@ WHERE id IN (SELECT event_id FROM candidates)
                     row.hard_deadline_at,
                     now_unix,
                 ),
+                started_at_unix: row.started_at.timestamp(),
+                started_event_sequence: row.started_event_sequence,
+                last_heartbeat_at_unix: row.last_heartbeat_at.map(|value| value.timestamp()),
+                lease_expires_at_unix: row.lease_expires_at.map(|value| value.timestamp()),
+                idle_deadline_at_unix: row.idle_deadline_at.map(|value| value.timestamp()),
+                hard_deadline_at_unix: row.hard_deadline_at.map(|value| value.timestamp()),
             })
             .collect())
+    }
+
+    pub async fn suppress_timeout_candidate_recovery(
+        &self,
+        candidate: &TimeoutCandidate,
+        reason: &str,
+        context: serde_json::Value,
+        now_unix: i64,
+    ) -> Result<bool> {
+        let context_json = serde_json::to_string(&context)
+            .context("failed to serialize timeout recovery suppression context")?;
+        self.run_serialized_write(|| async {
+            turn_item_attempt::suppress_timeout_recovery(
+                &self.connection,
+                candidate.attempt_id.as_str(),
+                reason,
+                context_json.clone(),
+                unix_to_datetime(now_unix),
+            )
+            .await
+        })
+        .await
     }
 
     pub async fn list_running_attempts_missing_deadlines(
@@ -8913,6 +9016,12 @@ WHERE id IN (SELECT event_id FROM candidates)
                 item_type: row.item_type,
                 attempt_number: row.attempt_number,
                 timeout_reason: row.timeout_reason,
+                started_at_unix: row.started_at.timestamp(),
+                started_event_sequence: row.started_event_sequence,
+                last_heartbeat_at_unix: row.last_heartbeat_at.map(|value| value.timestamp()),
+                lease_expires_at_unix: row.lease_expires_at.map(|value| value.timestamp()),
+                idle_deadline_at_unix: row.idle_deadline_at.map(|value| value.timestamp()),
+                hard_deadline_at_unix: row.hard_deadline_at.map(|value| value.timestamp()),
             })
             .collect())
     }
@@ -9220,9 +9329,12 @@ WHERE id IN (SELECT event_id FROM candidates)
                 item_id: candidate.item_id.clone(),
                 item_type: candidate.item_type,
                 attempt_number: candidate.attempt_number,
-                lease_expires_at: None,
-                idle_deadline_at: None,
-                hard_deadline_at: None,
+                started_at: unix_to_datetime(candidate.started_at_unix),
+                started_event_sequence: candidate.started_event_sequence,
+                last_heartbeat_at: candidate.last_heartbeat_at_unix.map(unix_to_datetime),
+                lease_expires_at: candidate.lease_expires_at_unix.map(unix_to_datetime),
+                idle_deadline_at: candidate.idle_deadline_at_unix.map(unix_to_datetime),
+                hard_deadline_at: candidate.hard_deadline_at_unix.map(unix_to_datetime),
             };
 
             let transitioned = turn_item_attempt::transition_running_attempt_to_timed_out(
@@ -11750,8 +11862,8 @@ mod tests {
     use crate::util::unix_to_datetime;
     use migration::{Migrator, MigratorTrait};
     use pioneer_protocol::{
-        ArtifactBindingDirection, ArtifactBindingKind, ArtifactCreatedByKind, ArtifactKind,
-        ArtifactRole, ExecutionWindowExhaustionReason, ExecutionWindowStatus,
+        AgentMessagePhase, ArtifactBindingDirection, ArtifactBindingKind, ArtifactCreatedByKind,
+        ArtifactKind, ArtifactRole, ExecutionWindowExhaustionReason, ExecutionWindowStatus,
         ItemCompletedNotification, ItemRecoveryAttachedNotification,
         ItemRecoveryExhaustedNotification, ItemRecoveryOpenedNotification,
         ItemRecoverySucceededNotification, ItemRetryAttemptStartedNotification,
@@ -14662,6 +14774,23 @@ mod tests {
         );
         assert_eq!(response.last_sequence, raw_events[0].sequence);
 
+        let liveness = store
+            .get_turn_liveness(turn_id)
+            .await
+            .expect("liveness query should succeed")
+            .expect("liveness row should exist");
+        assert_eq!(liveness.last_activity_sequence, 1);
+        assert_eq!(liveness.last_activity_kind, "item/snapshot_updated");
+        assert_eq!(
+            liveness.last_activity_item_id.as_deref(),
+            Some("agent_diff_native_turn")
+        );
+        assert_eq!(
+            liveness.last_activity_item_type.as_deref(),
+            Some("system_event")
+        );
+        assert_eq!(liveness.last_activity_at_unix, timestamp + 2);
+
         let current_diff = store
             .get_turn_item(turn_id, "agent_diff_native_turn")
             .await
@@ -15849,6 +15978,270 @@ mod tests {
             panic!("expected web_fetch payload");
         };
         assert_eq!(status, ToolCallStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn turn_liveness_tracks_latest_activity_and_attempt_start_sequence() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+
+        let store = CrudStore::new(connection);
+        let timestamp = 1_700_000_000;
+        let workspace_id = "ws_turn_liveness";
+        let thread_id = "thr_turn_liveness";
+        let turn_id = "turn_turn_liveness";
+        let stale_item_id = "reasoning_stale_liveness";
+        let later_item_id = "agent_message_liveness";
+        let thread = sample_thread(workspace_id, thread_id, timestamp);
+        let turn = sample_turn(turn_id);
+
+        store
+            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+            .await
+            .expect("turn start should persist");
+        store
+            .materialize_item_started(
+                ItemStartedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: TurnItem::Reasoning {
+                        id: stale_item_id.to_owned(),
+                        summary: Vec::new(),
+                        content: Vec::new(),
+                    },
+                },
+                timestamp + 1,
+            )
+            .await
+            .expect("stale item start should persist");
+        store
+            .configure_turn_item_attempt_deadlines(
+                turn_id,
+                stale_item_id,
+                timestamp + 1,
+                Some(timestamp + 2),
+                Some(timestamp + 2),
+                Some(timestamp + 2),
+            )
+            .await
+            .expect("deadlines should be configured");
+
+        let later_item = TurnItem::AgentMessage {
+            id: later_item_id.to_owned(),
+            text: "still working".to_owned(),
+            phase: AgentMessagePhase::FinalAnswer,
+            markdown: None,
+            markdown_version: None,
+        };
+        store
+            .materialize_item_started(
+                ItemStartedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: later_item.clone(),
+                },
+                timestamp + 10,
+            )
+            .await
+            .expect("later item start should persist");
+        store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: later_item,
+                },
+                timestamp + 11,
+            )
+            .await
+            .expect("later item completion should persist");
+
+        let liveness = store
+            .get_turn_liveness(turn_id)
+            .await
+            .expect("liveness query should succeed")
+            .expect("liveness row should exist");
+        assert_eq!(liveness.turn_id, turn_id);
+        assert_eq!(liveness.thread_id, thread_id);
+        assert_eq!(liveness.last_activity_sequence, 4);
+        assert_eq!(liveness.last_activity_kind, "item/completed");
+        assert_eq!(
+            liveness.last_activity_item_id.as_deref(),
+            Some(later_item_id)
+        );
+        assert_eq!(
+            liveness.last_activity_item_type.as_deref(),
+            Some("agent_message")
+        );
+        assert_eq!(liveness.last_activity_at_unix, timestamp + 11);
+
+        let candidates = store
+            .list_timeout_candidates(timestamp + 12, 8)
+            .await
+            .expect("timeout candidate list should succeed");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].item_id, stale_item_id);
+        assert_eq!(candidates[0].started_event_sequence, Some(2));
+        assert_eq!(candidates[0].last_heartbeat_at_unix, Some(timestamp + 1));
+    }
+
+    #[tokio::test]
+    async fn turn_liveness_tracks_item_heartbeat_without_new_turn_event() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+
+        let store = CrudStore::new(connection);
+        let timestamp = 1_700_000_000;
+        let workspace_id = "ws_turn_liveness_heartbeat";
+        let thread_id = "thr_turn_liveness_heartbeat";
+        let turn_id = "turn_turn_liveness_heartbeat";
+        let item_id = "reasoning_heartbeat_liveness";
+        let thread = sample_thread(workspace_id, thread_id, timestamp);
+        let turn = sample_turn(turn_id);
+
+        store
+            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+            .await
+            .expect("turn start should persist");
+        store
+            .materialize_item_started(
+                ItemStartedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: TurnItem::Reasoning {
+                        id: item_id.to_owned(),
+                        summary: Vec::new(),
+                        content: Vec::new(),
+                    },
+                },
+                timestamp + 1,
+            )
+            .await
+            .expect("item start should persist");
+
+        assert!(
+            store
+                .heartbeat_turn_item_attempt(
+                    turn_id,
+                    item_id,
+                    TurnItemType::Reasoning,
+                    timestamp + 5,
+                    Some(timestamp + 905),
+                    Some(timestamp + 905),
+                )
+                .await
+                .expect("heartbeat should persist")
+        );
+
+        let liveness = store
+            .get_turn_liveness(turn_id)
+            .await
+            .expect("liveness query should succeed")
+            .expect("liveness row should exist");
+        assert_eq!(liveness.last_activity_sequence, 2);
+        assert_eq!(liveness.last_activity_kind, "item/heartbeat");
+        assert_eq!(liveness.last_activity_item_id.as_deref(), Some(item_id));
+        assert_eq!(
+            liveness.last_activity_item_type.as_deref(),
+            Some("reasoning")
+        );
+        assert_eq!(liveness.last_activity_at_unix, timestamp + 5);
+    }
+
+    #[tokio::test]
+    async fn turn_liveness_orders_activity_by_time_then_sequence() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+
+        let turn_id = "turn_liveness_ordering";
+        let thread_id = "thr_liveness_ordering";
+        let timestamp = 1_700_000_000;
+
+        assert!(
+            crate::repositories::turn_liveness::observe_activity(
+                &connection,
+                crate::repositories::turn_liveness::TurnLivenessObservation {
+                    turn_id: turn_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    activity_sequence: 2,
+                    activity_kind: "item/heartbeat".to_owned(),
+                    item_id: Some("item_later_clock".to_owned()),
+                    item_type: Some("reasoning".to_owned()),
+                    observed_at: unix_to_datetime(timestamp + 10),
+                },
+            )
+            .await
+            .expect("initial liveness observation should persist")
+        );
+
+        assert!(
+            !crate::repositories::turn_liveness::observe_activity(
+                &connection,
+                crate::repositories::turn_liveness::TurnLivenessObservation {
+                    turn_id: turn_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    activity_sequence: 3,
+                    activity_kind: "item/completed".to_owned(),
+                    item_id: Some("item_older_clock".to_owned()),
+                    item_type: Some("agent_message".to_owned()),
+                    observed_at: unix_to_datetime(timestamp + 5),
+                },
+            )
+            .await
+            .expect("older liveness observation should be ignored")
+        );
+
+        let store = CrudStore::new(connection);
+        let liveness = store
+            .get_turn_liveness(turn_id)
+            .await
+            .expect("liveness query should succeed")
+            .expect("liveness row should exist");
+        assert_eq!(liveness.last_activity_sequence, 2);
+        assert_eq!(liveness.last_activity_kind, "item/heartbeat");
+        assert_eq!(liveness.last_activity_at_unix, timestamp + 10);
+
+        assert!(
+            crate::repositories::turn_liveness::observe_activity(
+                &store.connection,
+                crate::repositories::turn_liveness::TurnLivenessObservation {
+                    turn_id: turn_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    activity_sequence: 4,
+                    activity_kind: "item/updated".to_owned(),
+                    item_id: Some("item_same_clock".to_owned()),
+                    item_type: Some("agent_message".to_owned()),
+                    observed_at: unix_to_datetime(timestamp + 10),
+                },
+            )
+            .await
+            .expect("same-time higher sequence should update liveness")
+        );
+
+        let liveness = store
+            .get_turn_liveness(turn_id)
+            .await
+            .expect("liveness query should succeed")
+            .expect("liveness row should exist");
+        assert_eq!(liveness.last_activity_sequence, 4);
+        assert_eq!(liveness.last_activity_kind, "item/updated");
+        assert_eq!(liveness.last_activity_at_unix, timestamp + 10);
     }
 
     #[tokio::test]

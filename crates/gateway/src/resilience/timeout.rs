@@ -2,7 +2,7 @@ use anyhow::Result;
 use pioneer_config::{
     GatewayCommandExecutionTimeoutConfig, GatewayProviderStreamItemTimeoutConfig,
 };
-use pioneer_crud::{CrudStore, TimeoutCandidate, TurnItemAttemptDeadlines};
+use pioneer_crud::{CrudStore, TimeoutCandidate, TurnItemAttemptDeadlines, TurnLivenessRecord};
 use pioneer_protocol::{TurnItem, TurnItemType};
 use pioneer_provider::ProviderTimeoutPolicy;
 use std::collections::HashMap;
@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 const CLI_CONTEXT_COMPACTION_TIMEOUT_SECS: u64 = 5 * 60;
 const CLI_CONTEXT_COMPACTION_HARD_TIMEOUT_SECS: u64 = 10 * 60;
+pub const TIMEOUT_RECOVERY_SUPPRESSED_TURN_PROGRESS: &str = "turn_progressed_after_item_frontier";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimeoutPolicy {
@@ -188,6 +189,72 @@ pub struct TimeoutSupervisor {
     policy_registry: TimeoutPolicyRegistry,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TimeoutRecoveryClassification {
+    RecoverTurn,
+    SuppressRecoveryBecauseTurnProgressed { liveness: TurnLivenessRecord },
+}
+
+pub fn classify_timeout_candidate_liveness(
+    candidate: &TimeoutCandidate,
+    liveness: Option<&TurnLivenessRecord>,
+) -> TimeoutRecoveryClassification {
+    let Some(liveness) = liveness else {
+        return TimeoutRecoveryClassification::RecoverTurn;
+    };
+
+    let heartbeat_frontier = candidate
+        .last_heartbeat_at_unix
+        .unwrap_or(candidate.started_at_unix);
+    if liveness.last_activity_at_unix > heartbeat_frontier {
+        return TimeoutRecoveryClassification::SuppressRecoveryBecauseTurnProgressed {
+            liveness: liveness.clone(),
+        };
+    }
+
+    if candidate
+        .last_heartbeat_at_unix
+        .unwrap_or(candidate.started_at_unix)
+        == candidate.started_at_unix
+        && candidate
+            .started_event_sequence
+            .is_some_and(|sequence| liveness.last_activity_sequence > sequence)
+    {
+        return TimeoutRecoveryClassification::SuppressRecoveryBecauseTurnProgressed {
+            liveness: liveness.clone(),
+        };
+    }
+
+    TimeoutRecoveryClassification::RecoverTurn
+}
+
+pub fn timeout_recovery_suppression_context(
+    candidate: &TimeoutCandidate,
+    liveness: &TurnLivenessRecord,
+) -> serde_json::Value {
+    serde_json::json!({
+        "source": "timeout_classifier",
+        "reason": TIMEOUT_RECOVERY_SUPPRESSED_TURN_PROGRESS,
+        "attempt_id": candidate.attempt_id.as_str(),
+        "item_id": candidate.item_id.as_str(),
+        "item_type": format!("{:?}", candidate.item_type),
+        "attempt_number": candidate.attempt_number,
+        "timeout_reason": format!("{:?}", candidate.timeout_reason),
+        "started_at_unix": candidate.started_at_unix,
+        "started_event_sequence": candidate.started_event_sequence,
+        "last_heartbeat_at_unix": candidate.last_heartbeat_at_unix,
+        "turn_liveness": {
+            "turn_id": liveness.turn_id.as_str(),
+            "thread_id": liveness.thread_id.as_str(),
+            "last_activity_sequence": liveness.last_activity_sequence,
+            "last_activity_kind": liveness.last_activity_kind.as_str(),
+            "last_activity_item_id": liveness.last_activity_item_id.as_deref(),
+            "last_activity_item_type": liveness.last_activity_item_type.as_deref(),
+            "last_activity_at_unix": liveness.last_activity_at_unix,
+        }
+    })
+}
+
 impl TimeoutSupervisor {
     pub fn new(crud_store: Arc<CrudStore>, policy_registry: TimeoutPolicyRegistry) -> Self {
         Self {
@@ -259,6 +326,7 @@ impl TimeoutSupervisor {
             .heartbeat_turn_item_attempt(
                 turn_id,
                 item_id,
+                item_type,
                 now_unix,
                 deadlines.lease_expires_at_unix,
                 deadlines.idle_deadline_at_unix,
@@ -285,6 +353,20 @@ impl TimeoutSupervisor {
         self.crud_store
             .transition_timeout_candidate(candidate, now_unix)
             .await
+    }
+
+    pub async fn classify_timeout_candidate(
+        &self,
+        candidate: &TimeoutCandidate,
+    ) -> Result<TimeoutRecoveryClassification> {
+        let liveness = self
+            .crud_store
+            .get_turn_liveness(candidate.turn_id.as_str())
+            .await?;
+        Ok(classify_timeout_candidate_liveness(
+            candidate,
+            liveness.as_ref(),
+        ))
     }
 
     pub async fn renew_running_attempt_deadlines_for_turn(
@@ -368,7 +450,36 @@ fn saturating_add_secs(base: i64, seconds: u64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pioneer_protocol::{SystemEventLevel, TurnItem, TurnItemType};
+    use pioneer_protocol::{SystemEventLevel, TurnItem, TurnItemTimeoutReason, TurnItemType};
+
+    fn timeout_candidate() -> TimeoutCandidate {
+        TimeoutCandidate {
+            attempt_id: "attempt_1".to_owned(),
+            turn_id: "turn_1".to_owned(),
+            item_id: "reasoning_1".to_owned(),
+            item_type: TurnItemType::Reasoning,
+            attempt_number: 1,
+            timeout_reason: TurnItemTimeoutReason::IdleDeadlineExceeded,
+            started_at_unix: 1_000,
+            started_event_sequence: Some(4),
+            last_heartbeat_at_unix: Some(1_000),
+            lease_expires_at_unix: Some(1_900),
+            idle_deadline_at_unix: Some(1_900),
+            hard_deadline_at_unix: Some(2_800),
+        }
+    }
+
+    fn turn_liveness(at_unix: i64, sequence: i64) -> TurnLivenessRecord {
+        TurnLivenessRecord {
+            turn_id: "turn_1".to_owned(),
+            thread_id: "thread_1".to_owned(),
+            last_activity_sequence: sequence,
+            last_activity_kind: "item/completed".to_owned(),
+            last_activity_item_id: Some("later_item".to_owned()),
+            last_activity_item_type: Some("agent_message".to_owned()),
+            last_activity_at_unix: at_unix,
+        }
+    }
 
     #[test]
     fn provider_stream_item_defaults_allow_quarter_hour_idle_window() {
@@ -475,5 +586,53 @@ mod tests {
         assert_eq!(lease_expires_at, 1_030);
         assert_eq!(idle_deadline_at, 1_030);
         assert_eq!(hard_deadline_at, 1_120);
+    }
+
+    #[test]
+    fn timeout_classifier_recovers_when_no_later_turn_liveness_exists() {
+        let candidate = timeout_candidate();
+
+        assert_eq!(
+            classify_timeout_candidate_liveness(&candidate, None),
+            TimeoutRecoveryClassification::RecoverTurn
+        );
+        assert_eq!(
+            classify_timeout_candidate_liveness(&candidate, Some(&turn_liveness(1_000, 4))),
+            TimeoutRecoveryClassification::RecoverTurn
+        );
+    }
+
+    #[test]
+    fn timeout_classifier_suppresses_recovery_after_later_turn_activity() {
+        let candidate = timeout_candidate();
+        let liveness = turn_liveness(1_010, 5);
+
+        assert!(matches!(
+            classify_timeout_candidate_liveness(&candidate, Some(&liveness)),
+            TimeoutRecoveryClassification::SuppressRecoveryBecauseTurnProgressed { .. }
+        ));
+    }
+
+    #[test]
+    fn timeout_classifier_uses_sequence_for_same_second_activity_without_later_heartbeat() {
+        let candidate = timeout_candidate();
+        let liveness = turn_liveness(1_000, 5);
+
+        assert!(matches!(
+            classify_timeout_candidate_liveness(&candidate, Some(&liveness)),
+            TimeoutRecoveryClassification::SuppressRecoveryBecauseTurnProgressed { .. }
+        ));
+    }
+
+    #[test]
+    fn timeout_classifier_does_not_use_sequence_fallback_after_later_heartbeat() {
+        let mut candidate = timeout_candidate();
+        candidate.last_heartbeat_at_unix = Some(1_010);
+        let liveness = turn_liveness(1_010, 5);
+
+        assert_eq!(
+            classify_timeout_candidate_liveness(&candidate, Some(&liveness)),
+            TimeoutRecoveryClassification::RecoverTurn
+        );
     }
 }

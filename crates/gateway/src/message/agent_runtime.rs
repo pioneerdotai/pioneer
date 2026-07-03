@@ -2467,35 +2467,87 @@ impl MessageProcessor {
     ) {
         let mut active_recovery_job_id = None;
         let mut active_recovery_events = Vec::new();
-        let recovery_job_outcome = match self
-            .recovery_coordinator
-            .suppress_timeout_recovery_if_turn_not_in_progress(&candidate, now_unix)
+        let classification = match self
+            .timeout_supervisor
+            .classify_timeout_candidate(&candidate)
             .await
         {
-            Ok(true) => None,
-            Ok(false) => match self
-                .recovery_coordinator
-                .record_recovery_timeout_failure(&candidate, now_unix)
-                .await
-            {
-                Ok(Some((job_id, events))) => {
-                    active_recovery_job_id = Some(job_id);
-                    active_recovery_events = events;
-                    None
-                }
-                Ok(None) => match self
-                    .recovery_coordinator
-                    .enqueue_timeout_job(&candidate, now_unix)
+            Ok(classification) => classification,
+            Err(error) => {
+                warn!(
+                    turn_id = %candidate.turn_id,
+                    item_id = %candidate.item_id,
+                    attempt_id = %candidate.attempt_id,
+                    error = %format!("{error:#}"),
+                    "failed to classify timeout candidate before recovery; falling back to recovery path"
+                );
+                crate::resilience::TimeoutRecoveryClassification::RecoverTurn
+            }
+        };
+        let recovery_job_outcome = match classification {
+            crate::resilience::TimeoutRecoveryClassification::SuppressRecoveryBecauseTurnProgressed { liveness } => {
+                let context =
+                    crate::resilience::timeout_recovery_suppression_context(&candidate, &liveness);
+                if let Err(error) = self
+                    .crud_store
+                    .suppress_timeout_candidate_recovery(
+                        &candidate,
+                        crate::resilience::TIMEOUT_RECOVERY_SUPPRESSED_TURN_PROGRESS,
+                        context,
+                        now_unix,
+                    )
                     .await
                 {
-                    Ok(job) => Some(job),
+                    warn!(
+                        turn_id = %candidate.turn_id,
+                        item_id = %candidate.item_id,
+                        attempt_id = %candidate.attempt_id,
+                        error = %format!("{error:#}"),
+                        "failed to persist timeout recovery suppression for live turn"
+                    );
+                }
+                None
+            }
+            crate::resilience::TimeoutRecoveryClassification::RecoverTurn => match self
+                .recovery_coordinator
+                .suppress_timeout_recovery_if_turn_not_in_progress(&candidate, now_unix)
+                .await
+            {
+                Ok(true) => None,
+                Ok(false) => match self
+                    .recovery_coordinator
+                    .record_recovery_timeout_failure(&candidate, now_unix)
+                    .await
+                {
+                    Ok(Some((job_id, events))) => {
+                        active_recovery_job_id = Some(job_id);
+                        active_recovery_events = events;
+                        None
+                    }
+                    Ok(None) => match self
+                        .recovery_coordinator
+                        .enqueue_timeout_job(&candidate, now_unix)
+                        .await
+                    {
+                        Ok(job) => Some(job),
+                        Err(error) => {
+                            warn!(
+                                turn_id = %candidate.turn_id,
+                                item_id = %candidate.item_id,
+                                attempt_id = %candidate.attempt_id,
+                                error = %format!("{error:#}"),
+                                "failed to enqueue recovery job for timed out attempt"
+                            );
+                            None
+                        }
+                    },
                     Err(error) => {
                         warn!(
                             turn_id = %candidate.turn_id,
                             item_id = %candidate.item_id,
                             attempt_id = %candidate.attempt_id,
                             error = %format!("{error:#}"),
-                            "failed to enqueue recovery job for timed out attempt"
+                            "failed to update active recovery job for timed out attempt"
                         );
                         None
                     }
@@ -2506,21 +2558,11 @@ impl MessageProcessor {
                         item_id = %candidate.item_id,
                         attempt_id = %candidate.attempt_id,
                         error = %format!("{error:#}"),
-                        "failed to update active recovery job for timed out attempt"
+                        "failed to check timeout candidate turn status before recovery"
                     );
                     None
                 }
             },
-            Err(error) => {
-                warn!(
-                    turn_id = %candidate.turn_id,
-                    item_id = %candidate.item_id,
-                    attempt_id = %candidate.attempt_id,
-                    error = %format!("{error:#}"),
-                    "failed to check timeout candidate turn status before recovery"
-                );
-                None
-            }
         };
 
         let Some((thread_id, workspace_id)) = (match self

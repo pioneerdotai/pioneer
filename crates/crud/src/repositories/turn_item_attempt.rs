@@ -11,8 +11,9 @@ use sea_orm::{
 };
 
 use crate::convention::{
-    TURN_ITEM_STATUS_TIMED_OUT, turn_item_attempt_status_to_db, turn_item_timeout_reason_from_db,
-    turn_item_timeout_reason_to_db, turn_item_type_from_db, turn_item_type_to_db,
+    ATTEMPT_STATUS_TIMED_OUT, TURN_ITEM_STATUS_TIMED_OUT, turn_item_attempt_status_to_db,
+    turn_item_timeout_reason_from_db, turn_item_timeout_reason_to_db, turn_item_type_from_db,
+    turn_item_type_to_db,
 };
 use crate::turn_item_terminal::{TurnItemTerminalState, terminalize_turn_item_payload};
 
@@ -32,6 +33,9 @@ pub struct RunningAttemptSnapshot {
     pub item_id: String,
     pub item_type: TurnItemType,
     pub attempt_number: i64,
+    pub started_at: DateTimeWithTimeZone,
+    pub started_event_sequence: Option<i64>,
+    pub last_heartbeat_at: Option<DateTimeWithTimeZone>,
     pub lease_expires_at: Option<DateTimeWithTimeZone>,
     pub idle_deadline_at: Option<DateTimeWithTimeZone>,
     pub hard_deadline_at: Option<DateTimeWithTimeZone>,
@@ -45,6 +49,12 @@ pub struct TimedOutAttemptSnapshot {
     pub item_type: TurnItemType,
     pub attempt_number: i64,
     pub timeout_reason: TurnItemTimeoutReason,
+    pub started_at: DateTimeWithTimeZone,
+    pub started_event_sequence: Option<i64>,
+    pub last_heartbeat_at: Option<DateTimeWithTimeZone>,
+    pub lease_expires_at: Option<DateTimeWithTimeZone>,
+    pub idle_deadline_at: Option<DateTimeWithTimeZone>,
+    pub hard_deadline_at: Option<DateTimeWithTimeZone>,
 }
 
 pub async fn create_running_attempt<C: ConnectionTrait>(
@@ -55,6 +65,7 @@ pub async fn create_running_attempt<C: ConnectionTrait>(
     payload_json: String,
     deadlines: AttemptDeadlines,
     started_at: DateTimeWithTimeZone,
+    started_event_sequence: Option<i64>,
 ) -> Result<turn_item_attempt::Model> {
     let next_attempt_number = next_attempt_number(db, turn_id, item_id).await?;
     let id = generate_id(DB_ID_LEN);
@@ -76,10 +87,14 @@ pub async fn create_running_attempt<C: ConnectionTrait>(
         trace_id: Set(None),
         payload: Set(payload_json),
         started_at: Set(started_at),
+        started_event_sequence: Set(started_event_sequence),
         last_heartbeat_at: Set(Some(started_at)),
         lease_expires_at: Set(deadlines.lease_expires_at),
         idle_deadline_at: Set(deadlines.idle_deadline_at),
         hard_deadline_at: Set(deadlines.hard_deadline_at),
+        recovery_suppressed_reason: Set(None),
+        recovery_suppressed_at: Set(None),
+        recovery_suppression_context_json: Set(None),
         updated_at: Set(started_at),
     })
     .exec(db)
@@ -335,6 +350,9 @@ pub async fn list_expired_running_attempts<C: ConnectionTrait>(
             item_type: turn_item_type_from_db(row.item_type.as_str())
                 .unwrap_or(TurnItemType::DynamicToolCall),
             attempt_number: row.attempt_number,
+            started_at: row.started_at,
+            started_event_sequence: row.started_event_sequence,
+            last_heartbeat_at: row.last_heartbeat_at,
             lease_expires_at: row.lease_expires_at,
             idle_deadline_at: row.idle_deadline_at,
             hard_deadline_at: row.hard_deadline_at,
@@ -441,6 +459,9 @@ pub async fn list_running_attempts_for_turn<C: ConnectionTrait>(
             item_type: turn_item_type_from_db(row.item_type.as_str())
                 .unwrap_or(TurnItemType::DynamicToolCall),
             attempt_number: row.attempt_number,
+            started_at: row.started_at,
+            started_event_sequence: row.started_event_sequence,
+            last_heartbeat_at: row.last_heartbeat_at,
             lease_expires_at: row.lease_expires_at,
             idle_deadline_at: row.idle_deadline_at,
             hard_deadline_at: row.hard_deadline_at,
@@ -456,6 +477,7 @@ pub async fn list_timed_out_without_recovery<C: ConnectionTrait>(
     let rows = turn_item_attempt::Entity::find()
         .filter(turn_item_attempt::Column::Status.eq(timed_out_status))
         .filter(turn_item_attempt::Column::RecoveryAction.is_null())
+        .filter(turn_item_attempt::Column::RecoverySuppressedReason.is_null())
         .order_by_asc(turn_item_attempt::Column::UpdatedAt)
         .limit(limit)
         .all(db)
@@ -476,8 +498,51 @@ pub async fn list_timed_out_without_recovery<C: ConnectionTrait>(
                 .as_deref()
                 .and_then(turn_item_timeout_reason_from_db)
                 .unwrap_or(TurnItemTimeoutReason::HardDeadlineExceeded),
+            started_at: row.started_at,
+            started_event_sequence: row.started_event_sequence,
+            last_heartbeat_at: row.last_heartbeat_at,
+            lease_expires_at: row.lease_expires_at,
+            idle_deadline_at: row.idle_deadline_at,
+            hard_deadline_at: row.hard_deadline_at,
         })
         .collect())
+}
+
+pub async fn suppress_timeout_recovery<C: ConnectionTrait>(
+    db: &C,
+    attempt_id: &str,
+    reason: &str,
+    context_json: String,
+    updated_at: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let affected = turn_item_attempt::Entity::update_many()
+        .col_expr(
+            turn_item_attempt::Column::RecoverySuppressedReason,
+            Expr::value(Some(reason.to_owned())),
+        )
+        .col_expr(
+            turn_item_attempt::Column::RecoverySuppressedAt,
+            Expr::value(Some(updated_at)),
+        )
+        .col_expr(
+            turn_item_attempt::Column::RecoverySuppressionContextJson,
+            Expr::value(Some(context_json)),
+        )
+        .col_expr(
+            turn_item_attempt::Column::UpdatedAt,
+            Expr::value(updated_at),
+        )
+        .filter(turn_item_attempt::Column::Id.eq(attempt_id.to_owned()))
+        .filter(turn_item_attempt::Column::Status.eq(ATTEMPT_STATUS_TIMED_OUT))
+        .filter(turn_item_attempt::Column::RecoveryAction.is_null())
+        .filter(turn_item_attempt::Column::RecoverySuppressedReason.is_null())
+        .exec(db)
+        .await
+        .with_context(|| format!("failed to suppress timeout recovery for attempt `{attempt_id}`"))?
+        .rows_affected
+        > 0;
+
+    Ok(affected)
 }
 
 pub async fn mark_recovery_action<C: ConnectionTrait>(
