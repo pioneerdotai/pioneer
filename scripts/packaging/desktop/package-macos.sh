@@ -378,6 +378,7 @@ APP_DIR="$WORK_DIR/${APP_NAME}.app"
 CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
+APP_ENTITLEMENTS_PATH="$WORK_DIR/${APP_NAME}.entitlements"
 DESKTOP_EXECUTABLE_NAME="pioneer-app"
 MACOS_ICON_NAME="Pioneer.icns"
 MACOS_ICON_SOURCE="$REPO_ROOT/crates/desktop/assets/app-icon.icns"
@@ -468,12 +469,27 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
 </plist>
 PLIST
 
+cat > "$APP_ENTITLEMENTS_PATH" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.device.audio-input</key>
+  <true/>
+</dict>
+</plist>
+PLIST
+
 echo "APPL????" > "$CONTENTS_DIR/PkgInfo"
 
 if [[ -n "${MACOS_DESKTOP_SIGN_IDENTITY:-}" ]]; then
   require_cmd codesign
-  codesign --deep --force --timestamp --options runtime --sign "$MACOS_DESKTOP_SIGN_IDENTITY" "$APP_DIR"
+  codesign --deep --force --timestamp --options runtime --entitlements "$APP_ENTITLEMENTS_PATH" --sign "$MACOS_DESKTOP_SIGN_IDENTITY" "$APP_DIR"
   codesign --verify --deep --strict "$APP_DIR"
+  if ! codesign -d --entitlements :- "$APP_DIR" 2>/dev/null | grep -q "com.apple.security.device.audio-input"; then
+    echo "signed app is missing com.apple.security.device.audio-input entitlement" >&2
+    exit 1
+  fi
 fi
 
 DMG_NAME="Pioneer-${ARCH}.dmg"
