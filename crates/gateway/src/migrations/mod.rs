@@ -2,6 +2,7 @@ mod agent_diff_event_compaction;
 mod cli_runtime_native_event_compaction;
 mod task_anchor_backfill;
 mod timeline_pagination_backfill;
+mod turn_item_attempt_payload_compaction;
 
 use pioneer_crud::CrudStore;
 use std::sync::Arc;
@@ -12,6 +13,7 @@ pub(crate) fn spawn_gateway_startup_migrations(crud_store: Arc<CrudStore>) {
         timeline_pagination_backfill::run(crud_store.as_ref()).await;
         agent_diff_event_compaction::run(crud_store.as_ref()).await;
         cli_runtime_native_event_compaction::run(crud_store.as_ref()).await;
+        turn_item_attempt_payload_compaction::run(crud_store.as_ref()).await;
     });
 }
 

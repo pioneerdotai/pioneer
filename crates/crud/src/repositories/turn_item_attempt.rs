@@ -277,7 +277,7 @@ pub async fn finish_running_attempt<C: ConnectionTrait>(
 
     let status_db = turn_item_attempt_status_to_db(status).to_owned();
 
-    let affected = turn_item_attempt::Entity::update_many()
+    let mut update = turn_item_attempt::Entity::update_many()
         .col_expr(
             turn_item_attempt::Column::Status,
             Expr::value(status_db.clone()),
@@ -289,7 +289,12 @@ pub async fn finish_running_attempt<C: ConnectionTrait>(
         .col_expr(
             turn_item_attempt::Column::UpdatedAt,
             Expr::value(updated_at),
-        )
+        );
+    if clears_attempt_payload(status) {
+        update = update.col_expr(turn_item_attempt::Column::Payload, Expr::value("{}"));
+    }
+
+    let affected = update
         .filter(turn_item_attempt::Column::Id.eq(running.id.clone()))
         .filter(
             turn_item_attempt::Column::Status.eq(turn_item_attempt_status_to_db(
@@ -319,6 +324,17 @@ pub async fn finish_running_attempt<C: ConnectionTrait>(
         .context("failed to update turn_item active status")?;
 
     Ok(true)
+}
+
+fn clears_attempt_payload(status: TurnItemAttemptStatus) -> bool {
+    matches!(
+        status,
+        TurnItemAttemptStatus::Completed
+            | TurnItemAttemptStatus::Failed
+            | TurnItemAttemptStatus::Cancelled
+            | TurnItemAttemptStatus::Interrupted
+            | TurnItemAttemptStatus::Exhausted
+    )
 }
 
 pub async fn list_expired_running_attempts<C: ConnectionTrait>(

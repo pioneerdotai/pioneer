@@ -38,8 +38,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 
 use crate::convention::{
-    ATTEMPT_STATUS_INTERRUPTED, ATTEMPT_STATUS_RUNNING, DB_ID_LEN, MEMORY_EVENT_ACCESSED,
-    MEMORY_EVENT_CANDIDATE_APPROVED, MEMORY_EVENT_CANDIDATE_CREATED,
+    ATTEMPT_STATUS_CANCELLED, ATTEMPT_STATUS_COMPLETED, ATTEMPT_STATUS_EXHAUSTED,
+    ATTEMPT_STATUS_FAILED, ATTEMPT_STATUS_INTERRUPTED, ATTEMPT_STATUS_RUNNING, DB_ID_LEN,
+    MEMORY_EVENT_ACCESSED, MEMORY_EVENT_CANDIDATE_APPROVED, MEMORY_EVENT_CANDIDATE_CREATED,
     MEMORY_EVENT_CANDIDATE_EXPIRED, MEMORY_EVENT_CANDIDATE_REJECTED,
     MEMORY_EVENT_CAPSULE_REPAIR_STATUS_CHANGED, MEMORY_EVENT_CREATED, MEMORY_EVENT_EXPIRED,
     MEMORY_EVENT_FORGOTTEN, MEMORY_EVENT_QUARANTINED, MEMORY_EVENT_REPAIR_STATUS_CHANGED,
@@ -218,6 +219,16 @@ pub struct CliRuntimeNativeEventCompactionSummary {
     pub turns_touched: u64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TurnItemAttemptPayloadCompactionSummary {
+    pub dry_run: bool,
+    pub batch_limit: u64,
+    pub candidate_rows: u64,
+    pub updated_rows: u64,
+    pub payload_bytes: u64,
+    pub turns_touched: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AgentDiffCompactionCandidate {
     event_id: String,
@@ -235,6 +246,13 @@ struct AgentDiffCompactionStats {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct CliRuntimeNativeEventCompactionStats {
+    candidate_rows: u64,
+    payload_bytes: u64,
+    turns_touched: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TurnItemAttemptPayloadCompactionStats {
     candidate_rows: u64,
     payload_bytes: u64,
     turns_touched: u64,
@@ -1228,6 +1246,79 @@ impl CrudStore {
                             .commit()
                             .await
                             .context("failed to commit CLI runtime native event compaction")?;
+                        Ok(summary)
+                    }
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        Err(error)
+                    }
+                }
+            }
+        })
+        .await
+    }
+
+    pub async fn compact_terminal_turn_item_attempt_payloads(
+        &self,
+        batch_limit: u64,
+        dry_run: bool,
+    ) -> Result<TurnItemAttemptPayloadCompactionSummary> {
+        let batch_limit = batch_limit.max(1);
+        if dry_run {
+            let stats = Self::terminal_turn_item_attempt_payload_compaction_stats(
+                &self.connection,
+                batch_limit,
+            )
+            .await?;
+            return Ok(TurnItemAttemptPayloadCompactionSummary {
+                dry_run,
+                batch_limit,
+                candidate_rows: stats.candidate_rows,
+                updated_rows: 0,
+                payload_bytes: stats.payload_bytes,
+                turns_touched: stats.turns_touched,
+            });
+        }
+
+        self.run_serialized_write(|| {
+            let connection = self.connection.clone();
+            async move {
+                let transaction = connection
+                    .begin()
+                    .await
+                    .context("failed to begin turn_item_attempt payload compaction transaction")?;
+                let result: Result<TurnItemAttemptPayloadCompactionSummary> = async {
+                    let stats = Self::terminal_turn_item_attempt_payload_compaction_stats(
+                        &transaction,
+                        batch_limit,
+                    )
+                    .await?;
+                    let updated_rows = if stats.candidate_rows == 0 {
+                        0
+                    } else {
+                        Self::clear_terminal_turn_item_attempt_payload_compaction_batch(
+                            &transaction,
+                            batch_limit,
+                        )
+                        .await?
+                    };
+                    Ok(TurnItemAttemptPayloadCompactionSummary {
+                        dry_run,
+                        batch_limit,
+                        candidate_rows: stats.candidate_rows,
+                        updated_rows,
+                        payload_bytes: stats.payload_bytes,
+                        turns_touched: stats.turns_touched,
+                    })
+                }
+                .await;
+
+                match result {
+                    Ok(summary) => {
+                        transaction
+                            .commit()
+                            .await
+                            .context("failed to commit turn_item_attempt payload compaction")?;
                         Ok(summary)
                     }
                     Err(error) => {
@@ -7054,6 +7145,69 @@ WHERE id IN (SELECT event_id FROM candidates)
         Ok(result.rows_affected())
     }
 
+    async fn terminal_turn_item_attempt_payload_compaction_stats<C: ConnectionTrait>(
+        db: &C,
+        batch_limit: u64,
+    ) -> Result<TurnItemAttemptPayloadCompactionStats> {
+        let sql = terminal_turn_item_attempt_payload_compaction_sql(
+            r#"
+SELECT
+    COUNT(*) AS candidate_rows,
+    COALESCE(SUM(payload_bytes), 0) AS payload_bytes,
+    COUNT(DISTINCT turn_id) AS turns_touched
+FROM candidates
+"#,
+        );
+        let Some(row) = db
+            .query_one_raw(terminal_turn_item_attempt_payload_compaction_statement(
+                db.get_database_backend(),
+                sql,
+                batch_limit,
+            ))
+            .await
+            .context("failed to query turn_item_attempt payload compaction stats")?
+        else {
+            return Ok(TurnItemAttemptPayloadCompactionStats::default());
+        };
+
+        Ok(TurnItemAttemptPayloadCompactionStats {
+            candidate_rows: row
+                .try_get::<i64>("", "candidate_rows")
+                .context("failed to decode compactable turn_item_attempt payload count")?
+                .max(0) as u64,
+            payload_bytes: row
+                .try_get::<i64>("", "payload_bytes")
+                .context("failed to decode compactable turn_item_attempt payload size")?
+                .max(0) as u64,
+            turns_touched: row
+                .try_get::<i64>("", "turns_touched")
+                .context("failed to decode compactable turn_item_attempt turn count")?
+                .max(0) as u64,
+        })
+    }
+
+    async fn clear_terminal_turn_item_attempt_payload_compaction_batch<C: ConnectionTrait>(
+        db: &C,
+        batch_limit: u64,
+    ) -> Result<u64> {
+        let sql = terminal_turn_item_attempt_payload_compaction_sql(
+            r#"
+UPDATE turn_item_attempt
+SET payload = '{}'
+WHERE id IN (SELECT attempt_id FROM candidates)
+"#,
+        );
+        let result = db
+            .execute_raw(terminal_turn_item_attempt_payload_compaction_statement(
+                db.get_database_backend(),
+                sql,
+                batch_limit,
+            ))
+            .await
+            .context("failed to clear compactable turn_item_attempt payloads")?;
+        Ok(result.rows_affected())
+    }
+
     pub async fn get_thread_conversation_history(
         &self,
         thread_id: &str,
@@ -11627,6 +11781,49 @@ fn terminal_cli_runtime_native_event_compaction_statement(
     Statement::from_sql_and_values(backend, sql, values)
 }
 
+fn terminal_turn_item_attempt_payload_compaction_sql(result_sql: &str) -> String {
+    format!(
+        r#"
+WITH candidates AS (
+    SELECT
+        id AS attempt_id,
+        turn_id,
+        length(COALESCE(payload, '')) AS payload_bytes
+    FROM turn_item_attempt
+    WHERE status IN (
+        '{completed}',
+        '{failed}',
+        '{interrupted}',
+        '{cancelled}',
+        '{exhausted}'
+    )
+      AND payload <> '{{}}'
+    ORDER BY updated_at ASC, id ASC
+    LIMIT ?
+)
+{result_sql}
+"#,
+        completed = ATTEMPT_STATUS_COMPLETED,
+        failed = ATTEMPT_STATUS_FAILED,
+        interrupted = ATTEMPT_STATUS_INTERRUPTED,
+        cancelled = ATTEMPT_STATUS_CANCELLED,
+        exhausted = ATTEMPT_STATUS_EXHAUSTED,
+        result_sql = result_sql
+    )
+}
+
+fn terminal_turn_item_attempt_payload_compaction_statement(
+    backend: DatabaseBackend,
+    sql: String,
+    batch_limit: u64,
+) -> Statement {
+    Statement::from_sql_and_values(
+        backend,
+        sql,
+        [(batch_limit.min(i64::MAX as u64) as i64).into()],
+    )
+}
+
 fn contains_any_key(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
     match value {
         serde_json::Value::Object(map) => {
@@ -11841,17 +12038,18 @@ fn recovery_job_record_from_model(model: pioneer_entity::recovery_job::Model) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactBindingTargetRecord, BlockedTurnRecoveryResumeOutcome, ClaimedRecoveryActivation,
-        CliRuntimeNativeEventListFilter, CliRuntimePendingRequestListFilter,
-        CliRuntimePendingRequestStatus, CliRuntimeTurnBindingListFilter,
-        ConversationArtifactRefLimits, CrudStore, IngestArtifactMetadataRecord,
-        McpAuditEventRecord, McpServerCatalogSnapshotRecord, McpServerInstallationRecord,
-        NewArtifactBlobRecord, NewCliRuntimeNativeEvent, NewCliRuntimePendingRequest,
-        NewCliRuntimeThreadBinding, NewCliRuntimeTurnBinding, NewThreadEpisodicChunkRecord,
-        NewTurnExecutionCheckpointRecord, NewTurnExecutionWindowRecord, NewTurnLlmContextEntry,
-        NewTurnRuntimeSnapshot, ResolveCliRuntimePendingRequest, SkillAuditEventRecord,
-        SkillInstallationRecord, TaskEventPayload, TaskRunChildAnchor, ThreadAgentsDocError,
-        ThreadAgentsDocSaveReason, ThreadAgentsDocStatus, ThreadEpisodicActiveWriteSegmentRequest,
+        ATTEMPT_STATUS_COMPLETED, ArtifactBindingTargetRecord, BlockedTurnRecoveryResumeOutcome,
+        ClaimedRecoveryActivation, CliRuntimeNativeEventListFilter,
+        CliRuntimePendingRequestListFilter, CliRuntimePendingRequestStatus,
+        CliRuntimeTurnBindingListFilter, ConversationArtifactRefLimits, CrudStore,
+        IngestArtifactMetadataRecord, McpAuditEventRecord, McpServerCatalogSnapshotRecord,
+        McpServerInstallationRecord, NewArtifactBlobRecord, NewCliRuntimeNativeEvent,
+        NewCliRuntimePendingRequest, NewCliRuntimeThreadBinding, NewCliRuntimeTurnBinding,
+        NewThreadEpisodicChunkRecord, NewTurnExecutionCheckpointRecord,
+        NewTurnExecutionWindowRecord, NewTurnLlmContextEntry, NewTurnRuntimeSnapshot,
+        ResolveCliRuntimePendingRequest, SkillAuditEventRecord, SkillInstallationRecord,
+        TaskEventPayload, TaskRunChildAnchor, ThreadAgentsDocError, ThreadAgentsDocSaveReason,
+        ThreadAgentsDocStatus, ThreadEpisodicActiveWriteSegmentRequest,
         ThreadEpisodicCapsuleCapacityUpdate, ThreadEpisodicCapsuleWriteState,
         ThreadEpisodicChunkStatus, ThreadEpisodicChunkVisibility, ThreadEpisodicSourceActorRole,
         ThreadEpisodicSourceRuntimeKind, TurnExecutionCheckpointKind,
@@ -15522,6 +15720,128 @@ mod tests {
         assert!(
             missing.is_empty(),
             "attempt with all deadlines should not require repair"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_attempt_payload_is_cleared_without_affecting_item_reads() {
+        let store = test_store_with_workspace("ws_attempt_payload_cleanup").await;
+        let timestamp = 1_700_000_000;
+        let workspace_id = "ws_attempt_payload_cleanup";
+        let thread_id = "thr_attempt_payload_cleanup";
+        let turn_id = "turn_attempt_payload_cleanup";
+        let item_id = "call_attempt_payload_cleanup";
+        let thread = sample_thread(workspace_id, thread_id, timestamp);
+        let turn = sample_turn(turn_id);
+
+        store
+            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+            .await
+            .expect("turn start should persist");
+
+        let started_item = TurnItem::CommandExecution {
+            id: item_id.to_owned(),
+            tool_name: "shell".to_owned(),
+            arguments: serde_json::json!({ "cmd": "printf heavy" }),
+            status: ToolCallStatus::InProgress,
+            recovery_policy: None,
+            output_policy: ToolOutputPolicySnapshot::for_tool_name("shell"),
+            display: ToolDisplayPayload::Hidden,
+            storage: ToolStoragePayload::Metadata {
+                metadata: ToolMetadata::empty(),
+            },
+            recovery: None,
+            command: vec!["printf".to_owned(), "heavy".to_owned()],
+            cwd: Some("/tmp".to_owned()),
+            success: None,
+            outcome: None,
+            observation: None,
+        };
+        let mut completed_item = started_item.clone();
+        if let TurnItem::CommandExecution {
+            status, success, ..
+        } = &mut completed_item
+        {
+            *status = ToolCallStatus::Completed;
+            *success = Some(true);
+        }
+
+        store
+            .materialize_item_started(
+                ItemStartedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: started_item,
+                },
+                timestamp + 1,
+            )
+            .await
+            .expect("item start should persist");
+
+        let running_attempt = pioneer_entity::turn_item_attempt::Entity::find()
+            .filter(pioneer_entity::turn_item_attempt::Column::TurnId.eq(turn_id))
+            .filter(pioneer_entity::turn_item_attempt::Column::ItemId.eq(item_id))
+            .one(&store.connection)
+            .await
+            .expect("running attempt should query")
+            .expect("running attempt should exist");
+        assert_ne!(running_attempt.payload.as_str(), "{}");
+
+        store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: completed_item,
+                },
+                timestamp + 2,
+            )
+            .await
+            .expect("item completed should persist");
+
+        let completed_attempt = pioneer_entity::turn_item_attempt::Entity::find()
+            .filter(pioneer_entity::turn_item_attempt::Column::TurnId.eq(turn_id))
+            .filter(pioneer_entity::turn_item_attempt::Column::ItemId.eq(item_id))
+            .one(&store.connection)
+            .await
+            .expect("completed attempt should query")
+            .expect("completed attempt should exist");
+        assert_eq!(completed_attempt.status, ATTEMPT_STATUS_COMPLETED);
+        assert_eq!(completed_attempt.payload.as_str(), "{}");
+
+        let stored_item = store
+            .get_turn_item(turn_id, item_id)
+            .await
+            .expect("turn item should query")
+            .expect("turn item should exist");
+        assert!(matches!(
+            stored_item,
+            TurnItem::CommandExecution {
+                status: ToolCallStatus::Completed,
+                success: Some(true),
+                ..
+            }
+        ));
+
+        let turn_items = store
+            .get_turn_item_events(thread_id, turn_id)
+            .await
+            .expect("turn/items should query")
+            .expect("turn/items should exist");
+        assert_eq!(
+            turn_items
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    event.payload,
+                    TurnItemEventPayload::ItemStarted { .. }
+                        | TurnItemEventPayload::ItemCompleted { .. }
+                ))
+                .count(),
+            2,
+            "turn/items must still read full durable item events"
         );
     }
 
