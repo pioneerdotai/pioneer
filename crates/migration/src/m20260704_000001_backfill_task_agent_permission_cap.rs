@@ -39,3 +39,56 @@ async fn backfill_missing_permission_caps(manager: &SchemaManager<'_>) -> Result
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm_migration::sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
+
+    #[tokio::test]
+    async fn backfills_missing_task_agent_permission_caps() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("sqlite memory db");
+        db.execute_unprepared(
+            "CREATE TABLE task_agent_spec ( \
+                id TEXT PRIMARY KEY, \
+                permission_cap_json TEXT NULL \
+            )",
+        )
+        .await
+        .expect("create task_agent_spec");
+        db.execute_unprepared(
+            "INSERT INTO task_agent_spec (id, permission_cap_json) VALUES \
+                ('legacy', NULL), \
+                ('existing', '{\"mode\":\"supervised\"}')",
+        )
+        .await
+        .expect("insert specs");
+
+        let manager = SchemaManager::new(&db);
+        backfill_missing_permission_caps(&manager)
+            .await
+            .expect("backfill should succeed");
+
+        let row = db
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT \
+                    MAX(CASE WHEN id = 'existing' THEN permission_cap_json END) AS existing, \
+                    MAX(CASE WHEN id = 'legacy' THEN permission_cap_json END) AS legacy \
+                 FROM task_agent_spec"
+                    .to_owned(),
+            ))
+            .await
+            .expect("query specs")
+            .expect("summary row");
+        let existing: String = row.try_get("", "existing").unwrap();
+        let legacy: String = row.try_get("", "legacy").unwrap();
+
+        assert_eq!(existing, r#"{"mode":"supervised"}"#);
+        assert!(legacy.contains(r#""mode":"full_access""#));
+        assert!(legacy.contains(r#""network":"allow""#));
+        assert!(legacy.contains(r#""task_subagent":"allow""#));
+    }
+}
