@@ -9,7 +9,7 @@ use tracing::{info, warn};
 
 const CLI_RUNTIME_NATIVE_EVENT_COMPACTION_KEY: &str =
     "cli_runtime_native_event_terminal_delta_compaction";
-const CLI_RUNTIME_NATIVE_EVENT_COMPACTION_VERSION: i64 = 1;
+const CLI_RUNTIME_NATIVE_EVENT_COMPACTION_VERSION: i64 = 2;
 const CLI_RUNTIME_NATIVE_EVENT_COMPACTION_BATCH_SIZE: u64 = 16_384;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
@@ -196,7 +196,8 @@ mod tests {
     use migration::{Migrator, MigratorTrait};
     use pioneer_crud::{
         CliRuntimeNativeEventListFilter, CrudStore, NewCliRuntimeNativeEvent,
-        NewCliRuntimeTurnBinding, find_projection_meta,
+        NewCliRuntimeTurnBinding, PROJECTION_META_STATUS_COMPLETE, ProjectionMetaRecord,
+        find_projection_meta, upsert_projection_meta,
     };
     use pioneer_protocol::{
         SandboxMode, Thread, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus,
@@ -328,9 +329,29 @@ mod tests {
                 .expect("native event should persist");
         }
 
+        upsert_projection_meta(
+            &connection,
+            ProjectionMetaRecord {
+                projection_key: super::CLI_RUNTIME_NATIVE_EVENT_COMPACTION_KEY.to_owned(),
+                projection_version: 1,
+                status: PROJECTION_META_STATUS_COMPLETE.to_owned(),
+                source_thread_count: 0,
+                source_turn_count: 0,
+                source_turn_item_count: 0,
+                source_turn_event_count: 0,
+                last_error: None,
+                backfill_started_at: Some(now),
+                backfilled_at: Some(now),
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("outdated compaction meta should persist");
+
         let summary = compact_once(&store)
             .await
-            .expect("startup compaction should succeed");
+            .expect("startup compaction should rerun outdated complete meta");
         assert_eq!(summary.deleted_rows, 2);
         assert_eq!(summary.turns_touched, 1);
 
@@ -340,6 +361,10 @@ mod tests {
                 .expect("meta should query")
                 .expect("meta should exist");
         assert_eq!(meta.status, pioneer_crud::PROJECTION_META_STATUS_COMPLETE);
+        assert_eq!(
+            meta.projection_version,
+            super::CLI_RUNTIME_NATIVE_EVENT_COMPACTION_VERSION
+        );
         assert_eq!(meta.source_turn_event_count, 2);
 
         let second = compact_once(&store)

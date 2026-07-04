@@ -3551,6 +3551,11 @@ impl MessageProcessor {
         }
 
         if !cli_runtime_turn_binding_status_is_active(binding.status.as_str()) {
+            self.compact_cli_runtime_terminal_native_events_for_turn(
+                binding.turn_id.as_str(),
+                source,
+            )
+            .await;
             return false;
         }
 
