@@ -18,6 +18,7 @@ mod m20260624_000001_turn_reasoning_effort;
 mod m20260626_000001_semantic_timeline_projection;
 mod m20260628_000001_turn_permission_profile;
 mod m20260701_000001_turn_liveness;
+mod m20260704_000001_backfill_task_agent_permission_cap;
 
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
@@ -39,6 +40,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260626_000001_semantic_timeline_projection::Migration),
             Box::new(m20260628_000001_turn_permission_profile::Migration),
             Box::new(m20260701_000001_turn_liveness::Migration),
+            Box::new(m20260704_000001_backfill_task_agent_permission_cap::Migration),
         ]
     }
 }
