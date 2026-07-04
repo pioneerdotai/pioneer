@@ -121,6 +121,7 @@ where
     D: VoiceModelArchiveDownloader + ?Sized,
 {
     if is_voice_model_installed_and_verified(entry, &layout) {
+        remove_downloaded_model_archives(&layout)?;
         return Ok(VoiceModelInstallReport {
             status: VoiceModelInstallStatus::AlreadyInstalled,
             layout,
@@ -154,6 +155,7 @@ where
         )
     })?;
     write_ready_marker(entry, &layout)?;
+    remove_downloaded_model_archives(&layout)?;
 
     Ok(VoiceModelInstallReport {
         status: VoiceModelInstallStatus::Installed,
@@ -195,19 +197,9 @@ where
     D: VoiceModelArchiveDownloader + ?Sized,
 {
     if layout.archive_path.is_file() {
-        let archive_hash = sha256_file(layout.archive_path.as_path()).with_context(|| {
-            format!(
-                "failed to hash existing voice model archive {}",
-                layout.archive_path.display()
-            )
-        })?;
-        if archive_hash == entry.sha256 {
-            return Ok(());
-        }
-
         fs::remove_file(layout.archive_path.as_path()).with_context(|| {
             format!(
-                "failed to remove invalid voice model archive {}",
+                "failed to remove cached voice model archive {}",
                 layout.archive_path.display()
             )
         })?;
@@ -251,6 +243,23 @@ where
             "failed to promote voice model archive {} to {}",
             layout.partial_archive_path.display(),
             layout.archive_path.display()
+        )
+    })?;
+
+    Ok(())
+}
+
+fn remove_downloaded_model_archives(layout: &VoiceModelInstallLayout) -> Result<()> {
+    remove_path_if_exists(layout.archive_path.as_path()).with_context(|| {
+        format!(
+            "failed to remove downloaded voice model archive {}",
+            layout.archive_path.display()
+        )
+    })?;
+    remove_path_if_exists(layout.partial_archive_path.as_path()).with_context(|| {
+        format!(
+            "failed to remove partial voice model archive {}",
+            layout.partial_archive_path.display()
         )
     })?;
 
@@ -645,6 +654,9 @@ mod tests {
         let layout = test_layout(&temp_dir);
         let entry = test_entry_with_sha256("0".repeat(64));
         fs::create_dir_all(layout.model_data_dir.as_path()).expect("model dir");
+        fs::create_dir_all(layout.downloads_dir.as_path()).expect("downloads dir");
+        fs::write(layout.archive_path.as_path(), b"cached archive").expect("archive");
+        fs::write(layout.partial_archive_path.as_path(), b"cached partial").expect("partial");
         write_ready_marker(&entry, &layout).expect("ready marker");
 
         let calls = Arc::new(AtomicUsize::new(0));
@@ -659,6 +671,8 @@ mod tests {
 
         assert_eq!(report.status, VoiceModelInstallStatus::AlreadyInstalled);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(!report.layout.archive_path.exists());
+        assert!(!report.layout.partial_archive_path.exists());
     }
 
     #[tokio::test]
@@ -679,7 +693,7 @@ mod tests {
 
         assert_eq!(report.status, VoiceModelInstallStatus::Installed);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert!(layout.archive_path.is_file());
+        assert!(!layout.archive_path.exists());
         assert!(!layout.partial_archive_path.exists());
         assert!(layout.model_data_dir.join("weights.bin").is_file());
         assert!(layout.ready_marker_path.is_file());
@@ -708,6 +722,8 @@ mod tests {
 
         assert_eq!(report.status, VoiceModelInstallStatus::Installed);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!layout.archive_path.exists());
+        assert!(!layout.partial_archive_path.exists());
         assert!(layout.model_data_dir.join("weights.bin").is_file());
         assert!(layout.ready_marker_path.is_file());
         assert!(!layout.staging_dir.exists());
@@ -756,6 +772,7 @@ mod tests {
 
         assert_eq!(report.status, VoiceModelInstallStatus::Installed);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!layout.archive_path.exists());
         assert!(!layout.partial_archive_path.exists());
         assert!(layout.ready_marker_path.is_file());
     }
