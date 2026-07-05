@@ -160,8 +160,8 @@ use crate::{
     ThreadAgentsDocResolveForThreadResponse, ThreadAgentsDocResolvedPayload,
     ThreadAgentsDocSaveParams, ThreadAgentsDocSaveReason, ThreadAgentsDocSaveResponse,
     ThreadAgentsDocStatus, ThreadAgentsDocSummary, ThreadClosedNotification,
-    ThreadEpisodicAdaptiveDiagnostics, ThreadEpisodicAdaptiveStrategy, ThreadEpisodicChunk,
-    ThreadEpisodicChunkId, ThreadEpisodicChunkStatus, ThreadEpisodicHit, ThreadEpisodicItemId,
+    ThreadEpisodicAdaptiveDiagnostics, ThreadEpisodicAdaptiveStrategy, ThreadEpisodicHit,
+    ThreadEpisodicIndexItemId, ThreadEpisodicItem, ThreadEpisodicItemId, ThreadEpisodicItemStatus,
     ThreadEpisodicRecallDiagnostic, ThreadEpisodicRecallDiagnosticCode, ThreadEpisodicRecallInput,
     ThreadEpisodicRecallOutput, ThreadEpisodicRecallPolicyContext, ThreadEpisodicScoreBreakdown,
     ThreadEpisodicSearchMode, ThreadEpisodicSourceActorRole, ThreadEpisodicSourceContext,
@@ -586,7 +586,10 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!("thread_episodic_thread_id.json", ThreadEpisodicThreadId),
         schema_doc!("thread_episodic_turn_id.json", ThreadEpisodicTurnId),
         schema_doc!("thread_episodic_item_id.json", ThreadEpisodicItemId),
-        schema_doc!("thread_episodic_chunk_id.json", ThreadEpisodicChunkId),
+        schema_doc!(
+            "thread_episodic_index_item_id.json",
+            ThreadEpisodicIndexItemId
+        ),
         schema_doc!(
             "thread_episodic_source_actor_role.json",
             ThreadEpisodicSourceActorRole
@@ -595,16 +598,13 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
             "thread_episodic_source_context.json",
             ThreadEpisodicSourceContext
         ),
-        schema_doc!(
-            "thread_episodic_chunk_status.json",
-            ThreadEpisodicChunkStatus
-        ),
+        schema_doc!("thread_episodic_item_status.json", ThreadEpisodicItemStatus),
         schema_doc!("thread_episodic_visibility.json", ThreadEpisodicVisibility),
         schema_doc!(
             "thread_episodic_source_provenance.json",
             ThreadEpisodicSourceProvenance
         ),
-        schema_doc!("thread_episodic_chunk.json", ThreadEpisodicChunk),
+        schema_doc!("thread_episodic_item.json", ThreadEpisodicItem),
         schema_doc!("thread_episodic_search_mode.json", ThreadEpisodicSearchMode),
         schema_doc!(
             "thread_episodic_adaptive_strategy.json",

@@ -212,8 +212,8 @@ pub use thread_agents_doc::{
     ThreadAgentsDocStatus, ThreadAgentsDocSummary,
 };
 pub use thread_episodic::{
-    ThreadEpisodicAdaptiveDiagnostics, ThreadEpisodicAdaptiveStrategy, ThreadEpisodicChunk,
-    ThreadEpisodicChunkId, ThreadEpisodicChunkStatus, ThreadEpisodicHit, ThreadEpisodicItemId,
+    ThreadEpisodicAdaptiveDiagnostics, ThreadEpisodicAdaptiveStrategy, ThreadEpisodicHit,
+    ThreadEpisodicIndexItemId, ThreadEpisodicItem, ThreadEpisodicItemId, ThreadEpisodicItemStatus,
     ThreadEpisodicRecallDiagnostic, ThreadEpisodicRecallDiagnosticCode, ThreadEpisodicRecallInput,
     ThreadEpisodicRecallOutput, ThreadEpisodicRecallPolicyContext, ThreadEpisodicScoreBreakdown,
     ThreadEpisodicSearchMode, ThreadEpisodicSourceActorRole, ThreadEpisodicSourceContext,

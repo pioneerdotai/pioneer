@@ -5,34 +5,27 @@ use serde::{Deserialize, Serialize};
 
 #[sea_orm::model]
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
-#[sea_orm(table_name = "thread_episodic_chunks")]
+#[sea_orm(table_name = "thread_episodic_items")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: String,
-    #[sea_orm(unique_key = "uidx_thread_episodic_chunks_source_hash")]
+    #[sea_orm(unique_key = "uidx_thread_episodic_items_source_hash")]
     pub workspace_id: String,
-    #[sea_orm(unique_key = "uidx_thread_episodic_chunks_source_hash")]
+    #[sea_orm(unique_key = "uidx_thread_episodic_items_source_hash")]
     pub thread_id: String,
-    #[sea_orm(unique_key = "uidx_thread_episodic_chunks_source_hash")]
+    #[sea_orm(unique_key = "uidx_thread_episodic_items_source_hash")]
     pub turn_id: String,
-    #[sea_orm(unique_key = "uidx_thread_episodic_chunks_source_hash")]
+    #[sea_orm(unique_key = "uidx_thread_episodic_items_source_hash")]
     pub item_id: String,
-    #[sea_orm(unique_key = "uidx_thread_episodic_chunks_source_hash")]
-    pub chunk_index: i64,
-    pub chunk_count: i64,
     pub source_actor_role: String,
     pub source_runtime_kind: String,
     #[sea_orm(column_type = "Text")]
     pub source_context_json: String,
     pub visibility: String,
     pub status: String,
-    #[sea_orm(unique_key = "uidx_thread_episodic_chunks_source_hash")]
+    #[sea_orm(unique_key = "uidx_thread_episodic_items_source_hash")]
     pub text_hash: String,
     pub source_text_hash: String,
-    pub char_start: i64,
-    pub char_end: i64,
-    pub byte_start: Option<i64>,
-    pub byte_end: Option<i64>,
     pub language_hint: Option<String>,
     pub token_estimate: i64,
     pub capsule_id: Option<String>,

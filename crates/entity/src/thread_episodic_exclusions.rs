@@ -9,12 +9,12 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: String,
-    #[sea_orm(unique_key = "uidx_thread_episodic_exclusions_chunk")]
+    #[sea_orm(unique_key = "uidx_thread_episodic_exclusions_item")]
     pub workspace_id: String,
-    #[sea_orm(unique_key = "uidx_thread_episodic_exclusions_chunk")]
+    #[sea_orm(unique_key = "uidx_thread_episodic_exclusions_item")]
     pub thread_id: String,
-    #[sea_orm(unique_key = "uidx_thread_episodic_exclusions_chunk")]
-    pub chunk_id: String,
+    #[sea_orm(unique_key = "uidx_thread_episodic_exclusions_item")]
+    pub index_item_id: String,
     pub reason: String,
     pub created_by: String,
     pub created_at: DateTimeWithTimeZone,

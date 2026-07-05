@@ -311,9 +311,6 @@
         "thread_episodic": {
           "$ref": "#/$defs/GatewayThreadEpisodicSettings",
           "default": {
-            "chunk_max_chars": 1600,
-            "chunk_target_max_chars": 1200,
-            "chunk_target_min_chars": 700,
             "default_max_candidates": 32,
             "default_prompt_chars": 2400,
             "enabled": true,
@@ -321,13 +318,12 @@
             "indexing_enabled": true,
             "max_attempts": 5,
             "max_candidate_work": 128,
-            "max_chunks_per_item": 64,
             "max_hit_chars": 1200,
             "max_prompt_chars": 12000,
             "max_segments": 16,
             "min_relevancy": 0.25,
             "min_results": 1,
-            "near_capacity_percent": 90.0,
+            "near_capacity_percent": 85.0,
             "recall_enabled": true,
             "retry_base_delay_secs": 30,
             "retry_max_delay_secs": 900,
@@ -342,21 +338,6 @@
     "GatewayThreadEpisodicSettings": {
       "type": "object",
       "properties": {
-        "chunk_max_chars": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0
-        },
-        "chunk_target_max_chars": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0
-        },
-        "chunk_target_min_chars": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0
-        },
         "default_max_candidates": {
           "type": "integer",
           "format": "uint32",
@@ -383,11 +364,6 @@
           "format": "int64"
         },
         "max_candidate_work": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0
-        },
-        "max_chunks_per_item": {
           "type": "integer",
           "format": "uint32",
           "minimum": 0
@@ -450,10 +426,6 @@
         "min_relevancy",
         "min_results",
         "snippet_chars",
-        "chunk_target_min_chars",
-        "chunk_target_max_chars",
-        "chunk_max_chars",
-        "max_chunks_per_item",
         "index_batch_limit",
         "retry_base_delay_secs",
         "retry_max_delay_secs",

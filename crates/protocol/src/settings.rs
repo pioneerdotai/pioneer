@@ -108,10 +108,6 @@ pub struct GatewayThreadEpisodicSettings {
     pub min_relevancy: f32,
     pub min_results: u32,
     pub snippet_chars: u32,
-    pub chunk_target_min_chars: u32,
-    pub chunk_target_max_chars: u32,
-    pub chunk_max_chars: u32,
-    pub max_chunks_per_item: u32,
     pub index_batch_limit: u32,
     pub retry_base_delay_secs: i64,
     pub retry_max_delay_secs: i64,
@@ -134,15 +130,11 @@ impl Default for GatewayThreadEpisodicSettings {
             min_relevancy: 0.25,
             min_results: 1,
             snippet_chars: 360,
-            chunk_target_min_chars: 700,
-            chunk_target_max_chars: 1_200,
-            chunk_max_chars: 1_600,
-            max_chunks_per_item: 64,
             index_batch_limit: 16,
             retry_base_delay_secs: 30,
             retry_max_delay_secs: 900,
             max_attempts: 5,
-            near_capacity_percent: 90.0,
+            near_capacity_percent: 85.0,
         }
     }
 }
@@ -347,14 +339,6 @@ pub struct GatewayThreadEpisodicSettingsUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snippet_chars: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chunk_target_min_chars: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chunk_target_max_chars: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chunk_max_chars: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_chunks_per_item: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index_batch_limit: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_base_delay_secs: Option<i64>,
@@ -531,10 +515,6 @@ mod tests {
                 min_relevancy: 0.3,
                 min_results: 2,
                 snippet_chars: 280,
-                chunk_target_min_chars: 500,
-                chunk_target_max_chars: 900,
-                chunk_max_chars: 1_200,
-                max_chunks_per_item: 32,
                 index_batch_limit: 8,
                 retry_base_delay_secs: 10,
                 retry_max_delay_secs: 300,

@@ -189,10 +189,6 @@ pub struct GatewayThreadEpisodicSettings {
     pub min_relevancy: f32,
     pub min_results: u32,
     pub snippet_chars: u32,
-    pub chunk_target_min_chars: u32,
-    pub chunk_target_max_chars: u32,
-    pub chunk_max_chars: u32,
-    pub max_chunks_per_item: u32,
     pub index_batch_limit: u32,
     pub retry_base_delay_secs: i64,
     pub retry_max_delay_secs: i64,
@@ -233,14 +229,6 @@ struct GatewayThreadEpisodicSettingsOverride {
     min_results: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     snippet_chars: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    chunk_target_min_chars: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    chunk_target_max_chars: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    chunk_max_chars: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    max_chunks_per_item: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     index_batch_limit: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -714,10 +702,6 @@ impl GatewayThreadEpisodicSettings {
             min_relevancy: config.min_relevancy,
             min_results: config.min_results,
             snippet_chars: config.snippet_chars,
-            chunk_target_min_chars: config.chunk_target_min_chars.min(u32::MAX as usize) as u32,
-            chunk_target_max_chars: config.chunk_target_max_chars.min(u32::MAX as usize) as u32,
-            chunk_max_chars: config.chunk_max_chars.min(u32::MAX as usize) as u32,
-            max_chunks_per_item: config.max_chunks_per_item.min(u32::MAX as usize) as u32,
             index_batch_limit: config.index_batch_limit.min(u32::MAX as u64) as u32,
             retry_base_delay_secs: config.retry_base_delay_secs,
             retry_max_delay_secs: config.retry_max_delay_secs,
@@ -740,10 +724,6 @@ impl GatewayThreadEpisodicSettings {
             min_relevancy: settings.min_relevancy,
             min_results: settings.min_results,
             snippet_chars: settings.snippet_chars,
-            chunk_target_min_chars: settings.chunk_target_min_chars,
-            chunk_target_max_chars: settings.chunk_target_max_chars,
-            chunk_max_chars: settings.chunk_max_chars,
-            max_chunks_per_item: settings.max_chunks_per_item,
             index_batch_limit: settings.index_batch_limit,
             retry_base_delay_secs: settings.retry_base_delay_secs,
             retry_max_delay_secs: settings.retry_max_delay_secs,
@@ -766,10 +746,6 @@ impl GatewayThreadEpisodicSettings {
             min_relevancy: self.min_relevancy,
             min_results: self.min_results,
             snippet_chars: self.snippet_chars,
-            chunk_target_min_chars: self.chunk_target_min_chars,
-            chunk_target_max_chars: self.chunk_target_max_chars,
-            chunk_max_chars: self.chunk_max_chars,
-            max_chunks_per_item: self.max_chunks_per_item,
             index_batch_limit: self.index_batch_limit,
             retry_base_delay_secs: self.retry_base_delay_secs,
             retry_max_delay_secs: self.retry_max_delay_secs,
@@ -904,10 +880,6 @@ impl GatewayThreadEpisodicSettingsOverride {
             min_relevancy: Some(settings.min_relevancy),
             min_results: Some(settings.min_results),
             snippet_chars: Some(settings.snippet_chars),
-            chunk_target_min_chars: Some(settings.chunk_target_min_chars),
-            chunk_target_max_chars: Some(settings.chunk_target_max_chars),
-            chunk_max_chars: Some(settings.chunk_max_chars),
-            max_chunks_per_item: Some(settings.max_chunks_per_item),
             index_batch_limit: Some(settings.index_batch_limit),
             retry_base_delay_secs: Some(settings.retry_base_delay_secs),
             retry_max_delay_secs: Some(settings.retry_max_delay_secs),
@@ -955,18 +927,6 @@ impl GatewayThreadEpisodicSettingsOverride {
         }
         if let Some(snippet_chars) = self.snippet_chars {
             settings.snippet_chars = snippet_chars;
-        }
-        if let Some(chunk_target_min_chars) = self.chunk_target_min_chars {
-            settings.chunk_target_min_chars = chunk_target_min_chars;
-        }
-        if let Some(chunk_target_max_chars) = self.chunk_target_max_chars {
-            settings.chunk_target_max_chars = chunk_target_max_chars;
-        }
-        if let Some(chunk_max_chars) = self.chunk_max_chars {
-            settings.chunk_max_chars = chunk_max_chars;
-        }
-        if let Some(max_chunks_per_item) = self.max_chunks_per_item {
-            settings.max_chunks_per_item = max_chunks_per_item;
         }
         if let Some(index_batch_limit) = self.index_batch_limit {
             settings.index_batch_limit = index_batch_limit;
@@ -1026,18 +986,6 @@ impl GatewayThreadEpisodicSettingsOverride {
         if let Some(snippet_chars) = update.snippet_chars {
             self.snippet_chars = Some(snippet_chars);
         }
-        if let Some(chunk_target_min_chars) = update.chunk_target_min_chars {
-            self.chunk_target_min_chars = Some(chunk_target_min_chars);
-        }
-        if let Some(chunk_target_max_chars) = update.chunk_target_max_chars {
-            self.chunk_target_max_chars = Some(chunk_target_max_chars);
-        }
-        if let Some(chunk_max_chars) = update.chunk_max_chars {
-            self.chunk_max_chars = Some(chunk_max_chars);
-        }
-        if let Some(max_chunks_per_item) = update.max_chunks_per_item {
-            self.max_chunks_per_item = Some(max_chunks_per_item);
-        }
         if let Some(index_batch_limit) = update.index_batch_limit {
             self.index_batch_limit = Some(index_batch_limit);
         }
@@ -1074,10 +1022,6 @@ impl GatewayThreadEpisodicSettingsOverride {
         config.min_relevancy = settings.min_relevancy;
         config.min_results = settings.min_results;
         config.snippet_chars = settings.snippet_chars;
-        config.chunk_target_min_chars = settings.chunk_target_min_chars as usize;
-        config.chunk_target_max_chars = settings.chunk_target_max_chars as usize;
-        config.chunk_max_chars = settings.chunk_max_chars as usize;
-        config.max_chunks_per_item = settings.max_chunks_per_item as usize;
         config.index_batch_limit = settings.index_batch_limit as u64;
         config.retry_base_delay_secs = settings.retry_base_delay_secs;
         config.retry_max_delay_secs = settings.retry_max_delay_secs;
@@ -1801,10 +1745,6 @@ max_segments = 4
 min_relevancy = 0.45
 min_results = 2
 snippet_chars = 240
-chunk_target_min_chars = 500
-chunk_target_max_chars = 900
-chunk_max_chars = 1100
-max_chunks_per_item = 16
 index_batch_limit = 4
 retry_base_delay_secs = 12
 retry_max_delay_secs = 120
@@ -1827,15 +1767,11 @@ near_capacity_percent = 75.0
             min_relevancy: 0.25,
             min_results: 1,
             snippet_chars: 360,
-            chunk_target_min_chars: 700,
-            chunk_target_max_chars: 1_200,
-            chunk_max_chars: 1_600,
-            max_chunks_per_item: 64,
             index_batch_limit: 16,
             retry_base_delay_secs: 30,
             retry_max_delay_secs: 900,
             max_attempts: 5,
-            near_capacity_percent: 90.0,
+            near_capacity_percent: 85.0,
         };
 
         let mapped = settings.apply_to_gateway_thread_episodic_config(base);
@@ -1852,10 +1788,6 @@ near_capacity_percent = 75.0
         assert_eq!(mapped.min_relevancy, 0.45);
         assert_eq!(mapped.min_results, 2);
         assert_eq!(mapped.snippet_chars, 240);
-        assert_eq!(mapped.chunk_target_min_chars, 500);
-        assert_eq!(mapped.chunk_target_max_chars, 900);
-        assert_eq!(mapped.chunk_max_chars, 1100);
-        assert_eq!(mapped.max_chunks_per_item, 16);
         assert_eq!(mapped.index_batch_limit, 4);
         assert_eq!(mapped.retry_base_delay_secs, 12);
         assert_eq!(mapped.retry_max_delay_secs, 120);
@@ -1884,10 +1816,6 @@ near_capacity_percent = 75.0
             min_relevancy: 0.45,
             min_results: 2,
             snippet_chars: 240,
-            chunk_target_min_chars: 500,
-            chunk_target_max_chars: 900,
-            chunk_max_chars: 1100,
-            max_chunks_per_item: 16,
             index_batch_limit: 4,
             retry_base_delay_secs: 12,
             retry_max_delay_secs: 120,

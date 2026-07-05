@@ -630,18 +630,6 @@ pub struct GatewayThreadEpisodicConfig {
     /// Snippet chars requested from memvid search.
     #[serde(default = "default_gateway_thread_episodic_snippet_chars")]
     pub snippet_chars: u32,
-    /// Chunking lower target.
-    #[serde(default = "default_gateway_thread_episodic_chunk_target_min_chars")]
-    pub chunk_target_min_chars: usize,
-    /// Chunking upper target.
-    #[serde(default = "default_gateway_thread_episodic_chunk_target_max_chars")]
-    pub chunk_target_max_chars: usize,
-    /// Hard chunk size cap.
-    #[serde(default = "default_gateway_thread_episodic_chunk_max_chars")]
-    pub chunk_max_chars: usize,
-    /// Maximum chunks emitted for one source item.
-    #[serde(default = "default_gateway_thread_episodic_max_chunks_per_item")]
-    pub max_chunks_per_item: usize,
     /// Index worker batch limit.
     #[serde(default = "default_gateway_thread_episodic_index_batch_limit")]
     pub index_batch_limit: u64,
@@ -674,10 +662,6 @@ impl Default for GatewayThreadEpisodicConfig {
             min_relevancy: default_gateway_thread_episodic_min_relevancy(),
             min_results: default_gateway_thread_episodic_min_results(),
             snippet_chars: default_gateway_thread_episodic_snippet_chars(),
-            chunk_target_min_chars: default_gateway_thread_episodic_chunk_target_min_chars(),
-            chunk_target_max_chars: default_gateway_thread_episodic_chunk_target_max_chars(),
-            chunk_max_chars: default_gateway_thread_episodic_chunk_max_chars(),
-            max_chunks_per_item: default_gateway_thread_episodic_max_chunks_per_item(),
             index_batch_limit: default_gateway_thread_episodic_index_batch_limit(),
             retry_base_delay_secs: default_gateway_thread_episodic_retry_base_delay_secs(),
             retry_max_delay_secs: default_gateway_thread_episodic_retry_max_delay_secs(),
@@ -1847,22 +1831,6 @@ const fn default_gateway_thread_episodic_snippet_chars() -> u32 {
     360
 }
 
-const fn default_gateway_thread_episodic_chunk_target_min_chars() -> usize {
-    700
-}
-
-const fn default_gateway_thread_episodic_chunk_target_max_chars() -> usize {
-    1_200
-}
-
-const fn default_gateway_thread_episodic_chunk_max_chars() -> usize {
-    1_600
-}
-
-const fn default_gateway_thread_episodic_max_chunks_per_item() -> usize {
-    64
-}
-
 const fn default_gateway_thread_episodic_index_batch_limit() -> u64 {
     16
 }
@@ -1880,7 +1848,7 @@ const fn default_gateway_thread_episodic_max_attempts() -> i64 {
 }
 
 const fn default_gateway_thread_episodic_near_capacity_percent() -> f64 {
-    90.0
+    85.0
 }
 
 fn normalized_optional_model_selection_text(
@@ -3788,15 +3756,11 @@ active_recall_model = { source = "custom", model_provider = "legacy-provider", m
         assert_eq!(config.gateway.thread_episodic.min_relevancy, 0.25);
         assert_eq!(config.gateway.thread_episodic.min_results, 1);
         assert_eq!(config.gateway.thread_episodic.snippet_chars, 360);
-        assert_eq!(config.gateway.thread_episodic.chunk_target_min_chars, 700);
-        assert_eq!(config.gateway.thread_episodic.chunk_target_max_chars, 1_200);
-        assert_eq!(config.gateway.thread_episodic.chunk_max_chars, 1_600);
-        assert_eq!(config.gateway.thread_episodic.max_chunks_per_item, 64);
         assert_eq!(config.gateway.thread_episodic.index_batch_limit, 16);
         assert_eq!(config.gateway.thread_episodic.retry_base_delay_secs, 30);
         assert_eq!(config.gateway.thread_episodic.retry_max_delay_secs, 900);
         assert_eq!(config.gateway.thread_episodic.max_attempts, 5);
-        assert_eq!(config.gateway.thread_episodic.near_capacity_percent, 90.0);
+        assert_eq!(config.gateway.thread_episodic.near_capacity_percent, 85.0);
     }
 
     #[test]
@@ -3867,15 +3831,11 @@ active_recall_model = { source = "custom", model_provider = "legacy-provider", m
         assert_eq!(config.min_relevancy, 0.25);
         assert_eq!(config.min_results, 1);
         assert_eq!(config.snippet_chars, 360);
-        assert_eq!(config.chunk_target_min_chars, 700);
-        assert_eq!(config.chunk_target_max_chars, 1_200);
-        assert_eq!(config.chunk_max_chars, 1_600);
-        assert_eq!(config.max_chunks_per_item, 64);
         assert_eq!(config.index_batch_limit, 16);
         assert_eq!(config.retry_base_delay_secs, 30);
         assert_eq!(config.retry_max_delay_secs, 900);
         assert_eq!(config.max_attempts, 5);
-        assert_eq!(config.near_capacity_percent, 90.0);
+        assert_eq!(config.near_capacity_percent, 85.0);
     }
 
     #[test]
@@ -3894,7 +3854,7 @@ default_prompt_chars = 1000
         assert_eq!(config.default_prompt_chars, 1_000);
         assert_eq!(config.max_prompt_chars, 12_000);
         assert_eq!(config.index_batch_limit, 16);
-        assert_eq!(config.near_capacity_percent, 90.0);
+        assert_eq!(config.near_capacity_percent, 85.0);
     }
 
     #[test]

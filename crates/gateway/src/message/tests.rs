@@ -2198,6 +2198,10 @@ fn review_enabled_processor(
         test_tool_loop_config(),
         Arc::new(GatewayMemoryRuntime::disabled(crud_store)),
         std::env::temp_dir().join("pioneer-message-review-tests"),
+        std::env::temp_dir()
+            .join("pioneer-message-review-tests")
+            .join("memory")
+            .join("capsules"),
         pioneer_config::GatewayArtifactsConfig::default(),
         review_enabled_task_runtime_config(),
         crate::thread_episodic::ThreadEpisodicRuntimeConfig::default(),
@@ -11224,7 +11228,7 @@ async fn direct_durable_item_completed_ingestion_failure_does_not_block_commit()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn thread_episodic_store_ingestor_creates_chunks_and_jobs_idempotently() {
+async fn thread_episodic_store_ingestor_creates_items_and_jobs_idempotently() {
     let (_workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let ingestor = StoreThreadEpisodicIngestor::new(crud_store.clone());
     let thread_id = "thr_thread_episodic_ingest";
@@ -11262,18 +11266,16 @@ async fn thread_episodic_store_ingestor_creates_chunks_and_jobs_idempotently() {
         );
     }
 
-    let chunks = crud_store
-        .list_thread_episodic_chunks_for_thread(workspace_id.as_str(), thread_id, 10)
+    let items = crud_store
+        .list_thread_episodic_items_for_thread(workspace_id.as_str(), thread_id, 10)
         .await
-        .expect("chunks should be readable");
-    assert_eq!(chunks.len(), 2);
-    assert!(chunks.iter().all(|chunk| {
-        chunk.status == pioneer_crud::ThreadEpisodicChunkStatus::PendingIndex
-            && chunk.visibility == pioneer_crud::ThreadEpisodicChunkVisibility::UserVisible
-            && chunk.chunk_index == 0
-            && chunk.chunk_count == 1
-            && chunk.text_hash.len() == 64
-            && chunk.source_text_hash.len() == 64
+        .expect("items should be readable");
+    assert_eq!(items.len(), 2);
+    assert!(items.iter().all(|item| {
+        item.status == pioneer_crud::ThreadEpisodicItemStatus::PendingIndex
+            && item.visibility == pioneer_crud::ThreadEpisodicItemVisibility::UserVisible
+            && item.text_hash.len() == 64
+            && item.source_text_hash.len() == 64
     }));
 
     let jobs = crud_store
@@ -11289,7 +11291,7 @@ async fn thread_episodic_store_ingestor_creates_chunks_and_jobs_idempotently() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn thread_episodic_store_ingestor_indexes_visible_tool_and_task_summaries_only() {
+async fn thread_episodic_store_ingestor_indexes_visible_task_summaries_only() {
     let (_workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let ingestor = StoreThreadEpisodicIngestor::new(crud_store.clone());
     let thread_id = "thr_thread_episodic_summaries";
@@ -11300,7 +11302,7 @@ async fn thread_episodic_store_ingestor_indexes_visible_tool_and_task_summaries_
         thread_id,
         turn_id,
         TurnItem::DynamicToolCall {
-            id: "tool_summary_item".to_owned(),
+            id: "tool_item".to_owned(),
             tool_name: "read_file".to_owned(),
             arguments: serde_json::json!({"path":"README.md"}),
             status: ToolCallStatus::Completed,
@@ -11382,8 +11384,10 @@ async fn thread_episodic_store_ingestor_indexes_visible_tool_and_task_summaries_
         ingestor
             .ingest_committed_item(visible_tool)
             .await
-            .expect("visible tool summary should ingest"),
-        ThreadEpisodicIngestionOutcome::Accepted
+            .expect("visible tool summary should skip without failing"),
+        ThreadEpisodicIngestionOutcome::Skipped {
+            reason: crate::thread_episodic::ThreadEpisodicIngestionSkipReason::ToolItemsDisabled
+        }
     );
     assert_eq!(
         ingestor
@@ -11398,24 +11402,18 @@ async fn thread_episodic_store_ingestor_indexes_visible_tool_and_task_summaries_
             .await
             .expect("raw tool output should skip without failing"),
         ThreadEpisodicIngestionOutcome::Skipped {
-            reason: crate::thread_episodic::ThreadEpisodicIngestionSkipReason::RawToolOutput
+            reason: crate::thread_episodic::ThreadEpisodicIngestionSkipReason::ToolItemsDisabled
         }
     );
 
-    let chunks = crud_store
-        .list_thread_episodic_chunks_for_thread(workspace_id.as_str(), thread_id, 10)
+    let items = crud_store
+        .list_thread_episodic_items_for_thread(workspace_id.as_str(), thread_id, 10)
         .await
-        .expect("chunks should be readable");
-    assert_eq!(chunks.len(), 2);
-    assert!(chunks.iter().any(|chunk| {
-        chunk.source_actor_role == pioneer_crud::ThreadEpisodicSourceActorRole::Tool
-            && chunk.source_runtime_kind
-                == pioneer_crud::ThreadEpisodicSourceRuntimeKind::ToolSummary
-    }));
-    assert!(chunks.iter().any(|chunk| {
-        chunk.source_actor_role == pioneer_crud::ThreadEpisodicSourceActorRole::Task
-            && chunk.source_runtime_kind
-                == pioneer_crud::ThreadEpisodicSourceRuntimeKind::TaskResult
+        .expect("items should be readable");
+    assert_eq!(items.len(), 1);
+    assert!(items.iter().any(|item| {
+        item.source_actor_role == pioneer_crud::ThreadEpisodicSourceActorRole::Task
+            && item.source_runtime_kind == pioneer_crud::ThreadEpisodicSourceRuntimeKind::TaskResult
     }));
 }
 

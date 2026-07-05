@@ -1,28 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "ThreadEpisodicChunk",
+  "title": "ThreadEpisodicItem",
   "type": "object",
   "properties": {
-    "byte_end": {
-      "type": "integer",
-      "format": "uint32",
-      "minimum": 0
-    },
-    "byte_start": {
-      "type": "integer",
-      "format": "uint32",
-      "minimum": 0
-    },
-    "char_end": {
-      "type": "integer",
-      "format": "uint32",
-      "minimum": 0
-    },
-    "char_start": {
-      "type": "integer",
-      "format": "uint32",
-      "minimum": 0
-    },
     "provenance": {
       "$ref": "#/$defs/ThreadEpisodicSourceProvenance"
     },
@@ -30,7 +10,7 @@
       "type": "string"
     },
     "status": {
-      "$ref": "#/$defs/ThreadEpisodicChunkStatus"
+      "$ref": "#/$defs/ThreadEpisodicItemStatus"
     },
     "text_hash": {
       "type": "string"
@@ -50,14 +30,10 @@
     "visibility",
     "text_hash",
     "source_text_hash",
-    "char_start",
-    "char_end",
-    "byte_start",
-    "byte_end",
     "token_estimate"
   ],
   "$defs": {
-    "ThreadEpisodicChunkStatus": {
+    "ThreadEpisodicItemStatus": {
       "type": "string",
       "enum": [
         "pending_index",
@@ -74,7 +50,6 @@
       "enum": [
         "user",
         "assistant",
-        "tool_summary",
         "task_summary",
         "generated_summary"
       ]
@@ -83,7 +58,6 @@
       "type": "string",
       "enum": [
         "user_visible_thread_item",
-        "user_visible_tool_summary",
         "user_visible_task_summary",
         "thread_compaction_summary",
         "hidden_prompt",
@@ -97,23 +71,18 @@
       ]
     },
     "ThreadEpisodicSourceProvenance": {
-      "description": "Evidence pointer for a thread episodic chunk.\n\nThis is not a durable-memory identity. It points to where recalled\nconversation context came from so later layers can filter, debug, rebuild,\nand cite the exact source chunk without reusing durable memory record ids.",
+      "description": "Evidence pointer for a thread episodic source item.\n\nThis is not a durable-memory identity. It points to where recalled\nconversation context came from so later layers can filter, debug, rebuild,\nand cite the exact source item without reusing durable memory record ids.",
       "type": "object",
       "properties": {
-        "chunk_id": {
-          "type": "string"
-        },
-        "chunk_index": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0
-        },
         "created_at": {
           "type": [
             "integer",
             "null"
           ],
           "format": "int64"
+        },
+        "index_item_id": {
+          "type": "string"
         },
         "item_id": {
           "type": "string"
@@ -143,8 +112,7 @@
         "thread_id",
         "turn_id",
         "item_id",
-        "chunk_id",
-        "chunk_index",
+        "index_item_id",
         "source_actor_role",
         "source_context"
       ]

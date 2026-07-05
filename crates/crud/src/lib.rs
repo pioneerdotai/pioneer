@@ -354,20 +354,27 @@ pub use crate::repositories::turn_runtime_snapshot::{
     NewTurnRuntimeSnapshot, TurnRuntimeSnapshotRecord,
 };
 pub use crate::thread_episodic::{
-    NewThreadEpisodicCapsuleRecord, NewThreadEpisodicChunkRecord, NewThreadEpisodicExclusionRecord,
-    NewThreadEpisodicIndexJobRecord, NewThreadEpisodicRecallEventRecord,
-    NewThreadEpisodicThreadDirectoryRecord, ThreadEpisodicActiveWriteSegmentRequest,
-    ThreadEpisodicCapsuleCapacityUpdate, ThreadEpisodicCapsuleRecord, ThreadEpisodicCapsuleStatus,
-    ThreadEpisodicCapsuleWriteState, ThreadEpisodicChunkIndexedUpdate, ThreadEpisodicChunkRecord,
-    ThreadEpisodicChunkStatus, ThreadEpisodicChunkVisibility, ThreadEpisodicExclusionReason,
-    ThreadEpisodicExclusionRecord, ThreadEpisodicGraphEnrichmentState,
-    ThreadEpisodicIndexJobCompletionUpdate, ThreadEpisodicIndexJobFailureUpdate,
-    ThreadEpisodicIndexJobRecord, ThreadEpisodicIndexJobStatus, ThreadEpisodicRecallEventRecord,
-    ThreadEpisodicRepairStatus, ThreadEpisodicSourceActorRole, ThreadEpisodicSourceRuntimeKind,
+    NewThreadEpisodicCapsuleRecord, NewThreadEpisodicExclusionRecord,
+    NewThreadEpisodicIndexJobRecord, NewThreadEpisodicItemRecord,
+    NewThreadEpisodicRecallEventRecord, NewThreadEpisodicThreadDirectoryRecord,
+    THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID, THREAD_EPISODIC_WORKSPACE_SEGMENT_CAPACITY_BYTES,
+    ThreadEpisodicActiveWriteSegmentRequest, ThreadEpisodicCapsuleCapacityUpdate,
+    ThreadEpisodicCapsuleRecord, ThreadEpisodicCapsuleStatus, ThreadEpisodicCapsuleWriteState,
+    ThreadEpisodicExclusionReason, ThreadEpisodicExclusionRecord,
+    ThreadEpisodicGraphEnrichmentState, ThreadEpisodicIndexJobCompletionUpdate,
+    ThreadEpisodicIndexJobFailureUpdate, ThreadEpisodicIndexJobRecord,
+    ThreadEpisodicIndexJobStatus, ThreadEpisodicItemIndexedUpdate, ThreadEpisodicItemRecord,
+    ThreadEpisodicItemStatus, ThreadEpisodicItemVisibility, ThreadEpisodicRecallEventRecord,
+    ThreadEpisodicRefillSourceCounts, ThreadEpisodicRefillThread, ThreadEpisodicRepairStatus,
+    ThreadEpisodicSourceActorRole, ThreadEpisodicSourceRuntimeKind,
     ThreadEpisodicThreadDirectoryRecord, ThreadEpisodicThreadDirectorySelection,
     ThreadEpisodicThreadDirectoryStatus, ThreadEpisodicThreadDirectoryVisibility,
-    deterministic_thread_episodic_capsule_id, thread_episodic_capsule_ref,
-    thread_episodic_capsule_storage_uri, thread_episodic_frame_uri, thread_episodic_key_hash,
+    ThreadEpisodicWorkspaceActiveWriteSegmentRequest, deterministic_thread_episodic_capsule_id,
+    deterministic_thread_episodic_workspace_capsule_id, thread_episodic_capsule_ref,
+    thread_episodic_capsule_storage_uri, thread_episodic_frame_uri, thread_episodic_item_uri,
+    thread_episodic_key_hash, thread_episodic_thread_uri_prefix, thread_episodic_turn_uri_prefix,
+    thread_episodic_workspace_capsule_ref, thread_episodic_workspace_capsule_storage_uri,
+    thread_episodic_workspace_uri_prefix,
 };
 use crate::util::{optional_typed_json_from_db, typed_json_from_db, unix_to_datetime};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
@@ -3358,6 +3365,63 @@ impl CrudStore {
         .collect()
     }
 
+    pub async fn list_thread_episodic_workspace_capsules(
+        &self,
+        workspace_id: &str,
+        limit: u64,
+    ) -> Result<Vec<ThreadEpisodicCapsuleRecord>> {
+        thread_episodic_repository::list_workspace_capsules(&self.connection, workspace_id, limit)
+            .await?
+            .into_iter()
+            .map(crate::thread_episodic::thread_episodic_capsule_record_from_model)
+            .collect()
+    }
+
+    pub async fn list_all_thread_episodic_capsules(
+        &self,
+    ) -> Result<Vec<ThreadEpisodicCapsuleRecord>> {
+        thread_episodic_repository::list_all_capsules(&self.connection)
+            .await?
+            .into_iter()
+            .map(crate::thread_episodic::thread_episodic_capsule_record_from_model)
+            .collect()
+    }
+
+    pub async fn delete_all_thread_episodic_capsules(&self) -> Result<u64> {
+        self.run_serialized_write(|| async move {
+            thread_episodic_repository::delete_all_capsules(&self.connection).await
+        })
+        .await
+    }
+
+    pub async fn delete_all_thread_episodic_items(&self) -> Result<u64> {
+        self.run_serialized_write(|| async move {
+            thread_episodic_repository::delete_all_items(&self.connection).await
+        })
+        .await
+    }
+
+    pub async fn delete_all_thread_episodic_exclusions(&self) -> Result<u64> {
+        self.run_serialized_write(|| async move {
+            thread_episodic_repository::delete_all_exclusions(&self.connection).await
+        })
+        .await
+    }
+
+    pub async fn delete_all_thread_episodic_index_jobs(&self) -> Result<u64> {
+        self.run_serialized_write(|| async move {
+            thread_episodic_repository::delete_all_index_jobs(&self.connection).await
+        })
+        .await
+    }
+
+    pub async fn delete_all_thread_episodic_thread_directory_entries(&self) -> Result<u64> {
+        self.run_serialized_write(|| async move {
+            thread_episodic_repository::delete_all_thread_directory_entries(&self.connection).await
+        })
+        .await
+    }
+
     pub async fn resolve_thread_episodic_active_write_segment(
         &self,
         request: ThreadEpisodicActiveWriteSegmentRequest,
@@ -3428,7 +3492,7 @@ impl CrudStore {
                         encrypted: false,
                         status: ThreadEpisodicCapsuleStatus::Active,
                         repair_status: ThreadEpisodicRepairStatus::Ok,
-                        active_chunk_count: 0,
+                        active_frame_count: 0,
                         capacity_bytes: None,
                         size_bytes: None,
                         utilization_percent: None,
@@ -3447,6 +3511,98 @@ impl CrudStore {
                 )
                 .await?
                 .context("resolved thread episodic active write capsule missing")?;
+                crate::thread_episodic::thread_episodic_capsule_record_from_model(row)
+            }
+        })
+        .await
+    }
+
+    pub async fn resolve_thread_episodic_workspace_active_write_segment(
+        &self,
+        request: ThreadEpisodicWorkspaceActiveWriteSegmentRequest,
+        now_unix: i64,
+    ) -> Result<ThreadEpisodicCapsuleRecord> {
+        self.run_serialized_write(|| {
+            let request = request.clone();
+            async move {
+                if let Some(row) = thread_episodic_repository::find_active_write_workspace_capsule(
+                    &self.connection,
+                    request.workspace_id.as_str(),
+                )
+                .await?
+                {
+                    return crate::thread_episodic::thread_episodic_capsule_record_from_model(row);
+                }
+
+                let workspace_key_hash = crate::thread_episodic::thread_episodic_key_hash(
+                    "workspace",
+                    request.workspace_id.as_str(),
+                )?;
+                let thread_key_hash = crate::thread_episodic::thread_episodic_key_hash(
+                    "thread",
+                    THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID,
+                )?;
+                let segment_index = thread_episodic_repository::max_segment_index_for_thread(
+                    &self.connection,
+                    request.workspace_id.as_str(),
+                    THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID,
+                )
+                .await?
+                .unwrap_or(0)
+                    + 1;
+                let capsule_id =
+                    crate::thread_episodic::deterministic_thread_episodic_workspace_capsule_id(
+                        workspace_key_hash.as_str(),
+                        segment_index,
+                    )?;
+                let capsule_ref = crate::thread_episodic::thread_episodic_workspace_capsule_ref(
+                    workspace_key_hash.as_str(),
+                    segment_index,
+                    capsule_id.as_str(),
+                )?;
+                let storage_uri =
+                    crate::thread_episodic::thread_episodic_workspace_capsule_storage_uri(
+                        request.storage_uri_root.as_str(),
+                        workspace_key_hash.as_str(),
+                        segment_index,
+                        capsule_id.as_str(),
+                    )?;
+                let now = unix_to_datetime(now_unix);
+                thread_episodic_repository::insert_capsule_if_absent(
+                    &self.connection,
+                    NewThreadEpisodicCapsuleRecord {
+                        id: capsule_id,
+                        workspace_id: request.workspace_id.clone(),
+                        workspace_key_hash,
+                        thread_id: THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID.to_owned(),
+                        thread_key_hash,
+                        segment_index,
+                        write_state: ThreadEpisodicCapsuleWriteState::ActiveWrite,
+                        capsule_ref,
+                        storage_uri,
+                        backend: "memvid".to_owned(),
+                        format: "mv2".to_owned(),
+                        encrypted: false,
+                        status: ThreadEpisodicCapsuleStatus::Active,
+                        repair_status: ThreadEpisodicRepairStatus::Ok,
+                        active_frame_count: 0,
+                        capacity_bytes: Some(THREAD_EPISODIC_WORKSPACE_SEGMENT_CAPACITY_BYTES),
+                        size_bytes: None,
+                        utilization_percent: None,
+                        content_hash: None,
+                        metadata_json: None,
+                        last_error: None,
+                    },
+                    now,
+                )
+                .await?;
+
+                let row = thread_episodic_repository::find_active_write_workspace_capsule(
+                    &self.connection,
+                    request.workspace_id.as_str(),
+                )
+                .await?
+                .context("resolved workspace thread episodic active write capsule missing")?;
                 crate::thread_episodic::thread_episodic_capsule_record_from_model(row)
             }
         })
@@ -3513,66 +3669,64 @@ impl CrudStore {
         .transpose()
     }
 
-    pub async fn find_thread_episodic_chunk(
+    pub async fn find_thread_episodic_item(
         &self,
-        chunk_id: &str,
-    ) -> Result<Option<ThreadEpisodicChunkRecord>> {
-        thread_episodic_repository::find_chunk_by_id(&self.connection, chunk_id)
+        index_item_id: &str,
+    ) -> Result<Option<ThreadEpisodicItemRecord>> {
+        thread_episodic_repository::find_item_by_id(&self.connection, index_item_id)
             .await?
-            .map(crate::thread_episodic::thread_episodic_chunk_record_from_model)
+            .map(crate::thread_episodic::thread_episodic_item_record_from_model)
             .transpose()
     }
 
-    pub async fn upsert_thread_episodic_chunk(
+    pub async fn upsert_thread_episodic_item(
         &self,
-        chunk: NewThreadEpisodicChunkRecord,
+        item: NewThreadEpisodicItemRecord,
         now_unix: i64,
-    ) -> Result<ThreadEpisodicChunkRecord> {
+    ) -> Result<ThreadEpisodicItemRecord> {
         self.run_serialized_write(|| {
-            let chunk = chunk.clone();
+            let item = item.clone();
             async move {
-                let row = thread_episodic_repository::upsert_chunk_by_source_identity(
+                let row = thread_episodic_repository::upsert_item_by_source_identity(
                     &self.connection,
-                    chunk,
+                    item,
                     unix_to_datetime(now_unix),
                 )
                 .await?;
-                crate::thread_episodic::thread_episodic_chunk_record_from_model(row)
+                crate::thread_episodic::thread_episodic_item_record_from_model(row)
             }
         })
         .await
     }
 
-    pub async fn find_thread_episodic_chunk_by_source_identity(
+    pub async fn find_thread_episodic_item_by_source_identity(
         &self,
         workspace_id: &str,
         thread_id: &str,
         turn_id: &str,
         item_id: &str,
-        chunk_index: i64,
         text_hash: &str,
-    ) -> Result<Option<ThreadEpisodicChunkRecord>> {
-        thread_episodic_repository::find_chunk_by_source_identity(
+    ) -> Result<Option<ThreadEpisodicItemRecord>> {
+        thread_episodic_repository::find_item_by_source_identity(
             &self.connection,
             workspace_id,
             thread_id,
             turn_id,
             item_id,
-            chunk_index,
             text_hash,
         )
         .await?
-        .map(crate::thread_episodic::thread_episodic_chunk_record_from_model)
+        .map(crate::thread_episodic::thread_episodic_item_record_from_model)
         .transpose()
     }
 
-    pub async fn list_thread_episodic_chunks_for_thread(
+    pub async fn list_thread_episodic_items_for_thread(
         &self,
         workspace_id: &str,
         thread_id: &str,
         limit: u64,
-    ) -> Result<Vec<ThreadEpisodicChunkRecord>> {
-        thread_episodic_repository::list_chunks_for_thread(
+    ) -> Result<Vec<ThreadEpisodicItemRecord>> {
+        thread_episodic_repository::list_items_for_thread(
             &self.connection,
             workspace_id,
             thread_id,
@@ -3580,17 +3734,17 @@ impl CrudStore {
         )
         .await?
         .into_iter()
-        .map(crate::thread_episodic::thread_episodic_chunk_record_from_model)
+        .map(crate::thread_episodic::thread_episodic_item_record_from_model)
         .collect()
     }
 
-    pub async fn list_recallable_thread_episodic_chunks_for_thread(
+    pub async fn list_recallable_thread_episodic_items_for_thread(
         &self,
         workspace_id: &str,
         thread_id: &str,
         limit: u64,
-    ) -> Result<Vec<ThreadEpisodicChunkRecord>> {
-        thread_episodic_repository::list_recallable_chunks_for_thread(
+    ) -> Result<Vec<ThreadEpisodicItemRecord>> {
+        thread_episodic_repository::list_recallable_items_for_thread(
             &self.connection,
             workspace_id,
             thread_id,
@@ -3598,7 +3752,7 @@ impl CrudStore {
         )
         .await?
         .into_iter()
-        .map(crate::thread_episodic::thread_episodic_chunk_record_from_model)
+        .map(crate::thread_episodic::thread_episodic_item_record_from_model)
         .collect()
     }
 
@@ -3612,14 +3766,93 @@ impl CrudStore {
             .transpose()
     }
 
-    pub async fn find_thread_episodic_index_job_by_chunk(
+    pub async fn find_thread_episodic_index_job_by_item(
         &self,
-        chunk_id: &str,
+        index_item_id: &str,
     ) -> Result<Option<ThreadEpisodicIndexJobRecord>> {
-        thread_episodic_repository::find_index_job_by_chunk(&self.connection, chunk_id)
+        thread_episodic_repository::find_index_job_by_index_item(&self.connection, index_item_id)
             .await?
             .map(crate::thread_episodic::thread_episodic_index_job_record_from_model)
             .transpose()
+    }
+
+    pub async fn list_thread_episodic_refill_workspace_ids(&self) -> Result<Vec<String>> {
+        thread_episodic_repository::list_refill_workspace_ids(&self.connection).await
+    }
+
+    pub async fn list_thread_episodic_refill_threads(
+        &self,
+    ) -> Result<Vec<ThreadEpisodicRefillThread>> {
+        thread_episodic_repository::list_refill_threads(&self.connection).await
+    }
+
+    pub async fn count_thread_episodic_refill_sources(
+        &self,
+    ) -> Result<ThreadEpisodicRefillSourceCounts> {
+        thread_episodic_repository::count_refill_sources(&self.connection).await
+    }
+
+    pub async fn list_thread_episodic_refill_indexable_items(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<ThreadEpisodicItemRecord>> {
+        thread_episodic_repository::list_refill_indexable_items(&self.connection, limit)
+            .await?
+            .into_iter()
+            .map(crate::thread_episodic::thread_episodic_item_record_from_model)
+            .collect()
+    }
+
+    pub async fn enqueue_thread_episodic_refill_index_jobs(
+        &self,
+        now_unix: i64,
+        limit: u64,
+    ) -> Result<usize> {
+        self.run_serialized_write(|| async move {
+            let items =
+                thread_episodic_repository::list_refill_indexable_items(&self.connection, limit)
+                    .await?;
+            let now = unix_to_datetime(now_unix);
+            let mut enqueued = 0usize;
+            for item in items {
+                if thread_episodic_repository::find_index_job_by_index_item(
+                    &self.connection,
+                    item.id.as_str(),
+                )
+                .await?
+                .is_some()
+                {
+                    continue;
+                }
+
+                thread_episodic_repository::insert_index_job_if_absent(
+                    &self.connection,
+                    NewThreadEpisodicIndexJobRecord {
+                        id: None,
+                        workspace_id: item.workspace_id,
+                        thread_id: item.thread_id,
+                        index_item_id: item.id,
+                        capsule_id: None,
+                        capsule_ref: None,
+                        segment_index: None,
+                        frame_uri: None,
+                        status: ThreadEpisodicIndexJobStatus::Queued,
+                        graph_enrichment_state: ThreadEpisodicGraphEnrichmentState::NotSupported,
+                        next_run_at: now,
+                        last_error: None,
+                    },
+                    now,
+                )
+                .await?;
+                enqueued = enqueued.saturating_add(1);
+            }
+            Ok(enqueued)
+        })
+        .await
+    }
+
+    pub async fn count_incomplete_thread_episodic_index_jobs(&self) -> Result<u64> {
+        thread_episodic_repository::count_incomplete_index_jobs(&self.connection).await
     }
 
     pub async fn insert_thread_episodic_index_job_if_absent(
@@ -3804,61 +4037,61 @@ impl CrudStore {
         .await
     }
 
-    pub async fn mark_thread_episodic_chunk_indexed(
+    pub async fn mark_thread_episodic_item_indexed(
         &self,
-        chunk_id: &str,
-        update: ThreadEpisodicChunkIndexedUpdate,
+        index_item_id: &str,
+        update: ThreadEpisodicItemIndexedUpdate,
         now_unix: i64,
-    ) -> Result<Option<ThreadEpisodicChunkRecord>> {
+    ) -> Result<Option<ThreadEpisodicItemRecord>> {
         self.run_serialized_write(|| {
-            let chunk_id = chunk_id.to_owned();
+            let index_item_id = index_item_id.to_owned();
             let update = update.clone();
             async move {
-                thread_episodic_repository::mark_chunk_indexed(
+                thread_episodic_repository::mark_item_indexed(
                     &self.connection,
-                    chunk_id.as_str(),
+                    index_item_id.as_str(),
                     update,
                     unix_to_datetime(now_unix),
                 )
                 .await?
-                .map(crate::thread_episodic::thread_episodic_chunk_record_from_model)
+                .map(crate::thread_episodic::thread_episodic_item_record_from_model)
                 .transpose()
             }
         })
         .await
     }
 
-    pub async fn mark_thread_episodic_chunk_failed(
+    pub async fn mark_thread_episodic_item_failed(
         &self,
-        chunk_id: &str,
+        index_item_id: &str,
         now_unix: i64,
-    ) -> Result<Option<ThreadEpisodicChunkRecord>> {
+    ) -> Result<Option<ThreadEpisodicItemRecord>> {
         self.run_serialized_write(|| {
-            let chunk_id = chunk_id.to_owned();
+            let index_item_id = index_item_id.to_owned();
             async move {
-                thread_episodic_repository::mark_chunk_failed(
+                thread_episodic_repository::mark_item_failed(
                     &self.connection,
-                    chunk_id.as_str(),
+                    index_item_id.as_str(),
                     unix_to_datetime(now_unix),
                 )
                 .await?
-                .map(crate::thread_episodic::thread_episodic_chunk_record_from_model)
+                .map(crate::thread_episodic::thread_episodic_item_record_from_model)
                 .transpose()
             }
         })
         .await
     }
 
-    pub async fn tombstone_thread_episodic_chunks_for_item(
+    pub async fn tombstone_thread_episodic_items_for_item(
         &self,
         workspace_id: &str,
         thread_id: &str,
         turn_id: &str,
         item_id: &str,
         now_unix: i64,
-    ) -> Result<Vec<ThreadEpisodicChunkRecord>> {
+    ) -> Result<Vec<ThreadEpisodicItemRecord>> {
         self.run_serialized_write(|| async move {
-            thread_episodic_repository::mark_chunks_deleted_by_source_item(
+            thread_episodic_repository::mark_items_deleted_by_source_item(
                 &self.connection,
                 workspace_id,
                 thread_id,
@@ -3868,20 +4101,20 @@ impl CrudStore {
             )
             .await?
             .into_iter()
-            .map(crate::thread_episodic::thread_episodic_chunk_record_from_model)
+            .map(crate::thread_episodic::thread_episodic_item_record_from_model)
             .collect()
         })
         .await
     }
 
-    pub async fn tombstone_thread_episodic_chunks_for_thread(
+    pub async fn tombstone_thread_episodic_items_for_thread(
         &self,
         workspace_id: &str,
         thread_id: &str,
         now_unix: i64,
-    ) -> Result<Vec<ThreadEpisodicChunkRecord>> {
+    ) -> Result<Vec<ThreadEpisodicItemRecord>> {
         self.run_serialized_write(|| async move {
-            thread_episodic_repository::mark_chunks_deleted_for_thread(
+            thread_episodic_repository::mark_items_deleted_for_thread(
                 &self.connection,
                 workspace_id,
                 thread_id,
@@ -3889,30 +4122,30 @@ impl CrudStore {
             )
             .await?
             .into_iter()
-            .map(crate::thread_episodic::thread_episodic_chunk_record_from_model)
+            .map(crate::thread_episodic::thread_episodic_item_record_from_model)
             .collect()
         })
         .await
     }
 
-    pub async fn find_thread_episodic_exclusion_by_chunk(
+    pub async fn find_thread_episodic_exclusion_by_item(
         &self,
         workspace_id: &str,
         thread_id: &str,
-        chunk_id: &str,
+        index_item_id: &str,
     ) -> Result<Option<ThreadEpisodicExclusionRecord>> {
-        thread_episodic_repository::find_exclusion_by_chunk(
+        thread_episodic_repository::find_exclusion_by_index_item(
             &self.connection,
             workspace_id,
             thread_id,
-            chunk_id,
+            index_item_id,
         )
         .await?
         .map(crate::thread_episodic::thread_episodic_exclusion_record_from_model)
         .transpose()
     }
 
-    pub async fn exclude_thread_episodic_chunk(
+    pub async fn exclude_thread_episodic_item(
         &self,
         exclusion: NewThreadEpisodicExclusionRecord,
         now_unix: i64,
@@ -4056,12 +4289,12 @@ impl CrudStore {
         )
     }
 
-    pub async fn count_active_thread_episodic_chunks_for_thread(
+    pub async fn count_active_thread_episodic_items_for_thread(
         &self,
         workspace_id: &str,
         thread_id: &str,
     ) -> Result<i64> {
-        thread_episodic_repository::count_active_chunks_for_thread(
+        thread_episodic_repository::count_active_items_for_thread(
             &self.connection,
             workspace_id,
             thread_id,
@@ -12045,14 +12278,16 @@ mod tests {
         IngestArtifactMetadataRecord, McpAuditEventRecord, McpServerCatalogSnapshotRecord,
         McpServerInstallationRecord, NewArtifactBlobRecord, NewCliRuntimeNativeEvent,
         NewCliRuntimePendingRequest, NewCliRuntimeThreadBinding, NewCliRuntimeTurnBinding,
-        NewThreadEpisodicChunkRecord, NewTurnExecutionCheckpointRecord,
+        NewThreadEpisodicItemRecord, NewTurnExecutionCheckpointRecord,
         NewTurnExecutionWindowRecord, NewTurnLlmContextEntry, NewTurnRuntimeSnapshot,
         ResolveCliRuntimePendingRequest, SkillAuditEventRecord, SkillInstallationRecord,
-        TaskEventPayload, TaskRunChildAnchor, ThreadAgentsDocError, ThreadAgentsDocSaveReason,
-        ThreadAgentsDocStatus, ThreadEpisodicActiveWriteSegmentRequest,
-        ThreadEpisodicCapsuleCapacityUpdate, ThreadEpisodicCapsuleWriteState,
-        ThreadEpisodicChunkStatus, ThreadEpisodicChunkVisibility, ThreadEpisodicSourceActorRole,
-        ThreadEpisodicSourceRuntimeKind, TurnExecutionCheckpointKind,
+        THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID,
+        THREAD_EPISODIC_WORKSPACE_SEGMENT_CAPACITY_BYTES, TaskEventPayload, TaskRunChildAnchor,
+        ThreadAgentsDocError, ThreadAgentsDocSaveReason, ThreadAgentsDocStatus,
+        ThreadEpisodicActiveWriteSegmentRequest, ThreadEpisodicCapsuleCapacityUpdate,
+        ThreadEpisodicCapsuleWriteState, ThreadEpisodicItemStatus, ThreadEpisodicItemVisibility,
+        ThreadEpisodicSourceActorRole, ThreadEpisodicSourceRuntimeKind,
+        ThreadEpisodicWorkspaceActiveWriteSegmentRequest, TurnExecutionCheckpointKind,
         TurnExecutionWindowStatsRecord, TurnExecutionWindowUsageAggregateRecord,
         TurnItemAttemptDeadlines, TurnMcpBindingRecord, TurnSkillBindingRecord,
         WorkspaceSkillPolicyRecord,
@@ -12206,21 +12441,19 @@ mod tests {
         assert!(turn_refs.assistant.is_empty());
     }
 
-    fn thread_episodic_chunk_fixture(
+    fn thread_episodic_item_fixture(
         id: &str,
-        chunk_index: i64,
+        item_id: &str,
         text_hash: &str,
-        status: ThreadEpisodicChunkStatus,
-        visibility: ThreadEpisodicChunkVisibility,
-    ) -> NewThreadEpisodicChunkRecord {
-        NewThreadEpisodicChunkRecord {
+        status: ThreadEpisodicItemStatus,
+        visibility: ThreadEpisodicItemVisibility,
+    ) -> NewThreadEpisodicItemRecord {
+        NewThreadEpisodicItemRecord {
             id: Some(id.to_owned()),
             workspace_id: "ws_thread_episodic".to_owned(),
             thread_id: "thread_episodic_1".to_owned(),
             turn_id: "turn_episodic_1".to_owned(),
-            item_id: "assistant_message_1".to_owned(),
-            chunk_index,
-            chunk_count: 4,
+            item_id: item_id.to_owned(),
             source_actor_role: ThreadEpisodicSourceActorRole::Assistant,
             source_runtime_kind: ThreadEpisodicSourceRuntimeKind::AssistantTurn,
             source_context: ThreadEpisodicSourceContext::UserVisibleThreadItem,
@@ -12228,10 +12461,6 @@ mod tests {
             status,
             text_hash: text_hash.to_owned(),
             source_text_hash: "source_hash_1".to_owned(),
-            char_start: chunk_index * 100,
-            char_end: chunk_index * 100 + 50,
-            byte_start: Some(chunk_index * 100),
-            byte_end: Some(chunk_index * 100 + 50),
             language_hint: Some("ru".to_owned()),
             token_estimate: 12,
             capsule_id: None,
@@ -12245,82 +12474,82 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn thread_episodic_chunk_upsert_is_idempotent_by_source_identity_and_hash() {
+    async fn thread_episodic_item_upsert_is_idempotent_by_source_identity_and_hash() {
         let store = test_store_with_workspace("ws_thread_episodic").await;
-        let first = thread_episodic_chunk_fixture(
-            "chunk_episodic_1",
-            0,
+        let first = thread_episodic_item_fixture(
+            "item_episodic_1",
+            "assistant_message_1",
             "same_text_hash",
-            ThreadEpisodicChunkStatus::Active,
-            ThreadEpisodicChunkVisibility::UserVisible,
+            ThreadEpisodicItemStatus::Active,
+            ThreadEpisodicItemVisibility::UserVisible,
         );
         let inserted = store
-            .upsert_thread_episodic_chunk(first.clone(), 1_700_000_000)
+            .upsert_thread_episodic_item(first.clone(), 1_700_000_000)
             .await
             .expect("first upsert should insert");
 
         let mut duplicate = first;
-        duplicate.id = Some("chunk_episodic_2".to_owned());
+        duplicate.id = Some("item_episodic_2".to_owned());
         let second = store
-            .upsert_thread_episodic_chunk(duplicate, 1_700_000_100)
+            .upsert_thread_episodic_item(duplicate, 1_700_000_100)
             .await
             .expect("duplicate upsert should return existing row");
 
         assert_eq!(second.id, inserted.id);
         let rows = store
-            .list_thread_episodic_chunks_for_thread("ws_thread_episodic", "thread_episodic_1", 10)
+            .list_thread_episodic_items_for_thread("ws_thread_episodic", "thread_episodic_1", 10)
             .await
             .expect("admin list should succeed");
         assert_eq!(rows.len(), 1);
     }
 
     #[tokio::test]
-    async fn thread_episodic_recallable_chunks_suppress_deleted_excluded_and_internal_rows() {
+    async fn thread_episodic_recallable_items_suppress_deleted_excluded_and_internal_rows() {
         let store = test_store_with_workspace("ws_thread_episodic").await;
-        for chunk in [
-            thread_episodic_chunk_fixture(
-                "chunk_active",
-                0,
+        for item in [
+            thread_episodic_item_fixture(
+                "item_active",
+                "assistant_message_active",
                 "active_hash",
-                ThreadEpisodicChunkStatus::Active,
-                ThreadEpisodicChunkVisibility::UserVisible,
+                ThreadEpisodicItemStatus::Active,
+                ThreadEpisodicItemVisibility::UserVisible,
             ),
-            thread_episodic_chunk_fixture(
-                "chunk_excluded",
-                1,
+            thread_episodic_item_fixture(
+                "item_excluded",
+                "assistant_message_excluded",
                 "excluded_hash",
-                ThreadEpisodicChunkStatus::Excluded,
-                ThreadEpisodicChunkVisibility::UserVisible,
+                ThreadEpisodicItemStatus::Excluded,
+                ThreadEpisodicItemVisibility::UserVisible,
             ),
-            thread_episodic_chunk_fixture(
-                "chunk_deleted",
-                2,
+            thread_episodic_item_fixture(
+                "item_deleted",
+                "assistant_message_deleted",
                 "deleted_hash",
-                ThreadEpisodicChunkStatus::Deleted,
-                ThreadEpisodicChunkVisibility::UserVisible,
+                ThreadEpisodicItemStatus::Deleted,
+                ThreadEpisodicItemVisibility::UserVisible,
             ),
-            thread_episodic_chunk_fixture(
-                "chunk_internal",
-                3,
+            thread_episodic_item_fixture(
+                "item_internal",
+                "assistant_message_internal",
                 "internal_hash",
-                ThreadEpisodicChunkStatus::Active,
-                ThreadEpisodicChunkVisibility::InternalHidden,
+                ThreadEpisodicItemStatus::Active,
+                ThreadEpisodicItemVisibility::InternalHidden,
             ),
         ] {
             store
-                .upsert_thread_episodic_chunk(chunk, 1_700_000_000)
+                .upsert_thread_episodic_item(item, 1_700_000_000)
                 .await
-                .expect("chunk upsert should succeed");
+                .expect("item upsert should succeed");
         }
 
         let admin_rows = store
-            .list_thread_episodic_chunks_for_thread("ws_thread_episodic", "thread_episodic_1", 10)
+            .list_thread_episodic_items_for_thread("ws_thread_episodic", "thread_episodic_1", 10)
             .await
             .expect("admin list should include all rows");
         assert_eq!(admin_rows.len(), 4);
 
         let recallable = store
-            .list_recallable_thread_episodic_chunks_for_thread(
+            .list_recallable_thread_episodic_items_for_thread(
                 "ws_thread_episodic",
                 "thread_episodic_1",
                 10,
@@ -12328,7 +12557,7 @@ mod tests {
             .await
             .expect("recallable list should succeed");
         assert_eq!(recallable.len(), 1);
-        assert_eq!(recallable[0].id, "chunk_active");
+        assert_eq!(recallable[0].id, "item_active");
     }
 
     #[tokio::test]
@@ -12363,6 +12592,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thread_episodic_workspace_active_write_resolution_uses_segmented_sentinel() {
+        let store = test_store_with_workspace("ws_thread_episodic").await;
+        let request = ThreadEpisodicWorkspaceActiveWriteSegmentRequest {
+            workspace_id: "ws_thread_episodic".to_owned(),
+            storage_uri_root: "file:///tmp/pioneer-memory/capsules".to_owned(),
+        };
+
+        let first = store
+            .resolve_thread_episodic_workspace_active_write_segment(request.clone(), 1_700_000_000)
+            .await
+            .expect("first workspace active write segment should resolve");
+        let second = store
+            .resolve_thread_episodic_workspace_active_write_segment(request, 1_700_000_100)
+            .await
+            .expect("second workspace active write segment should resolve");
+
+        assert_eq!(second.id, first.id);
+        assert_eq!(first.thread_id, THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID);
+        assert_eq!(first.segment_index, 1);
+        assert_eq!(
+            first.write_state,
+            ThreadEpisodicCapsuleWriteState::ActiveWrite
+        );
+        assert_eq!(
+            first.storage_uri,
+            format!(
+                "file:///tmp/pioneer-memory/capsules/thread_episodic/workspace/{}/segments/000001/{}.mv2",
+                first.workspace_key_hash, first.id
+            )
+        );
+        assert_eq!(
+            first.capacity_bytes,
+            Some(THREAD_EPISODIC_WORKSPACE_SEGMENT_CAPACITY_BYTES)
+        );
+        assert!(!first.storage_uri.contains("thread_episodic_1"));
+
+        let rows = store
+            .list_thread_episodic_workspace_capsules("ws_thread_episodic", 10)
+            .await
+            .expect("workspace capsule list should succeed");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, first.id);
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_workspace_segment_rotation_creates_next_active_write_segment() {
+        let store = test_store_with_workspace("ws_thread_episodic").await;
+        let request = ThreadEpisodicWorkspaceActiveWriteSegmentRequest {
+            workspace_id: "ws_thread_episodic".to_owned(),
+            storage_uri_root: "file:///tmp/pioneer-memory/capsules".to_owned(),
+        };
+        let first = store
+            .resolve_thread_episodic_workspace_active_write_segment(request.clone(), 1_700_000_000)
+            .await
+            .expect("first workspace active segment should resolve");
+        let rotated = store
+            .transition_thread_episodic_active_write_segment(
+                first.id.as_str(),
+                ThreadEpisodicCapsuleWriteState::Full,
+                1_700_000_010,
+            )
+            .await
+            .expect("workspace rotation transition should succeed")
+            .expect("workspace capsule should exist");
+        assert_eq!(rotated.write_state, ThreadEpisodicCapsuleWriteState::Full);
+
+        let second = store
+            .resolve_thread_episodic_workspace_active_write_segment(request, 1_700_000_020)
+            .await
+            .expect("second workspace active segment should resolve");
+        assert_ne!(second.id, first.id);
+        assert_eq!(second.segment_index, 2);
+        assert_eq!(
+            second.write_state,
+            ThreadEpisodicCapsuleWriteState::ActiveWrite
+        );
+        assert_eq!(
+            second.capacity_bytes,
+            Some(THREAD_EPISODIC_WORKSPACE_SEGMENT_CAPACITY_BYTES)
+        );
+
+        let rows = store
+            .list_thread_episodic_workspace_capsules("ws_thread_episodic", 10)
+            .await
+            .expect("workspace capsule list should succeed");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.write_state == ThreadEpisodicCapsuleWriteState::ActiveWrite)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn thread_episodic_segment_rotation_creates_next_active_write_segment() {
         let store = test_store_with_workspace("ws_thread_episodic").await;
         let request = ThreadEpisodicActiveWriteSegmentRequest {
@@ -12383,7 +12707,7 @@ mod tests {
                     capacity_bytes: Some(1_000),
                     size_bytes: Some(900),
                     utilization_percent: Some(90.0),
-                    active_chunk_count: Some(12),
+                    active_frame_count: Some(12),
                     near_capacity_at: Some(unix_to_datetime(1_700_000_010)),
                     capacity_exceeded_at: None,
                     last_error: None,
@@ -12394,7 +12718,7 @@ mod tests {
             .expect("capacity update should succeed")
             .expect("capsule should exist");
         assert_eq!(capacity.capsule_ref, first_ref);
-        assert_eq!(capacity.active_chunk_count, 12);
+        assert_eq!(capacity.active_frame_count, 12);
         assert_eq!(capacity.utilization_percent, Some(90.0));
 
         let rotated = store

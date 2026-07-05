@@ -26,16 +26,16 @@ pub struct Model {
     #[sea_orm(column_type = "Text")]
     pub payload: String,
     pub started_at: DateTimeWithTimeZone,
-    pub started_event_sequence: Option<i64>,
     pub last_heartbeat_at: Option<DateTimeWithTimeZone>,
     pub lease_expires_at: Option<DateTimeWithTimeZone>,
     pub idle_deadline_at: Option<DateTimeWithTimeZone>,
     pub hard_deadline_at: Option<DateTimeWithTimeZone>,
+    pub updated_at: DateTimeWithTimeZone,
+    pub started_event_sequence: Option<i64>,
     pub recovery_suppressed_reason: Option<String>,
     pub recovery_suppressed_at: Option<DateTimeWithTimeZone>,
     #[sea_orm(column_type = "Text", nullable)]
     pub recovery_suppression_context_json: Option<String>,
-    pub updated_at: DateTimeWithTimeZone,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

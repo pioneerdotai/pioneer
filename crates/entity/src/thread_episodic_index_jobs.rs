@@ -11,9 +11,9 @@ pub struct Model {
     pub id: String,
     pub workspace_id: String,
     pub thread_id: String,
-    #[sea_orm(unique_key = "uidx_thread_episodic_index_jobs_chunk_capsule")]
-    pub chunk_id: String,
-    #[sea_orm(unique_key = "uidx_thread_episodic_index_jobs_chunk_capsule")]
+    #[sea_orm(unique_key = "uidx_thread_episodic_index_jobs_item_capsule")]
+    pub index_item_id: String,
+    #[sea_orm(unique_key = "uidx_thread_episodic_index_jobs_item_capsule")]
     pub capsule_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub capsule_ref: Option<String>,

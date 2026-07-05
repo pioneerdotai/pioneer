@@ -80,8 +80,8 @@ use crate::secrets::GatewaySecrets;
 use crate::session::SessionManager;
 use crate::thread::ThreadManager;
 use crate::thread_episodic::{
-    ThreadEpisodicChunkerConfig, ThreadEpisodicIndexExecutorConfig,
-    ThreadEpisodicRecallServiceConfig, ThreadEpisodicRuntimeConfig,
+    ThreadEpisodicIndexExecutorConfig, ThreadEpisodicRecallServiceConfig,
+    ThreadEpisodicRuntimeConfig,
 };
 use crate::transport::spawn_server;
 use crate::voice::model_bootstrap::start_parakeet_v3_int8_bootstrap;
@@ -453,7 +453,14 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
 
     let cli_runtime_manager = build_cli_runtime_manager(&runtime_home, &config)?;
 
-    migrations::spawn_gateway_startup_migrations(crud_store.clone());
+    let thread_episodic_storage_root = config
+        .gateway
+        .memory
+        .resolve_capsules_root(runtime_home.as_path())?;
+    migrations::spawn_gateway_startup_migrations(
+        crud_store.clone(),
+        thread_episodic_storage_root.clone(),
+    );
 
     let mut message_processor = MessageProcessor::new_with_memory_runtime_and_task_config(
         thread_manager,
@@ -467,6 +474,7 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         tool_loop_config,
         memory_runtime,
         runtime_home.clone(),
+        thread_episodic_storage_root,
         config.gateway.artifacts.clone(),
         task_runtime_config,
         thread_episodic_runtime_config_from_gateway_config(&config.gateway.thread_episodic),
@@ -762,12 +770,6 @@ fn thread_episodic_runtime_config_from_gateway_config(
         recall_enabled: config.recall_enabled,
         hook_max_prompt_chars: config.default_prompt_chars,
         hook_max_candidates: config.default_max_candidates,
-        chunker: ThreadEpisodicChunkerConfig {
-            target_min_chars: config.chunk_target_min_chars,
-            target_max_chars: config.chunk_target_max_chars,
-            max_chunk_chars: config.chunk_max_chars,
-            max_chunks_per_item: config.max_chunks_per_item,
-        },
         index_executor: ThreadEpisodicIndexExecutorConfig {
             batch_limit: config.index_batch_limit,
             retry_base_delay_secs: config.retry_base_delay_secs,
@@ -799,12 +801,6 @@ pub(crate) fn thread_episodic_runtime_config_from_gateway_settings(
         recall_enabled: settings.recall_enabled,
         hook_max_prompt_chars: settings.default_prompt_chars,
         hook_max_candidates: settings.default_max_candidates,
-        chunker: ThreadEpisodicChunkerConfig {
-            target_min_chars: settings.chunk_target_min_chars as usize,
-            target_max_chars: settings.chunk_target_max_chars as usize,
-            max_chunk_chars: settings.chunk_max_chars as usize,
-            max_chunks_per_item: settings.max_chunks_per_item as usize,
-        },
         index_executor: ThreadEpisodicIndexExecutorConfig {
             batch_limit: settings.index_batch_limit as u64,
             retry_base_delay_secs: settings.retry_base_delay_secs,
@@ -1160,10 +1156,6 @@ mod tests {
             min_relevancy: 0.4,
             min_results: 2,
             snippet_chars: 220,
-            chunk_target_min_chars: 400,
-            chunk_target_max_chars: 800,
-            chunk_max_chars: 1_000,
-            max_chunks_per_item: 12,
             index_batch_limit: 7,
             retry_base_delay_secs: 11,
             retry_max_delay_secs: 121,
@@ -1178,10 +1170,6 @@ mod tests {
         assert!(runtime.recall_enabled);
         assert_eq!(runtime.hook_max_prompt_chars, 1_500);
         assert_eq!(runtime.hook_max_candidates, 9);
-        assert_eq!(runtime.chunker.target_min_chars, 400);
-        assert_eq!(runtime.chunker.target_max_chars, 800);
-        assert_eq!(runtime.chunker.max_chunk_chars, 1_000);
-        assert_eq!(runtime.chunker.max_chunks_per_item, 12);
         assert_eq!(runtime.index_executor.batch_limit, 7);
         assert_eq!(runtime.index_executor.retry_base_delay_secs, 11);
         assert_eq!(runtime.index_executor.retry_max_delay_secs, 121);

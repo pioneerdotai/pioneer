@@ -1,30 +1,32 @@
 use anyhow::{Context, Result};
 use pioneer_entity::{
-    thread_episodic_capsules, thread_episodic_chunks, thread_episodic_exclusions,
-    thread_episodic_index_jobs, thread_episodic_recall_events, thread_episodic_thread_directory,
+    thread, thread_episodic_capsules, thread_episodic_exclusions, thread_episodic_index_jobs,
+    thread_episodic_items, thread_episodic_recall_events, thread_episodic_thread_directory,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use sea_orm::sea_query::Expr;
-use sea_orm::sea_query::OnConflict;
+use sea_orm::sea_query::{Expr, OnConflict, Query};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, IntoActiveModel,
     PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
 };
+use std::collections::HashSet;
 
 use crate::convention::DB_ID_LEN;
 use crate::thread_episodic::{
-    NewThreadEpisodicCapsuleRecord, NewThreadEpisodicChunkRecord, NewThreadEpisodicExclusionRecord,
-    NewThreadEpisodicIndexJobRecord, NewThreadEpisodicRecallEventRecord,
-    NewThreadEpisodicThreadDirectoryRecord, ThreadEpisodicCapsuleCapacityUpdate,
-    ThreadEpisodicCapsuleStatus, ThreadEpisodicCapsuleWriteState, ThreadEpisodicChunkIndexedUpdate,
-    ThreadEpisodicChunkStatus, ThreadEpisodicIndexJobCompletionUpdate,
-    ThreadEpisodicIndexJobFailureUpdate, ThreadEpisodicIndexJobStatus,
+    NewThreadEpisodicCapsuleRecord, NewThreadEpisodicExclusionRecord,
+    NewThreadEpisodicIndexJobRecord, NewThreadEpisodicItemRecord,
+    NewThreadEpisodicRecallEventRecord, NewThreadEpisodicThreadDirectoryRecord,
+    THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID, ThreadEpisodicCapsuleCapacityUpdate,
+    ThreadEpisodicCapsuleStatus, ThreadEpisodicCapsuleWriteState,
+    ThreadEpisodicIndexJobCompletionUpdate, ThreadEpisodicIndexJobFailureUpdate,
+    ThreadEpisodicIndexJobStatus, ThreadEpisodicItemIndexedUpdate, ThreadEpisodicItemStatus,
+    ThreadEpisodicItemVisibility, ThreadEpisodicRefillSourceCounts, ThreadEpisodicRefillThread,
     ThreadEpisodicThreadDirectorySelection, ThreadEpisodicThreadDirectoryStatus,
     ThreadEpisodicThreadDirectoryVisibility, capsule_status_to_db, capsule_write_state_to_db,
-    chunk_status_to_db, chunk_visibility_to_db, exclusion_reason_to_db,
-    graph_enrichment_state_to_db, index_job_status_from_db, index_job_status_to_db,
-    repair_status_to_db, source_actor_role_to_db, source_runtime_kind_to_db,
-    thread_directory_status_to_db, thread_directory_visibility_to_db,
+    exclusion_reason_to_db, graph_enrichment_state_to_db, index_job_status_from_db,
+    index_job_status_to_db, item_status_to_db, item_visibility_to_db, repair_status_to_db,
+    source_actor_role_to_db, source_runtime_kind_to_db, thread_directory_status_to_db,
+    thread_directory_visibility_to_db,
 };
 
 pub async fn find_active_write_capsule<C: ConnectionTrait>(
@@ -50,6 +52,23 @@ pub async fn find_active_write_capsule<C: ConnectionTrait>(
         .with_context(|| {
             format!("failed to find active thread episodic capsule for thread `{thread_id}`")
         })
+}
+
+pub async fn find_active_write_workspace_capsule<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+) -> Result<Option<thread_episodic_capsules::Model>> {
+    find_active_write_capsule(
+        db,
+        workspace_id,
+        THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "failed to find active workspace thread episodic capsule for workspace `{workspace_id}`"
+        )
+    })
 }
 
 pub async fn max_segment_index_for_thread<C: ConnectionTrait>(
@@ -89,7 +108,7 @@ pub async fn insert_capsule_if_absent<C: ConnectionTrait>(
         encrypted: Set(capsule.encrypted),
         status: Set(capsule_status_to_db(capsule.status).to_owned()),
         repair_status: Set(repair_status_to_db(capsule.repair_status).to_owned()),
-        active_chunk_count: Set(capsule.active_chunk_count),
+        active_frame_count: Set(capsule.active_frame_count),
         capacity_bytes: Set(capsule.capacity_bytes),
         size_bytes: Set(capsule.size_bytes),
         utilization_percent: Set(capsule.utilization_percent),
@@ -115,106 +134,96 @@ pub async fn insert_capsule_if_absent<C: ConnectionTrait>(
     Ok(())
 }
 
-pub async fn upsert_chunk_by_source_identity<C: ConnectionTrait>(
+pub async fn upsert_item_by_source_identity<C: ConnectionTrait>(
     db: &C,
-    chunk: NewThreadEpisodicChunkRecord,
+    item: NewThreadEpisodicItemRecord,
     now: DateTimeWithTimeZone,
-) -> Result<thread_episodic_chunks::Model> {
-    if let Some(existing) = find_chunk_by_source_identity(
+) -> Result<thread_episodic_items::Model> {
+    if let Some(existing) = find_item_by_source_identity(
         db,
-        chunk.workspace_id.as_str(),
-        chunk.thread_id.as_str(),
-        chunk.turn_id.as_str(),
-        chunk.item_id.as_str(),
-        chunk.chunk_index,
-        chunk.text_hash.as_str(),
+        item.workspace_id.as_str(),
+        item.thread_id.as_str(),
+        item.turn_id.as_str(),
+        item.item_id.as_str(),
+        item.text_hash.as_str(),
     )
     .await?
     {
         return Ok(existing);
     }
 
-    let id = chunk
+    let id = item
         .id
         .clone()
         .unwrap_or_else(|| pioneer_protocol::generate_id(DB_ID_LEN));
-    let source_context_json = serde_json::to_string(&chunk.source_context)
-        .context("failed to serialize thread episodic chunk source context")?;
+    let source_context_json = serde_json::to_string(&item.source_context)
+        .context("failed to serialize thread episodic item source context")?;
 
-    thread_episodic_chunks::Entity::insert(thread_episodic_chunks::ActiveModel {
+    thread_episodic_items::Entity::insert(thread_episodic_items::ActiveModel {
         id: Set(id),
-        workspace_id: Set(chunk.workspace_id.clone()),
-        thread_id: Set(chunk.thread_id.clone()),
-        turn_id: Set(chunk.turn_id.clone()),
-        item_id: Set(chunk.item_id.clone()),
-        chunk_index: Set(chunk.chunk_index),
-        chunk_count: Set(chunk.chunk_count),
-        source_actor_role: Set(source_actor_role_to_db(chunk.source_actor_role).to_owned()),
-        source_runtime_kind: Set(source_runtime_kind_to_db(chunk.source_runtime_kind).to_owned()),
+        workspace_id: Set(item.workspace_id.clone()),
+        thread_id: Set(item.thread_id.clone()),
+        turn_id: Set(item.turn_id.clone()),
+        item_id: Set(item.item_id.clone()),
+        source_actor_role: Set(source_actor_role_to_db(item.source_actor_role).to_owned()),
+        source_runtime_kind: Set(source_runtime_kind_to_db(item.source_runtime_kind).to_owned()),
         source_context_json: Set(source_context_json),
-        visibility: Set(chunk_visibility_to_db(chunk.visibility).to_owned()),
-        status: Set(chunk_status_to_db(chunk.status).to_owned()),
-        text_hash: Set(chunk.text_hash.clone()),
-        source_text_hash: Set(chunk.source_text_hash),
-        char_start: Set(chunk.char_start),
-        char_end: Set(chunk.char_end),
-        byte_start: Set(chunk.byte_start),
-        byte_end: Set(chunk.byte_end),
-        language_hint: Set(chunk.language_hint),
-        token_estimate: Set(chunk.token_estimate),
-        capsule_id: Set(chunk.capsule_id),
-        capsule_ref: Set(chunk.capsule_ref),
-        segment_index: Set(chunk.segment_index),
-        frame_id: Set(chunk.frame_id),
-        frame_uri: Set(chunk.frame_uri),
-        indexed_at: Set(chunk.indexed_at),
+        visibility: Set(item_visibility_to_db(item.visibility).to_owned()),
+        status: Set(item_status_to_db(item.status).to_owned()),
+        text_hash: Set(item.text_hash.clone()),
+        source_text_hash: Set(item.source_text_hash),
+        language_hint: Set(item.language_hint),
+        token_estimate: Set(item.token_estimate),
+        capsule_id: Set(item.capsule_id),
+        capsule_ref: Set(item.capsule_ref),
+        segment_index: Set(item.segment_index),
+        frame_id: Set(item.frame_id),
+        frame_uri: Set(item.frame_uri),
+        indexed_at: Set(item.indexed_at),
         created_at: Set(now),
         updated_at: Set(now),
-        deleted_at: Set(chunk.deleted_at),
+        deleted_at: Set(item.deleted_at),
     })
     .exec(db)
     .await
     .with_context(|| {
         format!(
-            "failed to upsert thread episodic chunk `{}/{}/{}/{}/{}`",
-            chunk.workspace_id, chunk.thread_id, chunk.turn_id, chunk.item_id, chunk.chunk_index
+            "failed to upsert thread episodic item `{}/{}/{}/{}`",
+            item.workspace_id, item.thread_id, item.turn_id, item.item_id
         )
     })?;
 
-    find_chunk_by_source_identity(
+    find_item_by_source_identity(
         db,
-        chunk.workspace_id.as_str(),
-        chunk.thread_id.as_str(),
-        chunk.turn_id.as_str(),
-        chunk.item_id.as_str(),
-        chunk.chunk_index,
-        chunk.text_hash.as_str(),
+        item.workspace_id.as_str(),
+        item.thread_id.as_str(),
+        item.turn_id.as_str(),
+        item.item_id.as_str(),
+        item.text_hash.as_str(),
     )
     .await?
-    .context("upserted thread episodic chunk missing")
+    .context("upserted thread episodic item missing")
 }
 
-pub async fn find_chunk_by_source_identity<C: ConnectionTrait>(
+pub async fn find_item_by_source_identity<C: ConnectionTrait>(
     db: &C,
     workspace_id: &str,
     thread_id: &str,
     turn_id: &str,
     item_id: &str,
-    chunk_index: i64,
     text_hash: &str,
-) -> Result<Option<thread_episodic_chunks::Model>> {
-    thread_episodic_chunks::Entity::find()
-        .filter(thread_episodic_chunks::Column::WorkspaceId.eq(workspace_id.to_owned()))
-        .filter(thread_episodic_chunks::Column::ThreadId.eq(thread_id.to_owned()))
-        .filter(thread_episodic_chunks::Column::TurnId.eq(turn_id.to_owned()))
-        .filter(thread_episodic_chunks::Column::ItemId.eq(item_id.to_owned()))
-        .filter(thread_episodic_chunks::Column::ChunkIndex.eq(chunk_index))
-        .filter(thread_episodic_chunks::Column::TextHash.eq(text_hash.to_owned()))
+) -> Result<Option<thread_episodic_items::Model>> {
+    thread_episodic_items::Entity::find()
+        .filter(thread_episodic_items::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .filter(thread_episodic_items::Column::ThreadId.eq(thread_id.to_owned()))
+        .filter(thread_episodic_items::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(thread_episodic_items::Column::ItemId.eq(item_id.to_owned()))
+        .filter(thread_episodic_items::Column::TextHash.eq(text_hash.to_owned()))
         .one(db)
         .await
         .with_context(|| {
             format!(
-                "failed to find thread episodic chunk `{workspace_id}/{thread_id}/{turn_id}/{item_id}/{chunk_index}`"
+                "failed to find thread episodic item `{workspace_id}/{thread_id}/{turn_id}/{item_id}`"
             )
         })
 }
@@ -245,6 +254,200 @@ pub async fn list_capsules_for_thread<C: ConnectionTrait>(
         .with_context(|| {
             format!("failed to list thread episodic capsules for thread `{thread_id}`")
         })
+}
+
+pub async fn list_workspace_capsules<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    limit: u64,
+) -> Result<Vec<thread_episodic_capsules::Model>> {
+    thread_episodic_capsules::Entity::find()
+        .filter(thread_episodic_capsules::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .filter(
+            thread_episodic_capsules::Column::ThreadId
+                .eq(THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID.to_owned()),
+        )
+        .order_by_asc(thread_episodic_capsules::Column::SegmentIndex)
+        .limit(limit)
+        .all(db)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to list workspace thread episodic capsules for workspace `{workspace_id}`"
+            )
+        })
+}
+
+pub async fn list_all_capsules<C: ConnectionTrait>(
+    db: &C,
+) -> Result<Vec<thread_episodic_capsules::Model>> {
+    thread_episodic_capsules::Entity::find()
+        .order_by_asc(thread_episodic_capsules::Column::WorkspaceId)
+        .order_by_asc(thread_episodic_capsules::Column::ThreadId)
+        .order_by_asc(thread_episodic_capsules::Column::SegmentIndex)
+        .all(db)
+        .await
+        .context("failed to list thread episodic capsules")
+}
+
+pub async fn delete_all_capsules<C: ConnectionTrait>(db: &C) -> Result<u64> {
+    let result = thread_episodic_capsules::Entity::delete_many()
+        .exec(db)
+        .await
+        .context("failed to delete thread episodic capsule rows")?;
+    Ok(result.rows_affected)
+}
+
+pub async fn delete_all_items<C: ConnectionTrait>(db: &C) -> Result<u64> {
+    let result = thread_episodic_items::Entity::delete_many()
+        .exec(db)
+        .await
+        .context("failed to delete thread episodic item rows")?;
+    Ok(result.rows_affected)
+}
+
+pub async fn delete_all_exclusions<C: ConnectionTrait>(db: &C) -> Result<u64> {
+    let result = thread_episodic_exclusions::Entity::delete_many()
+        .exec(db)
+        .await
+        .context("failed to delete thread episodic exclusion rows")?;
+    Ok(result.rows_affected)
+}
+
+pub async fn delete_all_index_jobs<C: ConnectionTrait>(db: &C) -> Result<u64> {
+    let result = thread_episodic_index_jobs::Entity::delete_many()
+        .exec(db)
+        .await
+        .context("failed to delete thread episodic index jobs")?;
+    Ok(result.rows_affected)
+}
+
+pub async fn delete_all_thread_directory_entries<C: ConnectionTrait>(db: &C) -> Result<u64> {
+    let result = thread_episodic_thread_directory::Entity::delete_many()
+        .exec(db)
+        .await
+        .context("failed to delete thread episodic thread directory rows")?;
+    Ok(result.rows_affected)
+}
+
+pub async fn list_refill_workspace_ids<C: ConnectionTrait>(db: &C) -> Result<Vec<String>> {
+    thread_episodic_items::Entity::find()
+        .select_only()
+        .column(thread_episodic_items::Column::WorkspaceId)
+        .distinct()
+        .into_tuple::<String>()
+        .all(db)
+        .await
+        .context("failed to list thread episodic refill workspace ids")
+}
+
+pub async fn list_refill_threads<C: ConnectionTrait>(
+    db: &C,
+) -> Result<Vec<ThreadEpisodicRefillThread>> {
+    let rows = thread::Entity::find()
+        .select_only()
+        .columns([thread::Column::WorkspaceId, thread::Column::Id])
+        .order_by_asc(thread::Column::WorkspaceId)
+        .order_by_asc(thread::Column::Id)
+        .into_tuple::<(String, String)>()
+        .all(db)
+        .await
+        .context("failed to list thread episodic refill source threads")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(workspace_id, thread_id)| ThreadEpisodicRefillThread {
+            workspace_id,
+            thread_id,
+        })
+        .collect())
+}
+
+pub async fn count_refill_sources<C: ConnectionTrait>(
+    db: &C,
+) -> Result<ThreadEpisodicRefillSourceCounts> {
+    let rows = thread_episodic_items::Entity::find()
+        .select_only()
+        .columns([
+            thread_episodic_items::Column::WorkspaceId,
+            thread_episodic_items::Column::ThreadId,
+            thread_episodic_items::Column::TurnId,
+            thread_episodic_items::Column::ItemId,
+        ])
+        .filter(
+            thread_episodic_items::Column::Status
+                .eq(item_status_to_db(ThreadEpisodicItemStatus::PendingIndex)),
+        )
+        .filter(thread_episodic_items::Column::DeletedAt.is_null())
+        .filter(
+            thread_episodic_items::Column::Visibility.ne(item_visibility_to_db(
+                ThreadEpisodicItemVisibility::InternalHidden,
+            )),
+        )
+        .into_tuple::<(String, String, String, String)>()
+        .all(db)
+        .await
+        .context("failed to count thread episodic refill source rows")?;
+
+    let mut source_threads = HashSet::new();
+    let mut source_turns = HashSet::new();
+    for (workspace_id, thread_id, turn_id, _item_id) in rows.iter() {
+        source_threads.insert((workspace_id.clone(), thread_id.clone()));
+        source_turns.insert((workspace_id.clone(), thread_id.clone(), turn_id.clone()));
+    }
+
+    Ok(ThreadEpisodicRefillSourceCounts {
+        source_thread_count: saturating_i64_from_usize(source_threads.len()),
+        source_turn_count: saturating_i64_from_usize(source_turns.len()),
+        source_turn_item_count: saturating_i64_from_usize(rows.len()),
+    })
+}
+
+pub async fn list_refill_indexable_items<C: ConnectionTrait>(
+    db: &C,
+    limit: u64,
+) -> Result<Vec<thread_episodic_items::Model>> {
+    let items_with_jobs = Query::select()
+        .column(thread_episodic_index_jobs::Column::IndexItemId)
+        .from(thread_episodic_index_jobs::Entity)
+        .to_owned();
+
+    thread_episodic_items::Entity::find()
+        .filter(
+            thread_episodic_items::Column::Status
+                .eq(item_status_to_db(ThreadEpisodicItemStatus::PendingIndex)),
+        )
+        .filter(thread_episodic_items::Column::DeletedAt.is_null())
+        .filter(
+            thread_episodic_items::Column::Visibility.ne(item_visibility_to_db(
+                ThreadEpisodicItemVisibility::InternalHidden,
+            )),
+        )
+        .filter(thread_episodic_items::Column::Id.not_in_subquery(items_with_jobs))
+        .order_by_asc(thread_episodic_items::Column::WorkspaceId)
+        .order_by_asc(thread_episodic_items::Column::ThreadId)
+        .order_by_asc(thread_episodic_items::Column::TurnId)
+        .order_by_asc(thread_episodic_items::Column::ItemId)
+        .limit(limit)
+        .all(db)
+        .await
+        .context("failed to list thread episodic refill indexable items")
+}
+
+fn saturating_i64_from_usize(value: usize) -> i64 {
+    value.min(i64::MAX as usize) as i64
+}
+
+pub async fn count_incomplete_index_jobs<C: ConnectionTrait>(db: &C) -> Result<u64> {
+    thread_episodic_index_jobs::Entity::find()
+        .filter(thread_episodic_index_jobs::Column::Status.is_in([
+            index_job_status_to_db(ThreadEpisodicIndexJobStatus::Queued).to_owned(),
+            index_job_status_to_db(ThreadEpisodicIndexJobStatus::Running).to_owned(),
+            index_job_status_to_db(ThreadEpisodicIndexJobStatus::Failed).to_owned(),
+        ]))
+        .count(db)
+        .await
+        .context("failed to count incomplete thread episodic index jobs")
 }
 
 pub async fn transition_capsule_write_state<C: ConnectionTrait>(
@@ -318,10 +521,10 @@ pub async fn update_capsule_capacity_metadata<C: ConnectionTrait>(
             thread_episodic_capsules::Column::UpdatedAt,
             Expr::value(now),
         );
-    if let Some(active_chunk_count) = update.active_chunk_count {
+    if let Some(active_frame_count) = update.active_frame_count {
         query = query.col_expr(
-            thread_episodic_capsules::Column::ActiveChunkCount,
-            Expr::value(active_chunk_count),
+            thread_episodic_capsules::Column::ActiveFrameCount,
+            Expr::value(active_frame_count),
         );
     }
     query
@@ -370,61 +573,57 @@ pub async fn update_capsule_metadata_json<C: ConnectionTrait>(
         })
 }
 
-pub async fn find_chunk_by_id<C: ConnectionTrait>(
+pub async fn find_item_by_id<C: ConnectionTrait>(
     db: &C,
-    chunk_id: &str,
-) -> Result<Option<thread_episodic_chunks::Model>> {
-    thread_episodic_chunks::Entity::find_by_id(chunk_id.to_owned())
+    index_item_id: &str,
+) -> Result<Option<thread_episodic_items::Model>> {
+    thread_episodic_items::Entity::find_by_id(index_item_id.to_owned())
         .one(db)
         .await
-        .with_context(|| format!("failed to find thread episodic chunk `{chunk_id}`"))
+        .with_context(|| format!("failed to find thread episodic item `{index_item_id}`"))
 }
 
-pub async fn list_chunks_for_thread<C: ConnectionTrait>(
+pub async fn list_items_for_thread<C: ConnectionTrait>(
     db: &C,
     workspace_id: &str,
     thread_id: &str,
     limit: u64,
-) -> Result<Vec<thread_episodic_chunks::Model>> {
-    thread_episodic_chunks::Entity::find()
-        .filter(thread_episodic_chunks::Column::WorkspaceId.eq(workspace_id.to_owned()))
-        .filter(thread_episodic_chunks::Column::ThreadId.eq(thread_id.to_owned()))
-        .order_by_asc(thread_episodic_chunks::Column::TurnId)
-        .order_by_asc(thread_episodic_chunks::Column::ItemId)
-        .order_by_asc(thread_episodic_chunks::Column::ChunkIndex)
+) -> Result<Vec<thread_episodic_items::Model>> {
+    thread_episodic_items::Entity::find()
+        .filter(thread_episodic_items::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .filter(thread_episodic_items::Column::ThreadId.eq(thread_id.to_owned()))
+        .order_by_asc(thread_episodic_items::Column::TurnId)
+        .order_by_asc(thread_episodic_items::Column::ItemId)
         .limit(limit)
         .all(db)
         .await
-        .with_context(|| format!("failed to list thread episodic chunks for thread `{thread_id}`"))
+        .with_context(|| format!("failed to list thread episodic items for thread `{thread_id}`"))
 }
 
-pub async fn list_recallable_chunks_for_thread<C: ConnectionTrait>(
+pub async fn list_recallable_items_for_thread<C: ConnectionTrait>(
     db: &C,
     workspace_id: &str,
     thread_id: &str,
     limit: u64,
-) -> Result<Vec<thread_episodic_chunks::Model>> {
-    thread_episodic_chunks::Entity::find()
-        .filter(thread_episodic_chunks::Column::WorkspaceId.eq(workspace_id.to_owned()))
-        .filter(thread_episodic_chunks::Column::ThreadId.eq(thread_id.to_owned()))
+) -> Result<Vec<thread_episodic_items::Model>> {
+    thread_episodic_items::Entity::find()
+        .filter(thread_episodic_items::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .filter(thread_episodic_items::Column::ThreadId.eq(thread_id.to_owned()))
+        .filter(thread_episodic_items::Column::Status.eq(item_status_to_db(
+            crate::thread_episodic::ThreadEpisodicItemStatus::Active,
+        )))
         .filter(
-            thread_episodic_chunks::Column::Status.eq(chunk_status_to_db(
-                crate::thread_episodic::ThreadEpisodicChunkStatus::Active,
+            thread_episodic_items::Column::Visibility.ne(item_visibility_to_db(
+                crate::thread_episodic::ThreadEpisodicItemVisibility::InternalHidden,
             )),
         )
-        .filter(
-            thread_episodic_chunks::Column::Visibility.ne(chunk_visibility_to_db(
-                crate::thread_episodic::ThreadEpisodicChunkVisibility::InternalHidden,
-            )),
-        )
-        .order_by_asc(thread_episodic_chunks::Column::TurnId)
-        .order_by_asc(thread_episodic_chunks::Column::ItemId)
-        .order_by_asc(thread_episodic_chunks::Column::ChunkIndex)
+        .order_by_asc(thread_episodic_items::Column::TurnId)
+        .order_by_asc(thread_episodic_items::Column::ItemId)
         .limit(limit)
         .all(db)
         .await
         .with_context(|| {
-            format!("failed to list recallable thread episodic chunks for thread `{thread_id}`")
+            format!("failed to list recallable thread episodic items for thread `{thread_id}`")
         })
 }
 
@@ -438,16 +637,18 @@ pub async fn find_index_job_by_id<C: ConnectionTrait>(
         .with_context(|| format!("failed to find thread episodic index job `{job_id}`"))
 }
 
-pub async fn find_index_job_by_chunk<C: ConnectionTrait>(
+pub async fn find_index_job_by_index_item<C: ConnectionTrait>(
     db: &C,
-    chunk_id: &str,
+    index_item_id: &str,
 ) -> Result<Option<thread_episodic_index_jobs::Model>> {
     thread_episodic_index_jobs::Entity::find()
-        .filter(thread_episodic_index_jobs::Column::ChunkId.eq(chunk_id.to_owned()))
+        .filter(thread_episodic_index_jobs::Column::IndexItemId.eq(index_item_id.to_owned()))
         .order_by_asc(thread_episodic_index_jobs::Column::CreatedAt)
         .one(db)
         .await
-        .with_context(|| format!("failed to find thread episodic index job for chunk `{chunk_id}`"))
+        .with_context(|| {
+            format!("failed to find thread episodic index job for item `{index_item_id}`")
+        })
 }
 
 pub async fn insert_index_job_if_absent<C: ConnectionTrait>(
@@ -455,7 +656,7 @@ pub async fn insert_index_job_if_absent<C: ConnectionTrait>(
     job: NewThreadEpisodicIndexJobRecord,
     now: DateTimeWithTimeZone,
 ) -> Result<thread_episodic_index_jobs::Model> {
-    if let Some(existing) = find_index_job_by_chunk(db, job.chunk_id.as_str()).await? {
+    if let Some(existing) = find_index_job_by_index_item(db, job.index_item_id.as_str()).await? {
         return Ok(existing);
     }
 
@@ -467,7 +668,7 @@ pub async fn insert_index_job_if_absent<C: ConnectionTrait>(
         id: Set(id),
         workspace_id: Set(job.workspace_id),
         thread_id: Set(job.thread_id),
-        chunk_id: Set(job.chunk_id.clone()),
+        index_item_id: Set(job.index_item_id.clone()),
         capsule_id: Set(job.capsule_id),
         capsule_ref: Set(job.capsule_ref),
         segment_index: Set(job.segment_index),
@@ -489,12 +690,12 @@ pub async fn insert_index_job_if_absent<C: ConnectionTrait>(
     .await
     .with_context(|| {
         format!(
-            "failed to insert thread episodic index job for chunk `{}`",
-            job.chunk_id
+            "failed to insert thread episodic index job for item `{}`",
+            job.index_item_id
         )
     })?;
 
-    find_index_job_by_chunk(db, job.chunk_id.as_str())
+    find_index_job_by_index_item(db, job.index_item_id.as_str())
         .await?
         .context("inserted thread episodic index job missing")
 }
@@ -553,7 +754,7 @@ pub async fn upsert_thread_directory_entry<C: ConnectionTrait>(
             thread_created_at: Set(record.thread_created_at),
             thread_updated_at: Set(record.thread_updated_at),
             last_indexed_at: Set(record.last_indexed_at),
-            indexed_chunk_count: Set(record.indexed_chunk_count),
+            indexed_item_count: Set(record.indexed_item_count),
             task_affinity_json: Set(record.task_affinity_json),
             project_affinity_json: Set(record.project_affinity_json),
             visibility: Set(thread_directory_visibility_to_db(record.visibility).to_owned()),
@@ -574,7 +775,7 @@ pub async fn upsert_thread_directory_entry<C: ConnectionTrait>(
             thread_episodic_thread_directory::Column::ThreadCreatedAt,
             thread_episodic_thread_directory::Column::ThreadUpdatedAt,
             thread_episodic_thread_directory::Column::LastIndexedAt,
-            thread_episodic_thread_directory::Column::IndexedChunkCount,
+            thread_episodic_thread_directory::Column::IndexedItemCount,
             thread_episodic_thread_directory::Column::TaskAffinityJson,
             thread_episodic_thread_directory::Column::ProjectAffinityJson,
             thread_episodic_thread_directory::Column::Visibility,
@@ -611,7 +812,7 @@ pub async fn list_selectable_thread_directory_entries<C: ConnectionTrait>(
             .filter(thread_episodic_thread_directory::Column::Visibility.eq(
                 thread_directory_visibility_to_db(ThreadEpisodicThreadDirectoryVisibility::Visible),
             ))
-            .filter(thread_episodic_thread_directory::Column::IndexedChunkCount.gt(0));
+            .filter(thread_episodic_thread_directory::Column::IndexedItemCount.gt(0));
     if !selection.exclude_thread_ids.is_empty() {
         query = query.filter(
             thread_episodic_thread_directory::Column::ThreadId
@@ -651,22 +852,22 @@ pub async fn list_thread_directory_entries_for_workspace<C: ConnectionTrait>(
         })
 }
 
-pub async fn count_active_chunks_for_thread<C: ConnectionTrait>(
+pub async fn count_active_items_for_thread<C: ConnectionTrait>(
     db: &C,
     workspace_id: &str,
     thread_id: &str,
 ) -> Result<i64> {
-    let count = thread_episodic_chunks::Entity::find()
-        .filter(thread_episodic_chunks::Column::WorkspaceId.eq(workspace_id.to_owned()))
-        .filter(thread_episodic_chunks::Column::ThreadId.eq(thread_id.to_owned()))
+    let count = thread_episodic_items::Entity::find()
+        .filter(thread_episodic_items::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .filter(thread_episodic_items::Column::ThreadId.eq(thread_id.to_owned()))
         .filter(
-            thread_episodic_chunks::Column::Status
-                .eq(chunk_status_to_db(ThreadEpisodicChunkStatus::Active)),
+            thread_episodic_items::Column::Status
+                .eq(item_status_to_db(ThreadEpisodicItemStatus::Active)),
         )
         .count(db)
         .await
         .with_context(|| {
-            format!("failed to count active thread episodic chunks for thread `{thread_id}`")
+            format!("failed to count active thread episodic items for thread `{thread_id}`")
         })?;
     Ok(count.min(i64::MAX as u64) as i64)
 }
@@ -868,17 +1069,17 @@ pub async fn mark_index_job_canceled<C: ConnectionTrait>(
     Ok(Some(row))
 }
 
-pub async fn mark_chunk_indexed<C: ConnectionTrait>(
+pub async fn mark_item_indexed<C: ConnectionTrait>(
     db: &C,
-    chunk_id: &str,
-    update: ThreadEpisodicChunkIndexedUpdate,
+    index_item_id: &str,
+    update: ThreadEpisodicItemIndexedUpdate,
     now: DateTimeWithTimeZone,
-) -> Result<Option<thread_episodic_chunks::Model>> {
-    let Some(row) = find_chunk_by_id(db, chunk_id).await? else {
+) -> Result<Option<thread_episodic_items::Model>> {
+    let Some(row) = find_item_by_id(db, index_item_id).await? else {
         return Ok(None);
     };
     let mut active = row.into_active_model();
-    active.status = Set(chunk_status_to_db(ThreadEpisodicChunkStatus::Active).to_owned());
+    active.status = Set(item_status_to_db(ThreadEpisodicItemStatus::Active).to_owned());
     active.capsule_id = Set(Some(update.capsule_id));
     active.capsule_ref = Set(Some(update.capsule_ref));
     active.segment_index = Set(Some(update.segment_index));
@@ -886,93 +1087,91 @@ pub async fn mark_chunk_indexed<C: ConnectionTrait>(
     active.frame_uri = Set(Some(update.frame_uri));
     active.indexed_at = Set(Some(now));
     active.updated_at = Set(now);
-    let row = active
-        .update(db)
-        .await
-        .with_context(|| format!("failed to mark thread episodic chunk `{chunk_id}` indexed"))?;
+    let row = active.update(db).await.with_context(|| {
+        format!("failed to mark thread episodic item `{index_item_id}` indexed")
+    })?;
     Ok(Some(row))
 }
 
-pub async fn mark_chunk_failed<C: ConnectionTrait>(
+pub async fn mark_item_failed<C: ConnectionTrait>(
     db: &C,
-    chunk_id: &str,
+    index_item_id: &str,
     now: DateTimeWithTimeZone,
-) -> Result<Option<thread_episodic_chunks::Model>> {
-    let Some(row) = find_chunk_by_id(db, chunk_id).await? else {
+) -> Result<Option<thread_episodic_items::Model>> {
+    let Some(row) = find_item_by_id(db, index_item_id).await? else {
         return Ok(None);
     };
     let mut active = row.into_active_model();
-    active.status = Set(chunk_status_to_db(ThreadEpisodicChunkStatus::Failed).to_owned());
+    active.status = Set(item_status_to_db(ThreadEpisodicItemStatus::Failed).to_owned());
     active.updated_at = Set(now);
     let row = active
         .update(db)
         .await
-        .with_context(|| format!("failed to mark thread episodic chunk `{chunk_id}` failed"))?;
+        .with_context(|| format!("failed to mark thread episodic item `{index_item_id}` failed"))?;
     Ok(Some(row))
 }
 
-pub async fn mark_chunks_deleted_by_source_item<C: ConnectionTrait>(
+pub async fn mark_items_deleted_by_source_item<C: ConnectionTrait>(
     db: &C,
     workspace_id: &str,
     thread_id: &str,
     turn_id: &str,
     item_id: &str,
     now: DateTimeWithTimeZone,
-) -> Result<Vec<thread_episodic_chunks::Model>> {
-    let rows = thread_episodic_chunks::Entity::find()
-        .filter(thread_episodic_chunks::Column::WorkspaceId.eq(workspace_id.to_owned()))
-        .filter(thread_episodic_chunks::Column::ThreadId.eq(thread_id.to_owned()))
-        .filter(thread_episodic_chunks::Column::TurnId.eq(turn_id.to_owned()))
-        .filter(thread_episodic_chunks::Column::ItemId.eq(item_id.to_owned()))
+) -> Result<Vec<thread_episodic_items::Model>> {
+    let rows = thread_episodic_items::Entity::find()
+        .filter(thread_episodic_items::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .filter(thread_episodic_items::Column::ThreadId.eq(thread_id.to_owned()))
+        .filter(thread_episodic_items::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(thread_episodic_items::Column::ItemId.eq(item_id.to_owned()))
         .all(db)
         .await
         .with_context(|| {
             format!(
-                "failed to list thread episodic chunks for deleted item `{workspace_id}/{thread_id}/{turn_id}/{item_id}`"
+                "failed to list thread episodic items for deleted item `{workspace_id}/{thread_id}/{turn_id}/{item_id}`"
             )
         })?;
-    mark_chunk_rows_deleted(db, rows, now).await
+    mark_item_rows_deleted(db, rows, now).await
 }
 
-pub async fn mark_chunks_deleted_for_thread<C: ConnectionTrait>(
+pub async fn mark_items_deleted_for_thread<C: ConnectionTrait>(
     db: &C,
     workspace_id: &str,
     thread_id: &str,
     now: DateTimeWithTimeZone,
-) -> Result<Vec<thread_episodic_chunks::Model>> {
-    let rows = thread_episodic_chunks::Entity::find()
-        .filter(thread_episodic_chunks::Column::WorkspaceId.eq(workspace_id.to_owned()))
-        .filter(thread_episodic_chunks::Column::ThreadId.eq(thread_id.to_owned()))
+) -> Result<Vec<thread_episodic_items::Model>> {
+    let rows = thread_episodic_items::Entity::find()
+        .filter(thread_episodic_items::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .filter(thread_episodic_items::Column::ThreadId.eq(thread_id.to_owned()))
         .all(db)
         .await
         .with_context(|| {
             format!(
-                "failed to list thread episodic chunks for deleted thread `{workspace_id}/{thread_id}`"
+                "failed to list thread episodic items for deleted thread `{workspace_id}/{thread_id}`"
             )
         })?;
-    mark_chunk_rows_deleted(db, rows, now).await
+    mark_item_rows_deleted(db, rows, now).await
 }
 
-async fn mark_chunk_rows_deleted<C: ConnectionTrait>(
+async fn mark_item_rows_deleted<C: ConnectionTrait>(
     db: &C,
-    rows: Vec<thread_episodic_chunks::Model>,
+    rows: Vec<thread_episodic_items::Model>,
     now: DateTimeWithTimeZone,
-) -> Result<Vec<thread_episodic_chunks::Model>> {
+) -> Result<Vec<thread_episodic_items::Model>> {
     let mut updated = Vec::with_capacity(rows.len());
     for row in rows {
-        if row.status == chunk_status_to_db(ThreadEpisodicChunkStatus::Deleted) {
+        if row.status == item_status_to_db(ThreadEpisodicItemStatus::Deleted) {
             updated.push(row);
             continue;
         }
-        let chunk_id = row.id.clone();
+        let index_item_id = row.id.clone();
         let mut active = row.into_active_model();
-        active.status = Set(chunk_status_to_db(ThreadEpisodicChunkStatus::Deleted).to_owned());
+        active.status = Set(item_status_to_db(ThreadEpisodicItemStatus::Deleted).to_owned());
         active.deleted_at = Set(Some(now));
         active.updated_at = Set(now);
-        let row = active
-            .update(db)
-            .await
-            .with_context(|| format!("failed to tombstone thread episodic chunk `{chunk_id}`"))?;
+        let row = active.update(db).await.with_context(|| {
+            format!("failed to tombstone thread episodic item `{index_item_id}`")
+        })?;
         updated.push(row);
     }
     Ok(updated)
@@ -992,19 +1191,21 @@ fn active_capacity_error_count(active: &thread_episodic_index_jobs::ActiveModel)
     }
 }
 
-pub async fn find_exclusion_by_chunk<C: ConnectionTrait>(
+pub async fn find_exclusion_by_index_item<C: ConnectionTrait>(
     db: &C,
     workspace_id: &str,
     thread_id: &str,
-    chunk_id: &str,
+    index_item_id: &str,
 ) -> Result<Option<thread_episodic_exclusions::Model>> {
     thread_episodic_exclusions::Entity::find()
         .filter(thread_episodic_exclusions::Column::WorkspaceId.eq(workspace_id.to_owned()))
         .filter(thread_episodic_exclusions::Column::ThreadId.eq(thread_id.to_owned()))
-        .filter(thread_episodic_exclusions::Column::ChunkId.eq(chunk_id.to_owned()))
+        .filter(thread_episodic_exclusions::Column::IndexItemId.eq(index_item_id.to_owned()))
         .one(db)
         .await
-        .with_context(|| format!("failed to find thread episodic exclusion for chunk `{chunk_id}`"))
+        .with_context(|| {
+            format!("failed to find thread episodic exclusion for item `{index_item_id}`")
+        })
 }
 
 pub async fn insert_exclusion_if_absent<C: ConnectionTrait>(
@@ -1012,11 +1213,11 @@ pub async fn insert_exclusion_if_absent<C: ConnectionTrait>(
     exclusion: NewThreadEpisodicExclusionRecord,
     now: DateTimeWithTimeZone,
 ) -> Result<thread_episodic_exclusions::Model> {
-    if let Some(existing) = find_exclusion_by_chunk(
+    if let Some(existing) = find_exclusion_by_index_item(
         db,
         exclusion.workspace_id.as_str(),
         exclusion.thread_id.as_str(),
-        exclusion.chunk_id.as_str(),
+        exclusion.index_item_id.as_str(),
     )
     .await?
     {
@@ -1031,7 +1232,7 @@ pub async fn insert_exclusion_if_absent<C: ConnectionTrait>(
         id: Set(id),
         workspace_id: Set(exclusion.workspace_id.clone()),
         thread_id: Set(exclusion.thread_id.clone()),
-        chunk_id: Set(exclusion.chunk_id.clone()),
+        index_item_id: Set(exclusion.index_item_id.clone()),
         reason: Set(exclusion_reason_to_db(exclusion.reason).to_owned()),
         created_by: Set(exclusion.created_by),
         created_at: Set(now),
@@ -1040,22 +1241,22 @@ pub async fn insert_exclusion_if_absent<C: ConnectionTrait>(
     .await
     .with_context(|| {
         format!(
-            "failed to insert thread episodic exclusion for chunk `{}`",
-            exclusion.chunk_id
+            "failed to insert thread episodic exclusion for item `{}`",
+            exclusion.index_item_id
         )
     })?;
 
-    find_exclusion_by_chunk(
+    find_exclusion_by_index_item(
         db,
         exclusion.workspace_id.as_str(),
         exclusion.thread_id.as_str(),
-        exclusion.chunk_id.as_str(),
+        exclusion.index_item_id.as_str(),
     )
     .await?
     .ok_or_else(|| {
         anyhow::anyhow!(
-            "inserted thread episodic exclusion for chunk `{}` was not found",
-            exclusion.chunk_id
+            "inserted thread episodic exclusion for item `{}` was not found",
+            exclusion.index_item_id
         )
     })
 }

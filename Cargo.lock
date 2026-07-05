@@ -6172,9 +6172,8 @@ dependencies = [
 
 [[package]]
 name = "memvid-core"
-version = "2.0.140"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1d781d355751509b0a845a9203eb2db5a4e2b9750f193380439378a61080f85"
+version = "3.1.0"
+source = "git+https://github.com/pioneerdotai/memory?tag=v3.1.0#4f6d5cabebdbc7b9b049275625999a5ca935e304"
 dependencies = [
  "atomic-write-file",
  "base64 0.22.1",
@@ -7943,6 +7942,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "flate2",
+ "fs4",
  "futures-util",
  "hex",
  "jsonwebtoken",

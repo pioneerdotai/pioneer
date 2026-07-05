@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "VoiceSessionStartContext",
+  "description": "Minimal context required to route and own a streaming voice session.\n\nFull turn materialization context is provided on commit/finalize so clients can\nstart microphone streaming before slower attachment/capability preparation.",
+  "type": "object",
+  "properties": {
+    "thread_id": {
+      "type": "string"
+    },
+    "turn_id": {
+      "type": "string"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_id",
+    "thread_id",
+    "turn_id"
+  ]
+}

@@ -4,7 +4,7 @@ use memvid_core::{
     SearchEngineKind, SearchHit, SearchRequest, TemporalFilter,
 };
 use pioneer_protocol::{
-    ThreadEpisodicAdaptiveStrategy, ThreadEpisodicChunkStatus, ThreadEpisodicScoreBreakdown,
+    ThreadEpisodicAdaptiveStrategy, ThreadEpisodicItemStatus, ThreadEpisodicScoreBreakdown,
     ThreadEpisodicSearchMode, ThreadEpisodicSourceContext, ThreadEpisodicVisibility,
 };
 use serde::{Deserialize, Serialize};
@@ -17,7 +17,7 @@ use tokio::sync::Mutex;
 
 const THREAD_EPISODIC_SCHEMA_VERSION: &str = "1";
 const THREAD_EPISODIC_TRACK: &str = "pioneer_thread_episodic";
-const THREAD_EPISODIC_KIND: &str = "pioneer.thread_episodic.chunk";
+const THREAD_EPISODIC_KIND: &str = "pioneer.thread_episodic.item";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -145,7 +145,8 @@ pub struct ThreadEpisodicMemvidIndexRequest {
     pub storage_uri: String,
     pub capsule_id: String,
     pub capsule_ref: String,
-    pub chunk_id: String,
+    pub workspace_capsule: bool,
+    pub index_item_id: String,
     pub frame_uri: String,
     pub text: String,
     pub metadata: BTreeMap<String, String>,
@@ -447,7 +448,7 @@ pub struct ThreadEpisodicExactSourceTarget {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chunk_id: Option<String>,
+    pub index_item_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -455,6 +456,8 @@ pub struct ThreadEpisodicMemvidSearchRequest {
     pub workspace_id: String,
     pub thread_id: String,
     pub query: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
     pub profile: ThreadEpisodicSearchProfile,
     #[serde(default)]
     pub segments: Vec<ThreadEpisodicMemvidSearchSegment>,
@@ -468,14 +471,12 @@ pub struct ThreadEpisodicMemvidSearchHit {
     pub thread_id: String,
     pub turn_id: String,
     pub item_id: String,
-    pub chunk_id: String,
-    pub chunk_index: i64,
-    pub chunk_count: i64,
+    pub index_item_id: String,
     pub source_actor_role: String,
     pub source_runtime_kind: String,
     pub source_context: ThreadEpisodicSourceContext,
     pub visibility: ThreadEpisodicVisibility,
-    pub status: ThreadEpisodicChunkStatus,
+    pub status: ThreadEpisodicItemStatus,
     pub segment_index: i64,
     pub capsule_id: String,
     pub capsule_ref: String,
@@ -512,7 +513,7 @@ pub enum ThreadEpisodicCandidateSuppressionReason {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadEpisodicCandidateSuppression {
-    pub chunk_id: String,
+    pub index_item_id: String,
     pub reason: ThreadEpisodicCandidateSuppressionReason,
 }
 
@@ -558,7 +559,7 @@ pub struct ThreadEpisodicRankingContext {
 pub trait ThreadEpisodicMemvidBackend: Send + Sync {
     fn capabilities(&self) -> ThreadEpisodicMemvidBackendCapabilities;
 
-    async fn index_chunk(
+    async fn index_item(
         &self,
         request: ThreadEpisodicMemvidIndexRequest,
     ) -> Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError>;
@@ -610,7 +611,7 @@ impl ThreadEpisodicMemvidBackend for MemvidThreadEpisodicBackend {
         self.capabilities.clone()
     }
 
-    async fn index_chunk(
+    async fn index_item(
         &self,
         request: ThreadEpisodicMemvidIndexRequest,
     ) -> Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError> {
@@ -633,7 +634,7 @@ impl ThreadEpisodicMemvidBackend for MemvidThreadEpisodicBackend {
         let path_for_task = path.clone();
         let request_for_task = request.clone();
 
-        tokio::task::spawn_blocking(move || index_chunk_blocking(path_for_task, request_for_task))
+        tokio::task::spawn_blocking(move || index_item_blocking(path_for_task, request_for_task))
             .await
             .map_err(|error| {
                 ThreadEpisodicMemvidError::retryable(format!(
@@ -669,8 +670,11 @@ impl ThreadEpisodicMemvidBackend for MemvidThreadEpisodicBackend {
             let lock = self.lock_for_path(path.as_path()).await;
             let _guard = lock.lock().await;
             let path_for_task = path.clone();
-            let search_request =
-                memvid_thread_episodic_search_request(&request.profile, &request.query);
+            let search_request = memvid_thread_episodic_search_request(
+                &request.profile,
+                &request.query,
+                request.scope.as_deref(),
+            );
             let segment_for_task = segment.clone();
             let workspace_id = request.workspace_id.clone();
             let thread_id = request.thread_id.clone();
@@ -708,7 +712,7 @@ impl ThreadEpisodicMemvidBackend for MemvidThreadEpisodicBackend {
                 .partial_cmp(&score_or_zero(left.memvid_score))
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| right.segment_index.cmp(&left.segment_index))
-                .then_with(|| left.chunk_id.cmp(&right.chunk_id))
+                .then_with(|| left.index_item_id.cmp(&right.index_item_id))
         });
 
         let scores = raw_hits
@@ -754,11 +758,11 @@ impl ThreadEpisodicMemvidBackend for MemvidThreadEpisodicBackend {
     }
 }
 
-fn index_chunk_blocking(
+fn index_item_blocking(
     path: PathBuf,
     request: ThreadEpisodicMemvidIndexRequest,
 ) -> Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError> {
-    let mut memvid = open_or_create_memvid(path.as_path())?;
+    let mut memvid = open_or_create_memvid(path.as_path(), request.workspace_capsule)?;
     let options = index_put_options(&request);
     let payload = request.text.as_bytes().to_vec();
     match memvid.frame_by_uri(request.frame_uri.as_str()) {
@@ -778,19 +782,14 @@ fn index_chunk_blocking(
         .frame_by_uri(request.frame_uri.as_str())
         .map_err(classify_memvid_error)?;
     let stats = memvid.stats().map_err(classify_memvid_error)?;
+    let stats = thread_episodic_stats_from_memvid(stats)?;
+
     Ok(ThreadEpisodicMemvidIndexOutput {
         frame_id: i64::try_from(frame.id).map_err(|_| {
             ThreadEpisodicMemvidError::non_retryable("thread episodic frame id does not fit i64")
         })?,
         frame_uri: request.frame_uri,
-        stats: ThreadEpisodicMemvidStats {
-            active_frame_count: Some(i64_from_u64(stats.active_frame_count)?),
-            frame_count: Some(i64_from_u64(stats.frame_count)?),
-            size_bytes: Some(i64_from_u64(stats.size_bytes)?),
-            capacity_bytes: Some(i64_from_u64(stats.capacity_bytes)?),
-            remaining_capacity_bytes: Some(i64_from_u64(stats.remaining_capacity_bytes)?),
-            utilization_percent: Some(stats.storage_utilisation_percent),
-        },
+        stats,
     })
 }
 
@@ -835,8 +834,8 @@ fn search_hit_to_thread_episodic_hit(
         .get("pioneer.thread_episodic.thread_id")
         .cloned()
         .unwrap_or_else(|| thread_id.to_owned());
-    let chunk_id = metadata
-        .get("pioneer.thread_episodic.chunk_id")
+    let index_item_id = metadata
+        .get("pioneer.thread_episodic.index_item_id")
         .cloned()
         .or_else(|| hit.title.clone())
         .unwrap_or_else(|| hit.uri.clone());
@@ -850,8 +849,8 @@ fn search_hit_to_thread_episodic_hit(
         .unwrap_or(ThreadEpisodicVisibility::UserVisible);
     let status = metadata
         .get("pioneer.thread_episodic.status")
-        .and_then(|value| parse_thread_episodic_chunk_status(value))
-        .unwrap_or(ThreadEpisodicChunkStatus::Active);
+        .and_then(|value| parse_thread_episodic_item_status(value))
+        .unwrap_or(ThreadEpisodicItemStatus::Active);
     let score = hit.score;
     let lexical_score = match engine {
         SearchEngineKind::Tantivy | SearchEngineKind::LexFallback => score,
@@ -868,11 +867,7 @@ fn search_hit_to_thread_episodic_hit(
             .get("pioneer.thread_episodic.item_id")
             .cloned()
             .unwrap_or_default(),
-        chunk_id,
-        chunk_index: parse_i64_metadata(&metadata, "pioneer.thread_episodic.chunk_index")
-            .unwrap_or_default(),
-        chunk_count: parse_i64_metadata(&metadata, "pioneer.thread_episodic.chunk_count")
-            .unwrap_or(1),
+        index_item_id,
         source_actor_role: metadata
             .get("pioneer.thread_episodic.source_actor_role")
             .cloned()
@@ -902,13 +897,14 @@ fn search_hit_to_thread_episodic_hit(
 fn memvid_thread_episodic_search_request(
     profile: &ThreadEpisodicSearchProfile,
     query: &str,
+    scope: Option<&str>,
 ) -> SearchRequest {
     SearchRequest {
         query: query.to_owned(),
         top_k: profile.max_candidates as usize,
         snippet_chars: profile.snippet_chars as usize,
         uri: None,
-        scope: None,
+        scope: scope.map(str::to_owned),
         cursor: None,
         temporal: profile.recent_start_unix.map(|start_utc| TemporalFilter {
             start_utc: Some(start_utc),
@@ -942,24 +938,24 @@ pub fn filter_thread_episodic_search_candidates(
             Some(ThreadEpisodicCandidateSuppressionReason::HiddenOrInternal)
         } else {
             match hit.status {
-                ThreadEpisodicChunkStatus::Deleted => {
+                ThreadEpisodicItemStatus::Deleted => {
                     Some(ThreadEpisodicCandidateSuppressionReason::Deleted)
                 }
-                ThreadEpisodicChunkStatus::Excluded => {
+                ThreadEpisodicItemStatus::Excluded => {
                     Some(ThreadEpisodicCandidateSuppressionReason::Excluded)
                 }
-                ThreadEpisodicChunkStatus::IndexFailed => {
+                ThreadEpisodicItemStatus::IndexFailed => {
                     Some(ThreadEpisodicCandidateSuppressionReason::IndexFailed)
                 }
-                ThreadEpisodicChunkStatus::PendingIndex | ThreadEpisodicChunkStatus::Unknown => {
+                ThreadEpisodicItemStatus::PendingIndex | ThreadEpisodicItemStatus::Unknown => {
                     Some(ThreadEpisodicCandidateSuppressionReason::PendingIndex)
                 }
-                ThreadEpisodicChunkStatus::Indexed | ThreadEpisodicChunkStatus::Active => None,
+                ThreadEpisodicItemStatus::Indexed | ThreadEpisodicItemStatus::Active => None,
             }
         };
         if let Some(reason) = reason {
             suppressions.push(ThreadEpisodicCandidateSuppression {
-                chunk_id: hit.chunk_id,
+                index_item_id: hit.index_item_id,
                 reason,
             });
         } else {
@@ -1010,7 +1006,7 @@ pub fn rank_thread_episodic_search_hits(
             .partial_cmp(&left.score_breakdown.final_score)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| right.hit.segment_index.cmp(&left.hit.segment_index))
-            .then_with(|| left.hit.chunk_id.cmp(&right.hit.chunk_id))
+            .then_with(|| left.hit.index_item_id.cmp(&right.hit.index_item_id))
     });
     ranked
 }
@@ -1018,7 +1014,7 @@ pub fn rank_thread_episodic_search_hits(
 fn index_put_options(request: &ThreadEpisodicMemvidIndexRequest) -> PutOptions {
     let mut builder = PutOptions::builder()
         .uri(request.frame_uri.as_str())
-        .title(request.chunk_id.as_str())
+        .title(request.index_item_id.as_str())
         .track(THREAD_EPISODIC_TRACK)
         .kind(THREAD_EPISODIC_KIND)
         .tag(
@@ -1034,8 +1030,8 @@ fn index_put_options(request: &ThreadEpisodicMemvidIndexRequest) -> PutOptions {
             request.capsule_ref.as_str(),
         )
         .tag(
-            "pioneer.thread_episodic.chunk_id",
-            request.chunk_id.as_str(),
+            "pioneer.thread_episodic.index_item_id",
+            request.index_item_id.as_str(),
         )
         .metadata(DocMetadata {
             mime: Some("text/plain; charset=utf-8".to_owned()),
@@ -1146,14 +1142,14 @@ fn parse_thread_episodic_visibility(value: &str) -> Option<ThreadEpisodicVisibil
     }
 }
 
-fn parse_thread_episodic_chunk_status(value: &str) -> Option<ThreadEpisodicChunkStatus> {
+fn parse_thread_episodic_item_status(value: &str) -> Option<ThreadEpisodicItemStatus> {
     match value {
-        "indexed" => Some(ThreadEpisodicChunkStatus::Indexed),
-        "active" => Some(ThreadEpisodicChunkStatus::Active),
-        "pending_index" => Some(ThreadEpisodicChunkStatus::PendingIndex),
-        "deleted" => Some(ThreadEpisodicChunkStatus::Deleted),
-        "excluded" => Some(ThreadEpisodicChunkStatus::Excluded),
-        "index_failed" | "failed" => Some(ThreadEpisodicChunkStatus::IndexFailed),
+        "indexed" => Some(ThreadEpisodicItemStatus::Indexed),
+        "active" => Some(ThreadEpisodicItemStatus::Active),
+        "pending_index" => Some(ThreadEpisodicItemStatus::PendingIndex),
+        "deleted" => Some(ThreadEpisodicItemStatus::Deleted),
+        "excluded" => Some(ThreadEpisodicItemStatus::Excluded),
+        "index_failed" | "failed" => Some(ThreadEpisodicItemStatus::IndexFailed),
         _ => None,
     }
 }
@@ -1164,9 +1160,9 @@ fn exact_source_boost(
 ) -> Option<f32> {
     let exact_source = exact_source?;
     if exact_source
-        .chunk_id
+        .index_item_id
         .as_deref()
-        .is_some_and(|chunk_id| chunk_id == hit.chunk_id)
+        .is_some_and(|index_item_id| index_item_id == hit.index_item_id)
     {
         return Some(2.0);
     }
@@ -1209,19 +1205,39 @@ fn source_role_boost(source_actor_role: &str) -> Option<f32> {
     match source_actor_role {
         "user" => Some(0.08),
         "assistant" => Some(0.05),
-        "tool" | "tool_summary" => Some(0.03),
         "task" | "task_summary" => Some(0.03),
         "system_visible" | "generated_summary" => Some(0.04),
         _ => None,
     }
 }
 
-fn open_or_create_memvid(path: &Path) -> Result<Memvid, ThreadEpisodicMemvidError> {
+fn open_or_create_memvid(
+    path: &Path,
+    _workspace_capsule: bool,
+) -> Result<Memvid, ThreadEpisodicMemvidError> {
     if path.exists() {
         Memvid::open(path).map_err(classify_memvid_error)
     } else {
         Memvid::create(path).map_err(classify_memvid_error)
     }
+}
+
+fn thread_episodic_stats_from_memvid(
+    stats: memvid_core::Stats,
+) -> Result<ThreadEpisodicMemvidStats, ThreadEpisodicMemvidError> {
+    let capacity_bytes = optional_i64_from_unlimited_capacity(stats.capacity_bytes)?;
+    let remaining_capacity_bytes = optional_i64_from_capacity_bound_stat(
+        stats.remaining_capacity_bytes,
+        stats.capacity_bytes,
+    )?;
+    Ok(ThreadEpisodicMemvidStats {
+        active_frame_count: Some(i64_from_u64(stats.active_frame_count)?),
+        frame_count: Some(i64_from_u64(stats.frame_count)?),
+        size_bytes: Some(i64_from_u64(stats.size_bytes)?),
+        capacity_bytes,
+        remaining_capacity_bytes,
+        utilization_percent: Some(stats.storage_utilisation_percent),
+    })
 }
 
 fn classify_memvid_error(error: MemvidError) -> ThreadEpisodicMemvidError {
@@ -1257,6 +1273,27 @@ fn i64_from_u64(value: u64) -> Result<i64, ThreadEpisodicMemvidError> {
         .map_err(|_| ThreadEpisodicMemvidError::non_retryable("memvid stat does not fit i64"))
 }
 
+fn optional_i64_from_unlimited_capacity(
+    value: u64,
+) -> Result<Option<i64>, ThreadEpisodicMemvidError> {
+    if value == u64::MAX {
+        Ok(None)
+    } else {
+        i64_from_u64(value).map(Some)
+    }
+}
+
+fn optional_i64_from_capacity_bound_stat(
+    value: u64,
+    capacity_bytes: u64,
+) -> Result<Option<i64>, ThreadEpisodicMemvidError> {
+    if capacity_bytes == u64::MAX {
+        Ok(None)
+    } else {
+        i64_from_u64(value).map(Some)
+    }
+}
+
 fn path_from_storage_uri(storage_uri: &str) -> Result<PathBuf, ThreadEpisodicMemvidError> {
     let path = storage_uri.strip_prefix("file://").ok_or_else(|| {
         ThreadEpisodicMemvidError::non_retryable(format!(
@@ -1275,8 +1312,6 @@ pub fn thread_episodic_memvid_metadata(
     thread_id: &str,
     turn_id: &str,
     item_id: &str,
-    chunk_index: i64,
-    chunk_count: i64,
     source_actor_role: &str,
     source_runtime_kind: &str,
     source_context: &str,
@@ -1304,16 +1339,6 @@ pub fn thread_episodic_memvid_metadata(
     ]
     .into_iter()
     .map(|(key, value)| (key.to_owned(), value.to_owned()))
-    .chain([
-        (
-            "pioneer.thread_episodic.chunk_index".to_owned(),
-            chunk_index.to_string(),
-        ),
-        (
-            "pioneer.thread_episodic.chunk_count".to_owned(),
-            chunk_count.to_string(),
-        ),
-    ])
     .collect()
 }
 
@@ -1331,7 +1356,7 @@ mod tests {
             self.capabilities.clone()
         }
 
-        async fn index_chunk(
+        async fn index_item(
             &self,
             request: ThreadEpisodicMemvidIndexRequest,
         ) -> Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError> {
@@ -1547,7 +1572,8 @@ mod tests {
         let mut profile =
             ThreadEpisodicSearchProfile::for_kind(ThreadEpisodicSearchProfileKind::RecentContext);
         profile.recent_start_unix = Some(1_700_000_000);
-        let request = memvid_thread_episodic_search_request(&profile, "architecture decision");
+        let request =
+            memvid_thread_episodic_search_request(&profile, "architecture decision", None);
         assert_eq!(request.query, "architecture decision");
         assert_eq!(request.top_k, profile.max_candidates as usize);
         assert_eq!(
@@ -1560,6 +1586,19 @@ mod tests {
     }
 
     #[test]
+    fn search_request_preserves_optional_scope() {
+        let profile =
+            ThreadEpisodicSearchProfile::for_kind(ThreadEpisodicSearchProfileKind::DefaultContext);
+        let scope = "mv2://workspace/workspace_a/thread/thread_a/";
+
+        let scoped = memvid_thread_episodic_search_request(&profile, "memory limit", Some(scope));
+        assert_eq!(scoped.scope.as_deref(), Some(scope));
+
+        let unscoped = memvid_thread_episodic_search_request(&profile, "memory limit", None);
+        assert_eq!(unscoped.scope, None);
+    }
+
+    #[test]
     fn hard_filter_suppresses_hidden_deleted_excluded_and_wrong_scope() {
         let mut hits = vec![
             test_hit("workspace_a", "thread_a", "active"),
@@ -1569,14 +1608,14 @@ mod tests {
             test_hit("workspace_a", "thread_a", "excluded"),
             test_hit("workspace_a", "thread_a", "hidden"),
         ];
-        hits[3].status = ThreadEpisodicChunkStatus::Deleted;
-        hits[4].status = ThreadEpisodicChunkStatus::Excluded;
+        hits[3].status = ThreadEpisodicItemStatus::Deleted;
+        hits[4].status = ThreadEpisodicItemStatus::Excluded;
         hits[5].visibility = ThreadEpisodicVisibility::Internal;
 
         let filtered = filter_thread_episodic_search_candidates("workspace_a", "thread_a", hits);
 
         assert_eq!(filtered.hits.len(), 1);
-        assert_eq!(filtered.hits[0].chunk_id, "active");
+        assert_eq!(filtered.hits[0].index_item_id, "active");
         assert_eq!(filtered.suppressions.len(), 5);
         assert!(filtered.suppressions.iter().any(|suppression| {
             suppression.reason == ThreadEpisodicCandidateSuppressionReason::WrongWorkspace
@@ -1603,13 +1642,13 @@ mod tests {
                 exact_source: Some(ThreadEpisodicExactSourceTarget {
                     turn_id: Some("turn_1".to_owned()),
                     item_id: Some("item_1".to_owned()),
-                    chunk_id: None,
+                    index_item_id: None,
                 }),
                 now_unix: Some(1_000),
             },
         );
 
-        assert_eq!(ranked[0].hit.chunk_id, "exact");
+        assert_eq!(ranked[0].hit.index_item_id, "exact");
         assert_eq!(ranked[0].score_breakdown.exact_source_boost, Some(1.0));
         assert_eq!(ranked[0].score_breakdown.recency_boost, Some(0.30));
         assert_eq!(ranked[0].score_breakdown.source_role_boost, Some(0.08));
@@ -1621,29 +1660,55 @@ mod tests {
         assert_eq!(error.kind, ThreadEpisodicMemvidFailureKind::NonRetryable);
     }
 
+    #[test]
+    fn workspace_index_creates_capacity_bounded_capsule() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("segment-000001.mv2");
+        let frame_uri =
+            "mv2://workspace/workspace_1/thread/thread_1/turn/turn_1/item/item_1/index/index_1";
+
+        let output = index_item_blocking(
+            path.clone(),
+            ThreadEpisodicMemvidIndexRequest {
+                storage_uri: thread_episodic_storage_uri_from_path(path.as_path()),
+                capsule_id: "capsule_1".to_owned(),
+                capsule_ref:
+                    "mv2://pioneer/thread_episodic/workspace/workspace_hash/segments/000001/capsules/capsule_1".to_owned(),
+                workspace_capsule: true,
+                index_item_id: "index_item_1".to_owned(),
+                frame_uri: frame_uri.to_owned(),
+                text: "workspace memory item".to_owned(),
+                metadata: BTreeMap::new(),
+            },
+        )
+        .expect("workspace item should index");
+
+        assert_eq!(output.frame_uri, frame_uri);
+        assert_eq!(output.stats.capacity_bytes, Some(50 * 1024 * 1024));
+        assert!(output.stats.remaining_capacity_bytes.is_some());
+    }
+
     fn test_hit(
         workspace_id: &str,
         thread_id: &str,
-        chunk_id: &str,
+        index_item_id: &str,
     ) -> ThreadEpisodicMemvidSearchHit {
         ThreadEpisodicMemvidSearchHit {
             workspace_id: workspace_id.to_owned(),
             thread_id: thread_id.to_owned(),
             turn_id: "turn".to_owned(),
             item_id: "item".to_owned(),
-            chunk_id: chunk_id.to_owned(),
-            chunk_index: 0,
-            chunk_count: 1,
+            index_item_id: index_item_id.to_owned(),
             source_actor_role: "user".to_owned(),
             source_runtime_kind: "user_turn".to_owned(),
             source_context: ThreadEpisodicSourceContext::UserVisibleThreadItem,
             visibility: ThreadEpisodicVisibility::UserVisible,
-            status: ThreadEpisodicChunkStatus::Active,
+            status: ThreadEpisodicItemStatus::Active,
             segment_index: 1,
             capsule_id: "capsule".to_owned(),
             capsule_ref: "capsule_ref".to_owned(),
             frame_id: 1,
-            frame_uri: format!("mv2://frame/{chunk_id}"),
+            frame_uri: format!("mv2://frame/{index_item_id}"),
             text: "text".to_owned(),
             memvid_score: Some(0.5),
             lexical_score: Some(0.5),

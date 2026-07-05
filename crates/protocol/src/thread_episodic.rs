@@ -19,14 +19,13 @@ pub struct ThreadEpisodicItemId(pub String);
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq, Hash)]
 #[serde(transparent)]
-pub struct ThreadEpisodicChunkId(pub String);
+pub struct ThreadEpisodicIndexItemId(pub String);
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ThreadEpisodicSourceActorRole {
     User,
     Assistant,
-    ToolSummary,
     TaskSummary,
     GeneratedSummary,
 }
@@ -35,7 +34,6 @@ pub enum ThreadEpisodicSourceActorRole {
 #[serde(rename_all = "snake_case")]
 pub enum ThreadEpisodicSourceContext {
     UserVisibleThreadItem,
-    UserVisibleToolSummary,
     UserVisibleTaskSummary,
     ThreadCompactionSummary,
     HiddenPrompt,
@@ -54,7 +52,6 @@ impl ThreadEpisodicSourceContext {
         matches!(
             self,
             Self::UserVisibleThreadItem
-                | Self::UserVisibleToolSummary
                 | Self::UserVisibleTaskSummary
                 | Self::ThreadCompactionSummary
         )
@@ -67,7 +64,7 @@ impl ThreadEpisodicSourceContext {
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
-pub enum ThreadEpisodicChunkStatus {
+pub enum ThreadEpisodicItemStatus {
     PendingIndex,
     Indexed,
     Active,
@@ -78,7 +75,7 @@ pub enum ThreadEpisodicChunkStatus {
     Unknown,
 }
 
-impl ThreadEpisodicChunkStatus {
+impl ThreadEpisodicItemStatus {
     pub const fn is_recallable(self) -> bool {
         matches!(self, Self::Indexed | Self::Active)
     }
@@ -104,11 +101,11 @@ impl ThreadEpisodicVisibility {
     }
 }
 
-/// Evidence pointer for a thread episodic chunk.
+/// Evidence pointer for a thread episodic source item.
 ///
 /// This is not a durable-memory identity. It points to where recalled
 /// conversation context came from so later layers can filter, debug, rebuild,
-/// and cite the exact source chunk without reusing durable memory record ids.
+/// and cite the exact source item without reusing durable memory record ids.
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 pub struct ThreadEpisodicSourceProvenance {
     pub source_id: String,
@@ -116,8 +113,7 @@ pub struct ThreadEpisodicSourceProvenance {
     pub thread_id: ThreadEpisodicThreadId,
     pub turn_id: ThreadEpisodicTurnId,
     pub item_id: ThreadEpisodicItemId,
-    pub chunk_id: ThreadEpisodicChunkId,
-    pub chunk_index: u32,
+    pub index_item_id: ThreadEpisodicIndexItemId,
     pub source_actor_role: ThreadEpisodicSourceActorRole,
     pub source_context: ThreadEpisodicSourceContext,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -125,16 +121,12 @@ pub struct ThreadEpisodicSourceProvenance {
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
-pub struct ThreadEpisodicChunk {
+pub struct ThreadEpisodicItem {
     pub provenance: ThreadEpisodicSourceProvenance,
-    pub status: ThreadEpisodicChunkStatus,
+    pub status: ThreadEpisodicItemStatus,
     pub visibility: ThreadEpisodicVisibility,
     pub text_hash: String,
     pub source_text_hash: String,
-    pub char_start: u32,
-    pub char_end: u32,
-    pub byte_start: u32,
-    pub byte_end: u32,
     pub token_estimate: u32,
 }
 
@@ -267,8 +259,8 @@ pub struct ThreadEpisodicRecallOutput {
 #[cfg(test)]
 mod tests {
     use super::{
-        ThreadEpisodicAdaptiveDiagnostics, ThreadEpisodicAdaptiveStrategy, ThreadEpisodicChunkId,
-        ThreadEpisodicChunkStatus, ThreadEpisodicHit, ThreadEpisodicItemId,
+        ThreadEpisodicAdaptiveDiagnostics, ThreadEpisodicAdaptiveStrategy, ThreadEpisodicHit,
+        ThreadEpisodicIndexItemId, ThreadEpisodicItemId, ThreadEpisodicItemStatus,
         ThreadEpisodicRecallDiagnostic, ThreadEpisodicRecallDiagnosticCode,
         ThreadEpisodicRecallInput, ThreadEpisodicRecallOutput, ThreadEpisodicScoreBreakdown,
         ThreadEpisodicSearchMode, ThreadEpisodicSourceActorRole, ThreadEpisodicSourceContext,
@@ -281,13 +273,12 @@ mod tests {
 
     fn sample_provenance() -> ThreadEpisodicSourceProvenance {
         ThreadEpisodicSourceProvenance {
-            source_id: "thread:turn_41/item_1/chunk_0".to_owned(),
+            source_id: "thread:turn_41/item_1/index_0".to_owned(),
             workspace_id: ThreadEpisodicWorkspaceId("ws_1".to_owned()),
             thread_id: ThreadEpisodicThreadId("thread_1".to_owned()),
             turn_id: ThreadEpisodicTurnId("turn_41".to_owned()),
             item_id: ThreadEpisodicItemId("item_1".to_owned()),
-            chunk_id: ThreadEpisodicChunkId("chunk_0".to_owned()),
-            chunk_index: 0,
+            index_item_id: ThreadEpisodicIndexItemId("index_0".to_owned()),
             source_actor_role: ThreadEpisodicSourceActorRole::Assistant,
             source_context: ThreadEpisodicSourceContext::UserVisibleThreadItem,
             created_at: Some(123),
@@ -301,13 +292,12 @@ mod tests {
         assert_eq!(
             encoded,
             json!({
-                "source_id": "thread:turn_41/item_1/chunk_0",
+                "source_id": "thread:turn_41/item_1/index_0",
                 "workspace_id": "ws_1",
                 "thread_id": "thread_1",
                 "turn_id": "turn_41",
                 "item_id": "item_1",
-                "chunk_id": "chunk_0",
-                "chunk_index": 0,
+                "index_item_id": "index_0",
                 "source_actor_role": "assistant",
                 "source_context": "user_visible_thread_item",
                 "created_at": 123
@@ -335,19 +325,19 @@ mod tests {
     }
 
     #[test]
-    fn chunk_status_roundtrips_and_marks_recallable_states() {
-        let encoded = serde_json::to_value(ThreadEpisodicChunkStatus::PendingIndex)
-            .expect("encode chunk status");
+    fn item_status_roundtrips_and_marks_recallable_states() {
+        let encoded = serde_json::to_value(ThreadEpisodicItemStatus::PendingIndex)
+            .expect("encode item status");
         assert_eq!(encoded, json!("pending_index"));
 
-        let decoded: ThreadEpisodicChunkStatus =
-            serde_json::from_value(json!("indexed")).expect("decode chunk status");
-        assert_eq!(decoded, ThreadEpisodicChunkStatus::Indexed);
+        let decoded: ThreadEpisodicItemStatus =
+            serde_json::from_value(json!("indexed")).expect("decode item status");
+        assert_eq!(decoded, ThreadEpisodicItemStatus::Indexed);
         assert!(decoded.is_recallable());
-        assert!(ThreadEpisodicChunkStatus::Active.is_recallable());
-        assert!(!ThreadEpisodicChunkStatus::Deleted.is_recallable());
-        assert!(!ThreadEpisodicChunkStatus::Excluded.is_recallable());
-        assert!(!ThreadEpisodicChunkStatus::IndexFailed.is_recallable());
+        assert!(ThreadEpisodicItemStatus::Active.is_recallable());
+        assert!(!ThreadEpisodicItemStatus::Deleted.is_recallable());
+        assert!(!ThreadEpisodicItemStatus::Excluded.is_recallable());
+        assert!(!ThreadEpisodicItemStatus::IndexFailed.is_recallable());
     }
 
     #[test]
@@ -375,7 +365,7 @@ mod tests {
         let context: ThreadEpisodicSourceContext =
             serde_json::from_value(json!("provider_added_new_context"))
                 .expect("unknown context maps to safe unknown");
-        let status: ThreadEpisodicChunkStatus =
+        let status: ThreadEpisodicItemStatus =
             serde_json::from_value(json!("provider_added_new_status"))
                 .expect("unknown status maps to safe unknown");
         let visibility: ThreadEpisodicVisibility =
@@ -384,7 +374,7 @@ mod tests {
 
         assert_eq!(context, ThreadEpisodicSourceContext::Unknown);
         assert!(context.is_hidden_or_internal());
-        assert_eq!(status, ThreadEpisodicChunkStatus::Unknown);
+        assert_eq!(status, ThreadEpisodicItemStatus::Unknown);
         assert!(!status.is_recallable());
         assert_eq!(visibility, ThreadEpisodicVisibility::Unknown);
         assert!(!visibility.is_user_visible());
@@ -405,11 +395,11 @@ mod tests {
     #[test]
     fn thread_episodic_ids_are_not_durable_memory_ids() {
         assert_ne!(
-            TypeId::of::<ThreadEpisodicChunkId>(),
+            TypeId::of::<ThreadEpisodicIndexItemId>(),
             TypeId::of::<String>()
         );
         assert_ne!(
-            TypeId::of::<ThreadEpisodicChunkId>(),
+            TypeId::of::<ThreadEpisodicIndexItemId>(),
             TypeId::of::<MemoryRecord>()
         );
     }
@@ -479,7 +469,7 @@ mod tests {
         let encoded = serde_json::to_value(&output).expect("encode output");
         assert_eq!(encoded["hits"][0]["provenance"]["turn_id"], "turn_41");
         assert_eq!(encoded["hits"][0]["provenance"]["item_id"], "item_1");
-        assert_eq!(encoded["hits"][0]["provenance"]["chunk_id"], "chunk_0");
+        assert_eq!(encoded["hits"][0]["provenance"]["index_item_id"], "index_0");
 
         let decoded: ThreadEpisodicRecallOutput =
             serde_json::from_value(encoded).expect("decode output");

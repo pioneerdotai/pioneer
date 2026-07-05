@@ -4,7 +4,6 @@
   "type": "string",
   "enum": [
     "user_visible_thread_item",
-    "user_visible_tool_summary",
     "user_visible_task_summary",
     "thread_compaction_summary",
     "hidden_prompt",

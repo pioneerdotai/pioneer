@@ -5,7 +5,6 @@
   "enum": [
     "user",
     "assistant",
-    "tool_summary",
     "task_summary",
     "generated_summary"
   ]

@@ -3,30 +3,6 @@
   "title": "GatewayThreadEpisodicSettingsUpdate",
   "type": "object",
   "properties": {
-    "chunk_max_chars": {
-      "type": [
-        "integer",
-        "null"
-      ],
-      "format": "uint32",
-      "minimum": 0
-    },
-    "chunk_target_max_chars": {
-      "type": [
-        "integer",
-        "null"
-      ],
-      "format": "uint32",
-      "minimum": 0
-    },
-    "chunk_target_min_chars": {
-      "type": [
-        "integer",
-        "null"
-      ],
-      "format": "uint32",
-      "minimum": 0
-    },
     "default_max_candidates": {
       "type": [
         "integer",
@@ -71,14 +47,6 @@
       "format": "int64"
     },
     "max_candidate_work": {
-      "type": [
-        "integer",
-        "null"
-      ],
-      "format": "uint32",
-      "minimum": 0
-    },
-    "max_chunks_per_item": {
       "type": [
         "integer",
         "null"

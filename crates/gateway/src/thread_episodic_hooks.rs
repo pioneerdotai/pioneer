@@ -94,6 +94,7 @@ impl ThreadEpisodicMemoryRecallProvider {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn with_workspace_service(
         service: Arc<ThreadEpisodicRecallService>,
         workspace_service: Arc<WorkspaceEpisodicRecallService>,
@@ -375,8 +376,7 @@ fn refs_for_thread_hit(
     let (bucket, allow_bucket_fallback) = match hit.provenance.source_actor_role {
         ThreadEpisodicSourceActorRole::User => (&turn_refs.user, true),
         ThreadEpisodicSourceActorRole::Assistant => (&turn_refs.assistant, true),
-        ThreadEpisodicSourceActorRole::ToolSummary
-        | ThreadEpisodicSourceActorRole::TaskSummary
+        ThreadEpisodicSourceActorRole::TaskSummary
         | ThreadEpisodicSourceActorRole::GeneratedSummary => (&turn_refs.assistant, false),
     };
     if bucket.is_empty() {
@@ -697,7 +697,6 @@ fn thread_context_actor_role_label(
     match role {
         pioneer_protocol::ThreadEpisodicSourceActorRole::User => "user",
         pioneer_protocol::ThreadEpisodicSourceActorRole::Assistant => "assistant",
-        pioneer_protocol::ThreadEpisodicSourceActorRole::ToolSummary => "tool_summary",
         pioneer_protocol::ThreadEpisodicSourceActorRole::TaskSummary => "task_summary",
         pioneer_protocol::ThreadEpisodicSourceActorRole::GeneratedSummary => "generated_summary",
     }
@@ -709,9 +708,6 @@ fn thread_context_source_context_label(
     match context {
         pioneer_protocol::ThreadEpisodicSourceContext::UserVisibleThreadItem => {
             "user_visible_thread_item"
-        }
-        pioneer_protocol::ThreadEpisodicSourceContext::UserVisibleToolSummary => {
-            "user_visible_tool_summary"
         }
         pioneer_protocol::ThreadEpisodicSourceContext::UserVisibleTaskSummary => {
             "user_visible_task_summary"
@@ -1174,8 +1170,9 @@ mod tests {
                 thread_id: ThreadEpisodicThreadId("thread_1".to_owned()),
                 turn_id: ThreadEpisodicTurnId("turn_1".to_owned()),
                 item_id: ThreadEpisodicItemId("item_1".to_owned()),
-                chunk_id: pioneer_protocol::ThreadEpisodicChunkId("chunk_1".to_owned()),
-                chunk_index: 0,
+                index_item_id: pioneer_protocol::ThreadEpisodicIndexItemId(
+                    "index_item_1".to_owned(),
+                ),
                 source_actor_role: ThreadEpisodicSourceActorRole::User,
                 source_context: ThreadEpisodicSourceContext::UserVisibleThreadItem,
                 created_at: Some(1_700_000_000),

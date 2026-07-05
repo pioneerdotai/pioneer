@@ -20,7 +20,7 @@ pub struct Model {
     pub thread_created_at: Option<DateTimeWithTimeZone>,
     pub thread_updated_at: Option<DateTimeWithTimeZone>,
     pub last_indexed_at: Option<DateTimeWithTimeZone>,
-    pub indexed_chunk_count: i64,
+    pub indexed_item_count: i64,
     #[sea_orm(column_type = "Text", nullable)]
     pub task_affinity_json: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]

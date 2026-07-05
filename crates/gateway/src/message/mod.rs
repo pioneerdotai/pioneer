@@ -40,7 +40,7 @@ use crate::prompt_hooks::agents_doc_prompt_hook_package;
 use crate::thread_episodic::{
     StoreThreadEpisodicIndexPayloadProvider, StoreThreadEpisodicIngestor,
     ThreadEpisodicIndexExecutor, ThreadEpisodicIngestor, ThreadEpisodicRecallService,
-    ThreadEpisodicRuntimeConfig, WorkspaceEpisodicRecallService,
+    ThreadEpisodicRuntimeConfig,
 };
 use crate::thread_episodic_hooks::{
     ThreadContextRecallHookConfig, ThreadEpisodicMemoryRecallProvider,
@@ -374,7 +374,6 @@ pub struct MessageProcessor {
     thread_episodic_ingestor: Arc<RwLock<Arc<dyn ThreadEpisodicIngestor>>>,
     thread_episodic_index_executor: Arc<ThreadEpisodicIndexExecutor>,
     thread_episodic_recall_service: Arc<ThreadEpisodicRecallService>,
-    workspace_episodic_recall_service: Arc<WorkspaceEpisodicRecallService>,
     voice_model_bootstrap: Arc<VoiceModelBootstrapHandle>,
     pub(crate) voice_sessions: GatewayVoiceSessionStore,
     pub(crate) voice_session_buffers: GatewayVoiceSessionBufferStore,
@@ -435,6 +434,7 @@ impl MessageProcessor {
         runtime_home: PathBuf,
         artifacts_config: GatewayArtifactsConfig,
     ) -> Self {
+        let thread_episodic_storage_root = runtime_home.join("memory").join("capsules");
         Self::new_with_memory_runtime_and_task_config(
             thread_manager,
             provider_registry,
@@ -447,6 +447,7 @@ impl MessageProcessor {
             tool_loop_config,
             memory_runtime,
             runtime_home,
+            thread_episodic_storage_root,
             artifacts_config,
             TaskRuntimeConfig::default(),
             ThreadEpisodicRuntimeConfig::default(),
@@ -466,6 +467,7 @@ impl MessageProcessor {
         tool_loop_config: ToolLoopConfig,
         memory_runtime: Arc<GatewayMemoryRuntime>,
         runtime_home: PathBuf,
+        thread_episodic_storage_root: PathBuf,
         artifacts_config: GatewayArtifactsConfig,
         task_runtime_config: TaskRuntimeConfig,
         thread_episodic_runtime_config: ThreadEpisodicRuntimeConfig,
@@ -532,7 +534,6 @@ impl MessageProcessor {
         ));
         let artifact_downloads =
             Arc::new(artifacts::download::ArtifactDownloadSessionManager::new());
-        let thread_episodic_storage_root = runtime_home.join("memory").join("capsules");
         let thread_episodic_backend: Arc<dyn ThreadEpisodicMemvidBackend> =
             Arc::new(MemvidThreadEpisodicBackend::new());
         let thread_episodic_index_executor = Arc::new(ThreadEpisodicIndexExecutor::new(
@@ -549,10 +550,6 @@ impl MessageProcessor {
             thread_episodic_backend,
         ));
         thread_episodic_recall_service.apply_config(thread_episodic_runtime_config.recall_service);
-        let workspace_episodic_recall_service = Arc::new(WorkspaceEpisodicRecallService::new(
-            crud_store.clone(),
-            thread_episodic_recall_service.clone(),
-        ));
 
         Self {
             thread_manager,
@@ -613,12 +610,10 @@ impl MessageProcessor {
                     crud_store,
                     thread_episodic_runtime_config.enabled
                         && thread_episodic_runtime_config.indexing_enabled,
-                    thread_episodic_runtime_config.chunker,
                 ),
             ))),
             thread_episodic_index_executor,
             thread_episodic_recall_service,
-            workspace_episodic_recall_service,
             voice_model_bootstrap: Arc::new(VoiceModelBootstrapHandle::unavailable(
                 "local voice model bootstrap has not started",
             )),
@@ -881,13 +876,10 @@ impl MessageProcessor {
                 Some(bridge.memory_provider.clone()),
                 Some(bridge.memory_provider.clone()),
                 Some(bridge.memory_policy_provider),
-                Some(Arc::new(
-                    ThreadEpisodicMemoryRecallProvider::with_workspace_service(
-                        self.thread_episodic_recall_service.clone(),
-                        self.workspace_episodic_recall_service.clone(),
-                        self.crud_store.clone(),
-                    ),
-                )),
+                Some(Arc::new(ThreadEpisodicMemoryRecallProvider::new(
+                    self.thread_episodic_recall_service.clone(),
+                    self.crud_store.clone(),
+                ))),
                 self.agent_manager.memory_tool_bundle_artifact_store(),
                 self.memory_loop_config(),
             ))
@@ -973,7 +965,6 @@ impl MessageProcessor {
             Arc::new(StoreThreadEpisodicIngestor::with_config(
                 self.crud_store.clone(),
                 config.enabled && config.indexing_enabled,
-                config.chunker,
             ));
     }
 
@@ -2028,10 +2019,6 @@ impl MessageProcessor {
             crud_store.clone(),
             thread_episodic_backend,
         ));
-        let workspace_episodic_recall_service = Arc::new(WorkspaceEpisodicRecallService::new(
-            crud_store.clone(),
-            thread_episodic_recall_service.clone(),
-        ));
         Self {
             thread_manager,
             agent_manager,
@@ -2103,7 +2090,6 @@ impl MessageProcessor {
             ))),
             thread_episodic_index_executor,
             thread_episodic_recall_service,
-            workspace_episodic_recall_service,
             voice_model_bootstrap: Arc::new(VoiceModelBootstrapHandle::ready()),
             voice_sessions: GatewayVoiceSessionStore::default(),
             voice_session_buffers: GatewayVoiceSessionBufferStore::default(),

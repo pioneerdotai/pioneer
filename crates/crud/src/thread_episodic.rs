@@ -2,6 +2,9 @@ use anyhow::{Result, bail};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sha2::{Digest, Sha256};
 
+pub const THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID: &str = "__workspace__";
+pub const THREAD_EPISODIC_WORKSPACE_SEGMENT_CAPACITY_BYTES: i64 = 50 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadEpisodicCapsuleWriteState {
     ActiveWrite,
@@ -30,7 +33,6 @@ pub enum ThreadEpisodicRepairStatus {
 pub enum ThreadEpisodicSourceActorRole {
     User,
     Assistant,
-    Tool,
     Task,
     SystemVisible,
 }
@@ -40,19 +42,18 @@ pub enum ThreadEpisodicSourceRuntimeKind {
     UserTurn,
     AssistantTurn,
     TaskResult,
-    ToolSummary,
     CompactionSummary,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ThreadEpisodicChunkVisibility {
+pub enum ThreadEpisodicItemVisibility {
     UserVisible,
     ParentVisible,
     InternalHidden,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ThreadEpisodicChunkStatus {
+pub enum ThreadEpisodicItemStatus {
     PendingIndex,
     Active,
     Excluded,
@@ -115,7 +116,7 @@ pub struct ThreadEpisodicCapsuleRecord {
     pub encrypted: bool,
     pub status: ThreadEpisodicCapsuleStatus,
     pub repair_status: ThreadEpisodicRepairStatus,
-    pub active_chunk_count: i64,
+    pub active_frame_count: i64,
     pub capacity_bytes: Option<i64>,
     pub size_bytes: Option<i64>,
     pub utilization_percent: Option<f64>,
@@ -138,6 +139,25 @@ pub struct ThreadEpisodicActiveWriteSegmentRequest {
     pub storage_uri_root: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadEpisodicWorkspaceActiveWriteSegmentRequest {
+    pub workspace_id: String,
+    pub storage_uri_root: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ThreadEpisodicRefillSourceCounts {
+    pub source_thread_count: i64,
+    pub source_turn_count: i64,
+    pub source_turn_item_count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadEpisodicRefillThread {
+    pub workspace_id: String,
+    pub thread_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewThreadEpisodicCapsuleRecord {
     pub id: String,
@@ -154,7 +174,7 @@ pub struct NewThreadEpisodicCapsuleRecord {
     pub encrypted: bool,
     pub status: ThreadEpisodicCapsuleStatus,
     pub repair_status: ThreadEpisodicRepairStatus,
-    pub active_chunk_count: i64,
+    pub active_frame_count: i64,
     pub capacity_bytes: Option<i64>,
     pub size_bytes: Option<i64>,
     pub utilization_percent: Option<f64>,
@@ -168,32 +188,26 @@ pub struct ThreadEpisodicCapsuleCapacityUpdate {
     pub capacity_bytes: Option<i64>,
     pub size_bytes: Option<i64>,
     pub utilization_percent: Option<f64>,
-    pub active_chunk_count: Option<i64>,
+    pub active_frame_count: Option<i64>,
     pub near_capacity_at: Option<DateTimeWithTimeZone>,
     pub capacity_exceeded_at: Option<DateTimeWithTimeZone>,
     pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ThreadEpisodicChunkRecord {
+pub struct ThreadEpisodicItemRecord {
     pub id: String,
     pub workspace_id: String,
     pub thread_id: String,
     pub turn_id: String,
     pub item_id: String,
-    pub chunk_index: i64,
-    pub chunk_count: i64,
     pub source_actor_role: ThreadEpisodicSourceActorRole,
     pub source_runtime_kind: ThreadEpisodicSourceRuntimeKind,
     pub source_context: pioneer_protocol::ThreadEpisodicSourceContext,
-    pub visibility: ThreadEpisodicChunkVisibility,
-    pub status: ThreadEpisodicChunkStatus,
+    pub visibility: ThreadEpisodicItemVisibility,
+    pub status: ThreadEpisodicItemStatus,
     pub text_hash: String,
     pub source_text_hash: String,
-    pub char_start: i64,
-    pub char_end: i64,
-    pub byte_start: Option<i64>,
-    pub byte_end: Option<i64>,
     pub language_hint: Option<String>,
     pub token_estimate: i64,
     pub capsule_id: Option<String>,
@@ -208,25 +222,19 @@ pub struct ThreadEpisodicChunkRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NewThreadEpisodicChunkRecord {
+pub struct NewThreadEpisodicItemRecord {
     pub id: Option<String>,
     pub workspace_id: String,
     pub thread_id: String,
     pub turn_id: String,
     pub item_id: String,
-    pub chunk_index: i64,
-    pub chunk_count: i64,
     pub source_actor_role: ThreadEpisodicSourceActorRole,
     pub source_runtime_kind: ThreadEpisodicSourceRuntimeKind,
     pub source_context: pioneer_protocol::ThreadEpisodicSourceContext,
-    pub visibility: ThreadEpisodicChunkVisibility,
-    pub status: ThreadEpisodicChunkStatus,
+    pub visibility: ThreadEpisodicItemVisibility,
+    pub status: ThreadEpisodicItemStatus,
     pub text_hash: String,
     pub source_text_hash: String,
-    pub char_start: i64,
-    pub char_end: i64,
-    pub byte_start: Option<i64>,
-    pub byte_end: Option<i64>,
     pub language_hint: Option<String>,
     pub token_estimate: i64,
     pub capsule_id: Option<String>,
@@ -243,7 +251,7 @@ pub struct ThreadEpisodicIndexJobRecord {
     pub id: String,
     pub workspace_id: String,
     pub thread_id: String,
-    pub chunk_id: String,
+    pub index_item_id: String,
     pub capsule_id: Option<String>,
     pub capsule_ref: Option<String>,
     pub segment_index: Option<i64>,
@@ -265,7 +273,7 @@ pub struct NewThreadEpisodicIndexJobRecord {
     pub id: Option<String>,
     pub workspace_id: String,
     pub thread_id: String,
-    pub chunk_id: String,
+    pub index_item_id: String,
     pub capsule_id: Option<String>,
     pub capsule_ref: Option<String>,
     pub segment_index: Option<i64>,
@@ -295,7 +303,7 @@ pub struct ThreadEpisodicIndexJobFailureUpdate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ThreadEpisodicChunkIndexedUpdate {
+pub struct ThreadEpisodicItemIndexedUpdate {
     pub capsule_id: String,
     pub capsule_ref: String,
     pub segment_index: i64,
@@ -308,7 +316,7 @@ pub struct ThreadEpisodicExclusionRecord {
     pub id: String,
     pub workspace_id: String,
     pub thread_id: String,
-    pub chunk_id: String,
+    pub index_item_id: String,
     pub reason: ThreadEpisodicExclusionReason,
     pub created_by: String,
     pub created_at: DateTimeWithTimeZone,
@@ -319,7 +327,7 @@ pub struct NewThreadEpisodicExclusionRecord {
     pub id: Option<String>,
     pub workspace_id: String,
     pub thread_id: String,
-    pub chunk_id: String,
+    pub index_item_id: String,
     pub reason: ThreadEpisodicExclusionReason,
     pub created_by: String,
 }
@@ -372,7 +380,7 @@ pub struct ThreadEpisodicThreadDirectoryRecord {
     pub thread_created_at: Option<DateTimeWithTimeZone>,
     pub thread_updated_at: Option<DateTimeWithTimeZone>,
     pub last_indexed_at: Option<DateTimeWithTimeZone>,
-    pub indexed_chunk_count: i64,
+    pub indexed_item_count: i64,
     pub task_affinity_json: Option<String>,
     pub project_affinity_json: Option<String>,
     pub visibility: ThreadEpisodicThreadDirectoryVisibility,
@@ -392,7 +400,7 @@ pub struct NewThreadEpisodicThreadDirectoryRecord {
     pub thread_created_at: Option<DateTimeWithTimeZone>,
     pub thread_updated_at: Option<DateTimeWithTimeZone>,
     pub last_indexed_at: Option<DateTimeWithTimeZone>,
-    pub indexed_chunk_count: i64,
+    pub indexed_item_count: i64,
     pub task_affinity_json: Option<String>,
     pub project_affinity_json: Option<String>,
     pub visibility: ThreadEpisodicThreadDirectoryVisibility,
@@ -491,10 +499,108 @@ pub fn deterministic_thread_episodic_capsule_id(
     Ok(hash.chars().take(21).collect())
 }
 
-pub fn thread_episodic_frame_uri(capsule_ref: &str, chunk_id: &str) -> Result<String> {
+pub fn deterministic_thread_episodic_workspace_capsule_id(
+    workspace_key_hash: &str,
+    segment_index: i64,
+) -> Result<String> {
+    ensure_ref_part("workspace_key_hash", workspace_key_hash)?;
+    if segment_index < 0 {
+        bail!("thread episodic workspace segment index cannot be negative");
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"thread_episodic_workspace_capsule\0");
+    hasher.update(workspace_key_hash.as_bytes());
+    hasher.update([0]);
+    hasher.update(segment_index.to_string().as_bytes());
+    let hash = hex::encode(hasher.finalize());
+    Ok(hash.chars().take(21).collect())
+}
+
+pub fn thread_episodic_workspace_capsule_ref(
+    workspace_key_hash: &str,
+    segment_index: i64,
+    capsule_id: &str,
+) -> Result<String> {
+    ensure_ref_part("workspace_key_hash", workspace_key_hash)?;
+    ensure_ref_part("capsule_id", capsule_id)?;
+    if segment_index < 0 {
+        bail!("thread episodic workspace segment index cannot be negative");
+    }
+    Ok(format!(
+        "mv2://pioneer/thread_episodic/workspace/{}/segments/{:06}/capsules/{}",
+        workspace_key_hash, segment_index, capsule_id
+    ))
+}
+
+pub fn thread_episodic_workspace_capsule_storage_uri(
+    storage_uri_root: &str,
+    workspace_key_hash: &str,
+    segment_index: i64,
+    capsule_id: &str,
+) -> Result<String> {
+    ensure_ref_part("workspace_key_hash", workspace_key_hash)?;
+    ensure_ref_part("capsule_id", capsule_id)?;
+    if storage_uri_root.trim().is_empty() {
+        bail!("thread episodic storage uri root cannot be empty");
+    }
+    if segment_index < 0 {
+        bail!("thread episodic workspace segment index cannot be negative");
+    }
+    Ok(format!(
+        "{}/thread_episodic/workspace/{}/segments/{:06}/{}.mv2",
+        storage_uri_root.trim_end_matches('/'),
+        workspace_key_hash,
+        segment_index,
+        capsule_id
+    ))
+}
+
+pub fn thread_episodic_frame_uri(capsule_ref: &str, index_item_id: &str) -> Result<String> {
     ensure_ref_part("capsule_ref", capsule_ref)?;
-    ensure_ref_part("chunk_id", chunk_id)?;
-    Ok(format!("{capsule_ref}/chunk/{chunk_id}"))
+    ensure_ref_part("index_item_id", index_item_id)?;
+    Ok(format!("{capsule_ref}/index/{index_item_id}"))
+}
+
+pub fn thread_episodic_workspace_uri_prefix(workspace_id: &str) -> Result<String> {
+    Ok(format!(
+        "mv2://workspace/{}/",
+        encode_thread_episodic_uri_segment("workspace_id", workspace_id)?
+    ))
+}
+
+pub fn thread_episodic_thread_uri_prefix(workspace_id: &str, thread_id: &str) -> Result<String> {
+    Ok(format!(
+        "{}thread/{}/",
+        thread_episodic_workspace_uri_prefix(workspace_id)?,
+        encode_thread_episodic_uri_segment("thread_id", thread_id)?
+    ))
+}
+
+pub fn thread_episodic_turn_uri_prefix(
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<String> {
+    Ok(format!(
+        "{}turn/{}/",
+        thread_episodic_thread_uri_prefix(workspace_id, thread_id)?,
+        encode_thread_episodic_uri_segment("turn_id", turn_id)?
+    ))
+}
+
+pub fn thread_episodic_item_uri(
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    item_id: &str,
+    index_item_id: &str,
+) -> Result<String> {
+    Ok(format!(
+        "{}item/{}/index/{}",
+        thread_episodic_turn_uri_prefix(workspace_id, thread_id, turn_id)?,
+        encode_thread_episodic_uri_segment("item_id", item_id)?,
+        encode_thread_episodic_uri_segment("index_item_id", index_item_id)?
+    ))
 }
 
 pub(crate) fn thread_episodic_capsule_record_from_model(
@@ -515,7 +621,7 @@ pub(crate) fn thread_episodic_capsule_record_from_model(
         encrypted: model.encrypted,
         status: capsule_status_from_db(model.status.as_str())?,
         repair_status: repair_status_from_db(model.repair_status.as_str())?,
-        active_chunk_count: model.active_chunk_count,
+        active_frame_count: model.active_frame_count,
         capacity_bytes: model.capacity_bytes,
         size_bytes: model.size_bytes,
         utilization_percent: model.utilization_percent,
@@ -532,28 +638,22 @@ pub(crate) fn thread_episodic_capsule_record_from_model(
     })
 }
 
-pub(crate) fn thread_episodic_chunk_record_from_model(
-    model: pioneer_entity::thread_episodic_chunks::Model,
-) -> Result<ThreadEpisodicChunkRecord> {
-    Ok(ThreadEpisodicChunkRecord {
+pub(crate) fn thread_episodic_item_record_from_model(
+    model: pioneer_entity::thread_episodic_items::Model,
+) -> Result<ThreadEpisodicItemRecord> {
+    Ok(ThreadEpisodicItemRecord {
         id: model.id,
         workspace_id: model.workspace_id,
         thread_id: model.thread_id,
         turn_id: model.turn_id,
         item_id: model.item_id,
-        chunk_index: model.chunk_index,
-        chunk_count: model.chunk_count,
         source_actor_role: source_actor_role_from_db(model.source_actor_role.as_str())?,
         source_runtime_kind: source_runtime_kind_from_db(model.source_runtime_kind.as_str())?,
         source_context: serde_json::from_str(model.source_context_json.as_str())?,
-        visibility: chunk_visibility_from_db(model.visibility.as_str())?,
-        status: chunk_status_from_db(model.status.as_str())?,
+        visibility: item_visibility_from_db(model.visibility.as_str())?,
+        status: item_status_from_db(model.status.as_str())?,
         text_hash: model.text_hash,
         source_text_hash: model.source_text_hash,
-        char_start: model.char_start,
-        char_end: model.char_end,
-        byte_start: model.byte_start,
-        byte_end: model.byte_end,
         language_hint: model.language_hint,
         token_estimate: model.token_estimate,
         capsule_id: model.capsule_id,
@@ -575,7 +675,7 @@ pub(crate) fn thread_episodic_index_job_record_from_model(
         id: model.id,
         workspace_id: model.workspace_id,
         thread_id: model.thread_id,
-        chunk_id: model.chunk_id,
+        index_item_id: model.index_item_id,
         capsule_id: model.capsule_id,
         capsule_ref: model.capsule_ref,
         segment_index: model.segment_index,
@@ -602,7 +702,7 @@ pub(crate) fn thread_episodic_exclusion_record_from_model(
         id: model.id,
         workspace_id: model.workspace_id,
         thread_id: model.thread_id,
-        chunk_id: model.chunk_id,
+        index_item_id: model.index_item_id,
         reason: exclusion_reason_from_db(model.reason.as_str())?,
         created_by: model.created_by,
         created_at: model.created_at,
@@ -644,7 +744,7 @@ pub(crate) fn thread_episodic_thread_directory_record_from_model(
         thread_created_at: model.thread_created_at,
         thread_updated_at: model.thread_updated_at,
         last_indexed_at: model.last_indexed_at,
-        indexed_chunk_count: model.indexed_chunk_count,
+        indexed_item_count: model.indexed_item_count,
         task_affinity_json: model.task_affinity_json,
         project_affinity_json: model.project_affinity_json,
         visibility: thread_directory_visibility_from_db(model.visibility.as_str()),
@@ -715,7 +815,6 @@ pub(crate) fn source_actor_role_to_db(role: ThreadEpisodicSourceActorRole) -> &'
     match role {
         ThreadEpisodicSourceActorRole::User => "user",
         ThreadEpisodicSourceActorRole::Assistant => "assistant",
-        ThreadEpisodicSourceActorRole::Tool => "tool",
         ThreadEpisodicSourceActorRole::Task => "task",
         ThreadEpisodicSourceActorRole::SystemVisible => "system_visible",
     }
@@ -725,7 +824,6 @@ pub(crate) fn source_actor_role_from_db(value: &str) -> Result<ThreadEpisodicSou
     match value {
         "user" => Ok(ThreadEpisodicSourceActorRole::User),
         "assistant" => Ok(ThreadEpisodicSourceActorRole::Assistant),
-        "tool" => Ok(ThreadEpisodicSourceActorRole::Tool),
         "task" => Ok(ThreadEpisodicSourceActorRole::Task),
         "system_visible" => Ok(ThreadEpisodicSourceActorRole::SystemVisible),
         other => bail!("unknown thread episodic source actor role `{other}`"),
@@ -737,7 +835,6 @@ pub(crate) fn source_runtime_kind_to_db(kind: ThreadEpisodicSourceRuntimeKind) -
         ThreadEpisodicSourceRuntimeKind::UserTurn => "user_turn",
         ThreadEpisodicSourceRuntimeKind::AssistantTurn => "assistant_turn",
         ThreadEpisodicSourceRuntimeKind::TaskResult => "task_result",
-        ThreadEpisodicSourceRuntimeKind::ToolSummary => "tool_summary",
         ThreadEpisodicSourceRuntimeKind::CompactionSummary => "compaction_summary",
     }
 }
@@ -747,47 +844,46 @@ pub(crate) fn source_runtime_kind_from_db(value: &str) -> Result<ThreadEpisodicS
         "user_turn" => Ok(ThreadEpisodicSourceRuntimeKind::UserTurn),
         "assistant_turn" => Ok(ThreadEpisodicSourceRuntimeKind::AssistantTurn),
         "task_result" => Ok(ThreadEpisodicSourceRuntimeKind::TaskResult),
-        "tool_summary" => Ok(ThreadEpisodicSourceRuntimeKind::ToolSummary),
         "compaction_summary" => Ok(ThreadEpisodicSourceRuntimeKind::CompactionSummary),
         other => bail!("unknown thread episodic source runtime kind `{other}`"),
     }
 }
 
-pub(crate) fn chunk_visibility_to_db(visibility: ThreadEpisodicChunkVisibility) -> &'static str {
+pub(crate) fn item_visibility_to_db(visibility: ThreadEpisodicItemVisibility) -> &'static str {
     match visibility {
-        ThreadEpisodicChunkVisibility::UserVisible => "user_visible",
-        ThreadEpisodicChunkVisibility::ParentVisible => "parent_visible",
-        ThreadEpisodicChunkVisibility::InternalHidden => "internal_hidden",
+        ThreadEpisodicItemVisibility::UserVisible => "user_visible",
+        ThreadEpisodicItemVisibility::ParentVisible => "parent_visible",
+        ThreadEpisodicItemVisibility::InternalHidden => "internal_hidden",
     }
 }
 
-pub(crate) fn chunk_visibility_from_db(value: &str) -> Result<ThreadEpisodicChunkVisibility> {
+pub(crate) fn item_visibility_from_db(value: &str) -> Result<ThreadEpisodicItemVisibility> {
     match value {
-        "user_visible" => Ok(ThreadEpisodicChunkVisibility::UserVisible),
-        "parent_visible" => Ok(ThreadEpisodicChunkVisibility::ParentVisible),
-        "internal_hidden" => Ok(ThreadEpisodicChunkVisibility::InternalHidden),
-        other => bail!("unknown thread episodic chunk visibility `{other}`"),
+        "user_visible" => Ok(ThreadEpisodicItemVisibility::UserVisible),
+        "parent_visible" => Ok(ThreadEpisodicItemVisibility::ParentVisible),
+        "internal_hidden" => Ok(ThreadEpisodicItemVisibility::InternalHidden),
+        other => bail!("unknown thread episodic item visibility `{other}`"),
     }
 }
 
-pub(crate) fn chunk_status_to_db(status: ThreadEpisodicChunkStatus) -> &'static str {
+pub(crate) fn item_status_to_db(status: ThreadEpisodicItemStatus) -> &'static str {
     match status {
-        ThreadEpisodicChunkStatus::PendingIndex => "pending_index",
-        ThreadEpisodicChunkStatus::Active => "active",
-        ThreadEpisodicChunkStatus::Excluded => "excluded",
-        ThreadEpisodicChunkStatus::Deleted => "deleted",
-        ThreadEpisodicChunkStatus::Failed => "failed",
+        ThreadEpisodicItemStatus::PendingIndex => "pending_index",
+        ThreadEpisodicItemStatus::Active => "active",
+        ThreadEpisodicItemStatus::Excluded => "excluded",
+        ThreadEpisodicItemStatus::Deleted => "deleted",
+        ThreadEpisodicItemStatus::Failed => "failed",
     }
 }
 
-pub(crate) fn chunk_status_from_db(value: &str) -> Result<ThreadEpisodicChunkStatus> {
+pub(crate) fn item_status_from_db(value: &str) -> Result<ThreadEpisodicItemStatus> {
     match value {
-        "pending_index" => Ok(ThreadEpisodicChunkStatus::PendingIndex),
-        "active" => Ok(ThreadEpisodicChunkStatus::Active),
-        "excluded" => Ok(ThreadEpisodicChunkStatus::Excluded),
-        "deleted" => Ok(ThreadEpisodicChunkStatus::Deleted),
-        "failed" => Ok(ThreadEpisodicChunkStatus::Failed),
-        other => bail!("unknown thread episodic chunk status `{other}`"),
+        "pending_index" => Ok(ThreadEpisodicItemStatus::PendingIndex),
+        "active" => Ok(ThreadEpisodicItemStatus::Active),
+        "excluded" => Ok(ThreadEpisodicItemStatus::Excluded),
+        "deleted" => Ok(ThreadEpisodicItemStatus::Deleted),
+        "failed" => Ok(ThreadEpisodicItemStatus::Failed),
+        other => bail!("unknown thread episodic item status `{other}`"),
     }
 }
 
@@ -905,10 +1001,29 @@ fn ensure_ref_part(field: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+fn encode_thread_episodic_uri_segment(field: &str, value: &str) -> Result<String> {
+    if value.trim().is_empty() {
+        bail!("thread episodic {field} cannot be empty");
+    }
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => {
+                encoded.push('%');
+                encoded.push_str(format!("{byte:02X}").as_str());
+            }
+        }
+    }
+    Ok(encoded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pioneer_entity::thread_episodic_chunks;
+    use pioneer_entity::thread_episodic_items;
     use sea_orm::entity::prelude::DateTimeWithTimeZone;
 
     fn timestamp() -> DateTimeWithTimeZone {
@@ -916,15 +1031,13 @@ mod tests {
     }
 
     #[test]
-    fn chunk_model_conversion_preserves_typed_boundaries_without_text_payload() {
-        let model = thread_episodic_chunks::Model {
-            id: "chunk_1".to_owned(),
+    fn item_model_conversion_preserves_typed_boundaries_without_text_payload() {
+        let model = thread_episodic_items::Model {
+            id: "item_1".to_owned(),
             workspace_id: "workspace_1".to_owned(),
             thread_id: "thread_1".to_owned(),
             turn_id: "turn_1".to_owned(),
             item_id: "item_1".to_owned(),
-            chunk_index: 0,
-            chunk_count: 1,
             source_actor_role: "assistant".to_owned(),
             source_runtime_kind: "assistant_turn".to_owned(),
             source_context_json: serde_json::to_string(
@@ -935,10 +1048,6 @@ mod tests {
             status: "active".to_owned(),
             text_hash: "text_hash".to_owned(),
             source_text_hash: "source_hash".to_owned(),
-            char_start: 0,
-            char_end: 32,
-            byte_start: Some(0),
-            byte_end: Some(32),
             language_hint: Some("ru".to_owned()),
             token_estimate: 8,
             capsule_id: Some("capsule_1".to_owned()),
@@ -955,16 +1064,13 @@ mod tests {
             deleted_at: None,
         };
 
-        let record = thread_episodic_chunk_record_from_model(model).expect("convert chunk");
+        let record = thread_episodic_item_record_from_model(model).expect("convert item");
         assert_eq!(
             record.source_context,
             pioneer_protocol::ThreadEpisodicSourceContext::UserVisibleThreadItem
         );
-        assert_eq!(
-            record.visibility,
-            ThreadEpisodicChunkVisibility::UserVisible
-        );
-        assert_eq!(record.status, ThreadEpisodicChunkStatus::Active);
+        assert_eq!(record.visibility, ThreadEpisodicItemVisibility::UserVisible);
+        assert_eq!(record.status, ThreadEpisodicItemStatus::Active);
         assert_eq!(record.text_hash, "text_hash");
     }
 
@@ -979,10 +1085,99 @@ mod tests {
         );
 
         let frame_uri =
-            thread_episodic_frame_uri(capsule_ref.as_str(), "chunk_id").expect("frame uri");
+            thread_episodic_frame_uri(capsule_ref.as_str(), "index_item_id").expect("frame uri");
         assert_eq!(
             frame_uri,
-            "mv2://pioneer/thread_episodic/workspace_hash/thread_hash/segments/000003/capsules/capsule_id/chunk/chunk_id"
+            "mv2://pioneer/thread_episodic/workspace_hash/thread_hash/segments/000003/capsules/capsule_id/index/index_item_id"
         );
+    }
+
+    #[test]
+    fn workspace_episodic_uri_helpers_build_prefix_chain() {
+        let workspace_prefix =
+            thread_episodic_workspace_uri_prefix("workspace_1").expect("workspace prefix");
+        assert_eq!(workspace_prefix, "mv2://workspace/workspace_1/");
+
+        let thread_prefix =
+            thread_episodic_thread_uri_prefix("workspace_1", "thread_1").expect("thread prefix");
+        assert_eq!(
+            thread_prefix,
+            "mv2://workspace/workspace_1/thread/thread_1/"
+        );
+        assert!(thread_prefix.starts_with(workspace_prefix.as_str()));
+
+        let turn_prefix = thread_episodic_turn_uri_prefix("workspace_1", "thread_1", "turn_1")
+            .expect("turn prefix");
+        assert_eq!(
+            turn_prefix,
+            "mv2://workspace/workspace_1/thread/thread_1/turn/turn_1/"
+        );
+        assert!(turn_prefix.starts_with(thread_prefix.as_str()));
+
+        let item_uri =
+            thread_episodic_item_uri("workspace_1", "thread_1", "turn_1", "item_1", "index_1")
+                .expect("item uri");
+        assert_eq!(
+            item_uri,
+            "mv2://workspace/workspace_1/thread/thread_1/turn/turn_1/item/item_1/index/index_1"
+        );
+        assert!(item_uri.starts_with(turn_prefix.as_str()));
+    }
+
+    #[test]
+    fn workspace_episodic_uri_helpers_escape_unsafe_segments() {
+        let item_uri = thread_episodic_item_uri(
+            "workspace 1/日本",
+            "thread/1",
+            "turn?x=1",
+            "item #1",
+            "index/1",
+        )
+        .expect("item uri");
+
+        assert_eq!(
+            item_uri,
+            "mv2://workspace/workspace%201%2F%E6%97%A5%E6%9C%AC/thread/thread%2F1/turn/turn%3Fx%3D1/item/item%20%231/index/index%2F1"
+        );
+        assert!(thread_episodic_workspace_uri_prefix("  ").is_err());
+    }
+
+    #[test]
+    fn workspace_capsule_helpers_are_workspace_scoped_and_deterministic() {
+        let first = deterministic_thread_episodic_workspace_capsule_id("workspace_hash", 1)
+            .expect("workspace capsule id");
+        let second = deterministic_thread_episodic_workspace_capsule_id("workspace_hash", 1)
+            .expect("workspace capsule id");
+        let next = deterministic_thread_episodic_workspace_capsule_id("workspace_hash", 2)
+            .expect("workspace capsule id");
+        assert_eq!(first, second);
+        assert_ne!(first, next);
+        assert_eq!(first.len(), 21);
+
+        let capsule_ref =
+            thread_episodic_workspace_capsule_ref("workspace_hash", 1, first.as_str())
+                .expect("workspace capsule ref");
+        assert_eq!(
+            capsule_ref,
+            format!(
+                "mv2://pioneer/thread_episodic/workspace/workspace_hash/segments/000001/capsules/{first}"
+            )
+        );
+
+        let storage_uri = thread_episodic_workspace_capsule_storage_uri(
+            "file:///memory/root/",
+            "workspace_hash",
+            1,
+            first.as_str(),
+        )
+        .expect("workspace storage uri");
+        assert_eq!(
+            storage_uri,
+            format!(
+                "file:///memory/root/thread_episodic/workspace/workspace_hash/segments/000001/{first}.mv2"
+            )
+        );
+        assert!(!storage_uri.contains("thread_1"));
+        assert!(!capsule_ref.contains("thread_1"));
     }
 }

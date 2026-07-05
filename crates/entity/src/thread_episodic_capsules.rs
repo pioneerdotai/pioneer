@@ -27,7 +27,7 @@ pub struct Model {
     pub encrypted: bool,
     pub status: String,
     pub repair_status: String,
-    pub active_chunk_count: i64,
+    pub active_frame_count: i64,
     pub capacity_bytes: Option<i64>,
     pub size_bytes: Option<i64>,
     #[sea_orm(column_type = "Double", nullable)]
