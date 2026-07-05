@@ -1,6 +1,7 @@
 # Local
 .DS_Store
 config/local.toml
+.worktrees
 
 # Builds
 target
