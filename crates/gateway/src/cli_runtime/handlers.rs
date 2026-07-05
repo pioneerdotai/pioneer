@@ -1448,12 +1448,12 @@ impl MessageProcessor {
                 >= CLI_RUNTIME_HUMAN_RESPONSE_TIMEOUT_MS
             {
                 if let Some(turn_id) = pending.turn_id.as_deref() {
-                    if let Err(error) = self
-                        .reconcile_cli_runtime_human_wait_for_turn(
+                    if let Err(error) =
+                        message_future(self.reconcile_cli_runtime_human_wait_for_turn(
                             turn_id,
                             now_unix_ms,
                             "CLI runtime request response",
-                        )
+                        ))
                         .await
                     {
                         self.send_error(

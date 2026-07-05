@@ -18,6 +18,15 @@ pub(super) struct PreparedApiProviderTurnStart {
     permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot,
 }
 
+struct PreparedCliRuntimeNativeTurnStart {
+    outcome: crate::thread::TurnStartOutcome,
+    session_key: crate::cli_runtime::manager::CLIAgentRuntimeSessionKey,
+    cli_session: std::sync::Arc<dyn crate::cli_runtime::manager::CLIAgentRuntimeSession>,
+    native_thread_id: String,
+    turn_start_params: crate::cli_runtime::manager::CLIAgentRuntimeTurnStartParams,
+    request_timeout_ms: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TurnStartSuccessResponse {
     TurnStart,
@@ -143,8 +152,12 @@ impl MessageProcessor {
                     return;
                 }
             };
-            self.finish_turn_start_success(connection_id, request_id, &prepared.outcome)
-                .await;
+            message_future(self.finish_turn_start_success(
+                connection_id,
+                request_id,
+                &prepared.outcome,
+            ))
+            .await;
             self.dispatch_prepared_api_provider_turn_start(prepared)
                 .await;
         })
@@ -393,7 +406,7 @@ impl MessageProcessor {
                 Some(prepared.outcome.started_notification.workspace_id.clone()),
             )
             .await;
-        self.publish_turn_start_success(&prepared.outcome).await;
+        message_future(self.publish_turn_start_success(&prepared.outcome)).await;
     }
 
     pub(super) async fn dispatch_prepared_api_provider_turn_start(
@@ -1013,53 +1026,85 @@ impl MessageProcessor {
                 .await;
                 return;
             }
+            let native_thread_id = native_thread.binding.native_thread_id;
+            let native_turn_start_params =
+                crate::cli_runtime::manager::CLIAgentRuntimeTurnStartParams {
+                    native_thread_id: native_thread_id.clone(),
+                    input: native_turn_input,
+                    cwd: native_thread.binding.native_cwd,
+                    approval_policy: Some(effective_approval_policy),
+                    sandbox: sandbox_policy_value,
+                    model: Some(outcome.materialization.thread.model.clone()),
+                    effort: effective_cli_runtime_effort,
+                    personality: cli_runtime_personality,
+                    summary: cli_runtime_summary,
+                };
+            let native_turn_start = PreparedCliRuntimeNativeTurnStart {
+                outcome,
+                session_key,
+                cli_session,
+                native_thread_id,
+                turn_start_params: native_turn_start_params,
+                request_timeout_ms: runtime_config.request_timeout_ms,
+            };
+
             let success_sent = match success_response {
                 TurnStartSuccessResponse::TurnStart => {
-                    self.finish_turn_start_success(connection_id, request_id, &outcome)
-                        .await
-                }
-                TurnStartSuccessResponse::VoiceSessionFinalize => {
-                    self.finish_voice_session_finalize_turn_start_success(
+                    message_future(self.finish_turn_start_success(
                         connection_id,
                         request_id,
-                        &outcome,
-                    )
+                        &native_turn_start.outcome,
+                    ))
+                    .await
+                }
+                TurnStartSuccessResponse::VoiceSessionFinalize => {
+                    message_future(self.finish_voice_session_finalize_turn_start_success(
+                        connection_id,
+                        request_id,
+                        &native_turn_start.outcome,
+                    ))
                     .await
                 }
             };
             if !success_sent {
                 return;
             }
-            let native_turn = match cli_session
-                .start_turn(
-                    crate::cli_runtime::manager::CLIAgentRuntimeTurnStartParams {
-                        native_thread_id: native_thread.binding.native_thread_id.clone(),
-                        input: native_turn_input,
-                        cwd: native_thread.binding.native_cwd.clone(),
-                        approval_policy: Some(effective_approval_policy),
-                        sandbox: sandbox_policy_value,
-                        model: Some(outcome.materialization.thread.model.clone()),
-                        effort: effective_cli_runtime_effort,
-                        personality: cli_runtime_personality,
-                        summary: cli_runtime_summary,
-                    },
-                    std::time::Duration::from_millis(runtime_config.request_timeout_ms),
+            message_future(self.start_prepared_cli_runtime_native_turn(native_turn_start)).await;
+        })
+    }
+
+    async fn start_prepared_cli_runtime_native_turn(
+        &self,
+        prepared: PreparedCliRuntimeNativeTurnStart,
+    ) {
+        let PreparedCliRuntimeNativeTurnStart {
+            outcome,
+            session_key,
+            cli_session,
+            native_thread_id,
+            turn_start_params,
+            request_timeout_ms,
+        } = prepared;
+        let native_turn = match cli_session
+            .start_turn(
+                turn_start_params,
+                std::time::Duration::from_millis(request_timeout_ms),
+            )
+            .await
+        {
+            Ok(native_turn) => native_turn,
+            Err(error) => {
+                self.mark_turn_blocked(
+                    outcome.started_notification.thread_id.clone(),
+                    outcome.started_notification.turn.id.clone(),
+                    format!("failed to start CLI runtime turn: {error:#}"),
                 )
-                .await
-            {
-                Ok(native_turn) => native_turn,
-                Err(error) => {
-                    self.mark_turn_blocked(
-                        outcome.started_notification.thread_id.clone(),
-                        outcome.started_notification.turn.id.clone(),
-                        format!("failed to start CLI runtime turn: {error:#}"),
-                    )
-                    .await;
-                    return;
-                }
-            };
-            let native_turn_id = native_turn.native_turn_id.clone();
-            if let Err(error) =
+                .await;
+                return;
+            }
+        };
+        let native_turn_id = native_turn.native_turn_id.clone();
+        if let Err(error) =
             crate::cli_runtime::turn_binding::persist_cli_runtime_turn_binding_after_native_start(
                 self.crud_store.as_ref(),
                 crate::cli_runtime::turn_binding::CLIAgentRuntimeNativeTurnStarted {
@@ -1079,13 +1124,12 @@ impl MessageProcessor {
             .await;
             return;
         }
-            self.flush_cli_runtime_events_for_native_turn(
-                &session_key,
-                native_thread.binding.native_thread_id.as_str(),
-                native_turn_id.as_str(),
-            )
-            .await;
-        })
+        self.flush_cli_runtime_events_for_native_turn(
+            &session_key,
+            native_thread_id.as_str(),
+            native_turn_id.as_str(),
+        )
+        .await;
     }
 
     async fn validate_cli_runtime_turn_start_backend(
@@ -1447,7 +1491,7 @@ impl MessageProcessor {
             );
             return false;
         }
-        self.publish_turn_start_success(outcome).await
+        message_future(self.publish_turn_start_success(outcome)).await
     }
 
     async fn finish_voice_session_finalize_turn_start_success(
@@ -1490,7 +1534,7 @@ impl MessageProcessor {
             );
             return false;
         }
-        self.publish_turn_start_success(outcome).await
+        message_future(self.publish_turn_start_success(outcome)).await
     }
 
     async fn publish_turn_start_success(&self, outcome: &crate::thread::TurnStartOutcome) -> bool {
