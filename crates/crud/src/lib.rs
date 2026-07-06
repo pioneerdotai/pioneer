@@ -29,7 +29,10 @@ use pioneer_protocol::{
     TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType, TurnItemsResponse,
     TurnPermissionProfileSnapshot, TurnPermissionProfileSource, TurnStatus, UserInput, generate_id,
 };
-use pioneer_sqlite::{SqliteWriteCoordinator, is_anyhow_sqlite_lock};
+use pioneer_sqlite::{
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteWriteCoordinator,
+    is_anyhow_sqlite_lock, retry_with_backoff,
+};
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, DatabaseConnection, DbErr,
     EntityTrait, QueryFilter, QueryOrder, QuerySelect, Statement, TransactionTrait,
@@ -38,6 +41,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error as StdError;
 use std::fmt;
 use std::future::Future;
+use std::time::Duration;
 
 use crate::convention::{
     ATTEMPT_STATUS_CANCELLED, ATTEMPT_STATUS_COMPLETED, ATTEMPT_STATUS_EXHAUSTED,
@@ -10352,32 +10356,56 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         let claim_expires_at =
             unix_to_datetime(event_timestamp_secs.saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS));
 
+        self.run_serialized_turn_event_materialization(|| {
+            self.materialize_turn_event_with_attempt_deadlines_once(
+                event.clone(),
+                event_timestamp_secs,
+                projection_context.clone(),
+                claim_token.clone(),
+                created_at,
+                claim_expires_at,
+            )
+        })
+        .await
+    }
+
+    async fn materialize_turn_event_with_attempt_deadlines_once(
+        &self,
+        event: TurnEventPayload,
+        event_timestamp_secs: i64,
+        projection_context: TurnEventProjectionContext,
+        claim_token: String,
+        created_at: DateTimeWithTimeZone,
+        claim_expires_at: DateTimeWithTimeZone,
+    ) -> Result<()> {
         let appended_event = self
-            .run_serialized_write(|| {
-                self.append_claimed_turn_event_projection_once(
-                    event.clone(),
-                    created_at,
-                    projection_context.clone(),
-                    claim_token.clone(),
-                    claim_expires_at,
-                )
-            })
+            .append_claimed_turn_event_projection_once(
+                event,
+                created_at,
+                projection_context.clone(),
+                claim_token.clone(),
+                claim_expires_at,
+            )
             .await?;
 
-        if let Err(error) = self
-            .run_serialized_write(|| {
+        if let Err(error) = retry_with_backoff(
+            || {
                 self.project_claimed_turn_event_once(
                     appended_event.clone(),
                     projection_context.clone(),
                     claim_token.clone(),
                     created_at,
                 )
-            })
-            .await
+            },
+            is_anyhow_sqlite_lock,
+            DEFAULT_LOCK_RETRY_ATTEMPTS,
+            Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
+        )
+        .await
         {
             let error_message = format!("{error:#}");
-            if let Err(mark_error) = self
-                .run_serialized_write(|| {
+            if let Err(mark_error) = retry_with_backoff(
+                || {
                     self.mark_turn_event_projection_failure_once(
                         appended_event.id.clone(),
                         claim_token.clone(),
@@ -10386,8 +10414,12 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                         event_timestamp_secs,
                         false,
                     )
-                })
-                .await
+                },
+                is_anyhow_sqlite_lock,
+                DEFAULT_LOCK_RETRY_ATTEMPTS,
+                Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
+            )
+            .await
             {
                 return Err(TurnEventProjectionAfterAppendError::new(
                     appended_event.id,
@@ -10409,6 +10441,18 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         }
 
         Ok(())
+    }
+
+    async fn run_serialized_turn_event_materialization<T, F, Fut>(&self, operation: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        self.write_coordinator
+            .run_serialized_with_retry(operation, |error| {
+                !turn_event_was_appended_before_error(error) && is_anyhow_sqlite_lock(error)
+            })
+            .await
     }
 
     async fn materialize_turn_events_atomically(
