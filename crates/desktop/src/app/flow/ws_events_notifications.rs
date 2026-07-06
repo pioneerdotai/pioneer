@@ -8,8 +8,9 @@ use pioneer_client::notifications::router::{
     WorkspacePreferenceReduction, WorkspaceRefreshReduction, apply_workspace_changed_to_catalog,
 };
 use pioneer_client::runtime::{ClientRuntimeNotification, ClientRuntimeNotificationContext};
+use pioneer_client::voice::{VoiceFinalizeUiAction, VoiceSessionResultReduction};
 use pioneer_client::workspaces::selectors as workspace_selectors;
-use pioneer_protocol::{VoiceError, VoiceSessionOutcome, VoiceSessionResultNotification};
+use pioneer_protocol::{VoiceError, VoiceSessionOutcome};
 
 impl PioneerDesktop {
     pub(in crate::app::flow) fn apply_gateway_notification(
@@ -17,11 +18,6 @@ impl PioneerDesktop {
         notification: GatewayNotification,
         cx: &mut Context<Self>,
     ) {
-        if let GatewayNotification::VoiceSessionResult(notification) = notification {
-            self.apply_voice_session_result_notification(notification, cx);
-            return;
-        }
-
         let active_workspace = self.active_workspace_scope_for_notifications();
         let mcp_workspace = self.mcp_workspace_scope();
         let notification_thread_workspace_matches =
@@ -48,26 +44,36 @@ impl PioneerDesktop {
         self.apply_gateway_notification_reduction(reduction, cx);
     }
 
-    fn apply_voice_session_result_notification(
+    fn apply_voice_session_result_reduction(
         &mut self,
-        notification: VoiceSessionResultNotification,
+        reduction: VoiceSessionResultReduction,
         cx: &mut Context<Self>,
     ) {
-        match notification.outcome {
-            VoiceSessionOutcome::TurnStarted | VoiceSessionOutcome::Cancelled => {}
-            VoiceSessionOutcome::NoSpeech => {
+        match reduction.action {
+            VoiceFinalizeUiAction::KeepFinalizing => {}
+            VoiceFinalizeUiAction::ClearFinalizing => {
+                if let DesktopVoiceComposerState::Finalizing { thread_id } =
+                    &self.desktop_voice_composer
+                {
+                    let thread_id = thread_id.clone();
+                    self.desktop_voice_composer = DesktopVoiceComposerState::Idle;
+                    if matches!(reduction.outcome, VoiceSessionOutcome::TurnStarted) {
+                        self.clear_composer_payload_for_thread(thread_id.as_str());
+                    }
+                    cx.notify();
+                }
+            }
+            VoiceFinalizeUiAction::ShowNoSpeechError => {
                 self.desktop_voice_composer = DesktopVoiceComposerState::Error {
                     kind: DesktopVoiceCaptureErrorKind::NoSpeech,
-                    message: desktop_voice_no_speech_message(notification.error.as_ref()),
+                    message: desktop_voice_no_speech_message(reduction.error.as_ref()),
                 };
                 cx.notify();
             }
-            VoiceSessionOutcome::Failed => {
+            VoiceFinalizeUiAction::ShowFinalizeError => {
                 self.desktop_voice_composer = DesktopVoiceComposerState::Error {
                     kind: DesktopVoiceCaptureErrorKind::GatewayFinalize,
-                    message: desktop_voice_transcription_failed_message(
-                        notification.error.as_ref(),
-                    ),
+                    message: desktop_voice_transcription_failed_message(reduction.error.as_ref()),
                 };
                 cx.notify();
             }
@@ -136,6 +142,9 @@ impl PioneerDesktop {
             }
             ClientRuntimeNotification::SemanticTimeline(update) => {
                 self.apply_semantic_timeline_live_update(update, cx);
+            }
+            ClientRuntimeNotification::VoiceSessionResult(reduction) => {
+                self.apply_voice_session_result_reduction(reduction, cx);
             }
             ClientRuntimeNotification::CLIRuntimeRefresh(reduction) => {
                 self.apply_cli_runtime_refresh_reduction(reduction, cx);

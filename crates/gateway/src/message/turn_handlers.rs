@@ -5,7 +5,10 @@ use crate::cli_runtime::config::{
 };
 use pioneer_cli_agent_runtime::claude::{ClaudeModelSnapshot, ClaudeProbe};
 use pioneer_cli_agent_runtime::codex::{CodexModelListProbeStatus, CodexModelSnapshot, CodexProbe};
-use pioneer_protocol::{AgentExecutionBackend, CLIAgentRuntimeKind, UserInput};
+use pioneer_protocol::{
+    AgentExecutionBackend, CLIAgentRuntimeKind, UserInput, VoiceError, VoiceErrorKind,
+    VoiceSessionOutcome, VoiceSessionResultNotification,
+};
 
 pub(super) struct PreparedApiProviderTurnStart {
     outcome: crate::thread::TurnStartOutcome,
@@ -27,10 +30,10 @@ struct PreparedCliRuntimeNativeTurnStart {
     request_timeout_ms: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum TurnStartSuccessResponse {
     TurnStart,
-    VoiceSessionFinalize,
+    VoiceSessionFinalizeAccepted { session_id: String },
 }
 
 fn cli_runtime_forbidden_input_kind(input: &UserInput) -> Option<&'static str> {
@@ -443,6 +446,48 @@ impl MessageProcessor {
         }
     }
 
+    async fn send_cli_runtime_turn_start_failure(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        success_response: &TurnStartSuccessResponse,
+        turn_id: &str,
+        message: String,
+    ) {
+        match success_response {
+            TurnStartSuccessResponse::TurnStart => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
+                )
+                .await;
+            }
+            TurnStartSuccessResponse::VoiceSessionFinalizeAccepted { session_id } => {
+                let error = VoiceError {
+                    kind: VoiceErrorKind::Unknown,
+                    message,
+                };
+                warn!(
+                    connection_id,
+                    session_id = %session_id,
+                    turn_id,
+                    error = %error.message,
+                    "accepted voice finalize failed while starting CLI runtime turn"
+                );
+                self.send_voice_session_result_notification(
+                    connection_id,
+                    VoiceSessionResultNotification {
+                        session_id: session_id.clone(),
+                        outcome: VoiceSessionOutcome::Failed,
+                        turn_id: (!turn_id.trim().is_empty()).then(|| turn_id.to_owned()),
+                        error: Some(error),
+                    },
+                )
+                .await;
+            }
+        }
+    }
+
     pub(super) fn turn_start_cli_runtime<'a>(
         &'a self,
         connection_id: ConnectionId,
@@ -453,12 +498,28 @@ impl MessageProcessor {
         success_response: TurnStartSuccessResponse,
     ) -> MessageFuture<'a, ()> {
         message_future(async move {
+            let response_turn_id = params.turn_id.clone();
+            macro_rules! send_turn_start_failure {
+                ($message:expr) => {{
+                    self.send_cli_runtime_turn_start_failure(
+                        connection_id,
+                        request_id.clone(),
+                        &success_response,
+                        response_turn_id.as_str(),
+                        $message,
+                    )
+                    .await;
+                }};
+            }
+
             let Some(runtime_config) = self
                 .validate_cli_runtime_turn_start_backend(
                     connection_id,
                     request_id.clone(),
                     runtime_id.as_str(),
                     runtime_kind,
+                    &success_response,
+                    response_turn_id.as_str(),
                 )
                 .await
             else {
@@ -467,15 +528,9 @@ impl MessageProcessor {
             params.model_provider = Some(cli_runtime_provider_key(runtime_id.as_str()));
 
             if !params.capabilities.is_empty() {
-                self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    "CLI runtime providers do not support skills, MCP capabilities, or tool attachments".to_owned(),
-                ),
-            )
-            .await;
+                send_turn_start_failure!(
+                    "CLI runtime providers do not support skills, MCP capabilities, or tool attachments".to_owned()
+                );
                 return;
             }
             if let Some(input_kind) = params
@@ -483,17 +538,9 @@ impl MessageProcessor {
                 .iter()
                 .find_map(cli_runtime_forbidden_input_kind)
             {
-                self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    format!(
-                        "CLI runtime providers only support text and attachment inputs; `{input_kind}` input is not supported"
-                    ),
-                ),
-            )
-            .await;
+                send_turn_start_failure!(format!(
+                    "CLI runtime providers only support text and attachment inputs; `{input_kind}` input is not supported"
+                ));
                 return;
             }
 
@@ -502,27 +549,16 @@ impl MessageProcessor {
                 .thread_get(params.thread_id.trim())
                 .await
             else {
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("thread `{}` is not loaded", params.thread_id.trim()),
-                    ),
-                )
-                .await;
+                send_turn_start_failure!(format!(
+                    "thread `{}` is not loaded",
+                    params.thread_id.trim()
+                ));
                 return;
             };
             let Some(manager) = self.cli_runtime_manager.as_ref() else {
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        "CLI runtime manager is not available for turn start".to_owned(),
-                    ),
-                )
-                .await;
+                send_turn_start_failure!(
+                    "CLI runtime manager is not available for turn start".to_owned()
+                );
                 return;
             };
             let session_key = match crate::cli_runtime::manager::CLIAgentRuntimeSessionKey::new(
@@ -532,15 +568,7 @@ impl MessageProcessor {
             ) {
                 Ok(session_key) => session_key,
                 Err(error) => {
-                    self.send_error(
-                        connection_id,
-                        JsonRpcErrorResponse::new(
-                            Some(request_id),
-                            INVALID_REQUEST_CODE,
-                            format!("invalid CLI runtime session key: {error:#}"),
-                        ),
-                    )
-                    .await;
+                    send_turn_start_failure!(format!("invalid CLI runtime session key: {error:#}"));
                     return;
                 }
             };
@@ -549,24 +577,14 @@ impl MessageProcessor {
                 .await
             {
                 Ok(Some(message)) => {
-                    self.send_error(
-                        connection_id,
-                        JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
-                    )
-                    .await;
+                    send_turn_start_failure!(message);
                     return;
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    self.send_error(
-                        connection_id,
-                        JsonRpcErrorResponse::new(
-                            Some(request_id),
-                            INVALID_REQUEST_CODE,
-                            format!("failed to check active CLI runtime turns: {error:#}"),
-                        ),
-                    )
-                    .await;
+                    send_turn_start_failure!(format!(
+                        "failed to check active CLI runtime turns: {error:#}"
+                    ));
                     return;
                 }
             }
@@ -577,15 +595,9 @@ impl MessageProcessor {
                 )
                 .await
             {
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to validate CLI runtime artifact input: {error:#}"),
-                    ),
-                )
-                .await;
+                send_turn_start_failure!(format!(
+                    "failed to validate CLI runtime artifact input: {error:#}"
+                ));
                 return;
             }
             let resolved_artifacts = match self
@@ -597,15 +609,9 @@ impl MessageProcessor {
             {
                 Ok(resolved_artifacts) => resolved_artifacts,
                 Err(error) => {
-                    self.send_error(
-                        connection_id,
-                        JsonRpcErrorResponse::new(
-                            Some(request_id),
-                            INVALID_REQUEST_CODE,
-                            format!("failed to materialize CLI runtime artifact input: {error:#}"),
-                        ),
-                    )
-                    .await;
+                    send_turn_start_failure!(format!(
+                        "failed to materialize CLI runtime artifact input: {error:#}"
+                    ));
                     return;
                 }
             };
@@ -625,15 +631,7 @@ impl MessageProcessor {
             } {
                 Ok(input_mapping) => input_mapping,
                 Err(error) => {
-                    self.send_error(
-                        connection_id,
-                        JsonRpcErrorResponse::new(
-                            Some(request_id),
-                            INVALID_REQUEST_CODE,
-                            format!("{error}"),
-                        ),
-                    )
-                    .await;
+                    send_turn_start_failure!(format!("{error}"));
                     return;
                 }
             };
@@ -661,17 +659,9 @@ impl MessageProcessor {
                 Some(sandbox) => match pioneer_crud::serialize_cli_runtime_json(&sandbox.0) {
                     Ok(sandbox_json) => Some(sandbox_json),
                     Err(error) => {
-                        self.send_error(
-                            connection_id,
-                            JsonRpcErrorResponse::new(
-                                Some(request_id),
-                                INVALID_REQUEST_CODE,
-                                format!(
-                                    "failed to serialize CLI runtime sandbox policy: {error:#}"
-                                ),
-                            ),
-                        )
-                        .await;
+                        send_turn_start_failure!(format!(
+                            "failed to serialize CLI runtime sandbox policy: {error:#}"
+                        ));
                         return;
                     }
                 },
@@ -690,11 +680,7 @@ impl MessageProcessor {
             ) {
                 Ok(effort) => effort,
                 Err(message) => {
-                    self.send_error(
-                        connection_id,
-                        JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
-                    )
-                    .await;
+                    send_turn_start_failure!(message);
                     return;
                 }
             };
@@ -710,15 +696,9 @@ impl MessageProcessor {
             let outcome = match self.thread_manager.turn_start(connection_id, params).await {
                 Ok(outcome) => outcome,
                 Err(error) => {
-                    self.send_error(
-                        connection_id,
-                        JsonRpcErrorResponse::new(
-                            Some(request_id),
-                            INVALID_REQUEST_CODE,
-                            format!("failed to start CLI runtime turn: {error:#}"),
-                        ),
-                    )
-                    .await;
+                    send_turn_start_failure!(format!(
+                        "failed to start CLI runtime turn: {error:#}"
+                    ));
                     return;
                 }
             };
@@ -737,11 +717,7 @@ impl MessageProcessor {
                 self.thread_manager
                     .rollback_turn_start(outcome.rollback_context.clone())
                     .await;
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
-                )
-                .await;
+                send_turn_start_failure!(message);
                 return;
             }
             let profile_selected_audit = match self.turn_profile_selected_audit_event(&outcome) {
@@ -750,15 +726,9 @@ impl MessageProcessor {
                     self.thread_manager
                         .rollback_turn_start(outcome.rollback_context.clone())
                         .await;
-                    self.send_error(
-                        connection_id,
-                        JsonRpcErrorResponse::new(
-                            Some(request_id),
-                            INVALID_REQUEST_CODE,
-                            format!("failed to resolve turn permission profile: {error:#}"),
-                        ),
-                    )
-                    .await;
+                    send_turn_start_failure!(format!(
+                        "failed to resolve turn permission profile: {error:#}"
+                    ));
                     return;
                 }
             };
@@ -779,17 +749,9 @@ impl MessageProcessor {
                     .rollback_turn_start(outcome.rollback_context.clone())
                     .await;
 
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!(
-                            "failed to persist CLI runtime turn/start state and permission audit: {error:#}"
-                        ),
-                    ),
-                )
-                .await;
+                send_turn_start_failure!(format!(
+                    "failed to persist CLI runtime turn/start state and permission audit: {error:#}"
+                ));
                 return;
             }
             self.ensure_hook_runtime_with_run_store().await;
@@ -809,15 +771,9 @@ impl MessageProcessor {
                         format!("failed to compile CLI runtime context bundle: {error:#}"),
                     )
                     .await;
-                    self.send_error(
-                        connection_id,
-                        JsonRpcErrorResponse::new(
-                            Some(request_id),
-                            INVALID_REQUEST_CODE,
-                            format!("failed to compile CLI runtime context bundle: {error:#}"),
-                        ),
-                    )
-                    .await;
+                    send_turn_start_failure!(format!(
+                        "failed to compile CLI runtime context bundle: {error:#}"
+                    ));
                     return;
                 }
             };
@@ -835,15 +791,9 @@ impl MessageProcessor {
                         format!("failed to resolve CLI runtime cwd: {error:#}"),
                     )
                     .await;
-                    self.send_error(
-                        connection_id,
-                        JsonRpcErrorResponse::new(
-                            Some(request_id.clone()),
-                            INVALID_REQUEST_CODE,
-                            format!("failed to resolve CLI runtime cwd: {error:#}"),
-                        ),
-                    )
-                    .await;
+                    send_turn_start_failure!(format!(
+                        "failed to resolve CLI runtime cwd: {error:#}"
+                    ));
                     return;
                 }
             };
@@ -866,15 +816,9 @@ impl MessageProcessor {
                         format!("failed to start CLI runtime session: {error:#}"),
                     )
                     .await;
-                    self.send_error(
-                        connection_id,
-                        JsonRpcErrorResponse::new(
-                            Some(request_id.clone()),
-                            INVALID_REQUEST_CODE,
-                            format!("failed to start CLI runtime session: {error:#}"),
-                        ),
-                    )
-                    .await;
+                    send_turn_start_failure!(format!(
+                        "failed to start CLI runtime session: {error:#}"
+                    ));
                     return;
                 }
             };
@@ -918,15 +862,9 @@ impl MessageProcessor {
                             format!("failed to open CLI runtime thread: {error:#}"),
                         )
                         .await;
-                        self.send_error(
-                            connection_id,
-                            JsonRpcErrorResponse::new(
-                                Some(request_id.clone()),
-                                INVALID_REQUEST_CODE,
-                                format!("failed to open CLI runtime thread: {error:#}"),
-                            ),
-                        )
-                        .await;
+                        send_turn_start_failure!(format!(
+                            "failed to open CLI runtime thread: {error:#}"
+                        ));
                         return;
                     }
                 };
@@ -940,15 +878,9 @@ impl MessageProcessor {
                         format!("failed to serialize CLI runtime input mapping: {error:#}"),
                     )
                     .await;
-                    self.send_error(
-                        connection_id,
-                        JsonRpcErrorResponse::new(
-                            Some(request_id.clone()),
-                            INVALID_REQUEST_CODE,
-                            format!("failed to serialize CLI runtime input mapping: {error:#}"),
-                        ),
-                    )
-                    .await;
+                    send_turn_start_failure!(format!(
+                        "failed to serialize CLI runtime input mapping: {error:#}"
+                    ));
                     return;
                 }
             };
@@ -969,15 +901,9 @@ impl MessageProcessor {
                     format!("failed to persist CLI runtime input mapping: {error:#}"),
                 )
                 .await;
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id.clone()),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to persist CLI runtime input mapping: {error:#}"),
-                    ),
-                )
-                .await;
+                send_turn_start_failure!(format!(
+                    "failed to persist CLI runtime input mapping: {error:#}"
+                ));
                 return;
             }
             let native_turn_input = match serde_json::to_value(&input_mapping.input) {
@@ -989,15 +915,9 @@ impl MessageProcessor {
                         format!("failed to encode CLI runtime turn input: {error:#}"),
                     )
                     .await;
-                    self.send_error(
-                        connection_id,
-                        JsonRpcErrorResponse::new(
-                            Some(request_id.clone()),
-                            INVALID_REQUEST_CODE,
-                            format!("failed to encode CLI runtime turn input: {error:#}"),
-                        ),
-                    )
-                    .await;
+                    send_turn_start_failure!(format!(
+                        "failed to encode CLI runtime turn input: {error:#}"
+                    ));
                     return;
                 }
             };
@@ -1015,15 +935,9 @@ impl MessageProcessor {
                     format!("failed to persist CLI runtime prompt manifest: {error:#}"),
                 )
                 .await;
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id.clone()),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to persist CLI runtime prompt manifest: {error:#}"),
-                    ),
-                )
-                .await;
+                send_turn_start_failure!(format!(
+                    "failed to persist CLI runtime prompt manifest: {error:#}"
+                ));
                 return;
             }
             let native_thread_id = native_thread.binding.native_thread_id;
@@ -1057,12 +971,14 @@ impl MessageProcessor {
                     ))
                     .await
                 }
-                TurnStartSuccessResponse::VoiceSessionFinalize => {
-                    message_future(self.finish_voice_session_finalize_turn_start_success(
-                        connection_id,
-                        request_id,
-                        &native_turn_start.outcome,
-                    ))
+                TurnStartSuccessResponse::VoiceSessionFinalizeAccepted { session_id } => {
+                    message_future(
+                        self.finish_voice_session_finalize_accepted_turn_start_success(
+                            connection_id,
+                            &native_turn_start.outcome,
+                            &session_id,
+                        ),
+                    )
                     .await
                 }
             };
@@ -1138,15 +1054,16 @@ impl MessageProcessor {
         request_id: RequestId,
         runtime_id: &str,
         runtime_kind: CLIAgentRuntimeKind,
+        success_response: &TurnStartSuccessResponse,
+        turn_id: &str,
     ) -> Option<pioneer_config::EffectiveGatewayCliAgentRuntimeInstanceConfig> {
         if self.cli_runtime_manager.is_none() {
-            self.send_error(
+            self.send_cli_runtime_turn_start_failure(
                 connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    cli_runtime_execution_disabled_message(),
-                ),
+                request_id,
+                success_response,
+                turn_id,
+                cli_runtime_execution_disabled_message(),
             )
             .await;
             return None;
@@ -1155,26 +1072,24 @@ impl MessageProcessor {
         let runtimes = match self.load_cli_runtime_instances() {
             Ok(runtimes) => runtimes,
             Err(error) => {
-                self.send_error(
+                self.send_cli_runtime_turn_start_failure(
                     connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to load CLI runtime config: {error:#}"),
-                    ),
+                    request_id,
+                    success_response,
+                    turn_id,
+                    format!("failed to load CLI runtime config: {error:#}"),
                 )
                 .await;
                 return None;
             }
         };
         if runtimes.is_empty() {
-            self.send_error(
+            self.send_cli_runtime_turn_start_failure(
                 connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    cli_runtime_execution_disabled_message(),
-                ),
+                request_id,
+                success_response,
+                turn_id,
+                cli_runtime_execution_disabled_message(),
             )
             .await;
             return None;
@@ -1184,40 +1099,37 @@ impl MessageProcessor {
             .into_iter()
             .find(|runtime| runtime.id == runtime_id)
         else {
-            self.send_error(
+            self.send_cli_runtime_turn_start_failure(
                 connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    format!("unknown CLI runtime `{runtime_id}`"),
-                ),
+                request_id,
+                success_response,
+                turn_id,
+                format!("unknown CLI runtime `{runtime_id}`"),
             )
             .await;
             return None;
         };
         if !runtime.enabled {
-            self.send_error(
+            self.send_cli_runtime_turn_start_failure(
                 connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    format!("CLI runtime `{runtime_id}` is disabled"),
-                ),
+                request_id,
+                success_response,
+                turn_id,
+                format!("CLI runtime `{runtime_id}` is disabled"),
             )
             .await;
             return None;
         }
         if !cli_runtime_kind_matches_config(runtime_kind, runtime.kind) {
-            self.send_error(
+            self.send_cli_runtime_turn_start_failure(
                 connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    format!(
-                        "CLI runtime `{runtime_id}` is configured as `{}` but request asked for `{}`",
-                        cli_runtime_config_kind_label(runtime.kind),
-                        cli_runtime_protocol_kind_label(runtime_kind)
-                    ),
+                request_id,
+                success_response,
+                turn_id,
+                format!(
+                    "CLI runtime `{runtime_id}` is configured as `{}` but request asked for `{}`",
+                    cli_runtime_config_kind_label(runtime.kind),
+                    cli_runtime_protocol_kind_label(runtime_kind)
                 ),
             )
             .await;
@@ -1494,11 +1406,11 @@ impl MessageProcessor {
         message_future(self.publish_turn_start_success(outcome)).await
     }
 
-    async fn finish_voice_session_finalize_turn_start_success(
+    async fn finish_voice_session_finalize_accepted_turn_start_success(
         &self,
         connection_id: ConnectionId,
-        request_id: RequestId,
         outcome: &crate::thread::TurnStartOutcome,
+        session_id: &str,
     ) -> bool {
         self.session_manager
             .set_connection_workspace(
@@ -1506,35 +1418,33 @@ impl MessageProcessor {
                 Some(outcome.started_notification.workspace_id.clone()),
             )
             .await;
-        let response = match JsonRpcResponse::from_result(
-            request_id,
-            &VoiceSessionFinalizeResponse {
-                status: VoiceStatus::Ready,
-            },
-        ) {
-            Ok(response) => response,
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        None,
-                        INVALID_REQUEST_CODE,
-                        format!("failed to encode voice finalize response: {error}"),
-                    ),
-                )
-                .await;
-                return false;
-            }
-        };
-        if let Err(error) = self.send_json(connection_id, &response).await {
-            warn!(
+        if !message_future(self.publish_turn_start_success(outcome)).await {
+            self.send_voice_session_result_notification(
                 connection_id,
-                error = %format!("{error:#}"),
-                "failed to send voice finalize response after CLI runtime turn start"
-            );
+                VoiceSessionResultNotification {
+                    session_id: session_id.to_owned(),
+                    outcome: VoiceSessionOutcome::Failed,
+                    turn_id: Some(outcome.started_notification.turn.id.clone()),
+                    error: Some(VoiceError {
+                        kind: VoiceErrorKind::Unknown,
+                        message: "failed to publish CLI runtime turn start".to_owned(),
+                    }),
+                },
+            )
+            .await;
             return false;
         }
-        message_future(self.publish_turn_start_success(outcome)).await
+        self.send_voice_session_result_notification(
+            connection_id,
+            VoiceSessionResultNotification {
+                session_id: session_id.to_owned(),
+                outcome: VoiceSessionOutcome::TurnStarted,
+                turn_id: Some(outcome.started_notification.turn.id.clone()),
+                error: None,
+            },
+        )
+        .await;
+        true
     }
 
     async fn publish_turn_start_success(&self, outcome: &crate::thread::TurnStartOutcome) -> bool {

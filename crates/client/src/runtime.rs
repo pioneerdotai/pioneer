@@ -56,6 +56,7 @@ use crate::{
     transport::ws::{
         GatewayWsClient, GatewayWsCommandSender, GatewayWsEvent, should_apply_ws_event,
     },
+    voice::{VoiceSessionResultReduction, reduce_voice_session_result_notification},
 };
 use pioneer_protocol::{
     ArtifactSummary, GatewayNotification, GatewayRemoteAccessStatusChangedNotification, Workspace,
@@ -134,6 +135,7 @@ pub enum ClientRuntimeNotification {
         reduction: PendingRequestsReduction,
     },
     SemanticTimeline(SemanticTimelineLiveUpdate),
+    VoiceSessionResult(VoiceSessionResultReduction),
     GatewayRemoteAccessStatusChanged(GatewayRemoteAccessStatusChangedNotification),
     WorkspaceChanged {
         notification: WorkspaceChangedNotification,
@@ -632,11 +634,15 @@ pub fn reduce_gateway_notification(
                 SemanticTimelineLiveUpdate::TurnWorkStateChanged(notification),
             ))
         }
+        GatewayNotification::VoiceSessionResult(notification) => {
+            Some(ClientRuntimeNotification::VoiceSessionResult(
+                reduce_voice_session_result_notification(&notification),
+            ))
+        }
         GatewayNotification::ContextCompressing(_)
         | GatewayNotification::ContextCompressed(_)
         | GatewayNotification::Unknown(_)
         | GatewayNotification::SkillsUploadChunkAck(_)
-        | GatewayNotification::VoiceSessionResult(_)
         | GatewayNotification::ArtifactProjectionUpdated(_)
         | GatewayNotification::ArtifactUploadProgress(_)
         | GatewayNotification::ArtifactDownloadProgress(_)

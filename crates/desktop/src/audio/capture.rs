@@ -4,7 +4,8 @@ use super::microphone::{
 use crate::gateway::GatewayWsCommandSender;
 use pioneer_protocol::{
     VoiceAudioEncoding, VoiceAudioFormat, VoiceSessionCancelParams, VoiceSessionFinalizeParams,
-    VoiceSessionStartContext, VoiceSessionStartParams, VoiceTurnContext,
+    VoiceSessionFinalizeResponse, VoiceSessionStartContext, VoiceSessionStartParams,
+    VoiceTurnContext,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -239,13 +240,19 @@ pub(crate) trait DesktopVoiceGateway {
         &self,
         session_id: String,
         context: VoiceTurnContext,
-    ) -> Result<(), DesktopVoiceCaptureError>;
+    ) -> Result<VoiceSessionFinalizeResponse, DesktopVoiceCaptureError>;
 
     fn cancel_voice_session(
         &self,
         session_id: String,
         reason: Option<String>,
     ) -> Result<(), DesktopVoiceCaptureError>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DesktopVoiceFinalizeAck {
+    pub(crate) session_id: String,
+    pub(crate) response: VoiceSessionFinalizeResponse,
 }
 
 impl DesktopVoiceGateway for GatewayWsCommandSender {
@@ -304,12 +311,11 @@ impl DesktopVoiceGateway for GatewayWsCommandSender {
         &self,
         session_id: String,
         context: VoiceTurnContext,
-    ) -> Result<(), DesktopVoiceCaptureError> {
+    ) -> Result<VoiceSessionFinalizeResponse, DesktopVoiceCaptureError> {
         self.voice_session_finalize(VoiceSessionFinalizeParams {
             session_id,
             context,
         })
-        .map(|_| ())
         .map_err(|error| {
             DesktopVoiceCaptureError::new(
                 DesktopVoiceCaptureErrorKind::GatewayFinalize,
@@ -485,12 +491,23 @@ where
     pub(crate) fn finalize_send(
         &mut self,
         context: VoiceTurnContext,
-    ) -> Result<(), DesktopVoiceCaptureError> {
+    ) -> Result<DesktopVoiceFinalizeAck, DesktopVoiceCaptureError> {
         let Some(session) = self.active_gateway_session.take() else {
-            return Ok(());
+            return Ok(DesktopVoiceFinalizeAck {
+                session_id: String::new(),
+                response: VoiceSessionFinalizeResponse {
+                    status: pioneer_protocol::VoiceStatus::Ready,
+                },
+            });
         };
-        self.gateway
-            .finalize_voice_session(session.session_id, context)
+        let session_id = session.session_id;
+        let response = self
+            .gateway
+            .finalize_voice_session(session_id.clone(), context)?;
+        Ok(DesktopVoiceFinalizeAck {
+            session_id,
+            response,
+        })
     }
 
     pub(crate) fn release_cancel(&mut self) -> Result<(), DesktopVoiceCaptureError> {
@@ -1084,7 +1101,7 @@ mod tests {
             &self,
             session_id: String,
             context: VoiceTurnContext,
-        ) -> Result<(), DesktopVoiceCaptureError> {
+        ) -> Result<VoiceSessionFinalizeResponse, DesktopVoiceCaptureError> {
             self.events
                 .lock()
                 .expect("events")
@@ -1092,7 +1109,9 @@ mod tests {
                     session_id,
                     turn_id: context.turn_id,
                 });
-            Ok(())
+            Ok(VoiceSessionFinalizeResponse {
+                status: pioneer_protocol::VoiceStatus::Transcribing,
+            })
         }
 
         fn cancel_voice_session(

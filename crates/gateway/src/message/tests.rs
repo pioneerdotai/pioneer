@@ -4678,7 +4678,7 @@ async fn voice_session_transcript_starts_turn_and_preserves_context_attachments(
     let finalize_response = recv_response_by_id(&mut rx, finalize_request_id.as_str()).await;
     let finalize_payload: pioneer_protocol::VoiceSessionFinalizeResponse =
         serde_json::from_value(finalize_response.result).expect("voice/session/finalize decode");
-    assert_eq!(finalize_payload.status, VoiceStatus::Ready);
+    assert_eq!(finalize_payload.status, VoiceStatus::Transcribing);
 
     let turn_started = recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
     let turn_started_payload: pioneer_protocol::TurnStartedNotification =
@@ -4736,6 +4736,22 @@ async fn voice_session_transcript_starts_turn_and_preserves_context_attachments(
         )),
         "voice turn must preserve selected MCP tool capability"
     );
+
+    let result_notification =
+        recv_notification_by_method(&mut rx, events::VOICE_SESSION_RESULT).await;
+    let result_payload: VoiceSessionResultNotification = serde_json::from_value(
+        result_notification
+            .params
+            .expect("voice/session/result params"),
+    )
+    .expect("voice/session/result decode");
+    assert_eq!(result_payload.session_id, start_payload.session_id);
+    assert_eq!(result_payload.outcome, VoiceSessionOutcome::TurnStarted);
+    assert_eq!(
+        result_payload.turn_id.as_deref(),
+        Some("turn_voice_success_0001")
+    );
+    assert!(result_payload.error.is_none());
 
     let _turn_completed = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
     assert_eq!(capture_provider.call_count(), 1);
@@ -4877,7 +4893,7 @@ async fn voice_session_finalize_without_speech_does_not_create_turn() {
     let finalize_response = recv_response_by_id(&mut rx, finalize_request_id.as_str()).await;
     let finalize_payload: pioneer_protocol::VoiceSessionFinalizeResponse =
         serde_json::from_value(finalize_response.result).expect("voice/session/finalize decode");
-    assert_eq!(finalize_payload.status, VoiceStatus::Ready);
+    assert_eq!(finalize_payload.status, VoiceStatus::Transcribing);
 
     let result_notification =
         recv_notification_by_method(&mut rx, events::VOICE_SESSION_RESULT).await;

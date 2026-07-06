@@ -90,6 +90,7 @@ pub mod threads;
 pub mod timeline;
 pub mod transport;
 pub mod turns;
+pub mod voice;
 pub mod workspaces;
 
 pub use error::{ClientError, ClientResult};

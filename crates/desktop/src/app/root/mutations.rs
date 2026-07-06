@@ -188,6 +188,16 @@ impl PioneerDesktop {
         self.composer_upload_error = None;
     }
 
+    pub(in crate::app) fn clear_composer_payload_for_thread(&mut self, thread_id: &str) {
+        if self.active_thread_id.as_deref() == Some(thread_id) {
+            self.composer_attachments.clear();
+            self.composer_capabilities.clear();
+            self.composer_upload_in_progress = false;
+            self.composer_upload_error = None;
+        }
+        self.clear_thread_draft(thread_id);
+    }
+
     pub(in crate::app) fn reset_thread_start_state(&mut self) {
         client_state_reducers::reset_thread_start_coordinator(&mut self.thread_start);
     }

@@ -232,7 +232,9 @@ pub(super) enum DesktopVoiceComposerState {
         target: DesktopVoiceHoldTarget,
         candidate: DesktopVoiceReleaseCandidate,
     },
-    Finalizing,
+    Finalizing {
+        thread_id: String,
+    },
     Error {
         kind: DesktopVoiceCaptureErrorKind,
         message: String,
@@ -243,7 +245,7 @@ impl DesktopVoiceComposerState {
     pub(super) fn is_active(&self) -> bool {
         matches!(
             self,
-            Self::Preparing { .. } | Self::Holding { .. } | Self::Finalizing
+            Self::Preparing { .. } | Self::Holding { .. } | Self::Finalizing { .. }
         )
     }
 

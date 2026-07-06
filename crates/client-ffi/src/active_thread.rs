@@ -1095,6 +1095,7 @@ impl ClientFfiActiveThreadState {
             | ClientRuntimeNotification::ArtifactDeletedRefresh(_)
             | ClientRuntimeNotification::CLIRuntimeRefresh(_)
             | ClientRuntimeNotification::GatewayRemoteAccessStatusChanged(_)
+            | ClientRuntimeNotification::VoiceSessionResult(_)
             | ClientRuntimeNotification::WorkspaceChanged { .. } => {
                 SemanticTimelineCachePatch::default()
             }

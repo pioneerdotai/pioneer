@@ -391,6 +391,18 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             crate::composer::turn_prepare::VoiceComposerLockState
         ),
         schema_doc!(
+            "voice_finalize_response_reduction.json",
+            crate::voice::VoiceFinalizeResponseReduction
+        ),
+        schema_doc!(
+            "voice_finalize_ui_action.json",
+            crate::voice::VoiceFinalizeUiAction
+        ),
+        schema_doc!(
+            "voice_session_result_reduction.json",
+            crate::voice::VoiceSessionResultReduction
+        ),
+        schema_doc!(
             "provider_api_key_action_unavailable.json",
             crate::providers::actions::ProviderApiKeyActionUnavailable
         ),

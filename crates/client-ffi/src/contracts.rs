@@ -10,6 +10,7 @@ use pioneer_client::{
         snapshot::ClientSnapshot,
     },
     transport::ws::GatewayWsEvent,
+    voice::{VoiceSessionResultReduction, reduce_voice_session_result_notification},
 };
 use pioneer_protocol::GatewayNotification;
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,7 @@ pub enum ClientEvent {
     SnapshotChanged(ClientSnapshot),
     GatewayConnectionChanged(ClientGatewayConnectionEvent),
     GatewayNotification(GatewayNotification),
+    VoiceSessionResultReduced(VoiceSessionResultReduction),
     EffectsPlanned(Vec<ClientEffect>),
     Error(ClientErrorEvent),
 }
@@ -95,12 +97,22 @@ pub fn reduce_gateway_ws_events_to_client_events(
     events
         .into_iter()
         .map(|event| reduce_gateway_ws_event(event, context))
-        .map(|event| match event {
+        .flat_map(|event| match event {
             ClientRuntimeWsEvent::Connection(reduction) => {
-                ClientEvent::GatewayConnectionChanged(reduction.into())
+                vec![ClientEvent::GatewayConnectionChanged(reduction.into())]
             }
             ClientRuntimeWsEvent::Notification(notification) => {
-                ClientEvent::GatewayNotification(notification)
+                let voice_reduction = match &notification {
+                    GatewayNotification::VoiceSessionResult(notification) => {
+                        Some(ClientEvent::VoiceSessionResultReduced(
+                            reduce_voice_session_result_notification(notification),
+                        ))
+                    }
+                    _ => None,
+                };
+                std::iter::once(ClientEvent::GatewayNotification(notification))
+                    .chain(voice_reduction)
+                    .collect()
             }
         })
         .collect()

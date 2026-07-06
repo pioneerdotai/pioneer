@@ -289,6 +289,16 @@ impl MessageProcessor {
             }
         };
 
+        self.send_voice_result(
+            connection_id,
+            request_id.clone(),
+            methods::VOICE_SESSION_FINALIZE,
+            &VoiceSessionFinalizeResponse {
+                status: VoiceStatus::Transcribing,
+            },
+        )
+        .await;
+
         let pipeline_outcome = self.finalize_voice_session_audio(&session).await;
         let _ = self
             .voice_sessions
@@ -317,15 +327,6 @@ impl MessageProcessor {
                                 non_zero_samples = signal_stats.non_zero_samples,
                                 "voice session produced empty transcript; no turn will be created"
                             );
-                            self.send_voice_result(
-                                connection_id,
-                                request_id,
-                                methods::VOICE_SESSION_FINALIZE,
-                                &VoiceSessionFinalizeResponse {
-                                    status: VoiceStatus::Ready,
-                                },
-                            )
-                            .await;
                             self.send_voice_session_result_notification(
                                 connection_id,
                                 VoiceSessionResultNotification {
@@ -353,7 +354,9 @@ impl MessageProcessor {
                                 turn_params,
                                 runtime_id,
                                 runtime_kind,
-                                super::turn_handlers::TurnStartSuccessResponse::VoiceSessionFinalize,
+                                super::turn_handlers::TurnStartSuccessResponse::VoiceSessionFinalizeAccepted {
+                                    session_id: session.session_id.clone(),
+                                },
                             )
                             .await;
                             return;
@@ -365,14 +368,6 @@ impl MessageProcessor {
                                     "ACP agent runtime `{runtime_id}` is not supported"
                                 ),
                             };
-                            self.send_voice_error(
-                                connection_id,
-                                request_id,
-                                INVALID_REQUEST_CODE,
-                                methods::VOICE_SESSION_FINALIZE,
-                                error.clone(),
-                            )
-                            .await;
                             self.send_voice_session_result_notification(
                                 connection_id,
                                 VoiceSessionResultNotification {
@@ -406,14 +401,6 @@ impl MessageProcessor {
                                 "failed to start voice turn after transcription: {message}"
                             ),
                         };
-                        self.send_voice_error(
-                            connection_id,
-                            request_id,
-                            INVALID_REQUEST_CODE,
-                            methods::VOICE_SESSION_FINALIZE,
-                            error.clone(),
-                        )
-                        .await;
                         self.send_voice_session_result_notification(
                             connection_id,
                             VoiceSessionResultNotification {
@@ -428,17 +415,18 @@ impl MessageProcessor {
                     }
                 };
 
-                self.send_voice_result(
+                self.finish_api_provider_turn_start_without_response(connection_id, &prepared)
+                    .await;
+                self.send_voice_session_result_notification(
                     connection_id,
-                    request_id,
-                    methods::VOICE_SESSION_FINALIZE,
-                    &VoiceSessionFinalizeResponse {
-                        status: VoiceStatus::Ready,
+                    VoiceSessionResultNotification {
+                        session_id: session.session_id.clone(),
+                        outcome: VoiceSessionOutcome::TurnStarted,
+                        turn_id: Some(session.turn_id.clone()),
+                        error: None,
                     },
                 )
                 .await;
-                self.finish_api_provider_turn_start_without_response(connection_id, &prepared)
-                    .await;
                 self.dispatch_prepared_api_provider_turn_start(prepared)
                     .await;
                 return;
@@ -460,15 +448,6 @@ impl MessageProcessor {
                     non_zero_samples = signal_stats.non_zero_samples,
                     "voice session finalized with no speech; no turn will be created"
                 );
-                self.send_voice_result(
-                    connection_id,
-                    request_id,
-                    methods::VOICE_SESSION_FINALIZE,
-                    &VoiceSessionFinalizeResponse {
-                        status: VoiceStatus::Ready,
-                    },
-                )
-                .await;
                 self.send_voice_session_result_notification(
                     connection_id,
                     VoiceSessionResultNotification {
@@ -482,22 +461,13 @@ impl MessageProcessor {
                 return;
             }
             Err(error) => {
-                let notification_error = error.clone();
-                self.send_voice_error(
-                    connection_id,
-                    request_id,
-                    INVALID_REQUEST_CODE,
-                    methods::VOICE_SESSION_FINALIZE,
-                    error,
-                )
-                .await;
                 self.send_voice_session_result_notification(
                     connection_id,
                     VoiceSessionResultNotification {
                         session_id: session.session_id.clone(),
                         outcome: VoiceSessionOutcome::Failed,
                         turn_id: Some(session.turn_id.clone()),
-                        error: Some(notification_error),
+                        error: Some(error),
                     },
                 )
                 .await;
@@ -765,7 +735,7 @@ impl MessageProcessor {
         }
     }
 
-    async fn send_voice_session_result_notification(
+    pub(super) async fn send_voice_session_result_notification(
         &self,
         connection_id: ConnectionId,
         notification: VoiceSessionResultNotification,

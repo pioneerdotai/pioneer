@@ -302,6 +302,10 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             pioneer_protocol::VoiceSessionResultNotification
         ),
         schema_doc!(
+            "voice_session_result_reduction.json",
+            pioneer_client::voice::VoiceSessionResultReduction
+        ),
+        schema_doc!(
             "voice_session_start_params.json",
             pioneer_protocol::VoiceSessionStartParams
         ),

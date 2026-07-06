@@ -22,6 +22,7 @@ use pioneer_client::{
     composer::turn_prepare::{self, PrepareVoiceComposerSnapshotRequest},
     providers::list as provider_list,
     turns::start as turn_start,
+    voice::{VoiceFinalizeUiAction, reduce_voice_session_finalize_response},
 };
 use pioneer_protocol::{VoiceSessionStartContext, VoiceStatus, VoiceStatusParams};
 use std::time::Duration;
@@ -47,7 +48,7 @@ impl PioneerDesktop {
             DesktopVoiceComposerState::Preparing {
                 release_requested: true,
                 ..
-            } | DesktopVoiceComposerState::Finalizing
+            } | DesktopVoiceComposerState::Finalizing { .. }
         )
     }
 
@@ -371,7 +372,6 @@ impl PioneerDesktop {
             return;
         }
 
-        self.desktop_voice_composer = DesktopVoiceComposerState::Finalizing;
         let Some(mut flow) = self.desktop_voice_capture.take() else {
             self.desktop_voice_prepare_request = None;
             self.desktop_voice_composer = DesktopVoiceComposerState::Idle;
@@ -385,6 +385,9 @@ impl PioneerDesktop {
             return;
         };
 
+        self.desktop_voice_composer = DesktopVoiceComposerState::Finalizing {
+            thread_id: prepare_request.thread_id.clone(),
+        };
         if let Err(error) = flow.stop_recording() {
             let _ = flow.release_cancel();
             self.desktop_voice_composer = desktop_voice_error_state_from_capture_error(error);
@@ -437,7 +440,7 @@ impl PioneerDesktop {
                             );
                             if matches!(
                                 view.desktop_voice_composer,
-                                DesktopVoiceComposerState::Finalizing
+                                DesktopVoiceComposerState::Finalizing { .. }
                             ) {
                                 view.desktop_voice_composer = DesktopVoiceComposerState::Error {
                                     kind: DesktopVoiceCaptureErrorKind::GatewaySession,
@@ -459,18 +462,27 @@ impl PioneerDesktop {
                     .await;
                 let _ = this.update(&mut cx, |view, cx| {
                     match result {
-                        Ok(()) => {
+                        Ok(ack) => {
                             if matches!(
                                 view.desktop_voice_composer,
-                                DesktopVoiceComposerState::Finalizing
+                                DesktopVoiceComposerState::Finalizing { .. }
                             ) {
-                                view.desktop_voice_composer = DesktopVoiceComposerState::Idle;
+                                let reduction = reduce_voice_session_finalize_response(
+                                    ack.session_id,
+                                    &ack.response,
+                                );
+                                if matches!(
+                                    reduction.action,
+                                    VoiceFinalizeUiAction::ClearFinalizing
+                                ) {
+                                    view.desktop_voice_composer = DesktopVoiceComposerState::Idle;
+                                }
                             }
                         }
                         Err(error) => {
                             if matches!(
                                 view.desktop_voice_composer,
-                                DesktopVoiceComposerState::Finalizing
+                                DesktopVoiceComposerState::Finalizing { .. }
                             ) {
                                 view.desktop_voice_composer =
                                     desktop_voice_error_state_from_capture_error(error);
