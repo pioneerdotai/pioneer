@@ -107,6 +107,7 @@ config = "0.15"
 dirs = "6"
 rand = "0.10"
 webclaw-core = { git = "https://github.com/0xMassi/webclaw", package = "webclaw-core", default-features = false }
+nono = { git = "https://github.com/nolabs-ai/nono", tag = "v0.66.0", default-features = false }
 scraper = "0.27"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 chrono-tz = "0.10"
