@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "version": 1,
+  "source": "composer_selection",
+  "permission_profile": {
+    "mode": "auto_accept_edits",
+    "source": "composer",
+    "effective_policy": {
+      "default_behavior": "ask",
+      "file_read": "allow",
+      "file_write": "allow",
+      "shell_command": "ask",
+      "network": "ask",
+      "mcp_read": "allow",
+      "mcp_write_or_unknown": "ask",
+      "dynamic_skill_tool": "ask",
+      "computer_use": "ask",
+      "task_subagent": "ask"
+    }
+  },
+  "sandbox": {
+    "mode": "workspace_write",
+    "cwd": "/workspace/project",
+    "filesystem": {
+      "kind": "restricted",
+      "entries": [
+        {
+          "path": {
+            "kind": "workspace_root"
+          },
+          "access": "write",
+          "provenance": "workspace",
+          "resolved_path": "/workspace/project"
+        }
+      ]
+    },
+    "tmp": {
+      "mode": "isolated"
+    },
+    "network": {
+      "mode": "disabled",
+      "allow_localhost": false,
+      "allow_unix_sockets": false
+    },
+    "backend_requirement": "required",
+    "backend_preference": [
+      "nono"
+    ]
+  },
+  "process": {
+    "shell": {
+      "enabled": true,
+      "allow_stdin": true,
+      "allow_session_inheritance": true
+    },
+    "environment": {
+      "inherit": true,
+      "denied_patterns": [
+        ".*TOKEN.*",
+        ".*SECRET.*",
+        ".*PASSWORD.*"
+      ]
+    },
+    "timeout": {
+      "max_duration_ms": 1800000
+    },
+    "command_risk": {}
+  },
+  "network": {
+    "mode": "disabled",
+    "allow_localhost": false,
+    "allow_unix_sockets": false
+  },
+  "approval": {
+    "allow_once": true,
+    "allow_for_turn": true,
+    "allow_for_session": false,
+    "allow_always": false,
+    "request_permissions": true
+  },
+  "backend": {
+    "execution_backend": "native",
+    "sandbox_backend": "nono",
+    "capabilities": {
+      "can_enforce_filesystem": true,
+      "can_enforce_network": true,
+      "can_enforce_process": true,
+      "supports_turn_scope_approval": true,
+      "supports_session_scope_approval": false,
+      "supports_request_permissions": true
+    }
+  },
+  "enforcement": {
+    "status": "active"
+  },
+  "created_at_unix_ms": 1700000001000
+}

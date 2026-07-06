@@ -945,6 +945,17 @@ pub struct TaskAgentToolPolicy {
     pub network_access: bool,
 }
 
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskAgentSecurityCap {
+    pub max_permission_profile: crate::TurnPermissionProfileCap,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub max_filesystem_entries: Vec<crate::TurnFilesystemSandboxEntry>,
+    pub max_network_policy: crate::TurnNetworkPolicySnapshot,
+    pub max_sandbox_mode: crate::TurnSandboxMode,
+    pub max_process_policy: crate::TurnProcessPolicySnapshot,
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskAgentResultFormat {
@@ -1172,6 +1183,8 @@ pub struct TaskAgentSpec {
     pub tool_policy: Option<TaskAgentToolPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_cap: Option<crate::TurnPermissionProfileCap>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_cap: Option<TaskAgentSecurityCap>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_contract: Option<TaskAgentResultContract>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1960,6 +1973,8 @@ pub struct TaskAgentSpecInput {
     pub tool_policy: Option<TaskAgentToolPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_cap: Option<crate::TurnPermissionProfileCap>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_cap: Option<TaskAgentSecurityCap>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_contract: Option<TaskAgentResultContract>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2792,6 +2807,21 @@ mod tests {
     };
     use serde_json::json;
 
+    fn task_security_cap_fixture() -> super::TaskAgentSecurityCap {
+        super::TaskAgentSecurityCap {
+            max_permission_profile: crate::task_permission_cap_for_mode(
+                crate::TurnPermissionMode::AutoAcceptEdits,
+            ),
+            max_filesystem_entries: vec![crate::TurnFilesystemSandboxEntry::workspace_root(
+                crate::TurnFilesystemAccess::Write,
+                "/workspace",
+            )],
+            max_network_policy: crate::TurnNetworkPolicySnapshot::disabled(),
+            max_sandbox_mode: crate::TurnSandboxMode::WorkspaceWrite,
+            max_process_policy: crate::TurnProcessPolicySnapshot::restricted(),
+        }
+    }
+
     #[test]
     fn task_enums_serialize_as_snake_case() {
         assert_eq!(
@@ -3130,6 +3160,62 @@ mod tests {
     }
 
     #[test]
+    fn task_security_cap_round_trips_in_agent_spec_event() {
+        let security_cap = task_security_cap_fixture();
+        let agent_spec = TaskAgentSpec {
+            id: "agent_spec_security01".to_owned(),
+            task_id: "task_security00001".to_owned(),
+            run_id: Some("run_security000001".to_owned()),
+            agent_role: Some("worker".to_owned()),
+            agent_nickname: Some("Worker".to_owned()),
+            model: Some("test-model".to_owned()),
+            model_provider: Some("openai".to_owned()),
+            prompt: super::TaskAgentPrompt {
+                goal: "Do work".to_owned(),
+                instructions: Vec::new(),
+                input: None,
+                output_instructions: None,
+            },
+            context_policy: None,
+            tool_policy: None,
+            permission_cap: Some(crate::task_permission_cap_for_mode(
+                crate::TurnPermissionMode::AutoAcceptEdits,
+            )),
+            security_cap: Some(security_cap.clone()),
+            result_contract: None,
+            review_policy: None,
+            depth: 1,
+            max_depth: 3,
+            created_at: 1,
+            updated_at: 1,
+        };
+        let payload = TaskEventPayload::AgentSpecCreated {
+            agent_spec: agent_spec.clone(),
+        };
+
+        let encoded = serde_json::to_value(&payload).expect("event should encode");
+        assert_eq!(
+            encoded["payload"]["agent_spec"]["securityCap"]["maxSandboxMode"],
+            json!("workspace_write")
+        );
+        assert_eq!(
+            encoded["payload"]["agent_spec"]["securityCap"]["maxNetworkPolicy"]["mode"],
+            json!("disabled")
+        );
+
+        let decoded: TaskEventPayload =
+            serde_json::from_value(encoded).expect("event should decode");
+        let TaskEventPayload::AgentSpecCreated {
+            agent_spec: decoded,
+        } = decoded
+        else {
+            panic!("expected agent spec event");
+        };
+        assert_eq!(decoded.security_cap, Some(security_cap));
+        assert_eq!(decoded, agent_spec);
+    }
+
+    #[test]
     fn legacy_task_agent_spec_without_review_policy_decodes() {
         let decoded: TaskAgentSpec = serde_json::from_value(json!({
             "id": "agent_spec_legacy01",
@@ -3156,5 +3242,6 @@ mod tests {
         .expect("legacy task agent spec should decode");
 
         assert!(decoded.review_policy.is_none());
+        assert!(decoded.security_cap.is_none());
     }
 }

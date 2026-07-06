@@ -234,6 +234,14 @@ pub struct TurnPermissionAuditEvent {
     pub profile_mode: TurnPermissionMode,
     pub profile_source: TurnPermissionProfileSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_snapshot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_snapshot_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_reason_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_capability: Option<crate::TurnSecurityCapabilityKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
@@ -255,6 +263,9 @@ pub struct TurnPermissionAuditEvent {
 #[serde(rename_all = "snake_case")]
 pub enum TurnPermissionAuditEventKind {
     ProfileSelected,
+    SecuritySnapshotResolved,
+    SecuritySandboxDegraded,
+    SecuritySandboxUnavailable,
     ApprovalRequested,
     ApprovalResolved,
     DecisionAllowed,
@@ -645,6 +656,42 @@ mod tests {
             }
         );
         assert!(event.is_terminal());
+    }
+
+    #[test]
+    fn security_audit_event_carries_snapshot_reference_and_reason_code() {
+        let event = TurnPermissionAuditEvent {
+            workspace_id: "ws_1".to_owned(),
+            thread_id: "thread_1".to_owned(),
+            turn_id: "turn_1".to_owned(),
+            event_kind: TurnPermissionAuditEventKind::SecuritySandboxDegraded,
+            profile_mode: TurnPermissionMode::AutoAcceptEdits,
+            profile_source: TurnPermissionProfileSource::Composer,
+            security_snapshot_id: Some("turn_1:security:v1".to_owned()),
+            security_snapshot_version: Some(1),
+            security_reason_code: Some("sandbox_degraded".to_owned()),
+            security_capability: Some(crate::TurnSecurityCapabilityKind::Filesystem),
+            item_id: None,
+            tool_call_id: None,
+            tool_name: None,
+            action_kind: None,
+            request_key: None,
+            decision: None,
+            reason: None,
+            cached: false,
+        };
+
+        let encoded = serde_json::to_value(&event).expect("audit event should encode");
+        assert_eq!(encoded["eventKind"], "security_sandbox_degraded");
+        assert_eq!(encoded["securitySnapshotId"], "turn_1:security:v1");
+        assert_eq!(encoded["securitySnapshotVersion"], 1);
+        assert_eq!(encoded["securityReasonCode"], "sandbox_degraded");
+        assert_eq!(encoded["securityCapability"], "filesystem");
+        assert!(encoded.get("details").is_none());
+
+        let decoded: TurnPermissionAuditEvent =
+            serde_json::from_value(encoded).expect("audit event should decode");
+        assert_eq!(decoded, event);
     }
 
     #[test]

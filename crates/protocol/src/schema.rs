@@ -33,19 +33,20 @@ use crate::artifact::{
 };
 
 use crate::{
-    AgentDurableEvent, AgentExecutionBackend, AgentMessagePhase, AgentProgressEvent, ByteRange,
-    CLIAgentRuntimeKind, CLIAgentRuntimeSandboxPolicy, CLIRuntimeAccountUpdatedNotification,
-    CLIRuntimeAppsChangedNotification, CLIRuntimeGetParams, CLIRuntimeGetResponse,
-    CLIRuntimeListModelsParams, CLIRuntimeListModelsResponse, CLIRuntimeListParams,
-    CLIRuntimeListResponse, CLIRuntimeLoginCancelParams, CLIRuntimeLoginCancelResponse,
-    CLIRuntimeLoginStartParams, CLIRuntimeLoginStartResponse, CLIRuntimeLoginStartType,
-    CLIRuntimePendingRequest, CLIRuntimePendingRequestStatus, CLIRuntimeRefreshParams,
-    CLIRuntimeRefreshResponse, CLIRuntimeRequestKind, CLIRuntimeRequestOpenedNotification,
-    CLIRuntimeRequestResolution, CLIRuntimeRequestResolvedNotification,
-    CLIRuntimeRequestRespondParams, CLIRuntimeRequestRespondResponse, CLIRuntimeReviewDelivery,
-    CLIRuntimeReviewStartParams, CLIRuntimeReviewStartResponse, CLIRuntimeReviewTarget,
-    CLIRuntimeStatusChangedNotification, CLIRuntimeStatusParams, CLIRuntimeStatusResponse,
-    CLIRuntimeThreadBinding, CLIRuntimeThreadBindingGetParams, CLIRuntimeThreadBindingGetResponse,
+    AgentDurableEvent, AgentExecutionBackend, AgentMessagePhase, AgentProgressEvent,
+    BackendSecurityCapabilities, ByteRange, CLIAgentRuntimeKind, CLIAgentRuntimeSandboxPolicy,
+    CLIRuntimeAccountUpdatedNotification, CLIRuntimeAppsChangedNotification, CLIRuntimeGetParams,
+    CLIRuntimeGetResponse, CLIRuntimeListModelsParams, CLIRuntimeListModelsResponse,
+    CLIRuntimeListParams, CLIRuntimeListResponse, CLIRuntimeLoginCancelParams,
+    CLIRuntimeLoginCancelResponse, CLIRuntimeLoginStartParams, CLIRuntimeLoginStartResponse,
+    CLIRuntimeLoginStartType, CLIRuntimePendingRequest, CLIRuntimePendingRequestStatus,
+    CLIRuntimeRefreshParams, CLIRuntimeRefreshResponse, CLIRuntimeRequestKind,
+    CLIRuntimeRequestOpenedNotification, CLIRuntimeRequestResolution,
+    CLIRuntimeRequestResolvedNotification, CLIRuntimeRequestRespondParams,
+    CLIRuntimeRequestRespondResponse, CLIRuntimeReviewDelivery, CLIRuntimeReviewStartParams,
+    CLIRuntimeReviewStartResponse, CLIRuntimeReviewTarget, CLIRuntimeStatusChangedNotification,
+    CLIRuntimeStatusParams, CLIRuntimeStatusResponse, CLIRuntimeThreadBinding,
+    CLIRuntimeThreadBindingGetParams, CLIRuntimeThreadBindingGetResponse,
     CLIRuntimeThreadCompactParams, CLIRuntimeThreadCompactResponse, CLIRuntimeThreadForkParams,
     CLIRuntimeThreadForkResponse, CLIRuntimeTurnSteerParams, CLIRuntimeTurnSteerResponse,
     ContextCompressedNotification, ContextCompressingNotification, DurableEventCausalityKey,
@@ -108,28 +109,28 @@ use crate::{
     ProviderListModelsResponse, ProviderListParams, ProviderListResponse, ProviderSetApiKeyParams,
     ProviderSetApiKeyResponse, ProviderTransportKind, RuntimeAccountSnapshot, RuntimeAppInfo,
     RuntimeCapabilities, RuntimeDiagnostic, RuntimeDiagnosticLevel, RuntimeModelInfo,
-    RuntimeStatus, RuntimeSummary, SandboxMode, SandboxPolicy, SkillArchiveFormat,
-    SkillAuditTimelineItem, SkillChangedItem, SkillDependencyDiagnostic, SkillHealthItem,
-    SkillHealthSummary, SkillHealthTarget, SkillInstallState, SkillLifecycleAuditSummary,
-    SkillLifecycleResultSkill, SkillLifecycleSource, SkillListItem, SkillListParams,
-    SkillListResponse, SkillPolicyState, SkillSecurityFinding, SkillTrustGateStatus,
-    SkillWorkspacePolicy, SkillsChangedNotification, SkillsHealthParams, SkillsHealthResponse,
-    SkillsInstallParams, SkillsInstallResponse, SkillsPolicyListParams, SkillsPolicyListResponse,
-    SkillsPolicySetParams, SkillsPolicySetResponse, SkillsUninstallParams, SkillsUninstallResponse,
-    SkillsUpdateParams, SkillsUpdateResponse, SkillsUploadAbortParams, SkillsUploadAbortResponse,
-    SkillsUploadChunkAckNotification, SkillsUploadChunkHeader, SkillsUploadFinishParams,
-    SkillsUploadFinishResponse, SkillsUploadStartParams, SkillsUploadStartResponse, Task,
-    TaskAcceptParams, TaskAcceptResponse, TaskAgendaItem, TaskAgendaParams, TaskAgendaResponse,
-    TaskAgentContext, TaskAgentContextMode, TaskAgentContextPolicy, TaskAgentInput,
-    TaskAgentInputAttachment, TaskAgentInputAttachmentKind, TaskAgentInputReference,
-    TaskAgentInputReferenceKind, TaskAgentInputVariable, TaskAgentPrompt, TaskAgentResultContract,
-    TaskAgentResultFormat, TaskAgentReviewMode, TaskAgentReviewPolicy, TaskAgentSpec,
-    TaskAgentSpecInput, TaskAgentToolPolicy, TaskAgentWriteMode, TaskArtifact, TaskAttachmentMode,
-    TaskCancelParams, TaskCancelResponse, TaskCancelScope, TaskCancelledNotification,
-    TaskCompletedNotification, TaskCompletionBehavior, TaskConcurrencyConflictPolicy,
-    TaskConcurrencyPolicy, TaskCreateParams, TaskCreateResponse, TaskCreatedNotification,
-    TaskDeliveriesParams, TaskDeliveriesResponse, TaskDelivery, TaskDeliveryAttempt,
-    TaskDeliveryAttemptStatus, TaskDeliveryCancelledNotification,
+    RuntimeStatus, RuntimeSummary, SandboxBackendKind, SandboxBackendRequirement, SandboxMode,
+    SandboxPolicy, SkillArchiveFormat, SkillAuditTimelineItem, SkillChangedItem,
+    SkillDependencyDiagnostic, SkillHealthItem, SkillHealthSummary, SkillHealthTarget,
+    SkillInstallState, SkillLifecycleAuditSummary, SkillLifecycleResultSkill, SkillLifecycleSource,
+    SkillListItem, SkillListParams, SkillListResponse, SkillPolicyState, SkillSecurityFinding,
+    SkillTrustGateStatus, SkillWorkspacePolicy, SkillsChangedNotification, SkillsHealthParams,
+    SkillsHealthResponse, SkillsInstallParams, SkillsInstallResponse, SkillsPolicyListParams,
+    SkillsPolicyListResponse, SkillsPolicySetParams, SkillsPolicySetResponse,
+    SkillsUninstallParams, SkillsUninstallResponse, SkillsUpdateParams, SkillsUpdateResponse,
+    SkillsUploadAbortParams, SkillsUploadAbortResponse, SkillsUploadChunkAckNotification,
+    SkillsUploadChunkHeader, SkillsUploadFinishParams, SkillsUploadFinishResponse,
+    SkillsUploadStartParams, SkillsUploadStartResponse, Task, TaskAcceptParams, TaskAcceptResponse,
+    TaskAgendaItem, TaskAgendaParams, TaskAgendaResponse, TaskAgentContext, TaskAgentContextMode,
+    TaskAgentContextPolicy, TaskAgentInput, TaskAgentInputAttachment, TaskAgentInputAttachmentKind,
+    TaskAgentInputReference, TaskAgentInputReferenceKind, TaskAgentInputVariable, TaskAgentPrompt,
+    TaskAgentResultContract, TaskAgentResultFormat, TaskAgentReviewMode, TaskAgentReviewPolicy,
+    TaskAgentSecurityCap, TaskAgentSpec, TaskAgentSpecInput, TaskAgentToolPolicy,
+    TaskAgentWriteMode, TaskArtifact, TaskAttachmentMode, TaskCancelParams, TaskCancelResponse,
+    TaskCancelScope, TaskCancelledNotification, TaskCompletedNotification, TaskCompletionBehavior,
+    TaskConcurrencyConflictPolicy, TaskConcurrencyPolicy, TaskCreateParams, TaskCreateResponse,
+    TaskCreatedNotification, TaskDeliveriesParams, TaskDeliveriesResponse, TaskDelivery,
+    TaskDeliveryAttempt, TaskDeliveryAttemptStatus, TaskDeliveryCancelledNotification,
     TaskDeliveryDeliveredNotification, TaskDeliveryFailedNotification, TaskDeliveryFormat,
     TaskDeliveryMode, TaskDeliveryPolicy, TaskDeliveryQueuedNotification,
     TaskDeliveryStartedNotification, TaskDeliveryStatus, TaskDependency, TaskDependencyCondition,
@@ -179,25 +180,32 @@ use crate::{
     ToolOutputSummary, ToolPermissionPolicySnapshot, ToolRecoveryIdempotencyMode,
     ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass, ToolRecoveryView, ToolRetryBudgetKind,
     ToolRetryBudgetUsage, ToolRetryErrorClass, ToolRetryExhaustionKind, ToolRetryResolution,
-    ToolStoragePayload, Turn, TurnAcceptedCapability, TurnBlockedNotification,
-    TurnBlockedResumeMetadata, TurnCLIRuntimeOptions, TurnCancelParams, TurnCancelResponse,
-    TurnCapability, TurnCapabilityAcceptedReason, TurnCapabilityKind, TurnCapabilityRejectedReason,
-    TurnCompletedNotification, TurnExecutionWindowBlockedNotification,
+    ToolStoragePayload, Turn, TurnAcceptedCapability, TurnApprovalScopePolicySnapshot,
+    TurnBlockedNotification, TurnBlockedResumeMetadata, TurnCLIRuntimeOptions, TurnCancelParams,
+    TurnCancelResponse, TurnCapability, TurnCapabilityAcceptedReason, TurnCapabilityKind,
+    TurnCapabilityRejectedReason, TurnCommandRiskPolicy, TurnCompletedNotification,
+    TurnEnvironmentPolicy, TurnExecutionSecuritySnapshot, TurnExecutionWindowBlockedNotification,
     TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
     TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification,
-    TurnFailedNotification, TurnGetParams, TurnGetResponse, TurnItem, TurnItemAttemptStatus,
-    TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType, TurnItemsParams,
-    TurnItemsResponse, TurnKind, TurnMcpServerCapabilitySummary, TurnMcpToolCapabilitySummary,
-    TurnOrigin, TurnPermissionActionKind, TurnPermissionApprovalRequest,
+    TurnFailedNotification, TurnFilesystemAccess, TurnFilesystemSandboxEntry,
+    TurnFilesystemSandboxKind, TurnFilesystemSandboxPath, TurnFilesystemSandboxPolicy,
+    TurnGetParams, TurnGetResponse, TurnItem, TurnItemAttemptStatus, TurnItemEvent,
+    TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType, TurnItemsParams, TurnItemsResponse,
+    TurnKind, TurnMcpServerCapabilitySummary, TurnMcpToolCapabilitySummary, TurnNetworkMode,
+    TurnNetworkPolicySnapshot, TurnOrigin, TurnPermissionActionKind, TurnPermissionApprovalRequest,
     TurnPermissionApprovalRequestDetail, TurnPermissionApprovalResolution,
     TurnPermissionAuditDecision, TurnPermissionAuditEvent, TurnPermissionAuditEventKind,
     TurnPermissionAuditRequestKey, TurnPermissionDecisionReason, TurnPermissionMode,
     TurnPermissionProfileCap, TurnPermissionProfileSelection, TurnPermissionProfileSnapshot,
     TurnPermissionProfileSource, TurnPermissionRequestOpenedNotification,
     TurnPermissionRequestResolvedNotification, TurnPermissionRequestRespondParams,
-    TurnPermissionRequestRespondResponse, TurnReasoningSelection, TurnRejectedCapability,
-    TurnResumeParams, TurnResumeResponse, TurnSkillCapabilitySummary, TurnStartParams,
-    TurnStartResponse, TurnStartedNotification, TurnStatus, TurnStatusChangedNotification,
+    TurnPermissionRequestRespondResponse, TurnProcessPolicySnapshot, TurnProcessTimeoutPolicy,
+    TurnReasoningSelection, TurnRejectedCapability, TurnResumeParams, TurnResumeResponse,
+    TurnSandboxMode, TurnSandboxSnapshot, TurnSecurityBackendSnapshot, TurnSecurityCapabilityKind,
+    TurnSecurityDegradation, TurnSecurityEnforcementStatus, TurnSecurityExecutionBackendKind,
+    TurnSecurityParentCapSnapshot, TurnSecurityRuleProvenance, TurnSecuritySnapshotSource,
+    TurnShellPolicy, TurnSkillCapabilitySummary, TurnStartParams, TurnStartResponse,
+    TurnStartedNotification, TurnStatus, TurnStatusChangedNotification, TurnTmpMode, TurnTmpPolicy,
     TurnToolLoopBudgetExceededNotification, UnknownGatewayNotification, UserInput,
     VoiceAudioEncoding, VoiceAudioFormat, VoiceChunkAckNotification, VoiceChunkFrameHeader,
     VoiceError, VoiceErrorKind, VoiceSessionCancelParams, VoiceSessionCancelResponse,
@@ -844,6 +852,7 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!("task_agent_context_policy.json", TaskAgentContextPolicy),
         schema_doc!("task_agent_write_mode.json", TaskAgentWriteMode),
         schema_doc!("task_agent_tool_policy.json", TaskAgentToolPolicy),
+        schema_doc!("task_agent_security_cap.json", TaskAgentSecurityCap),
         schema_doc!("task_agent_result_format.json", TaskAgentResultFormat),
         schema_doc!("task_schema.json", TaskSchema),
         schema_doc!("task_agent_result_contract.json", TaskAgentResultContract),
@@ -1073,6 +1082,86 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
             ToolPermissionPolicySnapshot
         ),
         schema_doc!("permission_behavior.json", PermissionBehavior),
+        schema_doc!(
+            "turn_execution_security_snapshot.json",
+            TurnExecutionSecuritySnapshot
+        ),
+        schema_doc!(
+            "turn_security_snapshot_source.json",
+            TurnSecuritySnapshotSource
+        ),
+        schema_doc!("turn_sandbox_snapshot.json", TurnSandboxSnapshot),
+        schema_doc!("turn_sandbox_mode.json", TurnSandboxMode),
+        schema_doc!(
+            "turn_filesystem_sandbox_policy.json",
+            TurnFilesystemSandboxPolicy
+        ),
+        schema_doc!(
+            "turn_filesystem_sandbox_kind.json",
+            TurnFilesystemSandboxKind
+        ),
+        schema_doc!(
+            "turn_filesystem_sandbox_entry.json",
+            TurnFilesystemSandboxEntry
+        ),
+        schema_doc!(
+            "turn_filesystem_sandbox_path.json",
+            TurnFilesystemSandboxPath
+        ),
+        schema_doc!("turn_filesystem_access.json", TurnFilesystemAccess),
+        schema_doc!(
+            "turn_security_rule_provenance.json",
+            TurnSecurityRuleProvenance
+        ),
+        schema_doc!("turn_tmp_policy.json", TurnTmpPolicy),
+        schema_doc!("turn_tmp_mode.json", TurnTmpMode),
+        schema_doc!(
+            "turn_network_policy_snapshot.json",
+            TurnNetworkPolicySnapshot
+        ),
+        schema_doc!("turn_network_mode.json", TurnNetworkMode),
+        schema_doc!(
+            "turn_process_policy_snapshot.json",
+            TurnProcessPolicySnapshot
+        ),
+        schema_doc!("turn_shell_policy.json", TurnShellPolicy),
+        schema_doc!("turn_environment_policy.json", TurnEnvironmentPolicy),
+        schema_doc!("turn_process_timeout_policy.json", TurnProcessTimeoutPolicy),
+        schema_doc!("turn_command_risk_policy.json", TurnCommandRiskPolicy),
+        schema_doc!(
+            "turn_approval_scope_policy_snapshot.json",
+            TurnApprovalScopePolicySnapshot
+        ),
+        schema_doc!(
+            "turn_security_backend_snapshot.json",
+            TurnSecurityBackendSnapshot
+        ),
+        schema_doc!(
+            "turn_security_execution_backend_kind.json",
+            TurnSecurityExecutionBackendKind
+        ),
+        schema_doc!("sandbox_backend_kind.json", SandboxBackendKind),
+        schema_doc!(
+            "sandbox_backend_requirement.json",
+            SandboxBackendRequirement
+        ),
+        schema_doc!(
+            "backend_security_capabilities.json",
+            BackendSecurityCapabilities
+        ),
+        schema_doc!(
+            "turn_security_enforcement_status.json",
+            TurnSecurityEnforcementStatus
+        ),
+        schema_doc!("turn_security_degradation.json", TurnSecurityDegradation),
+        schema_doc!(
+            "turn_security_capability_kind.json",
+            TurnSecurityCapabilityKind
+        ),
+        schema_doc!(
+            "turn_security_parent_cap_snapshot.json",
+            TurnSecurityParentCapSnapshot
+        ),
         schema_doc!("agent_execution_backend.json", AgentExecutionBackend),
         schema_doc!("cli_agent_runtime_kind.json", CLIAgentRuntimeKind),
         schema_doc!(

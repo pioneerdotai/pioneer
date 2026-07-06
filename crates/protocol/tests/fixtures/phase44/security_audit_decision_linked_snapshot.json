@@ -1,0 +1,16 @@
+{
+  "workspaceId": "ws_release_fixture",
+  "threadId": "thread_release_fixture",
+  "turnId": "turn_release_fixture",
+  "eventKind": "decision_denied",
+  "profileMode": "supervised",
+  "profileSource": "composer",
+  "securitySnapshotId": "turn_release_fixture:security:v1",
+  "securitySnapshotVersion": 1,
+  "toolCallId": "call_1",
+  "toolName": "read_file",
+  "actionKind": "file_read",
+  "decision": "deny",
+  "reason": "sandbox_denied",
+  "cached": false
+}

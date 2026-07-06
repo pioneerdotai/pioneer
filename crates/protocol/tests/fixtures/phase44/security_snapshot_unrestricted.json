@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "version": 1,
+  "source": "composer_selection",
+  "permission_profile": {
+    "mode": "full_access",
+    "source": "composer",
+    "effective_policy": {
+      "default_behavior": "allow",
+      "file_read": "allow",
+      "file_write": "allow",
+      "shell_command": "allow",
+      "network": "allow",
+      "mcp_read": "allow",
+      "mcp_write_or_unknown": "allow",
+      "dynamic_skill_tool": "allow",
+      "computer_use": "allow",
+      "task_subagent": "allow"
+    }
+  },
+  "sandbox": {
+    "mode": "unrestricted",
+    "cwd": "/workspace/project",
+    "filesystem": {
+      "kind": "unrestricted"
+    },
+    "tmp": {
+      "mode": "host"
+    },
+    "network": {
+      "mode": "enabled",
+      "allow_localhost": true,
+      "allow_unix_sockets": true
+    },
+    "backend_requirement": "optional"
+  },
+  "process": {
+    "shell": {
+      "enabled": true,
+      "allow_stdin": true,
+      "allow_session_inheritance": true
+    },
+    "environment": {
+      "inherit": true
+    },
+    "timeout": {
+      "max_duration_ms": 1800000
+    },
+    "command_risk": {}
+  },
+  "network": {
+    "mode": "enabled",
+    "allow_localhost": true,
+    "allow_unix_sockets": true
+  },
+  "approval": {
+    "allow_once": false,
+    "allow_for_turn": false,
+    "allow_for_session": false,
+    "allow_always": false,
+    "request_permissions": false
+  },
+  "backend": {
+    "execution_backend": "native",
+    "capabilities": {
+      "can_enforce_filesystem": false,
+      "can_enforce_network": false,
+      "can_enforce_process": false,
+      "supports_turn_scope_approval": false,
+      "supports_session_scope_approval": false,
+      "supports_request_permissions": false
+    }
+  },
+  "enforcement": {
+    "status": "active"
+  },
+  "created_at_unix_ms": 1700000000000
+}

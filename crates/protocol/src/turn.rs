@@ -385,6 +385,577 @@ pub struct TurnPermissionProfileCap {
     pub effective_policy: ToolPermissionPolicySnapshot,
 }
 
+pub const TURN_EXECUTION_SECURITY_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnExecutionSecuritySnapshot {
+    pub schema_version: u32,
+    pub version: u32,
+    pub source: TurnSecuritySnapshotSource,
+    pub permission_profile: TurnPermissionProfileSnapshot,
+    pub sandbox: TurnSandboxSnapshot,
+    pub process: TurnProcessPolicySnapshot,
+    pub network: TurnNetworkPolicySnapshot,
+    pub approval: TurnApprovalScopePolicySnapshot,
+    pub backend: TurnSecurityBackendSnapshot,
+    pub enforcement: TurnSecurityEnforcementStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_cap: Option<TurnSecurityParentCapSnapshot>,
+    pub created_at_unix_ms: i64,
+}
+
+impl TurnExecutionSecuritySnapshot {
+    pub fn audit_id(&self, turn_id: &str) -> String {
+        format!("{turn_id}:security:v{}", self.version)
+    }
+
+    pub fn unrestricted_full_access(cwd: impl Into<String>, created_at_unix_ms: i64) -> Self {
+        let permission_profile = TurnPermissionProfileSnapshot::from_mode(
+            TurnPermissionMode::FullAccess,
+            TurnPermissionProfileSource::Composer,
+        );
+        let network = TurnNetworkPolicySnapshot::enabled();
+        Self {
+            schema_version: TURN_EXECUTION_SECURITY_SNAPSHOT_SCHEMA_VERSION,
+            version: 1,
+            source: TurnSecuritySnapshotSource::ComposerSelection,
+            sandbox: TurnSandboxSnapshot {
+                mode: TurnSandboxMode::Unrestricted,
+                cwd: cwd.into(),
+                filesystem: TurnFilesystemSandboxPolicy::unrestricted(),
+                tmp: TurnTmpPolicy::unrestricted(),
+                network: network.clone(),
+                backend_requirement: SandboxBackendRequirement::Optional,
+                backend_preference: Vec::new(),
+            },
+            process: TurnProcessPolicySnapshot::unrestricted(),
+            approval: TurnApprovalScopePolicySnapshot::full_access(),
+            backend: TurnSecurityBackendSnapshot::native_unrestricted(),
+            enforcement: TurnSecurityEnforcementStatus::Active,
+            parent_cap: None,
+            created_at_unix_ms,
+            permission_profile,
+            network,
+        }
+    }
+
+    pub fn read_only(
+        permission_profile: TurnPermissionProfileSnapshot,
+        cwd: impl Into<String>,
+        read_roots: Vec<TurnFilesystemSandboxEntry>,
+        created_at_unix_ms: i64,
+    ) -> Self {
+        let network = TurnNetworkPolicySnapshot::disabled();
+        Self {
+            schema_version: TURN_EXECUTION_SECURITY_SNAPSHOT_SCHEMA_VERSION,
+            version: 1,
+            source: TurnSecuritySnapshotSource::ComposerSelection,
+            sandbox: TurnSandboxSnapshot {
+                mode: TurnSandboxMode::ReadOnly,
+                cwd: cwd.into(),
+                filesystem: TurnFilesystemSandboxPolicy {
+                    kind: TurnFilesystemSandboxKind::Restricted,
+                    entries: read_roots,
+                },
+                tmp: TurnTmpPolicy::isolated(),
+                network: network.clone(),
+                backend_requirement: SandboxBackendRequirement::Required,
+                backend_preference: vec![SandboxBackendKind::Nono],
+            },
+            process: TurnProcessPolicySnapshot::restricted(),
+            approval: TurnApprovalScopePolicySnapshot::supervised(),
+            backend: TurnSecurityBackendSnapshot::native_required(SandboxBackendKind::Nono),
+            enforcement: TurnSecurityEnforcementStatus::Active,
+            parent_cap: None,
+            created_at_unix_ms,
+            permission_profile,
+            network,
+        }
+    }
+
+    pub fn workspace_write(
+        permission_profile: TurnPermissionProfileSnapshot,
+        cwd: impl Into<String>,
+        read_write_roots: Vec<TurnFilesystemSandboxEntry>,
+        created_at_unix_ms: i64,
+    ) -> Self {
+        let network = TurnNetworkPolicySnapshot::disabled();
+        Self {
+            schema_version: TURN_EXECUTION_SECURITY_SNAPSHOT_SCHEMA_VERSION,
+            version: 1,
+            source: TurnSecuritySnapshotSource::ComposerSelection,
+            sandbox: TurnSandboxSnapshot {
+                mode: TurnSandboxMode::WorkspaceWrite,
+                cwd: cwd.into(),
+                filesystem: TurnFilesystemSandboxPolicy {
+                    kind: TurnFilesystemSandboxKind::Restricted,
+                    entries: read_write_roots,
+                },
+                tmp: TurnTmpPolicy::isolated(),
+                network: network.clone(),
+                backend_requirement: SandboxBackendRequirement::Required,
+                backend_preference: vec![SandboxBackendKind::Nono],
+            },
+            process: TurnProcessPolicySnapshot::restricted(),
+            approval: TurnApprovalScopePolicySnapshot::auto_accept_edits(),
+            backend: TurnSecurityBackendSnapshot::native_required(SandboxBackendKind::Nono),
+            enforcement: TurnSecurityEnforcementStatus::Active,
+            parent_cap: None,
+            created_at_unix_ms,
+            permission_profile,
+            network,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnSecuritySnapshotSource {
+    ComposerSelection,
+    GatewayDefault,
+    TaskInherited,
+    ReviewerInherited,
+    RevisionInherited,
+    RuntimeRecovery,
+    BackfilledLegacy,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnSandboxSnapshot {
+    pub mode: TurnSandboxMode,
+    pub cwd: String,
+    pub filesystem: TurnFilesystemSandboxPolicy,
+    pub tmp: TurnTmpPolicy,
+    pub network: TurnNetworkPolicySnapshot,
+    pub backend_requirement: SandboxBackendRequirement,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backend_preference: Vec<SandboxBackendKind>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnSandboxMode {
+    Unrestricted,
+    ReadOnly,
+    WorkspaceWrite,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnFilesystemSandboxPolicy {
+    pub kind: TurnFilesystemSandboxKind,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<TurnFilesystemSandboxEntry>,
+}
+
+impl TurnFilesystemSandboxPolicy {
+    pub fn unrestricted() -> Self {
+        Self {
+            kind: TurnFilesystemSandboxKind::Unrestricted,
+            entries: Vec::new(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnFilesystemSandboxKind {
+    Restricted,
+    Unrestricted,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnFilesystemSandboxEntry {
+    pub path: TurnFilesystemSandboxPath,
+    pub access: TurnFilesystemAccess,
+    pub provenance: TurnSecurityRuleProvenance,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_path: Option<String>,
+}
+
+impl TurnFilesystemSandboxEntry {
+    pub fn workspace_root(access: TurnFilesystemAccess, resolved_path: impl Into<String>) -> Self {
+        Self {
+            path: TurnFilesystemSandboxPath::WorkspaceRoot,
+            access,
+            provenance: TurnSecurityRuleProvenance::Workspace,
+            resolved_path: Some(resolved_path.into()),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnFilesystemAccess {
+    None,
+    Read,
+    Write,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq, Hash)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TurnFilesystemSandboxPath {
+    Root,
+    CurrentWorkingDirectory,
+    WorkspaceRoot,
+    ProjectRoot {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subpath: Option<String>,
+    },
+    SlashTmp,
+    Tmpdir,
+    RuntimeHome,
+    ExplicitPath {
+        path: String,
+    },
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnSecurityRuleProvenance {
+    ComposerSelection,
+    Workspace,
+    Project,
+    Runtime,
+    TaskCap,
+    System,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnTmpPolicy {
+    pub mode: TurnTmpMode,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writable_roots: Vec<String>,
+}
+
+impl TurnTmpPolicy {
+    pub fn unrestricted() -> Self {
+        Self {
+            mode: TurnTmpMode::Host,
+            writable_roots: Vec::new(),
+        }
+    }
+
+    pub fn isolated() -> Self {
+        Self {
+            mode: TurnTmpMode::Isolated,
+            writable_roots: Vec::new(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnTmpMode {
+    Host,
+    Isolated,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnNetworkPolicySnapshot {
+    pub mode: TurnNetworkMode,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_domains: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub denied_domains: Vec<String>,
+    pub allow_localhost: bool,
+    pub allow_unix_sockets: bool,
+}
+
+impl TurnNetworkPolicySnapshot {
+    pub fn enabled() -> Self {
+        Self {
+            mode: TurnNetworkMode::Enabled,
+            allowed_domains: Vec::new(),
+            denied_domains: Vec::new(),
+            allow_localhost: true,
+            allow_unix_sockets: true,
+        }
+    }
+
+    pub fn disabled() -> Self {
+        Self {
+            mode: TurnNetworkMode::Disabled,
+            allowed_domains: Vec::new(),
+            denied_domains: Vec::new(),
+            allow_localhost: false,
+            allow_unix_sockets: false,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnNetworkMode {
+    Disabled,
+    Restricted,
+    Enabled,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnProcessPolicySnapshot {
+    pub shell: TurnShellPolicy,
+    pub environment: TurnEnvironmentPolicy,
+    pub timeout: TurnProcessTimeoutPolicy,
+    pub command_risk: TurnCommandRiskPolicy,
+}
+
+impl TurnProcessPolicySnapshot {
+    pub fn unrestricted() -> Self {
+        Self {
+            shell: TurnShellPolicy::enabled(),
+            environment: TurnEnvironmentPolicy::unrestricted(),
+            timeout: TurnProcessTimeoutPolicy::default(),
+            command_risk: TurnCommandRiskPolicy::default(),
+        }
+    }
+
+    pub fn restricted() -> Self {
+        Self {
+            shell: TurnShellPolicy::enabled(),
+            environment: TurnEnvironmentPolicy::restricted(),
+            timeout: TurnProcessTimeoutPolicy::default(),
+            command_risk: TurnCommandRiskPolicy::default(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnShellPolicy {
+    pub enabled: bool,
+    pub allow_stdin: bool,
+    pub allow_session_inheritance: bool,
+}
+
+impl TurnShellPolicy {
+    pub fn enabled() -> Self {
+        Self {
+            enabled: true,
+            allow_stdin: true,
+            allow_session_inheritance: true,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnEnvironmentPolicy {
+    pub inherit: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_vars: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub denied_patterns: Vec<String>,
+}
+
+impl TurnEnvironmentPolicy {
+    pub fn unrestricted() -> Self {
+        Self {
+            inherit: true,
+            allowed_vars: Vec::new(),
+            denied_patterns: Vec::new(),
+        }
+    }
+
+    pub fn restricted() -> Self {
+        Self {
+            inherit: true,
+            allowed_vars: Vec::new(),
+            denied_patterns: vec![
+                ".*TOKEN.*".to_owned(),
+                ".*SECRET.*".to_owned(),
+                ".*PASSWORD.*".to_owned(),
+            ],
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnProcessTimeoutPolicy {
+    pub max_duration_ms: u64,
+}
+
+impl Default for TurnProcessTimeoutPolicy {
+    fn default() -> Self {
+        Self {
+            max_duration_ms: 30 * 60 * 1000,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq, Default)]
+pub struct TurnCommandRiskPolicy {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub denied_commands: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_command_families: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnApprovalScopePolicySnapshot {
+    pub allow_once: bool,
+    pub allow_for_turn: bool,
+    pub allow_for_session: bool,
+    pub allow_always: bool,
+    pub request_permissions: bool,
+}
+
+impl TurnApprovalScopePolicySnapshot {
+    pub fn full_access() -> Self {
+        Self {
+            allow_once: false,
+            allow_for_turn: false,
+            allow_for_session: false,
+            allow_always: false,
+            request_permissions: false,
+        }
+    }
+
+    pub fn auto_accept_edits() -> Self {
+        Self {
+            allow_once: true,
+            allow_for_turn: true,
+            allow_for_session: false,
+            allow_always: false,
+            request_permissions: true,
+        }
+    }
+
+    pub fn supervised() -> Self {
+        Self {
+            allow_once: true,
+            allow_for_turn: true,
+            allow_for_session: false,
+            allow_always: false,
+            request_permissions: true,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnSecurityBackendSnapshot {
+    pub execution_backend: TurnSecurityExecutionBackendKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_backend: Option<SandboxBackendKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    pub capabilities: BackendSecurityCapabilities,
+}
+
+impl TurnSecurityBackendSnapshot {
+    pub fn native_unrestricted() -> Self {
+        Self {
+            execution_backend: TurnSecurityExecutionBackendKind::Native,
+            sandbox_backend: None,
+            provider: None,
+            capabilities: BackendSecurityCapabilities::unrestricted(),
+        }
+    }
+
+    pub fn native_required(sandbox_backend: SandboxBackendKind) -> Self {
+        Self {
+            execution_backend: TurnSecurityExecutionBackendKind::Native,
+            sandbox_backend: Some(sandbox_backend),
+            provider: None,
+            capabilities: BackendSecurityCapabilities::native_sandboxed(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnSecurityExecutionBackendKind {
+    Native,
+    CodexCli,
+    ClaudeCli,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxBackendKind {
+    Nono,
+    WindowsRestrictedToken,
+    ProviderNative,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxBackendRequirement {
+    None,
+    Optional,
+    Required,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct BackendSecurityCapabilities {
+    pub can_enforce_filesystem: bool,
+    pub can_enforce_network: bool,
+    pub can_enforce_process: bool,
+    pub supports_turn_scope_approval: bool,
+    pub supports_session_scope_approval: bool,
+    pub supports_request_permissions: bool,
+}
+
+impl BackendSecurityCapabilities {
+    pub fn unrestricted() -> Self {
+        Self {
+            can_enforce_filesystem: false,
+            can_enforce_network: false,
+            can_enforce_process: false,
+            supports_turn_scope_approval: false,
+            supports_session_scope_approval: false,
+            supports_request_permissions: false,
+        }
+    }
+
+    pub fn native_sandboxed() -> Self {
+        Self {
+            can_enforce_filesystem: true,
+            can_enforce_network: true,
+            can_enforce_process: true,
+            supports_turn_scope_approval: true,
+            supports_session_scope_approval: false,
+            supports_request_permissions: true,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum TurnSecurityEnforcementStatus {
+    Active,
+    PartiallyActive {
+        degraded: Vec<TurnSecurityDegradation>,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnSecurityDegradation {
+    pub capability: TurnSecurityCapabilityKind,
+    pub reason: String,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnSecurityCapabilityKind {
+    Filesystem,
+    Network,
+    Process,
+    Approval,
+    SandboxBackend,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnSecurityParentCapSnapshot {
+    pub parent_turn_id: String,
+    pub max_permission_profile: TurnPermissionProfileCap,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub max_filesystem_entries: Vec<TurnFilesystemSandboxEntry>,
+    pub max_network_policy: TurnNetworkPolicySnapshot,
+    pub max_sandbox_mode: TurnSandboxMode,
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 pub struct TurnPermissionApprovalRequest {
     pub request_id: String,
@@ -457,6 +1028,7 @@ pub enum TurnPermissionDecisionReason {
     Cancelled,
     Expired,
     UnknownActionDefault,
+    SandboxDenied,
 }
 
 impl TurnPermissionDecisionReason {
@@ -472,6 +1044,7 @@ impl TurnPermissionDecisionReason {
             Self::Cancelled => "cancelled",
             Self::Expired => "expired",
             Self::UnknownActionDefault => "unknown_action_default",
+            Self::SandboxDenied => "sandbox_denied",
         }
     }
 }
@@ -3693,6 +4266,108 @@ mod tests {
     }
 
     #[test]
+    fn security_snapshot_unrestricted_full_access_round_trips_with_explicit_sandbox() {
+        let snapshot =
+            TurnExecutionSecuritySnapshot::unrestricted_full_access("/workspace/project", 1_700);
+
+        let encoded = serde_json::to_value(&snapshot).expect("snapshot should serialize");
+
+        assert_eq!(encoded["schema_version"], 1);
+        assert_eq!(encoded["version"], 1);
+        assert_eq!(encoded["permission_profile"]["mode"], "full_access");
+        assert_eq!(encoded["sandbox"]["mode"], "unrestricted");
+        assert_eq!(encoded["sandbox"]["filesystem"]["kind"], "unrestricted");
+        assert_eq!(encoded["sandbox"]["network"]["mode"], "enabled");
+        assert_eq!(encoded["network"]["mode"], "enabled");
+        assert_eq!(encoded["sandbox"]["backend_requirement"], "optional");
+        assert_eq!(encoded["process"]["shell"]["enabled"], true);
+        assert_eq!(encoded["enforcement"], json!({ "status": "active" }));
+        assert!(encoded.get("sandbox").is_some());
+
+        let decoded: TurnExecutionSecuritySnapshot =
+            serde_json::from_value(encoded).expect("snapshot should deserialize");
+        assert_eq!(decoded, snapshot);
+        assert_eq!(decoded.sandbox.mode, TurnSandboxMode::Unrestricted);
+        assert_eq!(
+            decoded.sandbox.filesystem.kind,
+            TurnFilesystemSandboxKind::Unrestricted
+        );
+    }
+
+    #[test]
+    fn security_snapshot_read_only_round_trips_with_restricted_roots() {
+        let profile = TurnPermissionProfileSnapshot::from_mode(
+            TurnPermissionMode::Supervised,
+            TurnPermissionProfileSource::Composer,
+        );
+        let snapshot = TurnExecutionSecuritySnapshot::read_only(
+            profile,
+            "/workspace/project",
+            vec![TurnFilesystemSandboxEntry::workspace_root(
+                TurnFilesystemAccess::Read,
+                "/workspace/project",
+            )],
+            1_701,
+        );
+
+        let encoded = serde_json::to_value(&snapshot).expect("snapshot should serialize");
+
+        assert_eq!(encoded["permission_profile"]["mode"], "supervised");
+        assert_eq!(encoded["sandbox"]["mode"], "read_only");
+        assert_eq!(encoded["sandbox"]["filesystem"]["kind"], "restricted");
+        assert_eq!(
+            encoded["sandbox"]["filesystem"]["entries"][0]["path"],
+            json!({ "kind": "workspace_root" })
+        );
+        assert_eq!(
+            encoded["sandbox"]["filesystem"]["entries"][0]["access"],
+            "read"
+        );
+        assert_eq!(encoded["network"]["mode"], "disabled");
+        assert_eq!(encoded["sandbox"]["backend_requirement"], "required");
+        assert_eq!(encoded["sandbox"]["backend_preference"], json!(["nono"]));
+
+        let decoded: TurnExecutionSecuritySnapshot =
+            serde_json::from_value(encoded).expect("snapshot should deserialize");
+        assert_eq!(decoded, snapshot);
+        assert_eq!(decoded.sandbox.mode, TurnSandboxMode::ReadOnly);
+    }
+
+    #[test]
+    fn security_snapshot_workspace_write_round_trips_with_write_roots() {
+        let profile = TurnPermissionProfileSnapshot::from_mode(
+            TurnPermissionMode::AutoAcceptEdits,
+            TurnPermissionProfileSource::Composer,
+        );
+        let snapshot = TurnExecutionSecuritySnapshot::workspace_write(
+            profile,
+            "/workspace/project",
+            vec![TurnFilesystemSandboxEntry::workspace_root(
+                TurnFilesystemAccess::Write,
+                "/workspace/project",
+            )],
+            1_702,
+        );
+
+        let encoded = serde_json::to_value(&snapshot).expect("snapshot should serialize");
+
+        assert_eq!(encoded["permission_profile"]["mode"], "auto_accept_edits");
+        assert_eq!(encoded["sandbox"]["mode"], "workspace_write");
+        assert_eq!(
+            encoded["sandbox"]["filesystem"]["entries"][0]["access"],
+            "write"
+        );
+        assert_eq!(encoded["approval"]["allow_for_turn"], true);
+        assert_eq!(encoded["approval"]["request_permissions"], true);
+        assert_eq!(encoded["backend"]["sandbox_backend"], "nono");
+
+        let decoded: TurnExecutionSecuritySnapshot =
+            serde_json::from_value(encoded).expect("snapshot should deserialize");
+        assert_eq!(decoded, snapshot);
+        assert_eq!(decoded.sandbox.mode, TurnSandboxMode::WorkspaceWrite);
+    }
+
+    #[test]
     fn execution_window_status_uses_snake_case_wire_values() {
         let cases = [
             (ExecutionWindowStatus::Running, "running"),
@@ -4163,6 +4838,36 @@ mod tests {
         assert!(params.execution_backend.is_none());
         assert!(params.reasoning.is_none());
         assert!(params.cli_runtime_options.is_none());
+    }
+
+    #[test]
+    fn turn_start_params_backcompat_accepts_old_payload_without_security_snapshot() {
+        let params: TurnStartParams = serde_json::from_value(json!({
+            "thread_id": "thr_legacy",
+            "turn_id": "turn_legacy",
+            "input": [
+                {
+                    "type": "text",
+                    "text": "legacy client payload"
+                }
+            ],
+            "sandbox_policy": {
+                "mode": "FullAccess"
+            }
+        }))
+        .expect("old turn/start payload should decode without a security snapshot");
+
+        assert_eq!(params.thread_id, "thr_legacy");
+        assert_eq!(params.turn_id, "turn_legacy");
+        assert!(params.permission_profile.is_none());
+        assert!(params.execution_backend.is_none());
+        assert!(params.cli_runtime_options.is_none());
+        assert_eq!(
+            params.sandbox_policy,
+            Some(SandboxPolicy {
+                mode: crate::SandboxMode::FullAccess
+            })
+        );
     }
 
     #[test]
@@ -4944,6 +5649,74 @@ mod tests {
             !schema_json.contains("outputJson") && !schema_json.contains("output_json"),
             "turn_item schema must not expose generic raw output_json"
         );
+    }
+
+    #[test]
+    fn generated_schema_documents_cover_execution_security_snapshot_contract() {
+        let documents = crate::protocol_schema_documents();
+        let schema_names = documents
+            .iter()
+            .map(|document| document.file_name)
+            .collect::<Vec<_>>();
+
+        for expected in [
+            "turn_execution_security_snapshot.json",
+            "turn_security_snapshot_source.json",
+            "turn_sandbox_snapshot.json",
+            "turn_sandbox_mode.json",
+            "turn_filesystem_sandbox_policy.json",
+            "turn_filesystem_sandbox_kind.json",
+            "turn_filesystem_sandbox_entry.json",
+            "turn_filesystem_sandbox_path.json",
+            "turn_filesystem_access.json",
+            "turn_network_policy_snapshot.json",
+            "turn_network_mode.json",
+            "turn_process_policy_snapshot.json",
+            "turn_shell_policy.json",
+            "turn_environment_policy.json",
+            "turn_process_timeout_policy.json",
+            "turn_command_risk_policy.json",
+            "turn_approval_scope_policy_snapshot.json",
+            "turn_security_backend_snapshot.json",
+            "turn_security_execution_backend_kind.json",
+            "sandbox_backend_kind.json",
+            "sandbox_backend_requirement.json",
+            "backend_security_capabilities.json",
+            "turn_security_enforcement_status.json",
+            "turn_security_degradation.json",
+            "turn_security_capability_kind.json",
+            "turn_security_parent_cap_snapshot.json",
+        ] {
+            assert!(
+                schema_names.iter().any(|name| *name == expected),
+                "missing schema document {expected}"
+            );
+        }
+
+        let snapshot_schema = documents
+            .iter()
+            .find(|document| document.file_name == "turn_execution_security_snapshot.json")
+            .expect("security snapshot schema should be exported");
+        let schema_json = serde_json::to_string(&snapshot_schema.schema)
+            .expect("security snapshot schema should serialize");
+        for expected_field in [
+            "schema_version",
+            "version",
+            "source",
+            "permission_profile",
+            "sandbox",
+            "process",
+            "network",
+            "approval",
+            "backend",
+            "enforcement",
+            "created_at_unix_ms",
+        ] {
+            assert!(
+                schema_json.contains(expected_field),
+                "security snapshot schema should include {expected_field}"
+            );
+        }
     }
 
     #[test]
