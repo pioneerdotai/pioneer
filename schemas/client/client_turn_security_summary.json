@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ClientTurnSecuritySummary",
+  "type": "object",
+  "properties": {
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ClientSecurityDiagnostic"
+      }
+    },
+    "enforcement": {
+      "$ref": "#/$defs/ClientSecurityEnforcementStatus"
+    },
+    "execution_backend": {
+      "$ref": "#/$defs/TurnSecurityExecutionBackendKind"
+    },
+    "filesystem_access": {
+      "$ref": "#/$defs/ClientSecurityFilesystemAccess"
+    },
+    "network_mode": {
+      "$ref": "#/$defs/TurnNetworkMode"
+    },
+    "permission_mode": {
+      "$ref": "#/$defs/TurnPermissionMode"
+    },
+    "sandbox_backend": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SandboxBackendKind"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "sandbox_mode": {
+      "$ref": "#/$defs/TurnSandboxMode"
+    }
+  },
+  "required": [
+    "permission_mode",
+    "sandbox_mode",
+    "filesystem_access",
+    "network_mode",
+    "execution_backend",
+    "enforcement"
+  ],
+  "$defs": {
+    "ClientSecurityDiagnostic": {
+      "type": "object",
+      "properties": {
+        "capability": {
+          "$ref": "#/$defs/TurnSecurityCapabilityKind"
+        },
+        "message": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/ClientSecurityEnforcementStatus"
+        }
+      },
+      "required": [
+        "capability",
+        "status",
+        "message"
+      ]
+    },
+    "ClientSecurityEnforcementStatus": {
+      "type": "string",
+      "enum": [
+        "active",
+        "degraded",
+        "unavailable"
+      ]
+    },
+    "ClientSecurityFilesystemAccess": {
+      "type": "string",
+      "enum": [
+        "unrestricted",
+        "read_only",
+        "workspace_write"
+      ]
+    },
+    "SandboxBackendKind": {
+      "type": "string",
+      "enum": [
+        "nono",
+        "windows_restricted_token",
+        "provider_native"
+      ]
+    },
+    "TurnNetworkMode": {
+      "type": "string",
+      "enum": [
+        "disabled",
+        "restricted",
+        "enabled"
+      ]
+    },
+    "TurnPermissionMode": {
+      "type": "string",
+      "enum": [
+        "full_access",
+        "auto_accept_edits",
+        "supervised"
+      ]
+    },
+    "TurnSandboxMode": {
+      "type": "string",
+      "enum": [
+        "unrestricted",
+        "read_only",
+        "workspace_write"
+      ]
+    },
+    "TurnSecurityCapabilityKind": {
+      "type": "string",
+      "enum": [
+        "filesystem",
+        "network",
+        "process",
+        "approval",
+        "sandbox_backend"
+      ]
+    },
+    "TurnSecurityExecutionBackendKind": {
+      "type": "string",
+      "enum": [
+        "native",
+        "codex_cli",
+        "claude_cli"
+      ]
+    }
+  }
+}

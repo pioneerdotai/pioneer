@@ -1,0 +1,162 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnFilesystemSandboxEntry",
+  "type": "object",
+  "properties": {
+    "access": {
+      "$ref": "#/$defs/TurnFilesystemAccess"
+    },
+    "path": {
+      "$ref": "#/$defs/TurnFilesystemSandboxPath"
+    },
+    "provenance": {
+      "$ref": "#/$defs/TurnSecurityRuleProvenance"
+    },
+    "resolved_path": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "path",
+    "access",
+    "provenance"
+  ],
+  "$defs": {
+    "TurnFilesystemAccess": {
+      "type": "string",
+      "enum": [
+        "none",
+        "read",
+        "write"
+      ]
+    },
+    "TurnFilesystemSandboxPath": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "root"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "current_working_directory"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "workspace_root"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "project_root"
+            },
+            "subpath": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "slash_tmp"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "tmpdir"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "runtime_home"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "explicit_path"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "path"
+          ]
+        }
+      ]
+    },
+    "TurnSecurityRuleProvenance": {
+      "type": "string",
+      "enum": [
+        "composer_selection",
+        "workspace",
+        "project",
+        "runtime",
+        "task_cap",
+        "system"
+      ]
+    }
+  }
+}

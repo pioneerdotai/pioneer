@@ -3992,6 +3992,36 @@
             }
           ]
         },
+        "securityCapability": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnSecurityCapabilityKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "securityReasonCode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "securitySnapshotId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "securitySnapshotVersion": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
         "threadId": {
           "type": "string"
         },
@@ -4027,6 +4057,9 @@
       "type": "string",
       "enum": [
         "profile_selected",
+        "security_snapshot_resolved",
+        "security_sandbox_degraded",
+        "security_sandbox_unavailable",
         "approval_requested",
         "approval_resolved",
         "decision_allowed",
@@ -4060,7 +4093,8 @@
         "user_denied",
         "cancelled",
         "expired",
-        "unknown_action_default"
+        "unknown_action_default",
+        "sandbox_denied"
       ]
     },
     "TurnPermissionMode": {
@@ -4079,6 +4113,16 @@
         "inherited_from_parent_turn",
         "task_permission_cap",
         "system"
+      ]
+    },
+    "TurnSecurityCapabilityKind": {
+      "type": "string",
+      "enum": [
+        "filesystem",
+        "network",
+        "process",
+        "approval",
+        "sandbox_backend"
       ]
     },
     "TurnSkillCapabilitySummary": {

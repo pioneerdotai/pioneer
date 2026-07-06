@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnTmpPolicy",
+  "type": "object",
+  "properties": {
+    "mode": {
+      "$ref": "#/$defs/TurnTmpMode"
+    },
+    "writable_roots": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "mode"
+  ],
+  "$defs": {
+    "TurnTmpMode": {
+      "type": "string",
+      "enum": [
+        "host",
+        "isolated"
+      ]
+    }
+  }
+}

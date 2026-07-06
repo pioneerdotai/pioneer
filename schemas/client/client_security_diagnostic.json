@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ClientSecurityDiagnostic",
+  "type": "object",
+  "properties": {
+    "capability": {
+      "$ref": "#/$defs/TurnSecurityCapabilityKind"
+    },
+    "message": {
+      "type": "string"
+    },
+    "status": {
+      "$ref": "#/$defs/ClientSecurityEnforcementStatus"
+    }
+  },
+  "required": [
+    "capability",
+    "status",
+    "message"
+  ],
+  "$defs": {
+    "ClientSecurityEnforcementStatus": {
+      "type": "string",
+      "enum": [
+        "active",
+        "degraded",
+        "unavailable"
+      ]
+    },
+    "TurnSecurityCapabilityKind": {
+      "type": "string",
+      "enum": [
+        "filesystem",
+        "network",
+        "process",
+        "approval",
+        "sandbox_backend"
+      ]
+    }
+  }
+}

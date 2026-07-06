@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnSecurityRuleProvenance",
+  "type": "string",
+  "enum": [
+    "composer_selection",
+    "workspace",
+    "project",
+    "runtime",
+    "task_cap",
+    "system"
+  ]
+}

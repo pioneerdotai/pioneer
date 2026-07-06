@@ -5725,6 +5725,35 @@
         "resolutionStrategy"
       ]
     },
+    "TaskAgentSecurityCap": {
+      "type": "object",
+      "properties": {
+        "maxFilesystemEntries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TurnFilesystemSandboxEntry"
+          }
+        },
+        "maxNetworkPolicy": {
+          "$ref": "#/$defs/TurnNetworkPolicySnapshot"
+        },
+        "maxPermissionProfile": {
+          "$ref": "#/$defs/TurnPermissionProfileCap"
+        },
+        "maxProcessPolicy": {
+          "$ref": "#/$defs/TurnProcessPolicySnapshot"
+        },
+        "maxSandboxMode": {
+          "$ref": "#/$defs/TurnSandboxMode"
+        }
+      },
+      "required": [
+        "maxPermissionProfile",
+        "maxNetworkPolicy",
+        "maxSandboxMode",
+        "maxProcessPolicy"
+      ]
+    },
     "TaskAgentSpec": {
       "type": "object",
       "properties": {
@@ -5814,6 +5843,16 @@
           "type": [
             "string",
             "null"
+          ]
+        },
+        "securityCap": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskAgentSecurityCap"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "taskId": {
@@ -9086,6 +9125,23 @@
         "can_resume_same_turn"
       ]
     },
+    "TurnCommandRiskPolicy": {
+      "type": "object",
+      "properties": {
+        "allowed_command_families": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "denied_commands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
     "TurnCompletedNotification": {
       "type": "object",
       "properties": {
@@ -9103,6 +9159,29 @@
         "workspace_id",
         "thread_id",
         "turn"
+      ]
+    },
+    "TurnEnvironmentPolicy": {
+      "type": "object",
+      "properties": {
+        "allowed_vars": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "denied_patterns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "inherit": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "inherit"
       ]
     },
     "TurnExecutionWindowBlockedNotification": {
@@ -9417,6 +9496,153 @@
         "workspace_id",
         "thread_id",
         "turn"
+      ]
+    },
+    "TurnFilesystemAccess": {
+      "type": "string",
+      "enum": [
+        "none",
+        "read",
+        "write"
+      ]
+    },
+    "TurnFilesystemSandboxEntry": {
+      "type": "object",
+      "properties": {
+        "access": {
+          "$ref": "#/$defs/TurnFilesystemAccess"
+        },
+        "path": {
+          "$ref": "#/$defs/TurnFilesystemSandboxPath"
+        },
+        "provenance": {
+          "$ref": "#/$defs/TurnSecurityRuleProvenance"
+        },
+        "resolved_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "access",
+        "provenance"
+      ]
+    },
+    "TurnFilesystemSandboxPath": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "root"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "current_working_directory"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "workspace_root"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "project_root"
+            },
+            "subpath": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "slash_tmp"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "tmpdir"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "runtime_home"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "explicit_path"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "path"
+          ]
+        }
       ]
     },
     "TurnItem": {
@@ -10467,6 +10693,45 @@
         "scopeKind"
       ]
     },
+    "TurnNetworkMode": {
+      "type": "string",
+      "enum": [
+        "disabled",
+        "restricted",
+        "enabled"
+      ]
+    },
+    "TurnNetworkPolicySnapshot": {
+      "type": "object",
+      "properties": {
+        "allow_localhost": {
+          "type": "boolean"
+        },
+        "allow_unix_sockets": {
+          "type": "boolean"
+        },
+        "allowed_domains": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "denied_domains": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "mode": {
+          "$ref": "#/$defs/TurnNetworkMode"
+        }
+      },
+      "required": [
+        "mode",
+        "allow_localhost",
+        "allow_unix_sockets"
+      ]
+    },
     "TurnOrigin": {
       "type": "string",
       "enum": [
@@ -10584,7 +10849,8 @@
         "user_denied",
         "cancelled",
         "expired",
-        "unknown_action_default"
+        "unknown_action_default",
+        "sandbox_denied"
       ]
     },
     "TurnPermissionMode": {
@@ -10675,6 +10941,80 @@
         "thread_id",
         "turn_id",
         "resolution"
+      ]
+    },
+    "TurnProcessPolicySnapshot": {
+      "type": "object",
+      "properties": {
+        "command_risk": {
+          "$ref": "#/$defs/TurnCommandRiskPolicy"
+        },
+        "environment": {
+          "$ref": "#/$defs/TurnEnvironmentPolicy"
+        },
+        "shell": {
+          "$ref": "#/$defs/TurnShellPolicy"
+        },
+        "timeout": {
+          "$ref": "#/$defs/TurnProcessTimeoutPolicy"
+        }
+      },
+      "required": [
+        "shell",
+        "environment",
+        "timeout",
+        "command_risk"
+      ]
+    },
+    "TurnProcessTimeoutPolicy": {
+      "type": "object",
+      "properties": {
+        "max_duration_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "max_duration_ms"
+      ]
+    },
+    "TurnSandboxMode": {
+      "type": "string",
+      "enum": [
+        "unrestricted",
+        "read_only",
+        "workspace_write"
+      ]
+    },
+    "TurnSecurityRuleProvenance": {
+      "type": "string",
+      "enum": [
+        "composer_selection",
+        "workspace",
+        "project",
+        "runtime",
+        "task_cap",
+        "system"
+      ]
+    },
+    "TurnShellPolicy": {
+      "type": "object",
+      "properties": {
+        "allow_session_inheritance": {
+          "type": "boolean"
+        },
+        "allow_stdin": {
+          "type": "boolean"
+        },
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled",
+        "allow_stdin",
+        "allow_session_inheritance"
       ]
     },
     "TurnSkillCapabilitySummary": {

@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnSecurityEnforcementStatus",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string",
+          "const": "active"
+        }
+      },
+      "required": [
+        "status"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "degraded": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TurnSecurityDegradation"
+          }
+        },
+        "status": {
+          "type": "string",
+          "const": "partially_active"
+        }
+      },
+      "required": [
+        "status",
+        "degraded"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "reason": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "const": "unavailable"
+        }
+      },
+      "required": [
+        "status",
+        "reason"
+      ]
+    }
+  ],
+  "$defs": {
+    "TurnSecurityCapabilityKind": {
+      "type": "string",
+      "enum": [
+        "filesystem",
+        "network",
+        "process",
+        "approval",
+        "sandbox_backend"
+      ]
+    },
+    "TurnSecurityDegradation": {
+      "type": "object",
+      "properties": {
+        "capability": {
+          "$ref": "#/$defs/TurnSecurityCapabilityKind"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "capability",
+        "reason"
+      ]
+    }
+  }
+}

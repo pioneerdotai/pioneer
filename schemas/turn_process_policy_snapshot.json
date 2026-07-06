@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnProcessPolicySnapshot",
+  "type": "object",
+  "properties": {
+    "command_risk": {
+      "$ref": "#/$defs/TurnCommandRiskPolicy"
+    },
+    "environment": {
+      "$ref": "#/$defs/TurnEnvironmentPolicy"
+    },
+    "shell": {
+      "$ref": "#/$defs/TurnShellPolicy"
+    },
+    "timeout": {
+      "$ref": "#/$defs/TurnProcessTimeoutPolicy"
+    }
+  },
+  "required": [
+    "shell",
+    "environment",
+    "timeout",
+    "command_risk"
+  ],
+  "$defs": {
+    "TurnCommandRiskPolicy": {
+      "type": "object",
+      "properties": {
+        "allowed_command_families": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "denied_commands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "TurnEnvironmentPolicy": {
+      "type": "object",
+      "properties": {
+        "allowed_vars": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "denied_patterns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "inherit": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "inherit"
+      ]
+    },
+    "TurnProcessTimeoutPolicy": {
+      "type": "object",
+      "properties": {
+        "max_duration_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "max_duration_ms"
+      ]
+    },
+    "TurnShellPolicy": {
+      "type": "object",
+      "properties": {
+        "allow_session_inheritance": {
+          "type": "boolean"
+        },
+        "allow_stdin": {
+          "type": "boolean"
+        },
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled",
+        "allow_stdin",
+        "allow_session_inheritance"
+      ]
+    }
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnSecuritySnapshotSource",
+  "type": "string",
+  "enum": [
+    "composer_selection",
+    "gateway_default",
+    "task_inherited",
+    "reviewer_inherited",
+    "revision_inherited",
+    "runtime_recovery",
+    "backfilled_legacy"
+  ]
+}

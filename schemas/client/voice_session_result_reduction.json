@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "VoiceSessionResultReduction",
+  "type": "object",
+  "properties": {
+    "action": {
+      "$ref": "#/$defs/VoiceFinalizeUiAction"
+    },
+    "error": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/VoiceError"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "outcome": {
+      "$ref": "#/$defs/VoiceSessionOutcome"
+    },
+    "session_id": {
+      "type": "string"
+    },
+    "turn_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "session_id",
+    "outcome",
+    "action"
+  ],
+  "$defs": {
+    "VoiceError": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/VoiceErrorKind"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "message"
+      ]
+    },
+    "VoiceErrorKind": {
+      "type": "string",
+      "enum": [
+        "model_unavailable",
+        "microphone_permission_blocked",
+        "device_unavailable",
+        "invalid_session",
+        "stale_chunk",
+        "sequence_gap",
+        "cancelled",
+        "no_speech",
+        "transcription_failed",
+        "gateway_busy",
+        "model_downloading",
+        "unknown"
+      ]
+    },
+    "VoiceFinalizeUiAction": {
+      "type": "string",
+      "enum": [
+        "keep_finalizing",
+        "clear_finalizing",
+        "show_no_speech_error",
+        "show_finalize_error"
+      ]
+    },
+    "VoiceSessionOutcome": {
+      "type": "string",
+      "enum": [
+        "turn_started",
+        "cancelled",
+        "no_speech",
+        "failed"
+      ]
+    }
+  }
+}

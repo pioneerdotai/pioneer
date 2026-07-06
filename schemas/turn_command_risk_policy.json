@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnCommandRiskPolicy",
+  "type": "object",
+  "properties": {
+    "allowed_command_families": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "denied_commands": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

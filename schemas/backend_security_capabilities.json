@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "BackendSecurityCapabilities",
+  "type": "object",
+  "properties": {
+    "can_enforce_filesystem": {
+      "type": "boolean"
+    },
+    "can_enforce_network": {
+      "type": "boolean"
+    },
+    "can_enforce_process": {
+      "type": "boolean"
+    },
+    "supports_request_permissions": {
+      "type": "boolean"
+    },
+    "supports_session_scope_approval": {
+      "type": "boolean"
+    },
+    "supports_turn_scope_approval": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "can_enforce_filesystem",
+    "can_enforce_network",
+    "can_enforce_process",
+    "supports_turn_scope_approval",
+    "supports_session_scope_approval",
+    "supports_request_permissions"
+  ]
+}

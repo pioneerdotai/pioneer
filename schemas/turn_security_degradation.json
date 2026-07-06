@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnSecurityDegradation",
+  "type": "object",
+  "properties": {
+    "capability": {
+      "$ref": "#/$defs/TurnSecurityCapabilityKind"
+    },
+    "reason": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "capability",
+    "reason"
+  ],
+  "$defs": {
+    "TurnSecurityCapabilityKind": {
+      "type": "string",
+      "enum": [
+        "filesystem",
+        "network",
+        "process",
+        "approval",
+        "sandbox_backend"
+      ]
+    }
+  }
+}

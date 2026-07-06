@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnProcessTimeoutPolicy",
+  "type": "object",
+  "properties": {
+    "max_duration_ms": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "max_duration_ms"
+  ]
+}

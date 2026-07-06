@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SandboxBackendKind",
+  "type": "string",
+  "enum": [
+    "nono",
+    "windows_restricted_token",
+    "provider_native"
+  ]
+}

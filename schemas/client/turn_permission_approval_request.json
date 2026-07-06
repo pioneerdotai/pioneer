@@ -98,7 +98,8 @@
         "user_denied",
         "cancelled",
         "expired",
-        "unknown_action_default"
+        "unknown_action_default",
+        "sandbox_denied"
       ]
     }
   }

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnShellPolicy",
+  "type": "object",
+  "properties": {
+    "allow_session_inheritance": {
+      "type": "boolean"
+    },
+    "allow_stdin": {
+      "type": "boolean"
+    },
+    "enabled": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "enabled",
+    "allow_stdin",
+    "allow_session_inheritance"
+  ]
+}

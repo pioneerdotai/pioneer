@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ClientSecurityDiagnosticRow",
+  "type": "object",
+  "properties": {
+    "capability": {
+      "$ref": "#/$defs/TurnSecurityCapabilityKind"
+    },
+    "label": {
+      "type": "string"
+    },
+    "message": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "capability",
+    "label",
+    "message"
+  ],
+  "$defs": {
+    "TurnSecurityCapabilityKind": {
+      "type": "string",
+      "enum": [
+        "filesystem",
+        "network",
+        "process",
+        "approval",
+        "sandbox_backend"
+      ]
+    }
+  }
+}

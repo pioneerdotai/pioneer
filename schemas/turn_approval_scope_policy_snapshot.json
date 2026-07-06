@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnApprovalScopePolicySnapshot",
+  "type": "object",
+  "properties": {
+    "allow_always": {
+      "type": "boolean"
+    },
+    "allow_for_session": {
+      "type": "boolean"
+    },
+    "allow_for_turn": {
+      "type": "boolean"
+    },
+    "allow_once": {
+      "type": "boolean"
+    },
+    "request_permissions": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "allow_once",
+    "allow_for_turn",
+    "allow_for_session",
+    "allow_always",
+    "request_permissions"
+  ]
+}

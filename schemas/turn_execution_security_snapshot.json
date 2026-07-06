@@ -1,0 +1,810 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnExecutionSecuritySnapshot",
+  "type": "object",
+  "properties": {
+    "approval": {
+      "$ref": "#/$defs/TurnApprovalScopePolicySnapshot"
+    },
+    "backend": {
+      "$ref": "#/$defs/TurnSecurityBackendSnapshot"
+    },
+    "created_at_unix_ms": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "enforcement": {
+      "$ref": "#/$defs/TurnSecurityEnforcementStatus"
+    },
+    "network": {
+      "$ref": "#/$defs/TurnNetworkPolicySnapshot"
+    },
+    "parent_cap": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TurnSecurityParentCapSnapshot"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "permission_profile": {
+      "$ref": "#/$defs/TurnPermissionProfileSnapshot"
+    },
+    "process": {
+      "$ref": "#/$defs/TurnProcessPolicySnapshot"
+    },
+    "sandbox": {
+      "$ref": "#/$defs/TurnSandboxSnapshot"
+    },
+    "schema_version": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "source": {
+      "$ref": "#/$defs/TurnSecuritySnapshotSource"
+    },
+    "version": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "schema_version",
+    "version",
+    "source",
+    "permission_profile",
+    "sandbox",
+    "process",
+    "network",
+    "approval",
+    "backend",
+    "enforcement",
+    "created_at_unix_ms"
+  ],
+  "$defs": {
+    "BackendSecurityCapabilities": {
+      "type": "object",
+      "properties": {
+        "can_enforce_filesystem": {
+          "type": "boolean"
+        },
+        "can_enforce_network": {
+          "type": "boolean"
+        },
+        "can_enforce_process": {
+          "type": "boolean"
+        },
+        "supports_request_permissions": {
+          "type": "boolean"
+        },
+        "supports_session_scope_approval": {
+          "type": "boolean"
+        },
+        "supports_turn_scope_approval": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "can_enforce_filesystem",
+        "can_enforce_network",
+        "can_enforce_process",
+        "supports_turn_scope_approval",
+        "supports_session_scope_approval",
+        "supports_request_permissions"
+      ]
+    },
+    "PermissionBehavior": {
+      "type": "string",
+      "enum": [
+        "allow",
+        "ask",
+        "deny"
+      ]
+    },
+    "SandboxBackendKind": {
+      "type": "string",
+      "enum": [
+        "nono",
+        "windows_restricted_token",
+        "provider_native"
+      ]
+    },
+    "SandboxBackendRequirement": {
+      "type": "string",
+      "enum": [
+        "none",
+        "optional",
+        "required"
+      ]
+    },
+    "ToolPermissionPolicySnapshot": {
+      "type": "object",
+      "properties": {
+        "allowed_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "allowed_tools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "computer_use": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "default_behavior": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "denied_tools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "dynamic_skill_tool": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "file_read": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "file_write": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "mcp_read": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "mcp_write_or_unknown": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "network": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "shell_command": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "task_subagent": {
+          "$ref": "#/$defs/PermissionBehavior"
+        }
+      },
+      "required": [
+        "default_behavior",
+        "file_read",
+        "file_write",
+        "shell_command",
+        "network",
+        "mcp_read",
+        "mcp_write_or_unknown",
+        "dynamic_skill_tool",
+        "computer_use",
+        "task_subagent"
+      ]
+    },
+    "TurnApprovalScopePolicySnapshot": {
+      "type": "object",
+      "properties": {
+        "allow_always": {
+          "type": "boolean"
+        },
+        "allow_for_session": {
+          "type": "boolean"
+        },
+        "allow_for_turn": {
+          "type": "boolean"
+        },
+        "allow_once": {
+          "type": "boolean"
+        },
+        "request_permissions": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "allow_once",
+        "allow_for_turn",
+        "allow_for_session",
+        "allow_always",
+        "request_permissions"
+      ]
+    },
+    "TurnCommandRiskPolicy": {
+      "type": "object",
+      "properties": {
+        "allowed_command_families": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "denied_commands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "TurnEnvironmentPolicy": {
+      "type": "object",
+      "properties": {
+        "allowed_vars": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "denied_patterns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "inherit": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "inherit"
+      ]
+    },
+    "TurnFilesystemAccess": {
+      "type": "string",
+      "enum": [
+        "none",
+        "read",
+        "write"
+      ]
+    },
+    "TurnFilesystemSandboxEntry": {
+      "type": "object",
+      "properties": {
+        "access": {
+          "$ref": "#/$defs/TurnFilesystemAccess"
+        },
+        "path": {
+          "$ref": "#/$defs/TurnFilesystemSandboxPath"
+        },
+        "provenance": {
+          "$ref": "#/$defs/TurnSecurityRuleProvenance"
+        },
+        "resolved_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "access",
+        "provenance"
+      ]
+    },
+    "TurnFilesystemSandboxKind": {
+      "type": "string",
+      "enum": [
+        "restricted",
+        "unrestricted"
+      ]
+    },
+    "TurnFilesystemSandboxPath": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "root"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "current_working_directory"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "workspace_root"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "project_root"
+            },
+            "subpath": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "slash_tmp"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "tmpdir"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "runtime_home"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "explicit_path"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "path"
+          ]
+        }
+      ]
+    },
+    "TurnFilesystemSandboxPolicy": {
+      "type": "object",
+      "properties": {
+        "entries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TurnFilesystemSandboxEntry"
+          }
+        },
+        "kind": {
+          "$ref": "#/$defs/TurnFilesystemSandboxKind"
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
+    "TurnNetworkMode": {
+      "type": "string",
+      "enum": [
+        "disabled",
+        "restricted",
+        "enabled"
+      ]
+    },
+    "TurnNetworkPolicySnapshot": {
+      "type": "object",
+      "properties": {
+        "allow_localhost": {
+          "type": "boolean"
+        },
+        "allow_unix_sockets": {
+          "type": "boolean"
+        },
+        "allowed_domains": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "denied_domains": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "mode": {
+          "$ref": "#/$defs/TurnNetworkMode"
+        }
+      },
+      "required": [
+        "mode",
+        "allow_localhost",
+        "allow_unix_sockets"
+      ]
+    },
+    "TurnPermissionMode": {
+      "type": "string",
+      "enum": [
+        "full_access",
+        "auto_accept_edits",
+        "supervised"
+      ]
+    },
+    "TurnPermissionProfileCap": {
+      "type": "object",
+      "properties": {
+        "effective_policy": {
+          "$ref": "#/$defs/ToolPermissionPolicySnapshot"
+        },
+        "mode": {
+          "$ref": "#/$defs/TurnPermissionMode"
+        }
+      },
+      "required": [
+        "mode",
+        "effective_policy"
+      ]
+    },
+    "TurnPermissionProfileSnapshot": {
+      "type": "object",
+      "properties": {
+        "effective_policy": {
+          "$ref": "#/$defs/ToolPermissionPolicySnapshot"
+        },
+        "mode": {
+          "$ref": "#/$defs/TurnPermissionMode"
+        },
+        "source": {
+          "$ref": "#/$defs/TurnPermissionProfileSource"
+        }
+      },
+      "required": [
+        "mode",
+        "source",
+        "effective_policy"
+      ]
+    },
+    "TurnPermissionProfileSource": {
+      "type": "string",
+      "enum": [
+        "composer",
+        "defaulted",
+        "inherited_from_parent_turn",
+        "task_permission_cap",
+        "system"
+      ]
+    },
+    "TurnProcessPolicySnapshot": {
+      "type": "object",
+      "properties": {
+        "command_risk": {
+          "$ref": "#/$defs/TurnCommandRiskPolicy"
+        },
+        "environment": {
+          "$ref": "#/$defs/TurnEnvironmentPolicy"
+        },
+        "shell": {
+          "$ref": "#/$defs/TurnShellPolicy"
+        },
+        "timeout": {
+          "$ref": "#/$defs/TurnProcessTimeoutPolicy"
+        }
+      },
+      "required": [
+        "shell",
+        "environment",
+        "timeout",
+        "command_risk"
+      ]
+    },
+    "TurnProcessTimeoutPolicy": {
+      "type": "object",
+      "properties": {
+        "max_duration_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "max_duration_ms"
+      ]
+    },
+    "TurnSandboxMode": {
+      "type": "string",
+      "enum": [
+        "unrestricted",
+        "read_only",
+        "workspace_write"
+      ]
+    },
+    "TurnSandboxSnapshot": {
+      "type": "object",
+      "properties": {
+        "backend_preference": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SandboxBackendKind"
+          }
+        },
+        "backend_requirement": {
+          "$ref": "#/$defs/SandboxBackendRequirement"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "filesystem": {
+          "$ref": "#/$defs/TurnFilesystemSandboxPolicy"
+        },
+        "mode": {
+          "$ref": "#/$defs/TurnSandboxMode"
+        },
+        "network": {
+          "$ref": "#/$defs/TurnNetworkPolicySnapshot"
+        },
+        "tmp": {
+          "$ref": "#/$defs/TurnTmpPolicy"
+        }
+      },
+      "required": [
+        "mode",
+        "cwd",
+        "filesystem",
+        "tmp",
+        "network",
+        "backend_requirement"
+      ]
+    },
+    "TurnSecurityBackendSnapshot": {
+      "type": "object",
+      "properties": {
+        "capabilities": {
+          "$ref": "#/$defs/BackendSecurityCapabilities"
+        },
+        "execution_backend": {
+          "$ref": "#/$defs/TurnSecurityExecutionBackendKind"
+        },
+        "provider": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sandbox_backend": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SandboxBackendKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "execution_backend",
+        "capabilities"
+      ]
+    },
+    "TurnSecurityCapabilityKind": {
+      "type": "string",
+      "enum": [
+        "filesystem",
+        "network",
+        "process",
+        "approval",
+        "sandbox_backend"
+      ]
+    },
+    "TurnSecurityDegradation": {
+      "type": "object",
+      "properties": {
+        "capability": {
+          "$ref": "#/$defs/TurnSecurityCapabilityKind"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "capability",
+        "reason"
+      ]
+    },
+    "TurnSecurityEnforcementStatus": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "active"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "degraded": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/TurnSecurityDegradation"
+              }
+            },
+            "status": {
+              "type": "string",
+              "const": "partially_active"
+            }
+          },
+          "required": [
+            "status",
+            "degraded"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string",
+              "const": "unavailable"
+            }
+          },
+          "required": [
+            "status",
+            "reason"
+          ]
+        }
+      ]
+    },
+    "TurnSecurityExecutionBackendKind": {
+      "type": "string",
+      "enum": [
+        "native",
+        "codex_cli",
+        "claude_cli"
+      ]
+    },
+    "TurnSecurityParentCapSnapshot": {
+      "type": "object",
+      "properties": {
+        "max_filesystem_entries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TurnFilesystemSandboxEntry"
+          }
+        },
+        "max_network_policy": {
+          "$ref": "#/$defs/TurnNetworkPolicySnapshot"
+        },
+        "max_permission_profile": {
+          "$ref": "#/$defs/TurnPermissionProfileCap"
+        },
+        "max_sandbox_mode": {
+          "$ref": "#/$defs/TurnSandboxMode"
+        },
+        "parent_turn_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "parent_turn_id",
+        "max_permission_profile",
+        "max_network_policy",
+        "max_sandbox_mode"
+      ]
+    },
+    "TurnSecurityRuleProvenance": {
+      "type": "string",
+      "enum": [
+        "composer_selection",
+        "workspace",
+        "project",
+        "runtime",
+        "task_cap",
+        "system"
+      ]
+    },
+    "TurnSecuritySnapshotSource": {
+      "type": "string",
+      "enum": [
+        "composer_selection",
+        "gateway_default",
+        "task_inherited",
+        "reviewer_inherited",
+        "revision_inherited",
+        "runtime_recovery",
+        "backfilled_legacy"
+      ]
+    },
+    "TurnShellPolicy": {
+      "type": "object",
+      "properties": {
+        "allow_session_inheritance": {
+          "type": "boolean"
+        },
+        "allow_stdin": {
+          "type": "boolean"
+        },
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled",
+        "allow_stdin",
+        "allow_session_inheritance"
+      ]
+    },
+    "TurnTmpMode": {
+      "type": "string",
+      "enum": [
+        "host",
+        "isolated"
+      ]
+    },
+    "TurnTmpPolicy": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/TurnTmpMode"
+        },
+        "writable_roots": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "mode"
+      ]
+    }
+  }
+}

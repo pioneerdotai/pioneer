@@ -4,6 +4,9 @@
   "type": "string",
   "enum": [
     "profile_selected",
+    "security_snapshot_resolved",
+    "security_sandbox_degraded",
+    "security_sandbox_unavailable",
     "approval_requested",
     "approval_resolved",
     "decision_allowed",

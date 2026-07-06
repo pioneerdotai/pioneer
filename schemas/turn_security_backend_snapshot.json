@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnSecurityBackendSnapshot",
+  "type": "object",
+  "properties": {
+    "capabilities": {
+      "$ref": "#/$defs/BackendSecurityCapabilities"
+    },
+    "execution_backend": {
+      "$ref": "#/$defs/TurnSecurityExecutionBackendKind"
+    },
+    "provider": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "sandbox_backend": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SandboxBackendKind"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "execution_backend",
+    "capabilities"
+  ],
+  "$defs": {
+    "BackendSecurityCapabilities": {
+      "type": "object",
+      "properties": {
+        "can_enforce_filesystem": {
+          "type": "boolean"
+        },
+        "can_enforce_network": {
+          "type": "boolean"
+        },
+        "can_enforce_process": {
+          "type": "boolean"
+        },
+        "supports_request_permissions": {
+          "type": "boolean"
+        },
+        "supports_session_scope_approval": {
+          "type": "boolean"
+        },
+        "supports_turn_scope_approval": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "can_enforce_filesystem",
+        "can_enforce_network",
+        "can_enforce_process",
+        "supports_turn_scope_approval",
+        "supports_session_scope_approval",
+        "supports_request_permissions"
+      ]
+    },
+    "SandboxBackendKind": {
+      "type": "string",
+      "enum": [
+        "nono",
+        "windows_restricted_token",
+        "provider_native"
+      ]
+    },
+    "TurnSecurityExecutionBackendKind": {
+      "type": "string",
+      "enum": [
+        "native",
+        "codex_cli",
+        "claude_cli"
+      ]
+    }
+  }
+}
