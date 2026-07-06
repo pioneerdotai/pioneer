@@ -20,7 +20,6 @@ mod memory_policy;
 mod memory_runtime;
 mod memory_tools;
 mod message;
-mod migrations;
 mod operations;
 mod permissions;
 mod prompt_hooks;
@@ -457,10 +456,8 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         .gateway
         .memory
         .resolve_capsules_root(runtime_home.as_path())?;
-    migrations::spawn_gateway_startup_migrations(
-        crud_store.clone(),
-        thread_episodic_storage_root.clone(),
-    );
+    database::startup::spawn(crud_store.clone(), thread_episodic_storage_root.clone());
+    database::maintenance::spawn(crud_store.clone());
 
     let mut message_processor = MessageProcessor::new_with_memory_runtime_and_task_config(
         thread_manager,

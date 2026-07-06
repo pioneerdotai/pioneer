@@ -9427,7 +9427,7 @@ async fn task_create_tool_persists_anchor_and_rejects_legacy_timeline_impl() {
         .await
         .expect("stale task anchor should persist");
 
-    let backfill = crate::migrations::backfill_task_anchors_once(crud_store.as_ref())
+    let backfill = crate::database::startup::backfill_task_anchors_once(crud_store.as_ref())
         .await
         .expect("task anchor backfill should complete");
     assert!(
@@ -19840,15 +19840,7 @@ async fn turn_items_returns_stream_events_for_resume() {
         .await;
 
     // The response may be preceded by late notifications; find the RPC response.
-    let mut payload = recv_text(&mut rx).await;
-    for _ in 0..5 {
-        if payload.contains("\"id\":\"ccccccccccccccccccccc\"") {
-            break;
-        }
-        payload = recv_text(&mut rx).await;
-    }
-    let response: JsonRpcResponse =
-        serde_json::from_str(&payload).expect("turn/items response should decode");
+    let response = recv_response_by_id(&mut rx, "ccccccccccccccccccccc").await;
     let turn_items: pioneer_protocol::TurnItemsResponse =
         serde_json::from_value(response.result).expect("turn/items result should decode");
     assert_eq!(turn_items.thread_id, "thr_000000000000000022");
@@ -20776,9 +20768,10 @@ async fn setup_semantic_timeline_query_harness_inner(
     )
     .await;
 
-    let summary = crate::migrations::backfill_timeline_pagination_once(crud_store.as_ref(), 16)
-        .await
-        .expect("semantic timeline backfill should succeed for fixture");
+    let summary =
+        crate::database::startup::backfill_timeline_pagination_once(crud_store.as_ref(), 16)
+            .await
+            .expect("semantic timeline backfill should succeed for fixture");
     assert!(
         !summary.skipped,
         "fixture backfill should build projection rows"
