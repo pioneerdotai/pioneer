@@ -494,6 +494,7 @@ mod tests {
                 network_access: true,
             }),
             permission_cap: Some(test_permission_cap()),
+            security_cap: None,
             result_contract: None,
             review_policy: None,
             depth,

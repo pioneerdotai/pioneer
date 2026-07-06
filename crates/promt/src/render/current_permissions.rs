@@ -66,6 +66,16 @@ fn permission_profile_summary_lines(
             push_behavior_line_if_restricted(&mut lines, "file_write", policy.file_write);
             push_behavior_line_if_restricted(&mut lines, "shell_command", policy.shell_command);
             push_behavior_line_if_restricted(&mut lines, "network", policy.network);
+            push_behavior_line_if_restricted(
+                &mut lines,
+                "mcp_write_or_unknown",
+                policy.mcp_write_or_unknown,
+            );
+            push_behavior_line_if_restricted(
+                &mut lines,
+                "dynamic_skill_tool",
+                policy.dynamic_skill_tool,
+            );
             push_behavior_line_if_restricted(&mut lines, "task_subagent", policy.task_subagent);
         }
         PermissionSummaryStyle::Snapshot => {
@@ -73,6 +83,13 @@ fn permission_profile_summary_lines(
             push_behavior_line(&mut lines, "file_write", policy.file_write);
             push_behavior_line(&mut lines, "shell_command", policy.shell_command);
             push_behavior_line(&mut lines, "network", policy.network);
+            push_behavior_line(&mut lines, "mcp_read", policy.mcp_read);
+            push_behavior_line(
+                &mut lines,
+                "mcp_write_or_unknown",
+                policy.mcp_write_or_unknown,
+            );
+            push_behavior_line(&mut lines, "dynamic_skill_tool", policy.dynamic_skill_tool);
             push_behavior_line(&mut lines, "task_subagent", policy.task_subagent);
         }
     }
@@ -101,6 +118,18 @@ fn profile_has_narrowing(policy: &ToolPermissionPolicySnapshot) -> bool {
         )
         || matches!(
             policy.network,
+            PermissionBehavior::Ask | PermissionBehavior::Deny
+        )
+        || matches!(
+            policy.mcp_read,
+            PermissionBehavior::Ask | PermissionBehavior::Deny
+        )
+        || matches!(
+            policy.mcp_write_or_unknown,
+            PermissionBehavior::Ask | PermissionBehavior::Deny
+        )
+        || matches!(
+            policy.dynamic_skill_tool,
             PermissionBehavior::Ask | PermissionBehavior::Deny
         )
         || matches!(
@@ -157,7 +186,7 @@ mod tests {
 
         assert_eq!(
             guidance,
-            "- mode: supervised\n- Commands, file changes, network access, task/subagent launches, and other external actions may require user approval before execution.\n- file_write: ask\n- shell_command: ask\n- network: ask\n- task_subagent: ask\n- Permission prompts are enforced by Pioneer; continue with allowed alternatives if an action is denied."
+            "- mode: supervised\n- Commands, file changes, network access, task/subagent launches, and other external actions may require user approval before execution.\n- file_write: ask\n- shell_command: ask\n- network: ask\n- mcp_write_or_unknown: ask\n- dynamic_skill_tool: ask\n- task_subagent: ask\n- Permission prompts are enforced by Pioneer; continue with allowed alternatives if an action is denied."
         );
         assert!(guidance.contains("may require user approval"));
         assert!(guidance.contains("enforced by Pioneer"));
@@ -179,6 +208,9 @@ mod tests {
         assert!(summary.contains("- file_write: ask"));
         assert!(summary.contains("- shell_command: ask"));
         assert!(summary.contains("- network: ask"));
+        assert!(summary.contains("- mcp_read: allow"));
+        assert!(summary.contains("- mcp_write_or_unknown: ask"));
+        assert!(summary.contains("- dynamic_skill_tool: ask"));
         assert!(summary.contains("- task_subagent: ask"));
     }
 }
