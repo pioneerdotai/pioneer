@@ -25,9 +25,10 @@ use pioneer_protocol::{
     TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnStatus,
     TaskThreadLineage, TaskTree, TaskTrigger, TaskTriggerKind, TaskTriggerSpec, TaskWriteLock,
     Thread, ThreadFolder, ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadPlacement,
-    TimelineOutputPolicy, ToolCallStatus, ToolDisplayPayload, ToolStoragePayload, Turn, TurnItem,
-    TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType, TurnItemsResponse,
-    TurnPermissionProfileSnapshot, TurnPermissionProfileSource, TurnStatus, UserInput, generate_id,
+    TimelineOutputPolicy, ToolCallStatus, ToolDisplayPayload, ToolStoragePayload, Turn,
+    TurnExecutionSecuritySnapshot, TurnItem, TurnItemEvent, TurnItemEventPayload,
+    TurnItemTimeoutReason, TurnItemType, TurnItemsResponse, TurnPermissionProfileSnapshot,
+    TurnPermissionProfileSource, TurnStatus, UserInput, generate_id,
 };
 use pioneer_sqlite::{
     DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteWriteCoordinator,
@@ -400,6 +401,7 @@ pub use crate::repositories::hook_run::{
     HookRunAttemptRecord, HookRunCompletionRecord, HookRunRecord, HookRunScope, HookRunScopeKind,
     NewHookAuditEventRecord, NewHookRunAttemptRecord, NewHookRunRecord, RecoverableHookRunRecord,
 };
+pub use crate::repositories::turn::TurnExecutionSecuritySnapshotRecord;
 pub use crate::repositories::turn_execution_window::{
     NewTurnExecutionCheckpointRecord, NewTurnExecutionWindowRecord,
     TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES, TurnExecutionCheckpointKind,
@@ -6794,6 +6796,35 @@ impl CrudStore {
         .await
     }
 
+    pub async fn set_turn_execution_security_snapshot(
+        &self,
+        turn_id: &str,
+        snapshot: &TurnExecutionSecuritySnapshot,
+    ) -> Result<bool> {
+        let turn_id = turn_id.to_owned();
+        let snapshot = snapshot.clone();
+        self.run_serialized_write(|| async {
+            turn::set_turn_execution_security_snapshot(
+                &self.connection,
+                turn_id.as_str(),
+                &snapshot,
+            )
+            .await
+        })
+        .await
+    }
+
+    pub async fn get_turn_execution_security_snapshot(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<TurnExecutionSecuritySnapshotRecord>> {
+        let turn_id = turn_id.to_owned();
+        self.run_serialized_write(|| async {
+            turn::find_turn_execution_security_snapshot(&self.connection, turn_id.as_str()).await
+        })
+        .await
+    }
+
     pub async fn update_turn_status(
         &self,
         thread_id: &str,
@@ -11654,6 +11685,7 @@ fn task_agent_spec_from_db_model(
         context_policy: optional_typed_json_from_db(model.context_policy_json)?,
         tool_policy: optional_typed_json_from_db(model.tool_policy_json)?,
         permission_cap: optional_typed_json_from_db(model.permission_cap_json)?,
+        security_cap: optional_typed_json_from_db(model.security_cap_json)?,
         result_contract: optional_typed_json_from_db(model.result_contract_json)?,
         review_policy: optional_typed_json_from_db(model.review_policy_json)?,
         depth: model.depth,
@@ -12427,9 +12459,10 @@ mod tests {
         ToolPermissionPolicySnapshot, ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot,
         ToolRecoveryRetryClass, ToolRetryBudgetKind, ToolRetryBudgetUsage, ToolRetryErrorClass,
         ToolRetryExhaustionKind, ToolRetryResolution, ToolStoragePayload, Turn,
-        TurnCompletedNotification, TurnItem, TurnItemEventPayload, TurnItemTimeoutReason,
+        TurnCompletedNotification, TurnExecutionSecuritySnapshot, TurnFilesystemAccess,
+        TurnFilesystemSandboxEntry, TurnItem, TurnItemEventPayload, TurnItemTimeoutReason,
         TurnItemType, TurnKind, TurnOrigin, TurnPermissionAuditEventKind, TurnPermissionMode,
-        TurnPermissionProfileSnapshot, TurnPermissionProfileSource, TurnStatus,
+        TurnPermissionProfileSnapshot, TurnPermissionProfileSource, TurnSandboxMode, TurnStatus,
         TurnToolLoopBudgetExceededNotification, UserInput,
     };
     use sea_orm::{
@@ -12460,6 +12493,53 @@ mod tests {
         .expect("workspace insert should succeed");
 
         CrudStore::new(connection)
+    }
+
+    async fn test_store_with_started_turn(
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> (CrudStore, Thread, Turn) {
+        let store = test_store_with_workspace(workspace_id).await;
+        let timestamp = 1_700_000_000;
+        let thread = Thread {
+            workspace_id: workspace_id.to_owned(),
+            id: thread_id.to_owned(),
+            name: None,
+            preview: String::new(),
+            mode: ThreadMode::Agent,
+            model: "gpt-5.4".to_owned(),
+            model_provider: "openai".to_owned(),
+            reasoning_effort: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+            status: ThreadStatus::Active,
+            origin_kind: ThreadOriginKind::User,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            turns: Vec::new(),
+        };
+        let turn = Turn {
+            id: turn_id.to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
+            error: None,
+            prompt_manifest: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+        };
+
+        store
+            .upsert_thread_model(&thread)
+            .await
+            .expect("thread should persist");
+        store
+            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+            .await
+            .expect("turn should persist");
+
+        (store, thread, turn)
     }
 
     fn test_artifact_binding(
@@ -15055,6 +15135,7 @@ mod tests {
             context_policy: None,
             tool_policy: None,
             permission_cap: None,
+            security_cap: None,
             result_contract: Some(TaskAgentResultContract {
                 format: TaskAgentResultFormat::Json,
                 required: true,
@@ -19147,6 +19228,10 @@ mod tests {
                     event_kind: TurnPermissionAuditEventKind::ProfileSelected,
                     profile_mode: permission_profile.mode,
                     profile_source: permission_profile.source,
+                    security_snapshot_id: None,
+                    security_snapshot_version: None,
+                    security_reason_code: None,
+                    security_capability: None,
                     item_id: None,
                     tool_call_id: None,
                     tool_name: None,
@@ -19268,6 +19353,10 @@ mod tests {
             event_kind: TurnPermissionAuditEventKind::ProfileSelected,
             profile_mode: permission_profile.mode,
             profile_source: permission_profile.source,
+            security_snapshot_id: None,
+            security_snapshot_version: None,
+            security_reason_code: None,
+            security_capability: None,
             item_id: None,
             tool_call_id: None,
             tool_name: None,
@@ -19451,6 +19540,245 @@ mod tests {
         assert_eq!(
             permission_profile.effective_policy,
             ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow)
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_execution_security_snapshot_missing_old_row_returns_none() {
+        let (store, _thread, turn) = test_store_with_started_turn(
+            "ws_security_missing",
+            "thr_security_missing",
+            "turn_security_missing",
+        )
+        .await;
+
+        let record = store
+            .get_turn_execution_security_snapshot(turn.id.as_str())
+            .await
+            .expect("security snapshot read should succeed");
+        assert_eq!(record, None);
+
+        let persisted_turn = pioneer_entity::turn::Entity::find_by_id(turn.id.clone())
+            .one(&store.connection)
+            .await
+            .expect("turn query should succeed")
+            .expect("turn should exist");
+        assert_eq!(persisted_turn.execution_security_snapshot_version, None);
+        assert_eq!(persisted_turn.execution_security_snapshot_json, None);
+
+        let snapshot =
+            TurnExecutionSecuritySnapshot::unrestricted_full_access("/workspace/security", 1);
+        let updated = store
+            .set_turn_execution_security_snapshot("missing_turn", &snapshot)
+            .await
+            .expect("missing turn update should not fail");
+        assert!(!updated, "missing turn should not be silently inserted");
+    }
+
+    #[tokio::test]
+    async fn turn_execution_security_snapshot_roundtrips_unrestricted_snapshot() {
+        let (store, _thread, turn) = test_store_with_started_turn(
+            "ws_security_unrestricted",
+            "thr_security_unrestricted",
+            "turn_security_unrestricted",
+        )
+        .await;
+        let snapshot = TurnExecutionSecuritySnapshot::unrestricted_full_access(
+            "/workspace/security-unrestricted",
+            1_700_000_000_000,
+        );
+
+        let updated = store
+            .set_turn_execution_security_snapshot(turn.id.as_str(), &snapshot)
+            .await
+            .expect("security snapshot update should succeed");
+        assert!(updated, "existing turn must be updated");
+
+        let record = store
+            .get_turn_execution_security_snapshot(turn.id.as_str())
+            .await
+            .expect("security snapshot read should succeed")
+            .expect("security snapshot should exist");
+        assert_eq!(record.turn_id, turn.id);
+        assert_eq!(record.version, 1);
+        assert_eq!(record.snapshot, snapshot);
+
+        let persisted_turn = pioneer_entity::turn::Entity::find_by_id(turn.id.clone())
+            .one(&store.connection)
+            .await
+            .expect("turn query should succeed")
+            .expect("turn should exist");
+        assert_eq!(persisted_turn.execution_security_snapshot_version, Some(1));
+        let persisted_snapshot = serde_json::from_str::<TurnExecutionSecuritySnapshot>(
+            persisted_turn
+                .execution_security_snapshot_json
+                .as_deref()
+                .expect("security snapshot json should persist"),
+        )
+        .expect("security snapshot json should decode");
+        assert_eq!(
+            persisted_snapshot.sandbox.mode,
+            TurnSandboxMode::Unrestricted
+        );
+        assert_eq!(persisted_snapshot, snapshot);
+    }
+
+    #[tokio::test]
+    async fn turn_execution_security_snapshot_roundtrips_restricted_snapshot() {
+        let (store, _thread, turn) = test_store_with_started_turn(
+            "ws_security_restricted",
+            "thr_security_restricted",
+            "turn_security_restricted",
+        )
+        .await;
+        let permission_profile = TurnPermissionProfileSnapshot::from_mode(
+            TurnPermissionMode::AutoAcceptEdits,
+            TurnPermissionProfileSource::Composer,
+        );
+        let snapshot = TurnExecutionSecuritySnapshot::workspace_write(
+            permission_profile.clone(),
+            "/workspace/security-restricted",
+            vec![TurnFilesystemSandboxEntry::workspace_root(
+                TurnFilesystemAccess::Write,
+                "/workspace/security-restricted",
+            )],
+            1_700_000_000_001,
+        );
+
+        let updated = store
+            .set_turn_execution_security_snapshot(turn.id.as_str(), &snapshot)
+            .await
+            .expect("security snapshot update should succeed");
+        assert!(updated, "existing turn must be updated");
+
+        let record = store
+            .get_turn_execution_security_snapshot(turn.id.as_str())
+            .await
+            .expect("security snapshot read should succeed")
+            .expect("security snapshot should exist");
+        assert_eq!(record.version, 1);
+        assert_eq!(record.snapshot.permission_profile, permission_profile);
+        assert_eq!(
+            record.snapshot.sandbox.mode,
+            TurnSandboxMode::WorkspaceWrite
+        );
+        assert_eq!(
+            record.snapshot.sandbox.filesystem.entries,
+            snapshot.sandbox.filesystem.entries
+        );
+        assert_eq!(record.snapshot, snapshot);
+    }
+
+    #[tokio::test]
+    async fn security_snapshot_gap_query_finds_turns_missing_execution_snapshot() {
+        let (store, thread, missing_turn) = test_store_with_started_turn(
+            "ws_security_gap",
+            "thr_security_gap",
+            "turn_security_gap_missing",
+        )
+        .await;
+        let complete_turn = Turn {
+            id: "turn_security_gap_present".to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
+            error: None,
+            prompt_manifest: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+        };
+        store
+            .materialize_turn_start(&thread, SandboxMode::FullAccess, &complete_turn, &[])
+            .await
+            .expect("second turn should materialize");
+        let snapshot =
+            TurnExecutionSecuritySnapshot::unrestricted_full_access("/workspace/security-gap", 1);
+        store
+            .set_turn_execution_security_snapshot(complete_turn.id.as_str(), &snapshot)
+            .await
+            .expect("security snapshot update should succeed");
+
+        let missing = pioneer_entity::turn::Entity::find()
+            .filter(pioneer_entity::turn::Column::ExecutionSecuritySnapshotJson.is_null())
+            .filter(pioneer_entity::turn::Column::Status.eq("in_progress"))
+            .all(&store.connection)
+            .await
+            .expect("gap query should run");
+        let missing_ids = missing
+            .iter()
+            .map(|turn| turn.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(missing_ids, vec![missing_turn.id.as_str()]);
+    }
+
+    #[tokio::test]
+    async fn security_snapshot_audit_decision_persists_snapshot_linkage() {
+        let (store, thread, turn) = test_store_with_started_turn(
+            "ws_security_audit_link",
+            "thr_security_audit_link",
+            "turn_security_audit_link",
+        )
+        .await;
+        let snapshot = TurnExecutionSecuritySnapshot::unrestricted_full_access(
+            "/workspace/security-audit-link",
+            1_700_000_000_000,
+        );
+        store
+            .set_turn_execution_security_snapshot(turn.id.as_str(), &snapshot)
+            .await
+            .expect("security snapshot update should succeed");
+
+        let audit = pioneer_protocol::TurnPermissionAuditEvent {
+            workspace_id: thread.workspace_id.clone(),
+            thread_id: thread.id.clone(),
+            turn_id: turn.id.clone(),
+            event_kind: TurnPermissionAuditEventKind::DecisionDenied,
+            profile_mode: TurnPermissionMode::Supervised,
+            profile_source: TurnPermissionProfileSource::Composer,
+            security_snapshot_id: Some(snapshot.audit_id(turn.id.as_str())),
+            security_snapshot_version: Some(snapshot.version),
+            security_reason_code: None,
+            security_capability: None,
+            item_id: Some("item_security_audit".to_owned()),
+            tool_call_id: Some("call_security_audit".to_owned()),
+            tool_name: Some("read_file".to_owned()),
+            action_kind: Some(pioneer_protocol::TurnPermissionActionKind::FileRead),
+            request_key: None,
+            decision: Some(pioneer_protocol::TurnPermissionAuditDecision::Deny),
+            reason: Some(pioneer_protocol::TurnPermissionDecisionReason::SandboxDenied),
+            cached: false,
+        };
+        store
+            .materialize_turn_permission_audit(audit.clone(), 1_700_000_002)
+            .await
+            .expect("security audit event should persist");
+
+        let turn_items = store
+            .get_turn_item_events(thread.id.as_str(), turn.id.as_str())
+            .await
+            .expect("turn events should load")
+            .expect("turn events should exist");
+        let persisted = turn_items
+            .events
+            .iter()
+            .find_map(|event| match &event.payload {
+                TurnItemEventPayload::TurnPermissionAudit(event)
+                    if event.event_kind == TurnPermissionAuditEventKind::DecisionDenied =>
+                {
+                    Some(event)
+                }
+                _ => None,
+            })
+            .expect("decision audit event should be projected");
+
+        assert_eq!(
+            persisted.security_snapshot_id.as_deref(),
+            audit.security_snapshot_id.as_deref()
+        );
+        assert_eq!(persisted.security_snapshot_version, Some(1));
+        assert_eq!(
+            persisted.reason,
+            Some(pioneer_protocol::TurnPermissionDecisionReason::SandboxDenied)
         );
     }
 

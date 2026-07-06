@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use pioneer_entity::{turn, turn_input, turn_item, turn_status_history};
-use pioneer_protocol::{Turn, TurnItem, TurnStatus, UserInput, generate_id};
+use pioneer_protocol::{
+    Turn, TurnExecutionSecuritySnapshot, TurnItem, TurnStatus, UserInput, generate_id,
+};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
@@ -30,6 +32,13 @@ struct TurnPermissionProfileColumns {
     mode: String,
     source: String,
     snapshot_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnExecutionSecuritySnapshotRecord {
+    pub turn_id: String,
+    pub version: i64,
+    pub snapshot: TurnExecutionSecuritySnapshot,
 }
 
 pub async fn find_turn_by_id<C: ConnectionTrait>(
@@ -108,6 +117,8 @@ pub async fn upsert_turn<C: ConnectionTrait>(
         permission_profile_mode: Set(Some(permission_profile_columns.mode)),
         permission_profile_source: Set(Some(permission_profile_columns.source)),
         permission_profile_snapshot_json: Set(Some(permission_profile_columns.snapshot_json)),
+        execution_security_snapshot_version: Set(None),
+        execution_security_snapshot_json: Set(None),
         created_at: Set(created_at),
         updated_at: Set(updated_at),
     })
@@ -121,6 +132,64 @@ pub async fn upsert_turn<C: ConnectionTrait>(
     .context("failed to upsert turn")?;
 
     Ok(())
+}
+
+pub async fn set_turn_execution_security_snapshot<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    snapshot: &TurnExecutionSecuritySnapshot,
+) -> Result<bool> {
+    let version = i32::try_from(snapshot.version)
+        .context("turn execution security snapshot version exceeds database integer range")?;
+    let snapshot_json = serde_json::to_string(snapshot)
+        .context("failed to serialize turn execution security snapshot to json")?;
+
+    let update_result = turn::Entity::update_many()
+        .filter(turn::Column::Id.eq(turn_id.to_owned()))
+        .col_expr(
+            turn::Column::ExecutionSecuritySnapshotVersion,
+            Expr::value(version),
+        )
+        .col_expr(
+            turn::Column::ExecutionSecuritySnapshotJson,
+            Expr::value(snapshot_json),
+        )
+        .exec(db)
+        .await
+        .context("failed to update turn execution security snapshot")?;
+
+    Ok(update_result.rows_affected > 0)
+}
+
+pub async fn find_turn_execution_security_snapshot<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+) -> Result<Option<TurnExecutionSecuritySnapshotRecord>> {
+    let Some(model) = find_turn_by_id(db, turn_id).await? else {
+        return Ok(None);
+    };
+    let Some(snapshot_json) = model
+        .execution_security_snapshot_json
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "{}" && *value != "null")
+    else {
+        return Ok(None);
+    };
+
+    let snapshot = serde_json::from_str::<TurnExecutionSecuritySnapshot>(snapshot_json)
+        .with_context(|| {
+            format!("failed to decode execution security snapshot for turn `{turn_id}`")
+        })?;
+    let version = model
+        .execution_security_snapshot_version
+        .unwrap_or_else(|| i64::from(snapshot.version));
+
+    Ok(Some(TurnExecutionSecuritySnapshotRecord {
+        turn_id: model.id,
+        version,
+        snapshot,
+    }))
 }
 
 fn build_turn_permission_profile_columns(
