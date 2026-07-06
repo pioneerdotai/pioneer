@@ -35,6 +35,8 @@ use sea_orm::{
     EntityTrait, QueryFilter, QueryOrder, QuerySelect, Statement, TransactionTrait,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::error::Error as StdError;
+use std::fmt;
 use std::future::Future;
 
 use crate::convention::{
@@ -65,6 +67,58 @@ use crate::convention::{
 };
 use crate::events::{TurnEventPayload, TurnStartedEventPayload};
 use crate::projector::TurnProjector;
+
+#[derive(Debug)]
+pub struct TurnEventProjectionAfterAppendError {
+    event_id: String,
+    turn_id: String,
+    sequence: i64,
+    projection_error: String,
+    projection_failure_record_error: Option<String>,
+}
+
+impl TurnEventProjectionAfterAppendError {
+    fn new(
+        event_id: String,
+        turn_id: String,
+        sequence: i64,
+        projection_error: String,
+        projection_failure_record_error: Option<String>,
+    ) -> Self {
+        Self {
+            event_id,
+            turn_id,
+            sequence,
+            projection_error,
+            projection_failure_record_error,
+        }
+    }
+}
+
+impl fmt::Display for TurnEventProjectionAfterAppendError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "turn event `{}` for turn `{}` sequence {} was appended but projection failed: {}",
+            self.event_id, self.turn_id, self.sequence, self.projection_error
+        )?;
+        if let Some(mark_error) = self.projection_failure_record_error.as_deref() {
+            write!(
+                formatter,
+                "; failed to persist projection failure state: {mark_error}"
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl StdError for TurnEventProjectionAfterAppendError {}
+
+pub fn turn_event_was_appended_before_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<TurnEventProjectionAfterAppendError>())
+}
 
 #[derive(Debug, Clone)]
 pub struct TaskReviewInvariantSnapshot {
@@ -10335,14 +10389,23 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                 })
                 .await
             {
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed to persist turn event projection failure for event `{}`: {mark_error:#}",
-                        appended_event.id
-                    )
-                });
+                return Err(TurnEventProjectionAfterAppendError::new(
+                    appended_event.id,
+                    appended_event.turn_id,
+                    appended_event.sequence,
+                    error_message,
+                    Some(format!("{mark_error:#}")),
+                )
+                .into());
             }
-            return Err(error);
+            return Err(TurnEventProjectionAfterAppendError::new(
+                appended_event.id,
+                appended_event.turn_id,
+                appended_event.sequence,
+                error_message,
+                None,
+            )
+            .into());
         }
 
         Ok(())
@@ -16245,6 +16308,10 @@ mod tests {
         assert!(
             format!("{projection_error:#}").contains("waiting for an earlier event"),
             "projection should fail because an earlier event is not projected"
+        );
+        assert!(
+            crate::turn_event_was_appended_before_error(&projection_error),
+            "projection failure should report that the raw turn event was already appended"
         );
 
         let events = pioneer_entity::turn_event::Entity::find()

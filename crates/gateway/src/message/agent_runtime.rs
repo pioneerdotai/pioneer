@@ -3594,6 +3594,31 @@ impl MessageProcessor {
         .await;
     }
 
+    async fn rollback_terminal_turn_finish_if_event_not_appended(
+        &self,
+        rollback_context: crate::thread::TurnFinishRollbackContext,
+        error: &anyhow::Error,
+        thread_id: &str,
+        turn_id: &str,
+        event_name: &'static str,
+    ) -> bool {
+        if pioneer_crud::turn_event_was_appended_before_error(error) {
+            warn!(
+                thread_id,
+                turn_id,
+                event = event_name,
+                error = %format!("{error:#}"),
+                "terminal turn event was appended but projection failed; preserving in-memory terminal state"
+            );
+            return false;
+        }
+
+        self.thread_manager
+            .rollback_turn_finish(rollback_context)
+            .await;
+        true
+    }
+
     pub(super) async fn complete_turn(
         &self,
         thread_id: String,
@@ -3663,17 +3688,24 @@ impl MessageProcessor {
             .materialize_turn_completed(turn_completed.clone(), event_timestamp)
             .await
         {
-            self.thread_manager
-                .rollback_turn_finish(finish_outcome.rollback_context)
+            let rolled_back = self
+                .rollback_terminal_turn_finish_if_event_not_appended(
+                    finish_outcome.rollback_context,
+                    &error,
+                    thread_id.as_str(),
+                    turn_id.as_str(),
+                    "turn/completed",
+                )
                 .await;
-
-            self.report_legacy_turn_failure(
-                thread_id,
-                turn_id,
-                format!("failed to persist turn/completed: {error:#}"),
-            )
-            .await;
-            return false;
+            if rolled_back {
+                self.report_legacy_turn_failure(
+                    thread_id,
+                    turn_id,
+                    format!("failed to persist turn/completed: {error:#}"),
+                )
+                .await;
+                return false;
+            }
         }
 
         if let Err(error) = self
@@ -4017,17 +4049,24 @@ impl MessageProcessor {
             .materialize_turn_blocked(turn_blocked.clone(), event_timestamp)
             .await
         {
-            self.thread_manager
-                .rollback_turn_finish(finish_outcome.rollback_context)
+            let rolled_back = self
+                .rollback_terminal_turn_finish_if_event_not_appended(
+                    finish_outcome.rollback_context,
+                    &error,
+                    thread_id.as_str(),
+                    turn_id.as_str(),
+                    "turn/blocked",
+                )
                 .await;
-
-            warn!(
-                thread_id,
-                turn_id,
-                error = %format!("{error:#}"),
-                "failed to persist turn/blocked event"
-            );
-            return false;
+            if rolled_back {
+                warn!(
+                    thread_id,
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to persist turn/blocked event"
+                );
+                return false;
+            }
         }
 
         self.ensure_blocked_turn_terminal_cleanup(
@@ -4184,13 +4223,22 @@ impl MessageProcessor {
             .materialize_turn_blocked(turn_blocked.clone(), event_timestamp)
             .await
         {
-            warn!(
-                thread_id,
-                turn_id,
-                error = %format!("{error:#}"),
-                "failed to persist unloaded turn/blocked event"
-            );
-            return false;
+            if pioneer_crud::turn_event_was_appended_before_error(&error) {
+                warn!(
+                    thread_id,
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    "unloaded turn/blocked event was appended but projection failed; continuing terminal cleanup"
+                );
+            } else {
+                warn!(
+                    thread_id,
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to persist unloaded turn/blocked event"
+                );
+                return false;
+            }
         }
 
         self.ensure_blocked_turn_terminal_cleanup(
@@ -4425,17 +4473,24 @@ impl MessageProcessor {
             .materialize_turn_failed(turn_failed.clone(), event_timestamp)
             .await
         {
-            self.thread_manager
-                .rollback_turn_finish(finish_outcome.rollback_context)
+            let rolled_back = self
+                .rollback_terminal_turn_finish_if_event_not_appended(
+                    finish_outcome.rollback_context,
+                    &error,
+                    thread_id.as_str(),
+                    turn_id.as_str(),
+                    "turn/interrupted",
+                )
                 .await;
-
-            warn!(
-                thread_id,
-                turn_id,
-                error = %format!("{error:#}"),
-                "failed to persist turn/interrupted event"
-            );
-            return false;
+            if rolled_back {
+                warn!(
+                    thread_id,
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to persist turn/interrupted event"
+                );
+                return false;
+            }
         }
 
         if let Err(error) = self
@@ -4623,17 +4678,24 @@ impl MessageProcessor {
             .materialize_turn_failed(turn_failed.clone(), event_timestamp)
             .await
         {
-            self.thread_manager
-                .rollback_turn_finish(finish_outcome.rollback_context)
+            let rolled_back = self
+                .rollback_terminal_turn_finish_if_event_not_appended(
+                    finish_outcome.rollback_context,
+                    &error,
+                    thread_id.as_str(),
+                    turn_id.as_str(),
+                    "turn/failed",
+                )
                 .await;
-
-            warn!(
-                thread_id,
-                turn_id,
-                error = %format!("{error:#}"),
-                "failed to persist turn/failed event"
-            );
-            return false;
+            if rolled_back {
+                warn!(
+                    thread_id,
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to persist turn/failed event"
+                );
+                return false;
+            }
         }
 
         if let Err(error) = self
