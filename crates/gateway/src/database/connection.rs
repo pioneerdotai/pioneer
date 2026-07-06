@@ -58,6 +58,8 @@ impl GatewayDatabaseRuntimeConfig {
 
 pub async fn initialize(runtime_home: &Path, app_config: &AppConfig) -> Result<DatabaseConnection> {
     let config = GatewayDatabaseRuntimeConfig::from_app_config(app_config)?;
+    pioneer_sqlite::zstd::register_auto_extension_once()
+        .context("failed to register sqlite-zstd gateway database extension")?;
 
     let database_path = runtime_home.join(config.file_name.as_str());
     let database_url = sqlite_connection_url(database_path.as_path());

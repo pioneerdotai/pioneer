@@ -80,6 +80,8 @@ tokio-util = { version = "0.7", features = ["full"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 # Tracing
+log = "0.4"
+env_logger = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3" }
 sentry = { version = "0.48", default-features = false, features = ["anyhow", "backtrace", "contexts", "panic", "transport", "tracing"] }
@@ -112,6 +114,11 @@ xcap = "0.9"
 xa11y = "0.9"
 tempfile = "3"
 fs4 = "0.13"
+lazy_static = "1.4"
+lru_time_cache = "0.11"
+owning_ref = "0.4"
+names = { version = "0.14", default-features = false }
+pretty_assertions = "1"
 keepawake = "0.6"
 cpal = "0.18"
 transcribe-rs = { version = "0.3.11", features = ["onnx"] }
@@ -147,6 +154,8 @@ windows-sys = "0.61"
 # Database
 sea-orm = "2.0.0-rc.42"
 sea-orm-migration = "2.0.0-rc.42"
+rusqlite = { version = "0.39", default-features = false, features = ["functions", "blob", "bundled", "array"] }
+zstd = { version = "0.13", features = ["experimental"] }
 
 # MCP
 rmcp = { version = "1.7", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }

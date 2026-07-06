@@ -7,6 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
+pub mod zstd;
+
 pub const DEFAULT_LOCK_RETRY_ATTEMPTS: usize = 5;
 pub const DEFAULT_LOCK_RETRY_BASE_DELAY_MS: u64 = 20;
 pub const DEFAULT_SQLITE_BUSY_TIMEOUT_MS: u64 = 5000;

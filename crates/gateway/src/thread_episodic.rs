@@ -1155,7 +1155,7 @@ impl ThreadEpisodicRecallService {
                 .await;
         }
 
-        match crate::migrations::thread_episodic_workspace_capsule_refill::refill_is_current(
+        match crate::database::startup::thread_episodic_workspace_capsule_refill::refill_is_current(
             self.crud_store.as_ref(),
         )
         .await
@@ -4792,8 +4792,8 @@ mod tests {
         pioneer_crud::upsert_projection_meta(
             &crud_store.database_connection(),
             pioneer_crud::ProjectionMetaRecord {
-                projection_key: crate::migrations::thread_episodic_workspace_capsule_refill::THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_KEY.to_owned(),
-                projection_version: crate::migrations::thread_episodic_workspace_capsule_refill::THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_VERSION,
+                projection_key: crate::database::startup::thread_episodic_workspace_capsule_refill::THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_KEY.to_owned(),
+                projection_version: crate::database::startup::thread_episodic_workspace_capsule_refill::THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_VERSION,
                 status: status.to_owned(),
                 source_thread_count: 0,
                 source_turn_count: 0,
