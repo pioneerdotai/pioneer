@@ -20,6 +20,7 @@ mod m20260628_000001_turn_permission_profile;
 mod m20260701_000001_turn_liveness;
 mod m20260704_000001_backfill_task_agent_permission_cap;
 mod m20260704_000002_thread_episodic_items_no_chunks;
+mod m20260706_000001_turn_execution_security_snapshot;
 
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
@@ -43,6 +44,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260701_000001_turn_liveness::Migration),
             Box::new(m20260704_000001_backfill_task_agent_permission_cap::Migration),
             Box::new(m20260704_000002_thread_episodic_items_no_chunks::Migration),
+            Box::new(m20260706_000001_turn_execution_security_snapshot::Migration),
         ]
     }
 }

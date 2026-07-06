@@ -23,14 +23,16 @@ pub struct Model {
     pub tool_policy_json: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub result_contract_json: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub review_policy_json: Option<String>,
     pub depth: i64,
     pub max_depth: i64,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(column_type = "Text", nullable)]
-    pub review_policy_json: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
     pub permission_cap_json: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub security_cap_json: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

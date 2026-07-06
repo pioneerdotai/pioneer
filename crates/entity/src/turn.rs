@@ -30,6 +30,9 @@ pub struct Model {
     pub permission_profile_source: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub permission_profile_snapshot_json: Option<String>,
+    pub execution_security_snapshot_version: Option<i64>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub execution_security_snapshot_json: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}
