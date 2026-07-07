@@ -1,5 +1,5 @@
 use super::events::EventKind;
-use super::reducer::ConversationProjector;
+use super::reducer::{ConversationProjector, ConversationViewState};
 use super::{Conversation, ConversationEvent, MAX_EVENT_LOG_LEN, TimelineEntryStatus, TurnPhase};
 use pioneer_protocol::{
     ArtifactKind, ArtifactRef, ArtifactStatus, ExecutionWindowExhaustionReason,
@@ -135,6 +135,10 @@ fn permission_audit_event(
         event_kind,
         profile_mode: TurnPermissionMode::Supervised,
         profile_source: TurnPermissionProfileSource::Composer,
+        security_snapshot_id: None,
+        security_snapshot_version: None,
+        security_reason_code: None,
+        security_capability: None,
         item_id: Some("item_tool".to_owned()),
         tool_call_id: Some("tool_call_1".to_owned()),
         tool_name: Some("shell".to_owned()),
@@ -174,6 +178,22 @@ fn turn_started_projection_preserves_permission_profile() {
         conversation.projection().turn_permission_profile(TURN_ID),
         Some(&permission_profile)
     );
+}
+
+#[test]
+fn turn_projection_stores_security_summary_without_provider_strings() {
+    let mut projection = ConversationViewState::default();
+    let snapshot =
+        pioneer_protocol::TurnExecutionSecuritySnapshot::unrestricted_full_access("/repo", 1_700);
+    let summary = crate::security::ClientTurnSecuritySummary::from_execution_snapshot(&snapshot);
+
+    projection.upsert_turn_security_summary(TURN_ID, summary.clone());
+
+    assert_eq!(projection.turn_security_summary(TURN_ID), Some(&summary));
+    let encoded = serde_json::to_string(projection.turn_security_summary(TURN_ID).unwrap())
+        .expect("security summary serializes");
+    assert!(!encoded.contains("danger"));
+    assert!(!encoded.contains("bypass"));
 }
 
 #[test]

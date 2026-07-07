@@ -271,6 +271,7 @@ fn running_turn_display_for_projection(
         turn_id: turn_id.to_owned(),
         started_at_unix_ms,
         permission_profile: projection.turn_permission_profile(turn_id).cloned(),
+        security_summary: projection.turn_security_summary(turn_id).cloned(),
     }
 }
 
@@ -548,6 +549,30 @@ mod tests {
                 kind: TimelineRowKind::RunningTurn(display),
                 ..
             } if display.permission_profile == Some(permission_profile)
+        ));
+    }
+
+    #[test]
+    fn running_turn_display_projects_security_summary() {
+        let security_summary = crate::security::ClientTurnSecuritySummary::from_execution_snapshot(
+            &pioneer_protocol::TurnExecutionSecuritySnapshot::unrestricted_full_access("/repo", 1),
+        );
+        let mut projection = ConversationViewState::default();
+        projection.upsert_turn_security_summary("turn_a", security_summary.clone());
+
+        let model = render_semantic_timeline_rows(
+            &[semantic_row(SemanticTimelineRowKind::TurnState {
+                block: turn_state_block(TurnWorkState::Running),
+            })],
+            projection,
+        );
+
+        assert!(matches!(
+            &model.rows[0],
+            TimelineRow {
+                kind: TimelineRowKind::RunningTurn(display),
+                ..
+            } if display.security_summary == Some(security_summary)
         ));
     }
 

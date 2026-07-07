@@ -603,6 +603,41 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Stable
         ),
         contract_type!(
+            "client_security_diagnostic.json",
+            crate::security::ClientSecurityDiagnostic,
+            Domain::Timeline,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "client_security_diagnostic_row.json",
+            crate::security::ClientSecurityDiagnosticRow,
+            Domain::Timeline,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "client_security_enforcement_status.json",
+            crate::security::ClientSecurityEnforcementStatus,
+            Domain::Timeline,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "client_security_filesystem_access.json",
+            crate::security::ClientSecurityFilesystemAccess,
+            Domain::Timeline,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "client_turn_security_summary.json",
+            crate::security::ClientTurnSecuritySummary,
+            Domain::Timeline,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
             "composer_attachment.json",
             crate::composer::attachments::ComposerAttachment,
             Domain::Composer,

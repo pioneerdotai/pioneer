@@ -1281,6 +1281,43 @@ mod tests {
     }
 
     #[test]
+    fn response_planner_routes_cli_runtime_denial_to_cli_rpc_params() {
+        let pending = PendingRequest::from_cli_runtime_opened_notification(request_opened(
+            "req",
+            "ws",
+            "claude",
+            Some("thread"),
+            Some("turn"),
+            "cargo check",
+        ));
+
+        let action = plan_pending_request_response(
+            &pending,
+            PendingRequestResolution::Deny {
+                reason: Some("unsafe command".to_owned()),
+            },
+        )
+        .expect("plan CLI denial response");
+
+        let PendingRequestResponseAction::CLIRuntime { method, params } = action else {
+            panic!("expected CLI runtime action");
+        };
+        assert_eq!(
+            method,
+            pioneer_protocol::constants::methods::CLI_RUNTIME_REQUEST_RESPOND
+        );
+        assert_eq!(params.workspace_id, "ws");
+        assert_eq!(params.runtime_id, "claude");
+        assert_eq!(params.request_id, "req");
+        assert_eq!(
+            params.resolution,
+            CLIRuntimeRequestResolution::Denied {
+                reason: Some("unsafe command".to_owned())
+            }
+        );
+    }
+
+    #[test]
     fn response_planner_routes_native_permission_request_to_native_rpc_params() {
         let pending =
             PendingRequest::from_native_permission_request(native_permission_request("req_native"));

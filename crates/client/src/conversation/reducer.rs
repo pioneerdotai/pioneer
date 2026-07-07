@@ -1,4 +1,5 @@
 use super::state_machine::TurnStateMachine;
+use crate::security::ClientTurnSecuritySummary;
 use pioneer_protocol::{
     ExecutionWindowExhaustionReason, ExecutionWindowStatus, MarkdownDocument, RecoveryJobStatus,
     SystemEventLevel, TimelineOrigin, ToolLoopBudgetAction, ToolLoopBudgetLimitKind,
@@ -101,6 +102,8 @@ pub struct TurnView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_profile: Option<TurnPermissionProfileSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_summary: Option<ClientTurnSecuritySummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume: Option<TurnBlockedResumeMetadata>,
 }
 
@@ -198,6 +201,11 @@ impl ConversationViewState {
             .and_then(|turn| turn.permission_profile.as_ref())
     }
 
+    pub fn turn_security_summary(&self, turn_id: &str) -> Option<&ClientTurnSecuritySummary> {
+        self.turn_by_id(turn_id)
+            .and_then(|turn| turn.security_summary.as_ref())
+    }
+
     pub fn permission_audit_for_turn(&self, turn_id: &str) -> Vec<&PermissionAuditDisplayItem> {
         self.permission_audit
             .iter()
@@ -236,6 +244,33 @@ impl ConversationViewState {
             completed_at_unix_ms: None,
             error: turn.error.clone(),
             permission_profile: Some(turn.permission_profile.clone()),
+            security_summary: None,
+            resume: None,
+        });
+    }
+
+    pub fn upsert_turn_security_summary(
+        &mut self,
+        turn_id: &str,
+        security_summary: ClientTurnSecuritySummary,
+    ) {
+        if let Some(existing) = self
+            .turns
+            .iter_mut()
+            .find(|existing| existing.id == turn_id)
+        {
+            existing.security_summary = Some(security_summary);
+            return;
+        }
+
+        self.turns.push(TurnView {
+            id: turn_id.to_owned(),
+            phase: TurnPhase::Starting,
+            started_at_unix_ms: None,
+            completed_at_unix_ms: None,
+            error: None,
+            permission_profile: None,
+            security_summary: Some(security_summary),
             resume: None,
         });
     }
@@ -1196,6 +1231,7 @@ impl ConversationProjector {
             completed_at_unix_ms,
             error,
             permission_profile: None,
+            security_summary: None,
             resume: None,
         });
         let index = self.view_state.turns.len().saturating_sub(1);
@@ -1446,6 +1482,8 @@ fn permission_audit_should_render_timeline_row(kind: TurnPermissionAuditEventKin
         TurnPermissionAuditEventKind::ApprovalRequested
             | TurnPermissionAuditEventKind::ApprovalResolved
             | TurnPermissionAuditEventKind::DecisionDenied
+            | TurnPermissionAuditEventKind::SecuritySandboxDegraded
+            | TurnPermissionAuditEventKind::SecuritySandboxUnavailable
     )
 }
 
@@ -1481,6 +1519,9 @@ fn permission_audit_timeline_message(event: &PermissionAuditDisplayItem) -> Stri
         (TurnPermissionAuditEventKind::DecisionDenied, _) => "Permission denied",
         (TurnPermissionAuditEventKind::DecisionAllowed, _) => "Permission allowed",
         (TurnPermissionAuditEventKind::ProfileSelected, _) => "Permission profile selected",
+        (TurnPermissionAuditEventKind::SecuritySnapshotResolved, _) => "Security snapshot resolved",
+        (TurnPermissionAuditEventKind::SecuritySandboxDegraded, _) => "Sandbox degraded",
+        (TurnPermissionAuditEventKind::SecuritySandboxUnavailable, _) => "Sandbox unavailable",
     }
     .to_owned()
 }
@@ -1552,6 +1593,9 @@ fn permission_audit_event_kind_label(kind: TurnPermissionAuditEventKind) -> &'st
         TurnPermissionAuditEventKind::ApprovalResolved => "approval_resolved",
         TurnPermissionAuditEventKind::DecisionAllowed => "decision_allowed",
         TurnPermissionAuditEventKind::DecisionDenied => "decision_denied",
+        TurnPermissionAuditEventKind::SecuritySnapshotResolved => "security_snapshot_resolved",
+        TurnPermissionAuditEventKind::SecuritySandboxDegraded => "security_sandbox_degraded",
+        TurnPermissionAuditEventKind::SecuritySandboxUnavailable => "security_sandbox_unavailable",
     }
 }
 

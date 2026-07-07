@@ -3,6 +3,7 @@
 use crate::{
     composer::permissions::{self as composer_permissions, TurnPermissionModeDisplay},
     conversation::{ConversationViewState, ItemView, TimelineEntryStatus, reducer::TurnPhase},
+    security::ClientTurnSecuritySummary,
 };
 use pioneer_protocol::{
     AgentMessagePhase, ArtifactRef, SystemEventLevel, ToolDisplayPayload, ToolMetadataValue,
@@ -54,6 +55,8 @@ pub struct RunningTurnDisplay {
     pub started_at_unix_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_profile: Option<TurnPermissionProfileSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_summary: Option<ClientTurnSecuritySummary>,
 }
 
 pub fn turn_permission_profile_display(
@@ -90,6 +93,7 @@ pub fn running_turn_display(projection: &ConversationViewState) -> Option<Runnin
             .started_at_unix_ms
             .or_else(|| first_turn_item_started_at(projection, active_turn.id.as_str())),
         permission_profile: active_turn.permission_profile.clone(),
+        security_summary: active_turn.security_summary.clone(),
     })
 }
 
@@ -2084,6 +2088,7 @@ mod tests {
                 completed_at_unix_ms: None,
                 error: None,
                 permission_profile: None,
+                security_summary: None,
                 resume: None,
             }],
             in_flight_turn_id: Some("turn_1".to_owned()),
@@ -2096,6 +2101,7 @@ mod tests {
                 turn_id: "turn_1".to_owned(),
                 started_at_unix_ms: Some(42),
                 permission_profile: None,
+                security_summary: None,
             })
         );
     }
@@ -2110,6 +2116,7 @@ mod tests {
                 completed_at_unix_ms: None,
                 error: None,
                 permission_profile: None,
+                security_summary: None,
                 resume: None,
             }],
             items: vec![ItemView {

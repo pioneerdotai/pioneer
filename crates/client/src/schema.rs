@@ -102,6 +102,26 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             crate::state::snapshot::ClientSnapshot
         ),
         schema_doc!(
+            "client_security_diagnostic.json",
+            crate::security::ClientSecurityDiagnostic
+        ),
+        schema_doc!(
+            "client_security_diagnostic_row.json",
+            crate::security::ClientSecurityDiagnosticRow
+        ),
+        schema_doc!(
+            "client_security_enforcement_status.json",
+            crate::security::ClientSecurityEnforcementStatus
+        ),
+        schema_doc!(
+            "client_security_filesystem_access.json",
+            crate::security::ClientSecurityFilesystemAccess
+        ),
+        schema_doc!(
+            "client_turn_security_summary.json",
+            crate::security::ClientTurnSecuritySummary
+        ),
+        schema_doc!(
             "composer_attachment.json",
             crate::composer::attachments::ComposerAttachment
         ),

@@ -23,6 +23,7 @@ use pioneer_client::{
         runtime_id_from_cli_runtime_provider_key,
     },
     runtime::{ClientRuntime, ClientRuntimeNotification, ClientRuntimeNotificationContext},
+    security::{ClientSecurityDiagnosticRow, ClientTurnSecuritySummary, security_diagnostic_rows},
     state::{reducers as client_state_reducers, selectors as client_selectors},
     threads::{coordinator::ThreadCoordinator, session as thread_session, start as thread_start},
     timeline::{
@@ -239,6 +240,10 @@ pub struct ClientActiveThreadSnapshot {
     pub history_loading: bool,
     pub projection: ConversationViewState,
     pub rows: Vec<TimelineRow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_turn_security_summary: Option<ClientTurnSecuritySummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_turn_security_diagnostics: Vec<ClientSecurityDiagnosticRow>,
     #[serde(default)]
     pub pending_requests: Vec<PendingRequest>,
 }
@@ -1305,6 +1310,11 @@ fn snapshot_from_inner(
     .map(str::to_owned);
     let (projection, rows) =
         render_active_thread_timeline(inner, thread_id, coordinator, expanded_keys);
+    let active_turn_security_summary = active_turn_security_summary(&projection);
+    let active_turn_security_diagnostics = active_turn_security_summary
+        .as_ref()
+        .map(security_diagnostic_rows)
+        .unwrap_or_default();
 
     ClientActiveThreadSnapshot {
         thread_id: Some(thread_id.to_owned()),
@@ -1318,10 +1328,21 @@ fn snapshot_from_inner(
         history_loading: coordinator.history_loading,
         projection,
         rows,
+        active_turn_security_summary,
+        active_turn_security_diagnostics,
         pending_requests: inner
             .pending_requests
             .pending_for_scope(Some(coordinator.workspace_id.as_str()), Some(thread_id)),
     }
+}
+
+fn active_turn_security_summary(
+    projection: &ConversationViewState,
+) -> Option<ClientTurnSecuritySummary> {
+    projection
+        .in_flight_turn_id
+        .as_deref()
+        .and_then(|turn_id| projection.turn_security_summary(turn_id).cloned())
 }
 
 fn render_active_thread_timeline(
@@ -1733,6 +1754,7 @@ fn notification_workspace_id(notification: &GatewayNotification) -> Option<&str>
 mod tests {
     use super::*;
     use pioneer_client::cli_runtime::approvals::{PendingRequest, PendingRequestsReduction};
+    use pioneer_client::conversation::reducer::{TurnPhase, TurnView};
     use pioneer_protocol::{
         ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus, Turn, TurnKind, TurnOrigin,
         TurnPermissionApprovalRequest, TurnStatus,
@@ -1874,6 +1896,118 @@ mod tests {
         assert_eq!(
             snapshot.projection.in_flight_turn_id.as_deref(),
             Some("turn_a")
+        );
+    }
+
+    #[test]
+    fn active_thread_snapshot_serializes_shared_security_summary_for_mobile() {
+        let security_summary = ClientTurnSecuritySummary::from_execution_snapshot(
+            &pioneer_protocol::TurnExecutionSecuritySnapshot::unrestricted_full_access(
+                "/repo", 1_700,
+            ),
+        );
+        let projection = ConversationViewState {
+            in_flight_turn_id: Some("turn_a".to_owned()),
+            turns: vec![TurnView {
+                id: "turn_a".to_owned(),
+                phase: TurnPhase::Running,
+                started_at_unix_ms: Some(42),
+                completed_at_unix_ms: None,
+                error: None,
+                permission_profile: None,
+                security_summary: Some(security_summary.clone()),
+                resume: None,
+            }],
+            ..ConversationViewState::default()
+        };
+
+        let snapshot = ClientActiveThreadSnapshot {
+            active_turn_security_summary: active_turn_security_summary(&projection),
+            active_turn_security_diagnostics: security_diagnostic_rows(&security_summary),
+            projection,
+            ..ClientActiveThreadSnapshot::default()
+        };
+        let encoded = serde_json::to_value(&snapshot).expect("snapshot serializes");
+
+        assert_eq!(
+            encoded["active_turn_security_summary"]["permission_mode"],
+            "full_access"
+        );
+        assert_eq!(
+            encoded["active_turn_security_summary"]["sandbox_mode"],
+            "unrestricted"
+        );
+        assert_eq!(
+            encoded["active_turn_security_summary"]["filesystem_access"],
+            "unrestricted"
+        );
+        assert_eq!(
+            encoded["active_turn_security_summary"]["enforcement"],
+            "active"
+        );
+        let encoded_text = encoded.to_string();
+        assert!(!encoded_text.contains("danger"));
+        assert!(!encoded_text.contains("bypass"));
+    }
+
+    #[test]
+    fn active_thread_snapshot_serializes_security_diagnostics_for_mobile() {
+        let mut security_snapshot = pioneer_protocol::TurnExecutionSecuritySnapshot::read_only(
+            pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+                TurnPermissionMode::Supervised,
+                pioneer_protocol::TurnPermissionProfileSource::Composer,
+            ),
+            "/repo",
+            vec![
+                pioneer_protocol::TurnFilesystemSandboxEntry::workspace_root(
+                    pioneer_protocol::TurnFilesystemAccess::Read,
+                    "/repo",
+                ),
+            ],
+            1,
+        );
+        security_snapshot.backend = pioneer_protocol::TurnSecurityBackendSnapshot {
+            execution_backend: pioneer_protocol::TurnSecurityExecutionBackendKind::ClaudeCli,
+            sandbox_backend: None,
+            provider: Some("claude".to_owned()),
+            capabilities: pioneer_protocol::BackendSecurityCapabilities {
+                can_enforce_filesystem: false,
+                can_enforce_network: false,
+                can_enforce_process: false,
+                supports_turn_scope_approval: true,
+                supports_session_scope_approval: false,
+                supports_request_permissions: true,
+            },
+        };
+        security_snapshot.enforcement =
+            pioneer_protocol::TurnSecurityEnforcementStatus::PartiallyActive {
+                degraded: vec![pioneer_protocol::TurnSecurityDegradation {
+                    capability: pioneer_protocol::TurnSecurityCapabilityKind::Filesystem,
+                    reason: "detailed filesystem sandbox is not provider-enforced".to_owned(),
+                }],
+            };
+        let security_summary =
+            ClientTurnSecuritySummary::from_execution_snapshot(&security_snapshot);
+        let diagnostics = security_diagnostic_rows(&security_summary);
+
+        let snapshot = ClientActiveThreadSnapshot {
+            active_turn_security_summary: Some(security_summary),
+            active_turn_security_diagnostics: diagnostics,
+            ..ClientActiveThreadSnapshot::default()
+        };
+        let encoded = serde_json::to_value(&snapshot).expect("snapshot serializes");
+
+        assert_eq!(
+            encoded["active_turn_security_summary"]["enforcement"],
+            "degraded"
+        );
+        assert_eq!(
+            encoded["active_turn_security_diagnostics"][0]["label"],
+            "Filesystem sandbox"
+        );
+        assert_eq!(
+            encoded["active_turn_security_diagnostics"][0]["message"],
+            "detailed filesystem sandbox is not provider-enforced"
         );
     }
 }

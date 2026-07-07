@@ -82,6 +82,7 @@ pub mod providers;
 pub mod rpc;
 pub mod runtime;
 pub mod schema;
+pub mod security;
 pub mod settings;
 pub mod skills;
 pub mod state;

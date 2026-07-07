@@ -5,6 +5,7 @@ use super::{
     rows::{TimelineCoalescedToolsKind, TimelineCoalescedToolsRow, TimelineRow, TimelineRowKind},
 };
 use crate::conversation::ConversationViewState;
+use crate::security::security_summary_label;
 use pioneer_protocol::TurnItem;
 use std::{
     collections::HashSet,
@@ -56,6 +57,21 @@ pub fn timeline_row_layout_hash(
                 .as_ref()
                 .map(|profile| profile.mode)
                 .hash(&mut hasher);
+            if let Some(summary) = &running_turn.security_summary {
+                summary.permission_mode.hash(&mut hasher);
+                summary.sandbox_mode.hash(&mut hasher);
+                summary.filesystem_access.hash(&mut hasher);
+                summary.network_mode.hash(&mut hasher);
+                summary.execution_backend.hash(&mut hasher);
+                summary.sandbox_backend.hash(&mut hasher);
+                summary.enforcement.hash(&mut hasher);
+                summary.diagnostics.len().hash(&mut hasher);
+                for diagnostic in &summary.diagnostics {
+                    diagnostic.capability.hash(&mut hasher);
+                    diagnostic.status.hash(&mut hasher);
+                    diagnostic.message.hash(&mut hasher);
+                }
+            }
         }
         TimelineRowKind::Item { timeline_index } => {
             0u8.hash(&mut hasher);
@@ -152,7 +168,15 @@ pub fn timeline_row_text_len(projection: &ConversationViewState, row: &TimelineR
                         .len()
                 })
                 .unwrap_or_default();
-            RUNNING_TURN_TEXT_LEN_ESTIMATE.saturating_add(permission_len)
+            let security_len = running_turn
+                .security_summary
+                .as_ref()
+                .map(security_summary_label)
+                .map(str::len)
+                .unwrap_or_default();
+            RUNNING_TURN_TEXT_LEN_ESTIMATE
+                .saturating_add(permission_len)
+                .saturating_add(security_len)
         }
     }
 }

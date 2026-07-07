@@ -96,6 +96,14 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             crate::active_thread::ClientActiveThreadSnapshot
         ),
         schema_doc!(
+            "client_turn_security_summary.json",
+            pioneer_client::security::ClientTurnSecuritySummary
+        ),
+        schema_doc!(
+            "client_security_diagnostic_row.json",
+            pioneer_client::security::ClientSecurityDiagnosticRow
+        ),
+        schema_doc!(
             "client_active_thread_snapshot_request.json",
             crate::active_thread::ClientActiveThreadSnapshotRequest
         ),
