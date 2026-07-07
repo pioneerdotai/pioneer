@@ -341,6 +341,7 @@ mod tests {
     fn provider(name: &str) -> ProviderSummary {
         ProviderSummary {
             name: name.to_owned(),
+            capabilities: Default::default(),
         }
     }
 

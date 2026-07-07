@@ -1118,6 +1118,32 @@ where
     )
 }
 
+pub fn provider_list_embedding_models<TTransport>(
+    transport: &TTransport,
+    params: ProviderListModelsParams,
+) -> Result<ProviderListModelsResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.workspace_id.as_str(),
+        "workspace_id",
+        methods::PROVIDER_EMBEDDING_MODELS_LIST,
+    )?;
+    require_non_empty_field(
+        params.provider.as_str(),
+        "provider",
+        methods::PROVIDER_EMBEDDING_MODELS_LIST,
+    )?;
+
+    send_json_rpc_request_typed(
+        transport,
+        methods::PROVIDER_EMBEDDING_MODELS_LIST,
+        &params,
+        PROVIDER_MODELS_TIMEOUT,
+    )
+}
+
 pub fn provider_set_api_key<TTransport>(
     transport: &TTransport,
     params: ProviderSetApiKeyParams,
@@ -2611,6 +2637,20 @@ mod tests {
                 .expect_err("provider should be required")
             ),
             "provider is required for provider/models/list"
+        );
+        assert_eq!(
+            format!(
+                "{:#}",
+                provider_list_embedding_models(
+                    &PanicTransport,
+                    ProviderListModelsParams {
+                        workspace_id: "ws_1".to_owned(),
+                        provider: " ".to_owned(),
+                    },
+                )
+                .expect_err("provider should be required")
+            ),
+            "provider is required for provider/embedding_models/list"
         );
         assert_eq!(
             format!(

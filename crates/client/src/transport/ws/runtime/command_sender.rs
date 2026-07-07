@@ -442,6 +442,13 @@ impl GatewayWsCommandSender {
         client_ws_commands::provider_list_models(self, params)
     }
 
+    pub fn provider_list_embedding_models(
+        &self,
+        params: ProviderListModelsParams,
+    ) -> Result<ProviderListModelsResponse> {
+        client_ws_commands::provider_list_embedding_models(self, params)
+    }
+
     pub fn provider_set_api_key(
         &self,
         params: ProviderSetApiKeyParams,

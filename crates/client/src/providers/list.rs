@@ -546,20 +546,40 @@ pub struct ProviderModelSelectorState {
     models: Vec<ProviderModelInfo>,
     selected_provider: Option<String>,
     selected_model: Option<String>,
+    mode: ProviderModelSelectorMode,
     loading_providers: bool,
     loading_cli_runtimes: bool,
     loading_models: bool,
     error: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderModelSelectorMode {
+    Chat,
+    Embeddings,
+}
+
 impl ProviderModelSelectorState {
     pub fn new(selected_provider: Option<String>, selected_model: Option<String>) -> Self {
+        Self::new_with_mode(
+            selected_provider,
+            selected_model,
+            ProviderModelSelectorMode::Chat,
+        )
+    }
+
+    pub fn new_with_mode(
+        selected_provider: Option<String>,
+        selected_model: Option<String>,
+        mode: ProviderModelSelectorMode,
+    ) -> Self {
         Self {
             providers: Vec::new(),
             cli_runtimes: Vec::new(),
             models: Vec::new(),
             selected_provider,
             selected_model,
+            mode,
             loading_providers: false,
             loading_cli_runtimes: false,
             loading_models: false,
@@ -575,6 +595,9 @@ impl ProviderModelSelectorState {
         let mut rows = self
             .providers
             .iter()
+            .filter(|provider| {
+                self.mode == ProviderModelSelectorMode::Chat || provider.capabilities.embeddings
+            })
             .map(|provider| ProviderModelSelectorProvider {
                 id: provider.name.clone(),
                 label: provider.name.clone(),
@@ -584,11 +607,13 @@ impl ProviderModelSelectorState {
             })
             .collect::<Vec<_>>();
 
-        rows.extend(
-            self.cli_runtimes
-                .iter()
-                .filter_map(cli_runtime_provider_row),
-        );
+        if self.mode == ProviderModelSelectorMode::Chat {
+            rows.extend(
+                self.cli_runtimes
+                    .iter()
+                    .filter_map(cli_runtime_provider_row),
+            );
+        }
         rows
     }
 
@@ -631,7 +656,7 @@ impl ProviderModelSelectorState {
 
     pub fn mark_providers_loading(&mut self) {
         self.loading_providers = true;
-        self.loading_cli_runtimes = true;
+        self.loading_cli_runtimes = self.mode == ProviderModelSelectorMode::Chat;
         self.error = None;
     }
 
@@ -845,6 +870,7 @@ fn provider_model_from_runtime_model(
             tool_calling: None,
             json_output: None,
             streaming: Some(true),
+            embeddings: None,
             thinking: supports_reasoning,
             reasoning,
             fine_tuning: None,
@@ -899,6 +925,16 @@ pub fn provider_list_models_params(
     }
 }
 
+pub fn provider_list_embedding_models_params(
+    workspace_id: impl Into<String>,
+    provider: impl Into<String>,
+) -> ProviderListModelsParams {
+    ProviderListModelsParams {
+        workspace_id: workspace_id.into(),
+        provider: provider.into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -943,6 +979,7 @@ mod tests {
         state.apply_refresh_response(ProviderListResponse {
             providers: vec![ProviderSummary {
                 name: "OpenAI".to_owned(),
+                capabilities: Default::default(),
             }],
         });
         assert!(!state.loading());
@@ -990,9 +1027,11 @@ mod tests {
         let providers = vec![
             ProviderSummary {
                 name: "AWS_Bedrock".to_owned(),
+                capabilities: Default::default(),
             },
             ProviderSummary {
                 name: "lm_studio".to_owned(),
+                capabilities: Default::default(),
             },
         ];
 
@@ -1171,6 +1210,7 @@ mod tests {
         state.apply_provider_list_success(ProviderListResponse {
             providers: vec![ProviderSummary {
                 name: "openai".to_owned(),
+                capabilities: Default::default(),
             }],
         });
         assert!(state.loading_providers());
@@ -1245,6 +1285,7 @@ mod tests {
         state.apply_provider_list_success(ProviderListResponse {
             providers: vec![ProviderSummary {
                 name: "openai".to_owned(),
+                capabilities: Default::default(),
             }],
         });
         state.apply_cli_runtime_list_success(CLIRuntimeListResponse {
@@ -1270,6 +1311,70 @@ mod tests {
                 runtime_kind: CLIAgentRuntimeKind::Codex,
             }
         );
+    }
+
+    #[test]
+    fn provider_model_selector_embedding_mode_filters_providers_and_runtimes() {
+        let mut state = ProviderModelSelectorState::new_with_mode(
+            None,
+            None,
+            ProviderModelSelectorMode::Embeddings,
+        );
+        state.mark_providers_loading();
+        assert!(state.loading_providers());
+
+        state.apply_provider_list_success(ProviderListResponse {
+            providers: vec![
+                ProviderSummary {
+                    name: "openai".to_owned(),
+                    capabilities: pioneer_protocol::ProviderSummaryCapabilities {
+                        embeddings: true,
+                    },
+                },
+                ProviderSummary {
+                    name: "anthropic".to_owned(),
+                    capabilities: Default::default(),
+                },
+            ],
+        });
+        assert!(!state.loading_providers());
+        state.apply_cli_runtime_list_success(CLIRuntimeListResponse {
+            runtimes: vec![runtime_summary(
+                "codex_work",
+                "Codex Work",
+                RuntimeStatus::Ready,
+            )],
+        });
+
+        let rows = state.provider_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "openai");
+
+        state.select_provider("openai".to_owned());
+        let applied = state.apply_provider_models_success(ProviderListModelsResponse {
+            provider: "openai".to_owned(),
+            models: vec![ProviderModelInfo {
+                id: "text-embedding-3-small".to_owned(),
+                name: None,
+                description: None,
+                created: None,
+                provider: "openai".to_owned(),
+                owned_by: None,
+                limits: Default::default(),
+                capabilities: ProviderModelCapabilities {
+                    embeddings: Some(true),
+                    ..Default::default()
+                },
+                pricing: None,
+                active: Some(true),
+                family: None,
+                lifecycle_status: None,
+            }],
+        });
+
+        assert!(applied);
+        assert_eq!(state.models().len(), 1);
+        assert_eq!(state.models()[0].id, "text-embedding-3-small");
     }
 
     #[test]
@@ -1390,6 +1495,10 @@ mod tests {
         let params = provider_list_models_params("ws", "openai");
         assert_eq!(params.workspace_id, "ws");
         assert_eq!(params.provider, "openai");
+
+        let params = provider_list_embedding_models_params("ws", "openrouter");
+        assert_eq!(params.workspace_id, "ws");
+        assert_eq!(params.provider, "openrouter");
 
         let params = cli_runtime_list_models_params("ws", "codex_work");
         assert_eq!(params.workspace_id, "ws");
