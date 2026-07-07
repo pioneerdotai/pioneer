@@ -1,11 +1,18 @@
+use crate::thread_episodic_embedding::{
+    LocalEmbeddingProvider, RemoteEmbeddingProvider, local_embedding_model_files,
+};
 use anyhow::Result;
 use async_trait::async_trait;
+use pioneer_config::{
+    GatewayThreadEpisodicVectorProviderConfig, GatewayThreadEpisodicVectorSearchConfig,
+};
 use pioneer_crud::{
     CrudStore, NewThreadEpisodicExclusionRecord, NewThreadEpisodicIndexJobRecord,
     NewThreadEpisodicItemRecord, NewThreadEpisodicRecallEventRecord,
-    NewThreadEpisodicThreadDirectoryRecord, THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID,
-    ThreadEpisodicCapsuleCapacityUpdate, ThreadEpisodicCapsuleRecord, ThreadEpisodicCapsuleStatus,
-    ThreadEpisodicCapsuleWriteState, ThreadEpisodicExclusionReason, ThreadEpisodicExclusionRecord,
+    NewThreadEpisodicThreadDirectoryRecord, PROJECTION_META_STATUS_COMPLETE,
+    THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID, ThreadEpisodicCapsuleCapacityUpdate,
+    ThreadEpisodicCapsuleRecord, ThreadEpisodicCapsuleStatus, ThreadEpisodicCapsuleWriteState,
+    ThreadEpisodicExclusionReason, ThreadEpisodicExclusionRecord,
     ThreadEpisodicGraphEnrichmentState, ThreadEpisodicIndexJobCompletionUpdate,
     ThreadEpisodicIndexJobFailureUpdate, ThreadEpisodicIndexJobRecord,
     ThreadEpisodicIndexJobStatus, ThreadEpisodicItemIndexedUpdate, ThreadEpisodicItemRecord,
@@ -13,11 +20,14 @@ use pioneer_crud::{
     ThreadEpisodicSourceActorRole as StoreThreadEpisodicSourceActorRole,
     ThreadEpisodicSourceRuntimeKind, ThreadEpisodicThreadDirectoryRecord,
     ThreadEpisodicThreadDirectoryStatus, ThreadEpisodicThreadDirectoryVisibility,
-    ThreadEpisodicWorkspaceActiveWriteSegmentRequest, thread_episodic_item_uri,
-    thread_episodic_thread_uri_prefix,
+    ThreadEpisodicWorkspaceActiveWriteSegmentRequest, find_projection_meta,
+    thread_episodic_item_uri, thread_episodic_thread_uri_prefix,
 };
 use pioneer_memory::{
-    ThreadEpisodicMemvidBackend, ThreadEpisodicMemvidError, ThreadEpisodicMemvidFailureKind,
+    ThreadEpisodicEmbeddingError, ThreadEpisodicEmbeddingProvider,
+    ThreadEpisodicMemvidAskRetrievalMode, ThreadEpisodicMemvidBackend,
+    ThreadEpisodicMemvidCapabilityState, ThreadEpisodicMemvidEmbedder, ThreadEpisodicMemvidError,
+    ThreadEpisodicMemvidFailureKind, ThreadEpisodicMemvidIndexEmbedding,
     ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidIndexRequest,
     ThreadEpisodicMemvidSearchOutput, ThreadEpisodicMemvidSearchRequest,
     ThreadEpisodicMemvidSearchSegment, ThreadEpisodicMemvidStats, ThreadEpisodicRankedSearchHit,
@@ -32,9 +42,11 @@ use pioneer_protocol::{
     ThreadEpisodicTurnId, ThreadEpisodicWorkspaceId, ThreadHistoryEventPayload, TurnItem,
     TurnItemEventPayload, TurnItemType,
 };
+use pioneer_provider::ProviderRegistry;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Instant;
 
@@ -97,11 +109,13 @@ impl ThreadEpisodicIngestionSkipReason {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ThreadEpisodicRuntimeConfig {
     pub enabled: bool,
     pub indexing_enabled: bool,
     pub recall_enabled: bool,
+    pub vector_search_enabled: bool,
+    pub vector_search: GatewayThreadEpisodicVectorSearchConfig,
     pub hook_max_prompt_chars: u32,
     pub hook_max_candidates: u32,
     pub index_executor: ThreadEpisodicIndexExecutorConfig,
@@ -114,6 +128,8 @@ impl Default for ThreadEpisodicRuntimeConfig {
             enabled: true,
             indexing_enabled: true,
             recall_enabled: true,
+            vector_search_enabled: false,
+            vector_search: GatewayThreadEpisodicVectorSearchConfig::default(),
             hook_max_prompt_chars: ThreadEpisodicRecallServiceConfig::default()
                 .default_prompt_chars,
             hook_max_candidates: ThreadEpisodicRecallServiceConfig::default()
@@ -259,7 +275,7 @@ pub(crate) struct ThreadEpisodicThreadReindexSummary {
     pub diagnostics: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ThreadEpisodicResolvedIndexRequest {
     pub request: ThreadEpisodicMemvidIndexRequest,
     pub segment_index: i64,
@@ -301,9 +317,47 @@ pub(crate) trait ThreadEpisodicIndexPayloadProvider: Send + Sync {
     ) -> std::result::Result<ThreadEpisodicResolvedIndexRequest, ThreadEpisodicIndexResolutionError>;
 }
 
+#[async_trait]
+pub(crate) trait ThreadEpisodicIndexEmbeddingProviderResolver: Send + Sync {
+    async fn resolve_active_embedding_provider(
+        &self,
+        workspace_id: &str,
+    ) -> std::result::Result<
+        Option<Arc<dyn ThreadEpisodicEmbeddingProvider>>,
+        ThreadEpisodicIndexResolutionError,
+    >;
+
+    fn active_embedding_provider_unavailable_reason(&self) -> Option<String> {
+        None
+    }
+}
+
 pub(crate) struct StoreThreadEpisodicIndexPayloadProvider {
     crud_store: Arc<CrudStore>,
     storage_uri_root: String,
+}
+
+#[allow(dead_code)]
+pub(crate) struct VectorThreadEpisodicIndexPayloadProvider {
+    inner: Arc<dyn ThreadEpisodicIndexPayloadProvider>,
+    embedding_provider: Arc<dyn ThreadEpisodicEmbeddingProvider>,
+}
+
+pub(crate) struct RuntimeVectorThreadEpisodicIndexPayloadProvider {
+    inner: Arc<dyn ThreadEpisodicIndexPayloadProvider>,
+    embedding_provider_resolver: Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>,
+}
+
+#[allow(dead_code)]
+pub(crate) struct SharedThreadEpisodicIndexEmbeddingProviderResolver {
+    active_provider: StdRwLock<Option<Arc<dyn ThreadEpisodicEmbeddingProvider>>>,
+    unavailable_reason: StdRwLock<Option<String>>,
+}
+
+pub(crate) struct ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver {
+    provider_registry: Arc<ProviderRegistry>,
+    runtime_home: PathBuf,
+    config: StdRwLock<GatewayThreadEpisodicVectorSearchConfig>,
 }
 
 impl StoreThreadEpisodicIndexPayloadProvider {
@@ -312,6 +366,304 @@ impl StoreThreadEpisodicIndexPayloadProvider {
             crud_store,
             storage_uri_root: storage_uri_root.into(),
         }
+    }
+}
+
+#[allow(dead_code)]
+impl VectorThreadEpisodicIndexPayloadProvider {
+    pub(crate) fn new(
+        inner: Arc<dyn ThreadEpisodicIndexPayloadProvider>,
+        embedding_provider: Arc<dyn ThreadEpisodicEmbeddingProvider>,
+    ) -> Self {
+        Self {
+            inner,
+            embedding_provider,
+        }
+    }
+}
+
+impl RuntimeVectorThreadEpisodicIndexPayloadProvider {
+    pub(crate) fn new(
+        inner: Arc<dyn ThreadEpisodicIndexPayloadProvider>,
+        embedding_provider_resolver: Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>,
+    ) -> Self {
+        Self {
+            inner,
+            embedding_provider_resolver,
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl SharedThreadEpisodicIndexEmbeddingProviderResolver {
+    pub(crate) fn new() -> Self {
+        Self {
+            active_provider: StdRwLock::new(None),
+            unavailable_reason: StdRwLock::new(None),
+        }
+    }
+
+    pub(crate) fn set_active_provider(
+        &self,
+        provider: Option<Arc<dyn ThreadEpisodicEmbeddingProvider>>,
+    ) {
+        let has_provider = provider.is_some();
+        if let Ok(mut active_provider) = self.active_provider.write() {
+            *active_provider = provider;
+        }
+        if let Ok(mut unavailable_reason) = self.unavailable_reason.write() {
+            if has_provider {
+                *unavailable_reason = None;
+            } else if unavailable_reason.is_some() {
+                *unavailable_reason = None;
+            }
+        }
+    }
+
+    pub(crate) fn set_active_provider_unavailable_reason(&self, reason: impl Into<String>) {
+        if let Ok(mut active_provider) = self.active_provider.write() {
+            *active_provider = None;
+        }
+        if let Ok(mut unavailable_reason) = self.unavailable_reason.write() {
+            *unavailable_reason = Some(reason.into());
+        }
+    }
+}
+
+#[async_trait]
+impl ThreadEpisodicIndexEmbeddingProviderResolver
+    for SharedThreadEpisodicIndexEmbeddingProviderResolver
+{
+    async fn resolve_active_embedding_provider(
+        &self,
+        _workspace_id: &str,
+    ) -> std::result::Result<
+        Option<Arc<dyn ThreadEpisodicEmbeddingProvider>>,
+        ThreadEpisodicIndexResolutionError,
+    > {
+        Ok(self
+            .active_provider
+            .read()
+            .ok()
+            .and_then(|provider| provider.clone()))
+    }
+
+    fn active_embedding_provider_unavailable_reason(&self) -> Option<String> {
+        self.unavailable_reason
+            .read()
+            .ok()
+            .and_then(|reason| reason.clone())
+    }
+}
+
+impl ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver {
+    pub(crate) fn new(
+        provider_registry: Arc<ProviderRegistry>,
+        runtime_home: PathBuf,
+        config: GatewayThreadEpisodicVectorSearchConfig,
+    ) -> Self {
+        Self {
+            provider_registry,
+            runtime_home,
+            config: StdRwLock::new(config),
+        }
+    }
+
+    pub(crate) fn apply_config(&self, config: GatewayThreadEpisodicVectorSearchConfig) {
+        if let Ok(mut current) = self.config.write() {
+            *current = config;
+        }
+    }
+
+    fn config_snapshot(&self) -> GatewayThreadEpisodicVectorSearchConfig {
+        self.config
+            .read()
+            .map(|config| config.clone())
+            .unwrap_or_default()
+    }
+
+    fn resolve_configured_provider(
+        &self,
+        workspace_id: &str,
+        config: &GatewayThreadEpisodicVectorSearchConfig,
+    ) -> std::result::Result<
+        Arc<dyn ThreadEpisodicEmbeddingProvider>,
+        ThreadEpisodicIndexResolutionError,
+    > {
+        match config.provider {
+            Some(GatewayThreadEpisodicVectorProviderConfig::OpenAi) => {
+                let model = config.model.as_deref().unwrap_or("").trim();
+                if model.is_empty() {
+                    return Err(embedding_resolution_error(
+                        ThreadEpisodicEmbeddingError::missing_model("openai", ""),
+                    ));
+                }
+                let api_provider = self
+                    .provider_registry
+                    .get_or_create_for_workspace(workspace_id, "openai")
+                    .map_err(|error| {
+                        embedding_resolution_error(
+                            ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
+                                "openai",
+                                model,
+                                format!("failed to resolve OpenAI provider: {error:#}"),
+                            ),
+                        )
+                    })?;
+                let provider = RemoteEmbeddingProvider::openai(
+                    model,
+                    config.embedding_normalized,
+                    api_provider,
+                )
+                .map_err(embedding_resolution_error)?;
+                Ok(Arc::new(provider))
+            }
+            Some(GatewayThreadEpisodicVectorProviderConfig::OpenRouter) => {
+                let model = config.model.as_deref().unwrap_or("").trim();
+                if model.is_empty() {
+                    return Err(embedding_resolution_error(
+                        ThreadEpisodicEmbeddingError::missing_model("openrouter", ""),
+                    ));
+                }
+                let explicit_dimension = config
+                    .embedding_dimension
+                    .and_then(|dimension| usize::try_from(dimension).ok());
+                let api_provider = self
+                    .provider_registry
+                    .get_or_create_for_workspace(workspace_id, "openrouter")
+                    .map_err(|error| {
+                        embedding_resolution_error(
+                            ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
+                                "openrouter",
+                                model,
+                                format!("failed to resolve OpenRouter provider: {error:#}"),
+                            ),
+                        )
+                    })?;
+                let provider = RemoteEmbeddingProvider::openrouter(
+                    model,
+                    explicit_dimension,
+                    config.embedding_normalized,
+                    api_provider,
+                )
+                .map_err(embedding_resolution_error)?;
+                Ok(Arc::new(provider))
+            }
+            Some(GatewayThreadEpisodicVectorProviderConfig::Local) => {
+                let model = config.local_model.as_deref().unwrap_or("").trim();
+                if model.is_empty() {
+                    return Err(embedding_resolution_error(
+                        ThreadEpisodicEmbeddingError::missing_model("local", ""),
+                    ));
+                }
+                let files = local_embedding_model_files(self.runtime_home.as_path(), model)
+                    .ok_or_else(|| ThreadEpisodicEmbeddingError::missing_model("local", model))
+                    .map_err(embedding_resolution_error)?;
+                if !files.model_path.exists() || !files.tokenizer_path.exists() {
+                    return Err(embedding_resolution_error(
+                        ThreadEpisodicEmbeddingError::missing_model("local", model),
+                    ));
+                }
+                let provider = LocalEmbeddingProvider::from_runtime_home(
+                    self.runtime_home.as_path(),
+                    model,
+                    config.embedding_normalized,
+                )
+                .map_err(embedding_resolution_error)?;
+                Ok(Arc::new(provider))
+            }
+            None => Err(embedding_resolution_error(
+                ThreadEpisodicEmbeddingError::missing_model("none", ""),
+            )),
+        }
+    }
+}
+
+#[async_trait]
+impl ThreadEpisodicIndexEmbeddingProviderResolver
+    for ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver
+{
+    async fn resolve_active_embedding_provider(
+        &self,
+        workspace_id: &str,
+    ) -> std::result::Result<
+        Option<Arc<dyn ThreadEpisodicEmbeddingProvider>>,
+        ThreadEpisodicIndexResolutionError,
+    > {
+        let config = self.config_snapshot();
+        if !config.enabled {
+            return Ok(None);
+        }
+        self.resolve_configured_provider(workspace_id, &config)
+            .map(Some)
+    }
+
+    fn active_embedding_provider_unavailable_reason(&self) -> Option<String> {
+        (!self.config_snapshot().enabled).then(|| {
+            "thread episodic vector search provider is disabled by runtime settings".to_owned()
+        })
+    }
+}
+
+#[async_trait]
+impl ThreadEpisodicIndexPayloadProvider for VectorThreadEpisodicIndexPayloadProvider {
+    async fn resolve_index_request(
+        &self,
+        job: &ThreadEpisodicIndexJobRecord,
+    ) -> std::result::Result<ThreadEpisodicResolvedIndexRequest, ThreadEpisodicIndexResolutionError>
+    {
+        let mut resolved = self.inner.resolve_index_request(job).await?;
+        attach_embedding_to_resolved_request(&mut resolved, self.embedding_provider.as_ref())?;
+        Ok(resolved)
+    }
+}
+
+#[async_trait]
+impl ThreadEpisodicIndexPayloadProvider for RuntimeVectorThreadEpisodicIndexPayloadProvider {
+    async fn resolve_index_request(
+        &self,
+        job: &ThreadEpisodicIndexJobRecord,
+    ) -> std::result::Result<ThreadEpisodicResolvedIndexRequest, ThreadEpisodicIndexResolutionError>
+    {
+        let mut resolved = self.inner.resolve_index_request(job).await?;
+        let Some(embedding_provider) = self
+            .embedding_provider_resolver
+            .resolve_active_embedding_provider(job.workspace_id.as_str())
+            .await?
+        else {
+            return Ok(resolved);
+        };
+        attach_embedding_to_resolved_request(&mut resolved, embedding_provider.as_ref())?;
+        Ok(resolved)
+    }
+}
+
+fn attach_embedding_to_resolved_request(
+    resolved: &mut ThreadEpisodicResolvedIndexRequest,
+    embedding_provider: &dyn ThreadEpisodicEmbeddingProvider,
+) -> std::result::Result<(), ThreadEpisodicIndexResolutionError> {
+    if resolved.request.embedding.is_some() {
+        return Ok(());
+    }
+
+    let identity = embedding_provider.identity();
+    let vector = embedding_provider
+        .embed_text_checked(resolved.request.text.as_str())
+        .map_err(embedding_resolution_error)?;
+    resolved.request.embedding = Some(
+        ThreadEpisodicMemvidIndexEmbedding::new(identity, vector)
+            .map_err(|error| ThreadEpisodicIndexResolutionError::non_retryable(error.message))?,
+    );
+    Ok(())
+}
+
+fn embedding_resolution_error(
+    error: ThreadEpisodicEmbeddingError,
+) -> ThreadEpisodicIndexResolutionError {
+    if error.is_retryable() || error.is_configuration_failure() {
+        ThreadEpisodicIndexResolutionError::retryable(error.message)
+    } else {
+        ThreadEpisodicIndexResolutionError::non_retryable(error.message)
     }
 }
 
@@ -424,6 +776,7 @@ impl ThreadEpisodicIndexPayloadProvider for StoreThreadEpisodicIndexPayloadProvi
                 item.text_hash.as_str(),
                 item.source_text_hash.as_str(),
             ),
+            embedding: None,
         };
 
         Ok(ThreadEpisodicResolvedIndexRequest {
@@ -501,6 +854,7 @@ fn thread_item_events_resolution_error(error: anyhow::Error) -> ThreadEpisodicIn
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ThreadEpisodicRecallServiceConfig {
     pub enabled: bool,
+    pub vector_search_enabled: bool,
     pub default_prompt_chars: u32,
     pub max_prompt_chars: u32,
     pub max_hit_chars: usize,
@@ -516,6 +870,7 @@ impl Default for ThreadEpisodicRecallServiceConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            vector_search_enabled: false,
             default_prompt_chars: 2_400,
             max_prompt_chars: 12_000,
             max_hit_chars: 1_200,
@@ -527,6 +882,30 @@ impl Default for ThreadEpisodicRecallServiceConfig {
             snippet_chars: 360,
         }
     }
+}
+
+struct ThreadEpisodicRecallProjectionGate {
+    search_allowed: bool,
+    search_path: ThreadEpisodicRecallSearchPath,
+    diagnostics: Vec<ThreadEpisodicRecallDiagnostic>,
+    unavailable_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThreadEpisodicRecallSearchPath {
+    Lexical,
+    HybridAsk,
+}
+
+fn projection_config_json_has_vector_search_enabled(payload: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("vector_search_enabled")
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1003,17 +1382,28 @@ fn workspace_prompt_domain_policy(domain: WorkspaceEpisodicPromptDomain) -> &'st
 pub(crate) struct ThreadEpisodicRecallService {
     crud_store: Arc<CrudStore>,
     backend: Arc<dyn ThreadEpisodicMemvidBackend>,
+    embedding_provider_resolver: Option<Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>>,
     config: StdRwLock<ThreadEpisodicRecallServiceConfig>,
 }
 
 impl ThreadEpisodicRecallService {
+    #[allow(dead_code)]
     pub(crate) fn new(
         crud_store: Arc<CrudStore>,
         backend: Arc<dyn ThreadEpisodicMemvidBackend>,
     ) -> Self {
+        Self::with_embedding_provider_resolver(crud_store, backend, None)
+    }
+
+    pub(crate) fn with_embedding_provider_resolver(
+        crud_store: Arc<CrudStore>,
+        backend: Arc<dyn ThreadEpisodicMemvidBackend>,
+        embedding_provider_resolver: Option<Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>>,
+    ) -> Self {
         Self {
             crud_store,
             backend,
+            embedding_provider_resolver,
             config: StdRwLock::new(ThreadEpisodicRecallServiceConfig::default()),
         }
     }
@@ -1024,9 +1414,20 @@ impl ThreadEpisodicRecallService {
         backend: Arc<dyn ThreadEpisodicMemvidBackend>,
         config: ThreadEpisodicRecallServiceConfig,
     ) -> Self {
+        Self::with_config_and_embedding_provider_resolver(crud_store, backend, config, None)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn with_config_and_embedding_provider_resolver(
+        crud_store: Arc<CrudStore>,
+        backend: Arc<dyn ThreadEpisodicMemvidBackend>,
+        config: ThreadEpisodicRecallServiceConfig,
+        embedding_provider_resolver: Option<Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>>,
+    ) -> Self {
         Self {
             crud_store,
             backend,
+            embedding_provider_resolver,
             config: StdRwLock::new(config),
         }
     }
@@ -1155,17 +1556,13 @@ impl ThreadEpisodicRecallService {
                 .await;
         }
 
-        match crate::database::startup::thread_episodic_workspace_capsule_refill::refill_is_current(
-            self.crud_store.as_ref(),
-        )
-        .await
-        {
-            Ok(true) => {}
-            Ok(false) => {
-                diagnostics.push(recall_diagnostic(
-                    ThreadEpisodicRecallDiagnosticCode::Completed,
-                    "thread episodic recall skipped while workspace capsule refill is incomplete",
-                ));
+        let gate = match self.resolve_recall_projection_gate(config).await {
+            Ok(mut gate) if gate.search_allowed => {
+                diagnostics.append(&mut gate.diagnostics);
+                gate
+            }
+            Ok(gate) => {
+                diagnostics.extend(gate.diagnostics);
                 let output = ThreadEpisodicRecallOutput {
                     hits: Vec::new(),
                     diagnostics,
@@ -1178,7 +1575,7 @@ impl ThreadEpisodicRecallService {
                         None,
                         output,
                         started_at,
-                        Some("skipped: workspace_capsule_refill_incomplete".to_owned()),
+                        gate.unavailable_reason,
                     )
                     .await;
             }
@@ -1205,7 +1602,7 @@ impl ThreadEpisodicRecallService {
                     )
                     .await;
             }
-        }
+        };
 
         let segments = match self
             .resolve_current_thread_segments(workspace_id, thread_id, profile.max_segments as u64)
@@ -1274,24 +1671,74 @@ impl ThreadEpisodicRecallService {
             }
         };
 
-        let backend_output = match self
-            .backend
-            .search(ThreadEpisodicMemvidSearchRequest {
-                workspace_id: workspace_id.to_owned(),
-                thread_id: thread_id.to_owned(),
-                query: query_text.to_owned(),
-                scope: Some(thread_scope),
-                profile: profile.clone(),
-                segments,
-                exact_source: None,
-            })
-            .await
-        {
+        let search_request = ThreadEpisodicMemvidSearchRequest {
+            workspace_id: workspace_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            query: query_text.to_owned(),
+            scope: Some(thread_scope),
+            profile: profile.clone(),
+            segments,
+            exact_source: None,
+        };
+
+        let (backend_result, backend_operation) = match gate.search_path {
+            ThreadEpisodicRecallSearchPath::Lexical => {
+                (self.backend.search(search_request).await, "search")
+            }
+            ThreadEpisodicRecallSearchPath::HybridAsk => {
+                match self.resolve_hybrid_recall_embedder(workspace_id).await {
+                    Ok(embedder) => {
+                        let lexical_fallback_request = search_request.clone();
+                        let ask_result = self
+                            .backend
+                            .ask_retrieval(
+                                search_request,
+                                ThreadEpisodicMemvidAskRetrievalMode::Hybrid,
+                                embedder,
+                            )
+                            .await;
+                        match ask_result {
+                            Ok(output) => (Ok(output), "ask retrieval"),
+                            Err(error)
+                                if error.kind == ThreadEpisodicMemvidFailureKind::Retryable =>
+                            {
+                                diagnostics.push(recall_diagnostic(
+                                    ThreadEpisodicRecallDiagnosticCode::Completed,
+                                    format!(
+                                        "thread episodic hybrid recall unavailable: {}; using lexical-only recall",
+                                        error.message
+                                    ),
+                                ));
+                                (
+                                    self.backend.search(lexical_fallback_request).await,
+                                    "search",
+                                )
+                            }
+                            Err(error) => (Err(error), "ask retrieval"),
+                        }
+                    }
+                    Err(reason) => {
+                        diagnostics.push(recall_diagnostic(
+                            ThreadEpisodicRecallDiagnosticCode::Completed,
+                            format!(
+                                "thread episodic hybrid recall unavailable: {reason}; using lexical-only recall"
+                            ),
+                        ));
+                        (self.backend.search(search_request).await, "search")
+                    }
+                }
+            }
+        };
+
+        let backend_output = match backend_result {
             Ok(output) => output,
             Err(error) => {
                 diagnostics.push(recall_diagnostic(
                     ThreadEpisodicRecallDiagnosticCode::BackendUnavailable,
-                    format!("thread episodic backend search failed: {}", error.message),
+                    format!(
+                        "thread episodic backend {backend_operation} failed: {}",
+                        error.message
+                    ),
                 ));
                 let output = ThreadEpisodicRecallOutput {
                     hits: Vec::new(),
@@ -1305,7 +1752,11 @@ impl ThreadEpisodicRecallService {
                         None,
                         output,
                         started_at,
-                        Some(format!("backend_search_failed: {}", error.message)),
+                        Some(format!(
+                            "backend_{}_failed: {}",
+                            backend_operation.replace(' ', "_"),
+                            error.message
+                        )),
                     )
                     .await;
             }
@@ -1355,6 +1806,124 @@ impl ThreadEpisodicRecallService {
             None,
         )
         .await
+    }
+
+    async fn resolve_hybrid_recall_embedder(
+        &self,
+        workspace_id: &str,
+    ) -> std::result::Result<Arc<ThreadEpisodicMemvidEmbedder>, String> {
+        let Some(resolver) = self.embedding_provider_resolver.as_ref() else {
+            return Err("active embedding provider resolver is not configured".to_owned());
+        };
+        let provider = resolver
+            .resolve_active_embedding_provider(workspace_id)
+            .await
+            .map_err(|error| format!("failed to resolve active embedding provider: {error:?}"))?;
+        let Some(provider) = provider else {
+            return Err(resolver
+                .active_embedding_provider_unavailable_reason()
+                .unwrap_or_else(|| "active embedding provider is not ready".to_owned()));
+        };
+
+        Ok(Arc::new(ThreadEpisodicMemvidEmbedder::new(provider)))
+    }
+
+    async fn resolve_recall_projection_gate(
+        &self,
+        config: ThreadEpisodicRecallServiceConfig,
+    ) -> Result<ThreadEpisodicRecallProjectionGate> {
+        let lexical_target =
+            crate::database::startup::thread_episodic_workspace_capsule_refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only();
+        let lexical_current =
+            crate::database::startup::thread_episodic_workspace_capsule_refill::refill_is_current_for_target(
+                self.crud_store.as_ref(),
+                &lexical_target,
+            )
+            .await?;
+
+        if !config.vector_search_enabled {
+            return if lexical_current {
+                Ok(ThreadEpisodicRecallProjectionGate {
+                    search_allowed: true,
+                    search_path: ThreadEpisodicRecallSearchPath::Lexical,
+                    diagnostics: Vec::new(),
+                    unavailable_reason: None,
+                })
+            } else {
+                Ok(ThreadEpisodicRecallProjectionGate {
+                    search_allowed: false,
+                    search_path: ThreadEpisodicRecallSearchPath::Lexical,
+                    diagnostics: vec![recall_diagnostic(
+                        ThreadEpisodicRecallDiagnosticCode::Completed,
+                        "thread episodic recall skipped while workspace capsule refill is incomplete",
+                    )],
+                    unavailable_reason: Some(
+                        "skipped: workspace_capsule_refill_incomplete".to_owned(),
+                    ),
+                })
+            };
+        }
+
+        let mut diagnostics = Vec::new();
+        let capabilities = self.backend.capabilities();
+        let hybrid_supported =
+            capabilities.hybrid_search == ThreadEpisodicMemvidCapabilityState::Supported;
+        if !hybrid_supported {
+            diagnostics.push(recall_diagnostic(
+                ThreadEpisodicRecallDiagnosticCode::Completed,
+                "thread episodic hybrid recall unavailable: backend does not report hybrid search support; using lexical recall when available",
+            ));
+        }
+
+        let meta = find_projection_meta(
+            &self.crud_store.database_connection(),
+            crate::database::startup::thread_episodic_workspace_capsule_refill::THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_KEY,
+        )
+        .await?;
+        let complete_vector_projection = meta.as_ref().is_some_and(|meta| {
+            meta.status == PROJECTION_META_STATUS_COMPLETE
+                && meta
+                    .projection_config_json
+                    .as_deref()
+                    .is_some_and(projection_config_json_has_vector_search_enabled)
+        });
+
+        if complete_vector_projection && !lexical_current {
+            return Ok(ThreadEpisodicRecallProjectionGate {
+                search_allowed: true,
+                search_path: if hybrid_supported {
+                    ThreadEpisodicRecallSearchPath::HybridAsk
+                } else {
+                    ThreadEpisodicRecallSearchPath::Lexical
+                },
+                diagnostics,
+                unavailable_reason: None,
+            });
+        }
+
+        if lexical_current {
+            diagnostics.push(recall_diagnostic(
+                ThreadEpisodicRecallDiagnosticCode::Completed,
+                "thread episodic hybrid recall unavailable: vector refill is incomplete; using lexical-only recall",
+            ));
+            return Ok(ThreadEpisodicRecallProjectionGate {
+                search_allowed: true,
+                search_path: ThreadEpisodicRecallSearchPath::Lexical,
+                diagnostics,
+                unavailable_reason: None,
+            });
+        }
+
+        diagnostics.push(recall_diagnostic(
+            ThreadEpisodicRecallDiagnosticCode::Completed,
+            "thread episodic recall skipped while vector refill is incomplete and lexical projection is unavailable",
+        ));
+        Ok(ThreadEpisodicRecallProjectionGate {
+            search_allowed: false,
+            search_path: ThreadEpisodicRecallSearchPath::Lexical,
+            diagnostics,
+            unavailable_reason: Some("skipped: vector_refill_incomplete".to_owned()),
+        })
     }
 
     async fn finish_recall(
@@ -3399,11 +3968,12 @@ mod tests {
     use pioneer_memory::{
         InMemoryMemoryBackend, MemoryOperationContext, MemoryService, MemoryServiceConfig,
         PioneerAdaptiveCutoffDiagnostics, PioneerAdaptiveCutoffReason,
-        ThreadEpisodicAdaptiveRetrievalImplementation, ThreadEpisodicMemvidBackendCapabilities,
-        ThreadEpisodicMemvidCapabilityState, ThreadEpisodicMemvidSearchHit,
-        ThreadEpisodicMemvidSearchOutput, ThreadEpisodicMemvidSearchRequest,
-        ThreadEpisodicMemvidStats, ThreadEpisodicSearchDiagnostics,
-        ThreadEpisodicSearchProfileKind, thread_episodic_storage_uri_from_path,
+        ThreadEpisodicAdaptiveRetrievalImplementation, ThreadEpisodicEmbeddingErrorKind,
+        ThreadEpisodicMemvidBackendCapabilities, ThreadEpisodicMemvidCapabilityState,
+        ThreadEpisodicMemvidSearchHit, ThreadEpisodicMemvidSearchOutput,
+        ThreadEpisodicMemvidSearchRequest, ThreadEpisodicMemvidStats,
+        ThreadEpisodicSearchDiagnostics, ThreadEpisodicSearchProfileKind,
+        thread_episodic_storage_uri_from_path,
     };
     use pioneer_protocol::{
         ItemCompletedNotification, MemoryCategory, MemoryForgetParams, MemoryForgetTarget,
@@ -3415,10 +3985,12 @@ mod tests {
     };
     use sea_orm::Database;
     use std::collections::{BTreeMap, VecDeque};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
     use tokio::sync::Mutex;
 
     struct FakeThreadEpisodicMemvidBackend {
+        capabilities: ThreadEpisodicMemvidBackendCapabilities,
         outcomes: Mutex<
             VecDeque<
                 std::result::Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError>,
@@ -3429,9 +4001,23 @@ mod tests {
                 std::result::Result<ThreadEpisodicMemvidSearchOutput, ThreadEpisodicMemvidError>,
             >,
         >,
+        ask_outcomes: Mutex<
+            VecDeque<
+                std::result::Result<ThreadEpisodicMemvidSearchOutput, ThreadEpisodicMemvidError>,
+            >,
+        >,
         requests: Mutex<Vec<ThreadEpisodicMemvidIndexRequest>>,
         search_requests: Mutex<Vec<ThreadEpisodicMemvidSearchRequest>>,
+        ask_requests: Mutex<Vec<FakeThreadEpisodicAskRequest>>,
         scoped_search_hits: Mutex<BTreeMap<String, Vec<ThreadEpisodicRankedSearchHit>>>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct FakeThreadEpisodicAskRequest {
+        request: ThreadEpisodicMemvidSearchRequest,
+        mode: ThreadEpisodicMemvidAskRetrievalMode,
+        provider_id: String,
+        model: String,
     }
 
     impl FakeThreadEpisodicMemvidBackend {
@@ -3441,10 +4027,15 @@ mod tests {
             >,
         ) -> Self {
             Self {
+                capabilities: fake_memvid_backend_capabilities(
+                    ThreadEpisodicMemvidCapabilityState::Disabled,
+                ),
                 outcomes: Mutex::new(VecDeque::from(outcomes)),
                 search_outcomes: Mutex::new(VecDeque::new()),
+                ask_outcomes: Mutex::new(VecDeque::new()),
                 requests: Mutex::new(Vec::new()),
                 search_requests: Mutex::new(Vec::new()),
+                ask_requests: Mutex::new(Vec::new()),
                 scoped_search_hits: Mutex::new(BTreeMap::new()),
             }
         }
@@ -3455,10 +4046,56 @@ mod tests {
             >,
         ) -> Self {
             Self {
+                capabilities: fake_memvid_backend_capabilities(
+                    ThreadEpisodicMemvidCapabilityState::Disabled,
+                ),
                 outcomes: Mutex::new(VecDeque::new()),
                 search_outcomes: Mutex::new(VecDeque::from(outcomes)),
+                ask_outcomes: Mutex::new(VecDeque::new()),
                 requests: Mutex::new(Vec::new()),
                 search_requests: Mutex::new(Vec::new()),
+                ask_requests: Mutex::new(Vec::new()),
+                scoped_search_hits: Mutex::new(BTreeMap::new()),
+            }
+        }
+
+        fn with_hybrid_ask(
+            outcomes: Vec<
+                std::result::Result<ThreadEpisodicMemvidSearchOutput, ThreadEpisodicMemvidError>,
+            >,
+        ) -> Self {
+            Self {
+                capabilities: fake_memvid_backend_capabilities(
+                    ThreadEpisodicMemvidCapabilityState::Supported,
+                ),
+                outcomes: Mutex::new(VecDeque::new()),
+                search_outcomes: Mutex::new(VecDeque::new()),
+                ask_outcomes: Mutex::new(VecDeque::from(outcomes)),
+                requests: Mutex::new(Vec::new()),
+                search_requests: Mutex::new(Vec::new()),
+                ask_requests: Mutex::new(Vec::new()),
+                scoped_search_hits: Mutex::new(BTreeMap::new()),
+            }
+        }
+
+        fn with_hybrid_ask_and_search(
+            ask_outcomes: Vec<
+                std::result::Result<ThreadEpisodicMemvidSearchOutput, ThreadEpisodicMemvidError>,
+            >,
+            search_outcomes: Vec<
+                std::result::Result<ThreadEpisodicMemvidSearchOutput, ThreadEpisodicMemvidError>,
+            >,
+        ) -> Self {
+            Self {
+                capabilities: fake_memvid_backend_capabilities(
+                    ThreadEpisodicMemvidCapabilityState::Supported,
+                ),
+                outcomes: Mutex::new(VecDeque::new()),
+                search_outcomes: Mutex::new(VecDeque::from(search_outcomes)),
+                ask_outcomes: Mutex::new(VecDeque::from(ask_outcomes)),
+                requests: Mutex::new(Vec::new()),
+                search_requests: Mutex::new(Vec::new()),
+                ask_requests: Mutex::new(Vec::new()),
                 scoped_search_hits: Mutex::new(BTreeMap::new()),
             }
         }
@@ -3469,6 +4106,10 @@ mod tests {
 
         async fn search_requests(&self) -> Vec<ThreadEpisodicMemvidSearchRequest> {
             self.search_requests.lock().await.clone()
+        }
+
+        async fn ask_requests(&self) -> Vec<FakeThreadEpisodicAskRequest> {
+            self.ask_requests.lock().await.clone()
         }
 
         async fn set_scoped_search_hits(
@@ -3483,15 +4124,7 @@ mod tests {
     #[async_trait]
     impl ThreadEpisodicMemvidBackend for FakeThreadEpisodicMemvidBackend {
         fn capabilities(&self) -> ThreadEpisodicMemvidBackendCapabilities {
-            ThreadEpisodicMemvidBackendCapabilities {
-                adaptive_retrieval: ThreadEpisodicMemvidCapabilityState::Supported,
-                adaptive_retrieval_implementation:
-                    ThreadEpisodicAdaptiveRetrievalImplementation::PioneerFallback,
-                semantic_search: ThreadEpisodicMemvidCapabilityState::Unsupported,
-                lexical_search: ThreadEpisodicMemvidCapabilityState::Supported,
-                temporal_search: ThreadEpisodicMemvidCapabilityState::Supported,
-                graph_search: ThreadEpisodicMemvidCapabilityState::Disabled,
-            }
+            self.capabilities.clone()
         }
 
         async fn index_item(
@@ -3503,6 +4136,10 @@ mod tests {
             let Some(outcome) = self.outcomes.lock().await.pop_front() else {
                 return Ok(ThreadEpisodicMemvidIndexOutput {
                     frame_id: 99,
+                    embedding_identity: request
+                        .embedding
+                        .as_ref()
+                        .map(|embedding| embedding.identity.clone()),
                     frame_uri: request.frame_uri,
                     stats: ThreadEpisodicMemvidStats {
                         active_frame_count: Some(1),
@@ -3537,6 +4174,48 @@ mod tests {
                 return Ok(empty_search_output());
             };
             outcome
+        }
+
+        async fn ask_retrieval(
+            &self,
+            request: ThreadEpisodicMemvidSearchRequest,
+            mode: ThreadEpisodicMemvidAskRetrievalMode,
+            embedder: Arc<ThreadEpisodicMemvidEmbedder>,
+        ) -> std::result::Result<ThreadEpisodicMemvidSearchOutput, ThreadEpisodicMemvidError>
+        {
+            self.ask_requests
+                .lock()
+                .await
+                .push(FakeThreadEpisodicAskRequest {
+                    request: request.clone(),
+                    mode,
+                    provider_id: embedder.provider().provider_id().to_owned(),
+                    model: embedder.provider().model().to_owned(),
+                });
+            if let Some(scope) = request.scope.as_ref() {
+                if let Some(hits) = self.scoped_search_hits.lock().await.get(scope).cloned() {
+                    return Ok(search_output_with_hits(hits));
+                }
+            }
+            let Some(outcome) = self.ask_outcomes.lock().await.pop_front() else {
+                return Ok(empty_search_output());
+            };
+            outcome
+        }
+    }
+
+    fn fake_memvid_backend_capabilities(
+        hybrid_search: ThreadEpisodicMemvidCapabilityState,
+    ) -> ThreadEpisodicMemvidBackendCapabilities {
+        ThreadEpisodicMemvidBackendCapabilities {
+            adaptive_retrieval: ThreadEpisodicMemvidCapabilityState::Supported,
+            adaptive_retrieval_implementation:
+                ThreadEpisodicAdaptiveRetrievalImplementation::PioneerFallback,
+            semantic_search: hybrid_search,
+            hybrid_search,
+            lexical_search: ThreadEpisodicMemvidCapabilityState::Supported,
+            temporal_search: ThreadEpisodicMemvidCapabilityState::Supported,
+            graph_search: ThreadEpisodicMemvidCapabilityState::Disabled,
         }
     }
 
@@ -4055,6 +4734,572 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thread_episodic_recall_capability_degrades_vector_enabled_to_lexical_projection() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let thread_id = "thread_recall_capability_vector_degraded";
+        let item = seed_active_thread_episodic_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            thread_id,
+            "turn_recall_capability_vector_degraded",
+            "item_recall_capability_vector_degraded",
+            "vector enabled but lexical projection is still available",
+        )
+        .await;
+        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::with_search(vec![Ok(
+            search_output_with_hits(vec![ranked_hit_for_item(
+                &item,
+                "vector enabled lexical fallback hit",
+                0.99,
+            )]),
+        )]));
+        let service = ThreadEpisodicRecallService::with_config(
+            crud_store,
+            backend.clone(),
+            ThreadEpisodicRecallServiceConfig {
+                vector_search_enabled: true,
+                ..ThreadEpisodicRecallServiceConfig::default()
+            },
+        );
+
+        let output = service
+            .search_current_thread(
+                recall_input(
+                    workspace_id.as_str(),
+                    thread_id,
+                    "turn_recall_capability_vector_degraded",
+                    "fallback",
+                ),
+                None,
+            )
+            .await;
+
+        assert!(!output.fallback_used);
+        assert_eq!(output.hits.len(), 1);
+        assert_eq!(backend.search_requests().await.len(), 1);
+        assert!(output.diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("hybrid recall unavailable")
+                && diagnostic.message.contains("using lexical-only recall")
+        }));
+    }
+
+    #[tokio::test]
+    async fn vector_disabled_recall_uses_lexical_without_provider_call() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let thread_id = "thread_vector_disabled_recall";
+        let item = seed_active_thread_episodic_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            thread_id,
+            "turn_vector_disabled_recall",
+            "item_vector_disabled_recall",
+            "disabled vector recall should stay lexical",
+        )
+        .await;
+        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::with_hybrid_ask_and_search(
+            vec![Ok(search_output_with_hits(Vec::new()))],
+            vec![Ok(search_output_with_hits(vec![ranked_hit_for_item(
+                &item,
+                "lexical recall after disable",
+                0.88,
+            )]))],
+        ));
+        let resolver = Arc::new(SharedThreadEpisodicIndexEmbeddingProviderResolver::new());
+        let embedding_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::new(vec![
+            0.9, 0.1, 0.0,
+        ]));
+        let embedding_provider_for_resolver: Arc<dyn ThreadEpisodicEmbeddingProvider> =
+            embedding_provider.clone();
+        resolver.set_active_provider(Some(embedding_provider_for_resolver));
+        let resolver_for_service: Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver> =
+            resolver.clone();
+        let service = ThreadEpisodicRecallService::with_config_and_embedding_provider_resolver(
+            crud_store,
+            backend.clone(),
+            ThreadEpisodicRecallServiceConfig {
+                vector_search_enabled: false,
+                ..ThreadEpisodicRecallServiceConfig::default()
+            },
+            Some(resolver_for_service),
+        );
+
+        let output = service
+            .search_current_thread(
+                recall_input(
+                    workspace_id.as_str(),
+                    thread_id,
+                    "turn_vector_disabled_recall",
+                    "disabled vector recall",
+                ),
+                None,
+            )
+            .await;
+
+        assert!(!output.fallback_used);
+        assert_eq!(output.hits.len(), 1);
+        assert_eq!(backend.search_requests().await.len(), 1);
+        assert!(
+            backend.ask_requests().await.is_empty(),
+            "disabled vector search must not use Memvid ask"
+        );
+        assert_eq!(
+            embedding_provider.calls(),
+            0,
+            "disabled vector search must not call the active embedding provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_recall_hybrid_ask_uses_memvid_ask_when_vector_ready() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let thread_id = "thread_recall_hybrid_ask";
+        let item = seed_active_thread_episodic_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            thread_id,
+            "turn_recall_hybrid_ask",
+            "item_recall_hybrid_ask",
+            "hybrid recall should route through memvid ask",
+        )
+        .await;
+        let vector_config = pioneer_config::GatewayThreadEpisodicVectorSearchConfig {
+            enabled: true,
+            provider: Some(pioneer_config::GatewayThreadEpisodicVectorProviderConfig::OpenRouter),
+            model: Some("custom/test-embedding".to_owned()),
+            local_model: Some("bge-small-en-v1.5".to_owned()),
+            embedding_dimension: Some(3),
+            embedding_normalized: true,
+        };
+        mark_thread_episodic_workspace_vector_refill_complete_for_test(
+            crud_store.as_ref(),
+            &vector_config,
+        )
+        .await;
+
+        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::with_hybrid_ask(vec![Ok(
+            search_output_with_hits(vec![ranked_hit_for_item(&item, "hybrid ask hit", 0.99)]),
+        )]));
+        let resolver = Arc::new(SharedThreadEpisodicIndexEmbeddingProviderResolver::new());
+        let embedding_provider: Arc<dyn ThreadEpisodicEmbeddingProvider> =
+            Arc::new(StaticThreadEpisodicEmbeddingProvider::with_identity(
+                "openrouter",
+                "custom/test-embedding",
+                vec![0.9, 0.1, 0.0],
+            ));
+        resolver.set_active_provider(Some(embedding_provider));
+        let resolver_for_service: Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver> =
+            resolver.clone();
+        let service = ThreadEpisodicRecallService::with_config_and_embedding_provider_resolver(
+            crud_store,
+            backend.clone(),
+            ThreadEpisodicRecallServiceConfig {
+                vector_search_enabled: true,
+                ..ThreadEpisodicRecallServiceConfig::default()
+            },
+            Some(resolver_for_service),
+        );
+
+        let output = service
+            .search_current_thread(
+                recall_input(
+                    workspace_id.as_str(),
+                    thread_id,
+                    "turn_recall_hybrid_ask",
+                    "hybrid recall",
+                ),
+                None,
+            )
+            .await;
+
+        assert!(!output.fallback_used);
+        assert_eq!(output.hits.len(), 1);
+        assert!(backend.search_requests().await.is_empty());
+        let ask_requests = backend.ask_requests().await;
+        assert_eq!(ask_requests.len(), 1);
+        assert_eq!(
+            ask_requests[0].mode,
+            ThreadEpisodicMemvidAskRetrievalMode::Hybrid
+        );
+        assert_eq!(ask_requests[0].provider_id, "openrouter");
+        assert_eq!(ask_requests[0].model, "custom/test-embedding");
+        assert_eq!(ask_requests[0].request.query, "hybrid recall");
+        assert!(
+            ask_requests[0]
+                .request
+                .scope
+                .as_deref()
+                .is_some_and(|scope| scope.contains(thread_id))
+        );
+        assert!(
+            !output
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.message.contains("hybrid recall unavailable") })
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_recall_hybrid_ask_deduplicates_duplicate_segment_hits() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let thread_id = "thread_recall_hybrid_ask_dedup";
+        let item = seed_active_thread_episodic_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            thread_id,
+            "turn_recall_hybrid_ask_dedup",
+            "item_recall_hybrid_ask_dedup",
+            "hybrid recall duplicate item text",
+        )
+        .await;
+        let vector_config = pioneer_config::GatewayThreadEpisodicVectorSearchConfig {
+            enabled: true,
+            provider: Some(pioneer_config::GatewayThreadEpisodicVectorProviderConfig::OpenRouter),
+            model: Some("custom/test-embedding".to_owned()),
+            local_model: Some("bge-small-en-v1.5".to_owned()),
+            embedding_dimension: Some(3),
+            embedding_normalized: true,
+        };
+        mark_thread_episodic_workspace_vector_refill_complete_for_test(
+            crud_store.as_ref(),
+            &vector_config,
+        )
+        .await;
+
+        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::with_hybrid_ask(vec![Ok(
+            search_output_with_hits(vec![
+                ranked_hit_for_item(&item, "duplicate lower segment hit", 0.55),
+                ranked_hit_for_item(&item, "duplicate higher segment hit", 0.95),
+            ]),
+        )]));
+        let resolver = Arc::new(SharedThreadEpisodicIndexEmbeddingProviderResolver::new());
+        let embedding_provider: Arc<dyn ThreadEpisodicEmbeddingProvider> =
+            Arc::new(StaticThreadEpisodicEmbeddingProvider::with_identity(
+                "openrouter",
+                "custom/test-embedding",
+                vec![0.9, 0.1, 0.0],
+            ));
+        resolver.set_active_provider(Some(embedding_provider));
+        let resolver_for_service: Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver> =
+            resolver.clone();
+        let service = ThreadEpisodicRecallService::with_config_and_embedding_provider_resolver(
+            crud_store,
+            backend.clone(),
+            ThreadEpisodicRecallServiceConfig {
+                vector_search_enabled: true,
+                ..ThreadEpisodicRecallServiceConfig::default()
+            },
+            Some(resolver_for_service),
+        );
+
+        let output = service
+            .search_current_thread(
+                recall_input(
+                    workspace_id.as_str(),
+                    thread_id,
+                    "turn_recall_hybrid_ask_dedup",
+                    "duplicate",
+                ),
+                None,
+            )
+            .await;
+
+        assert!(!output.fallback_used);
+        assert_eq!(backend.ask_requests().await.len(), 1);
+        assert_eq!(backend.search_requests().await.len(), 0);
+        assert_eq!(output.hits.len(), 1);
+        assert_eq!(output.hits[0].provenance.index_item_id.0, item.id);
+        assert!(output.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == ThreadEpisodicRecallDiagnosticCode::SuppressedByBoundary
+                && diagnostic.message.contains("deduplicated 1 duplicate")
+        }));
+    }
+
+    #[tokio::test]
+    async fn vector_degraded_recall_missing_api_key_falls_back_to_lexical_without_provider_call() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let thread_id = "thread_vector_degraded_missing_key";
+        let item = seed_active_thread_episodic_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            thread_id,
+            "turn_vector_degraded_missing_key",
+            "item_vector_degraded_missing_key",
+            "missing api key should use lexical recall",
+        )
+        .await;
+        let vector_config = pioneer_config::GatewayThreadEpisodicVectorSearchConfig {
+            enabled: true,
+            provider: Some(pioneer_config::GatewayThreadEpisodicVectorProviderConfig::OpenAi),
+            model: Some("text-embedding-3-small".to_owned()),
+            local_model: Some("bge-small-en-v1.5".to_owned()),
+            embedding_dimension: Some(1536),
+            embedding_normalized: true,
+        };
+        mark_thread_episodic_workspace_vector_refill_complete_for_test(
+            crud_store.as_ref(),
+            &vector_config,
+        )
+        .await;
+
+        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::with_hybrid_ask_and_search(
+            Vec::new(),
+            vec![Ok(search_output_with_hits(vec![ranked_hit_for_item(
+                &item,
+                "lexical fallback missing key hit",
+                0.91,
+            )]))],
+        ));
+        let resolver = Arc::new(SharedThreadEpisodicIndexEmbeddingProviderResolver::new());
+        resolver.set_active_provider_unavailable_reason("openai embedding API key is missing");
+        let resolver_for_service: Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver> =
+            resolver.clone();
+        let service = ThreadEpisodicRecallService::with_config_and_embedding_provider_resolver(
+            crud_store,
+            backend.clone(),
+            ThreadEpisodicRecallServiceConfig {
+                vector_search_enabled: true,
+                ..ThreadEpisodicRecallServiceConfig::default()
+            },
+            Some(resolver_for_service),
+        );
+
+        let output = service
+            .search_current_thread(
+                recall_input(
+                    workspace_id.as_str(),
+                    thread_id,
+                    "turn_vector_degraded_missing_key",
+                    "missing key",
+                ),
+                None,
+            )
+            .await;
+
+        assert!(!output.fallback_used);
+        assert_eq!(output.hits.len(), 1);
+        assert!(backend.ask_requests().await.is_empty());
+        assert_eq!(backend.search_requests().await.len(), 1);
+        assert!(output.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("openai embedding API key is missing")
+                && diagnostic.message.contains("using lexical-only recall")
+        }));
+    }
+
+    #[tokio::test]
+    async fn vector_degraded_recall_local_model_downloading_falls_back_to_lexical() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let thread_id = "thread_vector_degraded_local_downloading";
+        let item = seed_active_thread_episodic_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            thread_id,
+            "turn_vector_degraded_local_downloading",
+            "item_vector_degraded_local_downloading",
+            "local model downloading should use lexical recall",
+        )
+        .await;
+        let vector_config = pioneer_config::GatewayThreadEpisodicVectorSearchConfig {
+            enabled: true,
+            provider: Some(pioneer_config::GatewayThreadEpisodicVectorProviderConfig::Local),
+            model: Some("text-embedding-3-small".to_owned()),
+            local_model: Some("bge-small-en-v1.5".to_owned()),
+            embedding_dimension: Some(384),
+            embedding_normalized: true,
+        };
+        mark_thread_episodic_workspace_vector_refill_complete_for_test(
+            crud_store.as_ref(),
+            &vector_config,
+        )
+        .await;
+
+        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::with_hybrid_ask_and_search(
+            Vec::new(),
+            vec![Ok(search_output_with_hits(vec![ranked_hit_for_item(
+                &item,
+                "lexical fallback local downloading hit",
+                0.91,
+            )]))],
+        ));
+        let resolver = Arc::new(SharedThreadEpisodicIndexEmbeddingProviderResolver::new());
+        resolver
+            .set_active_provider_unavailable_reason("local embedding model is still downloading");
+        let resolver_for_service: Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver> =
+            resolver.clone();
+        let service = ThreadEpisodicRecallService::with_config_and_embedding_provider_resolver(
+            crud_store,
+            backend.clone(),
+            ThreadEpisodicRecallServiceConfig {
+                vector_search_enabled: true,
+                ..ThreadEpisodicRecallServiceConfig::default()
+            },
+            Some(resolver_for_service),
+        );
+
+        let output = service
+            .search_current_thread(
+                recall_input(
+                    workspace_id.as_str(),
+                    thread_id,
+                    "turn_vector_degraded_local_downloading",
+                    "local downloading",
+                ),
+                None,
+            )
+            .await;
+
+        assert!(!output.fallback_used);
+        assert_eq!(output.hits.len(), 1);
+        assert!(backend.ask_requests().await.is_empty());
+        assert_eq!(backend.search_requests().await.len(), 1);
+        assert!(output.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("local embedding model is still downloading")
+                && diagnostic.message.contains("using lexical-only recall")
+        }));
+    }
+
+    #[tokio::test]
+    async fn vector_degraded_recall_retryable_hybrid_ask_error_falls_back_to_lexical() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let thread_id = "thread_vector_degraded_retryable_ask";
+        let item = seed_active_thread_episodic_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            thread_id,
+            "turn_vector_degraded_retryable_ask",
+            "item_vector_degraded_retryable_ask",
+            "retryable provider error should use lexical recall",
+        )
+        .await;
+        let vector_config = pioneer_config::GatewayThreadEpisodicVectorSearchConfig {
+            enabled: true,
+            provider: Some(pioneer_config::GatewayThreadEpisodicVectorProviderConfig::OpenRouter),
+            model: Some("custom/test-embedding".to_owned()),
+            local_model: Some("bge-small-en-v1.5".to_owned()),
+            embedding_dimension: Some(3),
+            embedding_normalized: true,
+        };
+        mark_thread_episodic_workspace_vector_refill_complete_for_test(
+            crud_store.as_ref(),
+            &vector_config,
+        )
+        .await;
+
+        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::with_hybrid_ask_and_search(
+            vec![Err(ThreadEpisodicMemvidError::retryable(
+                "query embedding provider temporary failure",
+            ))],
+            vec![Ok(search_output_with_hits(vec![ranked_hit_for_item(
+                &item,
+                "lexical fallback retryable hit",
+                0.91,
+            )]))],
+        ));
+        let resolver = Arc::new(SharedThreadEpisodicIndexEmbeddingProviderResolver::new());
+        let embedding_provider: Arc<dyn ThreadEpisodicEmbeddingProvider> =
+            Arc::new(StaticThreadEpisodicEmbeddingProvider::with_identity(
+                "openrouter",
+                "custom/test-embedding",
+                vec![0.9, 0.1, 0.0],
+            ));
+        resolver.set_active_provider(Some(embedding_provider));
+        let resolver_for_service: Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver> =
+            resolver.clone();
+        let service = ThreadEpisodicRecallService::with_config_and_embedding_provider_resolver(
+            crud_store,
+            backend.clone(),
+            ThreadEpisodicRecallServiceConfig {
+                vector_search_enabled: true,
+                ..ThreadEpisodicRecallServiceConfig::default()
+            },
+            Some(resolver_for_service),
+        );
+
+        let output = service
+            .search_current_thread(
+                recall_input(
+                    workspace_id.as_str(),
+                    thread_id,
+                    "turn_vector_degraded_retryable_ask",
+                    "retryable",
+                ),
+                None,
+            )
+            .await;
+
+        assert!(!output.fallback_used);
+        assert_eq!(output.hits.len(), 1);
+        assert_eq!(backend.ask_requests().await.len(), 1);
+        assert_eq!(backend.search_requests().await.len(), 1);
+        assert!(output.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("query embedding provider temporary failure")
+                && diagnostic.message.contains("using lexical-only recall")
+        }));
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_recall_capability_skips_when_vector_refill_has_no_safe_projection() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let thread_id = "thread_recall_capability_vector_refill";
+        let item = seed_active_thread_episodic_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            thread_id,
+            "turn_recall_capability_vector_refill",
+            "item_recall_capability_vector_refill",
+            "vector refill should not use stale projection",
+        )
+        .await;
+        mark_thread_episodic_workspace_refill_status_for_test(
+            crud_store.as_ref(),
+            pioneer_crud::PROJECTION_META_STATUS_BACKFILLING,
+        )
+        .await;
+        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::with_search(vec![Ok(
+            search_output_with_hits(vec![ranked_hit_for_item(
+                &item,
+                "stale vector refill hit",
+                0.99,
+            )]),
+        )]));
+        let service = ThreadEpisodicRecallService::with_config(
+            crud_store,
+            backend.clone(),
+            ThreadEpisodicRecallServiceConfig {
+                vector_search_enabled: true,
+                ..ThreadEpisodicRecallServiceConfig::default()
+            },
+        );
+
+        let output = service
+            .search_current_thread(
+                recall_input(
+                    workspace_id.as_str(),
+                    thread_id,
+                    "turn_recall_capability_vector_refill",
+                    "refill",
+                ),
+                None,
+            )
+            .await;
+
+        assert!(!output.fallback_used);
+        assert!(output.hits.is_empty());
+        assert!(backend.search_requests().await.is_empty());
+        assert!(output.diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("vector refill is incomplete")
+                && diagnostic
+                    .message
+                    .contains("lexical projection is unavailable")
+        }));
+    }
+
+    #[tokio::test]
     async fn thread_episodic_recall_is_thread_scoped_with_one_workspace_capsule() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let thread_a = "thread_scope_a";
@@ -4175,6 +5420,114 @@ mod tests {
         assert_eq!(requests[1].scope.as_deref(), Some(scope_b.as_str()));
         assert!(requests.iter().all(|request| request.segments.len() == 1
             && request.segments[0].capsule_id == workspace_capsules[0].id));
+    }
+
+    #[tokio::test]
+    async fn recall_scope_hybrid_ask_does_not_expand_to_other_thread_or_workspace() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let thread_id = "thread_hybrid_scope_current";
+        let other_thread_id = "thread_hybrid_scope_other";
+        let other_workspace_id = "workspace_hybrid_scope_other";
+        let current_item = seed_active_thread_episodic_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            thread_id,
+            "turn_hybrid_scope_current",
+            "item_hybrid_scope_current",
+            "current thread hybrid scope memory",
+        )
+        .await;
+        let other_thread_item = seed_active_thread_episodic_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            other_thread_id,
+            "turn_hybrid_scope_other_thread",
+            "item_hybrid_scope_other_thread",
+            "other thread hybrid scope memory",
+        )
+        .await;
+        let other_workspace_item = seed_active_thread_episodic_item(
+            crud_store.as_ref(),
+            other_workspace_id,
+            thread_id,
+            "turn_hybrid_scope_other_workspace",
+            "item_hybrid_scope_other_workspace",
+            "other workspace hybrid scope memory",
+        )
+        .await;
+        let vector_config = pioneer_config::GatewayThreadEpisodicVectorSearchConfig {
+            enabled: true,
+            provider: Some(pioneer_config::GatewayThreadEpisodicVectorProviderConfig::OpenRouter),
+            model: Some("custom/test-embedding".to_owned()),
+            local_model: Some("bge-small-en-v1.5".to_owned()),
+            embedding_dimension: Some(3),
+            embedding_normalized: true,
+        };
+        mark_thread_episodic_workspace_vector_refill_complete_for_test(
+            crud_store.as_ref(),
+            &vector_config,
+        )
+        .await;
+
+        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::with_hybrid_ask(vec![Ok(
+            search_output_with_hits(vec![
+                ranked_hit_for_item(&other_workspace_item, "wrong workspace hit", 0.99),
+                ranked_hit_for_item(&other_thread_item, "wrong thread hit", 0.98),
+                ranked_hit_for_item(&current_item, "current thread hit", 0.70),
+            ]),
+        )]));
+        let resolver = Arc::new(SharedThreadEpisodicIndexEmbeddingProviderResolver::new());
+        let embedding_provider: Arc<dyn ThreadEpisodicEmbeddingProvider> =
+            Arc::new(StaticThreadEpisodicEmbeddingProvider::with_identity(
+                "openrouter",
+                "custom/test-embedding",
+                vec![0.9, 0.1, 0.0],
+            ));
+        resolver.set_active_provider(Some(embedding_provider));
+        let resolver_for_service: Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver> =
+            resolver.clone();
+        let service = ThreadEpisodicRecallService::with_config_and_embedding_provider_resolver(
+            crud_store,
+            backend.clone(),
+            ThreadEpisodicRecallServiceConfig {
+                vector_search_enabled: true,
+                ..ThreadEpisodicRecallServiceConfig::default()
+            },
+            Some(resolver_for_service),
+        );
+
+        let output = service
+            .search_current_thread(
+                recall_input(
+                    workspace_id.as_str(),
+                    thread_id,
+                    "turn_hybrid_scope_current",
+                    "hybrid scope",
+                ),
+                None,
+            )
+            .await;
+
+        assert!(!output.fallback_used);
+        assert_eq!(output.hits.len(), 1);
+        assert_eq!(output.hits[0].provenance.index_item_id.0, current_item.id);
+        let ask_requests = backend.ask_requests().await;
+        assert_eq!(ask_requests.len(), 1);
+        assert_eq!(backend.search_requests().await.len(), 0);
+        let expected_scope = thread_episodic_thread_uri_prefix(workspace_id.as_str(), thread_id)
+            .expect("thread scope");
+        assert_eq!(
+            ask_requests[0].request.scope.as_deref(),
+            Some(expected_scope.as_str())
+        );
+        assert!(output.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == ThreadEpisodicRecallDiagnosticCode::SuppressedByBoundary
+                && diagnostic.message.contains("wrong thread")
+        }));
+        assert!(output.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == ThreadEpisodicRecallDiagnosticCode::SuppressedByBoundary
+                && diagnostic.message.contains("wrong workspace")
+        }));
     }
 
     #[tokio::test]
@@ -4723,6 +6076,91 @@ mod tests {
         segment_index: i64,
     }
 
+    struct StaticThreadEpisodicEmbeddingProvider {
+        provider_id: &'static str,
+        model: &'static str,
+        dimension: usize,
+        normalized: bool,
+        embedding: Vec<f32>,
+        error: Option<ThreadEpisodicEmbeddingError>,
+        calls: AtomicUsize,
+    }
+
+    impl StaticThreadEpisodicEmbeddingProvider {
+        fn new(embedding: Vec<f32>) -> Self {
+            Self {
+                provider_id: "test",
+                model: "test-embedding",
+                dimension: embedding.len(),
+                normalized: true,
+                embedding,
+                error: None,
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn with_identity(
+            provider_id: &'static str,
+            model: &'static str,
+            embedding: Vec<f32>,
+        ) -> Self {
+            Self {
+                provider_id,
+                model,
+                dimension: embedding.len(),
+                normalized: true,
+                embedding,
+                error: None,
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn with_error(error: ThreadEpisodicEmbeddingError) -> Self {
+            Self {
+                provider_id: "test",
+                model: "test-embedding",
+                dimension: 3,
+                normalized: true,
+                embedding: vec![0.1, 0.2, 0.3],
+                error: Some(error),
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ThreadEpisodicEmbeddingProvider for StaticThreadEpisodicEmbeddingProvider {
+        fn provider_id(&self) -> &str {
+            self.provider_id
+        }
+
+        fn model(&self) -> &str {
+            self.model
+        }
+
+        fn dimension(&self) -> usize {
+            self.dimension
+        }
+
+        fn normalized(&self) -> bool {
+            self.normalized
+        }
+
+        fn embed_text(
+            &self,
+            _text: &str,
+        ) -> std::result::Result<Vec<f32>, ThreadEpisodicEmbeddingError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(error) = self.error.clone() {
+                return Err(error);
+            }
+            Ok(self.embedding.clone())
+        }
+    }
+
     #[async_trait]
     impl ThreadEpisodicIndexPayloadProvider for StaticThreadEpisodicIndexPayloadProvider {
         async fn resolve_index_request(
@@ -4737,6 +6175,158 @@ mod tests {
                 segment_index: self.segment_index,
             })
         }
+    }
+
+    #[tokio::test]
+    async fn vector_payload_provider_attaches_embedding_to_resolved_request() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let item = seed_pending_thread_episodic_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            "thread_vector_payload",
+            "turn_vector_payload",
+            "item_vector_payload",
+        )
+        .await;
+        let job = seed_thread_episodic_job(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            "thread_vector_payload",
+            item.id.as_str(),
+            1_700_000_000,
+        )
+        .await;
+        let request = static_index_request(
+            "file:///tmp/vector-payload.mv2".to_owned(),
+            "capsule_vector_payload",
+            "mv2://pioneer/thread_episodic/test/capsules/capsule_vector_payload",
+            item.id.as_str(),
+        );
+        let inner = Arc::new(StaticThreadEpisodicIndexPayloadProvider {
+            request,
+            segment_index: 3,
+        });
+        let embedding_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::new(vec![
+            0.1, 0.2, 0.3,
+        ]));
+        let provider =
+            VectorThreadEpisodicIndexPayloadProvider::new(inner, embedding_provider.clone());
+
+        let resolved = provider
+            .resolve_index_request(&job)
+            .await
+            .expect("vector payload should resolve");
+
+        let embedding = resolved
+            .request
+            .embedding
+            .expect("resolved request should include embedding");
+        assert_eq!(embedding.identity.provider_id, "test");
+        assert_eq!(embedding.identity.model, "test-embedding");
+        assert_eq!(embedding.identity.dimension, 3);
+        assert_eq!(embedding.vector, vec![0.1, 0.2, 0.3]);
+        assert_eq!(embedding_provider.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn vector_payload_provider_maps_retryable_embedding_failure() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let item = seed_pending_thread_episodic_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            "thread_vector_payload_retryable",
+            "turn_vector_payload_retryable",
+            "item_vector_payload_retryable",
+        )
+        .await;
+        let job = seed_thread_episodic_job(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            "thread_vector_payload_retryable",
+            item.id.as_str(),
+            1_700_000_000,
+        )
+        .await;
+        let request = static_index_request(
+            "file:///tmp/vector-payload-retryable.mv2".to_owned(),
+            "capsule_vector_payload_retryable",
+            "mv2://pioneer/thread_episodic/test/capsules/capsule_vector_payload_retryable",
+            item.id.as_str(),
+        );
+        let provider = VectorThreadEpisodicIndexPayloadProvider::new(
+            Arc::new(StaticThreadEpisodicIndexPayloadProvider {
+                request,
+                segment_index: 3,
+            }),
+            Arc::new(StaticThreadEpisodicEmbeddingProvider::with_error(
+                ThreadEpisodicEmbeddingError::retryable_provider_failure(
+                    "test",
+                    "test-embedding",
+                    "rate limited",
+                ),
+            )),
+        );
+
+        let error = provider
+            .resolve_index_request(&job)
+            .await
+            .expect_err("retryable embedding failure should propagate");
+
+        assert_eq!(
+            error.kind,
+            ThreadEpisodicIndexResolutionFailureKind::Retryable
+        );
+        assert!(error.message.contains("rate limited"));
+    }
+
+    #[tokio::test]
+    async fn vector_payload_provider_maps_configuration_embedding_failure_terminal() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let item = seed_pending_thread_episodic_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            "thread_vector_payload_config",
+            "turn_vector_payload_config",
+            "item_vector_payload_config",
+        )
+        .await;
+        let job = seed_thread_episodic_job(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            "thread_vector_payload_config",
+            item.id.as_str(),
+            1_700_000_000,
+        )
+        .await;
+        let request = static_index_request(
+            "file:///tmp/vector-payload-config.mv2".to_owned(),
+            "capsule_vector_payload_config",
+            "mv2://pioneer/thread_episodic/test/capsules/capsule_vector_payload_config",
+            item.id.as_str(),
+        );
+        let provider = VectorThreadEpisodicIndexPayloadProvider::new(
+            Arc::new(StaticThreadEpisodicIndexPayloadProvider {
+                request,
+                segment_index: 3,
+            }),
+            Arc::new(StaticThreadEpisodicEmbeddingProvider::with_error(
+                ThreadEpisodicEmbeddingError::missing_key("test", "test-embedding"),
+            )),
+        );
+
+        let error = provider
+            .resolve_index_request(&job)
+            .await
+            .expect_err("configuration embedding failure should propagate");
+
+        assert_eq!(
+            error.kind,
+            ThreadEpisodicIndexResolutionFailureKind::NonRetryable
+        );
+        assert!(matches!(
+            ThreadEpisodicEmbeddingError::missing_key("test", "test-embedding").kind,
+            ThreadEpisodicEmbeddingErrorKind::MissingKey
+        ));
     }
 
     fn committed_item(item: TurnItem) -> ThreadEpisodicCommittedItem {
@@ -4784,12 +6374,43 @@ mod tests {
         .await;
     }
 
+    async fn mark_thread_episodic_workspace_vector_refill_complete_for_test(
+        crud_store: &CrudStore,
+        config: &pioneer_config::GatewayThreadEpisodicVectorSearchConfig,
+    ) {
+        let now = fixed_datetime_from_unix(1_700_000_000);
+        let projection_target =
+            crate::database::startup::thread_episodic_workspace_capsule_refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_vector_search_config(config);
+        pioneer_crud::upsert_projection_meta_with_config(
+            &crud_store.database_connection(),
+            pioneer_crud::ProjectionMetaRecord {
+                projection_key: crate::database::startup::thread_episodic_workspace_capsule_refill::THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_KEY.to_owned(),
+                projection_version: crate::database::startup::thread_episodic_workspace_capsule_refill::THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_VERSION,
+                status: pioneer_crud::PROJECTION_META_STATUS_COMPLETE.to_owned(),
+                source_thread_count: 0,
+                source_turn_count: 0,
+                source_turn_item_count: 0,
+                source_turn_event_count: 0,
+                last_error: None,
+                backfill_started_at: Some(now),
+                backfilled_at: Some(now),
+                created_at: now,
+                updated_at: now,
+            },
+            projection_target.meta_config_record(),
+        )
+        .await
+        .expect("vector workspace capsule refill marker should be complete for test setup");
+    }
+
     async fn mark_thread_episodic_workspace_refill_status_for_test(
         crud_store: &CrudStore,
         status: &str,
     ) {
         let now = fixed_datetime_from_unix(1_700_000_000);
-        pioneer_crud::upsert_projection_meta(
+        let projection_target =
+            crate::database::startup::thread_episodic_workspace_capsule_refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only();
+        pioneer_crud::upsert_projection_meta_with_config(
             &crud_store.database_connection(),
             pioneer_crud::ProjectionMetaRecord {
                 projection_key: crate::database::startup::thread_episodic_workspace_capsule_refill::THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_KEY.to_owned(),
@@ -4805,6 +6426,7 @@ mod tests {
                 created_at: now,
                 updated_at: now,
             },
+            projection_target.meta_config_record(),
         )
         .await
         .expect("workspace capsule refill marker should be complete for test setup");
@@ -4892,6 +6514,7 @@ mod tests {
             frame_uri: format!("{capsule_ref}/index/{index_item_id}"),
             text: "test".to_owned(),
             metadata: Default::default(),
+            embedding: None,
         }
     }
 
@@ -4996,6 +6619,7 @@ mod tests {
             ThreadEpisodicMemvidIndexOutput {
                 frame_id: 42,
                 frame_uri: request.frame_uri.clone(),
+                embedding_identity: None,
                 stats: ThreadEpisodicMemvidStats {
                     active_frame_count: Some(1),
                     frame_count: Some(1),
@@ -5059,6 +6683,206 @@ mod tests {
         assert_eq!(metrics.total_capacity_errors, 0);
         assert_eq!(metrics.max_attempt_count, 1);
         assert!(metrics.completed_latency_avg_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_index_executor_runtime_vector_job_writes_embedding() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let thread_id = "thread_index_runtime_vector";
+        let item = seed_pending_thread_episodic_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            thread_id,
+            "turn_index_runtime_vector",
+            "item_index_runtime_vector",
+        )
+        .await;
+        let job = seed_thread_episodic_job(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            thread_id,
+            item.id.as_str(),
+            1_700_000_000,
+        )
+        .await;
+        let request = static_index_request(
+            "file:///tmp/thread-index-runtime-vector.mv2".to_owned(),
+            "capsule_runtime_vector",
+            "mv2://pioneer/thread_episodic/test/capsules/capsule_runtime_vector",
+            item.id.as_str(),
+        );
+        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(Vec::new()));
+        let resolver = Arc::new(SharedThreadEpisodicIndexEmbeddingProviderResolver::new());
+        let embedding_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::new(vec![
+            0.4, 0.5, 0.6,
+        ]));
+        resolver.set_active_provider(Some(embedding_provider.clone()));
+        let provider = Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
+            Arc::new(StaticThreadEpisodicIndexPayloadProvider {
+                request,
+                segment_index: 1,
+            }),
+            resolver,
+        ));
+        let executor =
+            ThreadEpisodicIndexExecutor::new(crud_store.clone(), backend.clone(), provider);
+
+        let summary = executor
+            .run_once(1_700_000_010)
+            .await
+            .expect("executor should run");
+
+        assert_eq!(summary.claimed, 1);
+        assert_eq!(summary.completed, 1);
+        assert_eq!(embedding_provider.calls(), 1);
+        let requests = backend.requests().await;
+        assert_eq!(requests.len(), 1);
+        let embedding = requests[0]
+            .embedding
+            .as_ref()
+            .expect("runtime vector job should attach embedding");
+        assert_eq!(embedding.identity.provider_id, "test");
+        assert_eq!(embedding.identity.model, "test-embedding");
+        assert_eq!(embedding.vector, vec![0.4, 0.5, 0.6]);
+
+        let stored_job = crud_store
+            .find_thread_episodic_index_job(job.id.as_str())
+            .await
+            .expect("job read")
+            .expect("job exists");
+        assert_eq!(stored_job.status, ThreadEpisodicIndexJobStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_index_executor_runtime_vector_provider_failure_is_retryable() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let thread_id = "thread_index_runtime_vector_retryable";
+        let item = seed_pending_thread_episodic_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            thread_id,
+            "turn_index_runtime_vector_retryable",
+            "item_index_runtime_vector_retryable",
+        )
+        .await;
+        let job = seed_thread_episodic_job(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            thread_id,
+            item.id.as_str(),
+            1_700_000_000,
+        )
+        .await;
+        let request = static_index_request(
+            "file:///tmp/thread-index-runtime-vector-retryable.mv2".to_owned(),
+            "capsule_runtime_vector_retryable",
+            "mv2://pioneer/thread_episodic/test/capsules/capsule_runtime_vector_retryable",
+            item.id.as_str(),
+        );
+        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(Vec::new()));
+        let resolver = Arc::new(SharedThreadEpisodicIndexEmbeddingProviderResolver::new());
+        let embedding_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::with_error(
+            ThreadEpisodicEmbeddingError::retryable_provider_failure(
+                "test",
+                "test-embedding",
+                "rate limited",
+            ),
+        ));
+        resolver.set_active_provider(Some(embedding_provider.clone()));
+        let provider = Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
+            Arc::new(StaticThreadEpisodicIndexPayloadProvider {
+                request,
+                segment_index: 1,
+            }),
+            resolver,
+        ));
+        let executor =
+            ThreadEpisodicIndexExecutor::new(crud_store.clone(), backend.clone(), provider);
+
+        let summary = executor
+            .run_once(1_700_000_010)
+            .await
+            .expect("executor should run");
+
+        assert_eq!(summary.claimed, 1);
+        assert_eq!(summary.completed, 0);
+        assert_eq!(summary.failed_retryable, 1);
+        assert_eq!(backend.requests().await.len(), 0);
+        assert_eq!(embedding_provider.calls(), 1);
+
+        let stored_job = crud_store
+            .find_thread_episodic_index_job(job.id.as_str())
+            .await
+            .expect("job read")
+            .expect("job exists");
+        assert_eq!(stored_job.status, ThreadEpisodicIndexJobStatus::Failed);
+        assert_eq!(stored_job.attempt_count, 1);
+        assert!(stored_job.next_run_at > fixed_datetime_from_unix(1_700_000_010));
+        assert!(
+            stored_job
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("rate limited"))
+        );
+        let stored_item = crud_store
+            .find_thread_episodic_item(item.id.as_str())
+            .await
+            .expect("item read")
+            .expect("item exists");
+        assert_eq!(stored_item.status, ThreadEpisodicItemStatus::PendingIndex);
+        assert!(stored_item.frame_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_vector_disable_runtime_writes_lexical_only() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let thread_id = "thread_index_runtime_lexical_disabled_vector";
+        let item = seed_pending_thread_episodic_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            thread_id,
+            "turn_index_runtime_lexical_disabled_vector",
+            "item_index_runtime_lexical_disabled_vector",
+        )
+        .await;
+        seed_thread_episodic_job(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            thread_id,
+            item.id.as_str(),
+            1_700_000_000,
+        )
+        .await;
+        let request = static_index_request(
+            "file:///tmp/thread-index-runtime-lexical-disabled-vector.mv2".to_owned(),
+            "capsule_runtime_lexical",
+            "mv2://pioneer/thread_episodic/test/capsules/capsule_runtime_lexical",
+            item.id.as_str(),
+        );
+        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(Vec::new()));
+        let resolver = Arc::new(SharedThreadEpisodicIndexEmbeddingProviderResolver::new());
+        let provider = Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
+            Arc::new(StaticThreadEpisodicIndexPayloadProvider {
+                request,
+                segment_index: 1,
+            }),
+            resolver,
+        ));
+        let executor = ThreadEpisodicIndexExecutor::new(crud_store, backend.clone(), provider);
+
+        let summary = executor
+            .run_once(1_700_000_010)
+            .await
+            .expect("executor should run");
+
+        assert_eq!(summary.claimed, 1);
+        assert_eq!(summary.completed, 1);
+        let requests = backend.requests().await;
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].embedding.is_none(),
+            "disabled vector state must preserve lexical-only writes"
+        );
     }
 
     #[tokio::test]
@@ -5228,6 +7052,7 @@ mod tests {
                 frame_id: 7,
                 frame_uri: request.frame_uri.clone(),
                 stats: ThreadEpisodicMemvidStats::default(),
+                embedding_identity: None,
             },
         )]));
         let provider = Arc::new(StaticThreadEpisodicIndexPayloadProvider {
