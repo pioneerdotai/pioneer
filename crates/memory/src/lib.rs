@@ -17,6 +17,7 @@ mod recall;
 mod recall_visibility;
 mod service;
 mod thread_episodic;
+mod thread_episodic_embedding;
 mod write;
 
 pub use backend::{
@@ -68,15 +69,23 @@ pub use thread_episodic::{
     PioneerAdaptiveCutoffDiagnostics, PioneerAdaptiveCutoffReason,
     ThreadEpisodicAdaptiveRetrievalImplementation, ThreadEpisodicCandidateSuppression,
     ThreadEpisodicCandidateSuppressionReason, ThreadEpisodicExactSourceTarget,
-    ThreadEpisodicFilteredSearchCandidates, ThreadEpisodicMemvidBackend,
-    ThreadEpisodicMemvidBackendCapabilities, ThreadEpisodicMemvidCapabilityState,
-    ThreadEpisodicMemvidError, ThreadEpisodicMemvidFailureKind, ThreadEpisodicMemvidFeatureAudit,
-    ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidIndexRequest,
-    ThreadEpisodicMemvidSearchHit, ThreadEpisodicMemvidSearchOutput,
-    ThreadEpisodicMemvidSearchRequest, ThreadEpisodicMemvidSearchSegment,
-    ThreadEpisodicMemvidStats, ThreadEpisodicRankedSearchHit, ThreadEpisodicRankingContext,
-    ThreadEpisodicSearchDiagnostics, ThreadEpisodicSearchProfile, ThreadEpisodicSearchProfileKind,
-    filter_thread_episodic_search_candidates, rank_thread_episodic_search_hits,
-    thread_episodic_memvid_metadata, thread_episodic_storage_uri_from_path,
+    ThreadEpisodicFilteredSearchCandidates, ThreadEpisodicMemvidAskRetrievalMode,
+    ThreadEpisodicMemvidBackend, ThreadEpisodicMemvidBackendCapabilities,
+    ThreadEpisodicMemvidCapabilityState, ThreadEpisodicMemvidError,
+    ThreadEpisodicMemvidFailureKind, ThreadEpisodicMemvidFeatureAudit,
+    ThreadEpisodicMemvidIndexEmbedding, ThreadEpisodicMemvidIndexOutput,
+    ThreadEpisodicMemvidIndexRequest, ThreadEpisodicMemvidSearchHit,
+    ThreadEpisodicMemvidSearchOutput, ThreadEpisodicMemvidSearchRequest,
+    ThreadEpisodicMemvidSearchSegment, ThreadEpisodicMemvidStats, ThreadEpisodicRankedSearchHit,
+    ThreadEpisodicRankingContext, ThreadEpisodicSearchDiagnostics, ThreadEpisodicSearchProfile,
+    ThreadEpisodicSearchProfileKind, filter_thread_episodic_search_candidates,
+    rank_thread_episodic_search_hits, thread_episodic_memvid_metadata,
+    thread_episodic_storage_uri_from_path,
+};
+pub use thread_episodic_embedding::{
+    ThreadEpisodicEmbeddingDiagnostic, ThreadEpisodicEmbeddingError,
+    ThreadEpisodicEmbeddingErrorKind, ThreadEpisodicEmbeddingFailureClass,
+    ThreadEpisodicEmbeddingIdentity, ThreadEpisodicEmbeddingProvider,
+    ThreadEpisodicEmbeddingSafeLogFields, ThreadEpisodicMemvidEmbedder,
 };
 pub use write::{build_memory_canonical_key, semantic_memory_fingerprint};

@@ -1,7 +1,10 @@
+use crate::thread_episodic_embedding::{
+    ThreadEpisodicEmbeddingIdentity, ThreadEpisodicMemvidEmbedder,
+};
 use async_trait::async_trait;
 use memvid_core::{
-    AclEnforcementMode, DocMetadata, FrameStatus, Memvid, MemvidError, PutOptions,
-    SearchEngineKind, SearchHit, SearchRequest, TemporalFilter,
+    AclEnforcementMode, AskMode, AskRequest, DocMetadata, FrameStatus, Memvid, MemvidError,
+    PutOptions, SearchEngineKind, SearchHit, SearchHitMetadata, SearchRequest, TemporalFilter,
 };
 use pioneer_protocol::{
     ThreadEpisodicAdaptiveStrategy, ThreadEpisodicItemStatus, ThreadEpisodicScoreBreakdown,
@@ -32,6 +35,7 @@ pub struct ThreadEpisodicMemvidBackendCapabilities {
     pub adaptive_retrieval: ThreadEpisodicMemvidCapabilityState,
     pub adaptive_retrieval_implementation: ThreadEpisodicAdaptiveRetrievalImplementation,
     pub semantic_search: ThreadEpisodicMemvidCapabilityState,
+    pub hybrid_search: ThreadEpisodicMemvidCapabilityState,
     pub lexical_search: ThreadEpisodicMemvidCapabilityState,
     pub temporal_search: ThreadEpisodicMemvidCapabilityState,
     pub graph_search: ThreadEpisodicMemvidCapabilityState,
@@ -43,7 +47,8 @@ impl ThreadEpisodicMemvidBackendCapabilities {
             adaptive_retrieval: ThreadEpisodicMemvidCapabilityState::Supported,
             adaptive_retrieval_implementation:
                 ThreadEpisodicAdaptiveRetrievalImplementation::PioneerFallback,
-            semantic_search: ThreadEpisodicMemvidCapabilityState::Unsupported,
+            semantic_search: ThreadEpisodicMemvidCapabilityState::Supported,
+            hybrid_search: ThreadEpisodicMemvidCapabilityState::Supported,
             lexical_search: ThreadEpisodicMemvidCapabilityState::Supported,
             temporal_search: ThreadEpisodicMemvidCapabilityState::Supported,
             graph_search: ThreadEpisodicMemvidCapabilityState::Disabled,
@@ -59,6 +64,22 @@ pub enum ThreadEpisodicAdaptiveRetrievalImplementation {
     Unsupported,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadEpisodicMemvidAskRetrievalMode {
+    Hybrid,
+    Semantic,
+}
+
+impl ThreadEpisodicMemvidAskRetrievalMode {
+    const fn ask_mode(self) -> AskMode {
+        match self {
+            Self::Hybrid => AskMode::Hybrid,
+            Self::Semantic => AskMode::Sem,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadEpisodicMemvidFeatureAudit {
     pub memvid_core_version: String,
@@ -71,9 +92,14 @@ pub struct ThreadEpisodicMemvidFeatureAudit {
 impl ThreadEpisodicMemvidFeatureAudit {
     pub fn current() -> Self {
         Self {
-            memvid_core_version: "2.0.139".to_owned(),
-            enabled_features: vec!["lex".to_owned(), "temporal_track".to_owned(), "simd".to_owned()],
-            disabled_features: vec!["vec".to_owned(), "logic_mesh".to_owned()],
+            memvid_core_version: "3.1.1".to_owned(),
+            enabled_features: vec![
+                "lex".to_owned(),
+                "temporal_track".to_owned(),
+                "simd".to_owned(),
+                "vec".to_owned(),
+            ],
+            disabled_features: vec!["api_embed".to_owned(), "logic_mesh".to_owned()],
             adaptive_retrieval_implementation:
                 ThreadEpisodicAdaptiveRetrievalImplementation::PioneerFallback,
             graph_search_note: "logic_mesh/graph search is intentionally not enabled for thread episodic memory in this phase".to_owned(),
@@ -140,7 +166,32 @@ pub struct ThreadEpisodicMemvidStats {
     pub utilization_percent: Option<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThreadEpisodicMemvidIndexEmbedding {
+    pub identity: ThreadEpisodicEmbeddingIdentity,
+    pub vector: Vec<f32>,
+}
+
+impl ThreadEpisodicMemvidIndexEmbedding {
+    pub fn new(
+        identity: ThreadEpisodicEmbeddingIdentity,
+        vector: Vec<f32>,
+    ) -> Result<Self, ThreadEpisodicMemvidError> {
+        if vector.len() != identity.dimension {
+            return Err(ThreadEpisodicMemvidError::non_retryable(format!(
+                "thread episodic embedding dimension mismatch for `{}`/`{}`: expected {}, got {}",
+                identity.provider_id,
+                identity.model,
+                identity.dimension,
+                vector.len()
+            )));
+        }
+
+        Ok(Self { identity, vector })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ThreadEpisodicMemvidIndexRequest {
     pub storage_uri: String,
     pub capsule_id: String,
@@ -150,6 +201,7 @@ pub struct ThreadEpisodicMemvidIndexRequest {
     pub frame_uri: String,
     pub text: String,
     pub metadata: BTreeMap<String, String>,
+    pub embedding: Option<ThreadEpisodicMemvidIndexEmbedding>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -157,6 +209,7 @@ pub struct ThreadEpisodicMemvidIndexOutput {
     pub frame_id: i64,
     pub frame_uri: String,
     pub stats: ThreadEpisodicMemvidStats,
+    pub embedding_identity: Option<ThreadEpisodicEmbeddingIdentity>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -568,6 +621,19 @@ pub trait ThreadEpisodicMemvidBackend: Send + Sync {
         &self,
         request: ThreadEpisodicMemvidSearchRequest,
     ) -> Result<ThreadEpisodicMemvidSearchOutput, ThreadEpisodicMemvidError>;
+
+    async fn ask_retrieval(
+        &self,
+        _request: ThreadEpisodicMemvidSearchRequest,
+        mode: ThreadEpisodicMemvidAskRetrievalMode,
+        embedder: Arc<ThreadEpisodicMemvidEmbedder>,
+    ) -> Result<ThreadEpisodicMemvidSearchOutput, ThreadEpisodicMemvidError> {
+        Err(ThreadEpisodicMemvidError::non_retryable(format!(
+            "thread episodic memvid ask retrieval is not implemented for this backend; mode={mode:?}, provider={}, model={}",
+            embedder.provider().provider_id(),
+            embedder.provider().model()
+        )))
+    }
 }
 
 pub struct MemvidThreadEpisodicBackend {
@@ -707,54 +773,147 @@ impl ThreadEpisodicMemvidBackend for MemvidThreadEpisodicBackend {
             }
         }
 
-        raw_hits.sort_by(|left, right| {
-            score_or_zero(right.memvid_score)
-                .partial_cmp(&score_or_zero(left.memvid_score))
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| right.segment_index.cmp(&left.segment_index))
-                .then_with(|| left.index_item_id.cmp(&right.index_item_id))
-        });
-
-        let scores = raw_hits
-            .iter()
-            .map(|hit| hit.memvid_score)
-            .collect::<Vec<_>>();
-        let (cutoff_len, adaptive) =
-            PioneerAdaptiveCutoff::cutoff_len(&scores, request.profile.adaptive_cutoff_config());
-        let raw_hits = raw_hits.into_iter().take(cutoff_len).collect::<Vec<_>>();
-        let filtered = filter_thread_episodic_search_candidates(
-            request.workspace_id.as_str(),
-            request.thread_id.as_str(),
+        Ok(finalize_thread_episodic_search_output(
+            request,
             raw_hits,
-        );
-        let mut ranked = rank_thread_episodic_search_hits(
-            filtered.hits,
-            ThreadEpisodicRankingContext {
-                exact_source: request.exact_source,
-                now_unix: None,
-            },
-        );
-        ranked.truncate(request.profile.max_candidates as usize);
-
-        let diagnostics = ThreadEpisodicSearchDiagnostics {
-            profile_kind: request.profile.kind,
-            search_mode: request.profile.mode,
-            searched_segment_count: searched_segment_ids.len() as u32,
             searched_segment_ids,
             unavailable_segment_ids,
-            raw_candidate_count: adaptive.candidate_count,
-            filtered_candidate_count: ranked.len() as u32,
-            returned_count: ranked.len() as u32,
-            adaptive,
-            native_memvid_adaptive_used: false,
-            suppressions: filtered.suppressions,
             warnings,
-        };
+            false,
+        ))
+    }
 
-        Ok(ThreadEpisodicMemvidSearchOutput {
-            hits: ranked,
-            diagnostics,
-        })
+    async fn ask_retrieval(
+        &self,
+        request: ThreadEpisodicMemvidSearchRequest,
+        mode: ThreadEpisodicMemvidAskRetrievalMode,
+        embedder: Arc<ThreadEpisodicMemvidEmbedder>,
+    ) -> Result<ThreadEpisodicMemvidSearchOutput, ThreadEpisodicMemvidError> {
+        request.profile.validate()?;
+        let mut segments = request.segments.clone();
+        segments.sort_by(|left, right| right.segment_index.cmp(&left.segment_index));
+        segments.truncate(request.profile.max_segments as usize);
+
+        let mut searched_segment_ids = Vec::new();
+        let mut unavailable_segment_ids = Vec::new();
+        let mut warnings = Vec::new();
+        let mut raw_hits = Vec::new();
+        for segment in &segments {
+            let path = path_from_storage_uri(segment.storage_uri.as_str())?;
+            if !path.exists() {
+                unavailable_segment_ids.push(segment.capsule_id.clone());
+                continue;
+            }
+
+            let lock = self.lock_for_path(path.as_path()).await;
+            let _guard = lock.lock().await;
+            let path_for_task = path.clone();
+            let ask_request = memvid_thread_episodic_ask_request(
+                &request.profile,
+                &request.query,
+                request.scope.as_deref(),
+                mode,
+            );
+            let embedder_for_task = (*embedder).clone();
+            let segment_for_task = segment.clone();
+            let workspace_id = request.workspace_id.clone();
+            let thread_id = request.thread_id.clone();
+            let segment_hits = tokio::task::spawn_blocking(move || {
+                ask_segment_blocking(
+                    path_for_task,
+                    ask_request,
+                    embedder_for_task,
+                    segment_for_task,
+                    workspace_id.as_str(),
+                    thread_id.as_str(),
+                )
+            })
+            .await
+            .map_err(|error| {
+                ThreadEpisodicMemvidError::retryable(format!(
+                    "thread episodic memvid ask retrieval task failed: {error}"
+                ))
+            })?;
+
+            match segment_hits {
+                Ok(hits) => {
+                    searched_segment_ids.push(segment.capsule_id.clone());
+                    raw_hits.extend(hits);
+                }
+                Err(error) if error.kind == ThreadEpisodicMemvidFailureKind::NonRetryable => {
+                    unavailable_segment_ids.push(segment.capsule_id.clone());
+                    warnings.push(error.message);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        Ok(finalize_thread_episodic_search_output(
+            request,
+            raw_hits,
+            searched_segment_ids,
+            unavailable_segment_ids,
+            warnings,
+            true,
+        ))
+    }
+}
+
+fn finalize_thread_episodic_search_output(
+    request: ThreadEpisodicMemvidSearchRequest,
+    mut raw_hits: Vec<ThreadEpisodicMemvidSearchHit>,
+    searched_segment_ids: Vec<String>,
+    unavailable_segment_ids: Vec<String>,
+    warnings: Vec<String>,
+    native_memvid_adaptive_used: bool,
+) -> ThreadEpisodicMemvidSearchOutput {
+    raw_hits.sort_by(|left, right| {
+        score_or_zero(right.memvid_score)
+            .partial_cmp(&score_or_zero(left.memvid_score))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| right.segment_index.cmp(&left.segment_index))
+            .then_with(|| left.index_item_id.cmp(&right.index_item_id))
+    });
+
+    let scores = raw_hits
+        .iter()
+        .map(|hit| hit.memvid_score)
+        .collect::<Vec<_>>();
+    let (cutoff_len, adaptive) =
+        PioneerAdaptiveCutoff::cutoff_len(&scores, request.profile.adaptive_cutoff_config());
+    let raw_hits = raw_hits.into_iter().take(cutoff_len).collect::<Vec<_>>();
+    let filtered = filter_thread_episodic_search_candidates(
+        request.workspace_id.as_str(),
+        request.thread_id.as_str(),
+        raw_hits,
+    );
+    let mut ranked = rank_thread_episodic_search_hits(
+        filtered.hits,
+        ThreadEpisodicRankingContext {
+            exact_source: request.exact_source,
+            now_unix: None,
+        },
+    );
+    ranked.truncate(request.profile.max_candidates as usize);
+
+    let diagnostics = ThreadEpisodicSearchDiagnostics {
+        profile_kind: request.profile.kind,
+        search_mode: request.profile.mode,
+        searched_segment_count: searched_segment_ids.len() as u32,
+        searched_segment_ids,
+        unavailable_segment_ids,
+        raw_candidate_count: adaptive.candidate_count,
+        filtered_candidate_count: ranked.len() as u32,
+        returned_count: ranked.len() as u32,
+        adaptive,
+        native_memvid_adaptive_used,
+        suppressions: filtered.suppressions,
+        warnings,
+    };
+
+    ThreadEpisodicMemvidSearchOutput {
+        hits: ranked,
+        diagnostics,
     }
 }
 
@@ -762,19 +921,42 @@ fn index_item_blocking(
     path: PathBuf,
     request: ThreadEpisodicMemvidIndexRequest,
 ) -> Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError> {
+    if let Some(embedding) = request.embedding.as_ref() {
+        validate_index_embedding(embedding)?;
+    }
+    let embedding_identity = request
+        .embedding
+        .as_ref()
+        .map(|embedding| embedding.identity.clone());
     let mut memvid = open_or_create_memvid(path.as_path(), request.workspace_capsule)?;
+    if let Some(embedding) = request.embedding.as_ref() {
+        memvid.enable_vec().map_err(classify_memvid_error)?;
+        memvid
+            .set_vec_model(embedding.identity.memvid_model_id().as_str())
+            .map_err(classify_memvid_error)?;
+    }
     let options = index_put_options(&request);
     let payload = request.text.as_bytes().to_vec();
+    let embedding_vector = request
+        .embedding
+        .as_ref()
+        .map(|embedding| embedding.vector.clone());
     match memvid.frame_by_uri(request.frame_uri.as_str()) {
         Ok(frame) if frame.status == FrameStatus::Active => {
             memvid
-                .update_frame(frame.id, Some(payload), options, None)
+                .update_frame(frame.id, Some(payload), options, embedding_vector)
                 .map_err(classify_memvid_error)?;
         }
         _ => {
-            memvid
-                .put_bytes_with_options(payload.as_slice(), options)
-                .map_err(classify_memvid_error)?;
+            if let Some(embedding_vector) = embedding_vector {
+                memvid
+                    .put_with_embedding_and_options(payload.as_slice(), embedding_vector, options)
+                    .map_err(classify_memvid_error)?;
+            } else {
+                memvid
+                    .put_bytes_with_options(payload.as_slice(), options)
+                    .map_err(classify_memvid_error)?;
+            }
         }
     }
     memvid.commit().map_err(classify_memvid_error)?;
@@ -790,7 +972,54 @@ fn index_item_blocking(
         })?,
         frame_uri: request.frame_uri,
         stats,
+        embedding_identity,
     })
+}
+
+fn validate_index_embedding(
+    embedding: &ThreadEpisodicMemvidIndexEmbedding,
+) -> Result<(), ThreadEpisodicMemvidError> {
+    if embedding.vector.len() == embedding.identity.dimension {
+        return Ok(());
+    }
+
+    Err(ThreadEpisodicMemvidError::non_retryable(format!(
+        "thread episodic embedding dimension mismatch for `{}`/`{}`: expected {}, got {}",
+        embedding.identity.provider_id,
+        embedding.identity.model,
+        embedding.identity.dimension,
+        embedding.vector.len()
+    )))
+}
+
+fn ask_segment_blocking(
+    path: PathBuf,
+    request: AskRequest,
+    embedder: ThreadEpisodicMemvidEmbedder,
+    segment: ThreadEpisodicMemvidSearchSegment,
+    workspace_id: &str,
+    thread_id: &str,
+) -> Result<Vec<ThreadEpisodicMemvidSearchHit>, ThreadEpisodicMemvidError> {
+    let mut memvid = Memvid::open_read_only(path.as_path()).map_err(classify_memvid_error)?;
+    let response = memvid
+        .ask(request, Some(&embedder))
+        .map_err(classify_memvid_error)?;
+    let engine = response.retrieval.engine;
+    Ok(response
+        .retrieval
+        .hits
+        .into_iter()
+        .filter_map(|mut hit| {
+            hydrate_search_hit_metadata(&memvid, &mut hit);
+            search_hit_to_thread_episodic_hit(
+                hit,
+                engine.clone(),
+                &segment,
+                workspace_id,
+                thread_id,
+            )
+        })
+        .collect())
 }
 
 fn search_segment_blocking(
@@ -806,7 +1035,8 @@ fn search_segment_blocking(
     Ok(response
         .hits
         .into_iter()
-        .filter_map(|hit| {
+        .filter_map(|mut hit| {
+            hydrate_search_hit_metadata(&memvid, &mut hit);
             search_hit_to_thread_episodic_hit(
                 hit,
                 engine.clone(),
@@ -816,6 +1046,41 @@ fn search_segment_blocking(
             )
         })
         .collect())
+}
+
+fn hydrate_search_hit_metadata(memvid: &Memvid, hit: &mut SearchHit) {
+    if hit
+        .metadata
+        .as_ref()
+        .is_some_and(|metadata| !metadata.extra_metadata.is_empty())
+    {
+        return;
+    }
+
+    let Ok(frame) = memvid.frame_by_id(hit.frame_id) else {
+        return;
+    };
+
+    let existing = hit.metadata.take().unwrap_or_default();
+    hit.metadata = Some(SearchHitMetadata {
+        matches: existing.matches,
+        tags: frame.tags,
+        labels: if existing.labels.is_empty() {
+            frame.labels
+        } else {
+            existing.labels
+        },
+        track: existing.track.or(frame.track),
+        created_at: existing.created_at,
+        content_dates: if existing.content_dates.is_empty() {
+            frame.content_dates
+        } else {
+            existing.content_dates
+        },
+        entities: existing.entities,
+        extra_metadata: frame.extra_metadata,
+        temporal: None,
+    });
 }
 
 fn search_hit_to_thread_episodic_hit(
@@ -841,7 +1106,7 @@ fn search_hit_to_thread_episodic_hit(
         .unwrap_or_else(|| hit.uri.clone());
     let source_context = metadata
         .get("pioneer.thread_episodic.source_context")
-        .and_then(|value| serde_json::from_str::<ThreadEpisodicSourceContext>(value).ok())
+        .and_then(|value| parse_thread_episodic_source_context(value))
         .unwrap_or(ThreadEpisodicSourceContext::Unknown);
     let visibility = metadata
         .get("pioneer.thread_episodic.visibility")
@@ -915,6 +1180,37 @@ fn memvid_thread_episodic_search_request(
         as_of_frame: None,
         as_of_ts: None,
         no_sketch: true,
+        acl_context: None,
+        acl_enforcement_mode: AclEnforcementMode::default(),
+    }
+}
+
+fn memvid_thread_episodic_ask_request(
+    profile: &ThreadEpisodicSearchProfile,
+    query: &str,
+    scope: Option<&str>,
+    mode: ThreadEpisodicMemvidAskRetrievalMode,
+) -> AskRequest {
+    AskRequest {
+        question: query.to_owned(),
+        top_k: profile.max_candidates as usize,
+        snippet_chars: profile.snippet_chars as usize,
+        uri: None,
+        scope: scope.map(str::to_owned),
+        cursor: None,
+        start: None,
+        end: None,
+        temporal: profile.recent_start_unix.map(|start_utc| TemporalFilter {
+            start_utc: Some(start_utc),
+            end_utc: None,
+            phrase: None,
+            tz: None,
+        }),
+        context_only: true,
+        mode: mode.ask_mode(),
+        as_of_frame: None,
+        as_of_ts: None,
+        adaptive: None,
         acl_context: None,
         acl_enforcement_mode: AclEnforcementMode::default(),
     }
@@ -1048,6 +1344,28 @@ fn index_put_options(request: &ThreadEpisodicMemvidIndexRequest) -> PutOptions {
         builder = builder.tag(key.as_str(), value.as_str());
     }
 
+    if let Some(embedding) = request.embedding.as_ref() {
+        let dimension = embedding.identity.dimension.to_string();
+        builder = builder
+            .tag(
+                "pioneer.thread_episodic.embedding.provider_id",
+                embedding.identity.provider_id.as_str(),
+            )
+            .tag(
+                "pioneer.thread_episodic.embedding.model",
+                embedding.identity.model.as_str(),
+            )
+            .tag("pioneer.thread_episodic.embedding.dimension", dimension)
+            .tag(
+                "pioneer.thread_episodic.embedding.normalized",
+                if embedding.identity.normalized {
+                    "true"
+                } else {
+                    "false"
+                },
+            );
+    }
+
     builder.build()
 }
 
@@ -1152,6 +1470,28 @@ fn parse_thread_episodic_item_status(value: &str) -> Option<ThreadEpisodicItemSt
         "index_failed" | "failed" => Some(ThreadEpisodicItemStatus::IndexFailed),
         _ => None,
     }
+}
+
+fn parse_thread_episodic_source_context(value: &str) -> Option<ThreadEpisodicSourceContext> {
+    serde_json::from_str::<ThreadEpisodicSourceContext>(value)
+        .ok()
+        .or_else(|| match value {
+            "user_visible_thread_item" => Some(ThreadEpisodicSourceContext::UserVisibleThreadItem),
+            "user_visible_task_summary" => {
+                Some(ThreadEpisodicSourceContext::UserVisibleTaskSummary)
+            }
+            "thread_compaction_summary" => {
+                Some(ThreadEpisodicSourceContext::ThreadCompactionSummary)
+            }
+            "hidden_prompt" => Some(ThreadEpisodicSourceContext::HiddenPrompt),
+            "reasoning_trace" => Some(ThreadEpisodicSourceContext::ReasoningTrace),
+            "raw_tool_output" => Some(ThreadEpisodicSourceContext::RawToolOutput),
+            "raw_task_runtime" => Some(ThreadEpisodicSourceContext::RawTaskRuntime),
+            "internal_hook_runtime" => Some(ThreadEpisodicSourceContext::InternalHookRuntime),
+            "system_prompt" => Some(ThreadEpisodicSourceContext::SystemPrompt),
+            "developer_prompt" => Some(ThreadEpisodicSourceContext::DeveloperPrompt),
+            _ => None,
+        })
 }
 
 fn exact_source_boost(
@@ -1259,6 +1599,7 @@ fn classify_memvid_error(error: MemvidError) -> ThreadEpisodicMemvidError {
         | MemvidError::VecNotEnabled
         | MemvidError::ClipNotEnabled
         | MemvidError::VecDimensionMismatch { .. }
+        | MemvidError::ModelMismatch { .. }
         | MemvidError::InvalidTier
         | MemvidError::EncryptedFile { .. }
         | MemvidError::AuxiliaryFileDetected { .. }
@@ -1345,6 +1686,36 @@ pub fn thread_episodic_memvid_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::thread_episodic_embedding::ThreadEpisodicEmbeddingProvider;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct StaticEmbeddingProvider {
+        calls: Arc<AtomicUsize>,
+        embedding: Vec<f32>,
+    }
+
+    impl ThreadEpisodicEmbeddingProvider for StaticEmbeddingProvider {
+        fn provider_id(&self) -> &str {
+            "test"
+        }
+
+        fn model(&self) -> &str {
+            "test-embedding"
+        }
+
+        fn dimension(&self) -> usize {
+            self.embedding.len()
+        }
+
+        fn normalized(&self) -> bool {
+            true
+        }
+
+        fn embed_text(&self, _text: &str) -> Result<Vec<f32>, crate::ThreadEpisodicEmbeddingError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.embedding.clone())
+        }
+    }
 
     struct FakeThreadEpisodicMemvidBackend {
         capabilities: ThreadEpisodicMemvidBackendCapabilities,
@@ -1364,6 +1735,7 @@ mod tests {
                 frame_id: 7,
                 frame_uri: request.frame_uri,
                 stats: ThreadEpisodicMemvidStats::default(),
+                embedding_identity: request.embedding.map(|embedding| embedding.identity),
             })
         }
 
@@ -1399,6 +1771,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ask_retrieval_default_reports_unsupported_instead_of_lexical_fallback() {
+        let backend = FakeThreadEpisodicMemvidBackend {
+            capabilities: ThreadEpisodicMemvidBackendCapabilities::memvid_default(),
+        };
+        let provider = Arc::new(StaticEmbeddingProvider {
+            calls: Arc::new(AtomicUsize::new(0)),
+            embedding: vec![0.9, 0.1, 0.0],
+        });
+        let error = backend
+            .ask_retrieval(
+                ThreadEpisodicMemvidSearchRequest {
+                    workspace_id: "workspace_1".to_owned(),
+                    thread_id: "thread_1".to_owned(),
+                    query: "fallback".to_owned(),
+                    scope: None,
+                    profile: ThreadEpisodicSearchProfile::for_kind(
+                        ThreadEpisodicSearchProfileKind::DefaultContext,
+                    ),
+                    segments: Vec::new(),
+                    exact_source: None,
+                },
+                ThreadEpisodicMemvidAskRetrievalMode::Hybrid,
+                Arc::new(ThreadEpisodicMemvidEmbedder::new(provider)),
+            )
+            .await
+            .expect_err("default ask retrieval should be explicit unsupported");
+
+        assert_eq!(error.kind, ThreadEpisodicMemvidFailureKind::NonRetryable);
+        assert!(error.message.contains("ask retrieval is not implemented"));
+    }
+
+    #[tokio::test]
     async fn fake_backend_uses_typed_capabilities() {
         let backend = FakeThreadEpisodicMemvidBackend {
             capabilities: ThreadEpisodicMemvidBackendCapabilities::memvid_default(),
@@ -1415,7 +1819,11 @@ mod tests {
         );
         assert_eq!(
             capabilities.semantic_search,
-            ThreadEpisodicMemvidCapabilityState::Unsupported
+            ThreadEpisodicMemvidCapabilityState::Supported
+        );
+        assert_eq!(
+            capabilities.hybrid_search,
+            ThreadEpisodicMemvidCapabilityState::Supported
         );
         assert_eq!(
             capabilities.lexical_search,
@@ -1441,7 +1849,8 @@ mod tests {
             json["adaptive_retrieval_implementation"],
             "pioneer_fallback"
         );
-        assert_eq!(json["semantic_search"], "unsupported");
+        assert_eq!(json["semantic_search"], "supported");
+        assert_eq!(json["hybrid_search"], "supported");
         assert_eq!(json["lexical_search"], "supported");
         assert_eq!(json["temporal_search"], "supported");
         assert_eq!(json["graph_search"], "disabled");
@@ -1450,19 +1859,53 @@ mod tests {
     #[test]
     fn feature_audit_records_current_memvid_feature_set() {
         let audit = ThreadEpisodicMemvidFeatureAudit::current();
-        assert_eq!(audit.memvid_core_version, "2.0.139");
+        assert_eq!(audit.memvid_core_version, "3.1.0");
         assert!(audit.enabled_features.contains(&"lex".to_owned()));
         assert!(
             audit
                 .enabled_features
                 .contains(&"temporal_track".to_owned())
         );
-        assert!(audit.disabled_features.contains(&"vec".to_owned()));
+        assert!(audit.enabled_features.contains(&"vec".to_owned()));
+        assert!(audit.disabled_features.contains(&"api_embed".to_owned()));
         assert_eq!(
             audit.adaptive_retrieval_implementation,
             ThreadEpisodicAdaptiveRetrievalImplementation::PioneerFallback
         );
         assert!(audit.graph_search_note.contains("not enabled"));
+    }
+
+    #[test]
+    fn ask_retrieval_request_uses_context_only_hybrid_and_scope() {
+        let profile =
+            ThreadEpisodicSearchProfile::for_kind(ThreadEpisodicSearchProfileKind::DefaultContext);
+        let request = memvid_thread_episodic_ask_request(
+            &profile,
+            "architecture decision",
+            Some("thread_scope"),
+            ThreadEpisodicMemvidAskRetrievalMode::Hybrid,
+        );
+
+        assert_eq!(request.question, "architecture decision");
+        assert_eq!(request.mode, AskMode::Hybrid);
+        assert!(request.context_only);
+        assert_eq!(request.scope.as_deref(), Some("thread_scope"));
+        assert_eq!(request.top_k, profile.max_candidates as usize);
+    }
+
+    #[test]
+    fn ask_retrieval_request_supports_semantic_debug_mode() {
+        let profile =
+            ThreadEpisodicSearchProfile::for_kind(ThreadEpisodicSearchProfileKind::DefaultContext);
+        let request = memvid_thread_episodic_ask_request(
+            &profile,
+            "architecture decision",
+            None,
+            ThreadEpisodicMemvidAskRetrievalMode::Semantic,
+        );
+
+        assert_eq!(request.mode, AskMode::Sem);
+        assert!(request.context_only);
     }
 
     #[test]
@@ -1679,13 +2122,526 @@ mod tests {
                 frame_uri: frame_uri.to_owned(),
                 text: "workspace memory item".to_owned(),
                 metadata: BTreeMap::new(),
+                embedding: None,
             },
         )
         .expect("workspace item should index");
 
         assert_eq!(output.frame_uri, frame_uri);
+        assert_eq!(output.embedding_identity, None);
         assert_eq!(output.stats.capacity_bytes, Some(50 * 1024 * 1024));
         assert!(output.stats.remaining_capacity_bytes.is_some());
+    }
+
+    #[test]
+    fn lexical_write_does_not_initialize_vector_index_and_preserves_metadata() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("segment-lexical.mv2");
+        let frame_uri =
+            "mv2://workspace/workspace_1/thread/thread_1/turn/turn_1/item/item_1/index/index_1";
+
+        let output = index_item_blocking(
+            path.clone(),
+            ThreadEpisodicMemvidIndexRequest {
+                storage_uri: thread_episodic_storage_uri_from_path(path.as_path()),
+                capsule_id: "capsule_lexical".to_owned(),
+                capsule_ref:
+                    "mv2://pioneer/thread_episodic/workspace/workspace_hash/segments/000001/capsules/capsule_lexical".to_owned(),
+                workspace_capsule: true,
+                index_item_id: "index_item_lexical".to_owned(),
+                frame_uri: frame_uri.to_owned(),
+                text: "workspace lexical memory item".to_owned(),
+                metadata: thread_episodic_memvid_metadata(
+                    "workspace_1",
+                    "thread_1",
+                    "turn_1",
+                    "item_1",
+                    "assistant",
+                    "agent",
+                    "user_visible_thread_item",
+                    "text_hash",
+                    "source_text_hash",
+                ),
+                embedding: None,
+            },
+        )
+        .expect("lexical item should index");
+
+        assert_eq!(output.embedding_identity, None);
+        let memvid = Memvid::open(path.as_path()).expect("memvid should reopen");
+        assert_eq!(
+            memvid
+                .effective_vec_index_dimension()
+                .expect("vec dimension should inspect"),
+            None
+        );
+        let frame = memvid.frame_by_uri(frame_uri).expect("frame should exist");
+        assert_eq!(
+            frame
+                .extra_metadata
+                .get("pioneer.thread_episodic.index_item_id")
+                .map(String::as_str),
+            Some("index_item_lexical")
+        );
+        assert_eq!(
+            frame
+                .extra_metadata
+                .get("pioneer.thread_episodic.workspace_id")
+                .map(String::as_str),
+            Some("workspace_1")
+        );
+        assert!(
+            !frame
+                .extra_metadata
+                .contains_key("pioneer.thread_episodic.embedding.model")
+        );
+    }
+
+    #[test]
+    fn lexical_write_updates_existing_frame_by_uri_without_vector_index() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("segment-lexical-update.mv2");
+        let frame_uri =
+            "mv2://workspace/workspace_1/thread/thread_1/turn/turn_1/item/item_1/index/index_1";
+
+        let first = ThreadEpisodicMemvidIndexRequest {
+            storage_uri: thread_episodic_storage_uri_from_path(path.as_path()),
+            capsule_id: "capsule_lexical".to_owned(),
+            capsule_ref:
+                "mv2://pioneer/thread_episodic/workspace/workspace_hash/segments/000001/capsules/capsule_lexical".to_owned(),
+            workspace_capsule: true,
+            index_item_id: "index_item_lexical".to_owned(),
+            frame_uri: frame_uri.to_owned(),
+            text: "first lexical text".to_owned(),
+            metadata: BTreeMap::new(),
+            embedding: None,
+        };
+        let first_output =
+            index_item_blocking(path.clone(), first).expect("first lexical write should index");
+
+        let second_output = index_item_blocking(
+            path.clone(),
+            ThreadEpisodicMemvidIndexRequest {
+                storage_uri: thread_episodic_storage_uri_from_path(path.as_path()),
+                capsule_id: "capsule_lexical".to_owned(),
+                capsule_ref:
+                    "mv2://pioneer/thread_episodic/workspace/workspace_hash/segments/000001/capsules/capsule_lexical".to_owned(),
+                workspace_capsule: true,
+                index_item_id: "index_item_lexical".to_owned(),
+                frame_uri: frame_uri.to_owned(),
+                text: "second lexical text".to_owned(),
+                metadata: BTreeMap::new(),
+                embedding: None,
+            },
+        )
+        .expect("second lexical write should update existing frame");
+
+        assert_ne!(second_output.frame_id, first_output.frame_id);
+        assert_eq!(second_output.embedding_identity, None);
+        let memvid = Memvid::open(path.as_path()).expect("memvid should reopen");
+        assert_eq!(
+            memvid
+                .effective_vec_index_dimension()
+                .expect("vec dimension should inspect"),
+            None
+        );
+        let old_frame = memvid
+            .frame_by_id(first_output.frame_id as u64)
+            .expect("old frame should still be addressable");
+        assert_eq!(old_frame.status, FrameStatus::Superseded);
+        let frame = memvid.frame_by_uri(frame_uri).expect("frame should exist");
+        assert_eq!(frame.id, second_output.frame_id as u64);
+        assert_eq!(frame.status, FrameStatus::Active);
+        assert!(
+            frame
+                .search_text
+                .as_deref()
+                .is_some_and(|text| text.starts_with("second lexical text"))
+        );
+    }
+
+    #[test]
+    fn index_request_embedding_is_optional_and_validates_identity_dimension() {
+        let identity =
+            ThreadEpisodicEmbeddingIdentity::new("openai", "text-embedding-3-small", 3, true);
+        let embedding =
+            ThreadEpisodicMemvidIndexEmbedding::new(identity.clone(), vec![0.1, 0.2, 0.3])
+                .expect("matching embedding should build");
+
+        let request = ThreadEpisodicMemvidIndexRequest {
+            storage_uri: "file:///tmp/thread-episodic-vector.mv2".to_owned(),
+            capsule_id: "capsule_vector".to_owned(),
+            capsule_ref: "mv2://pioneer/thread_episodic/test/capsules/capsule_vector".to_owned(),
+            workspace_capsule: true,
+            index_item_id: "index_item_vector".to_owned(),
+            frame_uri:
+                "mv2://workspace/workspace_1/thread/thread_1/turn/turn_1/item/item_1/index/index_1"
+                    .to_owned(),
+            text: "vector-ready memory item".to_owned(),
+            metadata: BTreeMap::new(),
+            embedding: Some(embedding),
+        };
+
+        assert_eq!(
+            request.embedding.as_ref().map(|value| &value.identity),
+            Some(&identity)
+        );
+
+        let mismatch = ThreadEpisodicMemvidIndexEmbedding::new(identity, vec![0.1, 0.2])
+            .expect_err("dimension mismatch should fail before Memvid write");
+        assert_eq!(mismatch.kind, ThreadEpisodicMemvidFailureKind::NonRetryable);
+
+        let lexical_request = ThreadEpisodicMemvidIndexRequest {
+            embedding: None,
+            ..request
+        };
+        assert!(lexical_request.embedding.is_none());
+    }
+
+    #[test]
+    fn vector_write_creates_active_frame_with_embedding_metadata() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("segment-vector.mv2");
+        let frame_uri =
+            "mv2://workspace/workspace_1/thread/thread_1/turn/turn_1/item/item_1/index/index_1";
+        let identity =
+            ThreadEpisodicEmbeddingIdentity::new("openai", "text-embedding-3-small", 3, true);
+        let embedding =
+            ThreadEpisodicMemvidIndexEmbedding::new(identity.clone(), vec![0.1, 0.2, 0.3])
+                .expect("embedding should match identity dimension");
+
+        let output = index_item_blocking(
+            path.clone(),
+            ThreadEpisodicMemvidIndexRequest {
+                storage_uri: thread_episodic_storage_uri_from_path(path.as_path()),
+                capsule_id: "capsule_vector".to_owned(),
+                capsule_ref:
+                    "mv2://pioneer/thread_episodic/workspace/workspace_hash/segments/000001/capsules/capsule_vector".to_owned(),
+                workspace_capsule: true,
+                index_item_id: "index_item_vector".to_owned(),
+                frame_uri: frame_uri.to_owned(),
+                text: "workspace memory item with vectors".to_owned(),
+                metadata: thread_episodic_memvid_metadata(
+                    "workspace_1",
+                    "thread_1",
+                    "turn_1",
+                    "item_1",
+                    "user",
+                    "agent",
+                    "user_visible_thread_item",
+                    "text_hash",
+                    "source_text_hash",
+                ),
+                embedding: Some(embedding),
+            },
+        )
+        .expect("vector item should index");
+
+        assert_eq!(output.frame_uri, frame_uri);
+        assert_eq!(output.embedding_identity, Some(identity.clone()));
+
+        let memvid = Memvid::open(path.as_path()).expect("memvid should reopen");
+        assert_eq!(
+            memvid.effective_vec_index_dimension().expect("vec dim"),
+            Some(3)
+        );
+        let frame = memvid.frame_by_uri(frame_uri).expect("frame should exist");
+        assert_eq!(frame.status, FrameStatus::Active);
+        assert_eq!(
+            frame
+                .extra_metadata
+                .get("pioneer.thread_episodic.index_item_id")
+                .map(String::as_str),
+            Some("index_item_vector")
+        );
+        assert_eq!(
+            frame
+                .extra_metadata
+                .get("pioneer.thread_episodic.embedding.provider_id")
+                .map(String::as_str),
+            Some("openai")
+        );
+        assert_eq!(
+            frame
+                .extra_metadata
+                .get("pioneer.thread_episodic.embedding.model")
+                .map(String::as_str),
+            Some("text-embedding-3-small")
+        );
+        assert_eq!(
+            frame
+                .extra_metadata
+                .get("pioneer.thread_episodic.embedding.dimension")
+                .map(String::as_str),
+            Some("3")
+        );
+        assert_eq!(
+            frame
+                .extra_metadata
+                .get("pioneer.thread_episodic.embedding.normalized")
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn vector_write_dimension_mismatch_fails_before_file_mutation() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("segment-vector-mismatch.mv2");
+        let identity =
+            ThreadEpisodicEmbeddingIdentity::new("openai", "text-embedding-3-small", 3, true);
+        let error = index_item_blocking(
+            path.clone(),
+            ThreadEpisodicMemvidIndexRequest {
+                storage_uri: thread_episodic_storage_uri_from_path(path.as_path()),
+                capsule_id: "capsule_vector".to_owned(),
+                capsule_ref:
+                    "mv2://pioneer/thread_episodic/workspace/workspace_hash/segments/000001/capsules/capsule_vector".to_owned(),
+                workspace_capsule: true,
+                index_item_id: "index_item_vector".to_owned(),
+                frame_uri:
+                    "mv2://workspace/workspace_1/thread/thread_1/turn/turn_1/item/item_1/index/index_1"
+                        .to_owned(),
+                text: "workspace memory item with bad vector".to_owned(),
+                metadata: BTreeMap::new(),
+                embedding: Some(ThreadEpisodicMemvidIndexEmbedding {
+                    identity,
+                    vector: vec![0.1, 0.2],
+                }),
+            },
+        )
+        .expect_err("dimension mismatch should fail");
+
+        assert_eq!(error.kind, ThreadEpisodicMemvidFailureKind::NonRetryable);
+        assert!(
+            !path.exists(),
+            "dimension mismatch should fail before creating the .mv2 file"
+        );
+    }
+
+    #[tokio::test]
+    async fn ask_response_mapping_hybrid_ask_retrieval_uses_memvid_with_supplied_embedder() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("segment-ask-vector.mv2");
+        let frame_uri =
+            "mv2://workspace/workspace_1/thread/thread_1/turn/turn_1/item/item_1/index/index_1";
+        let identity = ThreadEpisodicEmbeddingIdentity::new("test", "test-embedding", 3, true);
+        let embedding = ThreadEpisodicMemvidIndexEmbedding::new(identity, vec![0.9, 0.1, 0.0])
+            .expect("embedding should match identity");
+
+        index_item_blocking(
+            path.clone(),
+            ThreadEpisodicMemvidIndexRequest {
+                storage_uri: thread_episodic_storage_uri_from_path(path.as_path()),
+                capsule_id: "capsule_ask".to_owned(),
+                capsule_ref:
+                    "mv2://pioneer/thread_episodic/workspace/workspace_hash/segments/000001/capsules/capsule_ask".to_owned(),
+                workspace_capsule: true,
+                index_item_id: "index_item_ask".to_owned(),
+                frame_uri: frame_uri.to_owned(),
+                text: "hybrid vector retrieval architecture decision".to_owned(),
+                metadata: thread_episodic_memvid_metadata(
+                    "workspace_1",
+                    "thread_1",
+                    "turn_1",
+                    "item_1",
+                    "user",
+                    "agent",
+                    "user_visible_thread_item",
+                    "text_hash",
+                    "source_text_hash",
+                ),
+                embedding: Some(embedding),
+            },
+        )
+        .expect("vector item should index");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(StaticEmbeddingProvider {
+            calls: calls.clone(),
+            embedding: vec![0.9, 0.1, 0.0],
+        });
+        let embedder = Arc::new(ThreadEpisodicMemvidEmbedder::new(provider));
+        let backend = MemvidThreadEpisodicBackend::new();
+        let output = backend
+            .ask_retrieval(
+                ThreadEpisodicMemvidSearchRequest {
+                    workspace_id: "workspace_1".to_owned(),
+                    thread_id: "thread_1".to_owned(),
+                    query: "architecture decision".to_owned(),
+                    scope: None,
+                    profile: ThreadEpisodicSearchProfile::for_kind(
+                        ThreadEpisodicSearchProfileKind::DefaultContext,
+                    ),
+                    segments: vec![ThreadEpisodicMemvidSearchSegment {
+                        capsule_id: "capsule_ask".to_owned(),
+                        capsule_ref:
+                            "mv2://pioneer/thread_episodic/workspace/workspace_hash/segments/000001/capsules/capsule_ask".to_owned(),
+                        storage_uri: thread_episodic_storage_uri_from_path(path.as_path()),
+                        segment_index: 1,
+                    }],
+                    exact_source: None,
+                },
+                ThreadEpisodicMemvidAskRetrievalMode::Hybrid,
+                embedder,
+            )
+            .await
+            .expect("ask retrieval should return hits");
+
+        assert!(
+            calls.load(Ordering::SeqCst) > 0,
+            "Memvid ask should call the supplied embedder for hybrid retrieval"
+        );
+        assert_eq!(output.diagnostics.native_memvid_adaptive_used, true);
+        assert_eq!(output.diagnostics.returned_count, 1);
+        let hit = &output.hits[0].hit;
+        assert_eq!(hit.index_item_id, "index_item_ask");
+        assert_eq!(hit.workspace_id, "workspace_1");
+        assert_eq!(hit.thread_id, "thread_1");
+        assert_eq!(hit.turn_id, "turn_1");
+        assert_eq!(hit.item_id, "item_1");
+        assert_eq!(hit.frame_uri, frame_uri);
+        assert!(hit.text.contains("hybrid vector retrieval"));
+        assert_eq!(
+            hit.metadata
+                .get("pioneer.thread_episodic.source_text_hash")
+                .map(String::as_str),
+            Some("source_text_hash")
+        );
+        assert!(hit.memvid_score.is_some());
+        assert_eq!(hit.lexical_score, hit.memvid_score);
+    }
+
+    #[tokio::test]
+    async fn segment_merge_hybrid_ask_retrieval_merges_segments_and_reports_unavailable() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path_one = temp_dir.path().join("segment-merge-one.mv2");
+        let path_two = temp_dir.path().join("segment-merge-two.mv2");
+        let missing_path = temp_dir.path().join("segment-merge-missing.mv2");
+        let identity = ThreadEpisodicEmbeddingIdentity::new("test", "test-embedding", 3, true);
+
+        for (path, capsule_id, index_item_id, turn_id, item_id, text) in [
+            (
+                path_one.as_path(),
+                "capsule_one",
+                "index_item_one",
+                "turn_one",
+                "item_one",
+                "architecture decision in first segment",
+            ),
+            (
+                path_two.as_path(),
+                "capsule_two",
+                "index_item_two",
+                "turn_two",
+                "item_two",
+                "architecture decision in second segment",
+            ),
+        ] {
+            index_item_blocking(
+                path.to_path_buf(),
+                ThreadEpisodicMemvidIndexRequest {
+                    storage_uri: thread_episodic_storage_uri_from_path(path),
+                    capsule_id: capsule_id.to_owned(),
+                    capsule_ref: format!(
+                        "mv2://pioneer/thread_episodic/workspace/workspace_hash/segments/{capsule_id}/capsules/{capsule_id}"
+                    ),
+                    workspace_capsule: true,
+                    index_item_id: index_item_id.to_owned(),
+                    frame_uri: format!(
+                        "mv2://workspace/workspace_1/thread/thread_1/turn/{turn_id}/item/{item_id}/index/{index_item_id}"
+                    ),
+                    text: text.to_owned(),
+                    metadata: thread_episodic_memvid_metadata(
+                        "workspace_1",
+                        "thread_1",
+                        turn_id,
+                        item_id,
+                        "user",
+                        "agent",
+                        "user_visible_thread_item",
+                        "text_hash",
+                        "source_text_hash",
+                    ),
+                    embedding: Some(
+                        ThreadEpisodicMemvidIndexEmbedding::new(
+                            identity.clone(),
+                            vec![0.9, 0.1, 0.0],
+                        )
+                        .expect("embedding should match identity"),
+                    ),
+                },
+            )
+            .expect("vector item should index");
+        }
+
+        let provider = Arc::new(StaticEmbeddingProvider {
+            calls: Arc::new(AtomicUsize::new(0)),
+            embedding: vec![0.9, 0.1, 0.0],
+        });
+        let embedder = Arc::new(ThreadEpisodicMemvidEmbedder::new(provider));
+        let backend = MemvidThreadEpisodicBackend::new();
+        let request = ThreadEpisodicMemvidSearchRequest {
+            workspace_id: "workspace_1".to_owned(),
+            thread_id: "thread_1".to_owned(),
+            query: "architecture decision".to_owned(),
+            scope: Some("mv2://workspace/workspace_1/thread/thread_1/".to_owned()),
+            profile: ThreadEpisodicSearchProfile::for_kind(
+                ThreadEpisodicSearchProfileKind::DefaultContext,
+            ),
+            segments: vec![
+                ThreadEpisodicMemvidSearchSegment {
+                    capsule_id: "capsule_one".to_owned(),
+                    capsule_ref:
+                        "mv2://pioneer/thread_episodic/workspace/workspace_hash/segments/one/capsules/capsule_one"
+                            .to_owned(),
+                    storage_uri: thread_episodic_storage_uri_from_path(path_one.as_path()),
+                    segment_index: 1,
+                },
+                ThreadEpisodicMemvidSearchSegment {
+                    capsule_id: "capsule_two".to_owned(),
+                    capsule_ref:
+                        "mv2://pioneer/thread_episodic/workspace/workspace_hash/segments/two/capsules/capsule_two"
+                            .to_owned(),
+                    storage_uri: thread_episodic_storage_uri_from_path(path_two.as_path()),
+                    segment_index: 2,
+                },
+                ThreadEpisodicMemvidSearchSegment {
+                    capsule_id: "capsule_missing".to_owned(),
+                    capsule_ref:
+                        "mv2://pioneer/thread_episodic/workspace/workspace_hash/segments/missing/capsules/capsule_missing"
+                            .to_owned(),
+                    storage_uri: thread_episodic_storage_uri_from_path(missing_path.as_path()),
+                    segment_index: 3,
+                },
+            ],
+            exact_source: None,
+        };
+
+        let output = backend
+            .ask_retrieval(
+                request,
+                ThreadEpisodicMemvidAskRetrievalMode::Hybrid,
+                embedder,
+            )
+            .await
+            .expect("ask retrieval should merge segment hits");
+
+        assert_eq!(
+            output.diagnostics.searched_segment_ids,
+            vec!["capsule_two".to_owned(), "capsule_one".to_owned()]
+        );
+        assert_eq!(
+            output.diagnostics.unavailable_segment_ids,
+            vec!["capsule_missing".to_owned()]
+        );
+        let returned_ids = output
+            .hits
+            .iter()
+            .map(|hit| hit.hit.index_item_id.as_str())
+            .collect::<Vec<_>>();
+        assert!(returned_ids.contains(&"index_item_one"));
+        assert!(returned_ids.contains(&"index_item_two"));
     }
 
     fn test_hit(
