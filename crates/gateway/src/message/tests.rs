@@ -21765,6 +21765,152 @@ async fn live_semantic_timeline_pending_request_projects_approval_block() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_semantic_timeline_child_pending_request_projects_to_parent_thread() {
+    let mut harness = setup_live_semantic_timeline_harness("child_approval").await;
+    let now = chrono::Utc::now().fixed_offset();
+    let child_thread_id = "thr_semantic_live_child_approval_child";
+    let child_turn_id = "turn_semantic_live_child_approval_child";
+    let request_id = "semantic_live_child_approval_req";
+    materialize_artifact_api_thread(
+        harness.processor.crud_store.as_ref(),
+        harness.workspace_id.as_str(),
+        child_thread_id,
+        child_turn_id,
+    )
+    .await;
+    harness
+        .processor
+        .crud_store
+        .append_task_event(
+            TaskEventPayload::TaskThreadLineageCreated {
+                task_id: "task_semantic_live_child_approval".to_owned(),
+                run_id: "run_semantic_live_child_approval".to_owned(),
+                lineage: TaskThreadLineage {
+                    child_thread_id: child_thread_id.to_owned(),
+                    parent_thread_id: harness.thread_id.clone(),
+                    root_thread_id: harness.thread_id.clone(),
+                    depth: 1,
+                    origin_kind: Some("task_run".to_owned()),
+                    created_by_thread_id: Some(harness.thread_id.clone()),
+                    created_by_turn_id: Some(harness.turn_id.clone()),
+                    created_at: 10,
+                },
+            },
+            10,
+        )
+        .await
+        .expect("child task lineage should persist");
+
+    let pending_payload = CLIRuntimePendingRequest {
+        kind: CLIRuntimeRequestKind::CommandApproval,
+        title: Some("Run child command".to_owned()),
+        message: Some("Approve child semantic live command".to_owned()),
+        native_request_id: Some("semantic-native-child-approval".to_owned()),
+        payload: Some(json!({
+            "command": "echo child approval"
+        })),
+    };
+    harness
+        .processor
+        .open_cli_runtime_pending_request(NewCliRuntimePendingRequest {
+            request_id: request_id.to_owned(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            workspace_id: harness.workspace_id.clone(),
+            thread_id: child_thread_id.to_owned(),
+            turn_id: Some(child_turn_id.to_owned()),
+            native_thread_id: Some("semantic-native-child-thread".to_owned()),
+            native_turn_id: Some("semantic-native-child-turn".to_owned()),
+            native_item_id: Some("semantic-native-child-item".to_owned()),
+            request_kind: "command_approval".to_owned(),
+            payload_json: pioneer_crud::serialize_cli_runtime_json(&pending_payload)
+                .expect("pending request payload should serialize"),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("child pending request should open");
+
+    let blocks_changed =
+        recv_notification_by_method(&mut harness.rx, events::THREAD_TIMELINE_BLOCKS_CHANGED).await;
+    let blocks_changed: pioneer_protocol::ThreadTimelineBlocksChangedNotification =
+        serde_json::from_value(
+            blocks_changed
+                .params
+                .expect("timeline blocks notification should include params"),
+        )
+        .expect("timeline blocks notification should decode");
+    assert_eq!(blocks_changed.thread_id, harness.thread_id);
+    assert_eq!(
+        blocks_changed.changed_block_ids,
+        vec![pioneer_crud::approval_block_id(child_turn_id, request_id)]
+    );
+
+    let page = request_live_thread_timeline_page(&mut harness, "child-approval-parent-page").await;
+    let approval = page
+        .blocks
+        .iter()
+        .find_map(|block| match &block.kind {
+            pioneer_protocol::TimelineBlockKind::PendingRequest {
+                request_id,
+                status,
+                item_id,
+                request,
+                ..
+            } => Some((block, request_id, status, item_id, request)),
+            _ => None,
+        })
+        .expect("parent page should contain child approval proxy block");
+    assert_eq!(approval.0.thread_id, child_thread_id);
+    assert_eq!(approval.0.turn_id.as_deref(), Some(child_turn_id));
+    assert_eq!(approval.1, request_id);
+    assert_eq!(
+        *approval.2,
+        pioneer_protocol::CLIRuntimePendingRequestStatus::Pending
+    );
+    assert_eq!(approval.3.as_deref(), Some("semantic-native-child-item"));
+    assert_eq!(approval.4.title.as_deref(), Some("Run child command"));
+
+    let resolved_at = now + chrono::TimeDelta::milliseconds(1);
+    let resolved = harness
+        .processor
+        .crud_store
+        .resolve_cli_runtime_pending_request(pioneer_crud::ResolveCliRuntimePendingRequest {
+            request_id: request_id.to_owned(),
+            status: pioneer_crud::CliRuntimePendingRequestStatus::Answered,
+            response_json: Some(
+                pioneer_crud::serialize_cli_runtime_json(&CLIRuntimeRequestResolution::Approved)
+                    .expect("resolved payload should serialize"),
+            ),
+            updated_at: resolved_at,
+            resolved_at,
+        })
+        .await
+        .expect("child pending request should resolve")
+        .expect("child pending request should exist");
+    harness
+        .processor
+        .notify_semantic_timeline_pending_request_changed(&resolved)
+        .await;
+
+    let removed_blocks =
+        recv_notification_by_method(&mut harness.rx, events::THREAD_TIMELINE_BLOCKS_CHANGED).await;
+    let removed_blocks: pioneer_protocol::ThreadTimelineBlocksChangedNotification =
+        serde_json::from_value(
+            removed_blocks
+                .params
+                .expect("timeline blocks notification should include params"),
+        )
+        .expect("timeline blocks notification should decode");
+    assert_eq!(removed_blocks.thread_id, harness.thread_id);
+    assert_eq!(removed_blocks.changed_block_ids, Vec::<String>::new());
+    assert_eq!(
+        removed_blocks.removed_block_ids,
+        vec![pioneer_crud::approval_block_id(child_turn_id, request_id)]
+    );
+}
+
 async fn setup_semantic_timeline_query_harness() -> SemanticTimelineQueryHarness {
     setup_semantic_timeline_query_harness_inner(false).await
 }

@@ -1,6 +1,14 @@
+use super::view::merge_pending_timeline_render_rows;
 use super::{TimelineRenderModel, TimelineRenderRow};
 use crate::app::{conversation::ConversationViewState, root::PioneerDesktop};
-use pioneer_client::timeline::{semantic, semantic_render::render_semantic_timeline_rows};
+use pioneer_client::{
+    cli_runtime::approvals::{CLIRuntimePendingRequestEntry, PendingRequest},
+    timeline::{
+        semantic::{self, SemanticTimelineRow, SemanticTimelineRowKind},
+        semantic_render::render_semantic_timeline_rows,
+    },
+};
+use pioneer_protocol::{CLIRuntimePendingRequestStatus, TimelineBlock, TimelineBlockKind};
 use std::rc::Rc;
 
 pub(in crate::app::thread::view::timeline) const SEMANTIC_TURN_WORK_GROUP_PREFIX: &str =
@@ -43,6 +51,10 @@ impl PioneerDesktop {
             .into_iter()
             .map(TimelineRenderRow::Timeline)
             .collect();
+        let rows = merge_pending_timeline_render_rows(
+            Rc::new(rows),
+            pending_requests_from_semantic_rows(semantic_rows.rows.as_slice()),
+        );
 
         let model = TimelineRenderModel {
             projection: Rc::new(projection),
@@ -82,16 +94,53 @@ impl PioneerDesktop {
     }
 }
 
+fn pending_requests_from_semantic_rows(rows: &[SemanticTimelineRow]) -> Vec<PendingRequest> {
+    rows.iter()
+        .filter_map(|row| match &row.kind {
+            SemanticTimelineRowKind::PendingRequest { block } => {
+                pending_request_from_semantic_block(block)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn pending_request_from_semantic_block(block: &TimelineBlock) -> Option<PendingRequest> {
+    let TimelineBlockKind::PendingRequest {
+        runtime_id,
+        request_id,
+        status,
+        item_id,
+        request,
+    } = &block.kind
+    else {
+        return None;
+    };
+    if *status != CLIRuntimePendingRequestStatus::Pending {
+        return None;
+    }
+
+    Some(
+        CLIRuntimePendingRequestEntry {
+            workspace_id: block.workspace_id.clone(),
+            runtime_id: runtime_id.clone(),
+            request_id: request_id.clone(),
+            thread_id: Some(block.thread_id.clone()),
+            turn_id: block.turn_id.clone(),
+            item_id: item_id.clone(),
+            request: request.clone(),
+        }
+        .into_pending_request(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::thread::view::timeline::view::merge_pending_timeline_render_rows;
-    use pioneer_client::{
-        cli_runtime::approvals::{CLIRuntimePendingRequestEntry, PendingRequest},
-        timeline::{
-            labels::RunningTurnDisplay,
-            rows::{TimelineRow, TimelineRowKind},
-        },
+    use pioneer_client::timeline::{
+        labels::RunningTurnDisplay,
+        rows::{TimelineRow, TimelineRowKind},
+        semantic::SemanticTimelineRowId,
     };
     use pioneer_protocol::{
         CLIRuntimePendingRequest, CLIRuntimeRequestKind, TurnPermissionApprovalRequest,
@@ -107,6 +156,7 @@ mod tests {
                     turn_id: "turn_a".to_owned(),
                     started_at_unix_ms: None,
                     permission_profile: None,
+                    security_summary: None,
                 }),
             ),
         ]);
@@ -126,6 +176,48 @@ mod tests {
         assert!(matches!(merged[2], TimelineRenderRow::PendingRequest(_)));
         assert_eq!(merged[1].key(), "timeline-pending-request::native_req");
         assert_eq!(merged[2].key(), "timeline-pending-request::cli_req");
+    }
+
+    #[test]
+    fn semantic_pending_requests_preserve_child_thread_scope() {
+        let pending_requests = pending_requests_from_semantic_rows(&[SemanticTimelineRow {
+            id: SemanticTimelineRowId::TopLevelBlock {
+                block_id: "approval_block".to_owned(),
+            },
+            kind: SemanticTimelineRowKind::PendingRequest {
+                block: TimelineBlock {
+                    workspace_id: "workspace_a".to_owned(),
+                    thread_id: "child_thread".to_owned(),
+                    block_id: "approval_block".to_owned(),
+                    turn_id: Some("child_turn".to_owned()),
+                    sort_key: "0001".to_owned(),
+                    started_at_unix_ms: Some(1),
+                    updated_at_unix_ms: Some(2),
+                    kind: TimelineBlockKind::PendingRequest {
+                        runtime_id: "codex".to_owned(),
+                        request_id: "child_req".to_owned(),
+                        status: CLIRuntimePendingRequestStatus::Pending,
+                        item_id: Some("child_item".to_owned()),
+                        request: CLIRuntimePendingRequest {
+                            kind: CLIRuntimeRequestKind::CommandApproval,
+                            title: Some("Run command".to_owned()),
+                            message: None,
+                            native_request_id: None,
+                            payload: None,
+                        },
+                    },
+                },
+            },
+        }]);
+
+        assert_eq!(pending_requests.len(), 1);
+        assert_eq!(pending_requests[0].request_id, "child_req");
+        assert_eq!(
+            pending_requests[0].thread_id.as_deref(),
+            Some("child_thread")
+        );
+        assert_eq!(pending_requests[0].turn_id.as_deref(), Some("child_turn"));
+        assert_eq!(pending_requests[0].item_id.as_deref(), Some("child_item"));
     }
 
     fn timeline_row(key: &str, kind: TimelineRowKind) -> TimelineRenderRow {

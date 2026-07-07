@@ -2,7 +2,7 @@ use super::items::format_elapsed_ms;
 use super::model::{TimelineRow, TimelineRowKind};
 use crate::app::root::PioneerDesktop;
 use gpui::{ImageSource, Resource, prelude::*, *};
-use gpui_component::{StyledExt, h_flex, theme::ActiveTheme};
+use gpui_component::{StyledExt, h_flex, theme::ActiveTheme, v_flex};
 use pioneer_client::timeline::labels::{RunningTurnDisplay, now_unix_ms};
 use std::{rc::Rc, time::Duration};
 
@@ -37,7 +37,7 @@ impl PioneerDesktop {
     ) -> Size<Pixels> {
         let top = if is_first_row { px(40.) } else { px(10.) };
         let bottom = if is_last_row { px(40.) } else { px(10.) };
-        size(px(0.), top + px(52.) + bottom + px(1.))
+        size(px(0.), top + px(66.) + bottom + px(1.))
     }
 
     pub(super) fn hydrate_running_turn_rows(
@@ -156,10 +156,17 @@ impl PioneerDesktop {
                         ),
                     )
                     .child(
-                        div()
+                        v_flex()
                             .pt_1()
-                            .font_semibold()
-                            .child(t!("timeline.running.turn").to_string()),
+                            .gap_1()
+                            .child(
+                                div()
+                                    .font_semibold()
+                                    .child(t!("timeline.running.turn").to_string()),
+                            )
+                            .when_some(running_turn.security_summary.as_ref(), |this, summary| {
+                                this.child(self.render_turn_security_summary(summary, cx))
+                            }),
                     ),
             )
             .child(div().id(elapsed_id).pt_1().font_semibold().child(elapsed))

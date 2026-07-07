@@ -15,8 +15,14 @@ use crate::app::{
 };
 use crate::assets::PioneerIconName;
 use gpui::{prelude::*, *};
-use gpui_component::{Icon, IconName, h_flex, theme::ActiveTheme, v_flex};
-use pioneer_client::timeline::labels as timeline_labels;
+use gpui_component::{Icon, IconName, StyledExt, h_flex, theme::ActiveTheme, v_flex};
+use pioneer_client::{
+    security::{
+        ClientSecurityEnforcementStatus, ClientSecurityFilesystemAccess, ClientTurnSecuritySummary,
+        security_diagnostic_rows, security_summary_label,
+    },
+    timeline::labels as timeline_labels,
+};
 use pioneer_protocol::{TaskStatus, TurnItem, TurnPermissionMode, TurnPermissionProfileSnapshot};
 use std::hash::{Hash, Hasher};
 
@@ -107,6 +113,62 @@ impl PioneerDesktop {
                     .text_ellipsis()
                     .child(display.label),
             )
+            .into_any_element()
+    }
+
+    pub(super) fn turn_security_icon(summary: &ClientTurnSecuritySummary) -> PioneerIconName {
+        match summary.enforcement {
+            ClientSecurityEnforcementStatus::Unavailable => PioneerIconName::ShieldX,
+            ClientSecurityEnforcementStatus::Degraded => PioneerIconName::ShieldAlert,
+            ClientSecurityEnforcementStatus::Active => match summary.filesystem_access {
+                ClientSecurityFilesystemAccess::Unrestricted => PioneerIconName::ShieldCheck,
+                ClientSecurityFilesystemAccess::ReadOnly => PioneerIconName::ShieldX,
+                ClientSecurityFilesystemAccess::WorkspaceWrite => PioneerIconName::ShieldAlert,
+            },
+        }
+    }
+
+    pub(super) fn render_turn_security_badge(
+        &self,
+        summary: &ClientTurnSecuritySummary,
+        _: &mut Context<Self>,
+    ) -> AnyElement {
+        h_flex()
+            .items_center()
+            .gap_1()
+            .text_xs()
+            .opacity(0.72)
+            .child(Icon::new(Self::turn_security_icon(summary)).size_3())
+            .child(
+                div()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .child(security_summary_label(summary)),
+            )
+            .into_any_element()
+    }
+
+    pub(super) fn render_turn_security_summary(
+        &self,
+        summary: &ClientTurnSecuritySummary,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let diagnostic_rows = security_diagnostic_rows(summary);
+
+        v_flex()
+            .gap_1()
+            .child(self.render_turn_security_badge(summary, cx))
+            .children(diagnostic_rows.into_iter().take(2).map(|row| {
+                h_flex()
+                    .items_start()
+                    .gap_1()
+                    .text_xs()
+                    .opacity(0.62)
+                    .child(div().font_medium().child(row.label))
+                    .child(div().child(row.message))
+                    .into_any_element()
+            }))
             .into_any_element()
     }
 

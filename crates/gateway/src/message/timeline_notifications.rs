@@ -132,6 +132,70 @@ impl MessageProcessor {
             turn_id,
         )
         .await;
+        self.notify_semantic_timeline_pending_request_changed_for_ancestors(request, turn_id)
+            .await;
+    }
+
+    async fn notify_semantic_timeline_pending_request_changed_for_ancestors(
+        &self,
+        request: &CliRuntimePendingRequestRecord,
+        turn_id: &str,
+    ) {
+        let ancestor_thread_ids = self.pending_request_ancestor_thread_ids(request).await;
+        if ancestor_thread_ids.is_empty() {
+            return;
+        }
+
+        let block_id = approval_block_id(turn_id, request.request_id.as_str());
+        let is_pending = request.status == StoredCliRuntimePendingRequestStatus::Pending;
+        for ancestor_thread_id in ancestor_thread_ids {
+            let (changed_block_ids, removed_block_ids) = if is_pending {
+                (vec![block_id.clone()], Vec::new())
+            } else {
+                (Vec::new(), vec![block_id.clone()])
+            };
+            self.notify_semantic_timeline_blocks_changed(
+                request.workspace_id.as_str(),
+                ancestor_thread_id.as_str(),
+                changed_block_ids,
+                removed_block_ids,
+            )
+            .await;
+        }
+    }
+
+    async fn pending_request_ancestor_thread_ids(
+        &self,
+        request: &CliRuntimePendingRequestRecord,
+    ) -> Vec<String> {
+        let mut ancestor_thread_ids = Vec::new();
+        let mut seen = HashSet::<String>::new();
+        let mut current = request.thread_id.clone();
+        for _ in 0..64 {
+            let lineage = match self
+                .crud_store
+                .get_task_thread_lineage(current.as_str())
+                .await
+            {
+                Ok(Some(lineage)) => lineage,
+                Ok(None) => break,
+                Err(error) => {
+                    warn!(
+                        thread_id = current,
+                        error = %format!("{error:#}"),
+                        "failed to resolve ancestor timeline targets for pending request"
+                    );
+                    break;
+                }
+            };
+            let parent_thread_id = lineage.parent_thread_id;
+            if !seen.insert(parent_thread_id.clone()) {
+                break;
+            }
+            ancestor_thread_ids.push(parent_thread_id.clone());
+            current = parent_thread_id;
+        }
+        ancestor_thread_ids
     }
 
     async fn notify_semantic_timeline_blocks_changed(

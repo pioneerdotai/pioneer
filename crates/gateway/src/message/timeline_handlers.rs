@@ -7,14 +7,15 @@ use super::*;
 use anyhow::{Context, Result, anyhow};
 use pioneer_crud::{
     BLOCK_KIND_APPROVAL, BLOCK_KIND_ASSISTANT_MESSAGE, BLOCK_KIND_RUNNING, BLOCK_KIND_SYSTEM,
-    BLOCK_KIND_TURN_WORK, BLOCK_KIND_USER_MESSAGE, ProjectionPageAnchor,
-    SEMANTIC_TIMELINE_PROJECTION_VERSION, WORK_VISIBILITY_VISIBLE,
+    BLOCK_KIND_TURN_WORK, BLOCK_KIND_USER_MESSAGE, CliRuntimePendingRequestListFilter,
+    ProjectionPageAnchor, SEMANTIC_TIMELINE_PROJECTION_VERSION, WORK_VISIBILITY_VISIBLE,
+    approval_block_id,
 };
 use pioneer_entity::{thread_timeline_block, turn_work_item_projection, turn_work_projection};
 use pioneer_protocol::{
     CLIRuntimePendingRequest, CLIRuntimePendingRequestStatus, CLIRuntimeRequestKind,
-    ThreadTimelinePageParams, ThreadTimelinePageResponse, TimelineBlock, TimelineBlockKind,
-    TimelinePageInfo, TurnItem, TurnWorkBlock, TurnWorkItem, TurnWorkItemStatus,
+    TaskThreadLineage, ThreadTimelinePageParams, ThreadTimelinePageResponse, TimelineBlock,
+    TimelineBlockKind, TimelinePageInfo, TurnItem, TurnWorkBlock, TurnWorkItem, TurnWorkItemStatus,
     TurnWorkPageParams, TurnWorkPageResponse, TurnWorkPresentation, TurnWorkState, UserInput,
     UserMessageAttachment,
 };
@@ -154,7 +155,9 @@ impl MessageProcessor {
             }
         };
 
-        let blocks = match self.thread_timeline_blocks_from_rows(rows_page.rows).await {
+        let requested_thread_id = params.thread_id.clone();
+        let workspace_id = thread_model.workspace_id.clone();
+        let mut blocks = match self.thread_timeline_blocks_from_rows(rows_page.rows).await {
             Ok(blocks) => blocks,
             Err(error) => {
                 self.send_error(
@@ -169,14 +172,33 @@ impl MessageProcessor {
                 return;
             }
         };
+        let descendant_pending_blocks = match self
+            .descendant_pending_request_blocks(workspace_id.as_str(), requested_thread_id.as_str())
+            .await
+        {
+            Ok(blocks) => blocks,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to load descendant pending approvals: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+        append_timeline_blocks_dedup(&mut blocks, descendant_pending_blocks);
 
         self.session_manager
-            .set_connection_workspace(connection_id, Some(thread_model.workspace_id.clone()))
+            .set_connection_workspace(connection_id, Some(workspace_id.clone()))
             .await;
 
         let response_payload = ThreadTimelinePageResponse {
-            workspace_id: thread_model.workspace_id,
-            thread_id: params.thread_id,
+            workspace_id,
+            thread_id: requested_thread_id,
             projection_version: SEMANTIC_TIMELINE_PROJECTION_VERSION,
             blocks,
             page: page_info,
@@ -773,6 +795,74 @@ impl MessageProcessor {
         Ok(blocks)
     }
 
+    async fn descendant_pending_request_blocks(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+    ) -> Result<Vec<TimelineBlock>> {
+        let descendant_thread_ids = self.descendant_task_thread_ids(thread_id).await?;
+        if descendant_thread_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut blocks = Vec::new();
+        for descendant_thread_id in descendant_thread_ids {
+            let requests = self
+                .crud_store
+                .list_cli_runtime_pending_requests(CliRuntimePendingRequestListFilter {
+                    workspace_id: Some(workspace_id.to_owned()),
+                    thread_id: Some(descendant_thread_id),
+                    status: Some(StoredCliRuntimePendingRequestStatus::Pending),
+                    ..Default::default()
+                })
+                .await?;
+            for request in requests {
+                if let Some(block) = pending_request_proxy_block(request)? {
+                    blocks.push(block);
+                }
+            }
+        }
+        blocks.sort_by(|left, right| {
+            left.sort_key
+                .cmp(&right.sort_key)
+                .then_with(|| left.block_id.cmp(&right.block_id))
+        });
+        Ok(blocks)
+    }
+
+    async fn descendant_task_thread_ids(&self, thread_id: &str) -> Result<Vec<String>> {
+        let root_thread_id = self
+            .crud_store
+            .get_task_thread_lineage(thread_id)
+            .await?
+            .map(|lineage| lineage.root_thread_id)
+            .unwrap_or_else(|| thread_id.to_owned());
+        let lineage_rows = self
+            .crud_store
+            .list_task_thread_lineage_by_root_thread(root_thread_id.as_str())
+            .await?;
+        if lineage_rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let parent_by_child = parent_by_child_thread_id(lineage_rows.as_slice());
+        let mut descendants = Vec::new();
+        let mut seen = HashSet::<String>::new();
+        for lineage in lineage_rows {
+            if lineage.child_thread_id != thread_id
+                && timeline_lineage_descends_from(
+                    lineage.child_thread_id.as_str(),
+                    thread_id,
+                    &parent_by_child,
+                )
+                && seen.insert(lineage.child_thread_id.clone())
+            {
+                descendants.push(lineage.child_thread_id);
+            }
+        }
+        Ok(descendants)
+    }
+
     async fn thread_timeline_block_from_row(
         &self,
         row: thread_timeline_block::Model,
@@ -1203,6 +1293,102 @@ fn parse_cli_runtime_pending_request_status(value: &str) -> CLIRuntimePendingReq
         "expired" => CLIRuntimePendingRequestStatus::Expired,
         _ => CLIRuntimePendingRequestStatus::Expired,
     }
+}
+
+fn pending_request_proxy_block(
+    record: CliRuntimePendingRequestRecord,
+) -> Result<Option<TimelineBlock>> {
+    if record.status != StoredCliRuntimePendingRequestStatus::Pending {
+        return Ok(None);
+    }
+    let Some(turn_id) = record.turn_id.clone() else {
+        return Ok(None);
+    };
+
+    let request = serde_json::from_str::<CLIRuntimePendingRequest>(record.payload_json.as_str())
+        .with_context(|| {
+            format!(
+                "failed to decode CLI runtime pending request `{}` payload",
+                record.request_id
+            )
+        })?;
+    let sort_key = pending_request_proxy_sort_key(&record, turn_id.as_str());
+
+    Ok(Some(TimelineBlock {
+        workspace_id: record.workspace_id,
+        thread_id: record.thread_id,
+        block_id: approval_block_id(turn_id.as_str(), record.request_id.as_str()),
+        turn_id: Some(turn_id.clone()),
+        sort_key,
+        started_at_unix_ms: Some(record.created_at.timestamp_millis()),
+        updated_at_unix_ms: Some(record.updated_at.timestamp_millis()),
+        kind: TimelineBlockKind::PendingRequest {
+            runtime_id: record.runtime_id,
+            request_id: record.request_id,
+            status: CLIRuntimePendingRequestStatus::Pending,
+            item_id: record.native_item_id,
+            request,
+        },
+    }))
+}
+
+fn pending_request_proxy_sort_key(
+    record: &CliRuntimePendingRequestRecord,
+    turn_id: &str,
+) -> String {
+    format!(
+        "{:020}:{}:150:approval:{}",
+        record.created_at.timestamp_millis().max(0),
+        turn_id,
+        record.request_id
+    )
+}
+
+fn parent_by_child_thread_id(lineage_rows: &[TaskThreadLineage]) -> HashMap<String, String> {
+    let mut parent_by_child = HashMap::new();
+    for lineage in lineage_rows {
+        parent_by_child.insert(
+            lineage.child_thread_id.clone(),
+            lineage.parent_thread_id.clone(),
+        );
+    }
+    parent_by_child
+}
+
+fn timeline_lineage_descends_from(
+    child_thread_id: &str,
+    ancestor_thread_id: &str,
+    parent_by_child: &HashMap<String, String>,
+) -> bool {
+    let mut current = child_thread_id;
+    for _ in 0..=parent_by_child.len() {
+        let Some(parent) = parent_by_child.get(current) else {
+            return false;
+        };
+        if parent == ancestor_thread_id {
+            return true;
+        }
+        if parent == current {
+            return false;
+        }
+        current = parent.as_str();
+    }
+    false
+}
+
+fn append_timeline_blocks_dedup(blocks: &mut Vec<TimelineBlock>, extra: Vec<TimelineBlock>) {
+    if extra.is_empty() {
+        return;
+    }
+    let mut existing = blocks
+        .iter()
+        .map(|block| block.block_id.clone())
+        .collect::<HashSet<_>>();
+    blocks.extend(
+        extra
+            .into_iter()
+            .filter(|block| existing.insert(block.block_id.clone())),
+    );
 }
 
 fn parse_optional_metadata(value: &str) -> Result<Option<JsonValue>> {
