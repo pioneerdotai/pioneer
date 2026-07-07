@@ -5,7 +5,9 @@ use pioneer_protocol::{
     GatewayRemoteAccessSettings, GatewayRemoteAccessSettingsUpdate, GatewayRemoteAccessState,
     GatewaySettingsGetParams, GatewaySettingsGetResponse, GatewaySettingsSnapshot,
     GatewaySettingsUpdate, GatewaySettingsUpdateParams, GatewaySettingsUpdateResponse,
-    GatewayThreadEpisodicSettingsUpdate,
+    GatewayThreadEpisodicSettingsUpdate, GatewayThreadEpisodicVectorProvider,
+    GatewayThreadEpisodicVectorRefillStatus, GatewayThreadEpisodicVectorSearchSettings,
+    GatewayThreadEpisodicVectorSearchSettingsUpdate,
 };
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -255,6 +257,64 @@ pub fn thread_episodic_enabled_update_plan(
     })
 }
 
+pub fn thread_episodic_vector_search_update_plan(
+    current: Option<&GatewaySettingsSnapshot>,
+    mut vector_search: GatewayThreadEpisodicVectorSearchSettings,
+) -> Option<GatewaySettingsUpdatePlan> {
+    let mut snapshot = current.cloned()?;
+    let previous = snapshot.thread_episodic.vector_search.clone();
+
+    vector_search.provider_key.required = vector_search.enabled
+        && vector_search
+            .provider
+            .is_some_and(vector_provider_requires_key);
+    vector_search.provider_key.present = vector_search.provider_key.required
+        && previous.provider == vector_search.provider
+        && previous.provider_key.present;
+    if !vector_search.enabled {
+        vector_search.refill_status = GatewayThreadEpisodicVectorRefillStatus::Disabled;
+    } else {
+        vector_search.refill_status = GatewayThreadEpisodicVectorRefillStatus::Required;
+    }
+
+    snapshot.thread_episodic.vector_search = vector_search.clone();
+
+    Some(GatewaySettingsUpdatePlan {
+        snapshot,
+        update: GatewaySettingsUpdate {
+            general: None,
+            memory: None,
+            thread_episodic: Some(GatewayThreadEpisodicSettingsUpdate {
+                vector_search: Some(GatewayThreadEpisodicVectorSearchSettingsUpdate {
+                    enabled: Some(vector_search.enabled),
+                    provider: Some(vector_search.provider),
+                    model: Some(vector_search.model),
+                    local_model: Some(vector_search.local_model),
+                    embedding_dimension: Some(vector_search.embedding_dimension),
+                    embedding_normalized: Some(vector_search.embedding_normalized),
+                }),
+                ..GatewayThreadEpisodicSettingsUpdate::default()
+            }),
+            cli_runtimes: None,
+            remote_access: None,
+        },
+    })
+}
+
+pub fn vector_provider_requires_key(provider: GatewayThreadEpisodicVectorProvider) -> bool {
+    vector_provider_key_provider_id(provider).is_some()
+}
+
+pub fn vector_provider_key_provider_id(
+    provider: GatewayThreadEpisodicVectorProvider,
+) -> Option<&'static str> {
+    match provider {
+        GatewayThreadEpisodicVectorProvider::OpenAi => Some("openai"),
+        GatewayThreadEpisodicVectorProvider::OpenRouter => Some("openrouter"),
+        GatewayThreadEpisodicVectorProvider::Local => None,
+    }
+}
+
 pub fn remote_access_update_plan(
     current: Option<&GatewaySettingsSnapshot>,
     enabled: bool,
@@ -348,6 +408,8 @@ mod tests {
     use super::*;
     use pioneer_protocol::{
         GatewayGeneralSettings, GatewayMemorySettings, GatewayRemoteAccessSettings,
+        GatewayThreadEpisodicVectorProvider, GatewayThreadEpisodicVectorProviderKeyStatus,
+        GatewayThreadEpisodicVectorSearchSettings,
     };
 
     fn snapshot(keepawake: bool) -> GatewaySettingsSnapshot {
@@ -542,6 +604,57 @@ mod tests {
             Some(GatewayThreadEpisodicSettingsUpdate::enabled(false))
         );
         assert!(thread_episodic_enabled_update_plan(None, true).is_none());
+    }
+
+    #[test]
+    fn vector_search_update_plan_resets_provider_key_presence_on_provider_change() {
+        let mut current = snapshot(true);
+        current.thread_episodic.vector_search = GatewayThreadEpisodicVectorSearchSettings {
+            enabled: true,
+            provider: Some(GatewayThreadEpisodicVectorProvider::OpenAi),
+            provider_key: GatewayThreadEpisodicVectorProviderKeyStatus {
+                required: true,
+                present: true,
+            },
+            ..GatewayThreadEpisodicVectorSearchSettings::default()
+        };
+
+        let next = GatewayThreadEpisodicVectorSearchSettings {
+            enabled: true,
+            provider: Some(GatewayThreadEpisodicVectorProvider::OpenRouter),
+            model: Some("openai/text-embedding-3-small".to_owned()),
+            ..current.thread_episodic.vector_search.clone()
+        };
+        let plan = thread_episodic_vector_search_update_plan(Some(&current), next).expect("plan");
+
+        assert_eq!(
+            plan.snapshot.thread_episodic.vector_search.provider,
+            Some(GatewayThreadEpisodicVectorProvider::OpenRouter)
+        );
+        assert!(
+            plan.snapshot
+                .thread_episodic
+                .vector_search
+                .provider_key
+                .required
+        );
+        assert!(
+            !plan
+                .snapshot
+                .thread_episodic
+                .vector_search
+                .provider_key
+                .present
+        );
+        assert_eq!(
+            plan.snapshot.thread_episodic.vector_search.refill_status,
+            GatewayThreadEpisodicVectorRefillStatus::Required
+        );
+
+        let update_json = serde_json::to_string(&plan.update).expect("serialize update");
+        assert!(!update_json.contains("api_key"));
+        assert!(!update_json.contains("secret"));
+        assert!(update_json.contains("openrouter"));
     }
 
     #[test]
