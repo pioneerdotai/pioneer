@@ -21,6 +21,12 @@
     "ProviderModelCapabilities": {
       "type": "object",
       "properties": {
+        "embeddings": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "fine_tuning": {
           "type": [
             "boolean",

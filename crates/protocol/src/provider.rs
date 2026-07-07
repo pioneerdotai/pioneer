@@ -16,6 +16,14 @@ pub struct ProviderListResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ProviderSummary {
     pub name: String,
+    #[serde(default)]
+    pub capabilities: ProviderSummaryCapabilities,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ProviderSummaryCapabilities {
+    #[serde(default)]
+    pub embeddings: bool,
 }
 
 // --- Provider list models ---
@@ -79,6 +87,7 @@ pub struct ProviderModelCapabilities {
     pub tool_calling: Option<bool>,
     pub json_output: Option<bool>,
     pub streaming: Option<bool>,
+    pub embeddings: Option<bool>,
     pub thinking: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ProviderModelReasoningCapabilities>,

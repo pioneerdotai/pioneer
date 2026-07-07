@@ -17,6 +17,12 @@
     "ProviderSummary": {
       "type": "object",
       "properties": {
+        "capabilities": {
+          "$ref": "#/$defs/ProviderSummaryCapabilities",
+          "default": {
+            "embeddings": false
+          }
+        },
         "name": {
           "type": "string"
         }
@@ -24,6 +30,15 @@
       "required": [
         "name"
       ]
+    },
+    "ProviderSummaryCapabilities": {
+      "type": "object",
+      "properties": {
+        "embeddings": {
+          "type": "boolean",
+          "default": false
+        }
+      }
     }
   }
 }

@@ -31,6 +31,7 @@ pub mod methods {
     pub const VOICE_SESSION_CANCEL: &str = "voice/session/cancel";
     pub const PROVIDER_LIST: &str = "provider/list";
     pub const PROVIDER_MODELS_LIST: &str = "provider/models/list";
+    pub const PROVIDER_EMBEDDING_MODELS_LIST: &str = "provider/embedding_models/list";
     pub const PROVIDER_SET_API_KEY: &str = "provider/set_api_key";
     pub const PROVIDER_DELETE_API_KEY: &str = "provider/delete_api_key";
     pub const CLI_RUNTIME_LIST: &str = "cli_runtime/list";

@@ -126,7 +126,7 @@ pub use provider::{
     ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
     ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits, ProviderModelPricing,
     ProviderModelReasoningCapabilities, ProviderSetApiKeyParams, ProviderSetApiKeyResponse,
-    ProviderSummary, ReasoningCapabilitySource,
+    ProviderSummary, ProviderSummaryCapabilities, ReasoningCapabilitySource,
 };
 pub use settings::{
     GatewayCliRuntimeInstanceSettings, GatewayCliRuntimeSettings, GatewayGeneralSettings,
