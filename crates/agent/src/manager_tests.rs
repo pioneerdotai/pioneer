@@ -353,6 +353,7 @@ impl Provider for PendingProvider {
             streaming: false,
             vision: false,
             tool_calling: false,
+            embeddings: false,
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
         }
     }
@@ -2383,6 +2384,7 @@ impl Provider for CaptureStandardProvider {
             streaming: false,
             vision: false,
             tool_calling: false,
+            embeddings: false,
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
         }
     }
@@ -2428,6 +2430,7 @@ impl Provider for SequencedToolProvider {
             streaming: false,
             vision: true,
             tool_calling: true,
+            embeddings: false,
             input_types: test_native_image_input_capabilities(),
         }
     }
@@ -2489,6 +2492,7 @@ impl Provider for LoopBudgetProvider {
             streaming: false,
             vision: true,
             tool_calling: true,
+            embeddings: false,
             input_types: test_native_image_input_capabilities(),
         }
     }
@@ -2572,6 +2576,7 @@ impl Provider for AlwaysTaskCreateProvider {
             streaming: false,
             vision: false,
             tool_calling: true,
+            embeddings: false,
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
         }
     }
@@ -2628,6 +2633,7 @@ impl Provider for ProviderRecoveryBoundaryProvider {
             streaming: false,
             vision: false,
             tool_calling: true,
+            embeddings: false,
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
         }
     }
@@ -2684,6 +2690,7 @@ impl Provider for CaptureAgentProvider {
             streaming: false,
             vision: false,
             tool_calling: true,
+            embeddings: false,
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
         }
     }
@@ -2734,6 +2741,7 @@ impl Provider for ReviewGuardProvider {
             streaming: false,
             vision: false,
             tool_calling: true,
+            embeddings: false,
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
         }
     }
@@ -2803,6 +2811,7 @@ impl Provider for EmptyNoToolRoundProvider {
             streaming: false,
             vision: false,
             tool_calling: true,
+            embeddings: false,
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
         }
     }
@@ -2871,6 +2880,7 @@ impl Provider for SequencedTextProvider {
             streaming: false,
             vision: false,
             tool_calling: true,
+            embeddings: false,
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
         }
     }
@@ -2945,6 +2955,7 @@ impl Provider for TextOnlyAgentProvider {
             streaming: false,
             vision: false,
             tool_calling: true,
+            embeddings: false,
             input_types: ProviderInputCapabilities::disabled_for_all_file_types(),
         }
     }
