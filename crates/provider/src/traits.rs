@@ -38,6 +38,15 @@ pub trait Provider: Send + Sync {
         anyhow::bail!("provider '{}' does not support listing models", self.name())
     }
 
+    /// List embedding models available from this provider.
+    /// Default implementation returns an error for providers that don't support embeddings.
+    async fn list_embedding_models(&self) -> Result<Vec<ProviderModelInfo>> {
+        anyhow::bail!(
+            "provider '{}' does not support listing embedding models",
+            self.name()
+        )
+    }
+
     /// Create embeddings for one or more input texts.
     /// Default implementation returns an error for providers that do not support embeddings.
     async fn embed(&self, _request: EmbeddingRequest) -> Result<EmbeddingResponse> {

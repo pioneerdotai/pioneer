@@ -29,6 +29,31 @@ use pioneer_protocol::{ProviderModelCapabilities, ProviderModelInfo, ProviderMod
 
 const BASE_URL: &str = "https://api.openai.com/v1";
 
+#[derive(Clone, Copy)]
+struct OpenAiEmbeddingModelDefinition {
+    id: &'static str,
+    name: &'static str,
+    description: &'static str,
+}
+
+const OPENAI_EMBEDDING_MODELS: &[OpenAiEmbeddingModelDefinition] = &[
+    OpenAiEmbeddingModelDefinition {
+        id: "text-embedding-3-small",
+        name: "Text Embedding 3 Small",
+        description: "1536-dimensional embedding model optimized for cost and latency.",
+    },
+    OpenAiEmbeddingModelDefinition {
+        id: "text-embedding-3-large",
+        name: "Text Embedding 3 Large",
+        description: "3072-dimensional embedding model optimized for higher retrieval quality.",
+    },
+    OpenAiEmbeddingModelDefinition {
+        id: "text-embedding-ada-002",
+        name: "Text Embedding Ada 002",
+        description: "Legacy 1536-dimensional embedding model.",
+    },
+];
+
 pub struct OpenAiProvider {
     api_key: String,
     base_url: String,
@@ -1016,6 +1041,13 @@ impl crate::traits::Provider for OpenAiProvider {
             .collect())
     }
 
+    async fn list_embedding_models(&self) -> Result<Vec<ProviderModelInfo>> {
+        Ok(OPENAI_EMBEDDING_MODELS
+            .iter()
+            .map(openai_embedding_model_info)
+            .collect())
+    }
+
     async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse> {
         let expected_count = request.input.len();
         let api_request = ApiEmbeddingRequest {
@@ -1069,6 +1101,26 @@ fn provider_model_from_openai_model_entry(m: ApiModelEntry) -> ProviderModelInfo
         pricing: None,
         active: Some(true),
         family: None,
+        lifecycle_status: None,
+    }
+}
+
+fn openai_embedding_model_info(model: &OpenAiEmbeddingModelDefinition) -> ProviderModelInfo {
+    ProviderModelInfo {
+        id: model.id.to_owned(),
+        name: Some(model.name.to_owned()),
+        description: Some(model.description.to_owned()),
+        created: None,
+        provider: "openai".to_owned(),
+        owned_by: Some("openai".to_owned()),
+        limits: ProviderModelLimits::default(),
+        capabilities: ProviderModelCapabilities {
+            embeddings: Some(true),
+            ..ProviderModelCapabilities::default()
+        },
+        pricing: None,
+        active: Some(true),
+        family: Some("embedding".to_owned()),
         lifecycle_status: None,
     }
 }
@@ -1186,6 +1238,37 @@ mod tests {
 
         assert!(models[1].capabilities.reasoning.is_none());
         assert!(models[1].capabilities.thinking.is_none());
+        assert_eq!(models[1].capabilities.embeddings, None);
+    }
+
+    #[test]
+    fn openai_embedding_model_list_exposes_only_embedding_models() {
+        let models = OPENAI_EMBEDDING_MODELS
+            .iter()
+            .map(openai_embedding_model_info)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "text-embedding-3-small",
+                "text-embedding-3-large",
+                "text-embedding-ada-002"
+            ]
+        );
+        assert_eq!(models[0].name.as_deref(), Some("Text Embedding 3 Small"));
+        assert_eq!(
+            models[1].description.as_deref(),
+            Some("3072-dimensional embedding model optimized for higher retrieval quality.")
+        );
+        assert!(
+            models
+                .iter()
+                .all(|model| model.capabilities.embeddings == Some(true))
+        );
     }
 
     #[test]

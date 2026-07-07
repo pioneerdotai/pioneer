@@ -31,6 +31,26 @@ const APP_REFERER: &str = "https://getpioneer.dev";
 const APP_TITLE: &str = "Pioneer";
 const APP_CATEGORIES: &str = "personal-agent,general-chat";
 
+#[derive(Clone, Copy)]
+struct OpenRouterEmbeddingModelDefinition {
+    id: &'static str,
+    name: &'static str,
+    description: &'static str,
+}
+
+const OPENROUTER_EMBEDDING_MODELS: &[OpenRouterEmbeddingModelDefinition] = &[
+    OpenRouterEmbeddingModelDefinition {
+        id: "openai/text-embedding-3-small",
+        name: "OpenAI Text Embedding 3 Small",
+        description: "1536-dimensional embedding model routed through OpenRouter.",
+    },
+    OpenRouterEmbeddingModelDefinition {
+        id: "openai/text-embedding-3-large",
+        name: "OpenAI Text Embedding 3 Large",
+        description: "3072-dimensional embedding model routed through OpenRouter.",
+    },
+];
+
 pub struct OpenRouterProvider {
     api_key: String,
     base_url: String,
@@ -969,6 +989,13 @@ impl crate::traits::Provider for OpenRouterProvider {
             .collect())
     }
 
+    async fn list_embedding_models(&self) -> Result<Vec<ProviderModelInfo>> {
+        Ok(OPENROUTER_EMBEDDING_MODELS
+            .iter()
+            .map(openrouter_embedding_model_info)
+            .collect())
+    }
+
     async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse> {
         let expected_count = request.input.len();
         let api_request = ApiEmbeddingRequest {
@@ -1043,6 +1070,28 @@ fn provider_model_from_openrouter_model_entry(m: OpenRouterModelEntry) -> Provid
         pricing,
         active: Some(true),
         family: None,
+        lifecycle_status: None,
+    }
+}
+
+fn openrouter_embedding_model_info(
+    model: &OpenRouterEmbeddingModelDefinition,
+) -> ProviderModelInfo {
+    ProviderModelInfo {
+        id: model.id.to_owned(),
+        name: Some(model.name.to_owned()),
+        description: Some(model.description.to_owned()),
+        created: None,
+        provider: "openrouter".to_owned(),
+        owned_by: model.id.split('/').next().map(str::to_owned),
+        limits: ProviderModelLimits::default(),
+        capabilities: ProviderModelCapabilities {
+            embeddings: Some(true),
+            ..ProviderModelCapabilities::default()
+        },
+        pricing: None,
+        active: Some(true),
+        family: Some("embedding".to_owned()),
         lifecycle_status: None,
     }
 }
@@ -1158,6 +1207,38 @@ mod tests {
             vec!["max", "xhigh", "high", "medium", "low", "minimal", "none"]
         );
         assert_eq!(reasoning.supports_token_budget, Some(true));
+    }
+
+    #[test]
+    fn openrouter_embedding_model_list_exposes_only_embedding_models() {
+        let models = OPENROUTER_EMBEDDING_MODELS
+            .iter()
+            .map(openrouter_embedding_model_info)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "openai/text-embedding-3-small",
+                "openai/text-embedding-3-large"
+            ]
+        );
+        assert_eq!(
+            models[0].name.as_deref(),
+            Some("OpenAI Text Embedding 3 Small")
+        );
+        assert_eq!(
+            models[1].description.as_deref(),
+            Some("3072-dimensional embedding model routed through OpenRouter.")
+        );
+        assert!(
+            models
+                .iter()
+                .all(|model| model.capabilities.embeddings == Some(true))
+        );
     }
 
     #[test]
