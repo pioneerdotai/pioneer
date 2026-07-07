@@ -1,4 +1,3 @@
-use crate::secrets::GatewaySecrets;
 use crate::thread_episodic::{
     ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver,
     RuntimeVectorThreadEpisodicIndexPayloadProvider, StoreThreadEpisodicIndexPayloadProvider,
@@ -27,6 +26,7 @@ use pioneer_memory::{
     ThreadEpisodicMemvidFailureKind, ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidStats,
     thread_episodic_storage_uri_from_path,
 };
+use pioneer_provider::ProviderRegistry;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
@@ -192,7 +192,7 @@ pub(super) async fn run(
     crud_store: Arc<CrudStore>,
     thread_episodic_storage_root: PathBuf,
     vector_search_config: GatewayThreadEpisodicVectorSearchConfig,
-    gateway_secrets: Arc<GatewaySecrets>,
+    provider_registry: Arc<ProviderRegistry>,
     runtime_home: PathBuf,
 ) {
     let projection_target =
@@ -202,7 +202,7 @@ pub(super) async fn run(
     let embedding_provider_resolver = projection_target.requires_embedding_provider().then(|| {
         Arc::new(
             ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver::new(
-                gateway_secrets,
+                provider_registry,
                 runtime_home,
                 vector_search_config,
             ),

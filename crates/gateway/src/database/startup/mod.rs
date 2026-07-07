@@ -7,11 +7,11 @@ mod turn_item_attempt_payload_compaction;
 mod turn_permission_profile_backfill;
 mod zstd_payload_compression;
 
-use crate::secrets::GatewaySecrets;
 use pioneer_config::{
     GatewayThreadEpisodicVectorProviderConfig, GatewayThreadEpisodicVectorSearchConfig,
 };
 use pioneer_crud::CrudStore;
+use pioneer_provider::ProviderRegistry;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -20,7 +20,7 @@ pub(crate) fn spawn(
     crud_store: Arc<CrudStore>,
     thread_episodic_storage_root: PathBuf,
     thread_episodic_vector_search_config: GatewayThreadEpisodicVectorSearchConfig,
-    gateway_secrets: Arc<GatewaySecrets>,
+    provider_registry: Arc<ProviderRegistry>,
     runtime_home: PathBuf,
 ) {
     let _handle = tokio::spawn(async move {
@@ -35,7 +35,7 @@ pub(crate) fn spawn(
             crud_store,
             thread_episodic_storage_root,
             thread_episodic_vector_search_config,
-            gateway_secrets,
+            provider_registry,
             runtime_home,
         )
         .await;
@@ -46,7 +46,7 @@ pub(crate) fn spawn_thread_episodic_workspace_capsule_refill(
     crud_store: Arc<CrudStore>,
     thread_episodic_storage_root: PathBuf,
     thread_episodic_vector_search_config: GatewayThreadEpisodicVectorSearchConfig,
-    gateway_secrets: Arc<GatewaySecrets>,
+    provider_registry: Arc<ProviderRegistry>,
     runtime_home: PathBuf,
 ) {
     let _handle = tokio::spawn(async move {
@@ -54,7 +54,7 @@ pub(crate) fn spawn_thread_episodic_workspace_capsule_refill(
             crud_store,
             thread_episodic_storage_root,
             thread_episodic_vector_search_config,
-            gateway_secrets,
+            provider_registry,
             runtime_home,
         )
         .await;
@@ -65,7 +65,7 @@ async fn run_thread_episodic_workspace_capsule_refill(
     crud_store: Arc<CrudStore>,
     thread_episodic_storage_root: PathBuf,
     thread_episodic_vector_search_config: GatewayThreadEpisodicVectorSearchConfig,
-    gateway_secrets: Arc<GatewaySecrets>,
+    provider_registry: Arc<ProviderRegistry>,
     runtime_home: PathBuf,
 ) {
     match crate::thread_episodic_embedding::ensure_local_embedding_model_downloaded_if_needed(
@@ -103,7 +103,7 @@ async fn run_thread_episodic_workspace_capsule_refill(
         crud_store,
         thread_episodic_storage_root,
         thread_episodic_vector_search_config,
-        gateway_secrets,
+        provider_registry,
         runtime_home,
     )
     .await;
