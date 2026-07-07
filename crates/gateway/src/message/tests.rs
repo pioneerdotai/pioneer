@@ -21763,6 +21763,50 @@ async fn live_semantic_timeline_pending_request_projects_approval_block() {
         work.state,
         pioneer_protocol::TurnWorkState::WaitingForApproval
     );
+
+    let resolved_at = now + chrono::TimeDelta::milliseconds(1);
+    let resolved = harness
+        .processor
+        .crud_store
+        .resolve_cli_runtime_pending_request(pioneer_crud::ResolveCliRuntimePendingRequest {
+            request_id: request_id.to_owned(),
+            status: pioneer_crud::CliRuntimePendingRequestStatus::Answered,
+            response_json: Some(
+                pioneer_crud::serialize_cli_runtime_json(&CLIRuntimeRequestResolution::Approved)
+                    .expect("resolved payload should serialize"),
+            ),
+            updated_at: resolved_at,
+            resolved_at,
+        })
+        .await
+        .expect("pending request should resolve")
+        .expect("pending request should exist");
+    harness
+        .processor
+        .notify_semantic_timeline_pending_request_changed(&resolved)
+        .await;
+
+    let removed_blocks =
+        recv_notification_by_method(&mut harness.rx, events::THREAD_TIMELINE_BLOCKS_CHANGED).await;
+    let removed_blocks: pioneer_protocol::ThreadTimelineBlocksChangedNotification =
+        serde_json::from_value(
+            removed_blocks
+                .params
+                .expect("timeline blocks notification should include params"),
+        )
+        .expect("timeline blocks notification should decode");
+    assert_eq!(removed_blocks.thread_id, harness.thread_id);
+    assert_eq!(
+        removed_blocks.changed_block_ids,
+        vec![pioneer_crud::work_block_id(harness.turn_id.as_str())]
+    );
+    assert_eq!(
+        removed_blocks.removed_block_ids,
+        vec![pioneer_crud::approval_block_id(
+            harness.turn_id.as_str(),
+            request_id
+        )]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

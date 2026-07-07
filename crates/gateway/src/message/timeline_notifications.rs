@@ -116,14 +116,18 @@ impl MessageProcessor {
         let Some(turn_id) = request.turn_id.as_deref() else {
             return;
         };
+        let approval_block_id = approval_block_id(turn_id, request.request_id.as_str());
+        let is_pending = request.status == StoredCliRuntimePendingRequestStatus::Pending;
+        let (changed_block_ids, removed_block_ids) = if is_pending {
+            (vec![work_block_id(turn_id), approval_block_id], Vec::new())
+        } else {
+            (vec![work_block_id(turn_id)], vec![approval_block_id])
+        };
         self.notify_semantic_timeline_blocks_changed(
             request.workspace_id.as_str(),
             request.thread_id.as_str(),
-            vec![
-                work_block_id(turn_id),
-                approval_block_id(turn_id, request.request_id.as_str()),
-            ],
-            Vec::new(),
+            changed_block_ids,
+            removed_block_ids,
         )
         .await;
         self.notify_semantic_turn_work_state_changed(
