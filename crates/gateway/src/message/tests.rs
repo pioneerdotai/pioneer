@@ -79,40 +79,40 @@ use pioneer_protocol::{
     PromptManifestHookContributionKind, PromptManifestHookPhase, PromptManifestHookSource,
     PromptManifestHookSourceEntry, PromptManifestHookTruncation, PromptManifestProfile,
     ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse, ProviderFailureClass,
-    ProviderFailureDetails, ProviderFailureStage, ProviderListParams, ProviderListResponse,
-    ProviderSetApiKeyParams, ProviderSetApiKeyResponse, ProviderTransportKind, RecoveryAction,
-    RecoveryJobStatus, RecoveryTrigger, SandboxMode, SkillArchiveFormat,
-    SkillAuditEvent as ProtocolSkillAuditEvent, SkillListResponse, SkillsChangedNotification,
-    SkillsHealthResponse, SkillsInstallResponse, SkillsPolicySetResponse, SkillsUninstallResponse,
-    SkillsUpdateResponse, SkillsUploadAbortResponse, SkillsUploadChunkHeader,
-    SkillsUploadFinishResponse, SkillsUploadStartResponse, TaskAcceptResponse, TaskAgendaResponse,
-    TaskAgentPrompt, TaskAgentResultContract, TaskAgentResultFormat, TaskAgentReviewMode,
-    TaskAgentReviewPolicy, TaskAgentSpecInput, TaskAgentToolPolicy, TaskAgentWriteMode,
-    TaskAttachmentMode, TaskCompletionBehavior, TaskCreateParams, TaskDeliveriesParams,
-    TaskDeliveriesResponse, TaskDeliveryFormat, TaskDeliveryMode, TaskDeliveryPolicy,
-    TaskDeliveryStatus, TaskEventPayload, TaskExecutorKind, TaskLifecyclePolicy, TaskOwnerKind,
-    TaskParentTerminalAction, TaskPauseResponse, TaskResult, TaskResultCandidate,
-    TaskResultCandidateStatus, TaskResultReviewDecision, TaskResultReviewEventKind,
-    TaskResultReviewResolutionStrategy, TaskResultReviewerKind, TaskResumeResponse,
-    TaskRetryBackoffKind, TaskRetryPolicy, TaskReviseParams, TaskReviseResponse, TaskRun,
-    TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind,
-    TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskStatus, TaskThreadLineage,
-    TaskTriggerInput, TaskTriggerKind, TaskTriggerSpec, TaskTriggerStatus, TaskTurnItem, TaskValue,
-    TaskWaitParams, TaskWriteLockStatus, Thread, ThreadAgentsDocArchiveResponse,
-    ThreadAgentsDocGetResponse, ThreadAgentsDocResolveForThreadResponse,
-    ThreadAgentsDocSaveResponse, ThreadAgentsDocStatus, ThreadClosedNotification,
-    ThreadFolderCreateResponse, ThreadFolderDeleteResponse, ThreadFolderMoveResponse,
-    ThreadHistoryEventPayload, ThreadMode, ThreadMoveResponse, ThreadOriginKind,
-    ThreadSidebarVisibility, ThreadStartParams, ThreadStartResponse, ThreadStatus,
-    ThreadTreeResponse, ThreadUnsubscribeResponse, ThreadUnsubscribeStatus, ThreadUpdateResponse,
-    ToolCallStatus, ToolDisplayPayload, ToolMetadata, ToolOutputPolicySnapshot, ToolOutputSummary,
-    ToolResultView, ToolStoragePayload, Turn, TurnAcceptedCapability, TurnCancelResponse,
-    TurnCapabilityAcceptedReason, TurnCapabilityKind, TurnCapabilityRejectedReason,
-    TurnCompletedNotification, TurnFailedNotification, TurnGetResponse, TurnItem,
-    TurnItemEventPayload, TurnItemType, TurnKind, TurnOrigin, TurnRejectedCapability,
-    TurnSkillBinding, TurnStartResponse, TurnStatus, UserInput, UserMessageAttachment,
-    VoiceErrorKind, VoiceSessionOutcome, VoiceSessionResultNotification, VoiceStatus,
-    WorkspaceChangeKind, WorkspaceChangedNotification, WorkspaceCreateResponse,
+    ProviderFailureDetails, ProviderFailureStage, ProviderListModelsParams,
+    ProviderListModelsResponse, ProviderListParams, ProviderListResponse, ProviderSetApiKeyParams,
+    ProviderSetApiKeyResponse, ProviderTransportKind, RecoveryAction, RecoveryJobStatus,
+    RecoveryTrigger, SandboxMode, SkillArchiveFormat, SkillAuditEvent as ProtocolSkillAuditEvent,
+    SkillListResponse, SkillsChangedNotification, SkillsHealthResponse, SkillsInstallResponse,
+    SkillsPolicySetResponse, SkillsUninstallResponse, SkillsUpdateResponse,
+    SkillsUploadAbortResponse, SkillsUploadChunkHeader, SkillsUploadFinishResponse,
+    SkillsUploadStartResponse, TaskAcceptResponse, TaskAgendaResponse, TaskAgentPrompt,
+    TaskAgentResultContract, TaskAgentResultFormat, TaskAgentReviewMode, TaskAgentReviewPolicy,
+    TaskAgentSpecInput, TaskAgentToolPolicy, TaskAgentWriteMode, TaskAttachmentMode,
+    TaskCompletionBehavior, TaskCreateParams, TaskDeliveriesParams, TaskDeliveriesResponse,
+    TaskDeliveryFormat, TaskDeliveryMode, TaskDeliveryPolicy, TaskDeliveryStatus, TaskEventPayload,
+    TaskExecutorKind, TaskLifecyclePolicy, TaskOwnerKind, TaskParentTerminalAction,
+    TaskPauseResponse, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
+    TaskResultReviewDecision, TaskResultReviewEventKind, TaskResultReviewResolutionStrategy,
+    TaskResultReviewerKind, TaskResumeResponse, TaskRetryBackoffKind, TaskRetryPolicy,
+    TaskReviseParams, TaskReviseResponse, TaskRun, TaskRunExecutionStatus, TaskRunStatus,
+    TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind,
+    TaskRunTurnStatus, TaskStatus, TaskThreadLineage, TaskTriggerInput, TaskTriggerKind,
+    TaskTriggerSpec, TaskTriggerStatus, TaskTurnItem, TaskValue, TaskWaitParams,
+    TaskWriteLockStatus, Thread, ThreadAgentsDocArchiveResponse, ThreadAgentsDocGetResponse,
+    ThreadAgentsDocResolveForThreadResponse, ThreadAgentsDocSaveResponse, ThreadAgentsDocStatus,
+    ThreadClosedNotification, ThreadFolderCreateResponse, ThreadFolderDeleteResponse,
+    ThreadFolderMoveResponse, ThreadHistoryEventPayload, ThreadMode, ThreadMoveResponse,
+    ThreadOriginKind, ThreadSidebarVisibility, ThreadStartParams, ThreadStartResponse,
+    ThreadStatus, ThreadTreeResponse, ThreadUnsubscribeResponse, ThreadUnsubscribeStatus,
+    ThreadUpdateResponse, ToolCallStatus, ToolDisplayPayload, ToolMetadata,
+    ToolOutputPolicySnapshot, ToolOutputSummary, ToolResultView, ToolStoragePayload, Turn,
+    TurnAcceptedCapability, TurnCancelResponse, TurnCapabilityAcceptedReason, TurnCapabilityKind,
+    TurnCapabilityRejectedReason, TurnCompletedNotification, TurnFailedNotification,
+    TurnGetResponse, TurnItem, TurnItemEventPayload, TurnItemType, TurnKind, TurnOrigin,
+    TurnRejectedCapability, TurnSkillBinding, TurnStartResponse, TurnStatus, UserInput,
+    UserMessageAttachment, VoiceErrorKind, VoiceSessionOutcome, VoiceSessionResultNotification,
+    VoiceStatus, WorkspaceChangeKind, WorkspaceChangedNotification, WorkspaceCreateResponse,
     WorkspaceDefaultResponse, WorkspaceListResponse, WorkspaceSelectResponse,
     WorkspaceUpdateResponse, constants::events,
 };
@@ -2288,6 +2288,43 @@ async fn provider_api_key_handlers_use_keystore_without_settings_write() {
         .map(|provider| provider.name.as_str())
         .collect::<Vec<_>>();
     assert_eq!(provider_names, vec!["openai", "openrouter"]);
+    assert!(
+        list_payload
+            .providers
+            .iter()
+            .all(|provider| provider.capabilities.embeddings)
+    );
+
+    let embedding_models_request_id =
+        pioneer_protocol::RequestId::new("provider-embedding-models").expect("request id");
+    processor
+        .provider_list_embedding_models(
+            connection_id,
+            embedding_models_request_id.clone(),
+            ProviderListModelsParams {
+                workspace_id: workspace_id.clone(),
+                provider: "openai".to_owned(),
+            },
+        )
+        .await;
+    let embedding_models_response =
+        recv_response_by_id(&mut rx, embedding_models_request_id.as_str()).await;
+    let embedding_models_payload: ProviderListModelsResponse =
+        serde_json::from_value(embedding_models_response.result)
+            .expect("provider/embedding_models/list payload");
+    assert_eq!(embedding_models_payload.provider, "openai");
+    assert!(
+        embedding_models_payload
+            .models
+            .iter()
+            .all(|model| model.capabilities.embeddings == Some(true))
+    );
+    assert!(
+        embedding_models_payload
+            .models
+            .iter()
+            .any(|model| model.id == "text-embedding-3-small")
+    );
 
     processor
         .provider_list(

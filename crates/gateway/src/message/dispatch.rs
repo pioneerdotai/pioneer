@@ -1421,6 +1421,29 @@ impl MessageProcessor {
                         }
                     }
                 }
+                methods::PROVIDER_EMBEDDING_MODELS_LIST => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<ProviderListModelsParams>(params_value) {
+                        Ok(params) => {
+                            self.provider_list_embedding_models(connection_id, request.id, params)
+                                .await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{}`: {error}",
+                                        methods::PROVIDER_EMBEDDING_MODELS_LIST
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
                 methods::PROVIDER_SET_API_KEY => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ProviderSetApiKeyParams>(params_value) {

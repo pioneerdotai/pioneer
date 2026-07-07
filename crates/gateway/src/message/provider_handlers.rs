@@ -41,7 +41,20 @@ impl MessageProcessor {
         let result = ProviderListResponse {
             providers: provider_names
                 .into_iter()
-                .map(|name| ProviderSummary { name })
+                .map(|name| {
+                    let capabilities = self
+                        .provider_registry
+                        .get_or_create_for_workspace(workspace_id.as_str(), name.as_str())
+                        .map(|provider| {
+                            let capabilities = provider.capabilities();
+                            ProviderSummaryCapabilities {
+                                embeddings: capabilities.embeddings,
+                            }
+                        })
+                        .unwrap_or_default();
+
+                    ProviderSummary { name, capabilities }
+                })
                 .collect(),
         };
 
@@ -127,39 +140,7 @@ impl MessageProcessor {
             Ok(models) => {
                 let protocol_models = models
                     .into_iter()
-                    .map(|m| ProviderModelInfo {
-                        id: m.id,
-                        name: m.name,
-                        description: m.description,
-                        created: m.created,
-                        provider: m.provider,
-                        owned_by: m.owned_by,
-                        limits: ProviderModelLimits {
-                            max_input_tokens: m.limits.max_input_tokens,
-                            max_output_tokens: m.limits.max_output_tokens,
-                            context_window: m.limits.context_window,
-                        },
-                        capabilities: ProviderModelCapabilities {
-                            vision: m.capabilities.vision,
-                            tool_calling: m.capabilities.tool_calling,
-                            json_output: m.capabilities.json_output,
-                            streaming: m.capabilities.streaming,
-                            thinking: m.capabilities.thinking,
-                            reasoning: m.capabilities.reasoning,
-                            fine_tuning: m.capabilities.fine_tuning,
-                            input_modalities: m.capabilities.input_modalities,
-                            output_modalities: m.capabilities.output_modalities,
-                        },
-                        pricing: m.pricing.map(|p| ProviderModelPricing {
-                            input_token: p.input_token,
-                            output_token: p.output_token,
-                            image: p.image,
-                            request: p.request,
-                        }),
-                        active: m.active,
-                        family: m.family,
-                        lifecycle_status: m.lifecycle_status,
-                    })
+                    .map(provider_model_info_to_protocol)
                     .collect();
 
                 let result = ProviderListModelsResponse {
@@ -199,6 +180,110 @@ impl MessageProcessor {
                         INVALID_REQUEST_CODE,
                         format!(
                             "failed to list models for provider `{}`: {error:#}",
+                            params.provider
+                        ),
+                    ),
+                )
+                .await;
+            }
+        }
+    }
+
+    pub(super) async fn provider_list_embedding_models(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        params: ProviderListModelsParams,
+    ) {
+        let Some(workspace_id) = self
+            .validate_provider_workspace(
+                connection_id,
+                request_id.clone(),
+                methods::PROVIDER_EMBEDDING_MODELS_LIST,
+                params.workspace_id.clone(),
+            )
+            .await
+        else {
+            return;
+        };
+
+        if params.provider.trim().is_empty() {
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_PARAMS_CODE,
+                    format!(
+                        "invalid params for `{}`: `provider` is required",
+                        methods::PROVIDER_EMBEDDING_MODELS_LIST
+                    ),
+                ),
+            )
+            .await;
+            return;
+        }
+
+        let provider = match self
+            .provider_registry
+            .get_or_create_for_workspace(workspace_id.as_str(), &params.provider)
+        {
+            Ok(p) => p,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to create provider `{}`: {error:#}", params.provider),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+
+        match provider.list_embedding_models().await {
+            Ok(models) => {
+                let result = ProviderListModelsResponse {
+                    provider: params.provider,
+                    models: models
+                        .into_iter()
+                        .map(provider_model_info_to_protocol)
+                        .collect(),
+                };
+
+                let response = match JsonRpcResponse::from_result(request_id, &result) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                None,
+                                INVALID_REQUEST_CODE,
+                                format!("failed to encode response: {error}"),
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                };
+
+                if let Err(error) = self.send_json(connection_id, &response).await {
+                    warn!(
+                        connection_id,
+                        error = %format!("{error:#}"),
+                        "failed to send provider/list_embedding_models response"
+                    );
+                }
+            }
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!(
+                            "failed to list embedding models for provider `{}`: {error:#}",
                             params.provider
                         ),
                     ),
@@ -851,6 +936,43 @@ impl MessageProcessor {
             .set_connection_workspace(connection_id, Some(workspace_id.clone()))
             .await;
         Some(workspace_id)
+    }
+}
+
+fn provider_model_info_to_protocol(m: ProviderModelInfo) -> ProviderModelInfo {
+    ProviderModelInfo {
+        id: m.id,
+        name: m.name,
+        description: m.description,
+        created: m.created,
+        provider: m.provider,
+        owned_by: m.owned_by,
+        limits: ProviderModelLimits {
+            max_input_tokens: m.limits.max_input_tokens,
+            max_output_tokens: m.limits.max_output_tokens,
+            context_window: m.limits.context_window,
+        },
+        capabilities: ProviderModelCapabilities {
+            vision: m.capabilities.vision,
+            tool_calling: m.capabilities.tool_calling,
+            json_output: m.capabilities.json_output,
+            streaming: m.capabilities.streaming,
+            embeddings: m.capabilities.embeddings,
+            thinking: m.capabilities.thinking,
+            reasoning: m.capabilities.reasoning,
+            fine_tuning: m.capabilities.fine_tuning,
+            input_modalities: m.capabilities.input_modalities,
+            output_modalities: m.capabilities.output_modalities,
+        },
+        pricing: m.pricing.map(|p| ProviderModelPricing {
+            input_token: p.input_token,
+            output_token: p.output_token,
+            image: p.image,
+            request: p.request,
+        }),
+        active: m.active,
+        family: m.family,
+        lifecycle_status: m.lifecycle_status,
     }
 }
 
