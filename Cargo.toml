@@ -125,7 +125,7 @@ cpal = "0.18"
 transcribe-rs = { version = "0.3.11", features = ["onnx"] }
 
 # Agent memory capsule store
-memvid-core = { git = "https://github.com/pioneerdotai/memory", tag = "v3.1.0", default-features = false, features = ["lex", "temporal_track", "simd"] }
+memvid-core = { git = "https://github.com/pioneerdotai/memory", tag = "v3.1.1", default-features = false, features = ["lex", "temporal_track", "simd", "vec"] }
 
 # Embed
 rust-embed = "8"
