@@ -25,6 +25,18 @@ use pioneer_protocol::{
     VoiceSessionStartParams, VoiceStatusParams,
 };
 
+fn vector_provider_key_name(
+    provider: Option<pioneer_protocol::GatewayThreadEpisodicVectorProvider>,
+) -> Option<&'static str> {
+    match provider {
+        Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::OpenAi) => Some("openai"),
+        Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::OpenRouter) => {
+            Some("openrouter")
+        }
+        Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::Local) | None => None,
+    }
+}
+
 impl MessageProcessor {
     pub fn process_request<'a>(
         &'a self,
@@ -1262,7 +1274,7 @@ impl MessageProcessor {
                 methods::SETTINGS_GET => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<GatewaySettingsGetParams>(params_value) {
-                        Ok(_params) => match self.gateway_settings_snapshot() {
+                        Ok(_params) => match self.gateway_settings_snapshot(connection_id).await {
                             Ok(settings) => {
                                 let result =
                                     pioneer_protocol::GatewaySettingsGetResponse { settings };
@@ -1324,7 +1336,10 @@ impl MessageProcessor {
                 methods::SETTINGS_UPDATE => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<GatewaySettingsUpdateParams>(params_value) {
-                        Ok(params) => match self.update_gateway_settings(params.update).await {
+                        Ok(params) => match self
+                            .update_gateway_settings(connection_id, params.update)
+                            .await
+                        {
                             Ok(settings) => {
                                 let result =
                                     pioneer_protocol::GatewaySettingsUpdateResponse { settings };
@@ -2715,8 +2730,9 @@ impl MessageProcessor {
         }
     }
 
-    fn gateway_settings_snapshot(
+    async fn gateway_settings_snapshot(
         &self,
+        connection_id: ConnectionId,
     ) -> anyhow::Result<pioneer_protocol::GatewaySettingsSnapshot> {
         let config =
             pioneer_config::AppConfig::load().context("failed to load app config for settings")?;
@@ -2729,11 +2745,21 @@ impl MessageProcessor {
             config.gateway.settings_version,
             settings_file_name.as_str(),
         )?;
-        self.gateway_settings_snapshot_from_settings(&config.gateway, &settings)
+        let workspace_id = self
+            .session_manager
+            .connection_workspace_id(connection_id)
+            .await;
+        self.gateway_settings_snapshot_from_settings(
+            &config.gateway,
+            &settings,
+            workspace_id.as_deref(),
+        )
+        .await
     }
 
     async fn update_gateway_settings(
         &self,
+        connection_id: ConnectionId,
         update: pioneer_protocol::GatewaySettingsUpdate,
     ) -> anyhow::Result<pioneer_protocol::GatewaySettingsSnapshot> {
         let config =
@@ -2795,7 +2821,23 @@ impl MessageProcessor {
             }
         }
 
-        let snapshot = self.gateway_settings_snapshot_from_settings(&config.gateway, &settings)?;
+        let workspace_id = self
+            .session_manager
+            .connection_workspace_id(connection_id)
+            .await;
+        let snapshot = self
+            .gateway_settings_snapshot_from_settings(
+                &config.gateway,
+                &settings,
+                workspace_id.as_deref(),
+            )
+            .await?;
+        let mut snapshot = snapshot;
+        if changes.thread_episodic_vector_projection_changed {
+            crate::settings::force_thread_episodic_vector_refill_required(
+                &mut snapshot.thread_episodic.vector_search,
+            );
+        }
         if changes.memory {
             let memory_settings =
                 crate::settings::GatewayMemorySettings::from_protocol(snapshot.memory.clone());
@@ -2814,16 +2856,27 @@ impl MessageProcessor {
             );
             self.apply_thread_episodic_runtime_config(runtime_config)
                 .await;
+            if changes.thread_episodic_vector_projection_changed && thread_episodic_settings.enabled
+            {
+                crate::database::startup::spawn_thread_episodic_workspace_capsule_refill(
+                    self.crud_store.clone(),
+                    self.thread_episodic_storage_root.clone(),
+                    thread_episodic_settings.vector_search.clone(),
+                    self.provider_registry.clone(),
+                    self.artifact_runtime_home.clone(),
+                );
+            }
             self.reinstall_memory_hook_runtime_if_bound().await;
         }
 
         Ok(snapshot)
     }
 
-    fn gateway_settings_snapshot_from_settings(
+    async fn gateway_settings_snapshot_from_settings(
         &self,
         config: &pioneer_config::GatewayConfig,
         settings: &crate::settings::GatewaySettings,
+        workspace_id: Option<&str>,
     ) -> anyhow::Result<pioneer_protocol::GatewaySettingsSnapshot> {
         let has_remote_access_key = match settings.remote_access_secret_ref() {
             Some(secret_ref) => self.gateway_secrets.has_remote_access_secret(secret_ref)?,
@@ -2834,11 +2887,90 @@ impl MessageProcessor {
             .as_ref()
             .map(|supervisor| supervisor.status_snapshot())
             .unwrap_or_default();
-        Ok(settings.snapshot_with_remote_access_status(
+        let mut snapshot = settings.snapshot_with_remote_access_status(
             config,
             has_remote_access_key,
             remote_access_status,
-        ))
+        );
+        self.apply_vector_provider_key_presence(&mut snapshot, workspace_id)?;
+        crate::settings::apply_thread_episodic_vector_search_status(
+            &mut snapshot.thread_episodic.vector_search,
+        );
+        self.apply_vector_local_model_status(&mut snapshot);
+        self.apply_vector_refill_projection_status(&mut snapshot)
+            .await?;
+        Ok(snapshot)
+    }
+
+    async fn apply_vector_refill_projection_status(
+        &self,
+        snapshot: &mut pioneer_protocol::GatewaySettingsSnapshot,
+    ) -> anyhow::Result<()> {
+        let thread_episodic_settings =
+            crate::settings::GatewayThreadEpisodicSettings::from_protocol(
+                snapshot.thread_episodic.clone(),
+            );
+        let projection_target =
+            crate::database::startup::thread_episodic_workspace_capsule_refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_vector_search_config(
+                &thread_episodic_settings.vector_search,
+            );
+        let marker_status =
+            crate::database::startup::thread_episodic_workspace_capsule_refill::refill_status_for_target(
+                self.crud_store.as_ref(),
+                &projection_target,
+            )
+            .await?;
+        snapshot.thread_episodic.vector_search.refill_status =
+            if thread_episodic_settings.vector_search.enabled {
+                marker_status
+            } else if matches!(
+                marker_status,
+                pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Complete
+            ) {
+                pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Disabled
+            } else {
+                marker_status
+            };
+        Ok(())
+    }
+
+    pub(crate) fn apply_vector_provider_key_presence(
+        &self,
+        snapshot: &mut pioneer_protocol::GatewaySettingsSnapshot,
+        workspace_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let vector_search = &mut snapshot.thread_episodic.vector_search;
+        vector_search.provider_key.present = false;
+
+        if !vector_search.provider_key.required {
+            return Ok(());
+        }
+        let Some(workspace_id) = workspace_id else {
+            return Ok(());
+        };
+        let Some(provider) = vector_provider_key_name(vector_search.provider) else {
+            return Ok(());
+        };
+
+        vector_search.provider_key.present = self
+            .gateway_secrets
+            .get_workspace_provider_api_key(workspace_id, provider)?
+            .is_some();
+        Ok(())
+    }
+
+    fn apply_vector_local_model_status(
+        &self,
+        snapshot: &mut pioneer_protocol::GatewaySettingsSnapshot,
+    ) {
+        let vector_search = &mut snapshot.thread_episodic.vector_search;
+        vector_search.local_model_status =
+            crate::thread_episodic_embedding::local_embedding_model_status(
+                self.artifact_runtime_home.as_path(),
+                vector_search.enabled,
+                vector_search.provider,
+                vector_search.local_model.as_deref().unwrap_or(""),
+            );
     }
 
     async fn send_invalid_params_error(

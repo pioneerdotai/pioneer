@@ -775,6 +775,7 @@ impl Provider for DelayedProvider {
             streaming: false,
             vision: false,
             tool_calling: false,
+            embeddings: false,
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
         }
     }
@@ -813,6 +814,7 @@ impl Provider for RevisionProvider {
             streaming: false,
             vision: false,
             tool_calling: false,
+            embeddings: false,
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
         }
     }
@@ -882,6 +884,7 @@ impl Provider for RevisionHangingProvider {
             streaming: false,
             vision: false,
             tool_calling: false,
+            embeddings: false,
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
         }
     }
@@ -968,6 +971,7 @@ impl Provider for CountingDelayedProvider {
             streaming: false,
             vision: false,
             tool_calling: false,
+            embeddings: false,
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
         }
     }
@@ -1070,6 +1074,7 @@ impl Provider for CaptureSummaryProvider {
             streaming: false,
             vision: false,
             tool_calling: false,
+            embeddings: false,
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
         }
     }
@@ -1112,6 +1117,7 @@ impl Provider for PreflightCaptureProvider {
             streaming: false,
             vision: false,
             tool_calling: true,
+            embeddings: false,
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
         }
     }
@@ -1152,6 +1158,7 @@ impl Provider for HangingChildProvider {
             streaming: false,
             vision: false,
             tool_calling: true,
+            embeddings: false,
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
         }
     }
@@ -1193,6 +1200,7 @@ impl Provider for FlakyTitleProvider {
             streaming: false,
             vision: false,
             tool_calling: false,
+            embeddings: false,
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
         }
     }
@@ -1249,6 +1257,7 @@ impl Provider for GuardAwareProvider {
             streaming: false,
             vision: false,
             tool_calling: true,
+            embeddings: false,
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
         }
     }
@@ -1357,6 +1366,7 @@ impl Provider for CreateThenHangProvider {
             streaming: false,
             vision: false,
             tool_calling: true,
+            embeddings: false,
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
         }
     }
@@ -1822,6 +1832,7 @@ impl Provider for MemoryAgentE2eProvider {
             streaming: false,
             vision: false,
             tool_calling: false,
+            embeddings: false,
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
         }
     }
@@ -2019,6 +2030,7 @@ impl Provider for SequencedToolProvider {
             streaming: false,
             vision: false,
             tool_calling: true,
+            embeddings: false,
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
         }
     }
@@ -2142,6 +2154,9 @@ async fn provider_api_key_handlers_use_keystore_without_settings_write() {
     let set_request_id =
         pioneer_protocol::RequestId::new(generate_test_request_id("provider", "set"))
             .expect("valid set request id");
+    let set_openai_request_id =
+        pioneer_protocol::RequestId::new(generate_test_request_id("provider", "set_openai"))
+            .expect("valid set openai request id");
     let list_request_id =
         pioneer_protocol::RequestId::new(generate_test_request_id("provider", "list"))
             .expect("valid list request id");
@@ -2151,6 +2166,9 @@ async fn provider_api_key_handlers_use_keystore_without_settings_write() {
     let delete_request_id =
         pioneer_protocol::RequestId::new(generate_test_request_id("provider", "delete"))
             .expect("valid delete request id");
+    let delete_openai_request_id =
+        pioneer_protocol::RequestId::new(generate_test_request_id("provider", "delete_openai"))
+            .expect("valid delete openai request id");
     let delete_missing_request_id =
         pioneer_protocol::RequestId::new(generate_test_request_id("provider", "missing"))
             .expect("valid missing delete request id");
@@ -2184,6 +2202,73 @@ async fn provider_api_key_handlers_use_keystore_without_settings_write() {
         !settings_path.exists(),
         "provider key handler must not write gateway settings"
     );
+    processor
+        .session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let mut settings_snapshot = pioneer_protocol::GatewaySettingsSnapshot {
+        general: Default::default(),
+        memory: Default::default(),
+        thread_episodic: Default::default(),
+        cli_runtimes: Default::default(),
+        remote_access: Default::default(),
+    };
+    settings_snapshot.thread_episodic.vector_search.enabled = true;
+    settings_snapshot.thread_episodic.vector_search.provider =
+        Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::OpenRouter);
+    settings_snapshot
+        .thread_episodic
+        .vector_search
+        .provider_key
+        .required = true;
+    let connection_workspace_id = processor
+        .session_manager
+        .connection_workspace_id(connection_id)
+        .await;
+    processor
+        .apply_vector_provider_key_presence(
+            &mut settings_snapshot,
+            connection_workspace_id.as_deref(),
+        )
+        .expect("settings snapshot key status should apply");
+    assert!(
+        settings_snapshot
+            .thread_episodic
+            .vector_search
+            .provider_key
+            .present
+    );
+    let settings_snapshot_json =
+        serde_json::to_string(&settings_snapshot).expect("settings snapshot serializes");
+    assert!(settings_snapshot_json.contains("\"provider_key\""));
+    assert!(!settings_snapshot_json.contains("sk-secret-provider-key"));
+    assert!(!settings_snapshot_json.contains("api_key"));
+
+    processor
+        .provider_set_api_key(
+            connection_id,
+            set_openai_request_id.clone(),
+            ProviderSetApiKeyParams {
+                workspace_id: workspace_id.clone(),
+                provider: "OpenAI".to_owned(),
+                api_key: "sk-openai-embedding-key".to_owned(),
+            },
+        )
+        .await;
+    let set_openai_response = recv_response_by_id(&mut rx, set_openai_request_id.as_str()).await;
+    let set_openai_payload: ProviderSetApiKeyResponse =
+        serde_json::from_value(set_openai_response.result).expect("provider/set openai payload");
+    assert_eq!(set_openai_payload.provider, "openai");
+    assert!(set_openai_payload.updated);
+    assert_eq!(
+        secret_store
+            .get_string(
+                &SecretId::workspace_provider_api_key(workspace_id.as_str(), "openai")
+                    .expect("openai provider id"),
+            )
+            .expect("read openai provider key"),
+        Some("sk-openai-embedding-key".to_owned())
+    );
 
     processor
         .provider_list(
@@ -2197,8 +2282,12 @@ async fn provider_api_key_handlers_use_keystore_without_settings_write() {
     let list_response = recv_response_by_id(&mut rx, list_request_id.as_str()).await;
     let list_payload: ProviderListResponse =
         serde_json::from_value(list_response.result).expect("provider/list payload");
-    assert_eq!(list_payload.providers.len(), 1);
-    assert_eq!(list_payload.providers[0].name, "openrouter");
+    let provider_names = list_payload
+        .providers
+        .iter()
+        .map(|provider| provider.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(provider_names, vec!["openai", "openrouter"]);
 
     processor
         .provider_list(
@@ -2238,13 +2327,35 @@ async fn provider_api_key_handlers_use_keystore_without_settings_write() {
             .expect("read deleted provider key"),
         None
     );
+    assert_eq!(
+        secret_store
+            .get_string(
+                &SecretId::workspace_provider_api_key(workspace_id.as_str(), "openai")
+                    .expect("openai provider id"),
+            )
+            .expect("read preserved openai provider key"),
+        Some("sk-openai-embedding-key".to_owned())
+    );
+    processor
+        .apply_vector_provider_key_presence(
+            &mut settings_snapshot,
+            connection_workspace_id.as_deref(),
+        )
+        .expect("settings snapshot key status should apply after delete");
+    assert!(
+        !settings_snapshot
+            .thread_episodic
+            .vector_search
+            .provider_key
+            .present
+    );
 
     processor
         .provider_delete_api_key(
             connection_id,
             delete_missing_request_id.clone(),
             ProviderDeleteApiKeyParams {
-                workspace_id,
+                workspace_id: workspace_id.clone(),
                 provider: "openrouter".to_owned(),
             },
         )
@@ -2256,6 +2367,24 @@ async fn provider_api_key_handlers_use_keystore_without_settings_write() {
             .expect("provider/delete_api_key missing payload");
     assert_eq!(missing_delete_payload.provider, "openrouter");
     assert!(!missing_delete_payload.deleted);
+
+    processor
+        .provider_delete_api_key(
+            connection_id,
+            delete_openai_request_id.clone(),
+            ProviderDeleteApiKeyParams {
+                workspace_id,
+                provider: "openai".to_owned(),
+            },
+        )
+        .await;
+    let delete_openai_response =
+        recv_response_by_id(&mut rx, delete_openai_request_id.as_str()).await;
+    let delete_openai_payload: ProviderDeleteApiKeyResponse =
+        serde_json::from_value(delete_openai_response.result)
+            .expect("provider/delete_api_key openai payload");
+    assert_eq!(delete_openai_payload.provider, "openai");
+    assert!(delete_openai_payload.deleted);
 }
 
 #[tokio::test]

@@ -31,6 +31,7 @@ mod system_skills;
 mod task_tools;
 mod thread;
 mod thread_episodic;
+mod thread_episodic_embedding;
 mod thread_episodic_hooks;
 mod tokenizer;
 mod transport;
@@ -457,7 +458,13 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         .gateway
         .memory
         .resolve_capsules_root(runtime_home.as_path())?;
-    database::startup::spawn(crud_store.clone(), thread_episodic_storage_root.clone());
+    database::startup::spawn(
+        crud_store.clone(),
+        thread_episodic_storage_root.clone(),
+        config.gateway.thread_episodic.vector_search.clone(),
+        provider_registry.clone(),
+        runtime_home.clone(),
+    );
     database::maintenance::spawn(crud_store.clone());
 
     let mut message_processor = MessageProcessor::new_with_memory_runtime_and_task_config(
@@ -766,6 +773,8 @@ fn thread_episodic_runtime_config_from_gateway_config(
         enabled: config.enabled,
         indexing_enabled: config.indexing_enabled,
         recall_enabled: config.recall_enabled,
+        vector_search_enabled: config.vector_search.enabled,
+        vector_search: config.vector_search.clone(),
         hook_max_prompt_chars: config.default_prompt_chars,
         hook_max_candidates: config.default_max_candidates,
         index_executor: ThreadEpisodicIndexExecutorConfig {
@@ -777,6 +786,7 @@ fn thread_episodic_runtime_config_from_gateway_config(
         },
         recall_service: ThreadEpisodicRecallServiceConfig {
             enabled: config.enabled && config.recall_enabled,
+            vector_search_enabled: config.vector_search.enabled,
             default_prompt_chars: config.default_prompt_chars,
             max_prompt_chars: config.max_prompt_chars,
             max_hit_chars: config.max_hit_chars,
@@ -797,6 +807,8 @@ pub(crate) fn thread_episodic_runtime_config_from_gateway_settings(
         enabled: settings.enabled,
         indexing_enabled: settings.indexing_enabled,
         recall_enabled: settings.recall_enabled,
+        vector_search_enabled: settings.vector_search.enabled,
+        vector_search: settings.vector_search.clone(),
         hook_max_prompt_chars: settings.default_prompt_chars,
         hook_max_candidates: settings.default_max_candidates,
         index_executor: ThreadEpisodicIndexExecutorConfig {
@@ -808,6 +820,7 @@ pub(crate) fn thread_episodic_runtime_config_from_gateway_settings(
         },
         recall_service: ThreadEpisodicRecallServiceConfig {
             enabled: settings.enabled && settings.recall_enabled,
+            vector_search_enabled: settings.vector_search.enabled,
             default_prompt_chars: settings.default_prompt_chars,
             max_prompt_chars: settings.max_prompt_chars,
             max_hit_chars: settings.max_hit_chars as usize,
@@ -1159,6 +1172,7 @@ mod tests {
             retry_max_delay_secs: 121,
             max_attempts: 4,
             near_capacity_percent: 81.0,
+            vector_search: pioneer_config::GatewayThreadEpisodicVectorSearchConfig::default(),
         };
 
         let runtime = thread_episodic_runtime_config_from_gateway_settings(&settings);
@@ -1166,6 +1180,7 @@ mod tests {
         assert!(!runtime.enabled);
         assert!(runtime.indexing_enabled);
         assert!(runtime.recall_enabled);
+        assert!(!runtime.vector_search_enabled);
         assert_eq!(runtime.hook_max_prompt_chars, 1_500);
         assert_eq!(runtime.hook_max_candidates, 9);
         assert_eq!(runtime.index_executor.batch_limit, 7);
@@ -1183,6 +1198,12 @@ mod tests {
         assert_eq!(runtime.recall_service.min_relevancy, 0.4);
         assert_eq!(runtime.recall_service.min_results, 2);
         assert_eq!(runtime.recall_service.snippet_chars, 220);
+
+        let mut vector_settings = settings.clone();
+        vector_settings.vector_search.enabled = true;
+        let vector_runtime = thread_episodic_runtime_config_from_gateway_settings(&vector_settings);
+        assert!(vector_runtime.vector_search_enabled);
+        assert!(vector_runtime.recall_service.vector_search_enabled);
     }
 
     #[test]

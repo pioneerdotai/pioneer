@@ -5,8 +5,10 @@ use pioneer_config::{
     GatewayMemoryModelSelectionConfig,
     GatewayMemoryModelSelectionSource as ConfigGatewayMemoryModelSelectionSource,
     GatewayRemoteAccessConfig, GatewayThreadEpisodicConfig,
+    GatewayThreadEpisodicVectorProviderConfig, GatewayThreadEpisodicVectorSearchConfig,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Component, Path};
@@ -194,6 +196,7 @@ pub struct GatewayThreadEpisodicSettings {
     pub retry_max_delay_secs: i64,
     pub max_attempts: i64,
     pub near_capacity_percent: f64,
+    pub vector_search: GatewayThreadEpisodicVectorSearchConfig,
 }
 
 impl Default for GatewayThreadEpisodicSettings {
@@ -239,6 +242,8 @@ struct GatewayThreadEpisodicSettingsOverride {
     max_attempts: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     near_capacity_percent: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vector_search: Option<GatewayThreadEpisodicVectorSearchConfig>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -506,8 +511,11 @@ impl GatewaySettings {
             changes.memory = true;
         }
         if let Some(thread_episodic) = update.thread_episodic {
+            let previous_vector_identity = self.thread_episodic_vector_projection_identity_hash();
             self.apply_thread_episodic_settings_update(thread_episodic);
             changes.thread_episodic = true;
+            changes.thread_episodic_vector_projection_changed =
+                previous_vector_identity != self.thread_episodic_vector_projection_identity_hash();
         }
         if let Some(cli_runtimes) = update.cli_runtimes {
             self.set_cli_runtime_settings(cli_runtimes)?;
@@ -526,6 +534,16 @@ impl GatewaySettings {
         self.thread_episodic
             .get_or_insert_with(GatewayThreadEpisodicSettingsOverride::default)
             .apply_protocol_update(update);
+    }
+
+    fn thread_episodic_vector_projection_identity_hash(&self) -> String {
+        let vector_search = self
+            .thread_episodic
+            .as_ref()
+            .and_then(|thread_episodic| thread_episodic.vector_search.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        thread_episodic_vector_projection_identity_hash(&vector_search)
     }
 
     pub fn apply_to_gateway_memory_config(
@@ -707,6 +725,7 @@ impl GatewayThreadEpisodicSettings {
             retry_max_delay_secs: config.retry_max_delay_secs,
             max_attempts: config.max_attempts,
             near_capacity_percent: config.near_capacity_percent,
+            vector_search: config.vector_search.clone(),
         }
     }
 
@@ -729,6 +748,7 @@ impl GatewayThreadEpisodicSettings {
             retry_max_delay_secs: settings.retry_max_delay_secs,
             max_attempts: settings.max_attempts,
             near_capacity_percent: settings.near_capacity_percent,
+            vector_search: vector_search_config_from_protocol(settings.vector_search),
         }
     }
 
@@ -751,8 +771,281 @@ impl GatewayThreadEpisodicSettings {
             retry_max_delay_secs: self.retry_max_delay_secs,
             max_attempts: self.max_attempts,
             near_capacity_percent: self.near_capacity_percent,
+            vector_search: vector_search_config_to_protocol(&self.vector_search),
         }
     }
+}
+
+fn vector_search_config_to_protocol(
+    config: &GatewayThreadEpisodicVectorSearchConfig,
+) -> pioneer_protocol::GatewayThreadEpisodicVectorSearchSettings {
+    let provider = config.provider.map(vector_provider_to_protocol);
+    let mut settings = pioneer_protocol::GatewayThreadEpisodicVectorSearchSettings {
+        enabled: config.enabled,
+        provider,
+        model: config.model.clone(),
+        local_model: config.local_model.clone(),
+        embedding_dimension: config.embedding_dimension,
+        embedding_normalized: config.embedding_normalized,
+        provider_key: pioneer_protocol::GatewayThreadEpisodicVectorProviderKeyStatus {
+            required: config.enabled && config.provider.is_some_and(vector_provider_requires_key),
+            present: false,
+        },
+        refill_status: if config.enabled {
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Unknown
+        } else {
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Disabled
+        },
+        local_model_status: if config.enabled
+            && matches!(
+                config.provider,
+                Some(GatewayThreadEpisodicVectorProviderConfig::Local)
+            ) {
+            pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Unknown
+        } else {
+            pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::NotSelected
+        },
+    };
+    apply_thread_episodic_vector_search_status(&mut settings);
+    settings
+}
+
+fn vector_search_config_from_protocol(
+    settings: pioneer_protocol::GatewayThreadEpisodicVectorSearchSettings,
+) -> GatewayThreadEpisodicVectorSearchConfig {
+    GatewayThreadEpisodicVectorSearchConfig {
+        enabled: settings.enabled,
+        provider: settings.provider.map(vector_provider_from_protocol),
+        model: settings.model,
+        local_model: settings.local_model,
+        embedding_dimension: settings.embedding_dimension,
+        embedding_normalized: settings.embedding_normalized,
+    }
+}
+
+pub fn thread_episodic_vector_projection_identity_hash(
+    config: &GatewayThreadEpisodicVectorSearchConfig,
+) -> String {
+    let provider = if config.enabled {
+        config
+            .provider
+            .map(vector_provider_identity_name)
+            .unwrap_or("missing")
+    } else {
+        "disabled"
+    };
+    let model = if !config.enabled {
+        ""
+    } else if matches!(
+        config.provider,
+        Some(GatewayThreadEpisodicVectorProviderConfig::Local)
+    ) {
+        config.local_model.as_deref().map(str::trim).unwrap_or("")
+    } else {
+        config.model.as_deref().map(str::trim).unwrap_or("")
+    };
+    let dimension = if config.enabled {
+        resolved_vector_embedding_dimension(config)
+            .map(|dimension| dimension.to_string())
+            .unwrap_or_else(|| "unknown".to_owned())
+    } else {
+        "none".to_owned()
+    };
+    let normalized = if config.enabled && config.embedding_normalized {
+        "true"
+    } else {
+        "false"
+    };
+    let identity = format!(
+        "thread_episodic_vector_projection_v1\nenabled={}\nprovider={provider}\nmodel={model}\ndimension={dimension}\nnormalized={normalized}\n",
+        config.enabled
+    );
+    let digest = Sha256::digest(identity.as_bytes());
+    hex_lower(digest.as_slice())
+}
+
+pub fn apply_thread_episodic_vector_search_status(
+    vector_search: &mut pioneer_protocol::GatewayThreadEpisodicVectorSearchSettings,
+) {
+    let config = vector_search_config_from_protocol(vector_search.clone());
+    vector_search.provider_key.required =
+        vector_search.enabled && config.provider.is_some_and(vector_provider_requires_key);
+    if !vector_search.provider_key.required {
+        vector_search.provider_key.present = false;
+    }
+
+    if !vector_search.enabled {
+        vector_search.refill_status =
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Disabled;
+        vector_search.local_model_status =
+            pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::NotSelected;
+        return;
+    }
+
+    let Some(dimension) = resolved_vector_embedding_dimension(&config) else {
+        vector_search.refill_status =
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required;
+        if matches!(
+            config.provider,
+            Some(GatewayThreadEpisodicVectorProviderConfig::Local)
+        ) {
+            vector_search.local_model_status =
+                pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Missing;
+        }
+        return;
+    };
+    vector_search.embedding_dimension = Some(dimension);
+
+    if config.provider.is_some_and(vector_provider_requires_key)
+        && !vector_search.provider_key.present
+    {
+        vector_search.refill_status =
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required;
+        vector_search.local_model_status =
+            pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::NotSelected;
+        return;
+    }
+
+    if matches!(
+        config.provider,
+        Some(GatewayThreadEpisodicVectorProviderConfig::Local)
+    ) {
+        vector_search.local_model_status =
+            pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Missing;
+        vector_search.refill_status =
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required;
+        return;
+    }
+
+    vector_search.local_model_status =
+        pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::NotSelected;
+    vector_search.refill_status =
+        pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required;
+}
+
+pub fn force_thread_episodic_vector_refill_required(
+    vector_search: &mut pioneer_protocol::GatewayThreadEpisodicVectorSearchSettings,
+) {
+    vector_search.refill_status =
+        pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required;
+}
+
+fn apply_vector_search_protocol_update(
+    config: &mut GatewayThreadEpisodicVectorSearchConfig,
+    update: pioneer_protocol::GatewayThreadEpisodicVectorSearchSettingsUpdate,
+) {
+    if let Some(enabled) = update.enabled {
+        config.enabled = enabled;
+    }
+    if let Some(provider) = update.provider {
+        config.provider = provider.map(vector_provider_from_protocol);
+    }
+    if let Some(model) = update.model {
+        config.model = model;
+    }
+    if let Some(local_model) = update.local_model {
+        config.local_model = local_model;
+    }
+    if let Some(embedding_dimension) = update.embedding_dimension {
+        config.embedding_dimension = embedding_dimension;
+    }
+    if let Some(embedding_normalized) = update.embedding_normalized {
+        config.embedding_normalized = embedding_normalized;
+    }
+}
+
+fn vector_provider_to_protocol(
+    provider: GatewayThreadEpisodicVectorProviderConfig,
+) -> pioneer_protocol::GatewayThreadEpisodicVectorProvider {
+    match provider {
+        GatewayThreadEpisodicVectorProviderConfig::OpenAi => {
+            pioneer_protocol::GatewayThreadEpisodicVectorProvider::OpenAi
+        }
+        GatewayThreadEpisodicVectorProviderConfig::OpenRouter => {
+            pioneer_protocol::GatewayThreadEpisodicVectorProvider::OpenRouter
+        }
+        GatewayThreadEpisodicVectorProviderConfig::Local => {
+            pioneer_protocol::GatewayThreadEpisodicVectorProvider::Local
+        }
+    }
+}
+
+fn vector_provider_from_protocol(
+    provider: pioneer_protocol::GatewayThreadEpisodicVectorProvider,
+) -> GatewayThreadEpisodicVectorProviderConfig {
+    match provider {
+        pioneer_protocol::GatewayThreadEpisodicVectorProvider::OpenAi => {
+            GatewayThreadEpisodicVectorProviderConfig::OpenAi
+        }
+        pioneer_protocol::GatewayThreadEpisodicVectorProvider::OpenRouter => {
+            GatewayThreadEpisodicVectorProviderConfig::OpenRouter
+        }
+        pioneer_protocol::GatewayThreadEpisodicVectorProvider::Local => {
+            GatewayThreadEpisodicVectorProviderConfig::Local
+        }
+    }
+}
+
+fn vector_provider_requires_key(provider: GatewayThreadEpisodicVectorProviderConfig) -> bool {
+    matches!(
+        provider,
+        GatewayThreadEpisodicVectorProviderConfig::OpenAi
+            | GatewayThreadEpisodicVectorProviderConfig::OpenRouter
+    )
+}
+
+pub(crate) fn vector_provider_identity_name(
+    provider: GatewayThreadEpisodicVectorProviderConfig,
+) -> &'static str {
+    match provider {
+        GatewayThreadEpisodicVectorProviderConfig::OpenAi => "openai",
+        GatewayThreadEpisodicVectorProviderConfig::OpenRouter => "openrouter",
+        GatewayThreadEpisodicVectorProviderConfig::Local => "local",
+    }
+}
+
+pub(crate) fn resolved_vector_embedding_dimension(
+    config: &GatewayThreadEpisodicVectorSearchConfig,
+) -> Option<u32> {
+    if let Some(dimension) = config.embedding_dimension {
+        return Some(dimension);
+    }
+
+    match config.provider {
+        Some(GatewayThreadEpisodicVectorProviderConfig::OpenAi) => {
+            match config.model.as_deref().unwrap_or("").trim() {
+                "text-embedding-3-small" | "text-embedding-ada-002" => Some(1536),
+                "text-embedding-3-large" => Some(3072),
+                _ => None,
+            }
+        }
+        Some(GatewayThreadEpisodicVectorProviderConfig::OpenRouter) => {
+            match config.model.as_deref().unwrap_or("").trim() {
+                "openai/text-embedding-3-small" => Some(1536),
+                "openai/text-embedding-3-large" => Some(3072),
+                _ => None,
+            }
+        }
+        Some(GatewayThreadEpisodicVectorProviderConfig::Local) => {
+            match config.local_model.as_deref().unwrap_or("").trim() {
+                "bge-small-en-v1.5" => Some(384),
+                "bge-base-en-v1.5" | "nomic-embed-text-v1.5" => Some(768),
+                "gte-large" => Some(1024),
+                _ => None,
+            }
+        }
+        None => None,
+    }
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -760,6 +1053,7 @@ pub struct GatewaySettingsChangeSet {
     pub general: GatewayGeneralSettingsChangeSet,
     pub memory: bool,
     pub thread_episodic: bool,
+    pub thread_episodic_vector_projection_changed: bool,
     pub cli_runtimes: bool,
     pub remote_access: GatewayRemoteAccessChangeSet,
 }
@@ -885,6 +1179,7 @@ impl GatewayThreadEpisodicSettingsOverride {
             retry_max_delay_secs: Some(settings.retry_max_delay_secs),
             max_attempts: Some(settings.max_attempts),
             near_capacity_percent: Some(settings.near_capacity_percent),
+            vector_search: Some(settings.vector_search),
         }
     }
 
@@ -942,6 +1237,9 @@ impl GatewayThreadEpisodicSettingsOverride {
         }
         if let Some(near_capacity_percent) = self.near_capacity_percent {
             settings.near_capacity_percent = near_capacity_percent;
+        }
+        if let Some(vector_search) = &self.vector_search {
+            settings.vector_search = vector_search.clone();
         }
         settings
     }
@@ -1001,6 +1299,11 @@ impl GatewayThreadEpisodicSettingsOverride {
         if let Some(near_capacity_percent) = update.near_capacity_percent {
             self.near_capacity_percent = Some(near_capacity_percent);
         }
+        if let Some(vector_update) = update.vector_search {
+            let mut vector_search = self.vector_search.clone().unwrap_or_default();
+            apply_vector_search_protocol_update(&mut vector_search, vector_update);
+            self.vector_search = Some(vector_search);
+        }
     }
 
     fn apply_to_gateway_thread_episodic_config(
@@ -1027,6 +1330,7 @@ impl GatewayThreadEpisodicSettingsOverride {
         config.retry_max_delay_secs = settings.retry_max_delay_secs;
         config.max_attempts = settings.max_attempts;
         config.near_capacity_percent = settings.near_capacity_percent;
+        config.vector_search = settings.vector_search;
         config
     }
 }
@@ -1461,8 +1765,10 @@ mod tests {
         GatewayCliAgentRuntimeInstancesConfig, GatewayComputerUseToolsConfig, GatewayConfig,
         GatewayDatabaseConfig, GatewayExecutionWindowsConfig, GatewayMemoryConfig,
         GatewayMemoryModelSelectionConfig, GatewayProviderConfig, GatewaySkillsConfig,
-        GatewayThreadConfig, GatewayThreadEpisodicConfig, GatewayToolLoopBudgetConfig,
-        GatewayToolRetryBudgetConfig, GatewayToolsConfig, GatewayWebToolsConfig,
+        GatewayThreadConfig, GatewayThreadEpisodicConfig,
+        GatewayThreadEpisodicVectorProviderConfig, GatewayThreadEpisodicVectorSearchConfig,
+        GatewayToolLoopBudgetConfig, GatewayToolRetryBudgetConfig, GatewayToolsConfig,
+        GatewayWebToolsConfig,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -1750,6 +2056,14 @@ retry_base_delay_secs = 12
 retry_max_delay_secs = 120
 max_attempts = 3
 near_capacity_percent = 75.0
+
+[thread_episodic.vector_search]
+enabled = true
+provider = "openrouter"
+model = "openai/text-embedding-3-small"
+local_model = "bge-base-en-v1.5"
+embedding_dimension = 1536
+embedding_normalized = true
 "#,
         )
         .expect("gateway settings should parse");
@@ -1772,6 +2086,7 @@ near_capacity_percent = 75.0
             retry_max_delay_secs: 900,
             max_attempts: 5,
             near_capacity_percent: 85.0,
+            vector_search: pioneer_config::GatewayThreadEpisodicVectorSearchConfig::default(),
         };
 
         let mapped = settings.apply_to_gateway_thread_episodic_config(base);
@@ -1793,6 +2108,198 @@ near_capacity_percent = 75.0
         assert_eq!(mapped.retry_max_delay_secs, 120);
         assert_eq!(mapped.max_attempts, 3);
         assert_eq!(mapped.near_capacity_percent, 75.0);
+        assert!(mapped.vector_search.enabled);
+        assert_eq!(
+            mapped.vector_search.provider,
+            Some(pioneer_config::GatewayThreadEpisodicVectorProviderConfig::OpenRouter)
+        );
+        assert_eq!(
+            mapped.vector_search.model.as_deref(),
+            Some("openai/text-embedding-3-small")
+        );
+        assert_eq!(
+            mapped.vector_search.local_model.as_deref(),
+            Some("bge-base-en-v1.5")
+        );
+        assert_eq!(mapped.vector_search.embedding_dimension, Some(1536));
+        assert!(mapped.vector_search.embedding_normalized);
+    }
+
+    #[test]
+    fn vector_projection_hash_tracks_active_identity_but_not_disabled_model_fields() {
+        let disabled = GatewayThreadEpisodicVectorSearchConfig {
+            enabled: false,
+            provider: Some(GatewayThreadEpisodicVectorProviderConfig::OpenAi),
+            model: Some("text-embedding-3-small".to_owned()),
+            local_model: Some("bge-small-en-v1.5".to_owned()),
+            embedding_dimension: None,
+            embedding_normalized: true,
+        };
+        let disabled_changed_model = GatewayThreadEpisodicVectorSearchConfig {
+            model: Some("text-embedding-3-large".to_owned()),
+            provider: Some(GatewayThreadEpisodicVectorProviderConfig::OpenRouter),
+            ..disabled.clone()
+        };
+        assert_eq!(
+            super::thread_episodic_vector_projection_identity_hash(&disabled),
+            super::thread_episodic_vector_projection_identity_hash(&disabled_changed_model)
+        );
+
+        let enabled_openai = GatewayThreadEpisodicVectorSearchConfig {
+            enabled: true,
+            ..disabled
+        };
+        let enabled_openrouter = GatewayThreadEpisodicVectorSearchConfig {
+            provider: Some(GatewayThreadEpisodicVectorProviderConfig::OpenRouter),
+            model: Some("openai/text-embedding-3-small".to_owned()),
+            ..enabled_openai.clone()
+        };
+        assert_ne!(
+            super::thread_episodic_vector_projection_identity_hash(&enabled_openai),
+            super::thread_episodic_vector_projection_identity_hash(&enabled_openrouter)
+        );
+    }
+
+    #[test]
+    fn vector_search_status_marks_missing_provider_key_and_local_model_not_ready() {
+        let mut disabled = pioneer_protocol::GatewayThreadEpisodicVectorSearchSettings {
+            enabled: false,
+            provider: Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::OpenAi),
+            provider_key: pioneer_protocol::GatewayThreadEpisodicVectorProviderKeyStatus {
+                required: true,
+                present: true,
+            },
+            local_model_status:
+                pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Missing,
+            refill_status: pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required,
+            ..Default::default()
+        };
+        super::apply_thread_episodic_vector_search_status(&mut disabled);
+        assert!(!disabled.provider_key.required);
+        assert!(!disabled.provider_key.present);
+        assert_eq!(
+            disabled.local_model_status,
+            pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::NotSelected
+        );
+        assert_eq!(
+            disabled.refill_status,
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Disabled
+        );
+
+        let mut openai = pioneer_protocol::GatewayThreadEpisodicVectorSearchSettings {
+            enabled: true,
+            provider: Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::OpenAi),
+            model: Some("text-embedding-3-small".to_owned()),
+            ..Default::default()
+        };
+        super::apply_thread_episodic_vector_search_status(&mut openai);
+        assert!(openai.provider_key.required);
+        assert!(!openai.provider_key.present);
+        assert_eq!(openai.embedding_dimension, Some(1536));
+        assert_eq!(
+            openai.refill_status,
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required
+        );
+
+        openai.provider_key.present = true;
+        super::apply_thread_episodic_vector_search_status(&mut openai);
+        assert_eq!(
+            openai.refill_status,
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required
+        );
+
+        let mut local = pioneer_protocol::GatewayThreadEpisodicVectorSearchSettings {
+            enabled: true,
+            provider: Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::Local),
+            local_model: Some("bge-small-en-v1.5".to_owned()),
+            ..Default::default()
+        };
+        super::apply_thread_episodic_vector_search_status(&mut local);
+        assert!(!local.provider_key.required);
+        assert_eq!(local.embedding_dimension, Some(384));
+        assert_eq!(
+            local.local_model_status,
+            pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Missing
+        );
+        assert_eq!(
+            local.refill_status,
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required
+        );
+    }
+
+    #[test]
+    fn vector_disable_settings_change_set_marks_model_change_and_disable_transition() {
+        let mut settings = toml::from_str::<super::GatewaySettings>(
+            r#"
+version = 1
+
+[secrets]
+backend = "keystore"
+
+[thread_episodic.vector_search]
+enabled = true
+provider = "openai"
+model = "text-embedding-3-small"
+local_model = "bge-small-en-v1.5"
+embedding_normalized = true
+"#,
+        )
+        .expect("gateway settings should parse");
+
+        let model_change = settings
+            .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+                thread_episodic: Some(pioneer_protocol::GatewayThreadEpisodicSettingsUpdate {
+                    vector_search: Some(
+                        pioneer_protocol::GatewayThreadEpisodicVectorSearchSettingsUpdate {
+                            model: Some(Some("text-embedding-3-large".to_owned())),
+                            ..Default::default()
+                        },
+                    ),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .expect("model update should apply");
+        assert!(model_change.thread_episodic);
+        assert!(model_change.thread_episodic_vector_projection_changed);
+
+        let disable = settings
+            .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+                thread_episodic: Some(pioneer_protocol::GatewayThreadEpisodicSettingsUpdate {
+                    vector_search: Some(
+                        pioneer_protocol::GatewayThreadEpisodicVectorSearchSettingsUpdate {
+                            enabled: Some(false),
+                            ..Default::default()
+                        },
+                    ),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .expect("disable update should apply");
+        assert!(disable.thread_episodic_vector_projection_changed);
+
+        let already_disabled = settings
+            .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+                thread_episodic: Some(pioneer_protocol::GatewayThreadEpisodicSettingsUpdate {
+                    vector_search: Some(
+                        pioneer_protocol::GatewayThreadEpisodicVectorSearchSettingsUpdate {
+                            enabled: Some(false),
+                            provider: Some(Some(
+                                pioneer_protocol::GatewayThreadEpisodicVectorProvider::OpenRouter,
+                            )),
+                            model: Some(Some("different-disabled-model".to_owned())),
+                            local_model: Some(Some("different-disabled-local".to_owned())),
+                            embedding_dimension: Some(Some(1234)),
+                            embedding_normalized: Some(false),
+                        },
+                    ),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .expect("already-disabled update should apply");
+        assert!(!already_disabled.thread_episodic_vector_projection_changed);
     }
 
     #[test]
@@ -1821,6 +2328,7 @@ near_capacity_percent = 75.0
             retry_max_delay_secs: 120,
             max_attempts: 3,
             near_capacity_percent: 75.0,
+            vector_search: pioneer_config::GatewayThreadEpisodicVectorSearchConfig::default(),
         });
         save_gateway_settings(&path, &settings).expect("settings should save");
 
@@ -1862,6 +2370,112 @@ near_capacity_percent = 75.0
         assert!(!content.contains("recall_enabled"));
 
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn gateway_thread_episodic_snapshot_exposes_vector_status_without_key_values() {
+        let settings = toml::from_str::<super::GatewaySettings>(
+            r#"
+version = 1
+
+[secrets]
+backend = "keystore"
+"#,
+        )
+        .expect("gateway settings should parse");
+        let mut config = gateway_config_with_keepawake(false);
+        config.thread_episodic.vector_search.enabled = true;
+        config.thread_episodic.vector_search.provider =
+            Some(pioneer_config::GatewayThreadEpisodicVectorProviderConfig::OpenRouter);
+        config.thread_episodic.vector_search.model =
+            Some("openai/text-embedding-3-small".to_owned());
+        config.thread_episodic.vector_search.embedding_dimension = Some(1536);
+
+        let snapshot = settings.snapshot(&config);
+
+        assert!(snapshot.thread_episodic.vector_search.enabled);
+        assert_eq!(
+            snapshot.thread_episodic.vector_search.provider,
+            Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::OpenRouter)
+        );
+        assert_eq!(
+            snapshot.thread_episodic.vector_search.model.as_deref(),
+            Some("openai/text-embedding-3-small")
+        );
+        assert_eq!(
+            snapshot.thread_episodic.vector_search.embedding_dimension,
+            Some(1536)
+        );
+        assert!(snapshot.thread_episodic.vector_search.provider_key.required);
+        assert!(!snapshot.thread_episodic.vector_search.provider_key.present);
+        assert_eq!(
+            snapshot.thread_episodic.vector_search.refill_status,
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required
+        );
+
+        let serialized = serde_json::to_string(&snapshot).expect("snapshot serializes");
+        assert!(serialized.contains("provider_key"));
+        assert!(!serialized.contains("api_key"));
+        assert!(!serialized.contains("sk-"));
+    }
+
+    #[test]
+    fn gateway_thread_episodic_protocol_update_applies_vector_settings_without_secrets() {
+        let mut settings = toml::from_str::<super::GatewaySettings>(
+            r#"
+version = 1
+
+[secrets]
+backend = "keystore"
+"#,
+        )
+        .expect("gateway settings should parse");
+
+        let changes = settings
+            .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+                thread_episodic: Some(pioneer_protocol::GatewayThreadEpisodicSettingsUpdate {
+                    vector_search: Some(
+                        pioneer_protocol::GatewayThreadEpisodicVectorSearchSettingsUpdate {
+                            enabled: Some(true),
+                            provider: Some(Some(
+                                pioneer_protocol::GatewayThreadEpisodicVectorProvider::Local,
+                            )),
+                            model: Some(Some("bge-base-en-v1.5".to_owned())),
+                            local_model: Some(Some("bge-base-en-v1.5".to_owned())),
+                            embedding_dimension: Some(Some(768)),
+                            embedding_normalized: Some(true),
+                        },
+                    ),
+                    ..pioneer_protocol::GatewayThreadEpisodicSettingsUpdate::default()
+                }),
+                ..pioneer_protocol::GatewaySettingsUpdate::default()
+            })
+            .expect("vector settings update should apply");
+
+        assert!(changes.thread_episodic);
+        let mapped = settings.apply_to_gateway_thread_episodic_config(
+            pioneer_config::GatewayThreadEpisodicConfig::default(),
+        );
+        assert!(mapped.vector_search.enabled);
+        assert_eq!(
+            mapped.vector_search.provider,
+            Some(pioneer_config::GatewayThreadEpisodicVectorProviderConfig::Local)
+        );
+        assert_eq!(
+            mapped.vector_search.model.as_deref(),
+            Some("bge-base-en-v1.5")
+        );
+        assert_eq!(
+            mapped.vector_search.local_model.as_deref(),
+            Some("bge-base-en-v1.5")
+        );
+        assert_eq!(mapped.vector_search.embedding_dimension, Some(768));
+
+        let serialized = toml::to_string(&settings).expect("settings should serialize");
+        assert!(serialized.contains("[thread_episodic.vector_search]"));
+        assert!(serialized.contains("provider = \"local\""));
+        assert!(!serialized.contains("api_key"));
+        assert!(!serialized.contains("sk-"));
     }
 
     #[test]

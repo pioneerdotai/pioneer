@@ -38,7 +38,9 @@ use crate::hook_runtime::GatewayHookRuntimeBuilder;
 use crate::keep_awake::GatewayKeepAwake;
 use crate::prompt_hooks::agents_doc_prompt_hook_package;
 use crate::thread_episodic::{
-    StoreThreadEpisodicIndexPayloadProvider, StoreThreadEpisodicIngestor,
+    ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver,
+    RuntimeVectorThreadEpisodicIndexPayloadProvider, StoreThreadEpisodicIndexPayloadProvider,
+    StoreThreadEpisodicIngestor, ThreadEpisodicIndexEmbeddingProviderResolver,
     ThreadEpisodicIndexExecutor, ThreadEpisodicIngestor, ThreadEpisodicRecallService,
     ThreadEpisodicRuntimeConfig,
 };
@@ -380,11 +382,14 @@ pub struct MessageProcessor {
     hook_recovery_config: Arc<RwLock<GatewayHookRecoveryConfig>>,
     keepawake: Arc<GatewayKeepAwake>,
     artifact_runtime_home: PathBuf,
+    thread_episodic_storage_root: PathBuf,
     pub(crate) artifact_service: Arc<ArtifactService>,
     artifact_uploads: Arc<artifacts::upload::ArtifactUploadSessionManager>,
     artifact_downloads: Arc<artifacts::download::ArtifactDownloadSessionManager>,
     thread_episodic_ingestor: Arc<RwLock<Arc<dyn ThreadEpisodicIngestor>>>,
     thread_episodic_index_executor: Arc<ThreadEpisodicIndexExecutor>,
+    thread_episodic_embedding_provider_resolver:
+        Arc<ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver>,
     thread_episodic_recall_service: Arc<ThreadEpisodicRecallService>,
     voice_model_bootstrap: Arc<VoiceModelBootstrapHandle>,
     pub(crate) voice_sessions: GatewayVoiceSessionStore,
@@ -548,20 +553,38 @@ impl MessageProcessor {
             Arc::new(artifacts::download::ArtifactDownloadSessionManager::new());
         let thread_episodic_backend: Arc<dyn ThreadEpisodicMemvidBackend> =
             Arc::new(MemvidThreadEpisodicBackend::new());
+        let thread_episodic_embedding_provider_resolver = Arc::new(
+            ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver::new(
+                provider_registry.clone(),
+                runtime_home.clone(),
+                thread_episodic_runtime_config.vector_search.clone(),
+            ),
+        );
         let thread_episodic_index_executor = Arc::new(ThreadEpisodicIndexExecutor::new(
             crud_store.clone(),
             thread_episodic_backend.clone(),
-            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
-                crud_store.clone(),
-                thread_episodic_storage_uri_from_path(thread_episodic_storage_root.as_path()),
+            Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
+                Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                    crud_store.clone(),
+                    thread_episodic_storage_uri_from_path(thread_episodic_storage_root.as_path()),
+                )),
+                thread_episodic_embedding_provider_resolver.clone(),
             )),
         ));
         thread_episodic_index_executor.apply_config(thread_episodic_runtime_config.index_executor);
-        let thread_episodic_recall_service = Arc::new(ThreadEpisodicRecallService::new(
-            crud_store.clone(),
-            thread_episodic_backend,
-        ));
+        let thread_episodic_recall_embedding_provider_resolver: Arc<
+            dyn ThreadEpisodicIndexEmbeddingProviderResolver,
+        > = thread_episodic_embedding_provider_resolver.clone();
+        let thread_episodic_recall_service = Arc::new(
+            ThreadEpisodicRecallService::with_embedding_provider_resolver(
+                crud_store.clone(),
+                thread_episodic_backend,
+                Some(thread_episodic_recall_embedding_provider_resolver),
+            ),
+        );
         thread_episodic_recall_service.apply_config(thread_episodic_runtime_config.recall_service);
+        let thread_episodic_ingestion_enabled = thread_episodic_runtime_config.enabled
+            && thread_episodic_runtime_config.indexing_enabled;
 
         Self {
             thread_manager,
@@ -614,17 +637,18 @@ impl MessageProcessor {
             hook_recovery_config: Arc::new(RwLock::new(GatewayHookRecoveryConfig::default())),
             keepawake: Arc::new(GatewayKeepAwake::default()),
             artifact_runtime_home: runtime_home,
+            thread_episodic_storage_root,
             artifact_service,
             artifact_uploads,
             artifact_downloads,
             thread_episodic_ingestor: Arc::new(RwLock::new(Arc::new(
                 StoreThreadEpisodicIngestor::with_config(
                     crud_store,
-                    thread_episodic_runtime_config.enabled
-                        && thread_episodic_runtime_config.indexing_enabled,
+                    thread_episodic_ingestion_enabled,
                 ),
             ))),
             thread_episodic_index_executor,
+            thread_episodic_embedding_provider_resolver,
             thread_episodic_recall_service,
             voice_model_bootstrap: Arc::new(VoiceModelBootstrapHandle::unavailable(
                 "local voice model bootstrap has not started",
@@ -899,7 +923,7 @@ impl MessageProcessor {
                 let thread_config = self
                     .thread_episodic_runtime_config
                     .read()
-                    .map(|config| *config)
+                    .map(|config| config.clone())
                     .unwrap_or_default();
                 builder.install(thread_context_recall_hook_package(
                     self.thread_episodic_recall_service.clone(),
@@ -966,17 +990,24 @@ impl MessageProcessor {
         &self,
         config: ThreadEpisodicRuntimeConfig,
     ) {
+        let thread_episodic_ingestion_enabled = config.enabled && config.indexing_enabled;
         if let Ok(mut current) = self.thread_episodic_runtime_config.write() {
-            *current = config;
+            *current = config.clone();
         }
         self.thread_episodic_index_executor
             .apply_config(config.index_executor);
         self.thread_episodic_recall_service
             .apply_config(config.recall_service);
+        let mut vector_search_config = config.vector_search.clone();
+        if !config.enabled || !config.vector_search_enabled {
+            vector_search_config.enabled = false;
+        }
+        self.thread_episodic_embedding_provider_resolver
+            .apply_config(vector_search_config);
         *self.thread_episodic_ingestor.write().await =
             Arc::new(StoreThreadEpisodicIngestor::with_config(
                 self.crud_store.clone(),
-                config.enabled && config.indexing_enabled,
+                thread_episodic_ingestion_enabled,
             ));
     }
 
@@ -2014,23 +2045,35 @@ impl MessageProcessor {
             Arc::new(StdRwLock::new(normalized_tool_loop_config.memory.clone()));
         let thread_episodic_backend: Arc<dyn ThreadEpisodicMemvidBackend> =
             Arc::new(MemvidThreadEpisodicBackend::new());
+        let thread_episodic_storage_root = artifact_runtime_home.join("memory").join("capsules");
+        let thread_episodic_embedding_provider_resolver = Arc::new(
+            ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver::new(
+                provider_registry.clone(),
+                artifact_runtime_home.clone(),
+                ThreadEpisodicRuntimeConfig::default().vector_search,
+            ),
+        );
         let thread_episodic_index_executor = Arc::new(ThreadEpisodicIndexExecutor::new(
             crud_store.clone(),
             thread_episodic_backend.clone(),
-            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
-                crud_store.clone(),
-                thread_episodic_storage_uri_from_path(
-                    artifact_runtime_home
-                        .join("memory")
-                        .join("capsules")
-                        .as_path(),
-                ),
+            Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
+                Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                    crud_store.clone(),
+                    thread_episodic_storage_uri_from_path(thread_episodic_storage_root.as_path()),
+                )),
+                thread_episodic_embedding_provider_resolver.clone(),
             )),
         ));
-        let thread_episodic_recall_service = Arc::new(ThreadEpisodicRecallService::new(
-            crud_store.clone(),
-            thread_episodic_backend,
-        ));
+        let thread_episodic_recall_embedding_provider_resolver: Arc<
+            dyn ThreadEpisodicIndexEmbeddingProviderResolver,
+        > = thread_episodic_embedding_provider_resolver.clone();
+        let thread_episodic_recall_service = Arc::new(
+            ThreadEpisodicRecallService::with_embedding_provider_resolver(
+                crud_store.clone(),
+                thread_episodic_backend,
+                Some(thread_episodic_recall_embedding_provider_resolver),
+            ),
+        );
         Self {
             thread_manager,
             agent_manager,
@@ -2094,6 +2137,7 @@ impl MessageProcessor {
             hook_recovery_config: Arc::new(RwLock::new(GatewayHookRecoveryConfig::default())),
             keepawake: Arc::new(GatewayKeepAwake::default()),
             artifact_runtime_home,
+            thread_episodic_storage_root,
             artifact_service,
             artifact_uploads,
             artifact_downloads,
@@ -2101,6 +2145,7 @@ impl MessageProcessor {
                 StoreThreadEpisodicIngestor::new(crud_store),
             ))),
             thread_episodic_index_executor,
+            thread_episodic_embedding_provider_resolver,
             thread_episodic_recall_service,
             voice_model_bootstrap: Arc::new(VoiceModelBootstrapHandle::ready()),
             voice_sessions: GatewayVoiceSessionStore::default(),
