@@ -6,8 +6,14 @@ use crate::registry::ToolHandler;
 use crate::shell_format::{
     ExecModelPayload, ExecPayloadInput, build_exec_model_payload, render_exec_ui_text,
 };
+use crate::{
+    NativeSandboxPrepareOutcome, NativeSandboxRequest, NonoSandboxBackend, ProcessSpawnPlan,
+    WindowsRestrictedTokenBackend, build_process_spawn_plan, configure_nono_command,
+    configure_windows_restricted_token_command, prepare_native_sandbox_backend,
+};
 use async_trait::async_trait;
 use chrono::Utc;
+use pioneer_protocol::{SandboxBackendKind, TurnExecutionSecuritySnapshot};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -309,6 +315,7 @@ impl UnifiedExecHandler {
                 args,
                 invocation.workdir.as_path(),
                 &invocation.environment,
+                invocation.execution_security_snapshot.as_ref(),
                 &trace,
                 cancellation,
             )
@@ -322,9 +329,20 @@ impl UnifiedExecHandler {
             )));
         }
 
-        let cwd = resolve_workdir(invocation.workdir.as_path(), args.workdir.as_deref());
-        let (command_preview, mut command) = build_command(&args, cwd.as_path())?;
-        command.envs(invocation.environment.iter());
+        let process_plan = build_process_spawn_plan(
+            invocation.execution_security_snapshot.as_ref(),
+            invocation.workdir.as_path(),
+            &args,
+            &invocation.environment,
+            DEFAULT_TIMEOUT_MS,
+        )?;
+        let (command_preview, mut command) = build_command(&args, process_plan.cwd.as_path())?;
+        apply_process_spawn_plan_environment(&mut command, &process_plan);
+        apply_shell_sandbox_backend(
+            &mut command,
+            invocation.execution_security_snapshot.as_ref(),
+            &process_plan,
+        )?;
         let session_started_at = Instant::now();
 
         command.stdin(Stdio::piped());
@@ -661,15 +679,23 @@ async fn run_one_shot(
     args: ExecCommandArgs,
     base_dir: &Path,
     environment: &BTreeMap<String, String>,
+    execution_security_snapshot: Option<&pioneer_protocol::TurnExecutionSecuritySnapshot>,
     trace: &crate::events::ToolEventTrace,
     cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<OneShotCommandResult, ToolError> {
     let started_at = Instant::now();
-    let cwd = resolve_workdir(base_dir, args.workdir.as_deref());
-    let (command_preview, mut command) = build_command(&args, cwd.as_path())?;
-    command.envs(environment.iter());
+    let process_plan = build_process_spawn_plan(
+        execution_security_snapshot,
+        base_dir,
+        &args,
+        environment,
+        DEFAULT_TIMEOUT_MS,
+    )?;
+    let (command_preview, mut command) = build_command(&args, process_plan.cwd.as_path())?;
+    apply_process_spawn_plan_environment(&mut command, &process_plan);
+    apply_shell_sandbox_backend(&mut command, execution_security_snapshot, &process_plan)?;
 
-    let timeout_ms = args.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
+    let timeout_ms = process_plan.timeout_ms;
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     let mut child = command.spawn().map_err(|error| {
@@ -820,6 +846,69 @@ where
     Ok(out)
 }
 
+fn apply_shell_sandbox_backend(
+    command: &mut Command,
+    execution_security_snapshot: Option<&TurnExecutionSecuritySnapshot>,
+    process_plan: &ProcessSpawnPlan,
+) -> Result<(), ToolError> {
+    let Some(snapshot) = execution_security_snapshot else {
+        return Err(ToolError::Rejected(
+            "missing turn execution security snapshot; refusing to spawn shell command without resolved sandbox policy".to_owned(),
+        ));
+    };
+    let Some(backend_kind) = snapshot.backend.sandbox_backend else {
+        return Ok(());
+    };
+
+    match backend_kind {
+        SandboxBackendKind::Nono => {
+            let backend = NonoSandboxBackend::new();
+            let request = NativeSandboxRequest {
+                snapshot,
+                process_plan,
+                workspace_roots: &[],
+                execution_label: "shell",
+            };
+            match prepare_native_sandbox_backend(&backend, &request)? {
+                NativeSandboxPrepareOutcome::Ready(_) => configure_nono_command(command, snapshot),
+                NativeSandboxPrepareOutcome::Degraded { reason, .. }
+                | NativeSandboxPrepareOutcome::Unavailable { reason, .. } => {
+                    tracing::warn!(
+                        reason = %reason,
+                        "optional nono sandbox backend is not active for shell command"
+                    );
+                    Ok(())
+                }
+            }
+        }
+        SandboxBackendKind::WindowsRestrictedToken => {
+            let backend = WindowsRestrictedTokenBackend::new();
+            let request = NativeSandboxRequest {
+                snapshot,
+                process_plan,
+                workspace_roots: &[],
+                execution_label: "shell",
+            };
+            match prepare_native_sandbox_backend(&backend, &request)? {
+                NativeSandboxPrepareOutcome::Ready(_) => {
+                    configure_windows_restricted_token_command(command, snapshot, process_plan)
+                }
+                NativeSandboxPrepareOutcome::Degraded { reason, .. }
+                | NativeSandboxPrepareOutcome::Unavailable { reason, .. } => {
+                    tracing::warn!(
+                        reason = %reason,
+                        "optional windows restricted-token sandbox backend is not active for shell command"
+                    );
+                    Ok(())
+                }
+            }
+        }
+        SandboxBackendKind::ProviderNative => Err(ToolError::Rejected(
+            "provider-native sandbox cannot protect Pioneer native shell execution".to_owned(),
+        )),
+    }
+}
+
 fn build_command(args: &ExecCommandArgs, cwd: &Path) -> Result<(Vec<String>, Command), ToolError> {
     if let Some(command) = args.command.as_ref()
         && !command.is_empty()
@@ -883,17 +972,14 @@ fn shell_basename(shell: &str) -> &str {
         .unwrap_or(shell)
 }
 
-fn resolve_workdir(base_dir: &Path, requested: Option<&str>) -> PathBuf {
-    let Some(requested) = requested else {
-        return base_dir.to_path_buf();
-    };
-
-    let requested_path = Path::new(requested);
-    if requested_path.is_absolute() {
-        requested_path.to_path_buf()
-    } else {
-        base_dir.join(requested_path)
+fn apply_process_spawn_plan_environment(command: &mut Command, plan: &ProcessSpawnPlan) {
+    if !plan.inherit_environment {
+        command.env_clear();
     }
+    for key in &plan.removed_environment {
+        command.env_remove(key);
+    }
+    command.envs(plan.environment.iter());
 }
 
 fn configure_process_group(command: &mut Command) -> Result<(), ToolError> {
@@ -1092,19 +1178,28 @@ mod tests {
     use super::*;
     use crate::context::{ToolCallSource, ToolInvocation};
     use crate::events::ToolEventBus;
+    use pioneer_protocol::{
+        SandboxBackendKind, TurnExecutionSecuritySnapshot, TurnPermissionMode,
+        TurnPermissionProfileSnapshot, TurnPermissionProfileSource,
+    };
 
     fn invocation(tool_name: &str, payload: ToolPayload) -> ToolInvocation {
+        let workdir = std::env::current_dir().expect("cwd must be available");
         ToolInvocation {
             call_id: "call_1".to_owned(),
             tool_name: tool_name.to_owned(),
             source: ToolCallSource::Model,
             payload,
-            workdir: std::env::current_dir().expect("cwd must be available"),
+            workdir: workdir.clone(),
             environment: Default::default(),
             attempt_id: 1,
             idempotency_key: None,
             recovery: crate::spec::ToolRecoveryMetadata::default(),
             permission_metadata: crate::spec::ToolPermissionMetadata::default(),
+            execution_security_snapshot: Some(shell_security_snapshot(
+                TurnPermissionMode::FullAccess,
+                workdir.as_path(),
+            )),
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
     }
@@ -1119,6 +1214,45 @@ mod tests {
 
     fn trace(tool_name: &str) -> crate::events::ToolEventTrace {
         ToolEventBus::default().start_trace("turn_test", "call_1", tool_name)
+    }
+
+    fn shell_security_snapshot(
+        mode: TurnPermissionMode,
+        cwd: &Path,
+    ) -> TurnExecutionSecuritySnapshot {
+        match mode {
+            TurnPermissionMode::FullAccess => {
+                TurnExecutionSecuritySnapshot::unrestricted_full_access(cwd.to_string_lossy(), 1)
+            }
+            TurnPermissionMode::AutoAcceptEdits => TurnExecutionSecuritySnapshot::workspace_write(
+                TurnPermissionProfileSnapshot::from_mode(
+                    mode,
+                    TurnPermissionProfileSource::Composer,
+                ),
+                cwd.to_string_lossy(),
+                vec![
+                    pioneer_protocol::TurnFilesystemSandboxEntry::workspace_root(
+                        pioneer_protocol::TurnFilesystemAccess::Write,
+                        cwd.to_string_lossy(),
+                    ),
+                ],
+                1,
+            ),
+            TurnPermissionMode::Supervised => TurnExecutionSecuritySnapshot::read_only(
+                TurnPermissionProfileSnapshot::from_mode(
+                    mode,
+                    TurnPermissionProfileSource::Composer,
+                ),
+                cwd.to_string_lossy(),
+                vec![
+                    pioneer_protocol::TurnFilesystemSandboxEntry::workspace_root(
+                        pioneer_protocol::TurnFilesystemAccess::Read,
+                        cwd.to_string_lossy(),
+                    ),
+                ],
+                1,
+            ),
+        }
     }
 
     #[tokio::test]
@@ -1153,6 +1287,129 @@ mod tests {
             output.raw_text().contains("/tmp/pioneer-output-test"),
             "expected invocation env in command output: {}",
             output.raw_text()
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_security_full_access_runs_with_unrestricted_backend() {
+        let handler = UnifiedExecHandler::default();
+        let mut tool_invocation = invocation(
+            "exec_command",
+            ToolPayload::LocalShell(LocalShellPayload::ExecCommand(ExecCommandArgs {
+                command: Some(vec![
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    "printf full-access-ok".to_owned(),
+                ]),
+                workdir: None,
+                timeout_ms: None,
+                max_output_tokens: None,
+                yield_time_ms: None,
+                tty: Some(false),
+            })),
+        );
+        tool_invocation.execution_security_snapshot = Some(shell_security_snapshot(
+            TurnPermissionMode::FullAccess,
+            tool_invocation.workdir.as_path(),
+        ));
+
+        let output = handler
+            .handle(tool_invocation, trace("exec_command"))
+            .await
+            .expect("full access command should run");
+
+        assert!(output.success(), "full access output should succeed");
+        assert!(
+            output.raw_text().contains("full-access-ok"),
+            "unexpected full access output: {}",
+            output.raw_text()
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_security_required_windows_backend_fails_before_spawn() {
+        let handler = UnifiedExecHandler::default();
+        let mut tool_invocation = invocation(
+            "exec_command",
+            ToolPayload::LocalShell(LocalShellPayload::ExecCommand(ExecCommandArgs {
+                command: Some(vec![
+                    "definitely-not-a-real-pioneer-command".to_owned(),
+                    "would-have-spawned".to_owned(),
+                ]),
+                workdir: None,
+                timeout_ms: None,
+                max_output_tokens: None,
+                yield_time_ms: None,
+                tty: Some(false),
+            })),
+        );
+        let mut snapshot = shell_security_snapshot(
+            TurnPermissionMode::AutoAcceptEdits,
+            tool_invocation.workdir.as_path(),
+        );
+        snapshot.backend.sandbox_backend = Some(SandboxBackendKind::WindowsRestrictedToken);
+        snapshot.sandbox.backend_preference = vec![SandboxBackendKind::WindowsRestrictedToken];
+        tool_invocation.execution_security_snapshot = Some(snapshot);
+
+        let result = handler.handle(tool_invocation, trace("exec_command")).await;
+        let error = match result {
+            Ok(output) => panic!(
+                "required unavailable sandbox should fail before spawn, got output: {}",
+                output.raw_text()
+            ),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("required sandbox backend")
+                || error
+                    .to_string()
+                    .contains("windows restricted-token backend"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !error.to_string().contains("No such file")
+                && !error.to_string().contains("os error 2"),
+            "error should come from sandbox before command spawn: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_security_provider_native_snapshot_cannot_use_native_spawn_path() {
+        let handler = UnifiedExecHandler::default();
+        let mut tool_invocation = invocation(
+            "exec_command",
+            ToolPayload::LocalShell(LocalShellPayload::ExecCommand(ExecCommandArgs {
+                command: Some(vec!["sh".to_owned(), "-c".to_owned(), "echo no".to_owned()]),
+                workdir: None,
+                timeout_ms: None,
+                max_output_tokens: None,
+                yield_time_ms: None,
+                tty: Some(false),
+            })),
+        );
+        let mut snapshot = shell_security_snapshot(
+            TurnPermissionMode::FullAccess,
+            tool_invocation.workdir.as_path(),
+        );
+        snapshot.backend.sandbox_backend = Some(SandboxBackendKind::ProviderNative);
+        snapshot.sandbox.backend_preference = vec![SandboxBackendKind::ProviderNative];
+        tool_invocation.execution_security_snapshot = Some(snapshot);
+
+        let result = handler.handle(tool_invocation, trace("exec_command")).await;
+        let error = match result {
+            Ok(output) => panic!(
+                "provider-native snapshot should not run through native shell, got output: {}",
+                output.raw_text()
+            ),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("provider-native sandbox cannot protect"),
+            "unexpected error: {error}"
         );
     }
 

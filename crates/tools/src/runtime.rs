@@ -8,6 +8,7 @@ use crate::output_projection::{ToolProjectionInput, project_tool_result};
 use crate::permissions::PermissionEvaluationContext;
 use crate::router::{ToolCall, ToolRouter};
 use crate::spec::ExecutionClass;
+use pioneer_protocol::TurnExecutionSecuritySnapshot;
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -25,6 +26,7 @@ pub struct ToolCallRuntime {
     event_bus: ToolEventBus,
     turn_id: String,
     permission_context: PermissionEvaluationContext,
+    execution_security_snapshot: Option<TurnExecutionSecuritySnapshot>,
     workdir: PathBuf,
     environment: BTreeMap<String, String>,
     global_lock: Arc<RwLock<()>>,
@@ -53,6 +55,7 @@ impl ToolCallRuntime {
             event_bus,
             turn_id,
             permission_context,
+            execution_security_snapshot: None,
             workdir,
             environment: BTreeMap::new(),
             global_lock: Arc::new(RwLock::new(())),
@@ -62,6 +65,14 @@ impl ToolCallRuntime {
 
     pub fn with_environment(mut self, environment: BTreeMap<String, String>) -> Self {
         self.environment = environment;
+        self
+    }
+
+    pub fn with_execution_security_snapshot(
+        mut self,
+        snapshot: Option<TurnExecutionSecuritySnapshot>,
+    ) -> Self {
+        self.execution_security_snapshot = snapshot;
         self
     }
 
@@ -334,6 +345,11 @@ impl ToolCallRuntime {
         source: ToolCallSource,
         workdir: &PathBuf,
     ) -> Result<AnyToolResult, ToolError> {
+        if self.execution_security_snapshot.is_none() {
+            return Err(ToolError::Rejected(
+                "missing turn execution security snapshot; refusing to execute tool without resolved sandbox policy".to_owned(),
+            ));
+        }
         let dispatch = self.router.dispatch(
             self.orchestrator.as_ref(),
             call,
@@ -341,6 +357,7 @@ impl ToolCallRuntime {
             workdir.clone(),
             self.environment.clone(),
             &self.permission_context,
+            self.execution_security_snapshot.clone(),
             trace,
             cancellation.clone(),
         );
@@ -375,6 +392,7 @@ fn classify_call_error(
         idempotency_key: call.idempotency_key.clone(),
         recovery: call.recovery,
         permission_metadata: call.permission_metadata.clone(),
+        execution_security_snapshot: None,
         cancellation: CancellationToken::new(),
     };
     DefaultErrorClassifier.classify_error(&invocation, error)
@@ -591,6 +609,11 @@ mod tests {
             ),
             PathBuf::from("."),
         )
+        .with_execution_security_snapshot(Some(test_full_access_snapshot()))
+    }
+
+    fn test_full_access_snapshot() -> pioneer_protocol::TurnExecutionSecuritySnapshot {
+        pioneer_protocol::TurnExecutionSecuritySnapshot::unrestricted_full_access(".", 1)
     }
 
     fn function_call(tool_name: &str, call_id: &str, class: ExecutionClass) -> ToolCall {
@@ -748,6 +771,38 @@ mod tests {
             max_active.load(Ordering::SeqCst) >= 2,
             "shared execution should overlap"
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_rejects_tool_execution_without_security_snapshot() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let handler = Arc::new(SleepHandler {
+            sleep_ms: 1,
+            active: active.clone(),
+            max_active: Arc::new(AtomicUsize::new(0)),
+        });
+        let runtime = build_runtime_with_dyn_handler("tool", ExecutionClass::Shared, handler)
+            .with_execution_security_snapshot(None);
+
+        let error = match runtime
+            .execute_tool_call(function_call(
+                "tool",
+                "call_missing_security",
+                ExecutionClass::Shared,
+            ))
+            .await
+        {
+            Ok(_) => panic!("missing security snapshot should reject tool execution"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("missing turn execution security snapshot"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(active.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

@@ -2,6 +2,7 @@ use crate::ToolExtensionBundle;
 use crate::context::{FunctionToolOutput, ToolInvocation, ToolOutput, ToolPayload};
 use crate::error::ToolError;
 use crate::events::ToolEventTrace;
+use crate::mcp_policy::{enforce_mcp_network_policy, mcp_policy_classification_metadata};
 use crate::output_policy::{ToolOutputProjectionKind, mcp_output_policy};
 use crate::registry::ToolHandler;
 use crate::spec::{
@@ -9,6 +10,7 @@ use crate::spec::{
     ToolRecoveryMetadata, ToolRetryClass, ToolSpec,
 };
 use async_trait::async_trait;
+use pioneer_mcp::{McpToolSafetyHints, classify_mcp_tool_policy};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
@@ -281,6 +283,33 @@ impl ToolHandler for McpToolHandler {
                 ));
             }
         };
+        let classification = classify_mcp_tool_policy(McpToolSafetyHints {
+            read_only_hint: self.descriptor.annotations.read_only_hint,
+            destructive_hint: self.descriptor.annotations.destructive_hint,
+            open_world_hint: self.descriptor.annotations.open_world_hint,
+        });
+        let stage_metadata = mcp_stage_metadata(&self.descriptor);
+        trace.emit_stage(
+            1,
+            "mcp.policy.classified",
+            None,
+            Some(stage_metadata.clone()),
+        );
+        if let Err(error) = enforce_mcp_network_policy(
+            invocation.execution_security_snapshot.as_ref(),
+            &classification,
+            self.descriptor.server_name.as_str(),
+            self.descriptor.raw_tool_name.as_str(),
+        ) {
+            trace.emit_stage(
+                1,
+                "mcp.policy.denied",
+                Some(error.to_string()),
+                Some(stage_metadata),
+            );
+            return Err(error);
+        }
+
         let stage_metadata = mcp_stage_metadata(&self.descriptor);
         trace.emit_stage(1, "mcp.call.prepare", None, Some(stage_metadata.clone()));
         trace.emit_stage(1, "mcp.call.started", None, Some(stage_metadata.clone()));
@@ -356,6 +385,11 @@ impl ToolHandler for McpToolHandler {
 }
 
 fn mcp_stage_metadata(descriptor: &McpDynamicToolDescriptor) -> JsonValue {
+    let classification = classify_mcp_tool_policy(McpToolSafetyHints {
+        read_only_hint: descriptor.annotations.read_only_hint,
+        destructive_hint: descriptor.annotations.destructive_hint,
+        open_world_hint: descriptor.annotations.open_world_hint,
+    });
     serde_json::json!({
         "source": "mcp",
         "mcp": {
@@ -365,6 +399,7 @@ fn mcp_stage_metadata(descriptor: &McpDynamicToolDescriptor) -> JsonValue {
             "callableName": descriptor.callable_name,
             "catalogVersion": descriptor.catalog_version,
             "snapshotVersion": descriptor.snapshot_version,
+            "policy": mcp_policy_classification_metadata(&classification),
         }
     })
 }

@@ -14,6 +14,7 @@ anyhow.workspace = true
 async-trait.workspace = true
 pioneer-protocol.workspace = true
 pioneer-provider.workspace = true
+pioneer-mcp.workspace = true
 pioneer-skills.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -32,3 +33,9 @@ futures-util.workspace = true
 xa11y = { workspace = true, optional = true }
 xcap = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+nono.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

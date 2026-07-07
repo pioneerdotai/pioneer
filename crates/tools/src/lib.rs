@@ -4,21 +4,27 @@ mod context;
 mod domain;
 mod error;
 mod events;
+mod file_policy;
 mod loop_guard;
+mod mcp_policy;
+mod network_policy;
 mod orchestrator;
 mod output_dynamic_policy;
 mod output_policy;
 mod output_projection;
 mod permissions;
+mod process_policy;
 mod registry;
 mod retry_controller;
 mod router;
 mod runtime;
+mod sandbox_backend;
 mod shell_format;
 mod spec;
 mod tool_index;
 mod visibility;
 mod web;
+mod windows_restricted_token_backend;
 
 pub mod handlers;
 
@@ -44,6 +50,10 @@ pub use events::{
     ToolDeltaPayload, ToolEvent, ToolEventBus, ToolEventKind, ToolEventPayload, ToolEventTrace,
     ToolOutputDeltaEvent,
 };
+pub use file_policy::{
+    FilePolicyChecker, FilePolicyDecision, FilePolicyDeny, FilePolicyDenyReason, FilePolicyGrant,
+    FilePolicyOperation,
+};
 pub use handlers::{
     ExcludedMcpRuntimeTool, ExcludedSkillRuntimeTool, McpDynamicToolAnnotations,
     McpDynamicToolBinding, McpDynamicToolDescriptor, McpRuntimeToolMaterialization,
@@ -57,6 +67,11 @@ pub use loop_guard::{
     ExecutionWindowBudgetConfig, ExecutionWindowTotalBudgetConfig, ExecutionWindowsConfig,
     ToolLoopBudgetAction, ToolLoopBudgetConfig, ToolLoopBudgetExceeded, ToolLoopBudgetReason,
     ToolLoopGuard, ToolLoopGuardDecision, ToolLoopRoundAction, ToolLoopRoundPlan,
+};
+pub use mcp_policy::{enforce_mcp_network_policy, mcp_policy_classification_metadata};
+pub use network_policy::{
+    NetworkPolicyChecker, NetworkPolicyDecision, NetworkPolicyDeny, NetworkPolicyDenyReason,
+    NetworkPolicyGrant, enforce_network_url,
 };
 pub use orchestrator::{ApprovalState, OrchestratorPolicy, SandboxTarget, ToolOrchestrator};
 pub use output_dynamic_policy::{
@@ -79,8 +94,9 @@ pub use permissions::{
     PermissionActionKind, PermissionApprovalBroker, PermissionApprovalResolution,
     PermissionDecision, PermissionDecisionReason, PermissionEvaluationContext, PermissionIntent,
     PermissionRequestKey, PermissionRequestScope, ProfileToolPermissionEvaluator,
-    StaticPermissionApprovalBroker, ToolPermissionEvaluator,
+    StaticPermissionApprovalBroker, ToolPermissionEvaluator, extract_permission_intent,
 };
+pub use process_policy::{ProcessSpawnPlan, build_process_spawn_plan, resolve_process_cwd};
 pub use registry::{ToolHandler, ToolRegistry, ToolRegistryBuilder};
 pub use retry_controller::{
     ToolFailureSignature, ToolRetryBudgetConfig, ToolRetryBudgetKind, ToolRetryBudgetSnapshot,
@@ -91,6 +107,11 @@ pub use retry_controller::{
 };
 pub use router::{RawToolCall, ToolCall, ToolRouter};
 pub use runtime::ToolCallRuntime;
+pub use sandbox_backend::{
+    NativeSandboxBackend, NativeSandboxPrepareOutcome, NativeSandboxPreparedSpawn,
+    NativeSandboxRequest, NonoBackendSupport, NonoCapabilityPlan, NonoSandboxBackend,
+    build_nono_capability_plan, configure_nono_command, prepare_native_sandbox_backend,
+};
 pub use shell_format::{ExecModelPayload, ExecPayloadInput, ExecTruncation, render_exec_ui_text};
 pub use spec::{
     ConfiguredToolSpec, DynamicSkillPermissionKind, DynamicSkillPermissionMetadata, ExecutionClass,
@@ -112,6 +133,11 @@ pub use web::{
     WebSearchModelPayload, WebSearchResultItem, default_favicon_url, render_download_ui_text,
     render_web_fetch_ui_text, render_web_search_ui_text,
 };
+pub use windows_restricted_token_backend::{
+    WindowsRestrictedTokenBackend, WindowsRestrictedTokenPlan, WindowsRestrictedTokenSupport,
+    WindowsWorkspaceGrant, WindowsWorkspaceGrantAccess, build_windows_restricted_token_plan,
+    configure_windows_restricted_token_command,
+};
 
 #[cfg(feature = "computer-use")]
 use handlers::materialize_computer_use_domain_bundle;
@@ -121,6 +147,7 @@ use handlers::{
     ApplyPatchHandler, DownloadUrlHandler, EditFileHandler, GrepHandler, ListDirHandler,
     ReadFileHandler, UnifiedExecHandler, WebFetchHandler, WebSearchHandler, WriteFileHandler,
 };
+use pioneer_protocol::TurnExecutionSecuritySnapshot;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::path::{Component, Path, PathBuf};
@@ -396,6 +423,29 @@ pub fn build_tools_with_environment(
     extensions: Vec<ToolExtensionBundle>,
     environment: BTreeMap<String, String>,
 ) -> Result<BuiltinTools, BuildToolsError> {
+    build_tools_with_environment_and_security_snapshot(
+        workdir,
+        turn_id,
+        permission_context,
+        web_tools_config,
+        computer_use_tools_config,
+        extensions,
+        environment,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_tools_with_environment_and_security_snapshot(
+    workdir: impl Into<PathBuf>,
+    turn_id: impl Into<String>,
+    permission_context: PermissionEvaluationContext,
+    web_tools_config: WebToolsConfig,
+    computer_use_tools_config: ComputerUseToolsConfig,
+    extensions: Vec<ToolExtensionBundle>,
+    environment: BTreeMap<String, String>,
+    execution_security_snapshot: Option<TurnExecutionSecuritySnapshot>,
+) -> Result<BuiltinTools, BuildToolsError> {
     let turn_id = turn_id.into();
     validate_permission_context(&turn_id, &permission_context)?;
     let web_tools_config = web_tools_config.normalized();
@@ -544,7 +594,8 @@ pub fn build_tools_with_environment(
         permission_context,
         workdir.into(),
     )
-    .with_environment(environment);
+    .with_environment(environment)
+    .with_execution_security_snapshot(execution_security_snapshot);
 
     Ok(BuiltinTools {
         router,
@@ -561,7 +612,25 @@ pub fn build_builtin_tools(
     web_tools_config: WebToolsConfig,
     computer_use_tools_config: ComputerUseToolsConfig,
 ) -> BuiltinTools {
-    build_tools_with_environment(
+    build_builtin_tools_with_security_snapshot(
+        workdir,
+        turn_id,
+        permission_context,
+        web_tools_config,
+        computer_use_tools_config,
+        None,
+    )
+}
+
+pub fn build_builtin_tools_with_security_snapshot(
+    workdir: impl Into<PathBuf>,
+    turn_id: impl Into<String>,
+    permission_context: PermissionEvaluationContext,
+    web_tools_config: WebToolsConfig,
+    computer_use_tools_config: ComputerUseToolsConfig,
+    execution_security_snapshot: Option<TurnExecutionSecuritySnapshot>,
+) -> BuiltinTools {
+    build_tools_with_environment_and_security_snapshot(
         workdir,
         turn_id,
         permission_context,
@@ -569,6 +638,7 @@ pub fn build_builtin_tools(
         computer_use_tools_config,
         Vec::new(),
         BTreeMap::new(),
+        execution_security_snapshot,
     )
     .expect("build builtin tools")
 }
@@ -599,7 +669,6 @@ fn validate_permission_context(
 mod tests {
     use super::{
         BuildToolsError, BuiltinTools, ComputerUseToolsConfig, ToolExtensionBundle, WebToolsConfig,
-        build_builtin_tools, build_tools,
     };
     use crate::context::{FunctionToolOutput, ToolInvocation};
     use crate::events::ToolEventTrace;
@@ -610,6 +679,7 @@ mod tests {
         ConfiguredToolSpec, ExecutionClass, PayloadKind, REQUEST_TOOLS_TOOL_NAME, ToolSpec,
     };
     use async_trait::async_trait;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -681,6 +751,56 @@ mod tests {
             "thread_test",
             turn_id,
             pioneer_protocol::default_turn_permission_profile_snapshot(),
+        )
+    }
+
+    fn test_full_access_snapshot(
+        workdir: &Path,
+    ) -> pioneer_protocol::TurnExecutionSecuritySnapshot {
+        pioneer_protocol::TurnExecutionSecuritySnapshot::unrestricted_full_access(
+            workdir.to_string_lossy(),
+            1,
+        )
+    }
+
+    fn build_builtin_tools(
+        workdir: impl Into<PathBuf>,
+        turn_id: impl Into<String>,
+        permission_context: crate::PermissionEvaluationContext,
+        web_tools_config: WebToolsConfig,
+        computer_use_tools_config: ComputerUseToolsConfig,
+    ) -> BuiltinTools {
+        let workdir = workdir.into();
+        let security_snapshot = test_full_access_snapshot(workdir.as_path());
+        super::build_builtin_tools_with_security_snapshot(
+            workdir,
+            turn_id,
+            permission_context,
+            web_tools_config,
+            computer_use_tools_config,
+            Some(security_snapshot),
+        )
+    }
+
+    fn build_tools(
+        workdir: impl Into<PathBuf>,
+        turn_id: impl Into<String>,
+        permission_context: crate::PermissionEvaluationContext,
+        web_tools_config: WebToolsConfig,
+        computer_use_tools_config: ComputerUseToolsConfig,
+        extensions: Vec<ToolExtensionBundle>,
+    ) -> Result<BuiltinTools, BuildToolsError> {
+        let workdir = workdir.into();
+        let security_snapshot = test_full_access_snapshot(workdir.as_path());
+        super::build_tools_with_environment_and_security_snapshot(
+            workdir,
+            turn_id,
+            permission_context,
+            web_tools_config,
+            computer_use_tools_config,
+            extensions,
+            std::collections::BTreeMap::new(),
+            Some(security_snapshot),
         )
     }
 
@@ -1021,11 +1141,14 @@ mod tests {
             }),
         )
         .await;
-        assert!(edit.success());
+        assert!(edit.success(), "edit failed: {}", edit.raw_output_json());
         let edit_json = edit.raw_output_json();
         assert_eq!(edit_json["operation"].as_str(), Some("edited"));
         assert_eq!(edit_json["matches_replaced"].as_u64(), Some(1));
-        let expected_changed_file = target.display().to_string();
+        let expected_changed_file = std::fs::canonicalize(target.as_path())
+            .expect("target should canonicalize after edit")
+            .display()
+            .to_string();
         assert_eq!(
             edit_json["changed_files"][0].as_str(),
             Some(expected_changed_file.as_str())
@@ -1071,7 +1194,11 @@ mod tests {
             }),
         )
         .await;
-        assert!(first_edit.success());
+        assert!(
+            first_edit.success(),
+            "first edit failed: {}",
+            first_edit.raw_output_json()
+        );
         assert_eq!(
             first_edit.raw_output_json()["file_observation"]["id"].as_str(),
             Some("edit_file:edit_chain_first")

@@ -263,6 +263,7 @@ pub fn classify_tool_error(tool_name: &str, error: &ToolError) -> ToolOutcome {
         idempotency_key: None,
         recovery: crate::spec::ToolRecoveryMetadata::default(),
         permission_metadata: crate::spec::ToolPermissionMetadata::default(),
+        execution_security_snapshot: None,
         cancellation: tokio_util::sync::CancellationToken::new(),
     };
     classifier.classify_error(&invocation, error)
@@ -1052,6 +1053,7 @@ mod tests {
             idempotency_key: None,
             recovery: crate::spec::ToolRecoveryMetadata::default(),
             permission_metadata: crate::spec::ToolPermissionMetadata::default(),
+            execution_security_snapshot: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
     }
@@ -1070,6 +1072,7 @@ mod tests {
             idempotency_key: None,
             recovery: crate::spec::ToolRecoveryMetadata::default(),
             permission_metadata: crate::spec::ToolPermissionMetadata::default(),
+            execution_security_snapshot: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
     }
@@ -1088,6 +1091,7 @@ mod tests {
             idempotency_key: None,
             recovery: crate::spec::ToolRecoveryMetadata::default(),
             permission_metadata: crate::spec::ToolPermissionMetadata::default(),
+            execution_security_snapshot: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
     }
@@ -1108,6 +1112,7 @@ mod tests {
             idempotency_key: None,
             recovery: crate::spec::ToolRecoveryMetadata::default(),
             permission_metadata: crate::spec::ToolPermissionMetadata::default(),
+            execution_security_snapshot: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
         };
         let outcome = classifier.classify_result(
@@ -1330,6 +1335,7 @@ mod tests {
             idempotency_key: None,
             recovery: crate::spec::ToolRecoveryMetadata::default(),
             permission_metadata: crate::spec::ToolPermissionMetadata::default(),
+            execution_security_snapshot: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
         };
         let outcome = classifier.classify_result(&invocation, &serde_json::json!(payload), true);

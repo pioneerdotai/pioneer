@@ -18,6 +18,7 @@ use crate::visibility::{
     FinalToolVisibility, FinalToolVisibilityInput, ToolVisibilitySnapshot,
     compute_final_tool_visibility, materialized_dynamic_extension_tool_names,
 };
+use pioneer_protocol::TurnExecutionSecuritySnapshot;
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -295,6 +296,7 @@ impl ToolRouter {
         workdir: PathBuf,
         environment: BTreeMap<String, String>,
         permission_context: &PermissionEvaluationContext,
+        execution_security_snapshot: Option<TurnExecutionSecuritySnapshot>,
         trace: &ToolEventTrace,
         cancellation: CancellationToken,
     ) -> Result<crate::context::AnyToolResult, ToolError> {
@@ -309,6 +311,7 @@ impl ToolRouter {
             idempotency_key: call.idempotency_key,
             recovery: call.recovery,
             permission_metadata: call.permission_metadata,
+            execution_security_snapshot,
             cancellation,
         };
         orchestrator

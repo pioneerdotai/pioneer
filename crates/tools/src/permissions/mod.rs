@@ -4,6 +4,7 @@ use crate::domain::{ARTIFACT_DOMAIN_TOOL_NAMES, MEMORY_DOMAIN_TOOL_NAMES, TASK_D
 use crate::handlers::apply_patch::{extract_patch_input, validate_patch_document};
 use crate::spec::DynamicSkillPermissionKind;
 use async_trait::async_trait;
+use pioneer_mcp::{McpToolPermissionClass, McpToolSafetyHints, classify_mcp_tool_policy};
 use pioneer_protocol::{
     PermissionBehavior, ToolPermissionPolicySnapshot, TurnPermissionProfileSnapshot,
 };
@@ -66,6 +67,10 @@ impl PermissionIntent {
             ("tool_name", invocation.tool_name.as_str()),
             ("source", invocation.source.as_str()),
         ]);
+        let scope = mark_unknown_capability(
+            scope,
+            "no specific permission classifier matched this tool invocation",
+        );
         Self {
             action: PermissionActionKind::Unknown,
             scope,
@@ -85,6 +90,13 @@ impl PermissionIntent {
             normalized_scope_hash: self.scope.normalized_hash(),
             turn_id: context.turn_id.clone().unwrap_or_default(),
         }
+    }
+
+    pub fn is_unknown_capability(&self) -> bool {
+        self.scope
+            .entries
+            .get("unknown_capability")
+            .is_some_and(|value| value == "true")
     }
 }
 
@@ -182,9 +194,11 @@ fn extract_mcp_permission_intent(invocation: &ToolInvocation) -> Option<Permissi
         return None;
     };
 
-    let untrusted_read_only_hint = *read_only_hint == Some(true)
-        && *destructive_hint != Some(true)
-        && *open_world_hint != Some(true);
+    let classification = classify_mcp_tool_policy(McpToolSafetyHints {
+        read_only_hint: *read_only_hint,
+        destructive_hint: *destructive_hint,
+        open_world_hint: *open_world_hint,
+    });
     let mut scope = base_scope(invocation);
     scope
         .entries
@@ -210,17 +224,22 @@ fn extract_mcp_permission_intent(invocation: &ToolInvocation) -> Option<Permissi
             .insert("open_world_hint".to_owned(), value.to_string());
     }
     scope.entries.insert(
-        "mcp_safety".to_owned(),
-        if untrusted_read_only_hint {
-            "read_only_hint_untrusted"
-        } else {
-            "write_or_unknown"
-        }
-        .to_owned(),
+        "mcp_side_effect_class".to_owned(),
+        classification.side_effect_class.as_str().to_owned(),
     );
+    scope.entries.insert(
+        "mcp_requires_network".to_owned(),
+        classification.requires_network.to_string(),
+    );
+    if classification.side_effect_class == pioneer_mcp::McpToolSideEffectClass::Unknown {
+        scope = mark_unknown_capability(scope, "mcp side effects are not classified");
+    }
 
     Some(PermissionIntent {
-        action: PermissionActionKind::McpWriteOrUnknown,
+        action: match classification.permission_class {
+            McpToolPermissionClass::Read => PermissionActionKind::McpRead,
+            McpToolPermissionClass::WriteOrUnknown => PermissionActionKind::McpWriteOrUnknown,
+        },
         scope,
         summary: Some(format!("MCP `{server}` tool `{tool}`")),
     })
@@ -256,6 +275,19 @@ fn extract_dynamic_skill_permission_intent(
         scope
             .entries
             .insert("target_tool".to_owned(), target_tool.to_owned());
+    }
+    if matches!(metadata.kind, DynamicSkillPermissionKind::FunctionProxy)
+        && metadata
+            .target_tool
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none()
+    {
+        scope = mark_unknown_capability(
+            scope,
+            "dynamic skill function proxy target tool is unavailable",
+        );
     }
 
     match metadata.kind {
@@ -1157,23 +1189,45 @@ fn decision_from_behavior(
     invocation: &ToolInvocation,
     intent: &PermissionIntent,
 ) -> PermissionDecision {
+    let unknown_capability = intent.is_unknown_capability();
     match behavior {
         PermissionBehavior::Allow => PermissionDecision::Allow {
             reason: PermissionDecisionReason::PolicyAllowsAction,
         },
         PermissionBehavior::Ask => PermissionDecision::Ask {
             key: intent.request_key(context, invocation),
-            reason: if intent.action == PermissionActionKind::Unknown {
+            reason: if unknown_capability {
                 PermissionDecisionReason::UnknownActionDefault
             } else {
                 PermissionDecisionReason::PolicyRequiresApproval
             },
         },
         PermissionBehavior::Deny => PermissionDecision::Deny {
-            reason: PermissionDecisionReason::PolicyDeniesAction,
-            message: "tool action denied by turn permission profile".to_owned(),
+            reason: if unknown_capability {
+                PermissionDecisionReason::UnknownActionDefault
+            } else {
+                PermissionDecisionReason::PolicyDeniesAction
+            },
+            message: if unknown_capability {
+                "unknown tool capability denied by turn permission profile".to_owned()
+            } else {
+                "tool action denied by turn permission profile".to_owned()
+            },
         },
     }
+}
+
+fn mark_unknown_capability(
+    mut scope: PermissionRequestScope,
+    reason: impl Into<String>,
+) -> PermissionRequestScope {
+    scope
+        .entries
+        .insert("unknown_capability".to_owned(), "true".to_owned());
+    scope
+        .entries
+        .insert("unknown_reason".to_owned(), reason.into());
+    scope
 }
 
 fn policy_denies_tool_name(
@@ -1343,6 +1397,7 @@ mod tests {
             idempotency_key: None,
             recovery: ToolRecoveryMetadata::default(),
             permission_metadata: crate::spec::ToolPermissionMetadata::default(),
+            execution_security_snapshot: None,
             cancellation: CancellationToken::new(),
         }
     }
@@ -1505,6 +1560,11 @@ mod tests {
         let context = test_context(pioneer_protocol::TurnPermissionMode::Supervised);
         let decision = ProfileToolPermissionEvaluator.evaluate(&context, &invocation, &intent);
 
+        assert!(intent.is_unknown_capability());
+        assert_eq!(
+            intent.scope.entries.get("unknown_capability"),
+            Some(&"true".to_owned())
+        );
         assert!(matches!(
             decision,
             PermissionDecision::Ask {
@@ -1512,6 +1572,31 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn unknown_capability_denied_policy_returns_unknown_reason() {
+        let invocation = invocation_for_tool(
+            "mystery_tool",
+            ToolPayload::Function {
+                arguments: serde_json::json!({ "anything": true }),
+            },
+        );
+        let intent = extract_permission_intent(&invocation);
+        let context =
+            context_with_policy(ToolPermissionPolicySnapshot::all(PermissionBehavior::Deny));
+
+        let decision = ProfileToolPermissionEvaluator.evaluate(&context, &invocation, &intent);
+
+        assert_eq!(intent.action, PermissionActionKind::Unknown);
+        assert!(intent.is_unknown_capability());
+        assert_eq!(
+            decision,
+            PermissionDecision::Deny {
+                reason: PermissionDecisionReason::UnknownActionDefault,
+                message: "unknown tool capability denied by turn permission profile".to_owned()
+            }
+        );
     }
 
     #[test]
@@ -2028,7 +2113,7 @@ mod tests {
     }
 
     #[test]
-    fn extractor_treats_read_only_mcp_hint_as_untrusted_write_or_unknown() {
+    fn extractor_classifies_read_only_mcp_hint_as_mcp_read() {
         let invocation = invocation_for_tool(
             "mcp_docs_search",
             ToolPayload::Mcp {
@@ -2043,20 +2128,24 @@ mod tests {
 
         let intent = extract_permission_intent(&invocation);
 
-        assert_eq!(intent.action, PermissionActionKind::McpWriteOrUnknown);
+        assert_eq!(intent.action, PermissionActionKind::McpRead);
         assert_eq!(
             intent.scope.entries.get("server"),
             Some(&"srv_docs".to_owned())
         );
         assert_eq!(intent.scope.entries.get("tool"), Some(&"search".to_owned()));
         assert_eq!(
-            intent.scope.entries.get("mcp_safety"),
-            Some(&"read_only_hint_untrusted".to_owned())
+            intent.scope.entries.get("mcp_side_effect_class"),
+            Some(&"read_only".to_owned())
+        );
+        assert_eq!(
+            intent.scope.entries.get("mcp_requires_network"),
+            Some(&"false".to_owned())
         );
     }
 
     #[test]
-    fn restricted_profiles_ask_for_read_only_hint_mcp() {
+    fn restricted_profiles_allow_read_only_hint_mcp() {
         let invocation = invocation_for_tool(
             "mcp_docs_search",
             ToolPayload::Mcp {
@@ -2071,21 +2160,21 @@ mod tests {
         let intent = extract_permission_intent(&invocation);
         let context = test_context(pioneer_protocol::TurnPermissionMode::Supervised);
 
-        assert!(matches!(
+        assert_eq!(
             ProfileToolPermissionEvaluator.evaluate(&context, &invocation, &intent),
-            PermissionDecision::Ask {
-                reason: PermissionDecisionReason::PolicyRequiresApproval,
-                ..
+            PermissionDecision::Allow {
+                reason: PermissionDecisionReason::PolicyAllowsAction
             }
-        ));
+        );
     }
 
     #[test]
-    fn extractor_classifies_destructive_or_unknown_mcp_as_write_or_unknown() {
-        for (read_only_hint, destructive_hint, open_world_hint) in [
-            (Some(true), Some(true), Some(false)),
-            (None, None, None),
-            (Some(false), Some(false), Some(false)),
+    fn extractor_classifies_destructive_network_or_unknown_mcp_as_write_or_unknown() {
+        for (read_only_hint, destructive_hint, open_world_hint, expected_class, requires_network) in [
+            (Some(true), Some(true), Some(false), "write_like", "false"),
+            (Some(false), Some(false), Some(true), "network_like", "true"),
+            (None, None, None, "unknown", "false"),
+            (Some(false), Some(false), Some(false), "unknown", "false"),
         ] {
             let invocation = invocation_for_tool(
                 "mcp_repo_write",
@@ -2102,8 +2191,12 @@ mod tests {
 
             assert_eq!(intent.action, PermissionActionKind::McpWriteOrUnknown);
             assert_eq!(
-                intent.scope.entries.get("mcp_safety"),
-                Some(&"write_or_unknown".to_owned())
+                intent.scope.entries.get("mcp_side_effect_class"),
+                Some(&expected_class.to_owned())
+            );
+            assert_eq!(
+                intent.scope.entries.get("mcp_requires_network"),
+                Some(&requires_network.to_owned())
             );
         }
     }
@@ -2124,10 +2217,43 @@ mod tests {
         let intent = extract_permission_intent(&invocation);
         let context = test_context(pioneer_protocol::TurnPermissionMode::Supervised);
 
+        assert!(intent.is_unknown_capability());
+        assert_eq!(
+            intent.scope.entries.get("unknown_reason"),
+            Some(&"mcp side effects are not classified".to_owned())
+        );
         assert!(matches!(
             ProfileToolPermissionEvaluator.evaluate(&context, &invocation, &intent),
             PermissionDecision::Ask {
-                reason: PermissionDecisionReason::PolicyRequiresApproval,
+                reason: PermissionDecisionReason::UnknownActionDefault,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn unknown_capability_skill_function_proxy_without_target_requires_approval() {
+        let mut invocation = invocation_for_tool(
+            "skill_proxy_unknown",
+            ToolPayload::Function {
+                arguments: serde_json::json!({ "arguments": { "value": 1 } }),
+            },
+        );
+        invocation.permission_metadata =
+            dynamic_skill_metadata(DynamicSkillPermissionKind::FunctionProxy, None, None, None);
+        let intent = extract_permission_intent(&invocation);
+        let context = test_context(pioneer_protocol::TurnPermissionMode::Supervised);
+
+        assert_eq!(intent.action, PermissionActionKind::DynamicSkillTool);
+        assert!(intent.is_unknown_capability());
+        assert_eq!(
+            intent.scope.entries.get("unknown_reason"),
+            Some(&"dynamic skill function proxy target tool is unavailable".to_owned())
+        );
+        assert!(matches!(
+            ProfileToolPermissionEvaluator.evaluate(&context, &invocation, &intent),
+            PermissionDecision::Ask {
+                reason: PermissionDecisionReason::UnknownActionDefault,
                 ..
             }
         ));

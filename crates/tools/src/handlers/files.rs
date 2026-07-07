@@ -1,6 +1,7 @@
 use crate::context::{FunctionToolOutput, ToolInvocation, ToolOutput, ToolPayload};
 use crate::error::ToolError;
 use crate::registry::ToolHandler;
+use crate::{FilePolicyChecker, FilePolicyDecision, FilePolicyOperation};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde::Serialize;
@@ -473,10 +474,17 @@ impl ToolHandler for ReadFileHandler {
         _trace: crate::events::ToolEventTrace,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let args = parse_json_args::<ReadFileArgs>(invocation.payload)?;
-        let file_path = normalize_path_lexically(resolve_path(
+        let mut file_path = normalize_path_lexically(resolve_path(
             invocation.workdir.as_path(),
             args.path.as_str(),
         ));
+        if let Some(allowed_path) = enforce_file_policy_for_tool(
+            invocation.execution_security_snapshot.as_ref(),
+            FilePolicyOperation::Read,
+            file_path.as_path(),
+        )? {
+            file_path = allowed_path;
+        }
 
         let metadata = tokio::fs::metadata(file_path.as_path())
             .await
@@ -581,7 +589,12 @@ impl ToolHandler for WriteFileHandler {
         _trace: crate::events::ToolEventTrace,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let args = parse_write_file_args(invocation.payload)?;
-        let target = prepare_write_file_target(invocation.workdir.as_path(), &args).await?;
+        let target = prepare_write_file_target(
+            invocation.workdir.as_path(),
+            &args,
+            invocation.execution_security_snapshot.as_ref(),
+        )
+        .await?;
         if let Some(output) =
             verify_existing_file_preconditions(self.observation_store.as_ref(), &target, &args)
                 .await?
@@ -614,7 +627,13 @@ impl ToolHandler for EditFileHandler {
         _trace: crate::events::ToolEventTrace,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let args = parse_edit_file_args(invocation.payload)?;
-        let target = match prepare_edit_file_target(invocation.workdir.as_path(), &args).await? {
+        let target = match prepare_edit_file_target(
+            invocation.workdir.as_path(),
+            &args,
+            invocation.execution_security_snapshot.as_ref(),
+        )
+        .await?
+        {
             EditFileTargetValidation::Ready(target) => target,
             EditFileTargetValidation::Failed(output) => return Ok(output),
         };
@@ -1217,11 +1236,37 @@ fn write_max_bytes() -> usize {
     DEFAULT_WRITE_MAX_BYTES.min(HARD_WRITE_MAX_BYTES)
 }
 
+fn enforce_file_policy_for_tool(
+    snapshot: Option<&pioneer_protocol::TurnExecutionSecuritySnapshot>,
+    operation: FilePolicyOperation,
+    requested_path: &Path,
+) -> Result<Option<PathBuf>, ToolError> {
+    let Some(snapshot) = snapshot else {
+        return Ok(None);
+    };
+
+    match FilePolicyChecker::check(snapshot, operation, requested_path) {
+        FilePolicyDecision::Allowed(grant) => Ok(Some(grant.resolved_path)),
+        FilePolicyDecision::Denied(deny) => Err(ToolError::Rejected(format!(
+            "filesystem sandbox denied {operation:?} for `{}`: {}",
+            deny.requested_path.display(),
+            deny.message
+        ))),
+    }
+}
+
 async fn prepare_write_file_target(
     workdir: &Path,
     args: &WriteFileArgs,
+    execution_security_snapshot: Option<&pioneer_protocol::TurnExecutionSecuritySnapshot>,
 ) -> Result<WriteFileTarget, ToolError> {
-    let resolved_path = normalize_path_lexically(resolve_path(workdir, args.path.as_str()));
+    let requested_path = normalize_path_lexically(resolve_path(workdir, args.path.as_str()));
+    let resolved_path = enforce_file_policy_for_tool(
+        execution_security_snapshot,
+        FilePolicyOperation::Write,
+        requested_path.as_path(),
+    )?
+    .unwrap_or(requested_path);
     let parent = resolved_path.parent().ok_or_else(|| {
         ToolError::invalid_arguments(format!(
             "write_file target `{}` does not have a parent directory",
@@ -1298,8 +1343,15 @@ async fn prepare_write_file_target(
 async fn prepare_edit_file_target(
     workdir: &Path,
     args: &EditFileArgs,
+    execution_security_snapshot: Option<&pioneer_protocol::TurnExecutionSecuritySnapshot>,
 ) -> Result<EditFileTargetValidation, ToolError> {
-    let resolved_path = normalize_path_lexically(resolve_path(workdir, args.path.as_str()));
+    let requested_path = normalize_path_lexically(resolve_path(workdir, args.path.as_str()));
+    let resolved_path = enforce_file_policy_for_tool(
+        execution_security_snapshot,
+        FilePolicyOperation::Write,
+        requested_path.as_path(),
+    )?
+    .unwrap_or(requested_path);
 
     match tokio::fs::metadata(resolved_path.as_path()).await {
         Ok(metadata) if metadata.is_file() => Ok(EditFileTargetValidation::Ready(EditFileTarget {
@@ -2308,6 +2360,10 @@ mod tests {
     use crate::context::{ToolCallSource, ToolPayload};
     use crate::events::ToolEventBus;
     use crate::spec::ToolRecoveryMetadata;
+    use pioneer_protocol::{
+        TurnExecutionSecuritySnapshot, TurnFilesystemAccess, TurnFilesystemSandboxEntry,
+        TurnPermissionMode, TurnPermissionProfileSnapshot, TurnPermissionProfileSource,
+    };
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::fs;
 
@@ -2323,6 +2379,7 @@ mod tests {
             idempotency_key: None,
             recovery: ToolRecoveryMetadata::default(),
             permission_metadata: crate::spec::ToolPermissionMetadata::default(),
+            execution_security_snapshot: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
     }
@@ -2339,6 +2396,7 @@ mod tests {
             idempotency_key: None,
             recovery: ToolRecoveryMetadata::default(),
             permission_metadata: crate::spec::ToolPermissionMetadata::default(),
+            execution_security_snapshot: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
     }
@@ -2355,8 +2413,36 @@ mod tests {
             idempotency_key: None,
             recovery: ToolRecoveryMetadata::default(),
             permission_metadata: crate::spec::ToolPermissionMetadata::default(),
+            execution_security_snapshot: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
+    }
+
+    fn with_execution_security_snapshot(
+        mut invocation: ToolInvocation,
+        snapshot: TurnExecutionSecuritySnapshot,
+    ) -> ToolInvocation {
+        invocation.execution_security_snapshot = Some(snapshot);
+        invocation
+    }
+
+    fn workspace_write_security_snapshot(root: &Path) -> TurnExecutionSecuritySnapshot {
+        TurnExecutionSecuritySnapshot::workspace_write(
+            TurnPermissionProfileSnapshot::from_mode(
+                TurnPermissionMode::AutoAcceptEdits,
+                TurnPermissionProfileSource::Composer,
+            ),
+            root.to_string_lossy(),
+            vec![TurnFilesystemSandboxEntry::workspace_root(
+                TurnFilesystemAccess::Write,
+                root.to_string_lossy(),
+            )],
+            1,
+        )
+    }
+
+    fn unrestricted_full_access_security_snapshot(root: &Path) -> TurnExecutionSecuritySnapshot {
+        TurnExecutionSecuritySnapshot::unrestricted_full_access(root.to_string_lossy(), 1)
     }
 
     fn edit_invocation(call_id: &str, workdir: PathBuf, arguments: JsonValue) -> ToolInvocation {
@@ -2371,6 +2457,7 @@ mod tests {
             idempotency_key: None,
             recovery: ToolRecoveryMetadata::default(),
             permission_metadata: crate::spec::ToolPermissionMetadata::default(),
+            execution_security_snapshot: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
     }
@@ -2796,7 +2883,7 @@ mod tests {
             .expect("temp dir should create");
         let args = write_args("./nested/../file.txt", "hello");
 
-        let target = prepare_write_file_target(temp.as_path(), &args)
+        let target = prepare_write_file_target(temp.as_path(), &args, None)
             .await
             .expect("target should validate");
 
@@ -2817,7 +2904,7 @@ mod tests {
             .expect("temp dir should create");
         let args = write_args("nested/file.txt", "hello");
 
-        let target = prepare_write_file_target(temp.as_path(), &args)
+        let target = prepare_write_file_target(temp.as_path(), &args, None)
             .await
             .expect("target should validate");
 
@@ -2839,7 +2926,7 @@ mod tests {
         let mut args = write_args("nested/file.txt", "hello");
         args.create_dirs = Some(false);
 
-        let error = prepare_write_file_target(temp.as_path(), &args)
+        let error = prepare_write_file_target(temp.as_path(), &args, None)
             .await
             .expect_err("missing parent should fail");
 
@@ -2857,7 +2944,7 @@ mod tests {
             .expect("target dir should create");
         let args = write_args("target", "hello");
 
-        let error = prepare_write_file_target(temp.as_path(), &args)
+        let error = prepare_write_file_target(temp.as_path(), &args, None)
             .await
             .expect_err("directory target should fail");
 
@@ -2878,7 +2965,7 @@ mod tests {
         let mut args = write_args("file.txt", "new");
         args.overwrite = Some(false);
 
-        let error = prepare_write_file_target(temp.as_path(), &args)
+        let error = prepare_write_file_target(temp.as_path(), &args, None)
             .await
             .expect_err("overwrite=false should fail");
 
@@ -2942,7 +3029,7 @@ mod tests {
         let store = FileObservationStore::default();
         store.record(observation_for_file("read_file:complete", target_path.as_path()).await);
         let args = write_args("file.txt", "new");
-        let target = prepare_write_file_target(temp.as_path(), &args)
+        let target = prepare_write_file_target(temp.as_path(), &args, None)
             .await
             .expect("target should validate");
 
@@ -2972,7 +3059,7 @@ mod tests {
         });
         let mut args = write_args("file.txt", "new");
         args.read_observation_id = Some("read_file:partial".to_owned());
-        let target = prepare_write_file_target(temp.as_path(), &args)
+        let target = prepare_write_file_target(temp.as_path(), &args, None)
             .await
             .expect("target should validate");
 
@@ -3007,7 +3094,7 @@ mod tests {
             .await
             .expect("file should change");
         let args = write_args("file.txt", "new");
-        let target = prepare_write_file_target(temp.as_path(), &args)
+        let target = prepare_write_file_target(temp.as_path(), &args, None)
             .await
             .expect("target should validate");
 
@@ -3043,7 +3130,7 @@ mod tests {
             .expect("file should write");
         let mut args = write_args("file.txt", "new");
         args.expected_sha256 = Some(sha256_hex(b"different"));
-        let target = prepare_write_file_target(temp.as_path(), &args)
+        let target = prepare_write_file_target(temp.as_path(), &args, None)
             .await
             .expect("target should validate");
 
@@ -3078,7 +3165,7 @@ mod tests {
             .expect("file should write");
         let mut args = write_args("file.txt", "new");
         args.expected_sha256 = Some(sha256_hex(b"old"));
-        let target = prepare_write_file_target(temp.as_path(), &args)
+        let target = prepare_write_file_target(temp.as_path(), &args, None)
             .await
             .expect("target should validate");
 
@@ -3103,7 +3190,7 @@ mod tests {
             .expect("file should write");
         let mut args = write_args("file.txt", "new");
         args.expected_mtime_ms = Some(-1);
-        let target = prepare_write_file_target(temp.as_path(), &args)
+        let target = prepare_write_file_target(temp.as_path(), &args, None)
             .await
             .expect("target should validate");
 
@@ -3146,7 +3233,7 @@ mod tests {
         .expect("current state should read");
         let mut args = write_args("file.txt", "new");
         args.expected_mtime_ms = Some(current.mtime_ms);
-        let target = prepare_write_file_target(temp.as_path(), &args)
+        let target = prepare_write_file_target(temp.as_path(), &args, None)
             .await
             .expect("target should validate");
 
@@ -4679,7 +4766,7 @@ mod tests {
         })
         .expect("args should parse");
 
-        let target = match prepare_edit_file_target(temp.as_path(), &args)
+        let target = match prepare_edit_file_target(temp.as_path(), &args, None)
             .await
             .expect("target validation should run")
         {
@@ -4707,7 +4794,7 @@ mod tests {
         })
         .expect("args should parse");
 
-        let output = match prepare_edit_file_target(temp.as_path(), &args)
+        let output = match prepare_edit_file_target(temp.as_path(), &args, None)
             .await
             .expect("target validation should run")
         {
@@ -4743,7 +4830,7 @@ mod tests {
         })
         .expect("args should parse");
 
-        let error = match prepare_edit_file_target(temp.as_path(), &args).await {
+        let error = match prepare_edit_file_target(temp.as_path(), &args, None).await {
             Ok(_) => panic!("directory target should fail"),
             Err(error) => error,
         };
@@ -4871,6 +4958,252 @@ mod tests {
         assert_eq!(write_temp_file_count(temp.as_path(), "file.txt").await, 0);
 
         let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn write_file_policy_allows_path_inside_workspace_write_root() {
+        let temp = temp_path("write-policy-allowed");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        let snapshot = workspace_write_security_snapshot(temp.as_path());
+
+        let output = WriteFileHandler::default()
+            .handle(
+                with_execution_security_snapshot(
+                    write_invocation(
+                        "write_policy_allowed",
+                        temp.clone(),
+                        serde_json::json!({ "path": "file.txt", "content": "ok" }),
+                    ),
+                    snapshot,
+                ),
+                write_trace("write_policy_allowed"),
+            )
+            .await
+            .expect("write_file should be allowed inside workspace root");
+
+        assert!(output.success());
+        assert_eq!(
+            fs::read_to_string(temp.join("file.txt"))
+                .await
+                .expect("file should read"),
+            "ok"
+        );
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn write_file_policy_denies_path_outside_workspace_write_root_before_create() {
+        let root = temp_path("write-policy-root");
+        let outside = temp_path("write-policy-outside");
+        fs::create_dir_all(root.as_path())
+            .await
+            .expect("root dir should create");
+        fs::create_dir_all(outside.as_path())
+            .await
+            .expect("outside dir should create");
+        let denied_path = outside.join("blocked.txt");
+        let snapshot = workspace_write_security_snapshot(root.as_path());
+
+        let result = WriteFileHandler::default()
+            .handle(
+                with_execution_security_snapshot(
+                    write_invocation(
+                        "write_policy_denied",
+                        root.clone(),
+                        serde_json::json!({
+                            "path": denied_path.display().to_string(),
+                            "content": "blocked",
+                        }),
+                    ),
+                    snapshot,
+                ),
+                write_trace("write_policy_denied"),
+            )
+            .await;
+        let error = match result {
+            Ok(_) => panic!("write_file outside root should be denied"),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(error, ToolError::Rejected(message) if message.contains("outside the allowed sandbox roots"))
+        );
+        assert!(!denied_path.exists());
+        let _ = fs::remove_dir_all(root).await;
+        let _ = fs::remove_dir_all(outside).await;
+    }
+
+    #[tokio::test]
+    async fn write_file_policy_unrestricted_full_access_keeps_absolute_write_behavior() {
+        let root = temp_path("write-policy-fullaccess-root");
+        let outside = temp_path("write-policy-fullaccess-outside");
+        fs::create_dir_all(root.as_path())
+            .await
+            .expect("root dir should create");
+        fs::create_dir_all(outside.as_path())
+            .await
+            .expect("outside dir should create");
+        let outside_file = outside.join("allowed.txt");
+        let snapshot = unrestricted_full_access_security_snapshot(root.as_path());
+
+        let output = WriteFileHandler::default()
+            .handle(
+                with_execution_security_snapshot(
+                    write_invocation(
+                        "write_policy_fullaccess",
+                        root.clone(),
+                        serde_json::json!({
+                            "path": outside_file.display().to_string(),
+                            "content": "allowed",
+                        }),
+                    ),
+                    snapshot,
+                ),
+                write_trace("write_policy_fullaccess"),
+            )
+            .await
+            .expect("full access write should keep unrestricted behavior");
+
+        assert!(output.success());
+        assert_eq!(
+            fs::read_to_string(outside_file)
+                .await
+                .expect("outside file should read"),
+            "allowed"
+        );
+        let _ = fs::remove_dir_all(root).await;
+        let _ = fs::remove_dir_all(outside).await;
+    }
+
+    #[tokio::test]
+    async fn write_file_path_escape_denies_relative_parent_traversal_before_create() {
+        let base = temp_path("write-path-escape-traversal");
+        let root = base.join("workspace");
+        let outside = base.join("outside");
+        fs::create_dir_all(root.as_path())
+            .await
+            .expect("root dir should create");
+        fs::create_dir_all(outside.as_path())
+            .await
+            .expect("outside dir should create");
+        let denied_path = outside.join("blocked.txt");
+        let snapshot = workspace_write_security_snapshot(root.as_path());
+
+        let result = WriteFileHandler::default()
+            .handle(
+                with_execution_security_snapshot(
+                    write_invocation(
+                        "write_path_escape_parent",
+                        root.clone(),
+                        serde_json::json!({
+                            "path": "../outside/blocked.txt",
+                            "content": "blocked",
+                        }),
+                    ),
+                    snapshot,
+                ),
+                write_trace("write_path_escape_parent"),
+            )
+            .await;
+        let error = match result {
+            Ok(_) => panic!("relative parent traversal should be denied"),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(error, ToolError::Rejected(message) if message.contains("outside the allowed sandbox roots"))
+        );
+        assert!(!denied_path.exists());
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn write_file_path_escape_fullaccess_allows_relative_parent_traversal() {
+        let base = temp_path("write-path-escape-fullaccess");
+        let root = base.join("workspace");
+        let outside = base.join("outside");
+        fs::create_dir_all(root.as_path())
+            .await
+            .expect("root dir should create");
+        fs::create_dir_all(outside.as_path())
+            .await
+            .expect("outside dir should create");
+        let outside_file = outside.join("allowed.txt");
+        let snapshot = unrestricted_full_access_security_snapshot(root.as_path());
+
+        let output = WriteFileHandler::default()
+            .handle(
+                with_execution_security_snapshot(
+                    write_invocation(
+                        "write_path_escape_fullaccess",
+                        root.clone(),
+                        serde_json::json!({
+                            "path": "../outside/allowed.txt",
+                            "content": "allowed",
+                        }),
+                    ),
+                    snapshot,
+                ),
+                write_trace("write_path_escape_fullaccess"),
+            )
+            .await
+            .expect("full access should allow parent traversal");
+
+        assert!(output.success());
+        assert_eq!(
+            fs::read_to_string(outside_file.as_path())
+                .await
+                .expect("outside file should read"),
+            "allowed"
+        );
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_file_path_escape_denies_symlink_parent_before_create() {
+        let base = temp_path("write-path-escape-symlink");
+        let root = base.join("workspace");
+        let outside = base.join("outside");
+        fs::create_dir_all(root.as_path())
+            .await
+            .expect("root dir should create");
+        fs::create_dir_all(outside.as_path())
+            .await
+            .expect("outside dir should create");
+        std::os::unix::fs::symlink(outside.as_path(), root.join("linked").as_path())
+            .expect("symlink should create");
+        let denied_path = outside.join("blocked.txt");
+        let snapshot = workspace_write_security_snapshot(root.as_path());
+
+        let result = WriteFileHandler::default()
+            .handle(
+                with_execution_security_snapshot(
+                    write_invocation(
+                        "write_path_escape_symlink",
+                        root.clone(),
+                        serde_json::json!({
+                            "path": "linked/blocked.txt",
+                            "content": "blocked",
+                        }),
+                    ),
+                    snapshot,
+                ),
+                write_trace("write_path_escape_symlink"),
+            )
+            .await;
+        let error = match result {
+            Ok(_) => panic!("write through symlinked parent should be denied"),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(error, ToolError::Rejected(message) if message.contains("through a symlink"))
+        );
+        assert!(!denied_path.exists());
+        let _ = fs::remove_dir_all(base).await;
     }
 
     #[tokio::test]
@@ -5473,6 +5806,209 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn read_file_policy_allows_path_inside_workspace_read_root() {
+        let temp = temp_path("read-policy-allowed");
+        fs::create_dir_all(temp.as_path())
+            .await
+            .expect("temp dir should create");
+        fs::write(temp.join("file.txt"), "hello")
+            .await
+            .expect("file should write");
+        let snapshot = workspace_write_security_snapshot(temp.as_path());
+
+        let output = ReadFileHandler::default()
+            .handle(
+                with_execution_security_snapshot(
+                    read_invocation(
+                        "read_policy_allowed",
+                        temp.clone(),
+                        serde_json::json!({ "path": "file.txt" }),
+                    ),
+                    snapshot,
+                ),
+                read_trace("read_policy_allowed"),
+            )
+            .await
+            .expect("read_file should be allowed inside workspace root");
+
+        assert!(output.success());
+        assert!(
+            output
+                .raw_json()
+                .get("output")
+                .and_then(JsonValue::as_str)
+                .is_some_and(|output| output.contains("hello"))
+        );
+        let _ = fs::remove_dir_all(temp).await;
+    }
+
+    #[tokio::test]
+    async fn read_file_policy_denies_path_outside_workspace_read_root_before_open() {
+        let root = temp_path("read-policy-root");
+        let outside = temp_path("read-policy-outside");
+        fs::create_dir_all(root.as_path())
+            .await
+            .expect("root dir should create");
+        fs::create_dir_all(outside.as_path())
+            .await
+            .expect("outside dir should create");
+        let denied_path = outside.join("secret.txt");
+        fs::write(denied_path.as_path(), "secret")
+            .await
+            .expect("outside file should write");
+        let snapshot = workspace_write_security_snapshot(root.as_path());
+
+        let result = ReadFileHandler::default()
+            .handle(
+                with_execution_security_snapshot(
+                    read_invocation(
+                        "read_policy_denied",
+                        root.clone(),
+                        serde_json::json!({ "path": denied_path.display().to_string() }),
+                    ),
+                    snapshot,
+                ),
+                read_trace("read_policy_denied"),
+            )
+            .await;
+        let error = match result {
+            Ok(_) => panic!("read_file outside root should be denied"),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(error, ToolError::Rejected(message) if message.contains("outside the allowed sandbox roots"))
+        );
+        let _ = fs::remove_dir_all(root).await;
+        let _ = fs::remove_dir_all(outside).await;
+    }
+
+    #[tokio::test]
+    async fn read_file_policy_unrestricted_full_access_keeps_absolute_read_behavior() {
+        let root = temp_path("read-policy-fullaccess-root");
+        let outside = temp_path("read-policy-fullaccess-outside");
+        fs::create_dir_all(root.as_path())
+            .await
+            .expect("root dir should create");
+        fs::create_dir_all(outside.as_path())
+            .await
+            .expect("outside dir should create");
+        let outside_file = outside.join("allowed.txt");
+        fs::write(outside_file.as_path(), "allowed")
+            .await
+            .expect("outside file should write");
+        let snapshot = unrestricted_full_access_security_snapshot(root.as_path());
+
+        let output = ReadFileHandler::default()
+            .handle(
+                with_execution_security_snapshot(
+                    read_invocation(
+                        "read_policy_fullaccess",
+                        root.clone(),
+                        serde_json::json!({ "path": outside_file.display().to_string() }),
+                    ),
+                    snapshot,
+                ),
+                read_trace("read_policy_fullaccess"),
+            )
+            .await
+            .expect("full access read should keep unrestricted behavior");
+
+        assert!(output.success());
+        assert!(
+            output
+                .raw_json()
+                .get("output")
+                .and_then(JsonValue::as_str)
+                .is_some_and(|output| output.contains("allowed"))
+        );
+        let _ = fs::remove_dir_all(root).await;
+        let _ = fs::remove_dir_all(outside).await;
+    }
+
+    #[tokio::test]
+    async fn read_file_path_escape_denies_relative_parent_traversal() {
+        let base = temp_path("read-path-escape-traversal");
+        let root = base.join("workspace");
+        let outside = base.join("outside");
+        fs::create_dir_all(root.as_path())
+            .await
+            .expect("root dir should create");
+        fs::create_dir_all(outside.as_path())
+            .await
+            .expect("outside dir should create");
+        fs::write(outside.join("secret.txt").as_path(), "secret")
+            .await
+            .expect("outside file should write");
+        let snapshot = workspace_write_security_snapshot(root.as_path());
+
+        let result = ReadFileHandler::default()
+            .handle(
+                with_execution_security_snapshot(
+                    read_invocation(
+                        "read_path_escape_parent",
+                        root.clone(),
+                        serde_json::json!({ "path": "../outside/secret.txt" }),
+                    ),
+                    snapshot,
+                ),
+                read_trace("read_path_escape_parent"),
+            )
+            .await;
+        let error = match result {
+            Ok(_) => panic!("relative parent traversal should be denied"),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(error, ToolError::Rejected(message) if message.contains("outside the allowed sandbox roots"))
+        );
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn read_file_path_escape_fullaccess_allows_relative_parent_traversal() {
+        let base = temp_path("read-path-escape-fullaccess");
+        let root = base.join("workspace");
+        let outside = base.join("outside");
+        fs::create_dir_all(root.as_path())
+            .await
+            .expect("root dir should create");
+        fs::create_dir_all(outside.as_path())
+            .await
+            .expect("outside dir should create");
+        fs::write(outside.join("allowed.txt").as_path(), "allowed")
+            .await
+            .expect("outside file should write");
+        let snapshot = unrestricted_full_access_security_snapshot(root.as_path());
+
+        let output = ReadFileHandler::default()
+            .handle(
+                with_execution_security_snapshot(
+                    read_invocation(
+                        "read_path_escape_fullaccess",
+                        root.clone(),
+                        serde_json::json!({ "path": "../outside/allowed.txt" }),
+                    ),
+                    snapshot,
+                ),
+                read_trace("read_path_escape_fullaccess"),
+            )
+            .await
+            .expect("full access should allow parent traversal");
+
+        assert!(output.success());
+        assert!(
+            output
+                .raw_json()
+                .get("output")
+                .and_then(JsonValue::as_str)
+                .is_some_and(|output| output.contains("allowed"))
+        );
+        let _ = fs::remove_dir_all(base).await;
     }
 
     #[tokio::test]

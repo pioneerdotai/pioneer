@@ -4,6 +4,7 @@ use super::http::{
 use crate::WebToolsConfig;
 use crate::context::{FunctionToolOutput, ToolInvocation, ToolOutput, ToolPayload};
 use crate::error::ToolError;
+use crate::network_policy::enforce_network_url;
 use crate::registry::ToolHandler;
 use crate::web::{
     DownloadModelPayload, WebFetchLink, WebFetchModelPayload, WebFetchTruncation,
@@ -12,6 +13,7 @@ use crate::web::{
 };
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use pioneer_protocol::TurnExecutionSecuritySnapshot;
 use scraper::{Html, Selector};
 use serde::Deserialize;
 use serde::Serialize;
@@ -223,6 +225,7 @@ impl ToolHandler for WebSearchHandler {
             args.freshness.as_deref(),
             snippet_chars,
             &self.config,
+            invocation.execution_security_snapshot.as_ref(),
         )
         .await?;
 
@@ -289,6 +292,7 @@ impl ToolHandler for WebFetchHandler {
             args.url.as_str(),
             settings,
             self.config.default_user_agent.as_str(),
+            invocation.execution_security_snapshot.as_ref(),
         )
         .await?;
 
@@ -379,6 +383,7 @@ impl ToolHandler for DownloadUrlHandler {
             args.overwrite.unwrap_or(false),
             args.create_dirs.unwrap_or(true),
             self.config.default_user_agent.as_str(),
+            invocation.execution_security_snapshot.as_ref(),
         )
         .await?;
 
@@ -432,6 +437,7 @@ async fn search_duckduckgo(
     freshness: Option<&str>,
     max_snippet_chars: usize,
     config: &WebToolsConfig,
+    security_snapshot: Option<&TurnExecutionSecuritySnapshot>,
 ) -> Result<Vec<WebSearchResult>, ToolError> {
     let direct = search_duckduckgo_html(
         query,
@@ -441,14 +447,31 @@ async fn search_duckduckgo(
         freshness,
         max_snippet_chars,
         config,
+        security_snapshot,
     )
     .await;
 
     match direct {
         Ok(results) if !results.is_empty() => Ok(results),
-        Ok(_) => search_duckduckgo_instant_api(query, max_results, max_snippet_chars, config).await,
+        Ok(_) => {
+            search_duckduckgo_instant_api(
+                query,
+                max_results,
+                max_snippet_chars,
+                config,
+                security_snapshot,
+            )
+            .await
+        }
         Err(_) => {
-            search_duckduckgo_instant_api(query, max_results, max_snippet_chars, config).await
+            search_duckduckgo_instant_api(
+                query,
+                max_results,
+                max_snippet_chars,
+                config,
+                security_snapshot,
+            )
+            .await
         }
     }
 }
@@ -461,7 +484,14 @@ async fn search_duckduckgo_html(
     freshness: Option<&str>,
     max_snippet_chars: usize,
     config: &WebToolsConfig,
+    security_snapshot: Option<&TurnExecutionSecuritySnapshot>,
 ) -> Result<Vec<WebSearchResult>, ToolError> {
+    enforce_network_url(
+        security_snapshot,
+        config.ddg_html_search_url.as_str(),
+        "web_search",
+    )?;
+
     let timeout_ms = config
         .default_timeout_ms
         .clamp(1, config.hard_max_timeout_ms.max(1));
@@ -586,7 +616,14 @@ async fn search_duckduckgo_instant_api(
     max_results: usize,
     max_snippet_chars: usize,
     config: &WebToolsConfig,
+    security_snapshot: Option<&TurnExecutionSecuritySnapshot>,
 ) -> Result<Vec<WebSearchResult>, ToolError> {
+    enforce_network_url(
+        security_snapshot,
+        config.ddg_instant_api_url.as_str(),
+        "web_search",
+    )?;
+
     let timeout_ms = config
         .default_timeout_ms
         .clamp(1, config.hard_max_timeout_ms.max(1));
@@ -763,7 +800,10 @@ async fn fetch_url(
     url: &str,
     settings: FetchSettings,
     user_agent: &str,
+    security_snapshot: Option<&TurnExecutionSecuritySnapshot>,
 ) -> Result<HttpFetchResult, ToolError> {
+    enforce_network_url(security_snapshot, url, "web_fetch")?;
+
     let response = execute_buffered_http_request(BufferedHttpRequest {
         method: "GET".to_owned(),
         url: url.to_owned(),
@@ -806,8 +846,10 @@ async fn download_to_file(
     overwrite: bool,
     create_dirs: bool,
     user_agent: &str,
+    security_snapshot: Option<&TurnExecutionSecuritySnapshot>,
 ) -> Result<DownloadStreamResult, ToolError> {
     validate_http_url(url)?;
+    enforce_network_url(security_snapshot, url, "download_url")?;
 
     if create_dirs && let Some(parent) = destination.parent() {
         tokio::fs::create_dir_all(parent).await.map_err(|error| {
@@ -1236,5 +1278,38 @@ mod tests {
         let favicon = default_favicon_url("https://example.com/path?q=1")
             .expect("fallback favicon should be generated");
         assert_eq!(favicon, "https://example.com/favicon.ico");
+    }
+
+    #[tokio::test]
+    async fn network_policy_web_fetch_denies_disabled_snapshot_before_request() {
+        let snapshot = pioneer_protocol::TurnExecutionSecuritySnapshot::read_only(
+            pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+                pioneer_protocol::TurnPermissionMode::Supervised,
+                pioneer_protocol::TurnPermissionProfileSource::Composer,
+            ),
+            "/tmp/workspace",
+            Vec::new(),
+            1_700_000_000_000,
+        );
+        let settings = FetchSettings {
+            timeout_ms: 1,
+            max_bytes: 1024,
+            follow_redirects: false,
+            include_headers: false,
+        };
+
+        let error = fetch_url(
+            "https://example.com",
+            settings,
+            "pioneer-test",
+            Some(&snapshot),
+        )
+        .await
+        .expect_err("disabled network should reject before request");
+
+        assert!(
+            matches!(error, ToolError::Rejected(ref message) if message.contains("network access is disabled")),
+            "unexpected error: {error}"
+        );
     }
 }

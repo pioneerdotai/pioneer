@@ -1,5 +1,6 @@
 use crate::output_policy::ToolResultEnvelope;
 use crate::spec::{ToolPermissionMetadata, ToolRecoveryMetadata};
+use pioneer_protocol::TurnExecutionSecuritySnapshot;
 use pioneer_provider::ModelInputItem;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -106,6 +107,7 @@ pub struct ToolInvocation {
     pub idempotency_key: Option<String>,
     pub recovery: ToolRecoveryMetadata,
     pub permission_metadata: ToolPermissionMetadata,
+    pub execution_security_snapshot: Option<TurnExecutionSecuritySnapshot>,
     pub cancellation: CancellationToken,
 }
 

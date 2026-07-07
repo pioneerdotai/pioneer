@@ -2,6 +2,7 @@ use super::http::{BufferedHttpRequest, execute_buffered_http_request};
 use crate::ToolExtensionBundle;
 use crate::context::{AnyToolResult, FunctionToolOutput, ToolInvocation, ToolOutput, ToolPayload};
 use crate::error::ToolError;
+use crate::network_policy::enforce_network_url;
 use crate::output_dynamic_policy::{
     DynamicToolKind, DynamicToolOutputPolicyCaps, DynamicToolPolicyContext,
     DynamicToolPolicyDiagnostic, resolve_dynamic_tool_output_policy,
@@ -559,6 +560,11 @@ impl ToolHandler for SkillHttpToolHandler {
             .or_else(|| config.get("url").and_then(JsonValue::as_str))
             .ok_or_else(|| ToolError::invalid_arguments("http tool requires `url`"))?
             .to_owned();
+        enforce_network_url(
+            invocation.execution_security_snapshot.as_ref(),
+            url.as_str(),
+            "dynamic_skill_http",
+        )?;
 
         let timeout_ms = arguments
             .get("timeout_ms")
@@ -851,8 +857,19 @@ async fn execute_nested_tool_call(
 
 #[cfg(test)]
 mod tests {
-    use super::{ReadSkillHandler, SkillReadToolEntry, read_skill_spec};
-    use crate::{ToolCallSource, ToolHandler, ToolInvocation, ToolPayload, ToolRecoveryMetadata};
+    use super::{
+        ReadSkillHandler, SkillDynamicToolDescriptor, SkillDynamicToolKind, SkillHttpToolHandler,
+        SkillReadToolEntry, read_skill_spec,
+    };
+    use crate::{
+        ExecutionClass, ToolCallSource, ToolHandler, ToolInvocation, ToolPayload,
+        ToolRecoveryMetadata,
+    };
+    use pioneer_protocol::{
+        TurnExecutionSecuritySnapshot, TurnPermissionMode, TurnPermissionProfileSnapshot,
+        TurnPermissionProfileSource,
+    };
+    use pioneer_skills::{SkillSourceKind, SkillTrustLevel};
     use serde_json::json;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -888,8 +905,70 @@ mod tests {
             idempotency_key: None,
             recovery: ToolRecoveryMetadata::default(),
             permission_metadata: crate::spec::ToolPermissionMetadata::default(),
+            execution_security_snapshot: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
+    }
+
+    fn skill_http_handler(url: &str) -> SkillHttpToolHandler {
+        SkillHttpToolHandler {
+            descriptor: SkillDynamicToolDescriptor {
+                canonical_tool_name: "skill_weather_http".to_owned(),
+                skill_slug: "user:workspace/weather".to_owned(),
+                skill_asset_root: "/tmp/skill-weather".to_owned(),
+                skill_fingerprint: "fingerprint".to_owned(),
+                source_kind: SkillSourceKind::User,
+                trust_level: SkillTrustLevel::Community,
+                description: "Fetch weather".to_owned(),
+                parameters: json!({
+                    "type": "object",
+                    "additionalProperties": true
+                }),
+                execution_class: ExecutionClass::Shared,
+                kind: SkillDynamicToolKind::Http,
+                config: json!({
+                    "method": "GET",
+                    "url": url
+                }),
+                requested_output_policy: None,
+            },
+        }
+    }
+
+    fn skill_http_invocation(
+        arguments: serde_json::Value,
+        execution_security_snapshot: Option<TurnExecutionSecuritySnapshot>,
+    ) -> ToolInvocation {
+        ToolInvocation {
+            call_id: "call_skill_http".to_owned(),
+            tool_name: "skill_weather_http".to_owned(),
+            source: ToolCallSource::Model,
+            payload: ToolPayload::Function { arguments },
+            workdir: PathBuf::from("."),
+            environment: Default::default(),
+            attempt_id: 1,
+            idempotency_key: None,
+            recovery: ToolRecoveryMetadata::default(),
+            permission_metadata: crate::spec::ToolPermissionMetadata::default(),
+            execution_security_snapshot,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    fn read_only_snapshot() -> TurnExecutionSecuritySnapshot {
+        TurnExecutionSecuritySnapshot::read_only(
+            TurnPermissionProfileSnapshot::from_mode(
+                TurnPermissionMode::Supervised,
+                TurnPermissionProfileSource::Composer,
+            ),
+            "/tmp/workspace",
+            Vec::new(),
+            1_700_000_000_000,
+        )
+    }
+
+    fn full_access_snapshot() -> TurnExecutionSecuritySnapshot {
+        TurnExecutionSecuritySnapshot::unrestricted_full_access("/tmp/workspace", 1_700_000_000_000)
     }
 
     #[test]
@@ -940,6 +1019,57 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("source:owner/slug"));
+    }
+
+    #[tokio::test]
+    async fn skill_policy_http_tool_inherits_disabled_network_snapshot() {
+        let handler = skill_http_handler("https://example.com");
+        let result = handler
+            .handle(
+                skill_http_invocation(json!({}), Some(read_only_snapshot())),
+                crate::ToolEventBus::default().start_trace(
+                    "turn",
+                    "call_skill_http",
+                    "skill_weather_http",
+                ),
+            )
+            .await;
+
+        let error = match result {
+            Ok(_) => panic!("disabled network should reject skill HTTP"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, crate::ToolError::Rejected(ref message) if message.contains("network access is disabled")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_policy_http_tool_full_access_reaches_http_execution_path() {
+        let handler = skill_http_handler("https://example.com");
+        let result = handler
+            .handle(
+                skill_http_invocation(
+                    json!({ "method": "BAD METHOD" }),
+                    Some(full_access_snapshot()),
+                ),
+                crate::ToolEventBus::default().start_trace(
+                    "turn",
+                    "call_skill_http",
+                    "skill_weather_http",
+                ),
+            )
+            .await;
+
+        let error = match result {
+            Ok(_) => panic!("invalid method should fail inside HTTP execution path"),
+            Err(error) => error,
+        };
+        assert!(
+            !matches!(error, crate::ToolError::Rejected(message) if message.contains("network access is disabled")),
+            "full access must not be blocked by skill network policy"
+        );
     }
 
     #[test]

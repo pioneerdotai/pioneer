@@ -12,8 +12,8 @@ use crate::permissions::{
 use crate::registry::ToolRegistry;
 use crate::spec::ToolIdempotencyMode;
 use pioneer_protocol::{
-    TurnPermissionAuditDecision, TurnPermissionAuditEvent, TurnPermissionAuditEventKind,
-    TurnPermissionAuditRequestKey, TurnPermissionMode,
+    TurnExecutionSecuritySnapshot, TurnPermissionAuditDecision, TurnPermissionAuditEvent,
+    TurnPermissionAuditEventKind, TurnPermissionAuditRequestKey, TurnPermissionMode,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -74,8 +74,11 @@ impl PostExecutionPolicy {
     }
 }
 
-fn permission_decision_trace_payload(decision: &PermissionDecision) -> serde_json::Value {
-    match decision {
+fn permission_decision_trace_payload(
+    decision: &PermissionDecision,
+    intent: &PermissionIntent,
+) -> serde_json::Value {
+    let mut payload = match decision {
         PermissionDecision::Allow { reason } => serde_json::json!({
             "decision": "allow",
             "reason": reason,
@@ -90,7 +93,17 @@ fn permission_decision_trace_payload(decision: &PermissionDecision) -> serde_jso
             "decision": "deny",
             "reason": reason,
         }),
+    };
+
+    if intent.is_unknown_capability()
+        && let Some(map) = payload.as_object_mut()
+    {
+        map.insert("unknown_capability".to_owned(), serde_json::json!(true));
+        if let Some(reason) = intent.scope.entries.get("unknown_reason") {
+            map.insert("unknown_reason".to_owned(), serde_json::json!(reason));
+        }
     }
+    payload
 }
 
 fn shell_result_session_id(raw: &serde_json::Value) -> Option<u64> {
@@ -115,6 +128,15 @@ struct PermissionEvaluationGrant {
 struct ShellSessionPermission {
     intent: PermissionIntent,
     request_key: crate::PermissionRequestKey,
+}
+
+fn security_snapshot_audit_fields(
+    turn_id: &str,
+    snapshot: Option<&TurnExecutionSecuritySnapshot>,
+) -> (Option<String>, Option<u32>) {
+    snapshot
+        .map(|snapshot| (Some(snapshot.audit_id(turn_id)), Some(snapshot.version)))
+        .unwrap_or((None, None))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -292,6 +314,19 @@ impl ToolOrchestrator {
                     permission_context,
                     &error,
                 );
+                if matches!(error, ToolError::Rejected(_)) {
+                    self.emit_permission_audit(
+                        trace,
+                        &invocation,
+                        permission_context,
+                        &permission_grant.intent,
+                        TurnPermissionAuditEventKind::DecisionDenied,
+                        Some(TurnPermissionAuditDecision::Deny),
+                        permission_grant.request_key.as_ref(),
+                        Some(PermissionDecisionReason::SandboxDenied),
+                        false,
+                    );
+                }
                 trace.emit_stage(
                     1,
                     "retry.skipped",
@@ -325,18 +360,27 @@ impl ToolOrchestrator {
         reason: Option<PermissionDecisionReason>,
         cached: bool,
     ) {
+        let turn_id = permission_context
+            .turn_id
+            .clone()
+            .unwrap_or_else(|| trace.turn_id().to_owned());
+        let (security_snapshot_id, security_snapshot_version) = security_snapshot_audit_fields(
+            turn_id.as_str(),
+            invocation.execution_security_snapshot.as_ref(),
+        );
         trace.emit_permission_audit(
             invocation.attempt_id,
             TurnPermissionAuditEvent {
                 workspace_id: permission_context.workspace_id.clone().unwrap_or_default(),
                 thread_id: permission_context.thread_id.clone().unwrap_or_default(),
-                turn_id: permission_context
-                    .turn_id
-                    .clone()
-                    .unwrap_or_else(|| trace.turn_id().to_owned()),
+                turn_id,
                 event_kind,
                 profile_mode: permission_context.permission_profile.mode,
                 profile_source: permission_context.permission_profile.source,
+                security_snapshot_id,
+                security_snapshot_version,
+                security_reason_code: None,
+                security_capability: None,
                 item_id: Some(invocation.call_id.clone()),
                 tool_call_id: Some(invocation.call_id.clone()),
                 tool_name: Some(invocation.tool_name.clone()),
@@ -390,7 +434,7 @@ impl ToolOrchestrator {
             invocation.attempt_id,
             "permission.evaluate.completed",
             None,
-            Some(permission_decision_trace_payload(&decision)),
+            Some(permission_decision_trace_payload(&decision, &intent)),
         );
 
         match decision {
@@ -867,6 +911,7 @@ mod tests {
             idempotency_key: None,
             recovery: crate::spec::ToolRecoveryMetadata::default(),
             permission_metadata: crate::spec::ToolPermissionMetadata::default(),
+            execution_security_snapshot: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
     }
@@ -1075,7 +1120,7 @@ mod tests {
     #[tokio::test]
     async fn permission_ask_dispatches_after_approval() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let handler = Arc::new(CountingHandler {
+        let handler: Arc<dyn ToolHandler> = Arc::new(CountingHandler {
             calls: calls.clone(),
             first_error: None,
             success_text: "ok",
@@ -1109,7 +1154,7 @@ mod tests {
     #[tokio::test]
     async fn permission_ask_denied_does_not_dispatch() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let handler = Arc::new(CountingHandler {
+        let handler: Arc<dyn ToolHandler> = Arc::new(CountingHandler {
             calls: calls.clone(),
             first_error: None,
             success_text: "ok",
@@ -1136,6 +1181,49 @@ mod tests {
         let result = orchestrator
             .run_with_context(&registry, invocation(), &trace, &context)
             .await;
+        assert!(matches!(result, Err(ToolError::Rejected(_))));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn unknown_capability_user_denial_does_not_dispatch() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler: Arc<dyn ToolHandler> = Arc::new(CountingHandler {
+            calls: calls.clone(),
+            first_error: None,
+            success_text: "ok",
+        });
+        let registry = registry_with_named_handlers([("mystery_tool", handler)]);
+        let orchestrator = ToolOrchestrator::with_permission_evaluator_and_approval_broker(
+            OrchestratorPolicy::default(),
+            PostExecutionPolicy::default(),
+            Arc::new(ProfileToolPermissionEvaluator),
+            Arc::new(StaticPermissionApprovalBroker::deny(
+                "unknown capability denied",
+            )),
+        );
+        let invocation = invocation_for_tool(
+            "mystery_tool",
+            ToolPayload::Function {
+                arguments: serde_json::json!({ "value": true }),
+            },
+        );
+        let trace =
+            crate::events::ToolEventBus::default().start_trace("turn", "call_1", "mystery_tool");
+        let context = PermissionEvaluationContext::for_turn(
+            "workspace_test",
+            "thread_test",
+            "turn",
+            pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+                pioneer_protocol::TurnPermissionMode::Supervised,
+                pioneer_protocol::TurnPermissionProfileSource::Composer,
+            ),
+        );
+
+        let result = orchestrator
+            .run_with_context(&registry, invocation, &trace, &context)
+            .await;
+
         assert!(matches!(result, Err(ToolError::Rejected(_))));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }

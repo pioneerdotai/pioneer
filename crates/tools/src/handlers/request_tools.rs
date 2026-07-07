@@ -387,6 +387,7 @@ mod tests {
                     idempotency_key: None,
                     recovery: crate::spec::ToolRecoveryMetadata::default(),
                     permission_metadata: crate::spec::ToolPermissionMetadata::default(),
+                    execution_security_snapshot: None,
                     cancellation: tokio_util::sync::CancellationToken::new(),
                 },
                 crate::events::ToolEventBus::default().start_trace(
