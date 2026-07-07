@@ -5,7 +5,7 @@ use crate::thread_episodic::{
     ThreadEpisodicThreadReindexRequest, memvid_stats_reach_capacity_threshold,
 };
 use anyhow::{Context, Result, bail};
-use fs4::fs_std::FileExt;
+use fs4::{FileExt as Fs4FileExt, TryLockError as Fs4TryLockError};
 use pioneer_crud::{
     CrudStore, NewThreadEpisodicThreadDirectoryRecord, PROJECTION_META_STATUS_BACKFILLING,
     PROJECTION_META_STATUS_COMPLETE, PROJECTION_META_STATUS_FAILED, ProjectionMetaRecord,
@@ -157,7 +157,7 @@ struct RefillLockGuard {
 
 impl Drop for RefillLockGuard {
     fn drop(&mut self) {
-        let _ = self.file.unlock();
+        let _ = Fs4FileExt::unlock(&self.file);
     }
 }
 
@@ -180,15 +180,15 @@ fn try_acquire_refill_lock(thread_episodic_storage_root: &Path) -> Result<Option
                 lock_path.display()
             )
         })?;
-    if file.try_lock_exclusive().with_context(|| {
-        format!(
-            "failed to acquire thread episodic workspace refill lock `{}`",
-            lock_path.display()
-        )
-    })? {
-        Ok(Some(RefillLockGuard { file }))
-    } else {
-        Ok(None)
+    match Fs4FileExt::try_lock(&file) {
+        Ok(()) => Ok(Some(RefillLockGuard { file })),
+        Err(Fs4TryLockError::WouldBlock) => Ok(None),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to acquire thread episodic workspace refill lock `{}`",
+                lock_path.display()
+            )
+        }),
     }
 }
 

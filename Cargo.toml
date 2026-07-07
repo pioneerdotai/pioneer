@@ -81,7 +81,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 # Tracing
 log = "0.4"
-env_logger = "0.9"
+env_logger = "0.11"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3" }
 sentry = { version = "0.48", default-features = false, features = ["anyhow", "backtrace", "contexts", "panic", "transport", "tracing"] }
@@ -114,8 +114,8 @@ chrono-tz = "0.10"
 xcap = "0.9"
 xa11y = "0.9"
 tempfile = "3"
-fs4 = "0.13"
-lazy_static = "1.4"
+fs4 = "1.1"
+lazy_static = "1.5"
 lru_time_cache = "0.11"
 owning_ref = "0.4"
 names = { version = "0.14", default-features = false }
@@ -159,5 +159,5 @@ rusqlite = { version = "0.39", default-features = false, features = ["functions"
 zstd = { version = "0.13", features = ["experimental"] }
 
 # MCP
-rmcp = { version = "1.7", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
+rmcp = { version = "2.1", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
 process-wrap = { version = "9.1.0", features = ["tokio1"] }
