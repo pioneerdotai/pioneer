@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -14,10 +14,10 @@ use pioneer_protocol::{
 };
 use pioneer_provider::AttachmentDataSource;
 use pioneer_tools::{
-    ConfiguredToolSpec, ExecutionClass, FunctionToolOutput, PayloadKind, ToolError, ToolHandler,
-    ToolIdempotencyMode, ToolInvocation, ToolOutput, ToolOutputProjectionKind, ToolPayload,
-    ToolRecoveryMetadata, ToolRetryClass, ToolSpec, dynamic_unknown_output_policy,
-    normalize_tool_arguments_from_schema,
+    ConfiguredToolSpec, ExecutionClass, FilePolicyChecker, FilePolicyDecision, FilePolicyOperation,
+    FunctionToolOutput, PayloadKind, ToolError, ToolHandler, ToolIdempotencyMode, ToolInvocation,
+    ToolOutput, ToolOutputProjectionKind, ToolPayload, ToolRecoveryMetadata, ToolRetryClass,
+    ToolSpec, dynamic_unknown_output_policy, normalize_tool_arguments_from_schema,
 };
 use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
@@ -267,6 +267,13 @@ impl ArtifactToolHandler {
                 ))
             })?;
 
+        enforce_artifact_path_policy(
+            &invocation,
+            FilePolicyOperation::Write,
+            Path::new(output_dir),
+            "artifact_prepare output dir",
+        )?;
+
         tokio::fs::create_dir_all(output_dir)
             .await
             .map_err(|error| {
@@ -284,8 +291,15 @@ impl ArtifactToolHandler {
         let prepared = self.state.reserve_output(
             output_dir.as_path(),
             params,
-            invocation.call_id,
+            invocation.call_id.clone(),
             expires_at,
+        )?;
+
+        enforce_artifact_path_policy(
+            &invocation,
+            FilePolicyOperation::Write,
+            prepared.output_path.as_path(),
+            "artifact_prepare output path",
         )?;
 
         let response = ArtifactPrepareResponse {
@@ -618,6 +632,94 @@ fn artifact_tool_argument_hint(tool_name: &str) -> &'static str {
     }
 }
 
+fn enforce_artifact_path_policy(
+    invocation: &ToolInvocation,
+    operation: FilePolicyOperation,
+    path: &Path,
+    label: &str,
+) -> Result<(), ToolError> {
+    if artifact_output_dir_allows(invocation, operation, path) {
+        return Ok(());
+    }
+
+    let Some(snapshot) = invocation.execution_security_snapshot.as_ref() else {
+        return Ok(());
+    };
+    match FilePolicyChecker::check(snapshot, operation, path) {
+        FilePolicyDecision::Allowed(_) => Ok(()),
+        FilePolicyDecision::Denied(deny) => Err(ToolError::Rejected(format!(
+            "filesystem sandbox denied {:?} for {label} `{}`: {}",
+            deny.operation,
+            deny.requested_path.display(),
+            deny.message
+        ))),
+    }
+}
+
+fn artifact_output_dir_allows(
+    invocation: &ToolInvocation,
+    operation: FilePolicyOperation,
+    path: &Path,
+) -> bool {
+    let Some(output_dir) = invocation
+        .environment
+        .get(ARTIFACT_OUTPUT_DIR_ENV)
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return false;
+    };
+
+    match (
+        std::fs::canonicalize(output_dir),
+        resolve_artifact_policy_path(operation, path),
+    ) {
+        (Ok(output_dir), Ok(path)) => path.starts_with(output_dir.as_path()),
+        _ => {
+            let output_dir = normalize_artifact_path(Path::new(output_dir));
+            let path = normalize_artifact_path(path);
+            path.starts_with(output_dir.as_path())
+        }
+    }
+}
+
+fn resolve_artifact_policy_path(
+    operation: FilePolicyOperation,
+    path: &Path,
+) -> std::io::Result<PathBuf> {
+    match std::fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && operation == FilePolicyOperation::Write =>
+        {
+            let Some(parent) = path.parent() else {
+                return Err(error);
+            };
+            let Some(file_name) = path.file_name() else {
+                return Err(error);
+            };
+            Ok(std::fs::canonicalize(parent)?.join(file_name))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn normalize_artifact_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(value) => normalized.push(value),
+            Component::RootDir | Component::Prefix(_) => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
 #[derive(Debug)]
 struct ArtifactRegisterOutcome {
     response: ArtifactRegisterResponse,
@@ -666,11 +768,25 @@ async fn register_artifact_for_invocation(
     let workspace_root = artifact_register_workspace_root(invocation)?;
     let source_path =
         resolve_artifact_register_path(workspace_root.as_path(), input.path.as_str())?;
+    enforce_artifact_path_policy(
+        invocation,
+        FilePolicyOperation::Read,
+        source_path.as_path(),
+        "artifact_register source path",
+    )?;
     let prepared_output_path = input
         .prepared_output_path
         .as_deref()
         .map(|path| resolve_artifact_register_path(workspace_root.as_path(), path))
         .transpose()?;
+    if let Some(prepared_output_path) = prepared_output_path.as_ref() {
+        enforce_artifact_path_policy(
+            invocation,
+            FilePolicyOperation::Read,
+            prepared_output_path.as_path(),
+            "artifact_register prepared output path",
+        )?;
+    }
     let allowed_roots =
         artifact_register_allowed_roots(invocation, workspace_root.as_path()).await?;
     let source_canonical = tokio::fs::canonicalize(source_path.as_path()).await.ok();
@@ -697,6 +813,25 @@ async fn register_artifact_for_invocation(
                 .is_some_and(|root| path.starts_with(root))
             || artifact_state.prepared_output_for_path(path).is_some()
     });
+    if cleanup_source_after_success {
+        enforce_artifact_path_policy(
+            invocation,
+            FilePolicyOperation::Write,
+            source_path.as_path(),
+            "artifact_register cleanup source path",
+        )?;
+    }
+    for prepared in &prepared_registration_plan.prepared_outputs {
+        let prepared_canonical = std::fs::canonicalize(prepared.output_path.as_path()).ok();
+        if prepared_canonical.as_ref() != source_canonical.as_ref() {
+            enforce_artifact_path_policy(
+                invocation,
+                FilePolicyOperation::Write,
+                prepared.output_path.as_path(),
+                "artifact_register cleanup prepared output path",
+            )?;
+        }
+    }
 
     let registration_context = ArtifactRegistrationContext {
         workspace_id: context.workspace_id.clone(),
@@ -1164,6 +1299,10 @@ mod tests {
     use super::*;
     use migration::{Migrator, MigratorTrait};
     use pioneer_crud::CrudStore;
+    use pioneer_protocol::{
+        TurnExecutionSecuritySnapshot, TurnFilesystemAccess, TurnFilesystemSandboxEntry,
+        TurnPermissionMode, TurnPermissionProfileSnapshot, TurnPermissionProfileSource,
+    };
     use pioneer_tools::{ToolCallSource, ToolEventBus, ToolInvocation};
     use sea_orm::Database;
     use serde_json::Value as JsonValue;
@@ -1179,6 +1318,21 @@ mod tests {
             "pioneer-artifact-prepare-{label}-{nanos}-{}",
             std::process::id()
         ))
+    }
+
+    fn workspace_write_security_snapshot(root: &Path) -> TurnExecutionSecuritySnapshot {
+        TurnExecutionSecuritySnapshot::workspace_write(
+            TurnPermissionProfileSnapshot::from_mode(
+                TurnPermissionMode::AutoAcceptEdits,
+                TurnPermissionProfileSource::Composer,
+            ),
+            root.to_string_lossy(),
+            vec![TurnFilesystemSandboxEntry::workspace_root(
+                TurnFilesystemAccess::Write,
+                root.to_string_lossy(),
+            )],
+            1,
+        )
     }
 
     fn invocation(
@@ -1205,8 +1359,17 @@ mod tests {
             idempotency_key: None,
             recovery: ToolRecoveryMetadata::default(),
             permission_metadata: pioneer_tools::ToolPermissionMetadata::default(),
+            execution_security_snapshot: None,
             cancellation: CancellationToken::new(),
         }
+    }
+
+    fn with_execution_security_snapshot(
+        mut invocation: ToolInvocation,
+        snapshot: TurnExecutionSecuritySnapshot,
+    ) -> ToolInvocation {
+        invocation.execution_security_snapshot = Some(snapshot);
+        invocation
     }
 
     fn trace() -> pioneer_tools::ToolEventTrace {
@@ -1395,6 +1558,48 @@ mod tests {
         assert!(error.to_string().contains("PIONEER_ARTIFACT_OUTPUT_DIR"));
     }
 
+    #[tokio::test]
+    async fn artifact_prepare_allows_app_output_dir_outside_snapshot() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace_root = temp.path().join("workspace");
+        let output_dir = temp.path().join("artifact-output");
+        tokio::fs::create_dir_all(workspace_root.as_path())
+            .await
+            .expect("create workspace");
+        let state = Arc::new(ArtifactToolState::default());
+        let handler = ArtifactToolHandler::new(
+            Arc::new(artifact_register_service(temp.path().join("runtime")).await),
+            artifact_register_context(),
+            state.clone(),
+            Arc::new(NoopArtifactToolNotificationSink),
+        );
+        let snapshot = workspace_write_security_snapshot(workspace_root.as_path());
+
+        let output = handler
+            .handle(
+                with_execution_security_snapshot(
+                    invocation(
+                        Some(output_dir.as_path()),
+                        serde_json::json!({
+                            "displayName": "image.png",
+                            "kind": "image"
+                        }),
+                        "call_app_output_dir",
+                    ),
+                    snapshot,
+                ),
+                trace(),
+            )
+            .await
+            .expect("artifact output dir should be allowed even outside workspace snapshot")
+            .raw_json();
+
+        let output_path = PathBuf::from(output["outputPath"].as_str().expect("output path"));
+        let canonical_output_dir = std::fs::canonicalize(output_dir.as_path()).expect("output dir");
+        assert!(output_path.starts_with(canonical_output_dir.as_path()));
+        assert_eq!(state.prepared_outputs().len(), 1);
+    }
+
     async fn artifact_register_service(runtime_home: PathBuf) -> ArtifactService {
         let db = Database::connect("sqlite::memory:")
             .await
@@ -1483,10 +1688,13 @@ mod tests {
             .expect("write source");
         let service = artifact_register_service(temp.path().join("runtime")).await;
         let state = ArtifactToolState::default();
-        let invocation = artifact_register_invocation(
-            workspace.clone(),
-            Some(output_dir.clone()),
-            source_path.display().to_string(),
+        let invocation = with_execution_security_snapshot(
+            artifact_register_invocation(
+                workspace.clone(),
+                Some(output_dir.clone()),
+                source_path.display().to_string(),
+            ),
+            workspace_write_security_snapshot(workspace.as_path()),
         );
 
         let outcome = register_artifact_for_invocation(
@@ -1763,6 +1971,59 @@ mod tests {
         .to_string();
 
         assert!(error.contains("outside allowed roots"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn artifact_register_policy_denies_source_outside_snapshot_before_registration() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        tokio::fs::create_dir_all(workspace.as_path())
+            .await
+            .expect("create workspace");
+        tokio::fs::create_dir_all(outside.as_path())
+            .await
+            .expect("create outside");
+        let outside_file = outside.join("secret.txt");
+        tokio::fs::write(outside_file.as_path(), b"outside")
+            .await
+            .expect("write outside");
+        let service = artifact_register_service(temp.path().join("runtime")).await;
+        let state = ArtifactToolState::default();
+        let invocation = with_execution_security_snapshot(
+            artifact_register_invocation(
+                workspace.clone(),
+                None,
+                outside_file.display().to_string(),
+            ),
+            workspace_write_security_snapshot(workspace.as_path()),
+        );
+
+        let error = register_artifact_for_invocation(
+            &service,
+            &artifact_register_context(),
+            &state,
+            &invocation,
+            decode_artifact_tool_args(invocation.clone()).expect("decode register input"),
+        )
+        .await
+        .expect_err("outside-snapshot registration should fail")
+        .to_string();
+
+        assert!(error.contains("artifact_register source path"), "{error}");
+        assert!(
+            error.contains("outside the allowed sandbox roots"),
+            "{error}"
+        );
+        let page = service
+            .list_thread_artifacts(
+                "ws_artifact_register",
+                "thr_artifact_register",
+                crate::ArtifactListFilter::default(),
+            )
+            .await
+            .expect("list artifacts");
+        assert!(page.items.is_empty());
     }
 
     #[cfg(unix)]
