@@ -1,26 +1,34 @@
+use crate::secrets::GatewaySecrets;
 use crate::thread_episodic::{
-    StoreThreadEpisodicIndexPayloadProvider, StoreThreadEpisodicIngestor,
+    ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver,
+    RuntimeVectorThreadEpisodicIndexPayloadProvider, StoreThreadEpisodicIndexPayloadProvider,
+    StoreThreadEpisodicIngestor, ThreadEpisodicIndexEmbeddingProviderResolver,
     ThreadEpisodicIndexExecutorConfig, ThreadEpisodicIndexPayloadProvider,
-    ThreadEpisodicIndexResolutionFailureKind, ThreadEpisodicResolvedIndexRequest,
-    ThreadEpisodicThreadReindexRequest, memvid_stats_reach_capacity_threshold,
+    ThreadEpisodicIndexResolutionError, ThreadEpisodicIndexResolutionFailureKind,
+    ThreadEpisodicResolvedIndexRequest, ThreadEpisodicThreadReindexRequest,
+    memvid_stats_reach_capacity_threshold,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use fs4::{FileExt as Fs4FileExt, TryLockError as Fs4TryLockError};
+use pioneer_config::{
+    GatewayThreadEpisodicVectorProviderConfig, GatewayThreadEpisodicVectorSearchConfig,
+};
 use pioneer_crud::{
     CrudStore, NewThreadEpisodicThreadDirectoryRecord, PROJECTION_META_STATUS_BACKFILLING,
-    PROJECTION_META_STATUS_COMPLETE, PROJECTION_META_STATUS_FAILED, ProjectionMetaRecord,
-    ThreadEpisodicCapsuleCapacityUpdate, ThreadEpisodicCapsuleWriteState,
+    PROJECTION_META_STATUS_COMPLETE, PROJECTION_META_STATUS_FAILED, ProjectionMetaConfigRecord,
+    ProjectionMetaRecord, ThreadEpisodicCapsuleCapacityUpdate, ThreadEpisodicCapsuleWriteState,
     ThreadEpisodicIndexJobCompletionUpdate, ThreadEpisodicIndexJobFailureUpdate,
     ThreadEpisodicIndexJobRecord, ThreadEpisodicItemIndexedUpdate,
     ThreadEpisodicThreadDirectoryStatus, ThreadEpisodicThreadDirectoryVisibility,
-    find_projection_meta, upsert_projection_meta,
+    find_projection_meta, upsert_projection_meta_with_config,
 };
 use pioneer_memory::{
-    MemvidThreadEpisodicBackend, ThreadEpisodicMemvidBackend, ThreadEpisodicMemvidFailureKind,
-    ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidStats,
+    MemvidThreadEpisodicBackend, ThreadEpisodicEmbeddingProvider, ThreadEpisodicMemvidBackend,
+    ThreadEpisodicMemvidFailureKind, ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidStats,
     thread_episodic_storage_uri_from_path,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
+use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -30,12 +38,129 @@ use tracing::{info, warn};
 pub(crate) const THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_KEY: &str =
     "thread_episodic_workspace_capsule_refill";
 pub(crate) const THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_VERSION: i64 = 1;
+const THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_CONFIG_VERSION: u32 = 1;
 
 const REFILL_ENQUEUE_BATCH_SIZE: u64 = 1024;
 const REFILL_EXECUTOR_MAX_BATCHES: u64 = 100_000;
 const REFILL_JOB_CLAIM_LIMIT: u64 = 1;
 const REFILL_LOCK_FILE_NAME: &str = ".thread_episodic_workspace_capsule_refill.lock";
 const REFILL_INDEX_ERROR_MAX_CHARS: usize = 512;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget {
+    config_hash: String,
+    payload: ThreadEpisodicWorkspaceCapsuleRefillProjectionPayload,
+    payload_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+struct ThreadEpisodicWorkspaceCapsuleRefillProjectionPayload {
+    schema_version: u32,
+    vector_search_enabled: bool,
+    provider: Option<String>,
+    model: Option<String>,
+    dimension: Option<u32>,
+    normalized: Option<bool>,
+    config_hash: String,
+}
+
+impl ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget {
+    pub(crate) fn lexical_only() -> Self {
+        Self::from_vector_search_config(&GatewayThreadEpisodicVectorSearchConfig::default())
+    }
+
+    pub(crate) fn from_vector_search_config(
+        config: &GatewayThreadEpisodicVectorSearchConfig,
+    ) -> Self {
+        let config_hash = crate::settings::thread_episodic_vector_projection_identity_hash(config);
+        let payload = ThreadEpisodicWorkspaceCapsuleRefillProjectionPayload {
+            schema_version: THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_CONFIG_VERSION,
+            vector_search_enabled: config.enabled,
+            provider: config.enabled.then(|| {
+                config
+                    .provider
+                    .map(crate::settings::vector_provider_identity_name)
+                    .unwrap_or("missing")
+                    .to_owned()
+            }),
+            model: config.enabled.then(|| projection_embedding_model(config)),
+            dimension: config
+                .enabled
+                .then(|| crate::settings::resolved_vector_embedding_dimension(config))
+                .flatten(),
+            normalized: config.enabled.then_some(config.embedding_normalized),
+            config_hash: config_hash.clone(),
+        };
+        let payload_json = serde_json::to_string(&payload)
+            .expect("thread episodic refill projection payload should serialize");
+        Self {
+            config_hash,
+            payload,
+            payload_json,
+        }
+    }
+
+    pub(crate) fn meta_config_record(&self) -> ProjectionMetaConfigRecord {
+        ProjectionMetaConfigRecord {
+            projection_config_hash: Some(self.config_hash.clone()),
+            projection_config_json: Some(self.payload_json.clone()),
+        }
+    }
+
+    fn matches_projection_meta(&self, meta: &ProjectionMetaRecordLike<'_>) -> bool {
+        if meta.projection_config_hash != Some(self.config_hash.as_str()) {
+            return false;
+        }
+        let Some(payload_json) = meta.projection_config_json else {
+            return false;
+        };
+        serde_json::from_str::<ThreadEpisodicWorkspaceCapsuleRefillProjectionPayload>(payload_json)
+            .is_ok_and(|payload| payload == self.payload)
+    }
+
+    fn requires_embedding_provider(&self) -> bool {
+        self.payload.vector_search_enabled
+    }
+
+    fn matches_embedding_provider(&self, provider: &dyn ThreadEpisodicEmbeddingProvider) -> bool {
+        if !self.payload.vector_search_enabled {
+            return true;
+        }
+        self.payload.provider.as_deref() == Some(provider.provider_id())
+            && self.payload.model.as_deref() == Some(provider.model())
+            && self
+                .payload
+                .dimension
+                .is_some_and(|dimension| usize::try_from(dimension) == Ok(provider.dimension()))
+            && self.payload.normalized == Some(provider.normalized())
+    }
+}
+
+struct ProjectionMetaRecordLike<'a> {
+    projection_config_hash: Option<&'a str>,
+    projection_config_json: Option<&'a str>,
+}
+
+fn projection_embedding_model(config: &GatewayThreadEpisodicVectorSearchConfig) -> String {
+    match config.provider {
+        Some(GatewayThreadEpisodicVectorProviderConfig::Local) => config
+            .local_model
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .to_owned(),
+        Some(
+            GatewayThreadEpisodicVectorProviderConfig::OpenAi
+            | GatewayThreadEpisodicVectorProviderConfig::OpenRouter,
+        ) => config
+            .model
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .to_owned(),
+        None => String::new(),
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct ThreadEpisodicWorkspaceCapsuleRefillSummary {
@@ -63,8 +188,34 @@ pub(crate) struct ThreadEpisodicWorkspaceCapsuleRefillSummary {
     pub(crate) incomplete_jobs: u64,
 }
 
-pub(super) async fn run(crud_store: Arc<CrudStore>, thread_episodic_storage_root: PathBuf) {
-    match refill_once(crud_store, thread_episodic_storage_root.as_path()).await {
+pub(super) async fn run(
+    crud_store: Arc<CrudStore>,
+    thread_episodic_storage_root: PathBuf,
+    vector_search_config: GatewayThreadEpisodicVectorSearchConfig,
+    gateway_secrets: Arc<GatewaySecrets>,
+    runtime_home: PathBuf,
+) {
+    let projection_target =
+        ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_vector_search_config(
+            &vector_search_config,
+        );
+    let embedding_provider_resolver = projection_target.requires_embedding_provider().then(|| {
+        Arc::new(
+            ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver::new(
+                gateway_secrets,
+                runtime_home,
+                vector_search_config,
+            ),
+        ) as Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>
+    });
+    match refill_once_with_projection_resolver(
+        crud_store,
+        thread_episodic_storage_root.as_path(),
+        projection_target,
+        embedding_provider_resolver,
+    )
+    .await
+    {
         Ok(summary) if summary.skipped && summary.lock_contended => {
             info!(
                 "thread episodic workspace capsule refill skipped because another process holds the refill lock"
@@ -99,12 +250,48 @@ pub(super) async fn run(crud_store: Arc<CrudStore>, thread_episodic_storage_root
     }
 }
 
+#[allow(dead_code)]
 pub(crate) async fn refill_once(
     crud_store: Arc<CrudStore>,
     thread_episodic_storage_root: &Path,
 ) -> Result<ThreadEpisodicWorkspaceCapsuleRefillSummary> {
+    refill_once_with_projection(
+        crud_store,
+        thread_episodic_storage_root,
+        ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only(),
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn refill_once_with_projection(
+    crud_store: Arc<CrudStore>,
+    thread_episodic_storage_root: &Path,
+    projection_target: ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget,
+    embedding_provider: Option<Arc<dyn ThreadEpisodicEmbeddingProvider>>,
+) -> Result<ThreadEpisodicWorkspaceCapsuleRefillSummary> {
+    let embedding_provider_resolver = embedding_provider.map(|provider| {
+        Arc::new(FixedThreadEpisodicIndexEmbeddingProviderResolver::new(
+            Some(provider),
+        )) as Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>
+    });
+    refill_once_with_projection_resolver(
+        crud_store,
+        thread_episodic_storage_root,
+        projection_target,
+        embedding_provider_resolver,
+    )
+    .await
+}
+
+pub(crate) async fn refill_once_with_projection_resolver(
+    crud_store: Arc<CrudStore>,
+    thread_episodic_storage_root: &Path,
+    projection_target: ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget,
+    embedding_provider_resolver: Option<Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>>,
+) -> Result<ThreadEpisodicWorkspaceCapsuleRefillSummary> {
     let db = crud_store.database_connection();
-    if refill_is_current(crud_store.as_ref()).await? {
+    if refill_is_current_for_target(crud_store.as_ref(), &projection_target).await? {
         return Ok(ThreadEpisodicWorkspaceCapsuleRefillSummary {
             skipped: true,
             ..Default::default()
@@ -118,8 +305,15 @@ pub(crate) async fn refill_once(
         });
     };
 
+    preflight_refill_embedding_resolver(
+        crud_store.as_ref(),
+        &projection_target,
+        embedding_provider_resolver.as_ref(),
+    )
+    .await?;
+
     let started_at = now_datetime();
-    upsert_projection_meta(
+    upsert_projection_meta_with_config(
         &db,
         ProjectionMetaRecord {
             projection_key: THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_KEY.to_owned(),
@@ -135,24 +329,73 @@ pub(crate) async fn refill_once(
             created_at: started_at,
             updated_at: started_at,
         },
+        projection_target.meta_config_record(),
     )
     .await?;
 
-    let result = refill_after_marker(crud_store.clone(), thread_episodic_storage_root).await;
+    let result = refill_after_marker(
+        crud_store.clone(),
+        thread_episodic_storage_root,
+        embedding_provider_resolver,
+    )
+    .await;
     match result {
         Ok(summary) => {
-            mark_refill_complete(&db, &summary).await?;
+            mark_refill_complete(&db, &summary, &projection_target).await?;
             Ok(summary)
         }
         Err(error) => {
-            mark_refill_failed(&db, &error).await?;
+            mark_refill_failed(&db, &error, &projection_target).await?;
             Err(error)
         }
     }
 }
 
+#[allow(dead_code)]
+pub(crate) async fn refill_once_for_vector_search_config(
+    crud_store: Arc<CrudStore>,
+    thread_episodic_storage_root: &Path,
+    vector_search_config: &GatewayThreadEpisodicVectorSearchConfig,
+    embedding_provider: Option<Arc<dyn ThreadEpisodicEmbeddingProvider>>,
+) -> Result<ThreadEpisodicWorkspaceCapsuleRefillSummary> {
+    refill_once_with_projection(
+        crud_store,
+        thread_episodic_storage_root,
+        ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_vector_search_config(
+            vector_search_config,
+        ),
+        embedding_provider,
+    )
+    .await
+}
+
 struct RefillLockGuard {
     file: File,
+}
+
+struct FixedThreadEpisodicIndexEmbeddingProviderResolver {
+    provider: Option<Arc<dyn ThreadEpisodicEmbeddingProvider>>,
+}
+
+impl FixedThreadEpisodicIndexEmbeddingProviderResolver {
+    fn new(provider: Option<Arc<dyn ThreadEpisodicEmbeddingProvider>>) -> Self {
+        Self { provider }
+    }
+}
+
+#[async_trait::async_trait]
+impl ThreadEpisodicIndexEmbeddingProviderResolver
+    for FixedThreadEpisodicIndexEmbeddingProviderResolver
+{
+    async fn resolve_active_embedding_provider(
+        &self,
+        _workspace_id: &str,
+    ) -> std::result::Result<
+        Option<Arc<dyn ThreadEpisodicEmbeddingProvider>>,
+        ThreadEpisodicIndexResolutionError,
+    > {
+        Ok(self.provider.clone())
+    }
 }
 
 impl Drop for RefillLockGuard {
@@ -192,7 +435,19 @@ fn try_acquire_refill_lock(thread_episodic_storage_root: &Path) -> Result<Option
     }
 }
 
+#[allow(dead_code)]
 pub(crate) async fn refill_is_current(crud_store: &CrudStore) -> Result<bool> {
+    refill_is_current_for_target(
+        crud_store,
+        &ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only(),
+    )
+    .await
+}
+
+pub(crate) async fn refill_is_current_for_target(
+    crud_store: &CrudStore,
+    projection_target: &ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget,
+) -> Result<bool> {
     let db = crud_store.database_connection();
     let Some(meta) =
         find_projection_meta(&db, THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_KEY).await?
@@ -200,15 +455,59 @@ pub(crate) async fn refill_is_current(crud_store: &CrudStore) -> Result<bool> {
         return Ok(false);
     };
 
+    let marker = ProjectionMetaRecordLike {
+        projection_config_hash: meta.projection_config_hash.as_deref(),
+        projection_config_json: meta.projection_config_json.as_deref(),
+    };
     Ok(
         meta.projection_version == THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_VERSION
-            && meta.status == PROJECTION_META_STATUS_COMPLETE,
+            && meta.status == PROJECTION_META_STATUS_COMPLETE
+            && projection_target.matches_projection_meta(&marker),
     )
+}
+
+pub(crate) async fn refill_status_for_target(
+    crud_store: &CrudStore,
+    projection_target: &ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget,
+) -> Result<pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus> {
+    let db = crud_store.database_connection();
+    let Some(meta) =
+        find_projection_meta(&db, THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_KEY).await?
+    else {
+        return Ok(pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required);
+    };
+
+    if meta.projection_version != THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_VERSION {
+        return Ok(pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required);
+    }
+
+    let marker = ProjectionMetaRecordLike {
+        projection_config_hash: meta.projection_config_hash.as_deref(),
+        projection_config_json: meta.projection_config_json.as_deref(),
+    };
+    if !projection_target.matches_projection_meta(&marker) {
+        return Ok(pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required);
+    }
+
+    let status = match meta.status.as_str() {
+        PROJECTION_META_STATUS_COMPLETE => {
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Complete
+        }
+        PROJECTION_META_STATUS_BACKFILLING => {
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Running
+        }
+        PROJECTION_META_STATUS_FAILED => {
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Failed
+        }
+        _ => pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required,
+    };
+    Ok(status)
 }
 
 async fn refill_after_marker(
     crud_store: Arc<CrudStore>,
     thread_episodic_storage_root: &Path,
+    embedding_provider_resolver: Option<Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>>,
 ) -> Result<ThreadEpisodicWorkspaceCapsuleRefillSummary> {
     let now_unix = chrono::Utc::now().timestamp();
     let mut summary =
@@ -230,8 +529,63 @@ async fn refill_after_marker(
     summary.source_turn_item_count = source_counts.source_turn_item_count;
 
     enqueue_refill_jobs(crud_store.as_ref(), now_unix, &mut summary).await?;
-    execute_refill_jobs(crud_store, thread_episodic_storage_root, &mut summary).await?;
+    execute_refill_jobs(
+        crud_store,
+        thread_episodic_storage_root,
+        embedding_provider_resolver,
+        &mut summary,
+    )
+    .await?;
     Ok(summary)
+}
+
+async fn preflight_refill_embedding_resolver(
+    crud_store: &CrudStore,
+    projection_target: &ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget,
+    embedding_provider_resolver: Option<&Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>>,
+) -> Result<()> {
+    if !projection_target.requires_embedding_provider() {
+        return Ok(());
+    }
+    let Some(embedding_provider_resolver) = embedding_provider_resolver else {
+        bail!("thread episodic vector refill requires an active embedding provider resolver");
+    };
+
+    let threads = crud_store
+        .list_thread_episodic_refill_threads()
+        .await
+        .context("failed to list thread episodic source workspaces for vector refill preflight")?;
+    let workspace_ids = threads
+        .into_iter()
+        .map(|thread| thread.workspace_id)
+        .collect::<BTreeSet<_>>();
+
+    for workspace_id in workspace_ids {
+        let provider = embedding_provider_resolver
+            .resolve_active_embedding_provider(workspace_id.as_str())
+            .await
+            .map_err(|error| {
+                anyhow!(
+                    "thread episodic vector refill provider preflight failed for workspace `{}`: {}",
+                    workspace_id,
+                    error.message
+                )
+            })?;
+        let Some(provider) = provider else {
+            bail!(
+                "thread episodic vector refill provider preflight returned no provider for workspace `{}`",
+                workspace_id
+            );
+        };
+        if !projection_target.matches_embedding_provider(provider.as_ref()) {
+            bail!(
+                "thread episodic vector refill provider identity does not match projection target for workspace `{}`",
+                workspace_id
+            );
+        }
+    }
+
+    Ok(())
 }
 
 async fn cleanup_derived_artifacts(
@@ -347,12 +701,23 @@ async fn enqueue_refill_jobs(
 async fn execute_refill_jobs(
     crud_store: Arc<CrudStore>,
     thread_episodic_storage_root: &Path,
+    embedding_provider_resolver: Option<Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>>,
     summary: &mut ThreadEpisodicWorkspaceCapsuleRefillSummary,
 ) -> Result<()> {
     let storage_uri_root = thread_episodic_storage_uri_from_path(thread_episodic_storage_root);
     let backend = MemvidThreadEpisodicBackend::new();
-    let payload_provider =
-        StoreThreadEpisodicIndexPayloadProvider::new(crud_store.clone(), storage_uri_root);
+    let base_payload_provider: Arc<dyn ThreadEpisodicIndexPayloadProvider> = Arc::new(
+        StoreThreadEpisodicIndexPayloadProvider::new(crud_store.clone(), storage_uri_root),
+    );
+    let payload_provider: Arc<dyn ThreadEpisodicIndexPayloadProvider> =
+        if let Some(embedding_provider_resolver) = embedding_provider_resolver {
+            Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
+                base_payload_provider,
+                embedding_provider_resolver,
+            ))
+        } else {
+            base_payload_provider
+        };
     let config = ThreadEpisodicIndexExecutorConfig::default();
 
     for _ in 0..REFILL_EXECUTOR_MAX_BATCHES {
@@ -852,9 +1217,10 @@ async fn delete_orphan_mv2_files(thread_episodic_storage_root: &Path) -> Result<
 async fn mark_refill_complete(
     db: &sea_orm::DatabaseConnection,
     summary: &ThreadEpisodicWorkspaceCapsuleRefillSummary,
+    projection_target: &ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget,
 ) -> Result<()> {
     let now = now_datetime();
-    upsert_projection_meta(
+    upsert_projection_meta_with_config(
         db,
         ProjectionMetaRecord {
             projection_key: THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_KEY.to_owned(),
@@ -873,6 +1239,7 @@ async fn mark_refill_complete(
             created_at: now,
             updated_at: now,
         },
+        projection_target.meta_config_record(),
     )
     .await
 }
@@ -881,9 +1248,13 @@ fn saturating_i64_from_u64(value: u64) -> i64 {
     value.min(i64::MAX as u64) as i64
 }
 
-async fn mark_refill_failed(db: &sea_orm::DatabaseConnection, error: &anyhow::Error) -> Result<()> {
+async fn mark_refill_failed(
+    db: &sea_orm::DatabaseConnection,
+    error: &anyhow::Error,
+    projection_target: &ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget,
+) -> Result<()> {
     let now = now_datetime();
-    upsert_projection_meta(
+    upsert_projection_meta_with_config(
         db,
         ProjectionMetaRecord {
             projection_key: THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_KEY.to_owned(),
@@ -899,6 +1270,7 @@ async fn mark_refill_failed(db: &sea_orm::DatabaseConnection, error: &anyhow::Er
             created_at: now,
             updated_at: now,
         },
+        projection_target.meta_config_record(),
     )
     .await
 }
@@ -918,18 +1290,102 @@ mod tests {
     use migration::{Migrator, MigratorTrait};
     use pioneer_crud::{
         NewThreadEpisodicIndexJobRecord, NewThreadEpisodicItemRecord,
-        ThreadEpisodicActiveWriteSegmentRequest, ThreadEpisodicGraphEnrichmentState,
-        ThreadEpisodicIndexJobStatus, ThreadEpisodicItemStatus, ThreadEpisodicItemVisibility,
-        ThreadEpisodicSourceActorRole, ThreadEpisodicSourceRuntimeKind,
+        ThreadEpisodicActiveWriteSegmentRequest, ThreadEpisodicCapsuleStatus,
+        ThreadEpisodicGraphEnrichmentState, ThreadEpisodicIndexJobStatus, ThreadEpisodicItemStatus,
+        ThreadEpisodicItemVisibility, ThreadEpisodicSourceActorRole,
+        ThreadEpisodicSourceRuntimeKind,
     };
+    use pioneer_memory::ThreadEpisodicEmbeddingError;
     use pioneer_protocol::{
         ItemCompletedNotification, SandboxMode, Thread,
         ThreadEpisodicSourceActorRole as ProtocolThreadEpisodicSourceActorRole,
         ThreadEpisodicSourceContext, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility,
         ThreadStatus, Turn, TurnItem, TurnItemType, TurnKind, TurnOrigin, TurnStatus, UserInput,
     };
-    use sea_orm::Database;
+    use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    struct StaticThreadEpisodicEmbeddingProvider {
+        provider_id: &'static str,
+        model: &'static str,
+        dimension: usize,
+        normalized: bool,
+        embedding: Vec<f32>,
+        error: Option<ThreadEpisodicEmbeddingError>,
+        calls: AtomicUsize,
+    }
+
+    impl StaticThreadEpisodicEmbeddingProvider {
+        fn new(embedding: Vec<f32>) -> Self {
+            Self::with_identity("openai", "text-embedding-3-small", embedding)
+        }
+
+        fn with_identity(
+            provider_id: &'static str,
+            model: &'static str,
+            embedding: Vec<f32>,
+        ) -> Self {
+            Self {
+                provider_id,
+                model,
+                dimension: embedding.len(),
+                normalized: true,
+                embedding,
+                error: None,
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn retryable_failure() -> Self {
+            Self {
+                provider_id: "openai",
+                model: "text-embedding-3-small",
+                dimension: 3,
+                normalized: true,
+                embedding: vec![0.1, 0.2, 0.3],
+                error: Some(ThreadEpisodicEmbeddingError::retryable_provider_failure(
+                    "openai",
+                    "text-embedding-3-small",
+                    "rate limited",
+                )),
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ThreadEpisodicEmbeddingProvider for StaticThreadEpisodicEmbeddingProvider {
+        fn provider_id(&self) -> &str {
+            self.provider_id
+        }
+
+        fn model(&self) -> &str {
+            self.model
+        }
+
+        fn dimension(&self) -> usize {
+            self.dimension
+        }
+
+        fn normalized(&self) -> bool {
+            self.normalized
+        }
+
+        fn embed_text(
+            &self,
+            _text: &str,
+        ) -> std::result::Result<Vec<f32>, ThreadEpisodicEmbeddingError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(error) = self.error.clone() {
+                return Err(error);
+            }
+            Ok(self.embedding.clone())
+        }
+    }
 
     #[tokio::test]
     async fn thread_episodic_workspace_refill_complete_marker_skips_migration() {
@@ -946,6 +1402,128 @@ mod tests {
             .expect("complete marker should skip");
 
         assert!(summary.skipped);
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_refill_marker_records_lexical_projection_identity() {
+        let (crud_store, temp_dir, _workspace_id) = setup_store().await;
+        let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only();
+
+        let summary = refill_once(crud_store.clone(), temp_dir.path())
+            .await
+            .expect("empty refill should complete");
+
+        assert!(!summary.skipped);
+        let meta = find_projection_meta(
+            &crud_store.database_connection(),
+            THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_KEY,
+        )
+        .await
+        .expect("meta query should succeed")
+        .expect("meta exists");
+        assert_eq!(
+            meta.projection_config_hash.as_deref(),
+            Some(target.config_hash.as_str())
+        );
+        assert_eq!(
+            meta.projection_config_json.as_deref(),
+            Some(target.payload_json.as_str())
+        );
+        assert!(
+            refill_is_current(crud_store.as_ref())
+                .await
+                .expect("current check")
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_refill_marker_treats_vector_marker_as_stale_for_lexical_target() {
+        let (crud_store, _temp_dir, _workspace_id) = setup_store().await;
+        let vector_target =
+            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_vector_search_config(
+                &GatewayThreadEpisodicVectorSearchConfig {
+                    enabled: true,
+                    provider: Some(GatewayThreadEpisodicVectorProviderConfig::OpenAi),
+                    model: Some("text-embedding-3-small".to_owned()),
+                    local_model: Some("bge-small-en-v1.5".to_owned()),
+                    embedding_dimension: Some(1536),
+                    embedding_normalized: true,
+                },
+            );
+        mark_refill_marker_with_target(
+            crud_store.as_ref(),
+            PROJECTION_META_STATUS_COMPLETE,
+            THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_VERSION,
+            &vector_target,
+        )
+        .await;
+
+        assert!(
+            !refill_is_current(crud_store.as_ref())
+                .await
+                .expect("lexical current check")
+        );
+        assert!(
+            refill_is_current_for_target(crud_store.as_ref(), &vector_target)
+                .await
+                .expect("vector current check")
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_refill_marker_invalidates_vector_identity_changes() {
+        let (crud_store, _temp_dir, _workspace_id) = setup_store().await;
+        let base_config = GatewayThreadEpisodicVectorSearchConfig {
+            enabled: true,
+            provider: Some(GatewayThreadEpisodicVectorProviderConfig::OpenAi),
+            model: Some("text-embedding-3-small".to_owned()),
+            local_model: Some("bge-small-en-v1.5".to_owned()),
+            embedding_dimension: Some(1536),
+            embedding_normalized: true,
+        };
+        let base_target =
+            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_vector_search_config(
+                &base_config,
+            );
+        mark_refill_marker_with_target(
+            crud_store.as_ref(),
+            PROJECTION_META_STATUS_COMPLETE,
+            THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_VERSION,
+            &base_target,
+        )
+        .await;
+
+        for changed_config in [
+            GatewayThreadEpisodicVectorSearchConfig {
+                model: Some("text-embedding-3-large".to_owned()),
+                embedding_dimension: Some(3072),
+                ..base_config.clone()
+            },
+            GatewayThreadEpisodicVectorSearchConfig {
+                embedding_dimension: Some(768),
+                ..base_config.clone()
+            },
+            GatewayThreadEpisodicVectorSearchConfig {
+                embedding_normalized: false,
+                ..base_config.clone()
+            },
+            GatewayThreadEpisodicVectorSearchConfig {
+                provider: Some(GatewayThreadEpisodicVectorProviderConfig::OpenRouter),
+                model: Some("openai/text-embedding-3-small".to_owned()),
+                ..base_config.clone()
+            },
+        ] {
+            let changed_target =
+                ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_vector_search_config(
+                    &changed_config,
+                );
+            assert!(
+                !refill_is_current_for_target(crud_store.as_ref(), &changed_target)
+                    .await
+                    .expect("changed vector current check"),
+                "changed config should be stale: {changed_config:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1218,6 +1796,606 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thread_episodic_vector_disable_refill_cleans_stale_projection_without_deleting_history()
+     {
+        let (crud_store, temp_dir, workspace_id) = setup_store().await;
+        let thread_id = "thread_vector_to_lexical_cleanup";
+        let turn_id = "turn_vector_to_lexical_cleanup";
+        let item_id = "item_vector_to_lexical_cleanup";
+        ingest_materialized_user_item(
+            crud_store.clone(),
+            workspace_id.as_str(),
+            thread_id,
+            turn_id,
+            item_id,
+            "vector to lexical cleanup keeps canonical history",
+        )
+        .await;
+        let orphan_vector_path = temp_dir
+            .path()
+            .join("thread_episodic")
+            .join("orphan_vector_projection")
+            .join("segment.mv2");
+        tokio::fs::create_dir_all(
+            orphan_vector_path
+                .parent()
+                .expect("orphan vector file should have parent directory"),
+        )
+        .await
+        .expect("orphan vector parent should be created");
+        tokio::fs::write(&orphan_vector_path, b"stale vectorized mv2")
+            .await
+            .expect("orphan vector file should be created");
+        let vector_target =
+            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_vector_search_config(
+                &GatewayThreadEpisodicVectorSearchConfig {
+                    enabled: true,
+                    provider: Some(GatewayThreadEpisodicVectorProviderConfig::OpenAi),
+                    model: Some("text-embedding-3-small".to_owned()),
+                    local_model: Some("bge-small-en-v1.5".to_owned()),
+                    embedding_dimension: Some(1536),
+                    embedding_normalized: true,
+                },
+            );
+        mark_refill_marker_with_target(
+            crud_store.as_ref(),
+            PROJECTION_META_STATUS_COMPLETE,
+            THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_VERSION,
+            &vector_target,
+        )
+        .await;
+
+        let disabled_config = GatewayThreadEpisodicVectorSearchConfig {
+            enabled: false,
+            ..GatewayThreadEpisodicVectorSearchConfig::default()
+        };
+        let stale_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::new(vec![
+            0.1, 0.2, 0.3,
+        ]));
+        let summary = refill_once_for_vector_search_config(
+            crud_store.clone(),
+            temp_dir.path(),
+            &disabled_config,
+            Some(stale_provider.clone()),
+        )
+        .await
+        .expect("disabled vector search should rebuild lexical projection");
+
+        assert!(!summary.skipped);
+        assert!(
+            summary.capsule_files_deleted >= 1,
+            "stale vector .mv2 files should be deleted"
+        );
+        assert_eq!(
+            stale_provider.calls(),
+            0,
+            "disabled vector search must not call the stale embedding provider"
+        );
+        assert!(!orphan_vector_path.exists());
+        let items = crud_store
+            .list_thread_episodic_items_for_thread(workspace_id.as_str(), thread_id, 10)
+            .await
+            .expect("rebuilt lexical items should list");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].status, ThreadEpisodicItemStatus::Active);
+        assert!(items[0].frame_id.is_some());
+        assert!(
+            crud_store
+                .get_turn_item(turn_id, item_id)
+                .await
+                .expect("canonical turn item lookup should succeed")
+                .is_some(),
+            "cleanup must not delete canonical turn history"
+        );
+        assert!(
+            refill_is_current(crud_store.as_ref())
+                .await
+                .expect("lexical marker should be current after refill")
+        );
+        assert!(
+            !refill_is_current_for_target(crud_store.as_ref(), &vector_target)
+                .await
+                .expect("old vector marker should no longer be current")
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_vector_refill_indexes_items_with_embedding_identity() {
+        let (crud_store, temp_dir, workspace_id) = setup_store().await;
+        let thread_id = "thread_vector_refill";
+        ingest_materialized_user_item(
+            crud_store.clone(),
+            workspace_id.as_str(),
+            thread_id,
+            "turn_vector_refill",
+            "item_vector_refill",
+            "vector refill should embed this workspace memory item",
+        )
+        .await;
+        let target = vector_projection_target(3);
+        let embedding_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::new(vec![
+            0.1, 0.2, 0.3,
+        ]));
+
+        let summary = refill_once_with_projection(
+            crud_store.clone(),
+            temp_dir.path(),
+            target.clone(),
+            Some(embedding_provider.clone()),
+        )
+        .await
+        .expect("vector refill should complete");
+
+        assert!(!summary.skipped);
+        assert_eq!(summary.refill_jobs_enqueued, 1);
+        assert_eq!(summary.completed_jobs, 1);
+        assert_eq!(embedding_provider.calls(), 1);
+        assert!(
+            refill_is_current_for_target(crud_store.as_ref(), &target)
+                .await
+                .expect("vector marker should be current")
+        );
+
+        let items = crud_store
+            .list_thread_episodic_items_for_thread(workspace_id.as_str(), thread_id, 10)
+            .await
+            .expect("items should list");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].status, ThreadEpisodicItemStatus::Active);
+        assert!(items[0].frame_id.is_some());
+        assert!(
+            items[0]
+                .frame_uri
+                .as_deref()
+                .expect("frame uri should be persisted")
+                .starts_with("mv2://workspace/")
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_vector_refill_retryable_embedding_failure_does_not_complete_marker() {
+        let (crud_store, temp_dir, workspace_id) = setup_store().await;
+        let thread_id = "thread_vector_refill_retryable";
+        ingest_materialized_user_item(
+            crud_store.clone(),
+            workspace_id.as_str(),
+            thread_id,
+            "turn_vector_refill_retryable",
+            "item_vector_refill_retryable",
+            "vector refill provider failure should leave refill incomplete",
+        )
+        .await;
+        let target = vector_projection_target(3);
+        let embedding_provider =
+            Arc::new(StaticThreadEpisodicEmbeddingProvider::retryable_failure());
+
+        let error = refill_once_with_projection(
+            crud_store.clone(),
+            temp_dir.path(),
+            target.clone(),
+            Some(embedding_provider.clone()),
+        )
+        .await
+        .expect_err("retryable embedding failure should fail refill");
+
+        assert!(
+            error
+                .to_string()
+                .contains("thread episodic workspace refill left"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(embedding_provider.calls(), 1);
+        assert!(
+            !refill_is_current_for_target(crud_store.as_ref(), &target)
+                .await
+                .expect("failed vector marker should not be current")
+        );
+        let meta = find_projection_meta(
+            &crud_store.database_connection(),
+            THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_KEY,
+        )
+        .await
+        .expect("meta query should succeed")
+        .expect("meta exists");
+        assert_eq!(meta.status, PROJECTION_META_STATUS_FAILED);
+
+        let jobs = crud_store
+            .list_thread_episodic_index_jobs_for_thread(workspace_id.as_str(), thread_id, 10)
+            .await
+            .expect("jobs should list");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].status, ThreadEpisodicIndexJobStatus::Failed);
+        assert!(jobs[0].attempt_count >= 1);
+        assert!(
+            jobs[0]
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("rate limited"))
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_vector_model_change_rebuilds_stale_projection() {
+        let (crud_store, temp_dir, workspace_id) = setup_store().await;
+        let thread_id = "thread_vector_model_change";
+        ingest_materialized_user_item(
+            crud_store.clone(),
+            workspace_id.as_str(),
+            thread_id,
+            "turn_vector_model_change",
+            "item_vector_model_change",
+            "vector model change should rebuild derived workspace capsules",
+        )
+        .await;
+        let old_config = vector_search_config(
+            GatewayThreadEpisodicVectorProviderConfig::OpenAi,
+            "text-embedding-3-large",
+            3072,
+        );
+        let old_target =
+            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_vector_search_config(
+                &old_config,
+            );
+        mark_refill_marker_with_target(
+            crud_store.as_ref(),
+            PROJECTION_META_STATUS_COMPLETE,
+            THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_VERSION,
+            &old_target,
+        )
+        .await;
+        let stale_segment_path = temp_dir
+            .path()
+            .join("thread_episodic")
+            .join("stale_model")
+            .join("segment.mv2");
+        tokio::fs::create_dir_all(
+            stale_segment_path
+                .parent()
+                .expect("stale segment should have parent directory"),
+        )
+        .await
+        .expect("stale segment parent should be created");
+        tokio::fs::write(&stale_segment_path, b"old vector segment")
+            .await
+            .expect("stale segment should be written");
+
+        let new_config = vector_search_config(
+            GatewayThreadEpisodicVectorProviderConfig::OpenAi,
+            "text-embedding-3-small",
+            3,
+        );
+        let new_target =
+            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_vector_search_config(
+                &new_config,
+            );
+        let embedding_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::new(vec![
+            0.1, 0.2, 0.3,
+        ]));
+
+        let summary = refill_once_for_vector_search_config(
+            crud_store.clone(),
+            temp_dir.path(),
+            &new_config,
+            Some(embedding_provider.clone()),
+        )
+        .await
+        .expect("changed model should rebuild vector projection");
+
+        assert!(!summary.skipped);
+        assert_eq!(summary.completed_jobs, 1);
+        assert_eq!(embedding_provider.calls(), 1);
+        assert!(
+            summary.capsule_files_deleted >= 1,
+            "old projection .mv2 files should be deleted"
+        );
+        assert!(!stale_segment_path.exists());
+        assert!(
+            refill_is_current_for_target(crud_store.as_ref(), &new_target)
+                .await
+                .expect("new target current check")
+        );
+        assert!(
+            !refill_is_current_for_target(crud_store.as_ref(), &old_target)
+                .await
+                .expect("old target current check")
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_vector_model_same_config_does_not_rebuild() {
+        let (crud_store, temp_dir, _workspace_id) = setup_store().await;
+        let config = vector_search_config(
+            GatewayThreadEpisodicVectorProviderConfig::OpenAi,
+            "text-embedding-3-small",
+            3,
+        );
+        let target =
+            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_vector_search_config(
+                &config,
+            );
+        mark_refill_marker_with_target(
+            crud_store.as_ref(),
+            PROJECTION_META_STATUS_COMPLETE,
+            THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_VERSION,
+            &target,
+        )
+        .await;
+        let embedding_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::new(vec![
+            0.1, 0.2, 0.3,
+        ]));
+
+        let summary = refill_once_for_vector_search_config(
+            crud_store,
+            temp_dir.path(),
+            &config,
+            Some(embedding_provider.clone()),
+        )
+        .await
+        .expect("same vector config should skip");
+
+        assert!(summary.skipped);
+        assert_eq!(embedding_provider.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_vector_model_change_openai_to_openrouter_rebuilds_projection() {
+        let (crud_store, temp_dir, workspace_id) = setup_store().await;
+        ingest_materialized_user_item(
+            crud_store.clone(),
+            workspace_id.as_str(),
+            "thread_vector_provider_change",
+            "turn_vector_provider_change",
+            "item_vector_provider_change",
+            "provider change should rebuild vector projection",
+        )
+        .await;
+        let openai_config = vector_search_config(
+            GatewayThreadEpisodicVectorProviderConfig::OpenAi,
+            "text-embedding-3-small",
+            3,
+        );
+        let openai_target =
+            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_vector_search_config(
+                &openai_config,
+            );
+        mark_refill_marker_with_target(
+            crud_store.as_ref(),
+            PROJECTION_META_STATUS_COMPLETE,
+            THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_VERSION,
+            &openai_target,
+        )
+        .await;
+        let openrouter_config = vector_search_config(
+            GatewayThreadEpisodicVectorProviderConfig::OpenRouter,
+            "openai/text-embedding-3-small",
+            3,
+        );
+        let openrouter_target =
+            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_vector_search_config(
+                &openrouter_config,
+            );
+        let embedding_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::with_identity(
+            "openrouter",
+            "openai/text-embedding-3-small",
+            vec![0.1, 0.2, 0.3],
+        ));
+
+        let summary = refill_once_for_vector_search_config(
+            crud_store.clone(),
+            temp_dir.path(),
+            &openrouter_config,
+            Some(embedding_provider),
+        )
+        .await
+        .expect("provider change should rebuild vector projection");
+
+        assert!(!summary.skipped);
+        assert_eq!(summary.completed_jobs, 1);
+        assert!(
+            refill_is_current_for_target(crud_store.as_ref(), &openrouter_target)
+                .await
+                .expect("openrouter target current check")
+        );
+        assert!(
+            !refill_is_current_for_target(crud_store.as_ref(), &openai_target)
+                .await
+                .expect("openai target current check")
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_vector_refill_rejects_provider_identity_mismatch() {
+        let (crud_store, temp_dir, _workspace_id) = setup_store().await;
+        let config = vector_search_config(
+            GatewayThreadEpisodicVectorProviderConfig::OpenRouter,
+            "openai/text-embedding-3-small",
+            3,
+        );
+        let wrong_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::new(vec![
+            0.1, 0.2, 0.3,
+        ]));
+
+        let error = refill_once_for_vector_search_config(
+            crud_store.clone(),
+            temp_dir.path(),
+            &config,
+            Some(wrong_provider),
+        )
+        .await
+        .expect_err("mismatched provider identity should fail before refill");
+
+        assert!(
+            error
+                .to_string()
+                .contains("provider identity does not match projection target")
+        );
+        assert!(
+            find_projection_meta(
+                &crud_store.database_connection(),
+                THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_KEY,
+            )
+            .await
+            .expect("meta query should succeed")
+            .is_none(),
+            "provider mismatch should fail before writing a refill marker"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "manual smoke: requires copied production DB and storage paths in env"]
+    async fn thread_episodic_vector_refill_smoke_on_copied_production_db() {
+        let Some(db_path) =
+            std::env::var_os("PIONEER_THREAD_EPISODIC_VECTOR_REFILL_SMOKE_DB").map(PathBuf::from)
+        else {
+            eprintln!("skipping smoke: PIONEER_THREAD_EPISODIC_VECTOR_REFILL_SMOKE_DB is not set");
+            return;
+        };
+        let Some(storage_root) =
+            std::env::var_os("PIONEER_THREAD_EPISODIC_VECTOR_REFILL_SMOKE_STORAGE_ROOT")
+                .map(PathBuf::from)
+        else {
+            eprintln!(
+                "skipping smoke: PIONEER_THREAD_EPISODIC_VECTOR_REFILL_SMOKE_STORAGE_ROOT is not set"
+            );
+            return;
+        };
+        assert_manual_smoke_path_is_not_production(&db_path, "smoke DB");
+        assert_manual_smoke_path_is_not_production(&storage_root, "smoke storage root");
+        assert!(
+            db_path.exists(),
+            "smoke DB must exist: {}",
+            db_path.display()
+        );
+        std::fs::create_dir_all(&storage_root).expect("smoke storage root should be creatable");
+
+        pioneer_sqlite::zstd::register_auto_extension_once()
+            .expect("sqlite-zstd extension should register");
+        let database_url = pioneer_sqlite::sqlite_connection_url(db_path.as_path());
+        let connection = Database::connect(database_url.as_str())
+            .await
+            .expect("smoke DB should connect");
+        Migrator::up(&connection, None)
+            .await
+            .expect("smoke DB migrations should apply");
+        let quick_check_statement =
+            Statement::from_string(DatabaseBackend::Sqlite, "PRAGMA quick_check;".to_owned());
+        let quick_check = connection
+            .query_one_raw(quick_check_statement)
+            .await
+            .expect("quick_check query should succeed")
+            .expect("quick_check should return a row")
+            .try_get_by_index::<String>(0)
+            .expect("quick_check row should decode");
+        assert_eq!(quick_check, "ok");
+        let unsafe_storage_uri_statement = Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "SELECT COUNT(*) FROM thread_episodic_capsules WHERE storage_uri LIKE 'file://%/.pioneer/memory/%';"
+                .to_owned(),
+        );
+        let unsafe_storage_uri_count = connection
+            .query_one_raw(unsafe_storage_uri_statement)
+            .await
+            .expect("unsafe storage uri query should succeed")
+            .expect("unsafe storage uri query should return a row")
+            .try_get_by_index::<i64>(0)
+            .expect("unsafe storage uri count should decode");
+        assert_eq!(
+            unsafe_storage_uri_count, 0,
+            "smoke DB still points at production memory; rewrite copied storage_uri rows to a scratch storage root before running refill"
+        );
+
+        let crud_store = Arc::new(CrudStore::new(connection));
+        let workspace_ids = crud_store
+            .list_thread_episodic_refill_workspace_ids()
+            .await
+            .expect("smoke workspace ids should list");
+        assert!(
+            !workspace_ids.is_empty(),
+            "copied production DB should contain refill workspaces"
+        );
+
+        let vector_config = GatewayThreadEpisodicVectorSearchConfig {
+            enabled: true,
+            provider: Some(GatewayThreadEpisodicVectorProviderConfig::OpenRouter),
+            model: Some("smoke/test-embedding".to_owned()),
+            local_model: Some("bge-small-en-v1.5".to_owned()),
+            embedding_dimension: Some(3),
+            embedding_normalized: true,
+        };
+        let projection_target =
+            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_vector_search_config(
+                &vector_config,
+            );
+        let embedding_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::with_identity(
+            "openrouter",
+            "smoke/test-embedding",
+            vec![0.57735026, 0.57735026, 0.57735026],
+        ));
+
+        let summary = refill_once_for_vector_search_config(
+            crud_store.clone(),
+            storage_root.as_path(),
+            &vector_config,
+            Some(embedding_provider),
+        )
+        .await
+        .expect("copied production DB vector refill should complete");
+
+        assert!(!summary.lock_contended);
+        assert_eq!(summary.source_threads_failed, 0);
+        assert_eq!(summary.failed_retryable_jobs, 0);
+        assert_eq!(summary.failed_terminal_jobs, 0);
+        assert_eq!(summary.incomplete_jobs, 0);
+        assert_eq!(
+            crud_store
+                .count_incomplete_thread_episodic_index_jobs()
+                .await
+                .expect("incomplete jobs should count"),
+            0
+        );
+        assert!(
+            refill_is_current_for_target(crud_store.as_ref(), &projection_target)
+                .await
+                .expect("vector projection current check should succeed")
+        );
+        let meta = find_projection_meta(
+            &crud_store.database_connection(),
+            THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_KEY,
+        )
+        .await
+        .expect("projection meta query should succeed")
+        .expect("projection meta should exist");
+        assert_eq!(
+            meta.projection_config_hash.as_deref(),
+            Some(projection_target.config_hash.as_str())
+        );
+
+        for workspace_id in workspace_ids {
+            let capsules = crud_store
+                .list_thread_episodic_workspace_capsules(workspace_id.as_str(), 100)
+                .await
+                .expect("workspace capsules should list");
+            assert!(
+                capsules
+                    .iter()
+                    .any(|capsule| capsule.status == ThreadEpisodicCapsuleStatus::Active),
+                "workspace {workspace_id} should have active vector-refilled capsules"
+            );
+            for capsule in capsules {
+                if let (Some(size_bytes), Some(capacity_bytes)) =
+                    (capsule.size_bytes, capsule.capacity_bytes)
+                {
+                    assert!(
+                        size_bytes <= capacity_bytes,
+                        "capsule {} exceeds configured capacity: {size_bytes} > {capacity_bytes}",
+                        capsule.id
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn thread_episodic_workspace_refill_rebuilds_workspace_capsule_from_database() {
         let (crud_store, temp_dir, workspace_id) = setup_store().await;
         let thread_a = "thread_refill_a";
@@ -1377,8 +2555,23 @@ mod tests {
     }
 
     async fn mark_refill_marker(crud_store: &CrudStore, status: &str, version: i64) {
+        mark_refill_marker_with_target(
+            crud_store,
+            status,
+            version,
+            &ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only(),
+        )
+        .await;
+    }
+
+    async fn mark_refill_marker_with_target(
+        crud_store: &CrudStore,
+        status: &str,
+        version: i64,
+        projection_target: &ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget,
+    ) {
         let now = now_datetime();
-        upsert_projection_meta(
+        upsert_projection_meta_with_config(
             &crud_store.database_connection(),
             ProjectionMetaRecord {
                 projection_key: THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_KEY.to_owned(),
@@ -1394,9 +2587,60 @@ mod tests {
                 created_at: now,
                 updated_at: now,
             },
+            projection_target.meta_config_record(),
         )
         .await
         .expect("marker should upsert");
+    }
+
+    fn assert_manual_smoke_path_is_not_production(path: &Path, label: &str) {
+        if std::env::var_os("PIONEER_THREAD_EPISODIC_VECTOR_REFILL_SMOKE_ALLOW_ANY_PATH").is_some()
+        {
+            return;
+        }
+
+        let normalized = path.to_string_lossy().replace('\\', "/");
+        assert!(
+            !normalized.ends_with("/.pioneer/gateway.db")
+                && !normalized.contains("/.pioneer/memory"),
+            "{label} must point to an isolated copy, not production: {}",
+            path.display()
+        );
+        assert!(
+            normalized.contains("/.worktrees/")
+                || normalized.contains("/.scratch/")
+                || normalized.contains("/tmp/")
+                || normalized.contains("/var/folders/"),
+            "{label} must live in a worktree/scratch/temp path unless PIONEER_THREAD_EPISODIC_VECTOR_REFILL_SMOKE_ALLOW_ANY_PATH=1 is set: {}",
+            path.display()
+        );
+    }
+
+    fn vector_projection_target(
+        dimension: u32,
+    ) -> ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget {
+        ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_vector_search_config(
+            &vector_search_config(
+                GatewayThreadEpisodicVectorProviderConfig::OpenAi,
+                "text-embedding-3-small",
+                dimension,
+            ),
+        )
+    }
+
+    fn vector_search_config(
+        provider: GatewayThreadEpisodicVectorProviderConfig,
+        model: &str,
+        dimension: u32,
+    ) -> GatewayThreadEpisodicVectorSearchConfig {
+        GatewayThreadEpisodicVectorSearchConfig {
+            enabled: true,
+            provider: Some(provider),
+            model: Some(model.to_owned()),
+            local_model: Some("bge-small-en-v1.5".to_owned()),
+            embedding_dimension: Some(dimension),
+            embedding_normalized: true,
+        }
     }
 
     async fn ingest_materialized_user_item(
