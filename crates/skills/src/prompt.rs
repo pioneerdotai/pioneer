@@ -94,7 +94,7 @@ pub fn build_skill_prompt(active: &[ResolvedSkill], budget: SkillPromptBudget) -
     }
 
     if text.len() < max_chars {
-        let footer = "\nWhen a skill is relevant, call `read_skill` with the exact `Skill slug for read_skill` value before executing specialized actions. Do not use the display name alone. `read_skill` returns `skill_asset_root`; resolve relative file paths from the skill body under that directory and prefer absolute paths built from `skill_asset_root`. Then follow its instructions";
+        let footer = "\nWhen a skill is relevant, call `read_skill` with the exact `Skill slug for read_skill` value before executing specialized actions. Do not use the display name alone. `read_skill` returns `skill_asset_root`; resolve relative file paths from the skill body under that directory and prefer absolute paths built from `skill_asset_root`. Skill runtime tools remain subject to the current turn permissions and sandbox. Then follow its instructions";
         if text.len() + footer.len() <= max_chars {
             text.push_str(footer);
         }
@@ -281,6 +281,24 @@ mod tests {
         );
         assert!(built.text.contains("Skill asset root: `/tmp/weather`"));
         assert!(!built.text.contains("/tmp/weather/SKILL.md"));
+    }
+
+    #[test]
+    fn skill_prompt_policy_footer_mentions_current_turn_permissions() {
+        let active = vec![resolved("weather", "Get weather forecasts.")];
+
+        let built = build_skill_prompt(
+            active.as_slice(),
+            SkillPromptBudget {
+                max_chars: 2_000,
+                compact_mode_threshold: 6,
+                include_read_skill_hint: true,
+            },
+        );
+
+        assert!(built.text.contains(
+            "Skill runtime tools remain subject to the current turn permissions and sandbox"
+        ));
     }
 
     #[test]
