@@ -52,6 +52,12 @@ pub struct ProjectionMetaRecord {
     pub updated_at: DateTimeWithTimeZone,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectionMetaConfigRecord {
+    pub projection_config_hash: Option<String>,
+    pub projection_config_json: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThreadTimelineBlockRecord {
     pub block_id: String,
@@ -125,6 +131,14 @@ pub async fn upsert_projection_meta<C: ConnectionTrait>(
     db: &C,
     record: ProjectionMetaRecord,
 ) -> Result<()> {
+    upsert_projection_meta_with_config(db, record, ProjectionMetaConfigRecord::default()).await
+}
+
+pub async fn upsert_projection_meta_with_config<C: ConnectionTrait>(
+    db: &C,
+    record: ProjectionMetaRecord,
+    config: ProjectionMetaConfigRecord,
+) -> Result<()> {
     thread_timeline_projection_meta::Entity::insert(thread_timeline_projection_meta::ActiveModel {
         projection_key: Set(record.projection_key),
         projection_version: Set(record.projection_version),
@@ -133,6 +147,8 @@ pub async fn upsert_projection_meta<C: ConnectionTrait>(
         source_turn_count: Set(record.source_turn_count),
         source_turn_item_count: Set(record.source_turn_item_count),
         source_turn_event_count: Set(record.source_turn_event_count),
+        projection_config_hash: Set(config.projection_config_hash),
+        projection_config_json: Set(config.projection_config_json),
         last_error: Set(record.last_error),
         backfill_started_at: Set(record.backfill_started_at),
         backfilled_at: Set(record.backfilled_at),
@@ -148,6 +164,8 @@ pub async fn upsert_projection_meta<C: ConnectionTrait>(
                 thread_timeline_projection_meta::Column::SourceTurnCount,
                 thread_timeline_projection_meta::Column::SourceTurnItemCount,
                 thread_timeline_projection_meta::Column::SourceTurnEventCount,
+                thread_timeline_projection_meta::Column::ProjectionConfigHash,
+                thread_timeline_projection_meta::Column::ProjectionConfigJson,
                 thread_timeline_projection_meta::Column::LastError,
                 thread_timeline_projection_meta::Column::BackfillStartedAt,
                 thread_timeline_projection_meta::Column::BackfilledAt,
