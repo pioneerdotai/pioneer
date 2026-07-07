@@ -4259,10 +4259,22 @@ impl MessageProcessor {
                 .context("failed to serialize expired CLI runtime request resolution")?,
         );
         let now = cli_runtime_request_timestamp();
-        let expired = self
-            .crud_store
-            .expire_cli_runtime_pending_request(request.request_id.as_str(), response_json, now)
-            .await?;
+        let expire_result = {
+            let crud_store = self.crud_store.clone();
+            let request_id = request.request_id.clone();
+            message_fresh_task(async move {
+                crud_store
+                    .expire_cli_runtime_pending_request(request_id.as_str(), response_json, now)
+                    .await
+            })
+            .await
+        };
+        let expired = match expire_result {
+            Ok(result) => result,
+            Err(error) => Err(anyhow::anyhow!(
+                "CLI runtime pending request expiration task failed: {error}"
+            )),
+        }?;
         if let Some(expired) = expired.as_ref() {
             self.emit_cli_runtime_request_resolved(expired.clone(), resolution.clone())
                 .await;

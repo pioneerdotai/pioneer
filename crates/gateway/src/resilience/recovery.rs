@@ -616,6 +616,7 @@ enum RestoredRecoveryTurnUnavailable {
     TurnNotFound,
     TurnNotInProgress,
     MissingRuntimeSnapshot,
+    MissingExecutionSecuritySnapshot,
     SnapshotMismatch,
     SnapshotInvalid { error: String },
 }
@@ -625,6 +626,10 @@ impl RestoredRecoveryTurnUnavailable {
         match self {
             Self::MissingRuntimeSnapshot => Some(
                 "cannot restore recovery after agent loop loss because durable turn runtime snapshot is missing"
+                    .to_owned(),
+            ),
+            Self::MissingExecutionSecuritySnapshot => Some(
+                "cannot restore recovery after agent loop loss because durable turn execution security snapshot is missing"
                     .to_owned(),
             ),
             Self::SnapshotMismatch => Some(
@@ -2114,6 +2119,25 @@ impl RecoveryCoordinator {
             match crate::turn_runtime_snapshot::restored_recovery_turn_request_from_snapshot(
                 &snapshot,
                 turn.permission_profile,
+                match self
+                    .crud_store
+                    .get_turn_execution_security_snapshot(turn_id)
+                    .await
+                {
+                    Ok(Some(security_snapshot)) => security_snapshot.snapshot,
+                    Ok(None) => {
+                        return Ok(RestoredRecoveryTurnRequestLookup::Unavailable(
+                            RestoredRecoveryTurnUnavailable::MissingExecutionSecuritySnapshot,
+                        ));
+                    }
+                    Err(error) => {
+                        return Ok(RestoredRecoveryTurnRequestLookup::Unavailable(
+                            RestoredRecoveryTurnUnavailable::SnapshotInvalid {
+                                error: format!("{error:#}"),
+                            },
+                        ));
+                    }
+                },
             ) {
                 Ok(request) => request,
                 Err(error) => {
@@ -2781,9 +2805,11 @@ mod tests {
         ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus, ToolCallStatus,
         ToolDisplayPayload, ToolOutputPolicySnapshot, ToolRecoveryIdempotencyMode,
         ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass, ToolStoragePayload, TurnCapability,
-        TurnCapabilityKind, TurnCompletedNotification, TurnItem, TurnItemTimeoutReason,
+        TurnCapabilityKind, TurnCompletedNotification, TurnExecutionSecuritySnapshot,
+        TurnFilesystemAccess, TurnFilesystemSandboxEntry, TurnItem, TurnItemTimeoutReason,
         TurnItemType, TurnPermissionMode, TurnPermissionProfileSnapshot,
-        TurnPermissionProfileSource, TurnStatus, UserInput, build_execution_checkpoint_payload,
+        TurnPermissionProfileSource, TurnSandboxMode, TurnStatus, UserInput,
+        build_execution_checkpoint_payload,
     };
     use pioneer_provider::{
         ChatMessage, InputContentType, MessageAttachment, ProviderRegistry, providers::EchoProvider,
@@ -3126,6 +3152,16 @@ mod tests {
         thread_id: &str,
         turn_id: &str,
     ) {
+        persist_test_runtime_snapshot_only(crud_store, workspace_id, thread_id, turn_id).await;
+        persist_test_execution_security_snapshot(crud_store, thread_id, turn_id).await;
+    }
+
+    async fn persist_test_runtime_snapshot_only(
+        crud_store: &CrudStore,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+    ) {
         let mut workspace_skill_policies = HashMap::new();
         workspace_skill_policies.insert(
             SkillPolicyKey::new("writer", "user"),
@@ -3185,6 +3221,38 @@ mod tests {
             .expect("runtime snapshot should persist");
     }
 
+    async fn persist_test_execution_security_snapshot(
+        crud_store: &CrudStore,
+        thread_id: &str,
+        turn_id: &str,
+    ) {
+        let (_, turn) = crud_store
+            .get_turn(thread_id, turn_id)
+            .await
+            .expect("turn should load for security snapshot")
+            .expect("turn should exist for security snapshot");
+        let snapshot = test_execution_security_snapshot(turn.permission_profile);
+        crud_store
+            .set_turn_execution_security_snapshot(turn_id, &snapshot)
+            .await
+            .expect("security snapshot should persist");
+    }
+
+    fn test_execution_security_snapshot(
+        permission_profile: TurnPermissionProfileSnapshot,
+    ) -> TurnExecutionSecuritySnapshot {
+        let workspace_root = "/tmp/pioneer-recovery-security";
+        TurnExecutionSecuritySnapshot::workspace_write(
+            permission_profile,
+            workspace_root,
+            vec![TurnFilesystemSandboxEntry::workspace_root(
+                TurnFilesystemAccess::Write,
+                workspace_root,
+            )],
+            1_700_000_000_000,
+        )
+    }
+
     #[tokio::test]
     async fn restored_recovery_turn_request_uses_runtime_snapshot() {
         let (crud_store, coordinator) = setup_coordinator().await;
@@ -3233,6 +3301,14 @@ mod tests {
         );
         assert_eq!(restored.history.len(), 2);
         assert_eq!(restored.permission_profile, permission_profile);
+        let security_snapshot = restored
+            .execution_security_snapshot
+            .expect("restored request should carry persisted security snapshot");
+        assert_eq!(security_snapshot.permission_profile, permission_profile);
+        assert_eq!(
+            security_snapshot.sandbox.mode,
+            TurnSandboxMode::WorkspaceWrite
+        );
     }
 
     #[tokio::test]
@@ -3335,6 +3411,7 @@ mod tests {
             })
             .await
             .expect("invalid runtime snapshot should persist");
+        persist_test_execution_security_snapshot(crud_store.as_ref(), thread_id, turn_id).await;
         let window = crud_store
             .create_turn_execution_window(
                 NewTurnExecutionWindowRecord {
@@ -3364,6 +3441,65 @@ mod tests {
             lookup,
             super::RestoredRecoveryTurnRequestLookup::Unavailable(
                 super::RestoredRecoveryTurnUnavailable::SnapshotInvalid { .. }
+            )
+        ));
+
+        let still_running = crud_store
+            .get_turn_execution_window(window.id.as_str())
+            .await
+            .expect("window read should succeed")
+            .expect("window should exist");
+        assert_eq!(still_running.status, ExecutionWindowStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn restored_recovery_turn_request_rejects_missing_security_snapshot() {
+        let (crud_store, coordinator) = setup_coordinator().await;
+        let workspace_id = "ws_restore_missing_security";
+        let thread_id = "thr_restore_missing_security";
+        let turn_id = "turn_restore_missing_security";
+        materialize_turn_with_tool_item(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            "tool_restore_missing_security",
+            None,
+        )
+        .await;
+        persist_test_runtime_snapshot_only(crud_store.as_ref(), workspace_id, thread_id, turn_id)
+            .await;
+
+        let timestamp = chrono::Utc::now().fixed_offset();
+        let window = crud_store
+            .create_turn_execution_window(
+                NewTurnExecutionWindowRecord {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    window_index: 1,
+                    status: ExecutionWindowStatus::Running,
+                    exhaustion_reason: None,
+                    agent_round_count: 1,
+                    tool_call_count: 1,
+                    provider_token_count: 0,
+                    metadata_json: serde_json::json!({"runtimeWindowId": "stale_window_1"}),
+                    started_at: timestamp,
+                },
+                timestamp,
+                timestamp,
+            )
+            .await
+            .expect("running window should persist");
+
+        let lookup = coordinator
+            .restored_recovery_turn_request(thread_id, turn_id, 1_700_000_010)
+            .await
+            .expect("restored request lookup should evaluate");
+        assert!(matches!(
+            lookup,
+            super::RestoredRecoveryTurnRequestLookup::Unavailable(
+                super::RestoredRecoveryTurnUnavailable::MissingExecutionSecuritySnapshot
             )
         ));
 

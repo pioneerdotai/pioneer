@@ -124,7 +124,7 @@ use pioneer_provider::{
 use pioneer_skills::SkillTrustLevel;
 use pioneer_tools::{
     BuiltinTools, ComputerUseToolsConfig, RawToolCall, ToolError, ToolLoopBudgetConfig,
-    ToolRetryBudgetConfig, WebToolsConfig, build_tools,
+    ToolRetryBudgetConfig, WebToolsConfig, build_tools_with_environment_and_security_snapshot,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, Query};
@@ -154,6 +154,14 @@ fn test_tools_permission_context(turn_id: &str) -> pioneer_tools::PermissionEval
         "thread_test",
         turn_id,
         default_test_permission_profile(),
+    )
+}
+
+fn test_full_access_execution_security_snapshot() -> pioneer_protocol::TurnExecutionSecuritySnapshot
+{
+    pioneer_protocol::TurnExecutionSecuritySnapshot::unrestricted_full_access(
+        std::env::temp_dir().display().to_string(),
+        1,
     )
 }
 
@@ -378,6 +386,188 @@ fn test_cli_runtime_manager(
         )
         .expect("CLI runtime manager should build"),
     )
+}
+
+struct CliRuntimeSecurityHarness {
+    rx: mpsc::Receiver<Message>,
+    connection_id: ConnectionId,
+    thread_manager: Arc<ThreadManager>,
+    crud_store: Arc<CrudStore>,
+    workspace_id: String,
+    cli_session: Arc<RecordingCliRuntimeSession>,
+    processor: MessageProcessor,
+}
+
+async fn setup_cli_runtime_security_harness() -> CliRuntimeSecurityHarness {
+    let (tx, rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let processor = MessageProcessor::new(
+        thread_manager.clone(),
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_cli_runtime_manager_for_tests(test_cli_runtime_manager(cli_session.clone()));
+
+    CliRuntimeSecurityHarness {
+        rx,
+        connection_id,
+        thread_manager,
+        crud_store,
+        workspace_id,
+        cli_session,
+        processor,
+    }
+}
+
+async fn seed_cli_runtime_security_thread(
+    harness: &CliRuntimeSecurityHarness,
+    thread_id: &str,
+    name: &str,
+    model: &str,
+    model_provider: &str,
+    sandbox: Option<SandboxMode>,
+) {
+    harness
+        .thread_manager
+        .thread_start(
+            harness.connection_id,
+            harness.workspace_id.clone(),
+            ThreadStartParams {
+                thread_id: thread_id.to_owned(),
+                workspace_id: harness.workspace_id.clone(),
+                name: Some(name.to_owned()),
+                model: Some(model.to_owned()),
+                model_provider: Some(model_provider.to_owned()),
+                sandbox,
+                mode: Some(ThreadMode::Agent),
+                origin_kind: None,
+                sidebar_visibility: None,
+                agent_nickname: None,
+                agent_role: None,
+            },
+        )
+        .await
+        .expect("thread/start should seed CLI runtime security regression thread");
+}
+
+fn cli_runtime_execution_backend(runtime_id: &str, runtime_kind: CLIAgentRuntimeKind) -> JsonValue {
+    serde_json::to_value(AgentExecutionBackend::CLIAgentRuntime {
+        runtime_id: runtime_id.to_owned(),
+        runtime_kind,
+    })
+    .expect("execution backend should serialize")
+}
+
+fn cli_runtime_turn_start_request(
+    request_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    execution_backend: JsonValue,
+    permission_mode: &str,
+    text: &str,
+    cli_runtime_options: Option<JsonValue>,
+) -> String {
+    let mut params = json!({
+        "thread_id": thread_id,
+        "turn_id": turn_id,
+        "execution_backend": execution_backend,
+        "permission_profile": {
+            "mode": permission_mode
+        },
+        "input": [{
+            "type": "text",
+            "text": text
+        }]
+    });
+    if let Some(options) = cli_runtime_options {
+        params["cli_runtime_options"] = options;
+    }
+    json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "turn/start",
+        "params": params
+    })
+    .to_string()
+}
+
+async fn process_cli_runtime_turn_start(
+    harness: &CliRuntimeSecurityHarness,
+    turn_start_request: &str,
+) {
+    harness
+        .processor
+        .process_request(harness.connection_id, turn_start_request)
+        .await;
+}
+
+async fn assert_cli_runtime_start_sandbox_none(
+    cli_session: &RecordingCliRuntimeSession,
+    expected_approval_policy: &str,
+) {
+    let thread_starts = cli_session.thread_starts.lock().await;
+    assert_eq!(thread_starts.len(), 1);
+    assert_eq!(
+        thread_starts[0].approval_policy.as_deref(),
+        Some(expected_approval_policy)
+    );
+    assert!(thread_starts[0].sandbox.is_none());
+    drop(thread_starts);
+
+    let turn_start = wait_for_recorded_cli_runtime_turn_start(cli_session).await;
+    assert_eq!(
+        turn_start.approval_policy.as_deref(),
+        Some(expected_approval_policy)
+    );
+    assert!(turn_start.sandbox.is_none());
+}
+
+async fn wait_for_recorded_cli_runtime_turn_start(
+    cli_session: &RecordingCliRuntimeSession,
+) -> CLIAgentRuntimeTurnStartParams {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(turn_start) = cli_session.turn_starts.lock().await.first().cloned() {
+                return turn_start;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("CLI runtime turn/start should be recorded")
+}
+
+async fn load_persisted_security_snapshot(
+    crud_store: &CrudStore,
+    turn_id: &str,
+) -> pioneer_protocol::TurnExecutionSecuritySnapshot {
+    load_persisted_security_snapshot_record(crud_store, turn_id)
+        .await
+        .snapshot
+}
+
+async fn load_persisted_security_snapshot_record(
+    crud_store: &CrudStore,
+    turn_id: &str,
+) -> pioneer_crud::TurnExecutionSecuritySnapshotRecord {
+    crud_store
+        .get_turn_execution_security_snapshot(turn_id)
+        .await
+        .expect("security snapshot lookup should succeed")
+        .expect("CLI runtime turn should persist security snapshot")
 }
 
 fn thread_episodic_committed_item(
@@ -2123,6 +2313,20 @@ fn test_task_create_params(
             permission_cap: Some(pioneer_protocol::task_permission_cap_from_snapshot(
                 &pioneer_protocol::default_turn_permission_profile_snapshot(),
             )),
+            security_cap: Some(pioneer_protocol::TaskAgentSecurityCap {
+                max_permission_profile: pioneer_protocol::task_permission_cap_from_snapshot(
+                    &pioneer_protocol::default_turn_permission_profile_snapshot(),
+                ),
+                max_filesystem_entries: vec![
+                    pioneer_protocol::TurnFilesystemSandboxEntry::workspace_root(
+                        pioneer_protocol::TurnFilesystemAccess::Write,
+                        "/tmp/pioneer-message-tests",
+                    ),
+                ],
+                max_network_policy: pioneer_protocol::TurnNetworkPolicySnapshot::enabled(),
+                max_sandbox_mode: pioneer_protocol::TurnSandboxMode::Unrestricted,
+                max_process_policy: pioneer_protocol::TurnProcessPolicySnapshot::unrestricted(),
+            }),
             result_contract: None,
             review_policy: None,
             depth: 0,
@@ -2158,6 +2362,7 @@ async fn create_task_for_test(
     processor: &Arc<MessageProcessor>,
     params: TaskCreateParams,
 ) -> anyhow::Result<pioneer_protocol::TaskCreateResponse> {
+    ensure_task_create_parent_turn_for_test(processor, &params).await?;
     message_future(
         processor
             .task_runtime
@@ -2166,6 +2371,83 @@ async fn create_task_for_test(
     )
     .await
     .map_err(|error| anyhow::anyhow!("{error:#}"))
+}
+
+async fn ensure_task_create_parent_turn_for_test(
+    processor: &Arc<MessageProcessor>,
+    params: &TaskCreateParams,
+) -> anyhow::Result<()> {
+    let Some(parent_thread_id) = params.created_by_thread_id.as_deref() else {
+        return Ok(());
+    };
+    let Some(parent_turn_id) = params.created_by_turn_id.as_deref() else {
+        return Ok(());
+    };
+
+    if processor
+        .crud_store
+        .get_turn(parent_thread_id, parent_turn_id)
+        .await?
+        .is_none()
+    {
+        let thread = Thread {
+            workspace_id: params.workspace_id.clone(),
+            id: parent_thread_id.to_owned(),
+            name: None,
+            preview: String::new(),
+            mode: ThreadMode::Agent,
+            model: "test-model".to_owned(),
+            model_provider: "openai".to_owned(),
+            reasoning_effort: None,
+            created_at: 1,
+            updated_at: 1,
+            status: ThreadStatus::Active,
+            origin_kind: ThreadOriginKind::User,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            turns: Vec::new(),
+        };
+        let turn = Turn {
+            id: parent_turn_id.to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: TurnOrigin::User,
+            error: None,
+            prompt_manifest: None,
+            permission_profile: default_test_permission_profile(),
+        };
+        processor
+            .crud_store
+            .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[])
+            .await?;
+    }
+
+    if processor
+        .crud_store
+        .get_turn_execution_security_snapshot(parent_turn_id)
+        .await?
+        .is_none()
+    {
+        let updated = processor
+            .crud_store
+            .set_turn_execution_security_snapshot(
+                parent_turn_id,
+                &pioneer_protocol::TurnExecutionSecuritySnapshot::unrestricted_full_access(
+                    "/tmp/pioneer-message-tests",
+                    1,
+                ),
+            )
+            .await?;
+        if !updated {
+            anyhow::bail!(
+                "failed to persist parent execution security snapshot for test turn `{}`",
+                parent_turn_id
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn review_enabled_task_runtime_config() -> pioneer_tasks::TaskRuntimeConfig {
@@ -2204,7 +2486,12 @@ fn review_enabled_processor(
             .join("capsules"),
         pioneer_config::GatewayArtifactsConfig::default(),
         review_enabled_task_runtime_config(),
-        crate::thread_episodic::ThreadEpisodicRuntimeConfig::default(),
+        crate::thread_episodic::ThreadEpisodicRuntimeConfig {
+            enabled: false,
+            indexing_enabled: false,
+            recall_enabled: false,
+            ..crate::thread_episodic::ThreadEpisodicRuntimeConfig::default()
+        },
         super::MessageProcessorResilienceConfig::default(),
     ))
 }
@@ -13376,6 +13663,208 @@ async fn turn_start_without_execution_backend_uses_api_provider_path() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_start_security_snapshot_native_turn_is_persisted_before_dispatch() {
+    let (tx, _rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = MessageProcessor::new(
+        thread_manager.clone(),
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+
+    thread_manager
+        .thread_start(
+            connection_id,
+            workspace_id.clone(),
+            ThreadStartParams {
+                thread_id: "thread_security_native".to_owned(),
+                workspace_id,
+                name: Some("Security snapshot native".to_owned()),
+                model: Some("o4-mini".to_owned()),
+                model_provider: Some("openai".to_owned()),
+                sandbox: Some(SandboxMode::FullAccess),
+                mode: Some(ThreadMode::Agent),
+                origin_kind: None,
+                sidebar_visibility: None,
+                agent_nickname: None,
+                agent_role: None,
+            },
+        )
+        .await
+        .expect("thread/start should seed native security snapshot thread");
+    processor
+        .prepare_api_provider_turn_start(
+            connection_id,
+            pioneer_protocol::TurnStartParams {
+                thread_id: "thread_security_native".to_owned(),
+                turn_id: "turn_security_native".to_owned(),
+                input: vec![UserInput::Text {
+                    text: "edit workspace file".to_owned(),
+                    text_elements: Vec::new(),
+                }],
+                capabilities: Vec::new(),
+                model: None,
+                model_provider: None,
+                sandbox_policy: None,
+                mode: None,
+                execution_backend: None,
+                reasoning: None,
+                permission_profile: Some(pioneer_protocol::TurnPermissionProfileSelection {
+                    mode: pioneer_protocol::TurnPermissionMode::AutoAcceptEdits,
+                }),
+                cli_runtime_options: None,
+            },
+            None,
+        )
+        .await
+        .expect("native turn/start preparation should succeed");
+
+    let persisted = crud_store
+        .get_turn_execution_security_snapshot("turn_security_native")
+        .await
+        .expect("security snapshot lookup should succeed")
+        .expect("native turn should persist security snapshot");
+    assert_eq!(persisted.version, 1);
+    assert_eq!(
+        persisted.snapshot.permission_profile.mode,
+        pioneer_protocol::TurnPermissionMode::AutoAcceptEdits
+    );
+    assert_eq!(
+        persisted.snapshot.sandbox.mode,
+        pioneer_protocol::TurnSandboxMode::WorkspaceWrite
+    );
+    assert_eq!(
+        persisted.snapshot.backend.execution_backend,
+        pioneer_protocol::TurnSecurityExecutionBackendKind::Native
+    );
+    assert_eq!(
+        persisted.snapshot.enforcement,
+        pioneer_protocol::TurnSecurityEnforcementStatus::Active
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_start_security_audit_events_include_snapshot_reference() {
+    let (tx, _rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = MessageProcessor::new(
+        thread_manager.clone(),
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+    let thread_id = "thread_security_audit_native";
+    let turn_id = "turn_security_audit_native";
+
+    thread_manager
+        .thread_start(
+            connection_id,
+            workspace_id.clone(),
+            ThreadStartParams {
+                thread_id: thread_id.to_owned(),
+                workspace_id,
+                name: Some("Security audit native".to_owned()),
+                model: Some("o4-mini".to_owned()),
+                model_provider: Some("openai".to_owned()),
+                sandbox: Some(SandboxMode::FullAccess),
+                mode: Some(ThreadMode::Agent),
+                origin_kind: None,
+                sidebar_visibility: None,
+                agent_nickname: None,
+                agent_role: None,
+            },
+        )
+        .await
+        .expect("thread/start should seed native security audit thread");
+    processor
+        .prepare_api_provider_turn_start(
+            connection_id,
+            pioneer_protocol::TurnStartParams {
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                input: vec![UserInput::Text {
+                    text: "audit workspace security".to_owned(),
+                    text_elements: Vec::new(),
+                }],
+                capabilities: Vec::new(),
+                model: None,
+                model_provider: None,
+                sandbox_policy: None,
+                mode: None,
+                execution_backend: None,
+                reasoning: None,
+                permission_profile: Some(pioneer_protocol::TurnPermissionProfileSelection {
+                    mode: pioneer_protocol::TurnPermissionMode::AutoAcceptEdits,
+                }),
+                cli_runtime_options: None,
+            },
+            None,
+        )
+        .await
+        .expect("native turn/start preparation should succeed");
+
+    let persisted = crud_store
+        .get_turn_execution_security_snapshot(turn_id)
+        .await
+        .expect("security snapshot lookup should succeed")
+        .expect("native turn should persist security snapshot");
+    let turn_items = crud_store
+        .get_turn_item_events(thread_id, turn_id)
+        .await
+        .expect("turn item events should load")
+        .expect("turn item events should exist");
+    let audit = turn_items
+        .events
+        .iter()
+        .find_map(|event| match &event.payload {
+            TurnItemEventPayload::TurnPermissionAudit(audit)
+                if audit.event_kind
+                    == pioneer_protocol::TurnPermissionAuditEventKind::SecuritySnapshotResolved =>
+            {
+                Some(audit)
+            }
+            _ => None,
+        })
+        .expect("turn/start should persist security snapshot audit");
+
+    assert_eq!(
+        audit.security_snapshot_id.as_deref(),
+        Some(persisted.snapshot.audit_id(turn_id).as_str())
+    );
+    assert_eq!(
+        audit.security_snapshot_version,
+        Some(persisted.version as u32)
+    );
+    assert_eq!(
+        audit.security_reason_code.as_deref(),
+        Some("snapshot_resolved")
+    );
+    assert_eq!(
+        audit.profile_mode,
+        pioneer_protocol::TurnPermissionMode::AutoAcceptEdits
+    );
+    assert!(audit.tool_name.is_none());
+    assert!(audit.request_key.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turn_start_cli_runtime_backend_disabled_errors_before_provider_dispatch() {
     let (tx, mut rx) = mpsc::channel(16);
     let session_manager = Arc::new(SessionManager::new());
@@ -13465,106 +13954,320 @@ async fn turn_start_cli_runtime_backend_disabled_errors_before_provider_dispatch
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn codex_cli_full_access_sets_unrestricted_provider_sandbox() {
-    let (tx, mut rx) = mpsc::channel(16);
-    let session_manager = Arc::new(SessionManager::new());
-    let connection_id = session_manager.register_connection(tx).await;
-    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
-    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-    session_manager
-        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
-        .await;
-    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
-    let processor = MessageProcessor::new(
-        thread_manager.clone(),
-        test_provider(),
-        session_manager,
-        workspace_manager,
-        crud_store,
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_context_budget(),
-        test_tool_loop_config(),
+#[tokio::test]
+async fn codex_cli_runtime_full_access_sets_danger_full_access_permissions_profile() {
+    let mut harness = setup_cli_runtime_security_harness().await;
+    seed_cli_runtime_security_thread(
+        &harness,
+        "thread_codex_full_access",
+        "Codex full access regression",
+        "o4-mini",
+        "openai",
+        Some(SandboxMode::FullAccess),
     )
-    .with_cli_runtime_manager_for_tests(test_cli_runtime_manager(cli_session.clone()));
+    .await;
 
-    thread_manager
-        .thread_start(
-            connection_id,
-            workspace_id.clone(),
-            ThreadStartParams {
-                thread_id: "thread_codex_full_access".to_owned(),
-                workspace_id: workspace_id.clone(),
-                name: Some("Codex full access regression".to_owned()),
-                model: Some("o4-mini".to_owned()),
-                model_provider: Some("openai".to_owned()),
-                sandbox: Some(SandboxMode::FullAccess),
-                mode: Some(ThreadMode::Agent),
-                origin_kind: None,
-                sidebar_visibility: None,
-                agent_nickname: None,
-                agent_role: None,
-            },
-        )
-        .await
-        .expect("thread/start should seed Codex full access regression thread");
-
-    let execution_backend = serde_json::to_value(AgentExecutionBackend::CLIAgentRuntime {
-        runtime_id: "codex".to_owned(),
-        runtime_kind: CLIAgentRuntimeKind::Codex,
-    })
-    .expect("execution backend should serialize");
     let turn_request_id = generate_test_request_id("codexfull", "turn");
-    processor
-        .process_request(
-            connection_id,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": turn_request_id,
-                "method": "turn/start",
-                "params": {
-                    "thread_id": "thread_codex_full_access",
-                    "turn_id": "turn_codex_full_access",
-                    "execution_backend": execution_backend,
-                    "permission_profile": {
-                        "mode": "full_access"
-                    },
-                    "input": [{
-                        "type": "text",
-                        "text": "install package over network"
-                    }]
-                }
-            })
-            .to_string(),
-        )
-        .await;
+    let turn_start_request = cli_runtime_turn_start_request(
+        turn_request_id.as_str(),
+        "thread_codex_full_access",
+        "turn_codex_full_access",
+        cli_runtime_execution_backend("codex", CLIAgentRuntimeKind::Codex),
+        "full_access",
+        "install package over network",
+        None,
+    );
+    process_cli_runtime_turn_start(&harness, turn_start_request.as_str()).await;
 
     let mut websocket_messages = Vec::new();
-    while let Ok(message) = rx.try_recv() {
+    while let Ok(message) = harness.rx.try_recv() {
         websocket_messages.push(format!("{message:?}"));
     }
 
-    let thread_starts = cli_session.thread_starts.lock().await;
+    let thread_starts = harness.cli_session.thread_starts.lock().await;
     assert_eq!(
         thread_starts.len(),
         1,
         "Codex runtime thread/start should be called; websocket_messages={websocket_messages:#?}"
     );
     assert_eq!(thread_starts[0].approval_policy.as_deref(), Some("never"));
+    assert_eq!(thread_starts[0].sandbox.as_ref(), None);
     assert_eq!(
-        thread_starts[0].sandbox.as_ref(),
-        Some(&json!("danger-full-access"))
+        thread_starts[0].permissions.as_deref(),
+        Some(":danger-full-access")
     );
     drop(thread_starts);
 
-    let turn_starts = cli_session.turn_starts.lock().await;
-    assert_eq!(turn_starts.len(), 1);
-    assert_eq!(turn_starts[0].approval_policy.as_deref(), Some("never"));
+    let turn_start = wait_for_recorded_cli_runtime_turn_start(&harness.cli_session).await;
+    assert_eq!(turn_start.approval_policy.as_deref(), Some("never"));
+    assert_eq!(turn_start.sandbox.as_ref(), None);
     assert_eq!(
-        turn_starts[0].sandbox.as_ref(),
-        Some(&json!({ "type": "dangerFullAccess" }))
+        turn_start.permissions.as_deref(),
+        Some(":danger-full-access")
     );
+
+    let persisted =
+        load_persisted_security_snapshot_record(&harness.crud_store, "turn_codex_full_access")
+            .await;
+    assert_eq!(persisted.version, 1);
+    assert_eq!(
+        persisted.snapshot.permission_profile.mode,
+        pioneer_protocol::TurnPermissionMode::FullAccess
+    );
+    assert_eq!(
+        persisted.snapshot.sandbox.mode,
+        pioneer_protocol::TurnSandboxMode::Unrestricted
+    );
+    assert_eq!(
+        persisted.snapshot.backend.execution_backend,
+        pioneer_protocol::TurnSecurityExecutionBackendKind::CodexCli
+    );
+    assert_eq!(
+        persisted.snapshot.enforcement,
+        pioneer_protocol::TurnSecurityEnforcementStatus::Active
+    );
+}
+
+#[tokio::test]
+async fn codex_cli_runtime_supervised_sets_read_only_permissions_profile() {
+    let mut harness = setup_cli_runtime_security_harness().await;
+    seed_cli_runtime_security_thread(
+        &harness,
+        "thread_codex_supervised",
+        "Codex supervised regression",
+        "o4-mini",
+        "openai",
+        None,
+    )
+    .await;
+
+    let turn_request_id = generate_test_request_id("codexro", "turn");
+    let turn_start_request = cli_runtime_turn_start_request(
+        turn_request_id.as_str(),
+        "thread_codex_supervised",
+        "turn_codex_supervised",
+        cli_runtime_execution_backend("codex", CLIAgentRuntimeKind::Codex),
+        "supervised",
+        "inspect project",
+        None,
+    );
+    process_cli_runtime_turn_start(&harness, turn_start_request.as_str()).await;
+
+    let mut websocket_messages = Vec::new();
+    while let Ok(message) = harness.rx.try_recv() {
+        websocket_messages.push(format!("{message:?}"));
+    }
+
+    let thread_starts = harness.cli_session.thread_starts.lock().await;
+    assert_eq!(
+        thread_starts.len(),
+        1,
+        "Codex runtime thread/start should be called; websocket_messages={websocket_messages:#?}"
+    );
+    assert_eq!(
+        thread_starts[0].approval_policy.as_deref(),
+        Some("on-request")
+    );
+    assert_eq!(thread_starts[0].sandbox.as_ref(), None);
+    assert_eq!(thread_starts[0].permissions.as_deref(), Some(":read-only"));
+    drop(thread_starts);
+
+    let persisted =
+        load_persisted_security_snapshot_record(&harness.crud_store, "turn_codex_supervised").await;
+    let turn_start = wait_for_recorded_cli_runtime_turn_start(&harness.cli_session).await;
+    assert_eq!(turn_start.approval_policy.as_deref(), Some("on-request"));
+    assert_eq!(turn_start.sandbox.as_ref(), None);
+    assert_eq!(turn_start.permissions.as_deref(), Some(":read-only"));
+
+    assert_eq!(
+        persisted.snapshot.sandbox.mode,
+        pioneer_protocol::TurnSandboxMode::ReadOnly
+    );
+    assert_eq!(
+        persisted.snapshot.backend.execution_backend,
+        pioneer_protocol::TurnSecurityExecutionBackendKind::CodexCli
+    );
+    assert_eq!(
+        persisted.snapshot.enforcement,
+        pioneer_protocol::TurnSecurityEnforcementStatus::Active
+    );
+}
+
+#[tokio::test]
+async fn claude_cli_runtime_supervised_required_sandbox_is_rejected_without_runtime_call() {
+    let mut harness = setup_cli_runtime_security_harness().await;
+    seed_cli_runtime_security_thread(
+        &harness,
+        "thread_claude_supervised",
+        "Claude supervised regression",
+        "claude-sonnet",
+        "anthropic",
+        None,
+    )
+    .await;
+
+    let turn_request_id = generate_test_request_id("claudero", "turn");
+    let turn_start_request = cli_runtime_turn_start_request(
+        turn_request_id.as_str(),
+        "thread_claude_supervised",
+        "turn_claude_supervised",
+        cli_runtime_execution_backend("claude", CLIAgentRuntimeKind::Claude),
+        "supervised",
+        "inspect project",
+        None,
+    );
+    process_cli_runtime_turn_start(&harness, turn_start_request.as_str()).await;
+
+    let error = recv_error_by_id(&mut harness.rx, turn_request_id.as_str()).await;
+    assert!(
+        error
+            .error
+            .message
+            .contains("turn execution security unavailable"),
+        "error should mention unavailable security: {}",
+        error.error.message
+    );
+    assert!(harness.cli_session.thread_starts.lock().await.is_empty());
+    assert!(harness.cli_session.turn_starts.lock().await.is_empty());
+    assert!(
+        harness
+            .crud_store
+            .get_turn_execution_security_snapshot("turn_claude_supervised")
+            .await
+            .expect("security snapshot lookup should succeed")
+            .is_none(),
+        "rejected Claude restricted turn should roll back without a persisted snapshot"
+    );
+}
+
+#[tokio::test]
+async fn claude_cli_runtime_ignores_legacy_provider_sandbox_option() {
+    let mut harness = setup_cli_runtime_security_harness().await;
+    seed_cli_runtime_security_thread(
+        &harness,
+        "thread_claude_legacy_sandbox",
+        "Claude legacy sandbox regression",
+        "claude-sonnet",
+        "anthropic",
+        None,
+    )
+    .await;
+
+    let turn_request_id = generate_test_request_id("claudelegacy", "sandbox");
+    let turn_start_request = cli_runtime_turn_start_request(
+        turn_request_id.as_str(),
+        "thread_claude_legacy_sandbox",
+        "turn_claude_legacy_sandbox",
+        cli_runtime_execution_backend("claude", CLIAgentRuntimeKind::Claude),
+        "full_access",
+        "run with full access",
+        Some(json!({
+            "sandbox": {
+                "type": "readOnly",
+                "source": "legacy-client-field"
+            }
+        })),
+    );
+    process_cli_runtime_turn_start(&harness, turn_start_request.as_str()).await;
+
+    let turn_rpc_response = recv_response_by_id(&mut harness.rx, turn_request_id.as_str()).await;
+    let _turn_response: TurnStartResponse = serde_json::from_value(turn_rpc_response.result)
+        .expect("turn/start response payload should decode");
+
+    assert_cli_runtime_start_sandbox_none(&harness.cli_session, "bypassPermissions").await;
+
+    let persisted =
+        load_persisted_security_snapshot(&harness.crud_store, "turn_claude_legacy_sandbox").await;
+    assert_eq!(
+        persisted.permission_profile.mode,
+        pioneer_protocol::TurnPermissionMode::FullAccess
+    );
+    assert_eq!(
+        persisted.sandbox.mode,
+        pioneer_protocol::TurnSandboxMode::Unrestricted
+    );
+    assert_eq!(
+        persisted.backend.execution_backend,
+        pioneer_protocol::TurnSecurityExecutionBackendKind::ClaudeCli
+    );
+}
+
+#[tokio::test]
+async fn turn_start_security_audit_events_include_unavailable_sandbox_decision() {
+    let mut harness = setup_cli_runtime_security_harness().await;
+    let thread_id = "thread_security_audit_claude";
+    let turn_id = "turn_security_audit_claude";
+    seed_cli_runtime_security_thread(
+        &harness,
+        thread_id,
+        "Claude security audit regression",
+        "claude-sonnet",
+        "anthropic",
+        None,
+    )
+    .await;
+
+    let turn_request_id = generate_test_request_id("securityaudit", "claude");
+    let turn_start_request = cli_runtime_turn_start_request(
+        turn_request_id.as_str(),
+        thread_id,
+        turn_id,
+        cli_runtime_execution_backend("claude", CLIAgentRuntimeKind::Claude),
+        "supervised",
+        "inspect project",
+        None,
+    );
+    process_cli_runtime_turn_start(&harness, turn_start_request.as_str()).await;
+
+    let error = recv_error_by_id(&mut harness.rx, turn_request_id.as_str()).await;
+    assert!(
+        error
+            .error
+            .message
+            .contains("turn execution security unavailable"),
+        "error should mention unavailable security: {}",
+        error.error.message
+    );
+    assert!(harness.cli_session.thread_starts.lock().await.is_empty());
+    assert!(harness.cli_session.turn_starts.lock().await.is_empty());
+
+    let turn_items = harness
+        .crud_store
+        .get_turn_item_events(thread_id, turn_id)
+        .await
+        .expect("turn item events should load")
+        .expect("turn item events should exist");
+    let audit = turn_items
+        .events
+        .iter()
+        .find_map(|event| {
+            match &event.payload {
+            TurnItemEventPayload::TurnPermissionAudit(audit)
+                if audit.event_kind
+                    == pioneer_protocol::TurnPermissionAuditEventKind::SecuritySandboxUnavailable =>
+            {
+                Some(audit)
+            }
+            _ => None,
+        }
+        })
+        .expect("rejected turn/start should persist unavailable sandbox audit");
+
+    assert_eq!(
+        audit.security_snapshot_id.as_deref(),
+        Some("turn_security_audit_claude:security:v1")
+    );
+    assert_eq!(audit.security_snapshot_version, Some(1));
+    assert_eq!(
+        audit.security_reason_code.as_deref(),
+        Some("sandbox_unavailable")
+    );
+    assert_eq!(
+        audit.profile_mode,
+        pioneer_protocol::TurnPermissionMode::Supervised
+    );
+    assert!(audit.tool_name.is_none());
+    assert!(audit.request_key.is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -16087,6 +16790,303 @@ async fn cli_runtime_command_approval_denied_resolves_and_sends_decline() {
     );
 }
 
+#[tokio::test]
+async fn cli_runtime_request_claude_approval_roundtrip_preserves_provider_payload() {
+    let (tx, _rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("sonnet", "anthropic"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+
+    seed_cli_runtime_approval_turn_for_runtime(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        "claude",
+        "claude",
+        "thread_claude_request",
+        "turn_claude_request",
+        "claude-thread-request",
+    )
+    .await;
+    cli_manager
+        .get_or_start(
+            CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "claude", "thread_claude_request")
+                .expect("session key should build"),
+        )
+        .await
+        .expect("Claude runtime session should be active for native request response");
+
+    let original_input = json!({
+        "tool_name": "Bash",
+        "command": "cargo check",
+        "cwd": "/tmp/project"
+    });
+    let request_payload = CLIRuntimePendingRequest {
+        kind: CLIRuntimeRequestKind::CommandApproval,
+        title: Some("Run Claude tool".to_owned()),
+        message: Some("Claude wants to execute a command".to_owned()),
+        native_request_id: Some("claude-native-request-1".to_owned()),
+        payload: Some(json!({
+            "nativeRequestIdJson": "claude-native-request-1",
+            "input": original_input.clone()
+        })),
+    };
+    processor
+        .open_cli_runtime_pending_request(NewCliRuntimePendingRequest {
+            request_id: "claude-approval-request-1".to_owned(),
+            runtime_id: "claude".to_owned(),
+            runtime_kind: "claude".to_owned(),
+            workspace_id: workspace_id.clone(),
+            thread_id: "thread_claude_request".to_owned(),
+            turn_id: Some("turn_claude_request".to_owned()),
+            native_thread_id: Some("claude-thread-request".to_owned()),
+            native_turn_id: Some("turn_claude_request".to_owned()),
+            native_item_id: Some("claude-item-request".to_owned()),
+            request_kind: "command_approval".to_owned(),
+            payload_json: pioneer_crud::serialize_cli_runtime_json(&request_payload)
+                .expect("pending payload should serialize"),
+            created_at: chrono::Utc::now().fixed_offset(),
+            updated_at: chrono::Utc::now().fixed_offset(),
+        })
+        .await
+        .expect("pending request should open");
+
+    let stored = crud_store
+        .get_cli_runtime_pending_request("claude-approval-request-1")
+        .await
+        .expect("pending request lookup should succeed")
+        .expect("pending request should exist");
+    assert_eq!(stored.runtime_id, "claude");
+    assert_eq!(stored.runtime_kind, "claude");
+    let stored_payload: CLIRuntimePendingRequest =
+        pioneer_crud::deserialize_cli_runtime_json(stored.payload_json.as_str())
+            .expect("stored Claude pending request payload should decode");
+    assert_eq!(
+        stored_payload.native_request_id.as_deref(),
+        Some("claude-native-request-1")
+    );
+    assert_eq!(
+        stored_payload
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("input")),
+        Some(&original_input)
+    );
+
+    let response_request_id = generate_test_request_id("claude", "allow");
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": response_request_id,
+                "method": pioneer_protocol::constants::methods::CLI_RUNTIME_REQUEST_RESPOND,
+                "params": {
+                    "workspace_id": workspace_id,
+                    "runtime_id": "claude",
+                    "request_id": "claude-approval-request-1",
+                    "resolution": { "status": "approved" }
+                }
+            })
+            .to_string(),
+        )
+        .await;
+
+    let resolved = crud_store
+        .get_cli_runtime_pending_request("claude-approval-request-1")
+        .await
+        .expect("pending request lookup should succeed")
+        .expect("pending request should remain durable");
+    assert_eq!(
+        resolved.status,
+        pioneer_crud::CliRuntimePendingRequestStatus::Answered
+    );
+    let stored_resolution: CLIRuntimeRequestResolution =
+        pioneer_crud::deserialize_cli_runtime_json(
+            resolved
+                .response_json
+                .as_deref()
+                .expect("resolved Claude request should persist response JSON"),
+        )
+        .expect("stored Claude request resolution should decode");
+    assert_eq!(stored_resolution, CLIRuntimeRequestResolution::Approved);
+
+    let responses = cli_session.responses.lock().await;
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].0, json!("claude-native-request-1"));
+    assert_eq!(
+        responses[0].1,
+        json!({
+            "behavior": "allow",
+            "updatedInput": original_input
+        })
+    );
+}
+
+#[tokio::test]
+async fn cli_runtime_request_claude_denial_blocks_provider_action() {
+    let (tx, _rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("sonnet", "anthropic"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+
+    seed_cli_runtime_approval_turn_for_runtime(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        "claude",
+        "claude",
+        "thread_claude_deny",
+        "turn_claude_deny",
+        "claude-thread-deny",
+    )
+    .await;
+    cli_manager
+        .get_or_start(
+            CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "claude", "thread_claude_deny")
+                .expect("session key should build"),
+        )
+        .await
+        .expect("Claude runtime session should be active for native request response");
+
+    let request_payload = CLIRuntimePendingRequest {
+        kind: CLIRuntimeRequestKind::CommandApproval,
+        title: Some("Run Claude tool".to_owned()),
+        message: Some("Claude wants to execute a command".to_owned()),
+        native_request_id: Some("claude-native-deny".to_owned()),
+        payload: Some(json!({
+            "nativeRequestIdJson": "claude-native-deny",
+            "input": {
+                "tool_name": "Bash",
+                "command": "rm -rf build"
+            }
+        })),
+    };
+    processor
+        .open_cli_runtime_pending_request(NewCliRuntimePendingRequest {
+            request_id: "claude-approval-deny".to_owned(),
+            runtime_id: "claude".to_owned(),
+            runtime_kind: "claude".to_owned(),
+            workspace_id: workspace_id.clone(),
+            thread_id: "thread_claude_deny".to_owned(),
+            turn_id: Some("turn_claude_deny".to_owned()),
+            native_thread_id: Some("claude-thread-deny".to_owned()),
+            native_turn_id: Some("turn_claude_deny".to_owned()),
+            native_item_id: Some("claude-item-deny".to_owned()),
+            request_kind: "command_approval".to_owned(),
+            payload_json: pioneer_crud::serialize_cli_runtime_json(&request_payload)
+                .expect("pending payload should serialize"),
+            created_at: chrono::Utc::now().fixed_offset(),
+            updated_at: chrono::Utc::now().fixed_offset(),
+        })
+        .await
+        .expect("pending request should open");
+    let stored = crud_store
+        .get_cli_runtime_pending_request("claude-approval-deny")
+        .await
+        .expect("pending request lookup should succeed")
+        .expect("pending request should exist");
+    let stored_payload: CLIRuntimePendingRequest =
+        pioneer_crud::deserialize_cli_runtime_json(stored.payload_json.as_str())
+            .expect("stored Claude pending request payload should decode");
+    assert_eq!(
+        stored_payload.native_request_id.as_deref(),
+        Some("claude-native-deny")
+    );
+
+    let response_request_id = generate_test_request_id("claude", "deny");
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": response_request_id,
+                "method": pioneer_protocol::constants::methods::CLI_RUNTIME_REQUEST_RESPOND,
+                "params": {
+                    "workspace_id": workspace_id,
+                    "runtime_id": "claude",
+                    "request_id": "claude-approval-deny",
+                    "resolution": {
+                        "status": "denied",
+                        "reason": "unsafe command"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await;
+
+    let resolved = crud_store
+        .get_cli_runtime_pending_request("claude-approval-deny")
+        .await
+        .expect("pending request lookup should succeed")
+        .expect("pending request should remain durable");
+    assert_eq!(
+        resolved.status,
+        pioneer_crud::CliRuntimePendingRequestStatus::Answered
+    );
+    let stored_resolution: CLIRuntimeRequestResolution =
+        pioneer_crud::deserialize_cli_runtime_json(
+            resolved
+                .response_json
+                .as_deref()
+                .expect("resolved Claude request should persist response JSON"),
+        )
+        .expect("stored Claude request resolution should decode");
+    assert_eq!(
+        stored_resolution,
+        CLIRuntimeRequestResolution::Denied {
+            reason: Some("unsafe command".to_owned())
+        }
+    );
+
+    let responses = cli_session.responses.lock().await;
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].0, json!("claude-native-deny"));
+    assert_eq!(
+        responses[0].1,
+        json!({
+            "behavior": "deny",
+            "message": "unsafe command"
+        })
+    );
+    assert!(cli_session.interrupts.lock().await.is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_command_approval_cancel_sends_cancel_and_interrupts_turn() {
     let (processor, connection_id, mut rx, workspace_id, _crud_store, cli_session) =
@@ -17134,6 +18134,27 @@ async fn seed_cli_runtime_approval_turn(
     turn_id: &str,
     native_thread_id: &str,
 ) {
+    seed_cli_runtime_approval_turn_for_runtime(
+        crud_store,
+        workspace_id,
+        "codex",
+        "codex",
+        thread_id,
+        turn_id,
+        native_thread_id,
+    )
+    .await;
+}
+
+async fn seed_cli_runtime_approval_turn_for_runtime(
+    crud_store: &CrudStore,
+    workspace_id: &str,
+    runtime_id: &str,
+    runtime_kind: &str,
+    thread_id: &str,
+    turn_id: &str,
+    native_thread_id: &str,
+) {
     let now_secs = chrono::Utc::now().timestamp();
     let thread = Thread {
         workspace_id: workspace_id.to_owned(),
@@ -17181,8 +18202,8 @@ async fn seed_cli_runtime_approval_turn(
             turn_id: turn_id.to_owned(),
             thread_id: thread_id.to_owned(),
             workspace_id: workspace_id.to_owned(),
-            runtime_id: "codex".to_owned(),
-            runtime_kind: "codex".to_owned(),
+            runtime_id: runtime_id.to_owned(),
+            runtime_kind: runtime_kind.to_owned(),
             native_thread_id: native_thread_id.to_owned(),
             native_turn_id: Some(turn_id.to_owned()),
             request_id: None,
@@ -24894,13 +25915,15 @@ async fn turn_start_materializes_mcp_tool_bindings_and_executes_tool() {
         "MCP callable should be materialized as a dynamic tool"
     );
 
-    let built_tools = pioneer_tools::build_tools(
+    let built_tools = build_tools_with_environment_and_security_snapshot(
         std::env::temp_dir(),
         "turn_000000000000000131",
         test_tools_permission_context("turn_000000000000000131"),
         tool_loop_config.web,
         tool_loop_config.computer_use,
         materialization.bundles,
+        BTreeMap::new(),
+        Some(test_full_access_execution_security_snapshot()),
     )
     .expect("tool runtime should build with MCP extension");
     let call = built_tools
@@ -28807,13 +29830,15 @@ async fn built_memory_tools(harness: &MemoryGatewayHarness, turn_suffix: &str) -
     let context = memory_tool_context(harness, turn_suffix);
     let materialization = materialize_memory_tools_for_context(harness, context.clone()).await;
     let tool_loop_config = test_tool_loop_config();
-    build_tools(
+    build_tools_with_environment_and_security_snapshot(
         harness.runtime_home.clone(),
         context.turn_id.clone(),
         test_tools_permission_context(&context.turn_id),
         tool_loop_config.web,
         tool_loop_config.computer_use,
         materialization.bundles,
+        BTreeMap::new(),
+        Some(test_full_access_execution_security_snapshot()),
     )
     .expect("memory tools should build")
 }
@@ -29861,13 +30886,15 @@ async fn memory_task_runtime_context_materializes_all_memory_tools() {
 
     let tool_loop_config = test_tool_loop_config();
     let tools_turn_id = generate_test_request_id("turn", "task_runtime_memory_tools");
-    let tools = build_tools(
+    let tools = build_tools_with_environment_and_security_snapshot(
         harness.runtime_home.clone(),
         tools_turn_id.clone(),
         test_tools_permission_context(&tools_turn_id),
         tool_loop_config.web,
         tool_loop_config.computer_use,
         materialization.bundles,
+        BTreeMap::new(),
+        Some(test_full_access_execution_security_snapshot()),
     )
     .expect("task runtime memory tools should build");
     let remember = execute_memory_tool_payload(

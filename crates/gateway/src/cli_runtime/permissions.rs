@@ -1,9 +1,8 @@
 use pioneer_protocol::{
-    CLIAgentRuntimeKind, CLIAgentRuntimeSandboxPolicy, TurnCLIRuntimeOptions, TurnPermissionMode,
-    TurnPermissionProfileSelection, TurnPermissionProfileSnapshot,
+    CLIAgentRuntimeKind, TurnCLIRuntimeOptions, TurnExecutionSecuritySnapshot, TurnPermissionMode,
+    TurnPermissionProfileSelection, TurnPermissionProfileSnapshot, TurnSandboxMode,
     default_turn_permission_profile_snapshot, resolve_turn_permission_profile,
 };
-use serde_json::json;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CLIRuntimePermissionMappingQuality {
@@ -41,7 +40,7 @@ pub(crate) fn adapt_cli_runtime_permissions_for_turn(
     let approval_policy = base.approval_policy.to_owned();
 
     let mut options = runtime_options.unwrap_or_else(empty_cli_runtime_options);
-    options.sandbox = cli_runtime_sandbox_for_profile(runtime_kind, profile.mode);
+    options.sandbox = None;
 
     CLIRuntimePermissionAdapterResult {
         output: CLIRuntimePermissionAdapterOutput {
@@ -125,29 +124,23 @@ fn empty_cli_runtime_options() -> TurnCLIRuntimeOptions {
     }
 }
 
-fn cli_runtime_sandbox_for_profile(
-    runtime_kind: CLIAgentRuntimeKind,
-    mode: TurnPermissionMode,
-) -> Option<CLIAgentRuntimeSandboxPolicy> {
-    match runtime_kind {
-        CLIAgentRuntimeKind::Codex => Some(CLIAgentRuntimeSandboxPolicy(match mode {
-            TurnPermissionMode::FullAccess => json!({ "type": "dangerFullAccess" }),
-            TurnPermissionMode::AutoAcceptEdits | TurnPermissionMode::Supervised => json!({
-                "type": "workspaceWrite",
-                "writableRoots": [],
-                "networkAccess": false,
-                "excludeTmpdirEnvVar": false,
-                "excludeSlashTmp": false
-            }),
-        })),
-        CLIAgentRuntimeKind::Claude => None,
+pub(crate) fn codex_permissions_profile_for_security_snapshot(
+    snapshot: &TurnExecutionSecuritySnapshot,
+) -> &'static str {
+    match snapshot.sandbox.mode {
+        TurnSandboxMode::Unrestricted => ":danger-full-access",
+        TurnSandboxMode::ReadOnly => ":read-only",
+        TurnSandboxMode::WorkspaceWrite => ":workspace",
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pioneer_protocol::TurnPermissionProfileSelection;
+    use pioneer_protocol::{
+        CLIAgentRuntimeSandboxPolicy, TurnExecutionSecuritySnapshot,
+        TurnPermissionProfileSelection, TurnPermissionProfileSource,
+    };
 
     fn selection(mode: TurnPermissionMode) -> TurnPermissionProfileSelection {
         TurnPermissionProfileSelection { mode }
@@ -169,10 +162,7 @@ mod tests {
 
         assert_eq!(result.output.profile.mode, TurnPermissionMode::FullAccess);
         assert_eq!(result.output.approval_policy, "never");
-        assert_eq!(
-            result.options.sandbox.as_ref().map(|sandbox| &sandbox.0),
-            Some(&serde_json::json!({ "type": "dangerFullAccess" }))
-        );
+        assert_eq!(result.options.sandbox, None);
         assert_eq!(
             result.output.mapping_quality,
             CLIRuntimePermissionMappingQuality::Exact
@@ -195,15 +185,19 @@ mod tests {
         );
 
         assert_eq!(result.output.approval_policy, "on-request");
-        assert_eq!(
-            result
-                .options
-                .sandbox
-                .as_ref()
-                .and_then(|sandbox| sandbox.0.get("type"))
-                .and_then(serde_json::Value::as_str),
-            Some("workspaceWrite")
+        assert_eq!(result.options.sandbox, None);
+    }
+
+    #[test]
+    fn codex_security_supervised_profile_does_not_emit_pre_snapshot_sandbox() {
+        let result = adapt_cli_runtime_permissions_for_turn(
+            CLIAgentRuntimeKind::Codex,
+            Some(&selection(TurnPermissionMode::Supervised)),
+            None,
         );
+
+        assert_eq!(result.output.approval_policy, "on-request");
+        assert_eq!(result.options.sandbox, None);
     }
 
     #[test]
@@ -293,6 +287,22 @@ mod tests {
     }
 
     #[test]
+    fn claude_cli_runtime_full_access_permission_mapping_uses_bypass_permissions() {
+        let result = adapt_cli_runtime_permissions_for_turn(
+            CLIAgentRuntimeKind::Claude,
+            Some(&selection(TurnPermissionMode::FullAccess)),
+            None,
+        );
+
+        assert_eq!(result.output.approval_policy, "bypassPermissions");
+        assert_eq!(
+            result.output.mapping_quality,
+            CLIRuntimePermissionMappingQuality::Exact
+        );
+        assert_eq!(result.options.sandbox, None);
+    }
+
+    #[test]
     fn adapter_preserves_non_permission_cli_options() {
         let result = adapt_cli_runtime_permissions_for_turn(
             CLIAgentRuntimeKind::Codex,
@@ -310,14 +320,11 @@ mod tests {
         assert_eq!(result.options.personality.as_deref(), Some("direct"));
         assert_eq!(result.options.summary.as_deref(), Some("brief"));
         assert_eq!(result.options.steer_if_active, Some(true));
-        assert_eq!(
-            result.options.sandbox.as_ref().map(|sandbox| &sandbox.0),
-            Some(&serde_json::json!({ "type": "dangerFullAccess" }))
-        );
+        assert_eq!(result.options.sandbox, None);
     }
 
     #[test]
-    fn codex_full_access_overrides_restrictive_sandbox_option() {
+    fn codex_permission_adapter_ignores_legacy_sandbox_option() {
         let result = adapt_cli_runtime_permissions_for_turn(
             CLIAgentRuntimeKind::Codex,
             Some(&selection(TurnPermissionMode::FullAccess)),
@@ -334,9 +341,42 @@ mod tests {
         );
 
         assert_eq!(result.output.approval_policy, "never");
+        assert_eq!(result.options.sandbox, None);
+    }
+
+    #[test]
+    fn codex_security_snapshot_read_only_uses_permissions_profile() {
+        let snapshot = TurnExecutionSecuritySnapshot::read_only(
+            pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+                TurnPermissionMode::Supervised,
+                TurnPermissionProfileSource::Composer,
+            ),
+            "/tmp/workspace",
+            Vec::new(),
+            1_700_000_000_000,
+        );
+
         assert_eq!(
-            result.options.sandbox.as_ref().map(|sandbox| &sandbox.0),
-            Some(&serde_json::json!({ "type": "dangerFullAccess" }))
+            codex_permissions_profile_for_security_snapshot(&snapshot),
+            ":read-only"
+        );
+    }
+
+    #[test]
+    fn codex_security_snapshot_workspace_write_uses_permissions_profile() {
+        let snapshot = TurnExecutionSecuritySnapshot::workspace_write(
+            pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+                TurnPermissionMode::AutoAcceptEdits,
+                TurnPermissionProfileSource::Composer,
+            ),
+            "/tmp/workspace",
+            Vec::new(),
+            1_700_000_000_000,
+        );
+
+        assert_eq!(
+            codex_permissions_profile_for_security_snapshot(&snapshot),
+            ":workspace"
         );
     }
 }

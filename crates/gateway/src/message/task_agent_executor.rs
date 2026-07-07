@@ -16,8 +16,8 @@ use pioneer_protocol::{
     TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskThreadLineage, TaskTrigger,
     TaskTriggerKind, TaskValue, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility,
     ThreadStatus, ToolPermissionPolicySnapshot, Turn, TurnBlockedNotification,
-    TurnCompletedNotification, TurnFailedNotification, TurnKind, TurnOrigin,
-    TurnPermissionProfileSnapshot, TurnPermissionProfileSource, TurnStartParams,
+    TurnCompletedNotification, TurnExecutionSecuritySnapshot, TurnFailedNotification, TurnKind,
+    TurnOrigin, TurnPermissionProfileSnapshot, TurnPermissionProfileSource, TurnStartParams,
     TurnStartedNotification, TurnStatus, UserInput,
 };
 use pioneer_tasks::{
@@ -116,6 +116,7 @@ impl TaskAgentExecutor {
             &processor,
             &task_response,
             &run,
+            &agent_spec,
             parent,
             &occurrence_permission_profile,
         )
@@ -315,6 +316,30 @@ impl TaskAgentExecutor {
                 return Err(error).context("failed to resolve hidden task permission profile");
             }
         };
+        let child_security_snapshot = match resolve_task_child_execution_security_snapshot(
+            processor,
+            parent,
+            agent_spec,
+            turn_permission_profile.clone(),
+            thread_outcome
+                .started_notification
+                .thread
+                .model_provider
+                .as_str(),
+            child_thread_id.as_str(),
+            child_turn_id.as_str(),
+        )
+        .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                processor
+                    .thread_manager
+                    .rollback_turn_start(turn_outcome.rollback_context)
+                    .await;
+                return Err(error).context("failed to resolve hidden task execution security");
+            }
+        };
         let profile_selected_audit = processor.turn_profile_selected_audit_event_for_turn(
             context.workspace_id.as_str(),
             child_thread_id.as_str(),
@@ -339,6 +364,19 @@ impl TaskAgentExecutor {
                 .rollback_turn_start(turn_outcome.rollback_context)
                 .await;
             return Err(error).context("failed to persist hidden task turn");
+        }
+        if let Err(error) = persist_resolved_task_child_execution_security_snapshot(
+            processor,
+            child_turn_id.as_str(),
+            &child_security_snapshot,
+        )
+        .await
+        {
+            processor
+                .thread_manager
+                .rollback_turn_start(turn_outcome.rollback_context)
+                .await;
+            return Err(error).context("failed to persist hidden task execution security");
         }
         handle
             .link_child_thread_with_runtime(
@@ -422,7 +460,7 @@ impl TaskAgentExecutor {
         let runtime_permission_profile = turn_permission_profile;
         if let Err(error) = processor
             .agent_manager
-            .start_turn_with_hook_context_and_permission_profile(
+            .start_turn_with_hook_context_permission_profile_and_security_snapshot(
                 child_thread_id.as_str(),
                 child_turn_id.as_str(),
                 ThreadMode::Agent,
@@ -436,6 +474,7 @@ impl TaskAgentExecutor {
                 runtime_environment,
                 Vec::new(),
                 runtime_permission_profile,
+                child_security_snapshot,
             )
             .await
         {
@@ -763,6 +802,42 @@ impl TaskAgentExecutor {
                 return Ok(());
             }
         };
+        let child_security_snapshot = match resolve_task_child_execution_security_snapshot(
+            processor,
+            &parent,
+            agent_spec,
+            turn_permission_profile.clone(),
+            thread_outcome
+                .started_notification
+                .thread
+                .model_provider
+                .as_str(),
+            child_thread_id.as_str(),
+            child_turn_id.as_str(),
+        )
+        .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                processor
+                    .thread_manager
+                    .rollback_turn_start(turn_outcome.rollback_context)
+                    .await;
+                self.block_revision_dispatch_turn(
+                    processor,
+                    child_runtime,
+                    handle,
+                    task_error(
+                        "revision_execution_security_unavailable",
+                        format!("failed to resolve revision task execution security: {error:#}"),
+                        TaskErrorClass::Internal,
+                        Some(run.id.clone()),
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
         let profile_selected_audit = processor.turn_profile_selected_audit_event_for_turn(
             task.workspace_id.as_str(),
             child_thread_id.as_str(),
@@ -791,6 +866,31 @@ impl TaskAgentExecutor {
                 task_error(
                     "revision_turn_persist_failed",
                     format!("failed to persist revision task turn: {error:#}"),
+                    TaskErrorClass::Internal,
+                    Some(run.id.clone()),
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+        if let Err(error) = persist_resolved_task_child_execution_security_snapshot(
+            processor,
+            child_turn_id.as_str(),
+            &child_security_snapshot,
+        )
+        .await
+        {
+            processor
+                .thread_manager
+                .rollback_turn_start(turn_outcome.rollback_context)
+                .await;
+            self.block_revision_dispatch_turn(
+                processor,
+                child_runtime,
+                handle,
+                task_error(
+                    "revision_execution_security_persist_failed",
+                    format!("failed to persist revision task execution security: {error:#}"),
                     TaskErrorClass::Internal,
                     Some(run.id.clone()),
                 ),
@@ -884,7 +984,7 @@ impl TaskAgentExecutor {
         let runtime_permission_profile = turn_permission_profile;
         if let Err(error) = processor
             .agent_manager
-            .start_turn_with_hook_context_and_execution_checkpoint_and_permission_profile(
+            .start_turn_with_hook_context_and_execution_checkpoint_permission_profile_and_security_snapshot(
                 child_thread_id.as_str(),
                 child_turn_id.as_str(),
                 ThreadMode::Agent,
@@ -899,6 +999,7 @@ impl TaskAgentExecutor {
                 Vec::new(),
                 execution_checkpoint_context,
                 runtime_permission_profile,
+                child_security_snapshot,
             )
             .await
         {
@@ -1112,6 +1213,8 @@ impl TaskAgentExecutor {
         {
             Ok(outcome) => outcome,
             Err(error) if format!("{error:#}").contains("already has a running turn") => {
+                load_required_task_child_execution_security_snapshot(processor, child_turn_id)
+                    .await?;
                 processor.ensure_agent_listener_task(child_thread_id).await;
                 spawn_execution_heartbeat(
                     processor,
@@ -1206,9 +1309,11 @@ impl TaskAgentExecutor {
         let runtime_permission_profile = processor
             .materialized_turn_permission_profile(&turn_outcome.materialization.turn)
             .context("failed to resolve restored task permission profile")?;
+        let runtime_security_snapshot =
+            load_required_task_child_execution_security_snapshot(processor, child_turn_id).await?;
         processor
             .agent_manager
-            .start_turn_with_hook_context_and_execution_checkpoint_and_permission_profile(
+            .start_turn_with_hook_context_and_execution_checkpoint_permission_profile_and_security_snapshot(
                 child_thread_id,
                 child_turn_id,
                 ThreadMode::Agent,
@@ -1223,6 +1328,7 @@ impl TaskAgentExecutor {
                 Vec::new(),
                 execution_checkpoint_context,
                 runtime_permission_profile,
+                runtime_security_snapshot,
             )
             .await
             .map_err(|error| anyhow!("failed to redispatch child task turn: {error}"))?;
@@ -1744,6 +1850,7 @@ impl TaskAgentExecutor {
         }
 
         let task = &task_response.task;
+        let parent = resolve_parent_context(processor, task).await?;
         let effective_model = effective_agent_model(agent_spec)?;
         let thread_params = pioneer_protocol::ThreadStartParams {
             thread_id: task_run_turn.thread_id.clone(),
@@ -1825,6 +1932,30 @@ impl TaskAgentExecutor {
                 return Err(error).context("failed to resolve reviewer task permission profile");
             }
         };
+        let child_security_snapshot = match resolve_task_child_execution_security_snapshot(
+            processor,
+            &parent,
+            agent_spec,
+            turn_permission_profile.clone(),
+            thread_outcome
+                .started_notification
+                .thread
+                .model_provider
+                .as_str(),
+            task_run_turn.thread_id.as_str(),
+            task_run_turn.turn_id.as_str(),
+        )
+        .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                processor
+                    .thread_manager
+                    .rollback_turn_start(turn_outcome.rollback_context)
+                    .await;
+                return Err(error).context("failed to resolve hidden reviewer execution security");
+            }
+        };
         let profile_selected_audit = processor.turn_profile_selected_audit_event_for_turn(
             task.workspace_id.as_str(),
             task_run_turn.thread_id.as_str(),
@@ -1847,6 +1978,19 @@ impl TaskAgentExecutor {
                 .rollback_turn_start(turn_outcome.rollback_context)
                 .await;
             return Err(error).context("failed to persist hidden reviewer turn");
+        }
+        if let Err(error) = persist_resolved_task_child_execution_security_snapshot(
+            processor,
+            task_run_turn.turn_id.as_str(),
+            &child_security_snapshot,
+        )
+        .await
+        {
+            processor
+                .thread_manager
+                .rollback_turn_start(turn_outcome.rollback_context)
+                .await;
+            return Err(error).context("failed to persist hidden reviewer execution security");
         }
 
         processor.ensure_hook_runtime_with_run_store().await;
@@ -1907,7 +2051,7 @@ impl TaskAgentExecutor {
         let runtime_permission_profile = turn_permission_profile;
         if let Err(error) = processor
             .agent_manager
-            .start_turn_with_hook_context_and_permission_profile(
+            .start_turn_with_hook_context_permission_profile_and_security_snapshot(
                 task_run_turn.thread_id.as_str(),
                 task_run_turn.turn_id.as_str(),
                 ThreadMode::Agent,
@@ -1921,6 +2065,7 @@ impl TaskAgentExecutor {
                 runtime_environment,
                 Vec::new(),
                 runtime_permission_profile,
+                child_security_snapshot,
             )
             .await
         {
@@ -2258,12 +2403,30 @@ async fn ensure_task_run_occurrence_context(
     processor: &Arc<MessageProcessor>,
     task_response: &TaskGetResponse,
     run: &TaskRun,
+    agent_spec: &TaskAgentSpec,
     mut parent: TaskParentRuntimeContext,
     permission_profile: &TurnPermissionProfileSnapshot,
 ) -> Result<TaskParentRuntimeContext> {
     let Some(origin) = task_run_occurrence_origin(task_response, run) else {
         return Ok(parent);
     };
+    let effective_model = effective_agent_model(agent_spec)?;
+    let occurrence_security_snapshot = resolve_task_child_execution_security_snapshot(
+        processor,
+        &parent,
+        agent_spec,
+        permission_profile.clone(),
+        effective_model.model_provider.as_str(),
+        parent.parent_thread_id.as_str(),
+        run.id.as_str(),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "failed to resolve task run occurrence execution security for run `{}`",
+            run.id
+        )
+    })?;
     ensure_task_run_occurrence_turn(
         processor,
         &task_response.task,
@@ -2271,6 +2434,7 @@ async fn ensure_task_run_occurrence_context(
         run,
         origin,
         permission_profile,
+        &occurrence_security_snapshot,
     )
     .await?;
     ensure_task_run_occurrence_anchor(
@@ -2324,6 +2488,7 @@ async fn ensure_task_run_occurrence_turn(
     run: &TaskRun,
     origin: TurnOrigin,
     permission_profile: &TurnPermissionProfileSnapshot,
+    execution_security_snapshot: &TurnExecutionSecuritySnapshot,
 ) -> Result<()> {
     if processor
         .crud_store
@@ -2331,6 +2496,25 @@ async fn ensure_task_run_occurrence_turn(
         .await?
         .is_some()
     {
+        if processor
+            .crud_store
+            .get_turn_execution_security_snapshot(run.id.as_str())
+            .await?
+            .is_none()
+        {
+            persist_resolved_task_child_execution_security_snapshot(
+                processor,
+                run.id.as_str(),
+                execution_security_snapshot,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to persist missing task run occurrence execution security snapshot `{}`",
+                    run.id
+                )
+            })?;
+        }
         return Ok(());
     }
 
@@ -2362,7 +2546,13 @@ async fn ensure_task_run_occurrence_turn(
         .crud_store
         .get_thread_sandbox_mode(parent_thread_id)
         .await?
-        .unwrap_or(SandboxMode::FullAccess);
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot create task run occurrence turn for task `{}` because parent thread `{}` is missing legacy sandbox policy",
+                task.id,
+                parent_thread_id
+            )
+        })?;
     let profile_selected_audit = processor.turn_profile_selected_audit_event_for_turn(
         task.workspace_id.as_str(),
         parent_thread_id,
@@ -2385,6 +2575,18 @@ async fn ensure_task_run_occurrence_turn(
                 run.id, task.id
             )
         })?;
+    persist_resolved_task_child_execution_security_snapshot(
+        processor,
+        run.id.as_str(),
+        execution_security_snapshot,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "failed to persist task run occurrence execution security snapshot `{}` for task `{}`",
+            run.id, task.id
+        )
+    })?;
     processor
         .send_notification_to_thread_subscribers(
             parent_thread_id,
@@ -3242,6 +3444,89 @@ fn effective_task_child_permission_profile(
         apply_task_tool_policy_to_permission_profile(&mut profile, tool_policy);
     }
     Ok(profile)
+}
+
+async fn resolve_task_child_execution_security_snapshot(
+    processor: &Arc<MessageProcessor>,
+    parent: &TaskParentRuntimeContext,
+    agent_spec: &TaskAgentSpec,
+    child_permission_profile: TurnPermissionProfileSnapshot,
+    effective_model_provider: &str,
+    child_thread_id: &str,
+    child_turn_id: &str,
+) -> Result<TurnExecutionSecuritySnapshot> {
+    let security_cap = agent_spec.security_cap.as_ref().ok_or_else(|| {
+        anyhow!(
+            "task agent spec `{}` is missing security_cap",
+            agent_spec.id
+        )
+    })?;
+    let parent_turn_id = parent.parent_turn_id.as_deref().ok_or_else(|| {
+        anyhow!(
+            "task agent spec `{}` cannot start child turn without parent turn security snapshot",
+            agent_spec.id
+        )
+    })?;
+    let parent_snapshot = processor
+        .crud_store
+        .get_turn_execution_security_snapshot(parent_turn_id)
+        .await?
+        .ok_or_else(|| {
+            anyhow!(
+                "parent turn `{}` is missing execution security snapshot for task agent spec `{}`",
+                parent_turn_id,
+                agent_spec.id
+            )
+        })?
+        .snapshot;
+
+    crate::turn_security::resolve_task_child_execution_security(
+        parent_turn_id,
+        &parent_snapshot,
+        security_cap,
+        child_permission_profile,
+        effective_model_provider.to_owned(),
+        child_thread_id.to_owned(),
+        child_turn_id.to_owned(),
+        now_timestamp_secs().saturating_mul(1000),
+    )
+}
+
+async fn persist_resolved_task_child_execution_security_snapshot(
+    processor: &Arc<MessageProcessor>,
+    child_turn_id: &str,
+    snapshot: &TurnExecutionSecuritySnapshot,
+) -> Result<()> {
+    let updated = processor
+        .crud_store
+        .set_turn_execution_security_snapshot(child_turn_id, snapshot)
+        .await?;
+    if !updated {
+        bail!(
+            "failed to persist task child execution security snapshot: turn `{}` was not found",
+            child_turn_id
+        );
+    }
+    Ok(())
+}
+
+async fn load_required_task_child_execution_security_snapshot(
+    processor: &Arc<MessageProcessor>,
+    child_turn_id: &str,
+) -> Result<TurnExecutionSecuritySnapshot> {
+    processor
+        .crud_store
+        .get_turn_execution_security_snapshot(child_turn_id)
+        .await?
+        .map(|record| record.snapshot)
+        .ok_or_else(|| missing_task_child_execution_security_snapshot_error(child_turn_id))
+}
+
+fn missing_task_child_execution_security_snapshot_error(child_turn_id: &str) -> anyhow::Error {
+    anyhow!(
+        "child turn `{}` is missing persisted execution security snapshot during recovery",
+        child_turn_id
+    )
 }
 
 fn apply_task_tool_policy_to_permission_profile(
@@ -4623,6 +4908,7 @@ mod tests {
             context_policy: None,
             tool_policy,
             permission_cap,
+            security_cap: None,
             result_contract: None,
             review_policy: None,
             depth: 0,
@@ -4639,6 +4925,16 @@ mod tests {
             .expect_err("missing permission cap should fail");
 
         assert!(format!("{error:#}").contains("missing permission_cap"));
+    }
+
+    #[test]
+    fn recovery_security_missing_child_snapshot_error_is_explicit() {
+        let error = missing_task_child_execution_security_snapshot_error("child_turn_missing");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("missing persisted execution security snapshot"));
+        assert!(!message.contains("FullAccess"));
+        assert!(!message.contains("full_access"));
     }
 
     #[test]
@@ -5078,6 +5374,7 @@ mod tests {
             permission_cap: Some(pioneer_protocol::task_permission_cap_from_snapshot(
                 &pioneer_protocol::default_turn_permission_profile_snapshot(),
             )),
+            security_cap: None,
             result_contract: None,
             review_policy: None,
             depth: 0,

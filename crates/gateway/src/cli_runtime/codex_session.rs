@@ -226,11 +226,14 @@ impl CLIAgentRuntimeSession for CodexCLIAgentRuntimeSession {
                     approval_policy: params
                         .approval_policy
                         .unwrap_or_else(|| "default".to_owned()),
-                    sandbox: params
-                        .sandbox
-                        .as_ref()
-                        .and_then(|value| value.as_str().map(str::to_owned))
-                        .unwrap_or_else(|| "read-only".to_owned()),
+                    sandbox: params.permissions.is_none().then(|| {
+                        params
+                            .sandbox
+                            .as_ref()
+                            .and_then(|value| value.as_str().map(str::to_owned))
+                            .unwrap_or_else(|| "read-only".to_owned())
+                    }),
+                    permissions: params.permissions,
                     model: params.model,
                     service_tier: params.service_tier,
                 },
@@ -261,11 +264,14 @@ impl CLIAgentRuntimeSession for CodexCLIAgentRuntimeSession {
                     approval_policy: params
                         .approval_policy
                         .unwrap_or_else(|| "default".to_owned()),
-                    sandbox: params
-                        .sandbox
-                        .as_ref()
-                        .and_then(|value| value.as_str().map(str::to_owned))
-                        .unwrap_or_else(|| "read-only".to_owned()),
+                    sandbox: params.permissions.is_none().then(|| {
+                        params
+                            .sandbox
+                            .as_ref()
+                            .and_then(|value| value.as_str().map(str::to_owned))
+                            .unwrap_or_else(|| "read-only".to_owned())
+                    }),
+                    permissions: params.permissions,
                     model: params.model,
                     service_tier: params.service_tier,
                 },
@@ -296,7 +302,12 @@ impl CLIAgentRuntimeSession for CodexCLIAgentRuntimeSession {
                     input,
                     cwd: params.cwd,
                     approval_policy: params.approval_policy,
-                    sandbox_policy: params.sandbox,
+                    sandbox_policy: params
+                        .permissions
+                        .is_none()
+                        .then_some(params.sandbox)
+                        .flatten(),
+                    permissions: params.permissions,
                     model: params.model,
                     effort: params.effort,
                     personality: params.personality,

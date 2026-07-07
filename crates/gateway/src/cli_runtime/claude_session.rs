@@ -193,13 +193,15 @@ fn claude_process_config_from_instance(
         "--permission-prompt-tool".to_owned(),
         "stdio".to_owned(),
         "--permission-mode".to_owned(),
-        permission_mode,
-        "--safe-mode".to_owned(),
+        permission_mode.clone(),
         "--setting-sources=".to_owned(),
         "--include-partial-messages".to_owned(),
         "--input-format".to_owned(),
         "stream-json".to_owned(),
     ];
+    if permission_mode != "bypassPermissions" {
+        args.push("--safe-mode".to_owned());
+    }
     args.extend(instance.app_server_args.clone());
     args.extend(options.app_server_args.clone());
 
@@ -1464,6 +1466,10 @@ done
             .map(|pair| pair[1].clone())
     }
 
+    fn has_arg(args: &[String], flag: &str) -> bool {
+        args.iter().any(|arg| arg == flag)
+    }
+
     #[test]
     fn claude_process_config_uses_session_permission_mode() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -1484,6 +1490,60 @@ done
             arg_value_after(config.args.as_slice(), "--permission-mode").as_deref(),
             Some("acceptEdits")
         );
+    }
+
+    #[test]
+    fn claude_cli_runtime_full_access_uses_bypass_permissions_without_safe_mode() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let instance = claude_instance(temp_dir.path().to_string_lossy().into_owned());
+
+        let config = claude_process_config_from_instance(
+            &instance,
+            &CLIAgentRuntimeSessionStartOptions {
+                cwd: None,
+                approval_policy: Some("bypassPermissions".to_owned()),
+                app_server_args: Vec::new(),
+                env: Default::default(),
+            },
+        )
+        .expect("config should build");
+
+        assert_eq!(
+            arg_value_after(config.args.as_slice(), "--permission-mode").as_deref(),
+            Some("bypassPermissions")
+        );
+        assert!(
+            !has_arg(config.args.as_slice(), "--safe-mode"),
+            "FullAccess must not leave Claude trapped in safe-mode"
+        );
+    }
+
+    #[test]
+    fn claude_cli_runtime_restricted_modes_keep_safe_mode() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let instance = claude_instance(temp_dir.path().to_string_lossy().into_owned());
+
+        for permission_mode in ["default", "acceptEdits"] {
+            let config = claude_process_config_from_instance(
+                &instance,
+                &CLIAgentRuntimeSessionStartOptions {
+                    cwd: None,
+                    approval_policy: Some(permission_mode.to_owned()),
+                    app_server_args: Vec::new(),
+                    env: Default::default(),
+                },
+            )
+            .expect("config should build");
+
+            assert_eq!(
+                arg_value_after(config.args.as_slice(), "--permission-mode").as_deref(),
+                Some(permission_mode)
+            );
+            assert!(
+                has_arg(config.args.as_slice(), "--safe-mode"),
+                "restricted Claude mode `{permission_mode}` should keep safe-mode"
+            );
+        }
     }
 
     #[test]

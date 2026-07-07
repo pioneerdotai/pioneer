@@ -19,6 +19,7 @@ pub(super) struct PreparedApiProviderTurnStart {
     history: Vec<ChatMessage>,
     effective_reasoning_effort: Option<String>,
     permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot,
+    execution_security_snapshot: pioneer_protocol::TurnExecutionSecuritySnapshot,
 }
 
 struct PreparedCliRuntimeNativeTurnStart {
@@ -172,6 +173,7 @@ impl MessageProcessor {
         params: TurnStartParams,
         requested_reasoning_effort: Option<&str>,
     ) -> Result<PreparedApiProviderTurnStart, String> {
+        let security_params = params.clone();
         let outcome = self
             .thread_manager
             .turn_start(connection_id, params)
@@ -241,6 +243,18 @@ impl MessageProcessor {
                 "failed to persist turn/start state and permission audit: {error:#}"
             ));
         }
+        let execution_security_snapshot = match self
+            .persist_turn_execution_security_snapshot(&security_params, &outcome)
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(message) => {
+                self.thread_manager
+                    .rollback_turn_start(outcome.rollback_context.clone())
+                    .await;
+                return Err(message);
+            }
+        };
 
         self.ensure_hook_runtime_with_run_store().await;
         if let Err(error) = self
@@ -395,6 +409,7 @@ impl MessageProcessor {
             history,
             effective_reasoning_effort,
             permission_profile,
+            execution_security_snapshot,
         })
     }
 
@@ -419,7 +434,7 @@ impl MessageProcessor {
         let outcome = prepared.outcome;
         if let Err(error) = self
             .agent_manager
-            .start_turn_with_resolved_artifacts_environment_reasoning_and_permission_profile(
+            .start_turn_with_resolved_artifacts_environment_reasoning_permission_profile_and_security_snapshot(
                 outcome.started_notification.thread_id.as_str(),
                 outcome.started_notification.turn.id.as_str(),
                 outcome.materialization.thread.mode,
@@ -433,6 +448,7 @@ impl MessageProcessor {
                 prepared.history,
                 prepared.effective_reasoning_effort.as_deref(),
                 prepared.permission_profile,
+                prepared.execution_security_snapshot,
             )
             .await
         {
@@ -651,24 +667,9 @@ impl MessageProcessor {
                 "adapted Pioneer turn permission profile for CLI runtime"
             );
             params.cli_runtime_options = Some(permission_adapter.options.clone());
-            let sandbox_json = match params
-                .cli_runtime_options
-                .as_ref()
-                .and_then(|options| options.sandbox.as_ref())
-            {
-                Some(sandbox) => match pioneer_crud::serialize_cli_runtime_json(&sandbox.0) {
-                    Ok(sandbox_json) => Some(sandbox_json),
-                    Err(error) => {
-                        send_turn_start_failure!(format!(
-                            "failed to serialize CLI runtime sandbox policy: {error:#}"
-                        ));
-                        return;
-                    }
-                },
-                None => None,
-            };
             let effective_approval_policy = permission_adapter.output.approval_policy.clone();
-            let sandbox_policy_value = cli_runtime_sandbox_policy_value(&params);
+            let sandbox_policy_value: Option<JsonValue> = None;
+            let mut provider_permissions_id: Option<String> = None;
             let requested_reasoning_effort = requested_reasoning_effort(&params);
             let cli_runtime_effort = cli_runtime_effort(&params);
             // Transition rule: CLI turns may carry the legacy runtime effort, the
@@ -693,6 +694,7 @@ impl MessageProcessor {
                 .as_ref()
                 .and_then(|options| options.summary.clone());
 
+            let security_params = params.clone();
             let outcome = match self.thread_manager.turn_start(connection_id, params).await {
                 Ok(outcome) => outcome,
                 Err(error) => {
@@ -754,6 +756,56 @@ impl MessageProcessor {
                 ));
                 return;
             }
+            let security_snapshot = match self
+                .persist_turn_execution_security_snapshot(&security_params, &outcome)
+                .await
+            {
+                Ok(snapshot) => snapshot,
+                Err(message) => {
+                    self.thread_manager
+                        .rollback_turn_start(outcome.rollback_context.clone())
+                        .await;
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            if runtime_kind == CLIAgentRuntimeKind::Codex {
+                provider_permissions_id = Some(
+                    crate::cli_runtime::permissions::codex_permissions_profile_for_security_snapshot(
+                        &security_snapshot,
+                    )
+                    .to_owned(),
+                );
+            }
+            let sandbox_json = match sandbox_policy_value.as_ref() {
+                Some(sandbox_policy) => {
+                    match pioneer_crud::serialize_cli_runtime_json(sandbox_policy) {
+                        Ok(sandbox_json) => Some(sandbox_json),
+                        Err(error) => {
+                            self.thread_manager
+                                .rollback_turn_start(outcome.rollback_context.clone())
+                                .await;
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request_id),
+                                    INVALID_REQUEST_CODE,
+                                    format!(
+                                        "failed to serialize CLI runtime sandbox policy: {error:#}"
+                                    ),
+                                ),
+                            )
+                            .await;
+                            return;
+                        }
+                    }
+                }
+                None => None,
+            };
             self.ensure_hook_runtime_with_run_store().await;
             let context_bundle = match self
                 .compile_cli_runtime_context_bundle_for_turn(
@@ -829,6 +881,9 @@ impl MessageProcessor {
                 runtime_config.debug_native_events,
             )
             .await;
+            let thread_sandbox_label = sandbox_policy_value.as_ref().map(|sandbox_policy| {
+                serde_json::json!(cli_runtime_thread_sandbox_label(sandbox_policy))
+            });
             let native_thread =
                 match crate::cli_runtime::thread_binding::open_cli_runtime_thread_binding(
                     self.crud_store.as_ref(),
@@ -841,9 +896,8 @@ impl MessageProcessor {
                         cwd: native_cwd,
                         model: Some(outcome.materialization.thread.model.clone()),
                         approval_policy: Some(effective_approval_policy.clone()),
-                        sandbox: Some(serde_json::json!(cli_runtime_thread_sandbox_label(
-                            sandbox_policy_value.as_ref()
-                        ))),
+                        sandbox: thread_sandbox_label,
+                        permissions: provider_permissions_id.clone(),
                         service_tier: None,
                         resume_existing: cli_runtime_supports_durable_thread_resume(runtime_kind),
                         request_timeout: std::time::Duration::from_millis(
@@ -948,6 +1002,7 @@ impl MessageProcessor {
                     cwd: native_thread.binding.native_cwd,
                     approval_policy: Some(effective_approval_policy),
                     sandbox: sandbox_policy_value,
+                    permissions: provider_permissions_id,
                     model: Some(outcome.materialization.thread.model.clone()),
                     effort: effective_cli_runtime_effort,
                     personality: cli_runtime_personality,
@@ -985,8 +1040,17 @@ impl MessageProcessor {
             if !success_sent {
                 return;
             }
-            message_future(self.start_prepared_cli_runtime_native_turn(native_turn_start)).await;
+            self.spawn_prepared_cli_runtime_native_turn(native_turn_start);
         })
+    }
+
+    fn spawn_prepared_cli_runtime_native_turn(&self, prepared: PreparedCliRuntimeNativeTurnStart) {
+        let processor = self.clone();
+        let _handle = tokio::spawn(async move {
+            processor
+                .start_prepared_cli_runtime_native_turn(prepared)
+                .await;
+        });
     }
 
     async fn start_prepared_cli_runtime_native_turn(
@@ -1234,6 +1298,229 @@ impl MessageProcessor {
         Ok(turn.permission_profile.clone())
     }
 
+    async fn persist_turn_execution_security_snapshot(
+        &self,
+        params: &TurnStartParams,
+        outcome: &crate::thread::TurnStartOutcome,
+    ) -> Result<pioneer_protocol::TurnExecutionSecuritySnapshot, String> {
+        let permission_profile = self
+            .materialized_turn_permission_profile(&outcome.materialization.turn)
+            .map_err(|error| {
+                format!(
+                    "failed to resolve turn permission profile for security snapshot: {error:#}"
+                )
+            })?;
+        let workspace_id = outcome.started_notification.workspace_id.clone();
+        let input_context = crate::turn_security::TurnSecurityResolverInputContext {
+            workspace_id: workspace_id.clone(),
+            workspace_root: Some(self.turn_security_workspace_root(workspace_id.as_str())),
+            project_roots: Vec::new(),
+            effective_model_provider: outcome.materialization.thread.model_provider.clone(),
+            resolved_permission_profile: permission_profile,
+            parent_cap: None,
+            managed_policy: crate::turn_security::TurnSecurityManagedPolicyInput::default(),
+            created_at_unix_ms: now_timestamp_secs().saturating_mul(1000),
+        };
+        let resolver_input =
+            crate::turn_security::TurnSecurityResolverInput::from_turn_start_params(
+                params,
+                input_context,
+            )
+            .map_err(|error| {
+                format!("failed to build turn execution security resolver input: {error:#}")
+            })?;
+        let snapshot = crate::turn_security::resolve_turn_execution_security(&resolver_input)
+            .map_err(|error| {
+                format!("failed to resolve turn execution security snapshot: {error:#}")
+            })?;
+        let security_audit_events = self.turn_security_audit_events_for_turn(
+            outcome.started_notification.workspace_id.as_str(),
+            outcome.started_notification.thread_id.as_str(),
+            outcome.started_notification.turn.id.as_str(),
+            &snapshot,
+        );
+        self.log_turn_security_snapshot(
+            outcome.started_notification.workspace_id.as_str(),
+            outcome.started_notification.thread_id.as_str(),
+            outcome.started_notification.turn.id.as_str(),
+            &snapshot,
+        );
+        if let pioneer_protocol::TurnSecurityEnforcementStatus::Unavailable { reason } =
+            &snapshot.enforcement
+        {
+            self.materialize_turn_security_audit_events(security_audit_events)
+                .await?;
+            return Err(format!("turn execution security unavailable: {reason}"));
+        }
+        let updated = self
+            .crud_store
+            .set_turn_execution_security_snapshot(
+                outcome.started_notification.turn.id.as_str(),
+                &snapshot,
+            )
+            .await
+            .map_err(|error| {
+                format!("failed to persist turn execution security snapshot: {error:#}")
+            })?;
+        if !updated {
+            return Err(format!(
+                "failed to persist turn execution security snapshot: turn `{}` was not found",
+                outcome.started_notification.turn.id
+            ));
+        }
+        self.materialize_turn_security_audit_events(security_audit_events)
+            .await?;
+        Ok(snapshot)
+    }
+
+    fn log_turn_security_snapshot(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        snapshot: &pioneer_protocol::TurnExecutionSecuritySnapshot,
+    ) {
+        let diagnostic = crate::turn_security::turn_security_diagnostic_summary(snapshot);
+        let security_snapshot_id = snapshot.audit_id(turn_id);
+        match &snapshot.enforcement {
+            pioneer_protocol::TurnSecurityEnforcementStatus::Active => {
+                info!(
+                    target: "pioneer.security",
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    security_snapshot_id = security_snapshot_id.as_str(),
+                    security_snapshot_version = snapshot.version,
+                    security_backend = ?snapshot.backend.execution_backend,
+                    sandbox_backend = ?snapshot.backend.sandbox_backend,
+                    enforcement_status = diagnostic.enforcement_status,
+                    security_diagnostic_code = diagnostic.diagnostic_code,
+                    degraded_capabilities = ?diagnostic.degraded_capabilities,
+                    "turn execution security snapshot resolved"
+                );
+            }
+            pioneer_protocol::TurnSecurityEnforcementStatus::PartiallyActive { .. }
+            | pioneer_protocol::TurnSecurityEnforcementStatus::Unavailable { .. } => {
+                warn!(
+                    target: "pioneer.security",
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    security_snapshot_id = security_snapshot_id.as_str(),
+                    security_snapshot_version = snapshot.version,
+                    security_backend = ?snapshot.backend.execution_backend,
+                    sandbox_backend = ?snapshot.backend.sandbox_backend,
+                    enforcement_status = diagnostic.enforcement_status,
+                    security_diagnostic_code = diagnostic.diagnostic_code,
+                    degraded_capabilities = ?diagnostic.degraded_capabilities,
+                    "turn execution security snapshot degraded or unavailable"
+                );
+            }
+        }
+    }
+
+    async fn materialize_turn_security_audit_events(
+        &self,
+        events: Vec<pioneer_protocol::TurnPermissionAuditEvent>,
+    ) -> Result<(), String> {
+        let event_timestamp = now_timestamp_secs();
+        for event in events {
+            self.crud_store
+                .materialize_turn_permission_audit(event, event_timestamp)
+                .await
+                .map_err(|error| {
+                    format!("failed to persist turn execution security audit event: {error:#}")
+                })?;
+        }
+        Ok(())
+    }
+
+    fn turn_security_audit_events_for_turn(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        snapshot: &pioneer_protocol::TurnExecutionSecuritySnapshot,
+    ) -> Vec<pioneer_protocol::TurnPermissionAuditEvent> {
+        let mut events = vec![self.turn_security_audit_event_for_turn(
+            workspace_id,
+            thread_id,
+            turn_id,
+            snapshot,
+            pioneer_protocol::TurnPermissionAuditEventKind::SecuritySnapshotResolved,
+            Some("snapshot_resolved"),
+            None,
+        )];
+
+        match &snapshot.enforcement {
+            pioneer_protocol::TurnSecurityEnforcementStatus::Active => {}
+            pioneer_protocol::TurnSecurityEnforcementStatus::PartiallyActive { degraded } => {
+                events.extend(degraded.iter().map(|degradation| {
+                    self.turn_security_audit_event_for_turn(
+                        workspace_id,
+                        thread_id,
+                        turn_id,
+                        snapshot,
+                        pioneer_protocol::TurnPermissionAuditEventKind::SecuritySandboxDegraded,
+                        Some("sandbox_degraded"),
+                        Some(degradation.capability),
+                    )
+                }));
+            }
+            pioneer_protocol::TurnSecurityEnforcementStatus::Unavailable { .. } => {
+                events.push(self.turn_security_audit_event_for_turn(
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    snapshot,
+                    pioneer_protocol::TurnPermissionAuditEventKind::SecuritySandboxUnavailable,
+                    Some("sandbox_unavailable"),
+                    None,
+                ));
+            }
+        }
+
+        events
+    }
+
+    fn turn_security_audit_event_for_turn(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        snapshot: &pioneer_protocol::TurnExecutionSecuritySnapshot,
+        event_kind: pioneer_protocol::TurnPermissionAuditEventKind,
+        security_reason_code: Option<&str>,
+        security_capability: Option<pioneer_protocol::TurnSecurityCapabilityKind>,
+    ) -> pioneer_protocol::TurnPermissionAuditEvent {
+        pioneer_protocol::TurnPermissionAuditEvent {
+            workspace_id: workspace_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            event_kind,
+            profile_mode: snapshot.permission_profile.mode,
+            profile_source: snapshot.permission_profile.source,
+            security_snapshot_id: Some(snapshot.audit_id(turn_id)),
+            security_snapshot_version: Some(snapshot.version),
+            security_reason_code: security_reason_code.map(str::to_owned),
+            security_capability,
+            item_id: None,
+            tool_call_id: None,
+            tool_name: None,
+            action_kind: None,
+            request_key: None,
+            decision: None,
+            reason: None,
+            cached: false,
+        }
+    }
+
+    fn turn_security_workspace_root(&self, workspace_id: &str) -> std::path::PathBuf {
+        self.artifact_runtime_home
+            .join("workspaces")
+            .join(workspace_id)
+    }
+
     pub(super) fn turn_profile_selected_audit_event(
         &self,
         outcome: &crate::thread::TurnStartOutcome,
@@ -1262,6 +1549,10 @@ impl MessageProcessor {
             event_kind: pioneer_protocol::TurnPermissionAuditEventKind::ProfileSelected,
             profile_mode: permission_profile.mode,
             profile_source: permission_profile.source,
+            security_snapshot_id: None,
+            security_snapshot_version: None,
+            security_reason_code: None,
+            security_capability: None,
             item_id: None,
             tool_call_id: None,
             tool_name: None,
@@ -2762,18 +3053,7 @@ fn cli_runtime_effort(params: &TurnStartParams) -> Option<String> {
         .and_then(|options| options.effort.clone())
 }
 
-fn cli_runtime_sandbox_policy_value(params: &TurnStartParams) -> Option<JsonValue> {
-    params
-        .cli_runtime_options
-        .as_ref()
-        .and_then(|options| options.sandbox.as_ref())
-        .map(|sandbox| sandbox.0.clone())
-}
-
-fn cli_runtime_thread_sandbox_label(sandbox_policy: Option<&JsonValue>) -> String {
-    let Some(sandbox_policy) = sandbox_policy else {
-        return "workspace-write".to_owned();
-    };
+fn cli_runtime_thread_sandbox_label(sandbox_policy: &JsonValue) -> String {
     let raw = sandbox_policy
         .as_str()
         .or_else(|| sandbox_policy.get("type").and_then(JsonValue::as_str))
@@ -2782,7 +3062,6 @@ fn cli_runtime_thread_sandbox_label(sandbox_policy: Option<&JsonValue>) -> Strin
         "dangerfullaccess" | "fullaccess" | "dangerfull" => "danger-full-access".to_owned(),
         "readonly" | "read" => "read-only".to_owned(),
         "workspacewrite" | "workspace" | "write" => "workspace-write".to_owned(),
-        "externalsandbox" | "external" => "external-sandbox".to_owned(),
         _ => raw.trim().to_owned(),
     }
 }

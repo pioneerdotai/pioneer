@@ -23,6 +23,7 @@ pub(crate) struct CLIAgentRuntimeThreadBindingOpenRequest {
     pub model: Option<String>,
     pub approval_policy: Option<String>,
     pub sandbox: Option<serde_json::Value>,
+    pub permissions: Option<String>,
     pub service_tier: Option<String>,
     pub resume_existing: bool,
     pub request_timeout: Duration,
@@ -36,6 +37,7 @@ impl CLIAgentRuntimeThreadBindingOpenRequest {
             model: self.model.clone(),
             approval_policy: self.approval_policy.clone(),
             sandbox: self.sandbox.clone(),
+            permissions: self.permissions.clone(),
             service_tier: self.service_tier.clone(),
         }
     }
@@ -344,6 +346,7 @@ mod tests {
             model: Some("gpt-5".to_owned()),
             approval_policy: Some("on-request".to_owned()),
             sandbox: Some(json!("workspace-write")),
+            permissions: None,
             service_tier: None,
             resume_existing: true,
             request_timeout: Duration::from_secs(5),

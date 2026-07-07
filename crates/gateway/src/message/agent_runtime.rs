@@ -849,7 +849,15 @@ impl MessageProcessor {
 
         let wake_indexer = thread_episodic_index_wakeup_after_commit(&notification.item);
         let ingestor = self.thread_episodic_ingestor.read().await.clone();
-        match ingestor.ingest_committed_item(input).await {
+        let ingestion_result =
+            message_fresh_task(async move { ingestor.ingest_committed_item(input).await }).await;
+        let ingestion_result = match ingestion_result {
+            Ok(result) => result,
+            Err(error) => Err(anyhow::anyhow!(
+                "thread episodic committed-item ingestion task failed: {error}"
+            )),
+        };
+        match ingestion_result {
             Ok(crate::thread_episodic::ThreadEpisodicIngestionOutcome::Accepted) => {
                 debug!("thread episodic ingestion accepted committed item");
                 if wake_indexer {
@@ -4044,11 +4052,23 @@ impl MessageProcessor {
         };
 
         let event_timestamp = now_timestamp_secs();
-        if let Err(error) = self
-            .crud_store
-            .materialize_turn_blocked(turn_blocked.clone(), event_timestamp)
+        let materialize_blocked_result = {
+            let crud_store = self.crud_store.clone();
+            let turn_blocked = turn_blocked.clone();
+            message_fresh_task(async move {
+                crud_store
+                    .materialize_turn_blocked(turn_blocked, event_timestamp)
+                    .await
+            })
             .await
-        {
+        };
+        let materialize_blocked_result = match materialize_blocked_result {
+            Ok(result) => result,
+            Err(error) => Err(anyhow::anyhow!(
+                "turn/blocked materialization task failed: {error}"
+            )),
+        };
+        if let Err(error) = materialize_blocked_result {
             let rolled_back = self
                 .rollback_terminal_turn_finish_if_event_not_appended(
                     finish_outcome.rollback_context,
@@ -4218,11 +4238,23 @@ impl MessageProcessor {
             resume,
         };
         let event_timestamp = now_timestamp_secs();
-        if let Err(error) = self
-            .crud_store
-            .materialize_turn_blocked(turn_blocked.clone(), event_timestamp)
+        let materialize_blocked_result = {
+            let crud_store = self.crud_store.clone();
+            let turn_blocked = turn_blocked.clone();
+            message_fresh_task(async move {
+                crud_store
+                    .materialize_turn_blocked(turn_blocked, event_timestamp)
+                    .await
+            })
             .await
-        {
+        };
+        let materialize_blocked_result = match materialize_blocked_result {
+            Ok(result) => result,
+            Err(error) => Err(anyhow::anyhow!(
+                "unloaded turn/blocked materialization task failed: {error}"
+            )),
+        };
+        if let Err(error) = materialize_blocked_result {
             if pioneer_crud::turn_event_was_appended_before_error(&error) {
                 warn!(
                     thread_id,
@@ -4865,12 +4897,23 @@ impl MessageProcessor {
         };
 
         let started_timestamp = now_timestamp_secs();
-        if let Err(error) = message_future(
-            self.crud_store
-                .materialize_item_started(started.clone(), started_timestamp),
-        )
-        .await
-        {
+        let started_result = {
+            let crud_store = self.crud_store.clone();
+            let started = started.clone();
+            message_fresh_task(async move {
+                crud_store
+                    .materialize_item_started(started, started_timestamp)
+                    .await
+            })
+            .await
+        };
+        let started_result = match started_result {
+            Ok(result) => result,
+            Err(error) => Err(anyhow::anyhow!(
+                "user message item/started materialization task failed: {error}"
+            )),
+        };
+        if let Err(error) = started_result {
             warn!(
                 thread_id = thread_id,
                 turn_id = turn_id,
@@ -4898,12 +4941,23 @@ impl MessageProcessor {
         };
 
         let completed_timestamp = now_timestamp_secs();
-        if let Err(error) = message_future(
-            self.crud_store
-                .materialize_item_completed(completed.clone(), completed_timestamp),
-        )
-        .await
-        {
+        let completed_result = {
+            let crud_store = self.crud_store.clone();
+            let completed = completed.clone();
+            message_fresh_task(async move {
+                crud_store
+                    .materialize_item_completed(completed, completed_timestamp)
+                    .await
+            })
+            .await
+        };
+        let completed_result = match completed_result {
+            Ok(result) => result,
+            Err(error) => Err(anyhow::anyhow!(
+                "user message item/completed materialization task failed: {error}"
+            )),
+        };
+        if let Err(error) = completed_result {
             warn!(
                 thread_id = thread_id,
                 turn_id = turn_id,

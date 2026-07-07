@@ -113,6 +113,7 @@ pub(crate) struct CLIAgentRuntimeThreadOpenParams {
     pub model: Option<String>,
     pub approval_policy: Option<String>,
     pub sandbox: Option<JsonValue>,
+    pub permissions: Option<String>,
     pub service_tier: Option<String>,
 }
 
@@ -132,6 +133,7 @@ pub(crate) struct CLIAgentRuntimeTurnStartParams {
     pub model: Option<String>,
     pub approval_policy: Option<String>,
     pub sandbox: Option<JsonValue>,
+    pub permissions: Option<String>,
     pub effort: Option<String>,
     pub personality: Option<String>,
     pub summary: Option<String>,

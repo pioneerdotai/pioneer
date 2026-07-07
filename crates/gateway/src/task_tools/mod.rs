@@ -192,19 +192,22 @@ impl TaskToolProvider for GatewayTaskToolProvider {
             return Ok(Vec::new());
         }
 
-        let wait_state = processor
-            .task_runtime
-            .service()
-            .get_wait_state_snapshot(TaskWaitParams {
-                task_ids,
-                run_ids: Vec::new(),
-                timeout_ms: Some(0),
-                mode: TaskWaitMode::AllTerminalOrReviewRequired,
-                return_completed: false,
-                return_pending: false,
-            })
-            .await
-            .map_err(|error| format!("{error:#}"))?;
+        let task_service = processor.task_runtime.service();
+        let wait_state = task_tool_fresh_task(async move {
+            task_service
+                .get_wait_state_snapshot(TaskWaitParams {
+                    task_ids,
+                    run_ids: Vec::new(),
+                    timeout_ms: Some(0),
+                    mode: TaskWaitMode::AllTerminalOrReviewRequired,
+                    return_completed: false,
+                    return_pending: false,
+                })
+                .await
+        })
+        .await
+        .map_err(|error| format!("review-required task observation task failed: {error}"))?
+        .map_err(|error| format!("{error:#}"))?;
         let mut observations = wait_state
             .review_required
             .iter()
@@ -988,7 +991,8 @@ impl TaskToolHandler {
             input: prompt_input,
             output_instructions,
         };
-        let permission_cap = current_turn_permission_cap(&self.processor, &self.context).await?;
+        let security_cap = current_turn_security_cap(&self.processor, &self.context).await?;
+        let permission_cap = security_cap.max_permission_profile.clone();
         let agent_spec = (executor_kind == TaskExecutorKind::Agent).then_some(TaskAgentSpecInput {
             agent_role: input.agent_role,
             agent_nickname: input.agent_nickname,
@@ -998,6 +1002,7 @@ impl TaskToolHandler {
             context_policy: input.context_policy,
             tool_policy: input.tool_policy,
             permission_cap: Some(permission_cap),
+            security_cap: Some(security_cap),
             result_contract: input.result_contract,
             review_policy: None,
             depth: 0,
@@ -2411,25 +2416,25 @@ async fn current_thread_model_identity(
     Ok((model.to_owned(), model_provider.to_owned()))
 }
 
-async fn current_turn_permission_cap(
+async fn current_turn_security_cap(
     processor: &Arc<MessageProcessor>,
     context: &TaskTurnContext,
-) -> Result<pioneer_protocol::TurnPermissionProfileCap, ToolError> {
-    let turn = processor
+) -> Result<pioneer_protocol::TaskAgentSecurityCap, ToolError> {
+    let snapshot = processor
         .crud_store
-        .get_turn(context.thread_id.as_str(), context.turn_id.as_str())
+        .get_turn_execution_security_snapshot(context.turn_id.as_str())
         .await
         .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
 
-    let Some((_, turn)) = turn else {
+    let Some(record) = snapshot else {
         return Err(ToolError::execution_failed(format!(
-            "turn `{}`/`{}` is missing while resolving task permission cap",
+            "turn `{}`/`{}` is missing execution security snapshot while resolving task security cap",
             context.thread_id, context.turn_id
         )));
     };
 
-    Ok(pioneer_protocol::task_permission_cap_from_snapshot(
-        &turn.permission_profile,
+    Ok(crate::turn_security::task_security_cap_from_snapshot(
+        &record.snapshot,
     ))
 }
 
@@ -4273,6 +4278,7 @@ mod tests {
             idempotency_key: None,
             recovery: ToolRecoveryMetadata::default(),
             permission_metadata: pioneer_tools::ToolPermissionMetadata::default(),
+            execution_security_snapshot: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
     }

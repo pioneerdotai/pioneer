@@ -460,8 +460,6 @@ impl ThreadManager {
         let permission_profile = resolved_permission_profile.unwrap_or_else(|| {
             pioneer_protocol::resolve_turn_permission_profile(params.permission_profile.as_ref())
         });
-        let requested_sandbox_mode = params.sandbox_policy.map(|policy| policy.mode);
-
         let now = unix_timestamp_secs()? as i64;
 
         let mut state = self.state.write().await;
@@ -511,10 +509,6 @@ impl ThreadManager {
             entry.thread.model_provider = model_provider;
         }
         entry.thread.reasoning_effort = requested_reasoning_effort;
-        if let Some(sandbox_mode) = requested_sandbox_mode {
-            entry.sandbox_mode = sandbox_mode;
-        }
-
         let turn = pioneer_protocol::Turn {
             id: turn_id,
             status: TurnStatus::InProgress,

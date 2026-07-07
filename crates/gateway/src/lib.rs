@@ -35,6 +35,7 @@ mod thread_episodic_hooks;
 mod tokenizer;
 mod transport;
 mod turn_runtime_snapshot;
+mod turn_security;
 mod voice;
 mod workspace;
 
