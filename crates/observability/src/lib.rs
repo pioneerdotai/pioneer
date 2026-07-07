@@ -192,6 +192,7 @@ fn should_demote_rmcp_transport_worker_failure(
         && message.is_some_and(|message| {
             is_rmcp_streamable_http_initialize_response_failure(message)
                 || is_rmcp_streamable_http_auth_rejection(message)
+                || is_rmcp_streamable_http_transport_connect_failure(message)
                 || is_rmcp_streamable_http_initialized_notification_send_failure(message)
         })
 }
@@ -286,6 +287,13 @@ fn is_rmcp_streamable_http_auth_rejection(message: &str) -> bool {
             || message.contains("InsufficientScope"))
 }
 
+fn is_rmcp_streamable_http_transport_connect_failure(message: &str) -> bool {
+    message.contains("worker quit with fatal: Transport channel closed")
+        && message.contains("reqwest::Error")
+        && message.contains("kind: Request")
+        && message.contains("hyper_util::client::legacy::Error(Connect")
+}
+
 fn is_rmcp_streamable_http_initialized_notification_send_failure(message: &str) -> bool {
     message.contains("worker quit with fatal: Client error:")
         && message.contains("error sending request for url (")
@@ -366,6 +374,17 @@ mod tests {
             "rmcp::transport::worker",
             Some(
                 "worker quit with fatal: Transport channel closed, when UnexpectedServerResponse(\"HTTP 403 Forbidden: forbidden: access denied\\n\")",
+            ),
+        ));
+    }
+
+    #[test]
+    fn demotes_expected_rmcp_streamable_http_transport_connect_failure() {
+        assert!(should_demote_rmcp_transport_worker_failure(
+            &tracing::Level::ERROR,
+            "rmcp::transport::worker",
+            Some(
+                "worker quit with fatal: Transport channel closed, when Client(reqwest::Error { kind: Request, url: \"https://mcp.posthog.com/mcp\", source: hyper_util::client::legacy::Error(Connect, Error { code: -9806, message: \"connection closed via error\" }) })",
             ),
         ));
     }
