@@ -4,6 +4,7 @@ mod config;
 mod domain;
 mod error;
 mod fingerprint;
+mod policy;
 mod redaction;
 mod runtime;
 mod secrets;
@@ -19,6 +20,10 @@ pub use domain::{
 };
 pub use error::{McpConfigDocumentError, McpDiagnosticLevel, McpValidationDiagnostic};
 pub use fingerprint::fingerprint_installation;
+pub use policy::{
+    McpToolPermissionClass, McpToolPolicyClassification, McpToolSafetyHints,
+    McpToolSideEffectClass, classify_mcp_tool_policy,
+};
 pub use redaction::{REDACTED_VALUE, bounded_text, redact_text};
 pub use runtime::{
     McpRetryPolicy, McpRuntimeConnector, McpRuntimeError, McpRuntimeSession, McpSecretResolver,
