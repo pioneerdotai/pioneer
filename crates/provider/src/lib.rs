@@ -29,8 +29,8 @@ pub use registry::ProviderRegistry;
 pub use traits::Provider;
 pub use types::{
     AttachmentArtifactContext, AttachmentDataSource, ChatMessage, ChatRequest, ChatResponse,
-    CompiledPromptPayload, InputContentType, InputTypeSupport, MessageAttachment,
-    MessageContentPart, ModelInputItem, ProviderCapabilities, ProviderInputCapabilities,
-    ProviderTimeoutPolicy, ProviderToolCall, ReasoningConfig, ReasoningEffort, Role, StreamChunk,
-    TokenUsage, ToolChoice, ToolDefinition,
+    CompiledPromptPayload, EmbeddingRequest, EmbeddingResponse, InputContentType, InputTypeSupport,
+    MessageAttachment, MessageContentPart, ModelInputItem, ProviderCapabilities,
+    ProviderInputCapabilities, ProviderTimeoutPolicy, ProviderToolCall, ReasoningConfig,
+    ReasoningEffort, Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
 };

@@ -501,6 +501,7 @@ impl crate::traits::Provider for TelnyxProvider {
             streaming: true,
             vision: false,
             tool_calling: true,
+            embeddings: false,
             input_types: ProviderInputCapabilities::disabled_for_all_file_types(),
         }
     }

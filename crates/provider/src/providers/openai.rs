@@ -10,9 +10,9 @@ use crate::{
     tools::call::{StreamToolCallAccumulator, StreamToolCallDelta, StreamToolFunctionDelta},
     tools::parse::{parse_embedded_tool_payload, parse_tool_calls},
     types::{
-        ChatRequest, ChatResponse, InputContentType, InputTypeSupport, ProviderCapabilities,
-        ProviderInputCapabilities, ProviderTimeoutPolicy, ReasoningConfig, Role, StreamChunk,
-        TokenUsage, ToolChoice, ToolDefinition,
+        ChatRequest, ChatResponse, EmbeddingRequest, EmbeddingResponse, InputContentType,
+        InputTypeSupport, ProviderCapabilities, ProviderInputCapabilities, ProviderTimeoutPolicy,
+        ReasoningConfig, Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
     },
 };
 use anyhow::{Result, anyhow};
@@ -195,6 +195,24 @@ struct ApiUsage {
     prompt_tokens: Option<u64>,
     #[serde(default)]
     completion_tokens: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiEmbeddingRequest {
+    model: String,
+    input: Vec<String>,
+    encoding_format: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiEmbeddingResponse {
+    data: Vec<ApiEmbeddingData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiEmbeddingData {
+    embedding: Vec<f32>,
+    index: usize,
 }
 
 // ── SSE streaming response types ────────────────────────────────────────────
@@ -686,6 +704,10 @@ impl OpenAiProvider {
         format!("{}/models", self.base_url)
     }
 
+    fn embeddings_url(&self) -> String {
+        format!("{}/embeddings", self.base_url)
+    }
+
     async fn api_error(response: reqwest::Response) -> anyhow::Error {
         let status = response.status();
         let body = response
@@ -714,6 +736,7 @@ impl crate::traits::Provider for OpenAiProvider {
             streaming: true,
             vision: true,
             tool_calling: true,
+            embeddings: true,
             input_types: ProviderInputCapabilities {
                 text: true,
                 file: InputTypeSupport {
@@ -991,6 +1014,42 @@ impl crate::traits::Provider for OpenAiProvider {
             .into_iter()
             .map(provider_model_from_openai_model_entry)
             .collect())
+    }
+
+    async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse> {
+        let expected_count = request.input.len();
+        let api_request = ApiEmbeddingRequest {
+            model: request.model,
+            input: request.input,
+            encoding_format: "float",
+        };
+
+        let request_builder = self
+            .client
+            .post(self.embeddings_url())
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&api_request);
+        let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(Self::api_error(response).await);
+        }
+
+        let mut data = response.json::<ApiEmbeddingResponse>().await?.data;
+        data.sort_by_key(|item| item.index);
+        if data.len() != expected_count {
+            return Err(anyhow!(
+                "OpenAI embedding response returned {} embeddings for {} inputs",
+                data.len(),
+                expected_count
+            ));
+        }
+
+        Ok(EmbeddingResponse {
+            embeddings: data.into_iter().map(|item| item.embedding).collect(),
+        })
     }
 }
 

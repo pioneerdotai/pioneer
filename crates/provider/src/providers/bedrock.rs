@@ -796,6 +796,7 @@ impl crate::traits::Provider for BedrockProvider {
             streaming: false,
             vision: true,
             tool_calling: true,
+            embeddings: false,
             input_types: ProviderInputCapabilities {
                 text: true,
                 file: InputTypeSupport::native_inline_only(),

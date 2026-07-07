@@ -904,6 +904,7 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
             streaming: true,
             vision: self.input_types.image.is_supported(),
             tool_calling: true,
+            embeddings: false,
             input_types: self.input_types.clone(),
         }
     }

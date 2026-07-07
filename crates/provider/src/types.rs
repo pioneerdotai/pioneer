@@ -588,6 +588,26 @@ pub struct ChatRequest {
     pub compiled_prompt: Option<CompiledPromptPayload>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingRequest {
+    pub model: String,
+    pub input: Vec<String>,
+}
+
+impl EmbeddingRequest {
+    pub fn new(model: impl Into<String>, input: Vec<String>) -> Self {
+        Self {
+            model: model.into(),
+            input,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmbeddingResponse {
+    pub embeddings: Vec<Vec<f32>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReasoningConfig {
     Disabled,
@@ -745,6 +765,7 @@ pub struct ProviderCapabilities {
     pub streaming: bool,
     pub vision: bool,
     pub tool_calling: bool,
+    pub embeddings: bool,
     pub input_types: ProviderInputCapabilities,
 }
 

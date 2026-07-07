@@ -1,4 +1,7 @@
-use crate::types::{ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk};
+use crate::types::{
+    ChatRequest, ChatResponse, EmbeddingRequest, EmbeddingResponse, ProviderCapabilities,
+    StreamChunk,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
@@ -35,6 +38,12 @@ pub trait Provider: Send + Sync {
         anyhow::bail!("provider '{}' does not support listing models", self.name())
     }
 
+    /// Create embeddings for one or more input texts.
+    /// Default implementation returns an error for providers that do not support embeddings.
+    async fn embed(&self, _request: EmbeddingRequest) -> Result<EmbeddingResponse> {
+        anyhow::bail!("provider '{}' does not support embeddings", self.name())
+    }
+
     /// Pre-warm the HTTP connection pool (TLS handshake, DNS, HTTP/2 setup).
     /// Default implementation is a no-op.
     async fn warmup(&self) -> Result<()> {
@@ -64,6 +73,7 @@ mod tests {
                 streaming: true,
                 vision: false,
                 tool_calling: false,
+                embeddings: false,
                 input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
             }
         }

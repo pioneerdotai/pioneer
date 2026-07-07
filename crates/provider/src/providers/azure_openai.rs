@@ -616,6 +616,7 @@ impl crate::traits::Provider for AzureOpenAiProvider {
             streaming: true,
             vision: true,
             tool_calling: true,
+            embeddings: false,
             input_types: ProviderInputCapabilities {
                 text: true,
                 file: InputTypeSupport::disabled(),
