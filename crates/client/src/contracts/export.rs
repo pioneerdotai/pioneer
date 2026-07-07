@@ -1082,6 +1082,27 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Provisional
         ),
         contract_type!(
+            "voice_finalize_response_reduction.json",
+            crate::voice::VoiceFinalizeResponseReduction,
+            Domain::Composer,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "voice_finalize_ui_action.json",
+            crate::voice::VoiceFinalizeUiAction,
+            Domain::Composer,
+            Kind::ActionState,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "voice_session_result_reduction.json",
+            crate::voice::VoiceSessionResultReduction,
+            Domain::Composer,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
             "provider_api_key_action_unavailable.json",
             crate::providers::actions::ProviderApiKeyActionUnavailable,
             Domain::Providers,
