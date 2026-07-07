@@ -1612,6 +1612,7 @@ impl TaskService {
             context_policy: input.context_policy,
             tool_policy: input.tool_policy,
             permission_cap: input.permission_cap,
+            security_cap: input.security_cap,
             result_contract: input.result_contract,
             review_policy: agent_review_policy,
             depth,
@@ -3699,6 +3700,9 @@ fn validate_create_params(params: &TaskCreateParams) -> TaskRuntimeResult<()> {
         }
         if agent_spec.permission_cap.is_none() {
             bail!("agent executor requires agent_spec.permission_cap");
+        }
+        if agent_spec.security_cap.is_none() {
+            bail!("agent executor requires agent_spec.security_cap");
         }
         validate_agent_spec_for_trigger(params.trigger.spec.kind(), agent_spec)?;
     }

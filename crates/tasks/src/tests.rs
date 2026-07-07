@@ -14,8 +14,8 @@ use pioneer_crud::{
 use pioneer_protocol::{
     ArtifactBindingDirection, ArtifactBindingKind, ArtifactCreatedByKind, ArtifactKind,
     ArtifactRole, TaskAcceptParams, TaskAgentInput, TaskAgentInputVariable, TaskAgentPrompt,
-    TaskAgentReviewMode, TaskAgentReviewPolicy, TaskAgentSpecInput, TaskAgentToolPolicy,
-    TaskAgentWriteMode, TaskArtifact, TaskAttachmentMode, TaskCancelParams,
+    TaskAgentReviewMode, TaskAgentReviewPolicy, TaskAgentSecurityCap, TaskAgentSpecInput,
+    TaskAgentToolPolicy, TaskAgentWriteMode, TaskArtifact, TaskAttachmentMode, TaskCancelParams,
     TaskConcurrencyConflictPolicy, TaskConcurrencyPolicy, TaskCreateParams, TaskDeliveriesParams,
     TaskDeliveryMode, TaskDeliveryPolicy, TaskDeliveryStatus, TaskDetachParams, TaskError,
     TaskErrorClass, TaskEventPayload, TaskEventsParams, TaskExecutorKind, TaskLifecyclePolicy,
@@ -27,7 +27,9 @@ use pioneer_protocol::{
     TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind,
     TaskRunTurnStatus, TaskStatus, TaskThreadLineage, TaskTriggerCatchUpPolicy, TaskTriggerInput,
     TaskTriggerSpec, TaskTriggerStatus, TaskUpdateParams, TaskValue, TaskWaitMode, TaskWaitParams,
-    TaskWaitReviewAction, TaskWaitRevisionBlockedReason, ThreadLineage,
+    TaskWaitReviewAction, TaskWaitRevisionBlockedReason, ThreadLineage, TurnFilesystemAccess,
+    TurnFilesystemSandboxEntry, TurnNetworkPolicySnapshot, TurnPermissionMode,
+    TurnProcessPolicySnapshot, TurnSandboxMode,
 };
 use sea_orm::Database;
 use std::collections::BTreeMap;
@@ -467,6 +469,21 @@ fn test_permission_cap() -> pioneer_protocol::TurnPermissionProfileCap {
     )
 }
 
+fn test_security_cap() -> TaskAgentSecurityCap {
+    TaskAgentSecurityCap {
+        max_permission_profile: pioneer_protocol::task_permission_cap_for_mode(
+            TurnPermissionMode::AutoAcceptEdits,
+        ),
+        max_filesystem_entries: vec![TurnFilesystemSandboxEntry::workspace_root(
+            TurnFilesystemAccess::Write,
+            "/workspace",
+        )],
+        max_network_policy: TurnNetworkPolicySnapshot::disabled(),
+        max_sandbox_mode: TurnSandboxMode::WorkspaceWrite,
+        max_process_policy: TurnProcessPolicySnapshot::restricted(),
+    }
+}
+
 fn agent_spec(max_depth: i64) -> TaskAgentSpecInput {
     TaskAgentSpecInput {
         agent_role: None,
@@ -482,6 +499,7 @@ fn agent_spec(max_depth: i64) -> TaskAgentSpecInput {
         context_policy: None,
         tool_policy: None,
         permission_cap: Some(test_permission_cap()),
+        security_cap: Some(test_security_cap()),
         result_contract: None,
         review_policy: None,
         depth: 0,
@@ -3875,6 +3893,85 @@ async fn agent_task_create_requires_permission_cap() {
         .expect_err("agent task should reject missing permission cap");
 
     assert!(format!("{error:#}").contains("agent_spec.permission_cap"));
+}
+
+#[tokio::test]
+async fn task_security_cap_persists_on_agent_spec() {
+    let runtime = runtime().await;
+    let mut params = create_params(TaskTriggerSpec::Immediate);
+    params.executor_kind = TaskExecutorKind::Agent;
+    let mut spec = agent_spec(3);
+    let security_cap = test_security_cap();
+    spec.security_cap = Some(security_cap.clone());
+    params.agent_spec = Some(spec);
+
+    let created = runtime
+        .service()
+        .create_task(TaskCreateContext::default(), params)
+        .await
+        .expect("agent task should create");
+    assert_eq!(
+        created
+            .agent_spec
+            .as_ref()
+            .and_then(|spec| spec.security_cap.as_ref()),
+        Some(&security_cap)
+    );
+
+    let fetched = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: created.task.id,
+        })
+        .await
+        .expect("created task should read");
+    assert_eq!(
+        fetched
+            .agent_specs
+            .last()
+            .and_then(|spec| spec.security_cap.as_ref()),
+        Some(&security_cap)
+    );
+}
+
+#[tokio::test]
+async fn security_intersection_missing_security_cap_is_rejected_for_agent_task() {
+    let runtime = runtime().await;
+    let mut params = create_params(TaskTriggerSpec::Immediate);
+    params.executor_kind = TaskExecutorKind::Agent;
+    let mut spec = agent_spec(3);
+    spec.security_cap = None;
+    params.agent_spec = Some(spec);
+
+    let error = runtime
+        .service()
+        .create_task(TaskCreateContext::default(), params)
+        .await
+        .expect_err("agent task should reject missing security cap");
+    assert!(
+        format!("{error:#}").contains("agent_spec.security_cap"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[tokio::test]
+async fn recovery_security_missing_security_cap_is_not_defaulted() {
+    let runtime = runtime().await;
+    let mut params = create_params(TaskTriggerSpec::Immediate);
+    params.executor_kind = TaskExecutorKind::Agent;
+    let mut spec = agent_spec(3);
+    spec.security_cap = None;
+    params.agent_spec = Some(spec);
+
+    let error = runtime
+        .service()
+        .create_task(TaskCreateContext::default(), params)
+        .await
+        .expect_err("agent task should reject missing security cap");
+    let message = format!("{error:#}");
+    assert!(message.contains("agent_spec.security_cap"));
+    assert!(!message.contains("FullAccess"));
+    assert!(!message.contains("full_access"));
 }
 
 #[tokio::test]
