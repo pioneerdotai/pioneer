@@ -499,7 +499,7 @@ fn extract_task_permission_intent(invocation: &ToolInvocation) -> Option<Permiss
     }
 
     Some(PermissionIntent {
-        action: PermissionActionKind::TaskSubagent,
+        action: PermissionActionKind::Internal,
         scope,
         summary: Some(operation.to_owned()),
     })
@@ -1615,7 +1615,7 @@ mod tests {
     }
 
     #[test]
-    fn extractor_classifies_task_create_as_task_subagent() {
+    fn extractor_classifies_task_create_as_internal_task_management() {
         let invocation = invocation_for_tool(
             "task_create",
             ToolPayload::Function {
@@ -1628,7 +1628,7 @@ mod tests {
 
         let intent = extract_permission_intent(&invocation);
 
-        assert_eq!(intent.action, PermissionActionKind::TaskSubagent);
+        assert_eq!(intent.action, PermissionActionKind::Internal);
         assert_eq!(intent.scope.entries.get("domain"), Some(&"task".to_owned()));
         assert_eq!(
             intent.scope.entries.get("operation"),
