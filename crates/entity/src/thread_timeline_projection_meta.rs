@@ -21,6 +21,10 @@ pub struct Model {
     pub backfilled_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub projection_config_hash: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub projection_config_json: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}
