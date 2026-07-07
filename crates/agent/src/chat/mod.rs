@@ -71,11 +71,11 @@ use pioneer_protocol::{
     PromptManifestProfile, ProviderFailureDetails, ProviderFailureStage, ProviderTransportKind,
     RecoveryAttemptContext, ThreadMode, ToolRecoveryPolicySnapshot, TurnAcceptedCapability,
     TurnCapability, TurnCapabilityAcceptedReason, TurnCapabilityKind, TurnCapabilityRejectedReason,
-    TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowExhaustedNotification,
-    TurnExecutionWindowStartedNotification, TurnItem, TurnItemType, TurnPermissionProfileSnapshot,
-    TurnRejectedCapability, UserInput, build_execution_checkpoint_original_request_summary,
-    build_execution_checkpoint_payload, build_execution_checkpoint_provider_budget_summary,
-    generate_id,
+    TurnExecutionSecuritySnapshot, TurnExecutionWindowCheckpointedNotification,
+    TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification, TurnItem,
+    TurnItemType, TurnPermissionProfileSnapshot, TurnRejectedCapability, UserInput,
+    build_execution_checkpoint_original_request_summary, build_execution_checkpoint_payload,
+    build_execution_checkpoint_provider_budget_summary, generate_id,
 };
 use pioneer_provider::{
     AttachmentDataSource, ChatMessage, ChatRequest, CompiledPromptPayload, InputContentType,
@@ -93,7 +93,8 @@ use pioneer_tools::{
     ToolLoopBudgetExceeded, ToolLoopBudgetReason, ToolLoopGuard, ToolLoopGuardDecision,
     ToolLoopRoundAction, ToolOutcome, ToolOutcomeStatus, ToolRecoveryView, ToolResultEnvelope,
     ToolResultView, ToolRetryController, ToolRetryDecision, ToolRetryObservation,
-    build_builtin_tools, build_tools_with_environment, classify_tool_error,
+    build_builtin_tools_with_security_snapshot, build_tools_with_environment_and_security_snapshot,
+    classify_tool_error,
 };
 use serde_json::{Value as JsonValue, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -2178,6 +2179,7 @@ pub(super) async fn execute_chat_turn_flow(
     execution_window_index: u32,
     execution_checkpoint_context: Option<ExecutionCheckpointContext>,
     permission_profile: TurnPermissionProfileSnapshot,
+    execution_security_snapshot: Option<TurnExecutionSecuritySnapshot>,
     force_non_stream: bool,
     disable_tool_calling: bool,
     continue_generation_hint: bool,
@@ -2194,6 +2196,12 @@ pub(super) async fn execute_chat_turn_flow(
     event_tx: Arc<AgentEventHub>,
 ) -> Result<ChatTurnOutcome, ChatTurnError> {
     let user_message = build_user_message(input.as_slice(), resolved_artifacts.as_slice());
+
+    if execution_security_snapshot.is_none() {
+        return Err(ChatTurnError::Terminal(
+            "missing turn execution security snapshot; refusing to execute turn without resolved sandbox policy".to_owned(),
+        ));
+    }
 
     let thinking_item_id = generate_id(TURN_ITEM_ID_LEN);
     let message_item_id = generate_id(TURN_ITEM_ID_LEN);
@@ -2233,6 +2241,7 @@ pub(super) async fn execute_chat_turn_flow(
                 execution_window_index,
                 execution_checkpoint_context,
                 permission_profile,
+                execution_security_snapshot,
                 force_non_stream,
                 disable_tool_calling,
                 continue_generation_hint,
@@ -2806,6 +2815,7 @@ async fn execute_agent_provider_response(
     execution_window_index: u32,
     execution_checkpoint_context: Option<ExecutionCheckpointContext>,
     permission_profile: TurnPermissionProfileSnapshot,
+    execution_security_snapshot: Option<TurnExecutionSecuritySnapshot>,
     force_non_stream: bool,
     disable_tool_calling: bool,
     continue_generation_hint: bool,
@@ -3310,7 +3320,7 @@ async fn execute_agent_provider_response(
         permission_profile.clone(),
     );
     let runtime_environment = runtime_environment.into_iter().collect::<BTreeMap<_, _>>();
-    let tools = match build_tools_with_environment(
+    let tools = match build_tools_with_environment_and_security_snapshot(
         workdir.clone(),
         turn_id.to_owned(),
         permission_context.clone(),
@@ -3318,6 +3328,7 @@ async fn execute_agent_provider_response(
         tool_loop_config.computer_use.clone(),
         extension_bundles,
         runtime_environment.clone(),
+        execution_security_snapshot.clone(),
     ) {
         Ok(tools) => tools,
         Err(error) => {
@@ -3327,7 +3338,7 @@ async fn execute_agent_provider_response(
                 error = %error,
                 "failed to build tool runtime with extensions; continuing with built-ins only"
             );
-            build_tools_with_environment(
+            build_tools_with_environment_and_security_snapshot(
                 workdir.clone(),
                 turn_id.to_owned(),
                 permission_context.clone(),
@@ -3335,14 +3346,16 @@ async fn execute_agent_provider_response(
                 tool_loop_config.computer_use.clone(),
                 Vec::new(),
                 runtime_environment,
+                execution_security_snapshot.clone(),
             )
             .unwrap_or_else(|_| {
-                build_builtin_tools(
+                build_builtin_tools_with_security_snapshot(
                     workdir.clone(),
                     turn_id.to_owned(),
                     permission_context.clone(),
                     tool_loop_config.web.clone(),
                     tool_loop_config.computer_use.clone(),
+                    execution_security_snapshot,
                 )
             })
         }
@@ -5990,6 +6003,10 @@ mod tests {
         )
     }
 
+    fn test_full_access_security_snapshot() -> pioneer_protocol::TurnExecutionSecuritySnapshot {
+        pioneer_protocol::TurnExecutionSecuritySnapshot::unrestricted_full_access(".", 1)
+    }
+
     fn configured_test_tool(name: &str) -> ConfiguredToolSpec {
         ConfiguredToolSpec::new(
             ToolSpec::new(
@@ -6141,12 +6158,13 @@ mod tests {
 
     #[tokio::test]
     async fn request_tools_control_result_reports_unavailable_without_schema_leak() {
-        let built = pioneer_tools::build_builtin_tools(
+        let built = pioneer_tools::build_builtin_tools_with_security_snapshot(
             ".",
             "turn_agent_request_tools_result",
             test_tools_permission_context("turn_agent_request_tools_result"),
             test_web_config(),
             test_computer_use_config(),
+            Some(test_full_access_security_snapshot()),
         );
         built
             .router
@@ -6413,12 +6431,13 @@ mod tests {
 
     #[test]
     fn request_tools_visibility_expansion_exposes_computer_use_only_when_registered() {
-        let built = pioneer_tools::build_builtin_tools(
+        let built = pioneer_tools::build_builtin_tools_with_security_snapshot(
             ".",
             "turn_request_tools_computer_use_visibility",
             test_tools_permission_context("turn_request_tools_computer_use_visibility"),
             test_web_config(),
             test_computer_use_config(),
+            Some(test_full_access_security_snapshot()),
         );
         let mut visible_tool_names = vec!["request_tools".to_owned(), "read_file".to_owned()];
         let result = request_tools_result_for_added(
@@ -6448,12 +6467,13 @@ mod tests {
 
     #[test]
     fn tool_visibility_computer_use_is_hidden_by_default_and_visible_when_selected() {
-        let built = pioneer_tools::build_builtin_tools(
+        let built = pioneer_tools::build_builtin_tools_with_security_snapshot(
             ".",
             "turn_tool_visibility_computer_use",
             test_tools_permission_context("turn_tool_visibility_computer_use"),
             test_web_config(),
             test_computer_use_config(),
+            Some(test_full_access_security_snapshot()),
         );
         let core_tools = vec!["request_tools".to_owned(), "read_file".to_owned()];
 

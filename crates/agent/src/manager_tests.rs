@@ -181,7 +181,7 @@ impl AgentManager {
         capabilities: Vec<TurnCapability>,
         history: Vec<ChatMessage>,
     ) -> Result<(), AgentStartError> {
-        self.start_turn_with_resolved_artifacts_environment_reasoning_and_permission_profile(
+        self.start_turn_with_resolved_artifacts_environment_reasoning_permission_profile_and_security_snapshot(
             thread_id,
             turn_id,
             mode,
@@ -195,6 +195,7 @@ impl AgentManager {
             history,
             None,
             pioneer_protocol::default_turn_permission_profile_snapshot(),
+            test_full_access_security_snapshot(),
         )
         .await
     }
@@ -215,7 +216,7 @@ impl AgentManager {
         history: Vec<ChatMessage>,
         reasoning_effort: Option<&str>,
     ) -> Result<(), AgentStartError> {
-        self.start_turn_with_resolved_artifacts_environment_reasoning_and_permission_profile(
+        self.start_turn_with_resolved_artifacts_environment_reasoning_permission_profile_and_security_snapshot(
             thread_id,
             turn_id,
             mode,
@@ -229,6 +230,7 @@ impl AgentManager {
             history,
             reasoning_effort,
             pioneer_protocol::default_turn_permission_profile_snapshot(),
+            test_full_access_security_snapshot(),
         )
         .await
     }
@@ -249,7 +251,7 @@ impl AgentManager {
         runtime_environment: HashMap<String, String>,
         history: Vec<ChatMessage>,
     ) -> Result<(), AgentStartError> {
-        self.start_turn_with_hook_context_and_permission_profile(
+        self.start_turn_with_hook_context_permission_profile_and_security_snapshot(
             thread_id,
             turn_id,
             mode,
@@ -263,6 +265,7 @@ impl AgentManager {
             runtime_environment,
             history,
             pioneer_protocol::default_turn_permission_profile_snapshot(),
+            test_full_access_security_snapshot(),
         )
         .await
     }
@@ -286,6 +289,10 @@ fn test_tools_permission_context(turn_id: &str) -> pioneer_tools::PermissionEval
         turn_id,
         pioneer_protocol::default_turn_permission_profile_snapshot(),
     )
+}
+
+fn test_full_access_security_snapshot() -> pioneer_protocol::TurnExecutionSecuritySnapshot {
+    pioneer_protocol::TurnExecutionSecuritySnapshot::unrestricted_full_access(".", 1)
 }
 
 fn test_manager() -> AgentManager {
@@ -5854,12 +5861,13 @@ async fn phase_10_preflight_selected_optional_domain_tool_schemas_are_serialized
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
     let probe_tool_loop_config = test_tool_loop_config();
-    let computer_use_available = pioneer_tools::build_builtin_tools(
+    let computer_use_available = pioneer_tools::build_builtin_tools_with_security_snapshot(
         ".",
         "turn_phase10_computer_use_probe",
         test_tools_permission_context("turn_phase10_computer_use_probe"),
         probe_tool_loop_config.web,
         probe_tool_loop_config.computer_use,
+        Some(test_full_access_security_snapshot()),
     )
     .router
     .has_handler("computer_use");
@@ -6149,12 +6157,13 @@ async fn computer_use_text_only_model_does_not_gate_computer_use() {
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
     let probe_tool_loop_config = test_tool_loop_config();
-    let computer_use_available = pioneer_tools::build_builtin_tools(
+    let computer_use_available = pioneer_tools::build_builtin_tools_with_security_snapshot(
         ".",
         "turn_computer_use_text_only_no_gate_probe",
         test_tools_permission_context("turn_computer_use_text_only_no_gate_probe"),
         probe_tool_loop_config.web,
         probe_tool_loop_config.computer_use,
+        Some(test_full_access_security_snapshot()),
     )
     .router
     .has_handler("computer_use");
@@ -6201,12 +6210,13 @@ async fn computer_use_registered_tool_exposes_when_preflight_selects_it() {
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
     let probe_tool_loop_config = test_tool_loop_config();
-    let computer_use_available = pioneer_tools::build_builtin_tools(
+    let computer_use_available = pioneer_tools::build_builtin_tools_with_security_snapshot(
         ".",
         "turn_computer_use_registered_tool_probe",
         test_tools_permission_context("turn_computer_use_registered_tool_probe"),
         probe_tool_loop_config.web,
         probe_tool_loop_config.computer_use,
+        Some(test_full_access_security_snapshot()),
     )
     .router
     .has_handler("computer_use");

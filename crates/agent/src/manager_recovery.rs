@@ -115,6 +115,7 @@ mod tests {
             execution_usage: TurnExecutionUsageCounters::default(),
             execution_options: TurnExecutionOptions::default(),
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+            execution_security_snapshot: None,
         };
         let request = RecoveryAttemptRequest {
             recovery_job_id: "job_agents_md".to_owned(),
@@ -179,6 +180,7 @@ mod tests {
             execution_usage: TurnExecutionUsageCounters::default(),
             execution_options: TurnExecutionOptions::default(),
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+            execution_security_snapshot: None,
         };
         let payload = build_execution_checkpoint_payload(
             "ws_checkpoint".to_owned(),
@@ -352,6 +354,7 @@ mod tests {
             execution_usage: TurnExecutionUsageCounters::default(),
             execution_options: TurnExecutionOptions::default(),
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+            execution_security_snapshot: None,
         };
         let request = RecoveryAttemptRequest {
             recovery_job_id: "job_downgrade".to_owned(),

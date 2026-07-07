@@ -15,8 +15,8 @@ use pioneer_hooks::HookRuntime;
 use pioneer_protocol::{
     AgentDurableEvent, AgentProgressEvent, ExecutionCheckpointPayload,
     ExecutionWindowExhaustionReason, ItemDeltaNotification, ItemDeltaStream, McpScopeKind,
-    ProgressCoalescingKey, ProviderFailureDetails, ThreadMode, TurnCapability, TurnItemType,
-    TurnPermissionProfileSnapshot, UserInput,
+    ProgressCoalescingKey, ProviderFailureDetails, ThreadMode, TurnCapability,
+    TurnExecutionSecuritySnapshot, TurnItemType, TurnPermissionProfileSnapshot, UserInput,
 };
 #[cfg(test)]
 use pioneer_protocol::{
@@ -1413,6 +1413,7 @@ pub struct RestoredRecoveryTurnRequest {
     pub runtime_environment: HashMap<String, String>,
     pub history: Vec<ChatMessage>,
     pub permission_profile: TurnPermissionProfileSnapshot,
+    pub execution_security_snapshot: Option<TurnExecutionSecuritySnapshot>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1456,6 +1457,7 @@ struct ActiveTurnRequest {
     execution_usage: TurnExecutionUsageCounters,
     execution_options: TurnExecutionOptions,
     permission_profile: TurnPermissionProfileSnapshot,
+    execution_security_snapshot: Option<TurnExecutionSecuritySnapshot>,
 }
 
 #[derive(Debug, Clone)]
@@ -1506,6 +1508,7 @@ enum AgentCommand {
         history: Vec<ChatMessage>,
         execution_checkpoint_context: Option<ExecutionCheckpointContext>,
         permission_profile: TurnPermissionProfileSnapshot,
+        execution_security_snapshot: Option<TurnExecutionSecuritySnapshot>,
         ack: oneshot::Sender<Result<(), AgentStartError>>,
     },
     TurnTaskFinished {
@@ -1871,7 +1874,7 @@ impl AgentManager {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn start_turn_with_resolved_artifacts_environment_reasoning_and_permission_profile(
+    pub async fn start_turn_with_resolved_artifacts_environment_reasoning_permission_profile_and_security_snapshot(
         &self,
         thread_id: &str,
         turn_id: &str,
@@ -1886,6 +1889,7 @@ impl AgentManager {
         history: Vec<ChatMessage>,
         reasoning_effort: Option<&str>,
         permission_profile: TurnPermissionProfileSnapshot,
+        execution_security_snapshot: TurnExecutionSecuritySnapshot,
     ) -> Result<(), AgentStartError> {
         let reasoning = reasoning_config_from_effort(reasoning_effort)?;
         self.start_turn_with_hook_context_and_execution_checkpoint_and_reasoning(
@@ -1904,12 +1908,13 @@ impl AgentManager {
             None,
             reasoning,
             permission_profile,
+            Some(execution_security_snapshot),
         )
         .await
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn start_turn_with_hook_context_and_permission_profile(
+    pub async fn start_turn_with_hook_context_permission_profile_and_security_snapshot(
         &self,
         thread_id: &str,
         turn_id: &str,
@@ -1924,8 +1929,9 @@ impl AgentManager {
         runtime_environment: HashMap<String, String>,
         history: Vec<ChatMessage>,
         permission_profile: TurnPermissionProfileSnapshot,
+        execution_security_snapshot: TurnExecutionSecuritySnapshot,
     ) -> Result<(), AgentStartError> {
-        self.start_turn_with_hook_context_and_execution_checkpoint_and_permission_profile(
+        self.start_turn_with_hook_context_and_execution_checkpoint_permission_profile_and_security_snapshot(
             thread_id,
             turn_id,
             mode,
@@ -1940,12 +1946,13 @@ impl AgentManager {
             history,
             None,
             permission_profile,
+            execution_security_snapshot,
         )
         .await
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn start_turn_with_hook_context_and_execution_checkpoint_and_permission_profile(
+    pub async fn start_turn_with_hook_context_and_execution_checkpoint_permission_profile_and_security_snapshot(
         &self,
         thread_id: &str,
         turn_id: &str,
@@ -1961,6 +1968,7 @@ impl AgentManager {
         history: Vec<ChatMessage>,
         execution_checkpoint_context: Option<ExecutionCheckpointContext>,
         permission_profile: TurnPermissionProfileSnapshot,
+        execution_security_snapshot: TurnExecutionSecuritySnapshot,
     ) -> Result<(), AgentStartError> {
         self.start_turn_with_hook_context_and_execution_checkpoint_and_reasoning(
             thread_id,
@@ -1978,6 +1986,7 @@ impl AgentManager {
             execution_checkpoint_context,
             None,
             permission_profile,
+            Some(execution_security_snapshot),
         )
         .await
     }
@@ -2000,6 +2009,7 @@ impl AgentManager {
         execution_checkpoint_context: Option<ExecutionCheckpointContext>,
         reasoning: Option<ReasoningConfig>,
         permission_profile: TurnPermissionProfileSnapshot,
+        execution_security_snapshot: Option<TurnExecutionSecuritySnapshot>,
     ) -> Result<(), AgentStartError> {
         let command_tx = {
             let state = self.state.read().await;
@@ -2027,6 +2037,7 @@ impl AgentManager {
                 history,
                 execution_checkpoint_context,
                 permission_profile,
+                execution_security_snapshot,
                 ack: ack_tx,
             })
             .await

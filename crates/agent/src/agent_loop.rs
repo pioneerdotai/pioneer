@@ -14,8 +14,8 @@ use futures_util::FutureExt;
 use pioneer_hooks::{HookRuntime, TurnPostTurnStatus};
 use pioneer_protocol::{
     AgentDurableEvent, ExecutionWindowStatus, RecoveryAttemptContext, ThreadMode, TurnCapability,
-    TurnExecutionWindowBlockedNotification, TurnExecutionWindowContinuedNotification,
-    TurnPermissionProfileSnapshot, UserInput,
+    TurnExecutionSecuritySnapshot, TurnExecutionWindowBlockedNotification,
+    TurnExecutionWindowContinuedNotification, TurnPermissionProfileSnapshot, UserInput,
 };
 use pioneer_provider::{ChatMessage, Provider, ProviderRegistry};
 use std::future::Future;
@@ -231,6 +231,7 @@ pub(super) async fn run_agent_loop(
                 history,
                 execution_checkpoint_context,
                 permission_profile,
+                execution_security_snapshot,
                 ack,
             } => {
                 if active_turn_id.is_some() {
@@ -266,6 +267,7 @@ pub(super) async fn run_agent_loop(
                     execution_usage,
                     execution_options: super::TurnExecutionOptions::default(),
                     permission_profile,
+                    execution_security_snapshot,
                 };
 
                 let provider = match provider_registry
@@ -1003,6 +1005,7 @@ pub(super) async fn run_agent_loop(
                     execution_usage: super::TurnExecutionUsageCounters::default(),
                     execution_options: super::TurnExecutionOptions::default(),
                     permission_profile: turn_request.permission_profile,
+                    execution_security_snapshot: turn_request.execution_security_snapshot,
                 };
 
                 super::apply_recovery_adjustments(&mut active_request, &recovery_request);
@@ -1112,6 +1115,7 @@ fn spawn_turn_task(
             turn_request.execution_window_index,
             turn_request.execution_checkpoint_context,
             turn_request.permission_profile,
+            turn_request.execution_security_snapshot,
             turn_request.execution_options.force_non_stream,
             turn_request.execution_options.disable_tool_calling,
             turn_request.execution_options.continue_generation_hint,
@@ -1195,6 +1199,7 @@ async fn execute_turn_flow(
     execution_window_index: u32,
     execution_checkpoint_context: Option<super::ExecutionCheckpointContext>,
     permission_profile: TurnPermissionProfileSnapshot,
+    execution_security_snapshot: Option<TurnExecutionSecuritySnapshot>,
     force_non_stream: bool,
     disable_tool_calling: bool,
     continue_generation_hint: bool,
@@ -1231,6 +1236,7 @@ async fn execute_turn_flow(
             execution_window_index,
             execution_checkpoint_context,
             permission_profile,
+            execution_security_snapshot,
             force_non_stream,
             disable_tool_calling,
             continue_generation_hint,
