@@ -285,6 +285,7 @@ pub struct PioneerDesktop {
     pub(super) settings_content_view: SettingsContentView,
     pub(super) remote_access_settings_expanded: bool,
     pub(super) remote_access_key_input_revision: u64,
+    pub(super) vector_search_settings_expanded: bool,
     pub(super) remote_access_status_poll_generation: u64,
     pub(super) settings_tree_state: Entity<TreeState>,
     pub(super) provider_tree_state: Entity<TreeState>,

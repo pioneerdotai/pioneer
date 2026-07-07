@@ -9,6 +9,7 @@ use gpui_component::{
     spinner::Spinner,
     *,
 };
+use pioneer_client::providers::list::ProviderModelSelectorMode;
 use pioneer_client::providers::presentation::{
     self as provider_presentation, ProviderModelDisplayState,
 };
@@ -94,6 +95,7 @@ impl PioneerDesktop {
                 selected_provider: self.composer_selected_provider.clone(),
                 selected_model: self.composer_selected_model.clone(),
                 selected_reasoning_effort: self.composer_selected_reasoning_effort.clone(),
+                mode: ProviderModelSelectorMode::Chat,
                 workspace_id,
                 ws_sender: self.gateway.ws_command_sender.clone(),
                 on_save: Rc::new(

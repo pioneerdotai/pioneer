@@ -16,7 +16,9 @@ use gpui_component::{
     *,
 };
 pub(crate) use pioneer_client::composer::model_selection::ModelSelectorSelection;
-use pioneer_client::providers::list::{self as provider_list, ProviderModelSelectorState};
+use pioneer_client::providers::list::{
+    self as provider_list, ProviderModelSelectorMode, ProviderModelSelectorState,
+};
 use pioneer_client::providers::presentation as provider_presentation;
 use pioneer_protocol::ProviderModelInfo;
 use std::{
@@ -41,6 +43,7 @@ pub(crate) struct ModelSelectorDialogOptions {
     pub(crate) selected_provider: Option<String>,
     pub(crate) selected_model: Option<String>,
     pub(crate) selected_reasoning_effort: Option<String>,
+    pub(crate) mode: ProviderModelSelectorMode,
     pub(crate) workspace_id: String,
     pub(crate) ws_sender: GatewayWsCommandSender,
     pub(crate) on_save: ModelSelectorSaveCallback,
@@ -54,6 +57,7 @@ struct ModelSelectorDialogState {
     workspace_id: String,
     on_save: ModelSelectorSaveCallback,
     selector: Rc<RefCell<ProviderModelSelectorState>>,
+    mode: ProviderModelSelectorMode,
     selected_reasoning_effort: Rc<RefCell<Option<String>>>,
     provider_search_input: Entity<InputState>,
     model_search_input: Entity<InputState>,
@@ -169,9 +173,10 @@ impl PioneerDesktop {
     ) {
         let desktop_entity = cx.entity().clone();
 
-        let selector = Rc::new(RefCell::new(ProviderModelSelectorState::new(
+        let selector = Rc::new(RefCell::new(ProviderModelSelectorState::new_with_mode(
             options.selected_provider.clone(),
             options.selected_model.clone(),
+            options.mode,
         )));
         selector.borrow_mut().mark_providers_loading();
 
@@ -198,6 +203,7 @@ impl PioneerDesktop {
             workspace_id: options.workspace_id,
             on_save: options.on_save,
             selector,
+            mode: options.mode,
             selected_reasoning_effort: Rc::new(RefCell::new(options.selected_reasoning_effort)),
             provider_search_input,
             model_search_input,
@@ -211,7 +217,9 @@ impl PioneerDesktop {
         };
 
         Self::load_providers_async(cx, &state);
-        Self::load_cli_runtimes_async(cx, &state);
+        if state.mode == ProviderModelSelectorMode::Chat {
+            Self::load_cli_runtimes_async(cx, &state);
+        }
         Self::preload_selected_provider_models_async(cx, &state, options.selected_provider);
         Self::show_model_selector_dialog(window, cx, state);
     }
@@ -308,6 +316,7 @@ impl PioneerDesktop {
         let ws_sender = state.ws_sender.clone();
         let desktop_entity = state.desktop_entity.clone();
         let workspace_id = state.workspace_id.clone();
+        let mode = state.mode;
         let provider_name_for_error = provider_name.clone();
 
         cx.spawn(move |cx: &mut AsyncApp| {
@@ -331,6 +340,13 @@ impl PioneerDesktop {
                                         response,
                                     )
                                 })
+                        } else if mode == ProviderModelSelectorMode::Embeddings {
+                            ws_sender.provider_list_embedding_models(
+                                provider_list::provider_list_embedding_models_params(
+                                    workspace_id,
+                                    provider_name,
+                                ),
+                            )
                         } else {
                             ws_sender.provider_list_models(provider_list::provider_list_models_params(
                                 workspace_id,
