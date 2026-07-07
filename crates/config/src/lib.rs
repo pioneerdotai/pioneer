@@ -645,6 +645,9 @@ pub struct GatewayThreadEpisodicConfig {
     /// Segment rotation threshold based on memvid utilization stats.
     #[serde(default = "default_gateway_thread_episodic_near_capacity_percent")]
     pub near_capacity_percent: f64,
+    /// Opt-in vector search projection settings for thread episodic workspace capsules.
+    #[serde(default)]
+    pub vector_search: GatewayThreadEpisodicVectorSearchConfig,
 }
 
 impl Default for GatewayThreadEpisodicConfig {
@@ -667,8 +670,56 @@ impl Default for GatewayThreadEpisodicConfig {
             retry_max_delay_secs: default_gateway_thread_episodic_retry_max_delay_secs(),
             max_attempts: default_gateway_thread_episodic_max_attempts(),
             near_capacity_percent: default_gateway_thread_episodic_near_capacity_percent(),
+            vector_search: GatewayThreadEpisodicVectorSearchConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct GatewayThreadEpisodicVectorSearchConfig {
+    /// Enables semantic/vector search for the derived thread episodic projection.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Selected embedding provider. Ignored while `enabled` is false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<GatewayThreadEpisodicVectorProviderConfig>,
+    /// Selected provider model id. For local provider this is still kept as the
+    /// active embedding model id used in projection identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Local model choice persisted separately so switching away from Local does
+    /// not lose the user's local selection. Ignored while provider is not Local.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_model: Option<String>,
+    /// Embedding dimension for the active provider/model when known.
+    #[serde(default)]
+    pub embedding_dimension: Option<u32>,
+    /// Whether embeddings are normalized before being written/searched.
+    #[serde(default = "default_gateway_thread_episodic_vector_normalized")]
+    pub embedding_normalized: bool,
+}
+
+impl Default for GatewayThreadEpisodicVectorSearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: None,
+            model: None,
+            local_model: None,
+            embedding_dimension: None,
+            embedding_normalized: default_gateway_thread_episodic_vector_normalized(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum GatewayThreadEpisodicVectorProviderConfig {
+    #[serde(rename = "openai")]
+    OpenAi,
+    #[serde(rename = "openrouter")]
+    OpenRouter,
+    #[serde(rename = "local")]
+    Local,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1849,6 +1900,10 @@ const fn default_gateway_thread_episodic_max_attempts() -> i64 {
 
 const fn default_gateway_thread_episodic_near_capacity_percent() -> f64 {
     85.0
+}
+
+const fn default_gateway_thread_episodic_vector_normalized() -> bool {
+    true
 }
 
 fn normalized_optional_model_selection_text(
@@ -3761,6 +3816,28 @@ active_recall_model = { source = "custom", model_provider = "legacy-provider", m
         assert_eq!(config.gateway.thread_episodic.retry_max_delay_secs, 900);
         assert_eq!(config.gateway.thread_episodic.max_attempts, 5);
         assert_eq!(config.gateway.thread_episodic.near_capacity_percent, 85.0);
+        assert!(!config.gateway.thread_episodic.vector_search.enabled);
+        assert_eq!(config.gateway.thread_episodic.vector_search.provider, None);
+        assert_eq!(config.gateway.thread_episodic.vector_search.model, None);
+        assert_eq!(
+            config.gateway.thread_episodic.vector_search.local_model,
+            None
+        );
+        assert_eq!(
+            config
+                .gateway
+                .thread_episodic
+                .vector_search
+                .embedding_dimension,
+            None
+        );
+        assert!(
+            config
+                .gateway
+                .thread_episodic
+                .vector_search
+                .embedding_normalized
+        );
     }
 
     #[test]
@@ -3836,6 +3913,12 @@ active_recall_model = { source = "custom", model_provider = "legacy-provider", m
         assert_eq!(config.retry_max_delay_secs, 900);
         assert_eq!(config.max_attempts, 5);
         assert_eq!(config.near_capacity_percent, 85.0);
+        assert!(!config.vector_search.enabled);
+        assert_eq!(config.vector_search.provider, None);
+        assert_eq!(config.vector_search.model, None);
+        assert_eq!(config.vector_search.local_model, None);
+        assert_eq!(config.vector_search.embedding_dimension, None);
+        assert!(config.vector_search.embedding_normalized);
     }
 
     #[test]
@@ -3855,6 +3938,77 @@ default_prompt_chars = 1000
         assert_eq!(config.max_prompt_chars, 12_000);
         assert_eq!(config.index_batch_limit, 16);
         assert_eq!(config.near_capacity_percent, 85.0);
+        assert!(!config.vector_search.enabled);
+        assert_eq!(config.vector_search.provider, None);
+        assert_eq!(config.vector_search.model, None);
+        assert_eq!(config.vector_search.local_model, None);
+    }
+
+    #[test]
+    fn gateway_thread_episodic_vector_search_config_represents_provider_identity_without_keys() {
+        let config = toml::from_str::<super::GatewayThreadEpisodicConfig>(
+            r#"
+enabled = true
+
+[vector_search]
+enabled = true
+provider = "openrouter"
+model = "openai/text-embedding-3-small"
+local_model = "bge-base-en-v1.5"
+embedding_dimension = 1536
+embedding_normalized = true
+"#,
+        )
+        .expect("gateway thread episodic vector search config should deserialize");
+
+        assert!(config.vector_search.enabled);
+        assert_eq!(
+            config.vector_search.provider,
+            Some(super::GatewayThreadEpisodicVectorProviderConfig::OpenRouter)
+        );
+        assert_eq!(
+            config.vector_search.model.as_deref(),
+            Some("openai/text-embedding-3-small")
+        );
+        assert_eq!(
+            config.vector_search.local_model.as_deref(),
+            Some("bge-base-en-v1.5")
+        );
+        assert_eq!(config.vector_search.embedding_dimension, Some(1536));
+        assert!(config.vector_search.embedding_normalized);
+
+        let serialized =
+            toml::to_string(&config.vector_search).expect("vector config should serialize");
+        assert!(serialized.contains("provider = \"openrouter\""));
+        assert!(!serialized.contains("api_key"));
+        assert!(!serialized.contains("secret"));
+
+        let local_config = toml::from_str::<super::GatewayThreadEpisodicConfig>(
+            r#"
+enabled = true
+
+[vector_search]
+enabled = true
+provider = "local"
+model = "bge-small-en-v1.5"
+local_model = "bge-small-en-v1.5"
+embedding_dimension = 384
+"#,
+        )
+        .expect("gateway thread episodic local vector config should deserialize");
+        assert_eq!(
+            local_config.vector_search.provider,
+            Some(super::GatewayThreadEpisodicVectorProviderConfig::Local)
+        );
+        assert_eq!(
+            local_config.vector_search.model.as_deref(),
+            Some("bge-small-en-v1.5")
+        );
+        assert_eq!(
+            local_config.vector_search.local_model.as_deref(),
+            Some("bge-small-en-v1.5")
+        );
+        assert_eq!(local_config.vector_search.embedding_dimension, Some(384));
     }
 
     #[test]

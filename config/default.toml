@@ -277,6 +277,10 @@ retry_max_delay_secs = 900
 max_attempts = 5
 near_capacity_percent = 85.0
 
+[gateway.thread_episodic.vector_search]
+enabled = false
+embedding_normalized = true
+
 [gateway.auth]
 jwt_issuer = "pioneer"
 jwt_audience = "pioneer-clients"
