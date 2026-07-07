@@ -1,4 +1,4 @@
-use super::{MessageProcessor, message_future};
+use super::{MessageProcessor, message_future, record_resilience_worker_poll_error};
 use crate::bootstrap::bootstrap;
 use crate::cli_runtime::manager::{
     CLIAgentRuntimeManager, CLIAgentRuntimeSession, CLIAgentRuntimeSessionFactory,
@@ -586,6 +586,23 @@ fn thread_episodic_committed_item(
         source_context: crate::thread_episodic::committed_item_source_context(&item),
         item,
     }
+}
+
+#[test]
+fn resilience_worker_pool_timeout_is_transient_storage_backpressure() {
+    let error = anyhow::anyhow!(
+        "failed to query expired running attempts: Failed to acquire connection from pool: \
+         Connection pool timed out: Connection pool timed out"
+    );
+    let mut transient_storage_poll_failed = false;
+
+    record_resilience_worker_poll_error(
+        "timeout supervisor",
+        &error,
+        &mut transient_storage_poll_failed,
+    );
+
+    assert!(transient_storage_poll_failed);
 }
 
 #[test]

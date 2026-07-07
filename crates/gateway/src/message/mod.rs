@@ -266,12 +266,24 @@ where
     .await
 }
 
-fn record_transient_storage_poll_error(
+fn record_resilience_worker_poll_error(
+    operation: &'static str,
     error: &anyhow::Error,
     transient_storage_poll_failed: &mut bool,
 ) {
     if is_anyhow_sqlite_transient_access(error) {
         *transient_storage_poll_failed = true;
+        warn!(
+            operation,
+            error = %format!("{error:#}"),
+            "resilience worker poll deferred by transient storage access failure"
+        );
+    } else {
+        error!(
+            operation,
+            error = %format!("{error:#}"),
+            "resilience worker poll failed"
+        );
     }
 }
 
@@ -1054,11 +1066,11 @@ impl MessageProcessor {
                         }
                     }
                     Err(error) => {
-                        record_transient_storage_poll_error(
+                        record_resilience_worker_poll_error(
+                            "timeout supervisor",
                             &error,
                             &mut transient_storage_poll_failed,
                         );
-                        error!(error = %format!("{error:#}"), "timeout supervisor poll failed");
                     }
                 }
                 if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
@@ -1076,11 +1088,11 @@ impl MessageProcessor {
                         }
                     }
                     Err(error) => {
-                        record_transient_storage_poll_error(
+                        record_resilience_worker_poll_error(
+                            "recovery coordinator",
                             &error,
                             &mut transient_storage_poll_failed,
                         );
-                        error!(error = %format!("{error:#}"), "recovery coordinator poll failed");
                     }
                 }
                 if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
@@ -1130,13 +1142,10 @@ impl MessageProcessor {
                         }
                     }
                     Err(error) => {
-                        record_transient_storage_poll_error(
+                        record_resilience_worker_poll_error(
+                            "turn event projection replay",
                             &error,
                             &mut transient_storage_poll_failed,
-                        );
-                        error!(
-                            error = %format!("{error:#}"),
-                            "turn event projection replay poll failed"
                         );
                     }
                 }
@@ -1148,8 +1157,11 @@ impl MessageProcessor {
                     retry_transient_storage_access(|| this.process_due_task_deliveries(now, 64))
                         .await
                 {
-                    record_transient_storage_poll_error(&error, &mut transient_storage_poll_failed);
-                    error!(error = %format!("{error:#}"), "task delivery worker poll failed");
+                    record_resilience_worker_poll_error(
+                        "task delivery worker",
+                        &error,
+                        &mut transient_storage_poll_failed,
+                    );
                 }
                 if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
                     continue;
