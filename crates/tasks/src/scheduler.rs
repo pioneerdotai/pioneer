@@ -12,13 +12,13 @@ use pioneer_protocol::{
     TaskRunStatus, TaskTrigger, TaskTriggerKind, TaskTriggerStatus, generate_id,
 };
 use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, is_anyhow_sqlite_transient_open,
-    retry_with_backoff,
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS,
+    is_anyhow_sqlite_transient_access, retry_with_backoff,
 };
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{Duration, sleep};
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 const ID_LEN: usize = 21;
 pub const TASK_EXECUTION_LEASE_SECONDS: i64 = 300;
@@ -90,11 +90,15 @@ impl TaskScheduler {
             let sleep_duration = match processing {
                 Ok(_) => self.next_sleep_duration(now).await,
                 Err(error) => {
-                    let is_transient_storage = is_anyhow_sqlite_transient_open(&error);
-                    error!(error = %format!("{error:#}"), "task scheduler due processing failed");
+                    let is_transient_storage = is_transient_scheduler_storage_error(&error);
                     if is_transient_storage {
+                        warn!(
+                            error = %format!("{error:#}"),
+                            "task scheduler due processing deferred by transient storage access failure"
+                        );
                         Duration::from_secs(TASK_SCHEDULER_MAX_SLEEP_SECONDS)
                     } else {
+                        error!(error = %format!("{error:#}"), "task scheduler due processing failed");
                         self.next_sleep_duration(now).await
                     }
                 }
@@ -113,7 +117,7 @@ impl TaskScheduler {
     ) -> TaskRuntimeResult<usize> {
         retry_with_backoff(
             || self.process_due_once(now),
-            is_anyhow_sqlite_transient_open,
+            is_transient_scheduler_storage_error,
             DEFAULT_LOCK_RETRY_ATTEMPTS,
             Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
         )
@@ -532,4 +536,24 @@ fn is_recurring(trigger: &TaskTrigger) -> bool {
         trigger.kind(),
         TaskTriggerKind::Interval | TaskTriggerKind::Cron
     )
+}
+
+fn is_transient_scheduler_storage_error(error: &anyhow::Error) -> bool {
+    is_anyhow_sqlite_transient_access(error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_transient_scheduler_storage_error;
+    use anyhow::anyhow;
+
+    #[test]
+    fn scheduler_treats_pool_acquire_timeout_as_transient_storage_access() {
+        let error = anyhow!(
+            "failed to list active task triggers: Failed to acquire connection from pool: \
+             Connection pool timed out: Connection pool timed out"
+        );
+
+        assert!(is_transient_scheduler_storage_error(&error));
+    }
 }
