@@ -2472,9 +2472,120 @@ mod tests {
                 },
             ),
             invocation_for_tool(
+                "memory_search",
+                ToolPayload::Function {
+                    arguments: serde_json::json!({ "query": "preferences" }),
+                },
+            ),
+            invocation_for_tool(
+                "memory_list",
+                ToolPayload::Function {
+                    arguments: serde_json::json!({}),
+                },
+            ),
+            invocation_for_tool(
+                "memory_get",
+                ToolPayload::Function {
+                    arguments: serde_json::json!({ "memoryId": "mem_a" }),
+                },
+            ),
+            invocation_for_tool(
+                "memory_forget",
+                ToolPayload::Function {
+                    arguments: serde_json::json!({ "memoryId": "mem_a" }),
+                },
+            ),
+            invocation_for_tool(
+                "artifact_prepare",
+                ToolPayload::Function {
+                    arguments: serde_json::json!({ "filename": "report.md" }),
+                },
+            ),
+            invocation_for_tool(
                 "artifact_register",
                 ToolPayload::Function {
                     arguments: serde_json::json!({ "artifact_id": "artifact_a" }),
+                },
+            ),
+            invocation_for_tool(
+                "artifact_read",
+                ToolPayload::Function {
+                    arguments: serde_json::json!({ "artifactId": "artifact_a" }),
+                },
+            ),
+            invocation_for_tool(
+                "task_create",
+                ToolPayload::Function {
+                    arguments: serde_json::json!({
+                        "title": "Follow up",
+                        "goal": "Do work later"
+                    }),
+                },
+            ),
+            invocation_for_tool(
+                "task_update",
+                ToolPayload::Function {
+                    arguments: serde_json::json!({ "taskId": "task_a", "title": "Updated" }),
+                },
+            ),
+            invocation_for_tool(
+                "task_get",
+                ToolPayload::Function {
+                    arguments: serde_json::json!({ "taskId": "task_a" }),
+                },
+            ),
+            invocation_for_tool(
+                "task_list",
+                ToolPayload::Function {
+                    arguments: serde_json::json!({}),
+                },
+            ),
+            invocation_for_tool(
+                "task_wait",
+                ToolPayload::Function {
+                    arguments: serde_json::json!({ "taskIds": ["task_a"] }),
+                },
+            ),
+            invocation_for_tool(
+                "task_accept",
+                ToolPayload::Function {
+                    arguments: serde_json::json!({ "candidateId": "candidate_a" }),
+                },
+            ),
+            invocation_for_tool(
+                "task_revise",
+                ToolPayload::Function {
+                    arguments: serde_json::json!({ "candidateId": "candidate_a" }),
+                },
+            ),
+            invocation_for_tool(
+                "task_cancel",
+                ToolPayload::Function {
+                    arguments: serde_json::json!({ "taskId": "task_a" }),
+                },
+            ),
+            invocation_for_tool(
+                "task_detach",
+                ToolPayload::Function {
+                    arguments: serde_json::json!({ "taskId": "task_a" }),
+                },
+            ),
+            invocation_for_tool(
+                "task_reschedule",
+                ToolPayload::Function {
+                    arguments: serde_json::json!({ "taskId": "task_a" }),
+                },
+            ),
+            invocation_for_tool(
+                "task_pause",
+                ToolPayload::Function {
+                    arguments: serde_json::json!({ "taskId": "task_a" }),
+                },
+            ),
+            invocation_for_tool(
+                "task_resume",
+                ToolPayload::Function {
+                    arguments: serde_json::json!({ "taskId": "task_a" }),
                 },
             ),
         ];
