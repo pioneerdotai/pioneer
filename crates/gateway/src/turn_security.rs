@@ -61,6 +61,7 @@ pub(crate) struct TurnSecurityResolverInputContext {
     pub workspace_id: String,
     pub workspace_root: Option<PathBuf>,
     pub project_roots: Vec<PathBuf>,
+    pub app_read_roots: Vec<PathBuf>,
     pub effective_model_provider: String,
     pub resolved_permission_profile: TurnPermissionProfileSnapshot,
     pub parent_cap: Option<TurnSecurityParentCapSnapshot>,
@@ -75,6 +76,7 @@ pub(crate) struct TurnSecurityResolverInput {
     pub turn_id: String,
     pub workspace_root: PathBuf,
     pub project_roots: Vec<PathBuf>,
+    pub app_read_roots: Vec<PathBuf>,
     pub composer_permission_selection: Option<TurnPermissionProfileSelection>,
     pub resolved_permission_profile: TurnPermissionProfileSnapshot,
     pub execution_backend: TurnSecurityResolverExecutionBackend,
@@ -97,6 +99,11 @@ impl TurnSecurityResolverInput {
             .into_iter()
             .map(|path| validate_path("project_root", path))
             .collect::<Result<Vec<_>>>()?;
+        let app_read_roots = context
+            .app_read_roots
+            .into_iter()
+            .map(|path| validate_path("app_read_root", path))
+            .collect::<Result<Vec<_>>>()?;
         let execution_backend = resolve_execution_backend(
             params.execution_backend.as_ref(),
             context.effective_model_provider.as_str(),
@@ -108,6 +115,7 @@ impl TurnSecurityResolverInput {
             turn_id,
             workspace_root,
             project_roots,
+            app_read_roots,
             composer_permission_selection: params.permission_profile.clone(),
             resolved_permission_profile: context.resolved_permission_profile,
             execution_backend,
@@ -247,6 +255,7 @@ pub(crate) fn resolve_task_child_execution_security(
         turn_id: child_turn_id,
         workspace_root: PathBuf::from(cwd),
         project_roots: Vec::new(),
+        app_read_roots: Vec::new(),
         composer_permission_selection: None,
         resolved_permission_profile: snapshot.permission_profile.clone(),
         execution_backend: TurnSecurityResolverExecutionBackend::NativeApiProvider {
@@ -497,7 +506,8 @@ fn filesystem_entries(
     input: &TurnSecurityResolverInput,
     access: TurnFilesystemAccess,
 ) -> Vec<TurnFilesystemSandboxEntry> {
-    let mut entries = Vec::with_capacity(1 + input.project_roots.len());
+    let mut entries =
+        Vec::with_capacity(1 + input.project_roots.len() + input.app_read_roots.len());
     entries.push(TurnFilesystemSandboxEntry::workspace_root(
         access,
         input.workspace_root.to_string_lossy().into_owned(),
@@ -510,6 +520,16 @@ fn filesystem_entries(
             access,
             provenance: TurnSecurityRuleProvenance::Project,
             resolved_path: Some(project_root.to_string_lossy().into_owned()),
+        });
+    }
+    for app_read_root in &input.app_read_roots {
+        entries.push(TurnFilesystemSandboxEntry {
+            path: TurnFilesystemSandboxPath::ExplicitPath {
+                path: app_read_root.to_string_lossy().into_owned(),
+            },
+            access: TurnFilesystemAccess::Read,
+            provenance: TurnSecurityRuleProvenance::Runtime,
+            resolved_path: Some(app_read_root.to_string_lossy().into_owned()),
         });
     }
     entries
@@ -910,6 +930,7 @@ mod tests {
             workspace_id: "workspace_1".to_owned(),
             workspace_root: Some(PathBuf::from("/tmp/workspace_1")),
             project_roots: vec![PathBuf::from("/tmp/workspace_1/project")],
+            app_read_roots: Vec::new(),
             effective_model_provider: "openai".to_owned(),
             resolved_permission_profile: TurnPermissionProfileSnapshot::from_mode(
                 TurnPermissionMode::Supervised,
@@ -1115,6 +1136,54 @@ mod tests {
                 assert!(snapshot.sandbox.filesystem.entries.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn security_resolver_includes_app_read_roots_as_runtime_read_roots() {
+        let app_read_root = PathBuf::from("/tmp/pioneer-runtime/skills");
+        let mut input = resolver_input_for_mode_and_backend(TurnPermissionMode::Supervised, None);
+        input.app_read_roots = vec![app_read_root.clone()];
+
+        let snapshot = resolve_turn_execution_security(&input).expect("snapshot should resolve");
+
+        let app_entry = snapshot
+            .sandbox
+            .filesystem
+            .entries
+            .iter()
+            .find(|entry| entry.resolved_path.as_deref() == app_read_root.to_str())
+            .expect("app read root should be included");
+        assert_eq!(app_entry.access, TurnFilesystemAccess::Read);
+        assert_eq!(app_entry.provenance, TurnSecurityRuleProvenance::Runtime);
+    }
+
+    #[test]
+    fn security_resolver_keeps_app_roots_read_only_in_workspace_write_mode() {
+        let app_read_root = PathBuf::from("/tmp/pioneer-runtime/skills");
+        let mut input =
+            resolver_input_for_mode_and_backend(TurnPermissionMode::AutoAcceptEdits, None);
+        input.app_read_roots = vec![app_read_root.clone()];
+
+        let snapshot = resolve_turn_execution_security(&input).expect("snapshot should resolve");
+
+        let workspace_entry = snapshot
+            .sandbox
+            .filesystem
+            .entries
+            .iter()
+            .find(|entry| entry.provenance == TurnSecurityRuleProvenance::Workspace)
+            .expect("workspace root should be included");
+        assert_eq!(workspace_entry.access, TurnFilesystemAccess::Write);
+
+        let app_entry = snapshot
+            .sandbox
+            .filesystem
+            .entries
+            .iter()
+            .find(|entry| entry.resolved_path.as_deref() == app_read_root.to_str())
+            .expect("app read root should be included");
+        assert_eq!(app_entry.access, TurnFilesystemAccess::Read);
+        assert_eq!(app_entry.provenance, TurnSecurityRuleProvenance::Runtime);
     }
 
     #[test]

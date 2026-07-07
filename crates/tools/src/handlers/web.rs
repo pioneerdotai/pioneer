@@ -11,6 +11,7 @@ use crate::web::{
     WebSearchModelPayload, WebSearchResultItem, default_favicon_url, render_download_ui_text,
     render_web_fetch_ui_text, render_web_search_ui_text,
 };
+use crate::{FilePolicyChecker, FilePolicyDecision};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use pioneer_protocol::TurnExecutionSecuritySnapshot;
@@ -370,11 +371,25 @@ impl ToolHandler for DownloadUrlHandler {
             include_headers: false,
         };
 
-        let destination = resolve_download_destination(
+        let mut destination = resolve_download_destination(
             invocation.workdir.as_path(),
             args.destination.as_deref(),
             args.url.as_str(),
         )?;
+        if let Some(snapshot) = invocation.execution_security_snapshot.as_ref() {
+            match FilePolicyChecker::check_write(snapshot, destination.as_path()) {
+                FilePolicyDecision::Allowed(grant) => {
+                    destination = grant.resolved_path;
+                }
+                FilePolicyDecision::Denied(deny) => {
+                    return Err(ToolError::Rejected(format!(
+                        "filesystem sandbox denied Write for download destination `{}`: {}",
+                        deny.requested_path.display(),
+                        deny.message
+                    )));
+                }
+            }
+        }
 
         let stream_result = download_to_file(
             args.url.as_str(),
@@ -1311,5 +1326,93 @@ mod tests {
             matches!(error, ToolError::Rejected(ref message) if message.contains("network access is disabled")),
             "unexpected error: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn download_url_policy_denies_destination_outside_workspace_before_request() {
+        let base =
+            std::env::temp_dir().join(format!("pioneer-download-policy-{}", std::process::id()));
+        let workspace = base.join("workspace");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(workspace.as_path()).expect("workspace should create");
+        std::fs::create_dir_all(outside.as_path()).expect("outside should create");
+        let destination = outside.join("archive.tgz");
+        let snapshot = pioneer_protocol::TurnExecutionSecuritySnapshot::read_only(
+            pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+                pioneer_protocol::TurnPermissionMode::Supervised,
+                pioneer_protocol::TurnPermissionProfileSource::Composer,
+            ),
+            workspace.to_string_lossy(),
+            vec![
+                pioneer_protocol::TurnFilesystemSandboxEntry::workspace_root(
+                    pioneer_protocol::TurnFilesystemAccess::Read,
+                    workspace.to_string_lossy(),
+                ),
+            ],
+            1_700_000_000_000,
+        );
+        let handler = DownloadUrlHandler::new(test_web_config());
+        let invocation = ToolInvocation {
+            call_id: "call_download".to_owned(),
+            tool_name: "download_url".to_owned(),
+            source: crate::context::ToolCallSource::Model,
+            payload: ToolPayload::Function {
+                arguments: serde_json::json!({
+                    "url": "https://example.com/archive.tgz",
+                    "destination": destination.display().to_string(),
+                }),
+            },
+            workdir: workspace.clone(),
+            environment: Default::default(),
+            attempt_id: 1,
+            idempotency_key: None,
+            recovery: crate::spec::ToolRecoveryMetadata::default(),
+            permission_metadata: crate::spec::ToolPermissionMetadata::default(),
+            execution_security_snapshot: Some(snapshot),
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        };
+
+        let result = handler
+            .handle(
+                invocation,
+                crate::events::ToolEventBus::default().start_trace(
+                    "turn",
+                    "call_download",
+                    "download_url",
+                ),
+            )
+            .await;
+        let error = match result {
+            Ok(_) => panic!("outside destination should be rejected before network"),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(error, ToolError::Rejected(ref message) if message.contains("download destination") && message.contains("outside the allowed sandbox roots")),
+            "unexpected error: {error}"
+        );
+        assert!(!destination.exists());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    fn test_web_config() -> WebToolsConfig {
+        WebToolsConfig {
+            default_timeout_ms: 1,
+            hard_max_timeout_ms: 10,
+            default_fetch_max_bytes: 1024,
+            hard_fetch_max_bytes: 2048,
+            default_download_max_bytes: 1024,
+            hard_download_max_bytes: 2048,
+            default_max_results: 3,
+            hard_max_results: 5,
+            default_snippet_chars: 120,
+            hard_max_snippet_chars: 240,
+            default_link_count: 3,
+            hard_link_count: 5,
+            default_render_max_chars: 1024,
+            ddg_html_search_url: "https://duckduckgo.com/html/".to_owned(),
+            ddg_instant_api_url: "https://api.duckduckgo.com/".to_owned(),
+            default_user_agent: "Mozilla/5.0".to_owned(),
+        }
     }
 }

@@ -570,13 +570,18 @@ fn network_url_intent(
     };
 
     apply_url_scope(&mut scope, raw_url);
-    if invocation.tool_name == "download_url"
-        && let Some(destination) = args.and_then(|arguments| string_field(arguments, "destination"))
-    {
-        scope.entries.insert(
-            "destination".to_owned(),
-            resolve_requested_path(invocation.workdir.as_path(), destination),
-        );
+    if invocation.tool_name == "download_url" {
+        let destination = args
+            .and_then(|arguments| string_field(arguments, "destination"))
+            .map(|destination| resolve_requested_path(invocation.workdir.as_path(), destination))
+            .unwrap_or_else(|| {
+                invocation
+                    .workdir
+                    .join("__pioneer_download_destination__")
+                    .display()
+                    .to_string()
+            });
+        scope.entries.insert("destination".to_owned(), destination);
     }
 
     let target = scope
@@ -2065,6 +2070,26 @@ mod tests {
         assert_eq!(
             intent.scope.entries.get("destination"),
             Some(&"/workspace/downloads/archive.tgz".to_owned())
+        );
+    }
+
+    #[test]
+    fn extractor_marks_download_url_implicit_destination_under_workdir() {
+        let invocation = invocation_for_tool(
+            "download_url",
+            ToolPayload::Function {
+                arguments: serde_json::json!({
+                    "url": "https://example.com/archive.tgz"
+                }),
+            },
+        );
+
+        let intent = extract_permission_intent(&invocation);
+
+        assert_eq!(intent.action, PermissionActionKind::Network);
+        assert_eq!(
+            intent.scope.entries.get("destination"),
+            Some(&"/workspace/__pioneer_download_destination__".to_owned())
         );
     }
 

@@ -696,7 +696,15 @@ impl ToolHandler for ListDirHandler {
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let args = parse_json_args::<ListDirArgs>(invocation.payload)?;
         let base = args.path.unwrap_or_else(|| ".".to_owned());
-        let root = resolve_path(invocation.workdir.as_path(), base.as_str());
+        let mut root =
+            normalize_path_lexically(resolve_path(invocation.workdir.as_path(), base.as_str()));
+        if let Some(allowed_path) = enforce_file_policy_for_tool(
+            invocation.execution_security_snapshot.as_ref(),
+            FilePolicyOperation::Read,
+            root.as_path(),
+        )? {
+            root = allowed_path;
+        }
         let depth_limit = args
             .depth
             .unwrap_or(DEFAULT_LIST_DEPTH)
@@ -813,7 +821,18 @@ impl ToolHandler for GrepHandler {
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let args = parse_json_args::<GrepArgs>(invocation.payload)?;
         let base = args.path.as_deref().unwrap_or(".");
-        let search_path = resolve_path_within_workdir(invocation.workdir.as_path(), base)?;
+        let search_path = if invocation.execution_security_snapshot.is_some() {
+            let requested_path =
+                normalize_path_lexically(resolve_path(invocation.workdir.as_path(), base));
+            enforce_file_policy_for_tool(
+                invocation.execution_security_snapshot.as_ref(),
+                FilePolicyOperation::Read,
+                requested_path.as_path(),
+            )?
+            .unwrap_or(requested_path)
+        } else {
+            resolve_path_within_workdir(invocation.workdir.as_path(), base)?
+        };
 
         let max_results = args
             .max_results
@@ -2401,6 +2420,23 @@ mod tests {
         }
     }
 
+    fn list_invocation(call_id: &str, workdir: PathBuf, arguments: JsonValue) -> ToolInvocation {
+        ToolInvocation {
+            call_id: call_id.to_owned(),
+            tool_name: "list_dir".to_owned(),
+            source: ToolCallSource::Model,
+            payload: ToolPayload::Function { arguments },
+            workdir,
+            environment: Default::default(),
+            attempt_id: 1,
+            idempotency_key: None,
+            recovery: ToolRecoveryMetadata::default(),
+            permission_metadata: crate::spec::ToolPermissionMetadata::default(),
+            execution_security_snapshot: None,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
     fn write_invocation(call_id: &str, workdir: PathBuf, arguments: JsonValue) -> ToolInvocation {
         ToolInvocation {
             call_id: call_id.to_owned(),
@@ -2441,6 +2477,21 @@ mod tests {
         )
     }
 
+    fn read_only_security_snapshot(root: &Path) -> TurnExecutionSecuritySnapshot {
+        TurnExecutionSecuritySnapshot::read_only(
+            TurnPermissionProfileSnapshot::from_mode(
+                TurnPermissionMode::Supervised,
+                TurnPermissionProfileSource::Composer,
+            ),
+            root.to_string_lossy(),
+            vec![TurnFilesystemSandboxEntry::workspace_root(
+                TurnFilesystemAccess::Read,
+                root.to_string_lossy(),
+            )],
+            1,
+        )
+    }
+
     fn unrestricted_full_access_security_snapshot(root: &Path) -> TurnExecutionSecuritySnapshot {
         TurnExecutionSecuritySnapshot::unrestricted_full_access(root.to_string_lossy(), 1)
     }
@@ -2470,6 +2521,10 @@ mod tests {
         ToolEventBus::default().start_trace("turn", call_id, "read_file")
     }
 
+    fn list_trace(call_id: &str) -> crate::events::ToolEventTrace {
+        ToolEventBus::default().start_trace("turn", call_id, "list_dir")
+    }
+
     fn write_trace(call_id: &str) -> crate::events::ToolEventTrace {
         ToolEventBus::default().start_trace("turn", call_id, "write_file")
     }
@@ -2487,6 +2542,124 @@ mod tests {
             "pioneer-tools-{name}-{}-{suffix}",
             std::process::id()
         ))
+    }
+
+    #[tokio::test]
+    async fn list_dir_policy_denies_path_outside_workspace_read_root_before_open() {
+        let root = temp_path("list-policy-root");
+        let outside = temp_path("list-policy-outside");
+        fs::create_dir_all(root.as_path())
+            .await
+            .expect("root dir should create");
+        fs::create_dir_all(outside.as_path())
+            .await
+            .expect("outside dir should create");
+        let snapshot = read_only_security_snapshot(root.as_path());
+
+        let result = ListDirHandler
+            .handle(
+                with_execution_security_snapshot(
+                    list_invocation(
+                        "list_policy_denied",
+                        root.clone(),
+                        serde_json::json!({ "path": outside.display().to_string() }),
+                    ),
+                    snapshot,
+                ),
+                list_trace("list_policy_denied"),
+            )
+            .await;
+        let error = match result {
+            Ok(_) => panic!("list_dir outside root should be denied"),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(error, ToolError::Rejected(message) if message.contains("outside the allowed sandbox roots"))
+        );
+        let _ = fs::remove_dir_all(root).await;
+        let _ = fs::remove_dir_all(outside).await;
+    }
+
+    #[tokio::test]
+    async fn grep_files_policy_denies_path_outside_workspace_read_root_before_search() {
+        let root = temp_path("grep-policy-root");
+        let outside = temp_path("grep-policy-outside");
+        fs::create_dir_all(root.as_path())
+            .await
+            .expect("root dir should create");
+        fs::create_dir_all(outside.as_path())
+            .await
+            .expect("outside dir should create");
+        fs::write(outside.join("secret.txt"), "needle")
+            .await
+            .expect("outside file should write");
+        let snapshot = read_only_security_snapshot(root.as_path());
+
+        let result = GrepHandler
+            .handle(
+                with_execution_security_snapshot(
+                    grep_invocation(
+                        root.clone(),
+                        serde_json::json!({
+                            "pattern": "needle",
+                            "path": outside.display().to_string(),
+                        }),
+                    ),
+                    snapshot,
+                ),
+                trace(),
+            )
+            .await;
+        let error = match result {
+            Ok(_) => panic!("grep_files outside root should be denied"),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(error, ToolError::Rejected(message) if message.contains("outside the allowed sandbox roots"))
+        );
+        let _ = fs::remove_dir_all(root).await;
+        let _ = fs::remove_dir_all(outside).await;
+    }
+
+    #[tokio::test]
+    async fn grep_files_policy_allows_path_inside_workspace_read_root() {
+        let root = temp_path("grep-policy-allowed");
+        fs::create_dir_all(root.as_path())
+            .await
+            .expect("root dir should create");
+        fs::write(root.join("file.txt"), "needle\n")
+            .await
+            .expect("file should write");
+        let snapshot = read_only_security_snapshot(root.as_path());
+
+        let output = GrepHandler
+            .handle(
+                with_execution_security_snapshot(
+                    grep_invocation(
+                        root.clone(),
+                        serde_json::json!({
+                            "pattern": "needle",
+                            "path": ".",
+                        }),
+                    ),
+                    snapshot,
+                ),
+                trace(),
+            )
+            .await
+            .expect("grep_files should be allowed inside workspace root");
+
+        assert!(output.success());
+        assert!(
+            output
+                .raw_json()
+                .get("output")
+                .and_then(JsonValue::as_str)
+                .is_some_and(|output| output.contains("needle"))
+        );
+        let _ = fs::remove_dir_all(root).await;
     }
 
     #[test]

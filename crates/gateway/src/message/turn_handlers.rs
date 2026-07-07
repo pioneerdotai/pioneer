@@ -1315,6 +1315,7 @@ impl MessageProcessor {
             workspace_id: workspace_id.clone(),
             workspace_root: Some(self.turn_security_workspace_root(workspace_id.as_str())),
             project_roots: Vec::new(),
+            app_read_roots: self.turn_security_app_read_roots(),
             effective_model_provider: outcome.materialization.thread.model_provider.clone(),
             resolved_permission_profile: permission_profile,
             parent_cap: None,
@@ -1519,6 +1520,10 @@ impl MessageProcessor {
         self.artifact_runtime_home
             .join("workspaces")
             .join(workspace_id)
+    }
+
+    fn turn_security_app_read_roots(&self) -> Vec<std::path::PathBuf> {
+        vec![self.artifact_runtime_home.join("skills")]
     }
 
     pub(super) fn turn_profile_selected_audit_event(
