@@ -70,10 +70,19 @@ pub(crate) struct ZstdColumnCompressionSummary {
     pub(crate) column: &'static str,
     pub(crate) enabled_now: bool,
     pub(crate) already_enabled: bool,
+    pub(crate) skipped_empty: bool,
     pub(crate) total_rows: u64,
     pub(crate) pending_before: u64,
     pub(crate) pending_after: u64,
     pub(crate) maintenance_more_pending: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EnsureCompressionResult {
+    total_rows: u64,
+    was_enabled: bool,
+    enabled_now: bool,
+    skipped_empty: bool,
 }
 
 pub(crate) async fn run_startup_once(
@@ -85,20 +94,9 @@ pub(crate) async fn run_startup_once(
     let db = crud_store.database_connection();
     verify_sqlite_zstd_registered(&db).await?;
 
-    let total_rows = row_count(&db, config).await?;
-    let was_enabled = compression_is_enabled(&db, config).await?;
-    let mut enabled_now = false;
-
-    if !was_enabled {
-        mark_compression_backfilling(&db, config).await?;
-        if let Err(error) = enable_transparent_compression(&db, config).await {
-            mark_compression_failed(&db, config, &error).await?;
-            return Err(error);
-        }
-        mark_compression_complete(&db, config, total_rows).await?;
-        enabled_now = true;
-    } else {
-        mark_existing_compression_complete(&db, config, total_rows).await?;
+    let ensure = ensure_compression_enabled(&db, config).await?;
+    if ensure.skipped_empty {
+        return Ok(summary_without_maintenance(config, ensure));
     }
 
     let pending_before = pending_uncompressed_rows(&db, config).await?;
@@ -109,9 +107,10 @@ pub(crate) async fn run_startup_once(
     Ok(ZstdColumnCompressionSummary {
         table: config.table,
         column: config.column,
-        enabled_now,
-        already_enabled: was_enabled,
-        total_rows,
+        enabled_now: ensure.enabled_now,
+        already_enabled: ensure.was_enabled,
+        skipped_empty: ensure.skipped_empty,
+        total_rows: ensure.total_rows,
         pending_before,
         pending_after,
         maintenance_more_pending,
@@ -129,26 +128,30 @@ pub(crate) async fn run_periodic_maintenance_once(
 
     let mut before = Vec::with_capacity(configs.len());
     for config in configs {
-        before.push((
-            *config,
-            row_count(&db, *config).await?,
-            compression_is_enabled(&db, *config).await?,
-            pending_uncompressed_rows(&db, *config).await?,
-        ));
+        let ensure = ensure_compression_enabled(&db, *config).await?;
+        let pending_before = pending_uncompressed_rows(&db, *config).await?;
+        before.push((*config, ensure, pending_before));
     }
 
-    let maintenance_more_pending =
-        run_maintenance(&db, maintenance_seconds, target_db_load).await?;
+    let should_run_maintenance = before
+        .iter()
+        .any(|(_, ensure, _)| ensure.was_enabled || ensure.enabled_now);
+    let maintenance_more_pending = if should_run_maintenance {
+        run_maintenance(&db, maintenance_seconds, target_db_load).await?
+    } else {
+        false
+    };
 
     let mut summaries = Vec::with_capacity(before.len());
-    for (config, total_rows, was_enabled, pending_before) in before {
+    for (config, ensure, pending_before) in before {
         let pending_after = pending_uncompressed_rows(&db, config).await?;
         summaries.push(ZstdColumnCompressionSummary {
             table: config.table,
             column: config.column,
-            enabled_now: false,
-            already_enabled: was_enabled,
-            total_rows,
+            enabled_now: ensure.enabled_now,
+            already_enabled: ensure.was_enabled,
+            skipped_empty: ensure.skipped_empty,
+            total_rows: ensure.total_rows,
             pending_before,
             pending_after,
             maintenance_more_pending,
@@ -156,6 +159,56 @@ pub(crate) async fn run_periodic_maintenance_once(
     }
 
     Ok(summaries)
+}
+
+async fn ensure_compression_enabled(
+    db: &DatabaseConnection,
+    config: ZstdColumnConfig,
+) -> Result<EnsureCompressionResult> {
+    let total_rows = row_count(db, config).await?;
+    let was_enabled = compression_is_enabled(db, config).await?;
+    let mut enabled_now = false;
+    let mut skipped_empty = false;
+
+    if !was_enabled {
+        if total_rows == 0 {
+            skipped_empty = true;
+        } else {
+            mark_compression_backfilling(db, config).await?;
+            if let Err(error) = enable_transparent_compression(db, config).await {
+                mark_compression_failed(db, config, &error).await?;
+                return Err(error);
+            }
+            mark_compression_complete(db, config, total_rows).await?;
+            enabled_now = true;
+        }
+    } else {
+        mark_existing_compression_complete(db, config, total_rows).await?;
+    }
+
+    Ok(EnsureCompressionResult {
+        total_rows,
+        was_enabled,
+        enabled_now,
+        skipped_empty,
+    })
+}
+
+fn summary_without_maintenance(
+    config: ZstdColumnConfig,
+    ensure: EnsureCompressionResult,
+) -> ZstdColumnCompressionSummary {
+    ZstdColumnCompressionSummary {
+        table: config.table,
+        column: config.column,
+        enabled_now: ensure.enabled_now,
+        already_enabled: ensure.was_enabled,
+        skipped_empty: ensure.skipped_empty,
+        total_rows: ensure.total_rows,
+        pending_before: 0,
+        pending_after: 0,
+        maintenance_more_pending: false,
+    }
 }
 
 async fn verify_sqlite_zstd_registered(db: &DatabaseConnection) -> Result<()> {
@@ -403,7 +456,10 @@ fn now_datetime() -> DateTimeWithTimeZone {
 
 #[cfg(test)]
 mod tests {
-    use super::{TURN_EVENT_PAYLOAD, TURN_ITEM_PAYLOAD, ZSTD_PAYLOAD_COLUMNS, run_startup_once};
+    use super::{
+        TURN_EVENT_PAYLOAD, TURN_ITEM_PAYLOAD, ZSTD_PAYLOAD_COLUMNS, run_periodic_maintenance_once,
+        run_startup_once,
+    };
     use migration::{Migrator, MigratorTrait};
     use pioneer_crud::{CrudStore, find_projection_meta};
     use pioneer_protocol::{AgentMessagePhase, TurnItem};
@@ -506,26 +562,33 @@ mod tests {
         let store = CrudStore::new(connection.clone());
         let summary = run_startup_once(&store, TURN_EVENT_PAYLOAD, None, 1.0)
             .await
-            .expect("compression should enable on empty database");
+            .expect("compression startup should skip empty database");
 
-        assert!(summary.enabled_now);
+        assert!(!summary.enabled_now);
         assert!(!summary.already_enabled);
+        assert!(summary.skipped_empty);
         assert_eq!(summary.total_rows, 0);
         assert_eq!(summary.pending_before, 0);
         assert_eq!(summary.pending_after, 0);
 
+        let table_count = query_i64(
+            &connection,
+            "SELECT COUNT(*) AS value FROM sqlite_master WHERE type = 'table' AND name = 'turn_event'",
+        )
+        .await;
         let view_count = query_i64(
             &connection,
             "SELECT COUNT(*) AS value FROM sqlite_master WHERE type = 'view' AND name = 'turn_event'",
         )
         .await;
-        let backing_rows = query_i64(
+        let backing_table_count = query_i64(
             &connection,
-            "SELECT COUNT(*) AS value FROM _turn_event_zstd",
+            "SELECT COUNT(*) AS value FROM sqlite_master WHERE type = 'table' AND name = '_turn_event_zstd'",
         )
         .await;
-        assert_eq!(view_count, 1);
-        assert_eq!(backing_rows, 0);
+        assert_eq!(table_count, 1);
+        assert_eq!(view_count, 0);
+        assert_eq!(backing_table_count, 0);
 
         insert_turn_events(&connection, 3).await;
         let rows_after_insert =
@@ -536,31 +599,32 @@ mod tests {
              WHERE json_extract(payload, '$.payload.sequence') IS NOT NULL",
         )
         .await;
-        let pending_after_insert = query_i64(
+        let backing_table_after_insert = query_i64(
             &connection,
-            "SELECT COUNT(*) AS value FROM _turn_event_zstd WHERE _payload_dict IS NULL",
+            "SELECT COUNT(*) AS value FROM sqlite_master WHERE type = 'table' AND name = '_turn_event_zstd'",
         )
         .await;
         assert_eq!(rows_after_insert, 3);
         assert_eq!(json_extract_rows, 3);
-        assert_eq!(pending_after_insert, 3);
-
-        let maintenance = run_startup_once(&store, TURN_EVENT_PAYLOAD, None, 1.0)
-            .await
-            .expect("maintenance should not fail on small new database batches");
-        assert!(!maintenance.enabled_now);
-        assert!(maintenance.already_enabled);
-        assert_eq!(maintenance.pending_before, 3);
-        assert_eq!(maintenance.pending_after, 3);
+        assert_eq!(backing_table_after_insert, 0);
 
         insert_turn_events_with_offset(&connection, 120, 1_000).await;
         let compression = run_startup_once(&store, TURN_EVENT_PAYLOAD, None, 1.0)
             .await
-            .expect("maintenance should compress after a new database accumulates enough rows");
-        assert!(!compression.enabled_now);
-        assert!(compression.already_enabled);
+            .expect("compression should enable after a new database accumulates rows");
+        assert!(compression.enabled_now);
+        assert!(!compression.already_enabled);
+        assert!(!compression.skipped_empty);
+        assert_eq!(compression.total_rows, 123);
         assert_eq!(compression.pending_before, 123);
         assert_eq!(compression.pending_after, 0);
+
+        let view_count_after_compression = query_i64(
+            &connection,
+            "SELECT COUNT(*) AS value FROM sqlite_master WHERE type = 'view' AND name = 'turn_event'",
+        )
+        .await;
+        assert_eq!(view_count_after_compression, 1);
     }
 
     #[tokio::test]
@@ -723,13 +787,33 @@ mod tests {
         let store = CrudStore::new(connection.clone());
         let summary = run_startup_once(&store, TURN_ITEM_PAYLOAD, None, 1.0)
             .await
-            .expect("turn_item compression should enable on empty database");
+            .expect("turn_item compression startup should skip empty database");
 
-        assert!(summary.enabled_now);
+        assert!(!summary.enabled_now);
         assert!(!summary.already_enabled);
+        assert!(summary.skipped_empty);
         assert_eq!(summary.total_rows, 0);
         assert_eq!(summary.pending_before, 0);
         assert_eq!(summary.pending_after, 0);
+
+        let table_count = query_i64(
+            &connection,
+            "SELECT COUNT(*) AS value FROM sqlite_master WHERE type = 'table' AND name = 'turn_item'",
+        )
+        .await;
+        let view_count = query_i64(
+            &connection,
+            "SELECT COUNT(*) AS value FROM sqlite_master WHERE type = 'view' AND name = 'turn_item'",
+        )
+        .await;
+        let backing_table_count = query_i64(
+            &connection,
+            "SELECT COUNT(*) AS value FROM sqlite_master WHERE type = 'table' AND name = '_turn_item_zstd'",
+        )
+        .await;
+        assert_eq!(table_count, 1);
+        assert_eq!(view_count, 0);
+        assert_eq!(backing_table_count, 0);
 
         insert_turn_items(&connection, 3).await;
         let item = store
@@ -739,29 +823,98 @@ mod tests {
             .expect("new turn_item should exist");
         assert!(matches!(item, TurnItem::AgentMessage { .. }));
 
-        let pending_after_insert = query_i64(
+        let backing_table_after_insert = query_i64(
             &connection,
-            "SELECT COUNT(*) AS value FROM _turn_item_zstd WHERE _payload_dict IS NULL",
+            "SELECT COUNT(*) AS value FROM sqlite_master WHERE type = 'table' AND name = '_turn_item_zstd'",
         )
         .await;
-        assert_eq!(pending_after_insert, 3);
-
-        let maintenance = run_startup_once(&store, TURN_ITEM_PAYLOAD, None, 1.0)
-            .await
-            .expect("turn_item maintenance should not fail on small new database batches");
-        assert!(!maintenance.enabled_now);
-        assert!(maintenance.already_enabled);
-        assert_eq!(maintenance.pending_before, 3);
-        assert_eq!(maintenance.pending_after, 3);
+        assert_eq!(backing_table_after_insert, 0);
 
         insert_turn_items_with_offset(&connection, 120, 1_000).await;
         let compression = run_startup_once(&store, TURN_ITEM_PAYLOAD, None, 1.0)
             .await
-            .expect("turn_item maintenance should compress after enough rows accumulate");
-        assert!(!compression.enabled_now);
-        assert!(compression.already_enabled);
+            .expect("turn_item compression should enable after enough rows accumulate");
+        assert!(compression.enabled_now);
+        assert!(!compression.already_enabled);
+        assert!(!compression.skipped_empty);
+        assert_eq!(compression.total_rows, 123);
         assert_eq!(compression.pending_before, 123);
         assert_eq!(compression.pending_after, 0);
+
+        let view_count_after_compression = query_i64(
+            &connection,
+            "SELECT COUNT(*) AS value FROM sqlite_master WHERE type = 'view' AND name = 'turn_item'",
+        )
+        .await;
+        assert_eq!(view_count_after_compression, 1);
+    }
+
+    #[tokio::test]
+    async fn periodic_maintenance_enables_compression_after_empty_startup_gets_rows() {
+        pioneer_sqlite::zstd::register_auto_extension_once()
+            .expect("sqlite-zstd auto-extension should register");
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect sqlite memory");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+
+        let store = CrudStore::new(connection.clone());
+        for config in ZSTD_PAYLOAD_COLUMNS {
+            let summary = run_startup_once(&store, *config, None, 1.0)
+                .await
+                .expect("empty startup should skip compression");
+            assert!(summary.skipped_empty);
+        }
+
+        let turn_event_table = query_i64(
+            &connection,
+            "SELECT COUNT(*) AS value FROM sqlite_master WHERE type = 'table' AND name = 'turn_event'",
+        )
+        .await;
+        let turn_item_table = query_i64(
+            &connection,
+            "SELECT COUNT(*) AS value FROM sqlite_master WHERE type = 'table' AND name = 'turn_item'",
+        )
+        .await;
+        assert_eq!(turn_event_table, 1);
+        assert_eq!(turn_item_table, 1);
+
+        insert_turn_events(&connection, 120).await;
+        insert_turn_items(&connection, 120).await;
+
+        let summaries = run_periodic_maintenance_once(&store, ZSTD_PAYLOAD_COLUMNS, None, 1.0)
+            .await
+            .expect("periodic maintenance should enable compression without restart");
+        assert_eq!(summaries.len(), 2);
+        for summary in summaries {
+            assert!(summary.enabled_now);
+            assert!(!summary.already_enabled);
+            assert!(!summary.skipped_empty);
+            assert_eq!(summary.total_rows, 120);
+            assert_eq!(summary.pending_before, 120);
+            assert_eq!(summary.pending_after, 0);
+        }
+
+        let turn_event_view = query_i64(
+            &connection,
+            "SELECT COUNT(*) AS value FROM sqlite_master WHERE type = 'view' AND name = 'turn_event'",
+        )
+        .await;
+        let turn_item_view = query_i64(
+            &connection,
+            "SELECT COUNT(*) AS value FROM sqlite_master WHERE type = 'view' AND name = 'turn_item'",
+        )
+        .await;
+        let turn_event_rows =
+            query_i64(&connection, "SELECT COUNT(*) AS value FROM turn_event").await;
+        let turn_item_rows =
+            query_i64(&connection, "SELECT COUNT(*) AS value FROM turn_item").await;
+        assert_eq!(turn_event_view, 1);
+        assert_eq!(turn_item_view, 1);
+        assert_eq!(turn_event_rows, 120);
+        assert_eq!(turn_item_rows, 120);
     }
 
     #[tokio::test]

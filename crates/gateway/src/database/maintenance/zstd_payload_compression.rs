@@ -29,6 +29,9 @@ pub(super) fn spawn(crud_store: Arc<CrudStore>) {
                         info!(
                             table = summary.table,
                             column = summary.column,
+                            enabled_now = summary.enabled_now,
+                            already_enabled = summary.already_enabled,
+                            skipped_empty = summary.skipped_empty,
                             total_rows = summary.total_rows,
                             pending_before = summary.pending_before,
                             pending_after = summary.pending_after,

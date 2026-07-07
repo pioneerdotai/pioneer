@@ -446,6 +446,8 @@ mod tests {
             permission_profile_mode: Set(None),
             permission_profile_source: Set(None),
             permission_profile_snapshot_json: Set(None),
+            execution_security_snapshot_version: Set(None),
+            execution_security_snapshot_json: Set(None),
         })
         .exec(&connection)
         .await
