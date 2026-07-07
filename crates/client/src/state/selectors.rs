@@ -485,6 +485,7 @@ mod tests {
             workspace_id: workspace_id.to_owned(),
             thread_id: thread_id.to_owned(),
             turn_id: "turn".to_owned(),
+            visible_thread_ids: Vec::new(),
             tool_name: "exec_command".to_owned(),
             action: pioneer_protocol::TurnPermissionActionKind::ShellCommand,
             scope_hash: format!("{request_id}_scope"),

@@ -30,11 +30,15 @@ impl MessageProcessor {
             return;
         };
 
+        let visible_thread_ids = self
+            .native_permission_visible_thread_ids(thread_id.as_str())
+            .await;
         let protocol_request = TurnPermissionApprovalRequest {
             request_id: request.request_id.clone(),
             workspace_id: workspace_id.clone(),
             thread_id: thread_id.clone(),
             turn_id: turn_id.clone(),
+            visible_thread_ids,
             tool_name: request.tool_name,
             action: request.key.action,
             scope_hash: request.key.normalized_scope_hash,
@@ -208,6 +212,40 @@ impl MessageProcessor {
                 "failed to send turn permission response"
             );
         }
+    }
+
+    async fn native_permission_visible_thread_ids(&self, thread_id: &str) -> Vec<String> {
+        let mut visible_thread_ids = Vec::new();
+        let mut seen = HashSet::<String>::new();
+        let mut current = thread_id.to_owned();
+
+        for _ in 0..64 {
+            let lineage = match self
+                .crud_store
+                .get_task_thread_lineage(current.as_str())
+                .await
+            {
+                Ok(Some(lineage)) => lineage,
+                Ok(None) => break,
+                Err(error) => {
+                    warn!(
+                        thread_id = current,
+                        error = %format!("{error:#}"),
+                        "failed to resolve visible parent threads for native permission request"
+                    );
+                    break;
+                }
+            };
+
+            let parent_thread_id = lineage.parent_thread_id;
+            if !seen.insert(parent_thread_id.clone()) {
+                break;
+            }
+            visible_thread_ids.push(parent_thread_id.clone());
+            current = parent_thread_id;
+        }
+
+        visible_thread_ids
     }
 }
 

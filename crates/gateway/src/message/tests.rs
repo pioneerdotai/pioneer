@@ -16433,6 +16433,93 @@ async fn turn_permission_request_respond_resolves_native_pending_request_and_bro
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_permission_request_from_child_is_visible_in_parent_thread_scope() {
+    let (tx, mut rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+    let parent_thread_id = "thread_native_permission_parent";
+    let parent_turn_id = "turn_native_permission_parent";
+    let child_thread_id = "thread_native_permission_child";
+    let child_turn_id = "turn_native_permission_child";
+
+    processor
+        .crud_store
+        .append_task_event(
+            TaskEventPayload::TaskThreadLineageCreated {
+                task_id: "task_native_permission_child".to_owned(),
+                run_id: "run_native_permission_child".to_owned(),
+                lineage: TaskThreadLineage {
+                    child_thread_id: child_thread_id.to_owned(),
+                    parent_thread_id: parent_thread_id.to_owned(),
+                    root_thread_id: parent_thread_id.to_owned(),
+                    depth: 1,
+                    origin_kind: Some("task_run".to_owned()),
+                    created_by_thread_id: Some(parent_thread_id.to_owned()),
+                    created_by_turn_id: Some(parent_turn_id.to_owned()),
+                    created_at: 10,
+                },
+            },
+            10,
+        )
+        .await
+        .expect("child task lineage should persist");
+    let (respond_tx, _respond_rx) = tokio::sync::oneshot::channel();
+
+    processor
+        .open_native_permission_request(crate::permissions::GatewayPermissionApprovalRequest {
+            request_id: "perm-approval-child-visible-1".to_owned(),
+            workspace_id: Some(workspace_id.clone()),
+            thread_id: Some(child_thread_id.to_owned()),
+            turn_id: Some(child_turn_id.to_owned()),
+            tool_name: "exec_command".to_owned(),
+            key: pioneer_tools::PermissionRequestKey {
+                profile_mode: pioneer_protocol::TurnPermissionMode::Supervised,
+                tool_name: "exec_command".to_owned(),
+                action: pioneer_tools::PermissionActionKind::ShellCommand,
+                normalized_scope_hash: "scope-hash-child-visible".to_owned(),
+                turn_id: child_turn_id.to_owned(),
+            },
+            reason: pioneer_tools::PermissionDecisionReason::PolicyRequiresApproval,
+            summary: Some("run child shell command".to_owned()),
+            details: Vec::new(),
+            respond_to: respond_tx,
+        })
+        .await;
+
+    let opened = recv_notification_by_method(&mut rx, events::TURN_PERMISSION_REQUEST_OPENED).await;
+    assert_eq!(opened.method, events::TURN_PERMISSION_REQUEST_OPENED);
+    let opened_params = opened.params.as_ref().expect("opened params");
+    assert_eq!(
+        opened_params["request"]["thread_id"],
+        serde_json::json!(child_thread_id)
+    );
+    assert_eq!(
+        opened_params["request"]["turn_id"],
+        serde_json::json!(child_turn_id)
+    );
+    assert_eq!(
+        opened_params["request"]["visible_thread_ids"],
+        serde_json::json!([parent_thread_id])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_permission_request_cancellation_resolves_and_removes_pending_request() {
     let (tx, mut rx) = mpsc::channel(16);
     let session_manager = Arc::new(SessionManager::new());

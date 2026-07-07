@@ -962,6 +962,8 @@ pub struct TurnPermissionApprovalRequest {
     pub workspace_id: String,
     pub thread_id: String,
     pub turn_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub visible_thread_ids: Vec<String>,
     pub tool_name: String,
     pub action: TurnPermissionActionKind,
     pub scope_hash: String,

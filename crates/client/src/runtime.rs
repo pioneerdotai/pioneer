@@ -1009,6 +1009,7 @@ mod tests {
                     workspace_id: "ws_a".to_owned(),
                     thread_id: "thread_a".to_owned(),
                     turn_id: "turn_a".to_owned(),
+                    visible_thread_ids: Vec::new(),
                     tool_name: "shell".to_owned(),
                     action: pioneer_protocol::TurnPermissionActionKind::ShellCommand,
                     scope_hash: "scope_a".to_owned(),

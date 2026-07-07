@@ -564,9 +564,23 @@ fn pending_request_matches_scope(
 ) -> bool {
     workspace_id.map_or(true, |workspace_id| request.workspace_id == workspace_id)
         && match thread_id {
-            Some(thread_id) => request.thread_id.as_deref() == Some(thread_id),
+            Some(thread_id) => {
+                request.thread_id.as_deref() == Some(thread_id)
+                    || pending_request_visible_thread_ids(request)
+                        .iter()
+                        .any(|visible_thread_id| visible_thread_id == thread_id)
+            }
             None => request.thread_id.is_none(),
         }
+}
+
+fn pending_request_visible_thread_ids(request: &PendingRequest) -> &[String] {
+    match &request.payload {
+        PendingRequestPayload::NativePermissionGate { request } => {
+            request.visible_thread_ids.as_slice()
+        }
+        _ => &[],
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1086,6 +1100,7 @@ mod tests {
             workspace_id: "ws".to_owned(),
             thread_id: "thread".to_owned(),
             turn_id: "turn".to_owned(),
+            visible_thread_ids: Vec::new(),
             tool_name: "exec_command".to_owned(),
             action: pioneer_protocol::TurnPermissionActionKind::ShellCommand,
             scope_hash: "scope".to_owned(),
@@ -1206,6 +1221,46 @@ mod tests {
             pending.payload,
             PendingRequestPayload::NativePermissionGate { .. }
         ));
+    }
+
+    #[test]
+    fn native_permission_request_is_visible_in_parent_thread_scope() {
+        let mut request = native_permission_request("req_native");
+        request.thread_id = "child_thread".to_owned();
+        request.visible_thread_ids = vec!["parent_thread".to_owned()];
+        let pending = PendingRequest::from_native_permission_request(request);
+        let mut state = PendingRequestState::default();
+
+        state.apply(PendingRequestsReduction::Opened(pending.clone()));
+
+        assert_eq!(
+            state.pending_for_scope(Some("ws"), Some("child_thread")),
+            vec![pending.clone()]
+        );
+        assert_eq!(
+            state.pending_for_scope(Some("ws"), Some("parent_thread")),
+            vec![pending]
+        );
+        assert!(
+            state
+                .pending_for_scope(Some("ws"), Some("other_thread"))
+                .is_empty()
+        );
+
+        state.apply(PendingRequestsReduction::Resolved {
+            request_id: "req_native".to_owned(),
+        });
+
+        assert!(
+            state
+                .pending_for_scope(Some("ws"), Some("parent_thread"))
+                .is_empty()
+        );
+        assert!(
+            state
+                .pending_for_scope(Some("ws"), Some("child_thread"))
+                .is_empty()
+        );
     }
 
     #[test]
