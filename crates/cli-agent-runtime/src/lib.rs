@@ -9,6 +9,7 @@
 //! this CLI process/runtime boundary.
 
 pub mod approval;
+pub mod capabilities;
 pub mod claude;
 pub mod codex;
 pub mod config;

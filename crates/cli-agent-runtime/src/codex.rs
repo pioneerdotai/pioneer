@@ -1551,7 +1551,10 @@ pub struct CodexAccountReadResponse {
 pub struct CodexThreadStartParams {
     pub cwd: String,
     pub approval_policy: String,
-    pub sandbox: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1597,6 +1600,8 @@ pub struct CodexTurnStartParams {
     pub approval_policy: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_policy: Option<JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4320,7 +4325,8 @@ while read line; do :; done
                     CodexThreadStartParams {
                         cwd: "/tmp/project".to_owned(),
                         approval_policy: "on-request".to_owned(),
-                        sandbox: "workspace-write".to_owned(),
+                        sandbox: Some("workspace-write".to_owned()),
+                        permissions: None,
                         model: Some("gpt-5".to_owned()),
                         service_tier: Some("priority".to_owned()),
                     },
@@ -4381,6 +4387,7 @@ while read line; do :; done
                             "writableRoots": ["/tmp/project"],
                             "networkAccess": true
                         })),
+                        permissions: None,
                         model: Some("gpt-5".to_owned()),
                         effort: Some("medium".to_owned()),
                         personality: None,
@@ -4430,6 +4437,91 @@ while read line; do :; done
     }
 
     #[tokio::test]
+    async fn codex_security_thread_start_serializes_danger_full_access() {
+        let mut fake = FakeCodexAppServer::new();
+        let client = fake.client.clone();
+        let start = tokio::spawn(async move {
+            client
+                .thread_start(
+                    CodexThreadStartParams {
+                        cwd: "/tmp/project".to_owned(),
+                        approval_policy: "never".to_owned(),
+                        sandbox: Some("danger-full-access".to_owned()),
+                        permissions: None,
+                        model: None,
+                        service_tier: None,
+                    },
+                    Duration::from_secs(2),
+                )
+                .await
+        });
+
+        let request = fake.read_message().await;
+        assert_eq!(request["method"], json!("thread/start"));
+        assert_eq!(
+            request["params"],
+            json!({
+                "cwd": "/tmp/project",
+                "approvalPolicy": "never",
+                "sandbox": "danger-full-access"
+            })
+        );
+        fake.write_result_response(
+            request["id"].clone(),
+            json!({ "thread": { "id": "codex-thread-full-access" } }),
+        )
+        .await;
+
+        start
+            .await
+            .expect("thread start task should join")
+            .expect("thread start should succeed");
+    }
+
+    #[tokio::test]
+    async fn codex_security_turn_start_serializes_permissions_profile() {
+        let mut fake = FakeCodexAppServer::new();
+        let client = fake.client.clone();
+        let turn_start = tokio::spawn(async move {
+            client
+                .turn_start(
+                    CodexTurnStartParams {
+                        thread_id: "codex-thread-existing".to_owned(),
+                        input: vec![CLIRuntimeTurnInputItem::Text {
+                            text: "Inspect project".to_owned(),
+                        }],
+                        cwd: Some("/tmp/project".to_owned()),
+                        approval_policy: Some("on-request".to_owned()),
+                        sandbox_policy: None,
+                        permissions: Some(":read-only".to_owned()),
+                        model: None,
+                        effort: None,
+                        personality: None,
+                        summary: None,
+                    },
+                    Duration::from_secs(2),
+                )
+                .await
+        });
+
+        let request = fake.read_message().await;
+        assert_eq!(request["method"], json!("turn/start"));
+        assert_eq!(request["params"]["approvalPolicy"], json!("on-request"));
+        assert_eq!(request["params"]["permissions"], json!(":read-only"));
+        assert_eq!(request["params"].get("sandboxPolicy"), None);
+        fake.write_result_response(
+            request["id"].clone(),
+            json!({ "turn": { "id": "codex-turn-read-only" } }),
+        )
+        .await;
+
+        turn_start
+            .await
+            .expect("turn start task should join")
+            .expect("turn start should succeed");
+    }
+
+    #[tokio::test]
     async fn codex_turn_start_omits_effort_when_not_selected() {
         let mut fake = FakeCodexAppServer::new();
         let client = fake.client.clone();
@@ -4444,6 +4536,7 @@ while read line; do :; done
                         cwd: None,
                         approval_policy: None,
                         sandbox_policy: None,
+                        permissions: None,
                         model: Some("gpt-5".to_owned()),
                         effort: None,
                         personality: None,
@@ -4793,7 +4886,8 @@ while read line; do :; done
                     CodexThreadStartParams {
                         cwd: "/tmp/project".to_owned(),
                         approval_policy: "never".to_owned(),
-                        sandbox: "danger-full-access".to_owned(),
+                        sandbox: Some("danger-full-access".to_owned()),
+                        permissions: None,
                         model: None,
                         service_tier: None,
                     },
