@@ -554,7 +554,17 @@
             "recall_enabled": true,
             "retry_base_delay_secs": 30,
             "retry_max_delay_secs": 900,
-            "snippet_chars": 360
+            "snippet_chars": 360,
+            "vector_search": {
+              "embedding_normalized": true,
+              "enabled": false,
+              "local_model_status": "not_selected",
+              "provider_key": {
+                "present": false,
+                "required": false
+              },
+              "refill_status": "disabled"
+            }
           }
         }
       },
@@ -708,6 +718,19 @@
           "type": "integer",
           "format": "uint32",
           "minimum": 0
+        },
+        "vector_search": {
+          "$ref": "#/$defs/GatewayThreadEpisodicVectorSearchSettings",
+          "default": {
+            "embedding_normalized": true,
+            "enabled": false,
+            "local_model_status": "not_selected",
+            "provider_key": {
+              "present": false,
+              "required": false
+            },
+            "refill_status": "disabled"
+          }
         }
       },
       "required": [
@@ -857,6 +880,164 @@
           ],
           "format": "uint32",
           "minimum": 0
+        },
+        "vector_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayThreadEpisodicVectorSearchSettingsUpdate"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "GatewayThreadEpisodicVectorLocalModelStatus": {
+      "type": "string",
+      "enum": [
+        "not_selected",
+        "unknown",
+        "missing",
+        "downloading",
+        "installed",
+        "failed"
+      ]
+    },
+    "GatewayThreadEpisodicVectorProvider": {
+      "type": "string",
+      "enum": [
+        "openai",
+        "openrouter",
+        "local"
+      ]
+    },
+    "GatewayThreadEpisodicVectorProviderKeyStatus": {
+      "type": "object",
+      "properties": {
+        "present": {
+          "type": "boolean",
+          "default": false
+        },
+        "required": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "GatewayThreadEpisodicVectorRefillStatus": {
+      "type": "string",
+      "enum": [
+        "disabled",
+        "unknown",
+        "required",
+        "running",
+        "complete",
+        "failed"
+      ]
+    },
+    "GatewayThreadEpisodicVectorSearchSettings": {
+      "type": "object",
+      "properties": {
+        "embedding_dimension": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "embedding_normalized": {
+          "type": "boolean",
+          "default": true
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "local_model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "local_model_status": {
+          "$ref": "#/$defs/GatewayThreadEpisodicVectorLocalModelStatus",
+          "default": "not_selected"
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayThreadEpisodicVectorProvider"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "provider_key": {
+          "$ref": "#/$defs/GatewayThreadEpisodicVectorProviderKeyStatus",
+          "default": {
+            "present": false,
+            "required": false
+          }
+        },
+        "refill_status": {
+          "$ref": "#/$defs/GatewayThreadEpisodicVectorRefillStatus",
+          "default": "disabled"
+        }
+      }
+    },
+    "GatewayThreadEpisodicVectorSearchSettingsUpdate": {
+      "type": "object",
+      "properties": {
+        "embedding_dimension": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "embedding_normalized": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "local_model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayThreadEpisodicVectorProvider"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     }

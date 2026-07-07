@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GatewayThreadEpisodicVectorSearchSettings",
+  "type": "object",
+  "properties": {
+    "embedding_dimension": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0
+    },
+    "embedding_normalized": {
+      "type": "boolean",
+      "default": true
+    },
+    "enabled": {
+      "type": "boolean",
+      "default": false
+    },
+    "local_model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "local_model_status": {
+      "$ref": "#/$defs/GatewayThreadEpisodicVectorLocalModelStatus",
+      "default": "not_selected"
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "provider": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GatewayThreadEpisodicVectorProvider"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "provider_key": {
+      "$ref": "#/$defs/GatewayThreadEpisodicVectorProviderKeyStatus",
+      "default": {
+        "present": false,
+        "required": false
+      }
+    },
+    "refill_status": {
+      "$ref": "#/$defs/GatewayThreadEpisodicVectorRefillStatus",
+      "default": "disabled"
+    }
+  },
+  "$defs": {
+    "GatewayThreadEpisodicVectorLocalModelStatus": {
+      "type": "string",
+      "enum": [
+        "not_selected",
+        "unknown",
+        "missing",
+        "downloading",
+        "installed",
+        "failed"
+      ]
+    },
+    "GatewayThreadEpisodicVectorProvider": {
+      "type": "string",
+      "enum": [
+        "openai",
+        "openrouter",
+        "local"
+      ]
+    },
+    "GatewayThreadEpisodicVectorProviderKeyStatus": {
+      "type": "object",
+      "properties": {
+        "present": {
+          "type": "boolean",
+          "default": false
+        },
+        "required": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "GatewayThreadEpisodicVectorRefillStatus": {
+      "type": "string",
+      "enum": [
+        "disabled",
+        "unknown",
+        "required",
+        "running",
+        "complete",
+        "failed"
+      ]
+    }
+  }
+}

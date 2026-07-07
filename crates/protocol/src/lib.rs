@@ -137,7 +137,10 @@ pub use settings::{
     GatewayRemoteAccessTransport, GatewaySettingsGetParams, GatewaySettingsGetResponse,
     GatewaySettingsSnapshot, GatewaySettingsUpdate, GatewaySettingsUpdateParams,
     GatewaySettingsUpdateResponse, GatewayThreadEpisodicSettings,
-    GatewayThreadEpisodicSettingsUpdate,
+    GatewayThreadEpisodicSettingsUpdate, GatewayThreadEpisodicVectorLocalModelStatus,
+    GatewayThreadEpisodicVectorProvider, GatewayThreadEpisodicVectorProviderKeyStatus,
+    GatewayThreadEpisodicVectorRefillStatus, GatewayThreadEpisodicVectorSearchSettings,
+    GatewayThreadEpisodicVectorSearchSettingsUpdate,
 };
 pub use skills::{
     SkillArchiveFormat, SkillAuditTimelineItem, SkillChangedItem, SkillDependencyDiagnostic,

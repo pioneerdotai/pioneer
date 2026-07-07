@@ -62,8 +62,11 @@ use crate::{
     GatewayRemoteAccessTransport, GatewaySettingsGetParams, GatewaySettingsGetResponse,
     GatewaySettingsSnapshot, GatewaySettingsUpdate, GatewaySettingsUpdateParams,
     GatewaySettingsUpdateResponse, GatewayThreadEpisodicSettings,
-    GatewayThreadEpisodicSettingsUpdate, ItemCompletedNotification, ItemDeltaNotification,
-    ItemRecoveryAttachedNotification, ItemRecoveryExhaustedNotification,
+    GatewayThreadEpisodicSettingsUpdate, GatewayThreadEpisodicVectorLocalModelStatus,
+    GatewayThreadEpisodicVectorProvider, GatewayThreadEpisodicVectorProviderKeyStatus,
+    GatewayThreadEpisodicVectorRefillStatus, GatewayThreadEpisodicVectorSearchSettings,
+    GatewayThreadEpisodicVectorSearchSettingsUpdate, ItemCompletedNotification,
+    ItemDeltaNotification, ItemRecoveryAttachedNotification, ItemRecoveryExhaustedNotification,
     ItemRecoveryOpenedNotification, ItemRecoverySucceededNotification,
     ItemRetryAttemptStartedNotification, ItemRetryScheduledNotification, ItemStartedNotification,
     ItemTimeoutDetectedNotification, ItemToolRetryExhaustedNotification,
@@ -1518,8 +1521,32 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
             GatewayThreadEpisodicSettings
         ),
         schema_doc!(
+            "gateway_thread_episodic_vector_provider.json",
+            GatewayThreadEpisodicVectorProvider
+        ),
+        schema_doc!(
+            "gateway_thread_episodic_vector_provider_key_status.json",
+            GatewayThreadEpisodicVectorProviderKeyStatus
+        ),
+        schema_doc!(
+            "gateway_thread_episodic_vector_refill_status.json",
+            GatewayThreadEpisodicVectorRefillStatus
+        ),
+        schema_doc!(
+            "gateway_thread_episodic_vector_local_model_status.json",
+            GatewayThreadEpisodicVectorLocalModelStatus
+        ),
+        schema_doc!(
+            "gateway_thread_episodic_vector_search_settings.json",
+            GatewayThreadEpisodicVectorSearchSettings
+        ),
+        schema_doc!(
             "gateway_thread_episodic_settings_update.json",
             GatewayThreadEpisodicSettingsUpdate
+        ),
+        schema_doc!(
+            "gateway_thread_episodic_vector_search_settings_update.json",
+            GatewayThreadEpisodicVectorSearchSettingsUpdate
         ),
         schema_doc!(
             "gateway_cli_runtime_settings.json",

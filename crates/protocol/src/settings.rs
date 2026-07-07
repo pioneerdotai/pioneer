@@ -113,6 +113,8 @@ pub struct GatewayThreadEpisodicSettings {
     pub retry_max_delay_secs: i64,
     pub max_attempts: i64,
     pub near_capacity_percent: f64,
+    #[serde(default)]
+    pub vector_search: GatewayThreadEpisodicVectorSearchSettings,
 }
 
 impl Default for GatewayThreadEpisodicSettings {
@@ -135,8 +137,124 @@ impl Default for GatewayThreadEpisodicSettings {
             retry_max_delay_secs: 900,
             max_attempts: 5,
             near_capacity_percent: 85.0,
+            vector_search: GatewayThreadEpisodicVectorSearchSettings::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GatewayThreadEpisodicVectorSearchSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<GatewayThreadEpisodicVectorProvider>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_dimension: Option<u32>,
+    #[serde(default = "default_gateway_thread_episodic_vector_normalized")]
+    pub embedding_normalized: bool,
+    #[serde(default)]
+    pub provider_key: GatewayThreadEpisodicVectorProviderKeyStatus,
+    #[serde(default)]
+    pub refill_status: GatewayThreadEpisodicVectorRefillStatus,
+    #[serde(default)]
+    pub local_model_status: GatewayThreadEpisodicVectorLocalModelStatus,
+}
+
+impl Default for GatewayThreadEpisodicVectorSearchSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: None,
+            model: None,
+            local_model: None,
+            embedding_dimension: None,
+            embedding_normalized: default_gateway_thread_episodic_vector_normalized(),
+            provider_key: GatewayThreadEpisodicVectorProviderKeyStatus::default(),
+            refill_status: GatewayThreadEpisodicVectorRefillStatus::Disabled,
+            local_model_status: GatewayThreadEpisodicVectorLocalModelStatus::NotSelected,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum GatewayThreadEpisodicVectorProvider {
+    #[serde(rename = "openai")]
+    OpenAi,
+    #[serde(rename = "openrouter")]
+    OpenRouter,
+    #[serde(rename = "local")]
+    Local,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GatewayThreadEpisodicVectorProviderKeyStatus {
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub present: bool,
+}
+
+impl Default for GatewayThreadEpisodicVectorProviderKeyStatus {
+    fn default() -> Self {
+        Self {
+            required: false,
+            present: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayThreadEpisodicVectorRefillStatus {
+    Disabled,
+    Unknown,
+    Required,
+    Running,
+    Complete,
+    Failed,
+}
+
+impl Default for GatewayThreadEpisodicVectorRefillStatus {
+    fn default() -> Self {
+        Self::Disabled
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayThreadEpisodicVectorLocalModelStatus {
+    NotSelected,
+    Unknown,
+    Missing,
+    Downloading,
+    Installed,
+    Failed,
+}
+
+impl Default for GatewayThreadEpisodicVectorLocalModelStatus {
+    fn default() -> Self {
+        Self::NotSelected
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GatewayThreadEpisodicVectorSearchSettingsUpdate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<Option<GatewayThreadEpisodicVectorProvider>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_model: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_dimension: Option<Option<u32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_normalized: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -348,6 +466,8 @@ pub struct GatewayThreadEpisodicSettingsUpdate {
     pub max_attempts: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub near_capacity_percent: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector_search: Option<GatewayThreadEpisodicVectorSearchSettingsUpdate>,
 }
 
 impl GatewayThreadEpisodicSettingsUpdate {
@@ -430,6 +550,10 @@ impl GatewayMemoryModelSelection {
     }
 }
 
+const fn default_gateway_thread_episodic_vector_normalized() -> bool {
+    true
+}
+
 fn normalized_optional_model_selection_text(value: Option<&str>, max_len: usize) -> Option<String> {
     let normalized = value?.trim();
     if normalized.is_empty() {
@@ -443,8 +567,12 @@ fn normalized_optional_model_selection_text(value: Option<&str>, max_len: usize)
 mod tests {
     use super::{
         GatewayCliRuntimeInstanceSettings, GatewayCliRuntimeSettings, GatewayGeneralSettings,
-        GatewayGeneralSettingsUpdate, GatewayMemoryModelSelection, GatewaySettingsSnapshot,
-        GatewaySettingsUpdate, GatewayThreadEpisodicSettings, GatewayThreadEpisodicSettingsUpdate,
+        GatewayGeneralSettingsUpdate, GatewayMemoryModelSelection, GatewayMemorySettings,
+        GatewayRemoteAccessSettings, GatewaySettingsSnapshot, GatewaySettingsUpdate,
+        GatewayThreadEpisodicSettings, GatewayThreadEpisodicSettingsUpdate,
+        GatewayThreadEpisodicVectorLocalModelStatus, GatewayThreadEpisodicVectorProvider,
+        GatewayThreadEpisodicVectorProviderKeyStatus, GatewayThreadEpisodicVectorRefillStatus,
+        GatewayThreadEpisodicVectorSearchSettings, GatewayThreadEpisodicVectorSearchSettingsUpdate,
     };
     use crate::turn::CLIAgentRuntimeKind;
 
@@ -520,6 +648,7 @@ mod tests {
                 retry_max_delay_secs: 300,
                 max_attempts: 3,
                 near_capacity_percent: 85.0,
+                vector_search: GatewayThreadEpisodicVectorSearchSettings::default(),
             },
             cli_runtimes: GatewayCliRuntimeSettings {
                 instances: vec![GatewayCliRuntimeInstanceSettings {
@@ -576,5 +705,161 @@ mod tests {
             serde_json::from_str(serialized.as_str()).expect("settings update should deserialize");
         assert_eq!(roundtrip.thread_episodic, update.thread_episodic);
         assert_eq!(roundtrip.cli_runtimes, update.cli_runtimes);
+    }
+
+    #[test]
+    fn vector_search_settings_roundtrip_disabled_default() {
+        let settings = GatewayThreadEpisodicVectorSearchSettings::default();
+
+        let serialized =
+            serde_json::to_string(&settings).expect("vector settings should serialize");
+        assert!(serialized.contains("\"enabled\":false"));
+        assert!(!serialized.contains("api_key"));
+        assert!(!serialized.contains("secret"));
+
+        let roundtrip: GatewayThreadEpisodicVectorSearchSettings =
+            serde_json::from_str(serialized.as_str()).expect("vector settings should deserialize");
+        assert_eq!(roundtrip, settings);
+        assert_eq!(roundtrip.provider, None);
+        assert_eq!(roundtrip.model, None);
+        assert_eq!(roundtrip.local_model, None);
+        assert_eq!(
+            roundtrip.refill_status,
+            GatewayThreadEpisodicVectorRefillStatus::Disabled
+        );
+        assert_eq!(
+            roundtrip.local_model_status,
+            GatewayThreadEpisodicVectorLocalModelStatus::NotSelected
+        );
+    }
+
+    #[test]
+    fn vector_search_settings_roundtrip_api_provider_states() {
+        for (provider, model) in [
+            (
+                GatewayThreadEpisodicVectorProvider::OpenAi,
+                "text-embedding-3-small",
+            ),
+            (
+                GatewayThreadEpisodicVectorProvider::OpenRouter,
+                "openai/text-embedding-3-small",
+            ),
+        ] {
+            let settings = GatewayThreadEpisodicVectorSearchSettings {
+                enabled: true,
+                provider: Some(provider),
+                model: Some(model.to_owned()),
+                local_model: Some("bge-small-en-v1.5".to_owned()),
+                embedding_dimension: Some(1536),
+                embedding_normalized: true,
+                provider_key: GatewayThreadEpisodicVectorProviderKeyStatus {
+                    required: true,
+                    present: true,
+                },
+                refill_status: GatewayThreadEpisodicVectorRefillStatus::Complete,
+                local_model_status: GatewayThreadEpisodicVectorLocalModelStatus::NotSelected,
+            };
+
+            let serialized =
+                serde_json::to_string(&settings).expect("vector settings should serialize");
+            assert!(serialized.contains("\"provider_key\""));
+            assert!(!serialized.contains("api_key"));
+            assert!(!serialized.contains("sk-"));
+
+            let roundtrip: GatewayThreadEpisodicVectorSearchSettings =
+                serde_json::from_str(serialized.as_str())
+                    .expect("vector settings should deserialize");
+            assert_eq!(roundtrip, settings);
+        }
+    }
+
+    #[test]
+    fn gateway_settings_snapshot_reports_vector_key_presence_without_secret_values() {
+        let snapshot = GatewaySettingsSnapshot {
+            general: GatewayGeneralSettings::default(),
+            memory: GatewayMemorySettings::default(),
+            thread_episodic: GatewayThreadEpisodicSettings {
+                vector_search: GatewayThreadEpisodicVectorSearchSettings {
+                    enabled: true,
+                    provider: Some(GatewayThreadEpisodicVectorProvider::OpenRouter),
+                    model: Some("openai/text-embedding-3-small".to_owned()),
+                    local_model: Some("bge-small-en-v1.5".to_owned()),
+                    embedding_dimension: Some(1536),
+                    embedding_normalized: true,
+                    provider_key: GatewayThreadEpisodicVectorProviderKeyStatus {
+                        required: true,
+                        present: true,
+                    },
+                    refill_status: GatewayThreadEpisodicVectorRefillStatus::Complete,
+                    local_model_status: GatewayThreadEpisodicVectorLocalModelStatus::NotSelected,
+                },
+                ..GatewayThreadEpisodicSettings::default()
+            },
+            cli_runtimes: GatewayCliRuntimeSettings::default(),
+            remote_access: GatewayRemoteAccessSettings::default(),
+        };
+
+        let serialized =
+            serde_json::to_string(&snapshot).expect("settings snapshot should serialize");
+        assert!(serialized.contains("\"provider_key\""));
+        assert!(serialized.contains("\"present\":true"));
+        assert!(!serialized.contains("api_key"));
+        assert!(!serialized.contains("secret"));
+        assert!(!serialized.contains("sk-"));
+    }
+
+    #[test]
+    fn vector_search_settings_roundtrip_local_state() {
+        let settings = GatewayThreadEpisodicVectorSearchSettings {
+            enabled: true,
+            provider: Some(GatewayThreadEpisodicVectorProvider::Local),
+            model: Some("bge-base-en-v1.5".to_owned()),
+            local_model: Some("bge-base-en-v1.5".to_owned()),
+            embedding_dimension: Some(768),
+            embedding_normalized: true,
+            provider_key: GatewayThreadEpisodicVectorProviderKeyStatus {
+                required: false,
+                present: false,
+            },
+            refill_status: GatewayThreadEpisodicVectorRefillStatus::Required,
+            local_model_status: GatewayThreadEpisodicVectorLocalModelStatus::Missing,
+        };
+
+        let serialized = serde_json::to_string(&settings).expect("local vector settings serialize");
+        assert!(serialized.contains("\"provider\":\"local\""));
+        assert!(!serialized.contains("api_key"));
+
+        let roundtrip: GatewayThreadEpisodicVectorSearchSettings =
+            serde_json::from_str(serialized.as_str()).expect("local vector settings deserialize");
+        assert_eq!(roundtrip, settings);
+    }
+
+    #[test]
+    fn vector_search_update_roundtrips_without_secret_values() {
+        let update = GatewaySettingsUpdate {
+            thread_episodic: Some(GatewayThreadEpisodicSettingsUpdate {
+                vector_search: Some(GatewayThreadEpisodicVectorSearchSettingsUpdate {
+                    enabled: Some(true),
+                    provider: Some(Some(GatewayThreadEpisodicVectorProvider::OpenRouter)),
+                    model: Some(Some("openai/text-embedding-3-large".to_owned())),
+                    local_model: Some(Some("bge-small-en-v1.5".to_owned())),
+                    embedding_dimension: Some(Some(3072)),
+                    embedding_normalized: Some(true),
+                }),
+                ..GatewayThreadEpisodicSettingsUpdate::default()
+            }),
+            ..GatewaySettingsUpdate::default()
+        };
+
+        let serialized = serde_json::to_string(&update).expect("settings update serializes");
+        assert!(serialized.contains("\"vector_search\""));
+        assert!(serialized.contains("\"openrouter\""));
+        assert!(!serialized.contains("api_key"));
+        assert!(!serialized.contains("secret"));
+        assert!(!serialized.contains("sk-"));
+
+        let roundtrip: GatewaySettingsUpdate =
+            serde_json::from_str(serialized.as_str()).expect("settings update deserializes");
+        assert_eq!(roundtrip.thread_episodic, update.thread_episodic);
     }
 }
