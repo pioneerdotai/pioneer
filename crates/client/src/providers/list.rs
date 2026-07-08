@@ -596,7 +596,11 @@ impl ProviderModelSelectorState {
             .providers
             .iter()
             .filter(|provider| {
-                self.mode == ProviderModelSelectorMode::Chat || provider.capabilities.embeddings
+                if self.mode == ProviderModelSelectorMode::Chat {
+                    provider.name != "local"
+                } else {
+                    provider.capabilities.embeddings
+                }
             })
             .map(|provider| ProviderModelSelectorProvider {
                 id: provider.name.clone(),
@@ -1375,6 +1379,38 @@ mod tests {
         assert!(applied);
         assert_eq!(state.models().len(), 1);
         assert_eq!(state.models()[0].id, "text-embedding-3-small");
+    }
+
+    #[test]
+    fn provider_model_selector_hides_local_from_chat_and_shows_it_for_embeddings() {
+        let providers = vec![
+            ProviderSummary {
+                name: "openai".to_owned(),
+                capabilities: pioneer_protocol::ProviderSummaryCapabilities { embeddings: true },
+            },
+            ProviderSummary {
+                name: "local".to_owned(),
+                capabilities: pioneer_protocol::ProviderSummaryCapabilities { embeddings: true },
+            },
+        ];
+
+        let mut chat = ProviderModelSelectorState::new(None, None);
+        chat.apply_provider_list_success(ProviderListResponse {
+            providers: providers.clone(),
+        });
+        let chat_rows = chat.provider_rows();
+        assert!(chat_rows.iter().any(|row| row.id == "openai"));
+        assert!(!chat_rows.iter().any(|row| row.id == "local"));
+
+        let mut embeddings = ProviderModelSelectorState::new_with_mode(
+            None,
+            None,
+            ProviderModelSelectorMode::Embeddings,
+        );
+        embeddings.apply_provider_list_success(ProviderListResponse { providers });
+        let embedding_rows = embeddings.provider_rows();
+        assert!(embedding_rows.iter().any(|row| row.id == "openai"));
+        assert!(embedding_rows.iter().any(|row| row.id == "local"));
     }
 
     #[test]
