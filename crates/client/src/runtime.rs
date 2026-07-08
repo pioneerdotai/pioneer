@@ -59,7 +59,8 @@ use crate::{
     voice::{VoiceSessionResultReduction, reduce_voice_session_result_notification},
 };
 use pioneer_protocol::{
-    ArtifactSummary, GatewayNotification, GatewayRemoteAccessStatusChangedNotification, Workspace,
+    ArtifactSummary, GatewayNotification, GatewayRemoteAccessStatusChangedNotification,
+    GatewayThreadEpisodicVectorRefillStatusChangedNotification, Workspace,
     WorkspaceChangedNotification,
 };
 
@@ -137,6 +138,9 @@ pub enum ClientRuntimeNotification {
     SemanticTimeline(SemanticTimelineLiveUpdate),
     VoiceSessionResult(VoiceSessionResultReduction),
     GatewayRemoteAccessStatusChanged(GatewayRemoteAccessStatusChangedNotification),
+    GatewayThreadEpisodicVectorRefillStatusChanged(
+        GatewayThreadEpisodicVectorRefillStatusChangedNotification,
+    ),
     WorkspaceChanged {
         notification: WorkspaceChangedNotification,
         preference: WorkspacePreferenceReduction,
@@ -619,6 +623,17 @@ pub fn reduce_gateway_notification(
         GatewayNotification::GatewayRemoteAccessStatusChanged(notification) => Some(
             ClientRuntimeNotification::GatewayRemoteAccessStatusChanged(notification),
         ),
+        GatewayNotification::GatewayThreadEpisodicVectorRefillStatusChanged(notification) => {
+            if context.active_workspace_id == Some(notification.workspace_id.as_str()) {
+                Some(
+                    ClientRuntimeNotification::GatewayThreadEpisodicVectorRefillStatusChanged(
+                        notification,
+                    ),
+                )
+            } else {
+                None
+            }
+        }
         GatewayNotification::ThreadTimelineBlocksChanged(notification) => {
             Some(ClientRuntimeNotification::SemanticTimeline(
                 SemanticTimelineLiveUpdate::ThreadTimelineBlocksChanged(notification),
@@ -693,7 +708,9 @@ mod tests {
     use pioneer_protocol::{
         GatewayRemoteAccessErrorKind, GatewayRemoteAccessState,
         GatewayRemoteAccessStatusChangedNotification, GatewayRemoteAccessStatusSnapshot,
-        SkillsChangedNotification, ThreadTimelineBlocksChangedNotification, TimelineChangeReason,
+        GatewayThreadEpisodicVectorRefillStatus,
+        GatewayThreadEpisodicVectorRefillStatusChangedNotification, SkillsChangedNotification,
+        ThreadTimelineBlocksChangedNotification, TimelineChangeReason,
         TurnPermissionApprovalRequest, TurnPermissionApprovalResolution,
         TurnPermissionRequestOpenedNotification, TurnPermissionRequestResolvedNotification,
         UnknownGatewayNotification, Workspace, WorkspaceChangeKind, WorkspaceChangedNotification,
@@ -1101,6 +1118,45 @@ mod tests {
             notification.status.error_kind,
             Some(GatewayRemoteAccessErrorKind::RelayConnectFailed)
         );
+    }
+
+    #[test]
+    fn runtime_reduces_vector_refill_status_notification_for_active_workspace() {
+        let notification = GatewayNotification::GatewayThreadEpisodicVectorRefillStatusChanged(
+            GatewayThreadEpisodicVectorRefillStatusChangedNotification {
+                workspace_id: "workspace_a".to_owned(),
+                status: GatewayThreadEpisodicVectorRefillStatus::Complete,
+            },
+        );
+
+        let reduced = reduce_gateway_notification(
+            notification.clone(),
+            ClientRuntimeNotificationContext {
+                active_workspace_id: Some("workspace_a"),
+                ..ClientRuntimeNotificationContext::default()
+            },
+        );
+
+        let Some(ClientRuntimeNotification::GatewayThreadEpisodicVectorRefillStatusChanged(
+            notification,
+        )) = reduced
+        else {
+            panic!("expected vector refill status reduction");
+        };
+        assert_eq!(notification.workspace_id, "workspace_a");
+        assert_eq!(
+            notification.status,
+            GatewayThreadEpisodicVectorRefillStatus::Complete
+        );
+
+        let ignored = reduce_gateway_notification(
+            GatewayNotification::GatewayThreadEpisodicVectorRefillStatusChanged(notification),
+            ClientRuntimeNotificationContext {
+                active_workspace_id: Some("workspace_b"),
+                ..ClientRuntimeNotificationContext::default()
+            },
+        );
+        assert!(ignored.is_none());
     }
 
     #[test]
