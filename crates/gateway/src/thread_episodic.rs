@@ -9,10 +9,9 @@ use pioneer_config::{
 use pioneer_crud::{
     CrudStore, NewThreadEpisodicExclusionRecord, NewThreadEpisodicIndexJobRecord,
     NewThreadEpisodicItemRecord, NewThreadEpisodicRecallEventRecord,
-    NewThreadEpisodicThreadDirectoryRecord, PROJECTION_META_STATUS_COMPLETE,
-    THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID, ThreadEpisodicCapsuleCapacityUpdate,
-    ThreadEpisodicCapsuleRecord, ThreadEpisodicCapsuleStatus, ThreadEpisodicCapsuleWriteState,
-    ThreadEpisodicExclusionReason, ThreadEpisodicExclusionRecord,
+    NewThreadEpisodicThreadDirectoryRecord, THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID,
+    ThreadEpisodicCapsuleCapacityUpdate, ThreadEpisodicCapsuleRecord, ThreadEpisodicCapsuleStatus,
+    ThreadEpisodicCapsuleWriteState, ThreadEpisodicExclusionReason, ThreadEpisodicExclusionRecord,
     ThreadEpisodicGraphEnrichmentState, ThreadEpisodicIndexJobCompletionUpdate,
     ThreadEpisodicIndexJobFailureUpdate, ThreadEpisodicIndexJobRecord,
     ThreadEpisodicIndexJobStatus, ThreadEpisodicItemIndexedUpdate, ThreadEpisodicItemRecord,
@@ -20,8 +19,8 @@ use pioneer_crud::{
     ThreadEpisodicSourceActorRole as StoreThreadEpisodicSourceActorRole,
     ThreadEpisodicSourceRuntimeKind, ThreadEpisodicThreadDirectoryRecord,
     ThreadEpisodicThreadDirectoryStatus, ThreadEpisodicThreadDirectoryVisibility,
-    ThreadEpisodicWorkspaceActiveWriteSegmentRequest, find_projection_meta,
-    thread_episodic_item_uri, thread_episodic_thread_uri_prefix,
+    ThreadEpisodicWorkspaceActiveWriteSegmentRequest, thread_episodic_item_uri,
+    thread_episodic_thread_uri_prefix,
 };
 use pioneer_memory::{
     ThreadEpisodicEmbeddingError, ThreadEpisodicEmbeddingProvider,
@@ -330,6 +329,13 @@ pub(crate) trait ThreadEpisodicIndexEmbeddingProviderResolver: Send + Sync {
     fn active_embedding_provider_unavailable_reason(&self) -> Option<String> {
         None
     }
+
+    fn active_embedding_provider_unavailable_reason_for_workspace(
+        &self,
+        _workspace_id: &str,
+    ) -> Option<String> {
+        self.active_embedding_provider_unavailable_reason()
+    }
 }
 
 pub(crate) struct StoreThreadEpisodicIndexPayloadProvider {
@@ -358,6 +364,7 @@ pub(crate) struct ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver {
     provider_registry: Arc<ProviderRegistry>,
     runtime_home: PathBuf,
     config: StdRwLock<GatewayThreadEpisodicVectorSearchConfig>,
+    workspace_configs: StdRwLock<BTreeMap<String, GatewayThreadEpisodicVectorSearchConfig>>,
 }
 
 impl StoreThreadEpisodicIndexPayloadProvider {
@@ -466,6 +473,7 @@ impl ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver {
             provider_registry,
             runtime_home,
             config: StdRwLock::new(config),
+            workspace_configs: StdRwLock::new(BTreeMap::new()),
         }
     }
 
@@ -475,11 +483,31 @@ impl ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver {
         }
     }
 
+    pub(crate) fn apply_workspace_configs(
+        &self,
+        configs: BTreeMap<String, GatewayThreadEpisodicVectorSearchConfig>,
+    ) {
+        if let Ok(mut current) = self.workspace_configs.write() {
+            *current = configs;
+        }
+    }
+
     fn config_snapshot(&self) -> GatewayThreadEpisodicVectorSearchConfig {
         self.config
             .read()
             .map(|config| config.clone())
             .unwrap_or_default()
+    }
+
+    fn config_snapshot_for_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> GatewayThreadEpisodicVectorSearchConfig {
+        self.workspace_configs
+            .read()
+            .ok()
+            .and_then(|configs| configs.get(workspace_id).cloned())
+            .unwrap_or_else(|| self.config_snapshot())
     }
 
     fn resolve_configured_provider(
@@ -550,7 +578,12 @@ impl ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver {
                 Ok(Arc::new(provider))
             }
             Some(GatewayThreadEpisodicVectorProviderConfig::Local) => {
-                let model = config.local_model.as_deref().unwrap_or("").trim();
+                let model = config
+                    .model
+                    .as_deref()
+                    .or(config.local_model.as_deref())
+                    .map(str::trim)
+                    .unwrap_or("");
                 if model.is_empty() {
                     return Err(embedding_resolution_error(
                         ThreadEpisodicEmbeddingError::missing_model("local", ""),
@@ -590,7 +623,7 @@ impl ThreadEpisodicIndexEmbeddingProviderResolver
         Option<Arc<dyn ThreadEpisodicEmbeddingProvider>>,
         ThreadEpisodicIndexResolutionError,
     > {
-        let config = self.config_snapshot();
+        let config = self.config_snapshot_for_workspace(workspace_id);
         if !config.enabled {
             return Ok(None);
         }
@@ -601,6 +634,15 @@ impl ThreadEpisodicIndexEmbeddingProviderResolver
     fn active_embedding_provider_unavailable_reason(&self) -> Option<String> {
         (!self.config_snapshot().enabled).then(|| {
             "thread episodic vector search provider is disabled by runtime settings".to_owned()
+        })
+    }
+
+    fn active_embedding_provider_unavailable_reason_for_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Option<String> {
+        (!self.config_snapshot_for_workspace(workspace_id).enabled).then(|| {
+            "thread episodic vector search provider is disabled by workspace settings".to_owned()
         })
     }
 }
@@ -851,10 +893,11 @@ fn thread_item_events_resolution_error(error: anyhow::Error) -> ThreadEpisodicIn
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ThreadEpisodicRecallServiceConfig {
     pub enabled: bool,
     pub vector_search_enabled: bool,
+    pub vector_search: GatewayThreadEpisodicVectorSearchConfig,
     pub default_prompt_chars: u32,
     pub max_prompt_chars: u32,
     pub max_hit_chars: usize,
@@ -871,6 +914,7 @@ impl Default for ThreadEpisodicRecallServiceConfig {
         Self {
             enabled: true,
             vector_search_enabled: false,
+            vector_search: GatewayThreadEpisodicVectorSearchConfig::default(),
             default_prompt_chars: 2_400,
             max_prompt_chars: 12_000,
             max_hit_chars: 1_200,
@@ -895,17 +939,6 @@ struct ThreadEpisodicRecallProjectionGate {
 enum ThreadEpisodicRecallSearchPath {
     Lexical,
     HybridAsk,
-}
-
-fn projection_config_json_has_vector_search_enabled(payload: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(payload)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("vector_search_enabled")
-                .and_then(serde_json::Value::as_bool)
-        })
-        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1384,6 +1417,8 @@ pub(crate) struct ThreadEpisodicRecallService {
     backend: Arc<dyn ThreadEpisodicMemvidBackend>,
     embedding_provider_resolver: Option<Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>>,
     config: StdRwLock<ThreadEpisodicRecallServiceConfig>,
+    workspace_vector_search_configs:
+        StdRwLock<BTreeMap<String, GatewayThreadEpisodicVectorSearchConfig>>,
 }
 
 impl ThreadEpisodicRecallService {
@@ -1405,6 +1440,7 @@ impl ThreadEpisodicRecallService {
             backend,
             embedding_provider_resolver,
             config: StdRwLock::new(ThreadEpisodicRecallServiceConfig::default()),
+            workspace_vector_search_configs: StdRwLock::new(BTreeMap::new()),
         }
     }
 
@@ -1429,6 +1465,7 @@ impl ThreadEpisodicRecallService {
             backend,
             embedding_provider_resolver,
             config: StdRwLock::new(config),
+            workspace_vector_search_configs: StdRwLock::new(BTreeMap::new()),
         }
     }
 
@@ -1438,13 +1475,51 @@ impl ThreadEpisodicRecallService {
         }
     }
 
+    pub(crate) fn apply_workspace_vector_search_configs(
+        &self,
+        configs: BTreeMap<String, GatewayThreadEpisodicVectorSearchConfig>,
+    ) {
+        if let Ok(mut current) = self.workspace_vector_search_configs.write() {
+            *current = configs;
+        }
+    }
+
+    fn vector_search_config_for_workspace(
+        &self,
+        workspace_id: &str,
+        default_config: &GatewayThreadEpisodicVectorSearchConfig,
+    ) -> GatewayThreadEpisodicVectorSearchConfig {
+        self.workspace_vector_search_configs
+            .read()
+            .ok()
+            .and_then(|configs| configs.get(workspace_id).cloned())
+            .unwrap_or_else(|| default_config.clone())
+    }
+
+    fn recall_projection_target(
+        &self,
+        workspace_id: &str,
+        config: &ThreadEpisodicRecallServiceConfig,
+    ) -> crate::database::startup::thread_episodic_workspace_capsule_refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget
+    {
+        let vector_search =
+            self.vector_search_config_for_workspace(workspace_id, &config.vector_search);
+        crate::database::startup::thread_episodic_workspace_capsule_refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_vector_search_config(
+            &vector_search,
+        )
+    }
+
     pub(crate) async fn search_current_thread(
         &self,
         input: ThreadEpisodicRecallInput,
         profile: Option<ThreadEpisodicSearchProfile>,
     ) -> ThreadEpisodicRecallOutput {
         let started_at = Instant::now();
-        let config = self.config.read().map(|config| *config).unwrap_or_default();
+        let config = self
+            .config
+            .read()
+            .map(|config| config.clone())
+            .unwrap_or_default();
         let mut diagnostics = Vec::new();
         if !config.enabled {
             diagnostics.push(recall_diagnostic(
@@ -1556,7 +1631,14 @@ impl ThreadEpisodicRecallService {
                 .await;
         }
 
-        let gate = match self.resolve_recall_projection_gate(config).await {
+        let vector_search_config =
+            self.vector_search_config_for_workspace(workspace_id, &config.vector_search);
+        let vector_search_enabled = vector_search_config.enabled;
+        let projection_target = self.recall_projection_target(workspace_id, &config);
+        let gate = match self
+            .resolve_recall_projection_gate(workspace_id, vector_search_enabled, &projection_target)
+            .await
+        {
             Ok(mut gate) if gate.search_allowed => {
                 diagnostics.append(&mut gate.diagnostics);
                 gate
@@ -1821,7 +1903,7 @@ impl ThreadEpisodicRecallService {
             .map_err(|error| format!("failed to resolve active embedding provider: {error:?}"))?;
         let Some(provider) = provider else {
             return Err(resolver
-                .active_embedding_provider_unavailable_reason()
+                .active_embedding_provider_unavailable_reason_for_workspace(workspace_id)
                 .unwrap_or_else(|| "active embedding provider is not ready".to_owned()));
         };
 
@@ -1830,19 +1912,32 @@ impl ThreadEpisodicRecallService {
 
     async fn resolve_recall_projection_gate(
         &self,
-        config: ThreadEpisodicRecallServiceConfig,
+        workspace_id: &str,
+        vector_search_enabled: bool,
+        projection_target: &crate::database::startup::thread_episodic_workspace_capsule_refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget,
     ) -> Result<ThreadEpisodicRecallProjectionGate> {
         let lexical_target =
             crate::database::startup::thread_episodic_workspace_capsule_refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only();
         let lexical_current =
-            crate::database::startup::thread_episodic_workspace_capsule_refill::refill_is_current_for_target(
+            crate::database::startup::thread_episodic_workspace_capsule_refill::refill_is_current_for_workspace_target(
                 self.crud_store.as_ref(),
+                workspace_id,
                 &lexical_target,
             )
             .await?;
 
-        if !config.vector_search_enabled {
-            return if lexical_current {
+        if !vector_search_enabled {
+            let projection_current = if lexical_current {
+                true
+            } else {
+                crate::database::startup::thread_episodic_workspace_capsule_refill::refill_is_current_for_workspace_target(
+                    self.crud_store.as_ref(),
+                    workspace_id,
+                    projection_target,
+                )
+                .await?
+            };
+            return if projection_current {
                 Ok(ThreadEpisodicRecallProjectionGate {
                     search_allowed: true,
                     search_path: ThreadEpisodicRecallSearchPath::Lexical,
@@ -1875,18 +1970,13 @@ impl ThreadEpisodicRecallService {
             ));
         }
 
-        let meta = find_projection_meta(
-            &self.crud_store.database_connection(),
-            crate::database::startup::thread_episodic_workspace_capsule_refill::THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_KEY,
-        )
-        .await?;
-        let complete_vector_projection = meta.as_ref().is_some_and(|meta| {
-            meta.status == PROJECTION_META_STATUS_COMPLETE
-                && meta
-                    .projection_config_json
-                    .as_deref()
-                    .is_some_and(projection_config_json_has_vector_search_enabled)
-        });
+        let complete_vector_projection =
+            crate::database::startup::thread_episodic_workspace_capsule_refill::refill_is_current_for_workspace_target(
+                self.crud_store.as_ref(),
+                workspace_id,
+                projection_target,
+            )
+            .await?;
 
         if complete_vector_projection && !lexical_current {
             return Ok(ThreadEpisodicRecallProjectionGate {
@@ -2155,7 +2245,11 @@ impl ThreadEpisodicRecallService {
                 item.id
             ));
         }
-        let config = self.config.read().map(|config| *config).unwrap_or_default();
+        let config = self
+            .config
+            .read()
+            .map(|config| config.clone())
+            .unwrap_or_default();
         text = cap_string_chars(text.as_str(), config.max_hit_chars);
         if text.trim().is_empty() {
             return Ok(None);
@@ -4894,6 +4988,7 @@ mod tests {
             backend.clone(),
             ThreadEpisodicRecallServiceConfig {
                 vector_search_enabled: true,
+                vector_search: vector_config.clone(),
                 ..ThreadEpisodicRecallServiceConfig::default()
             },
             Some(resolver_for_service),
@@ -4986,6 +5081,7 @@ mod tests {
             backend.clone(),
             ThreadEpisodicRecallServiceConfig {
                 vector_search_enabled: true,
+                vector_search: vector_config.clone(),
                 ..ThreadEpisodicRecallServiceConfig::default()
             },
             Some(resolver_for_service),
@@ -5058,6 +5154,7 @@ mod tests {
             backend.clone(),
             ThreadEpisodicRecallServiceConfig {
                 vector_search_enabled: true,
+                vector_search: vector_config.clone(),
                 ..ThreadEpisodicRecallServiceConfig::default()
             },
             Some(resolver_for_service),
@@ -5132,6 +5229,7 @@ mod tests {
             backend.clone(),
             ThreadEpisodicRecallServiceConfig {
                 vector_search_enabled: true,
+                vector_search: vector_config.clone(),
                 ..ThreadEpisodicRecallServiceConfig::default()
             },
             Some(resolver_for_service),
@@ -5213,6 +5311,7 @@ mod tests {
             backend.clone(),
             ThreadEpisodicRecallServiceConfig {
                 vector_search_enabled: true,
+                vector_search: vector_config.clone(),
                 ..ThreadEpisodicRecallServiceConfig::default()
             },
             Some(resolver_for_service),
@@ -5491,6 +5590,7 @@ mod tests {
             backend.clone(),
             ThreadEpisodicRecallServiceConfig {
                 vector_search_enabled: true,
+                vector_search: vector_config.clone(),
                 ..ThreadEpisodicRecallServiceConfig::default()
             },
             Some(resolver_for_service),

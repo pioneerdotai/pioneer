@@ -2796,9 +2796,25 @@ impl MessageProcessor {
             config.gateway.settings_version,
             settings_file_name.as_str(),
         )?;
+        let workspace_id = self
+            .session_manager
+            .connection_workspace_id(connection_id)
+            .await;
+        if update
+            .thread_episodic
+            .as_ref()
+            .and_then(|thread_episodic| thread_episodic.vector_search.as_ref())
+            .is_some()
+            && workspace_id.is_none()
+        {
+            anyhow::bail!(
+                "workspace context is required to update thread episodic vector search settings"
+            );
+        }
 
         let previous_general_settings = settings.effective_general_settings(&config.gateway);
-        let changes = settings.apply_protocol_update(update)?;
+        let changes =
+            settings.apply_protocol_update_for_workspace(update, workspace_id.as_deref())?;
         if changes.remote_access.changed {
             if let Some(key) = changes.remote_access.key.as_deref() {
                 self.gateway_secrets.put_remote_access_secret(
@@ -2844,10 +2860,6 @@ impl MessageProcessor {
             }
         }
 
-        let workspace_id = self
-            .session_manager
-            .connection_workspace_id(connection_id)
-            .await;
         let snapshot = self
             .gateway_settings_snapshot_from_settings(
                 &config.gateway,
@@ -2871,23 +2883,49 @@ impl MessageProcessor {
         }
         if changes.thread_episodic {
             let thread_episodic_settings =
-                crate::settings::GatewayThreadEpisodicSettings::from_protocol(
-                    snapshot.thread_episodic.clone(),
-                );
+                settings.effective_thread_episodic_settings(&config.gateway.thread_episodic);
             let runtime_config = crate::thread_episodic_runtime_config_from_gateway_settings(
                 &thread_episodic_settings,
             );
             self.apply_thread_episodic_runtime_config(runtime_config)
                 .await;
+            let workspace_vector_search_configs =
+                settings.workspace_thread_episodic_vector_search_configs();
+            self.apply_thread_episodic_workspace_vector_search_configs(
+                workspace_vector_search_configs.clone(),
+            );
             if changes.thread_episodic_vector_projection_changed && thread_episodic_settings.enabled
             {
-                crate::database::startup::spawn_thread_episodic_workspace_capsule_refill(
-                    self.crud_store.clone(),
-                    self.thread_episodic_storage_root.clone(),
-                    thread_episodic_settings.vector_search.clone(),
-                    self.provider_registry.clone(),
-                    self.artifact_runtime_home.clone(),
-                );
+                if let Some(workspace_id) = changes
+                    .thread_episodic_vector_projection_workspace_id
+                    .as_deref()
+                    .or(workspace_id.as_deref())
+                {
+                    let workspace_thread_episodic_settings = settings
+                        .effective_thread_episodic_settings_for_workspace(
+                            &config.gateway.thread_episodic,
+                            Some(workspace_id),
+                        );
+                    crate::database::startup::spawn_thread_episodic_workspace_capsule_refill_for_workspace(
+                        self.crud_store.clone(),
+                        self.thread_episodic_storage_root.clone(),
+                        workspace_id.to_owned(),
+                        workspace_thread_episodic_settings.vector_search,
+                        thread_episodic_settings.vector_search.clone(),
+                        workspace_vector_search_configs,
+                        self.provider_registry.clone(),
+                        self.artifact_runtime_home.clone(),
+                    );
+                } else {
+                    crate::database::startup::spawn_thread_episodic_workspace_capsule_refill(
+                        self.crud_store.clone(),
+                        self.thread_episodic_storage_root.clone(),
+                        thread_episodic_settings.vector_search.clone(),
+                        workspace_vector_search_configs,
+                        self.provider_registry.clone(),
+                        self.artifact_runtime_home.clone(),
+                    );
+                }
             }
             self.reinstall_memory_hook_runtime_if_bound().await;
         }
@@ -2910,8 +2948,9 @@ impl MessageProcessor {
             .as_ref()
             .map(|supervisor| supervisor.status_snapshot())
             .unwrap_or_default();
-        let mut snapshot = settings.snapshot_with_remote_access_status(
+        let mut snapshot = settings.snapshot_with_remote_access_status_for_workspace(
             config,
+            workspace_id,
             has_remote_access_key,
             remote_access_status,
         );
@@ -2920,7 +2959,7 @@ impl MessageProcessor {
             &mut snapshot.thread_episodic.vector_search,
         );
         self.apply_vector_local_model_status(&mut snapshot);
-        self.apply_vector_refill_projection_status(&mut snapshot)
+        self.apply_vector_refill_projection_status(&mut snapshot, workspace_id)
             .await?;
         Ok(snapshot)
     }
@@ -2928,18 +2967,25 @@ impl MessageProcessor {
     async fn apply_vector_refill_projection_status(
         &self,
         snapshot: &mut pioneer_protocol::GatewaySettingsSnapshot,
+        workspace_id: Option<&str>,
     ) -> anyhow::Result<()> {
         let thread_episodic_settings =
             crate::settings::GatewayThreadEpisodicSettings::from_protocol(
                 snapshot.thread_episodic.clone(),
             );
+        let Some(workspace_id) = workspace_id else {
+            snapshot.thread_episodic.vector_search.refill_status =
+                pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Unknown;
+            return Ok(());
+        };
         let projection_target =
             crate::database::startup::thread_episodic_workspace_capsule_refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_vector_search_config(
                 &thread_episodic_settings.vector_search,
             );
         let marker_status =
-            crate::database::startup::thread_episodic_workspace_capsule_refill::refill_status_for_target(
+            crate::database::startup::thread_episodic_workspace_capsule_refill::refill_status_for_workspace_target(
                 self.crud_store.as_ref(),
+                workspace_id,
                 &projection_target,
             )
             .await?;
@@ -2992,7 +3038,11 @@ impl MessageProcessor {
                 self.artifact_runtime_home.as_path(),
                 vector_search.enabled,
                 vector_search.provider,
-                vector_search.local_model.as_deref().unwrap_or(""),
+                vector_search
+                    .model
+                    .as_deref()
+                    .or(vector_search.local_model.as_deref())
+                    .unwrap_or(""),
             );
     }
 

@@ -7,19 +7,21 @@ mod turn_item_attempt_payload_compaction;
 mod turn_permission_profile_backfill;
 mod zstd_payload_compression;
 
-use pioneer_config::{
-    GatewayThreadEpisodicVectorProviderConfig, GatewayThreadEpisodicVectorSearchConfig,
-};
+use pioneer_config::GatewayThreadEpisodicVectorSearchConfig;
 use pioneer_crud::CrudStore;
 use pioneer_provider::ProviderRegistry;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{info, warn};
 
 pub(crate) fn spawn(
     crud_store: Arc<CrudStore>,
     thread_episodic_storage_root: PathBuf,
     thread_episodic_vector_search_config: GatewayThreadEpisodicVectorSearchConfig,
+    thread_episodic_workspace_vector_search_configs: BTreeMap<
+        String,
+        GatewayThreadEpisodicVectorSearchConfig,
+    >,
     provider_registry: Arc<ProviderRegistry>,
     runtime_home: PathBuf,
 ) {
@@ -35,6 +37,7 @@ pub(crate) fn spawn(
             crud_store,
             thread_episodic_storage_root,
             thread_episodic_vector_search_config,
+            thread_episodic_workspace_vector_search_configs,
             provider_registry,
             runtime_home,
         )
@@ -46,6 +49,10 @@ pub(crate) fn spawn_thread_episodic_workspace_capsule_refill(
     crud_store: Arc<CrudStore>,
     thread_episodic_storage_root: PathBuf,
     thread_episodic_vector_search_config: GatewayThreadEpisodicVectorSearchConfig,
+    thread_episodic_workspace_vector_search_configs: BTreeMap<
+        String,
+        GatewayThreadEpisodicVectorSearchConfig,
+    >,
     provider_registry: Arc<ProviderRegistry>,
     runtime_home: PathBuf,
 ) {
@@ -54,6 +61,35 @@ pub(crate) fn spawn_thread_episodic_workspace_capsule_refill(
             crud_store,
             thread_episodic_storage_root,
             thread_episodic_vector_search_config,
+            thread_episodic_workspace_vector_search_configs,
+            provider_registry,
+            runtime_home,
+        )
+        .await;
+    });
+}
+
+pub(crate) fn spawn_thread_episodic_workspace_capsule_refill_for_workspace(
+    crud_store: Arc<CrudStore>,
+    thread_episodic_storage_root: PathBuf,
+    workspace_id: String,
+    workspace_vector_search_config: GatewayThreadEpisodicVectorSearchConfig,
+    default_thread_episodic_vector_search_config: GatewayThreadEpisodicVectorSearchConfig,
+    thread_episodic_workspace_vector_search_configs: BTreeMap<
+        String,
+        GatewayThreadEpisodicVectorSearchConfig,
+    >,
+    provider_registry: Arc<ProviderRegistry>,
+    runtime_home: PathBuf,
+) {
+    let _handle = tokio::spawn(async move {
+        run_thread_episodic_workspace_capsule_refill_for_workspace(
+            crud_store,
+            thread_episodic_storage_root,
+            workspace_id,
+            workspace_vector_search_config,
+            default_thread_episodic_vector_search_config,
+            thread_episodic_workspace_vector_search_configs,
             provider_registry,
             runtime_home,
         )
@@ -65,71 +101,48 @@ async fn run_thread_episodic_workspace_capsule_refill(
     crud_store: Arc<CrudStore>,
     thread_episodic_storage_root: PathBuf,
     thread_episodic_vector_search_config: GatewayThreadEpisodicVectorSearchConfig,
+    thread_episodic_workspace_vector_search_configs: BTreeMap<
+        String,
+        GatewayThreadEpisodicVectorSearchConfig,
+    >,
     provider_registry: Arc<ProviderRegistry>,
     runtime_home: PathBuf,
 ) {
-    match crate::thread_episodic_embedding::ensure_local_embedding_model_downloaded_if_needed(
-        runtime_home.as_path(),
-        &thread_episodic_vector_search_config,
-    )
-    .await
-    {
-        Ok(true) => info!(
-            model = %thread_episodic_vector_search_config.local_model.as_deref().unwrap_or(""),
-            "local embedding model downloaded before thread episodic refill"
-        ),
-        Ok(false) => {}
-        Err(error) => {
-            warn!(
-                error = %error,
-                "failed to download local embedding model before thread episodic refill"
-            );
-            return;
-        }
-    }
-
-    if !local_embedding_model_ready_for_refill(
-        runtime_home.as_path(),
-        &thread_episodic_vector_search_config,
-    ) {
-        info!(
-            model = %thread_episodic_vector_search_config.local_model.as_deref().unwrap_or(""),
-            "thread episodic vector refill is waiting for local embedding model files"
-        );
-        return;
-    }
-
     thread_episodic_workspace_capsule_refill::run(
         crud_store,
         thread_episodic_storage_root,
         thread_episodic_vector_search_config,
+        thread_episodic_workspace_vector_search_configs,
         provider_registry,
         runtime_home,
     )
     .await;
 }
 
-fn local_embedding_model_ready_for_refill(
-    runtime_home: &std::path::Path,
-    config: &GatewayThreadEpisodicVectorSearchConfig,
-) -> bool {
-    if !config.enabled || config.provider != Some(GatewayThreadEpisodicVectorProviderConfig::Local)
-    {
-        return true;
-    }
-
-    let Some(model) = config
-        .local_model
-        .as_deref()
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-    else {
-        return false;
-    };
-
-    crate::thread_episodic_embedding::local_embedding_model_files(runtime_home, model)
-        .map(|files| files.model_path.exists() && files.tokenizer_path.exists())
-        .unwrap_or(false)
+async fn run_thread_episodic_workspace_capsule_refill_for_workspace(
+    crud_store: Arc<CrudStore>,
+    thread_episodic_storage_root: PathBuf,
+    workspace_id: String,
+    workspace_vector_search_config: GatewayThreadEpisodicVectorSearchConfig,
+    default_thread_episodic_vector_search_config: GatewayThreadEpisodicVectorSearchConfig,
+    thread_episodic_workspace_vector_search_configs: BTreeMap<
+        String,
+        GatewayThreadEpisodicVectorSearchConfig,
+    >,
+    provider_registry: Arc<ProviderRegistry>,
+    runtime_home: PathBuf,
+) {
+    thread_episodic_workspace_capsule_refill::run_workspace(
+        crud_store,
+        thread_episodic_storage_root,
+        workspace_id,
+        workspace_vector_search_config,
+        default_thread_episodic_vector_search_config,
+        thread_episodic_workspace_vector_search_configs,
+        provider_registry,
+        runtime_home,
+    )
+    .await;
 }
 
 #[cfg(test)]

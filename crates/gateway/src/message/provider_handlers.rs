@@ -38,25 +38,31 @@ impl MessageProcessor {
             }
         };
 
-        let result = ProviderListResponse {
-            providers: provider_names
-                .into_iter()
-                .map(|name| {
-                    let capabilities = self
-                        .provider_registry
-                        .get_or_create_for_workspace(workspace_id.as_str(), name.as_str())
-                        .map(|provider| {
-                            let capabilities = provider.capabilities();
-                            ProviderSummaryCapabilities {
-                                embeddings: capabilities.embeddings,
-                            }
-                        })
-                        .unwrap_or_default();
+        let mut providers = provider_names
+            .into_iter()
+            .map(|name| {
+                let capabilities = self
+                    .provider_registry
+                    .get_or_create_for_workspace(workspace_id.as_str(), name.as_str())
+                    .map(|provider| {
+                        let capabilities = provider.capabilities();
+                        ProviderSummaryCapabilities {
+                            embeddings: capabilities.embeddings,
+                        }
+                    })
+                    .unwrap_or_default();
 
-                    ProviderSummary { name, capabilities }
-                })
-                .collect(),
-        };
+                ProviderSummary { name, capabilities }
+            })
+            .collect::<Vec<_>>();
+        if !providers.iter().any(|provider| provider.name == "local") {
+            providers.push(ProviderSummary {
+                name: "local".to_owned(),
+                capabilities: ProviderSummaryCapabilities { embeddings: true },
+            });
+        }
+
+        let result = ProviderListResponse { providers };
 
         let response = match JsonRpcResponse::from_result(request_id, &result) {
             Ok(response) => response,

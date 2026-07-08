@@ -458,10 +458,13 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         .gateway
         .memory
         .resolve_capsules_root(runtime_home.as_path())?;
+    let thread_episodic_workspace_vector_search_configs =
+        gateway_settings.workspace_thread_episodic_vector_search_configs();
     database::startup::spawn(
         crud_store.clone(),
         thread_episodic_storage_root.clone(),
         config.gateway.thread_episodic.vector_search.clone(),
+        thread_episodic_workspace_vector_search_configs.clone(),
         provider_registry.clone(),
         runtime_home.clone(),
     );
@@ -492,6 +495,9 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
     if let Some(cli_runtime_manager) = cli_runtime_manager {
         message_processor = message_processor.with_cli_runtime_manager(cli_runtime_manager);
     }
+    message_processor.apply_thread_episodic_workspace_vector_search_configs(
+        thread_episodic_workspace_vector_search_configs,
+    );
     message_processor = message_processor.with_voice_model_bootstrap(voice_model_bootstrap);
     message_processor = message_processor.with_voice_transcriber(
         TranscribeRsParakeetSpeechTranscriber::new(config.clone(), runtime_home.clone()),
@@ -787,6 +793,7 @@ fn thread_episodic_runtime_config_from_gateway_config(
         recall_service: ThreadEpisodicRecallServiceConfig {
             enabled: config.enabled && config.recall_enabled,
             vector_search_enabled: config.vector_search.enabled,
+            vector_search: config.vector_search.clone(),
             default_prompt_chars: config.default_prompt_chars,
             max_prompt_chars: config.max_prompt_chars,
             max_hit_chars: config.max_hit_chars,
@@ -821,6 +828,7 @@ pub(crate) fn thread_episodic_runtime_config_from_gateway_settings(
         recall_service: ThreadEpisodicRecallServiceConfig {
             enabled: settings.enabled && settings.recall_enabled,
             vector_search_enabled: settings.vector_search.enabled,
+            vector_search: settings.vector_search.clone(),
             default_prompt_chars: settings.default_prompt_chars,
             max_prompt_chars: settings.max_prompt_chars,
             max_hit_chars: settings.max_hit_chars as usize,

@@ -60,7 +60,7 @@ use pioneer_artifacts::{
 use pioneer_config::{
     GatewayArtifactsConfig, GatewayCliAgentRuntimeCommandHeartbeatConfig,
     GatewayCommandExecutionTimeoutConfig, GatewayHookRecoveryConfig,
-    GatewayProviderStreamItemTimeoutConfig,
+    GatewayProviderStreamItemTimeoutConfig, GatewayThreadEpisodicVectorSearchConfig,
 };
 use pioneer_crud::{
     CliRuntimePendingRequestRecord,
@@ -148,7 +148,7 @@ use pioneer_sqlite::{
 use pioneer_tasks::{TaskRuntime, TaskRuntimeConfig};
 use serde::Serialize;
 use serde_json::Value as JsonValue;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -582,7 +582,8 @@ impl MessageProcessor {
                 Some(thread_episodic_recall_embedding_provider_resolver),
             ),
         );
-        thread_episodic_recall_service.apply_config(thread_episodic_runtime_config.recall_service);
+        thread_episodic_recall_service
+            .apply_config(thread_episodic_runtime_config.recall_service.clone());
         let thread_episodic_ingestion_enabled = thread_episodic_runtime_config.enabled
             && thread_episodic_runtime_config.indexing_enabled;
 
@@ -1009,6 +1010,16 @@ impl MessageProcessor {
                 self.crud_store.clone(),
                 thread_episodic_ingestion_enabled,
             ));
+    }
+
+    pub(crate) fn apply_thread_episodic_workspace_vector_search_configs(
+        &self,
+        configs: BTreeMap<String, GatewayThreadEpisodicVectorSearchConfig>,
+    ) {
+        self.thread_episodic_embedding_provider_resolver
+            .apply_workspace_configs(configs.clone());
+        self.thread_episodic_recall_service
+            .apply_workspace_vector_search_configs(configs);
     }
 
     pub(crate) fn apply_keepawake_setting(&self, enabled: bool) -> anyhow::Result<()> {

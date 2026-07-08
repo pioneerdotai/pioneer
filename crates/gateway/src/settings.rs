@@ -26,6 +26,8 @@ pub struct GatewaySettings {
     memory: Option<GatewayMemorySettingsOverride>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     thread_episodic: Option<GatewayThreadEpisodicSettingsOverride>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    workspaces: BTreeMap<String, GatewayWorkspaceSettingsOverride>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cli_runtimes: Option<GatewayCliRuntimeSettingsOverride>,
     #[serde(
@@ -49,6 +51,8 @@ struct GatewaySettingsWire {
     #[serde(default)]
     thread_episodic: Option<GatewayThreadEpisodicSettingsOverride>,
     #[serde(default)]
+    workspaces: BTreeMap<String, GatewayWorkspaceSettingsOverride>,
+    #[serde(default)]
     cli_runtimes: Option<GatewayCliRuntimeSettingsOverride>,
     #[serde(default)]
     remote_access: GatewayRemoteAccessSettingsOverride,
@@ -66,6 +70,7 @@ impl<'de> Deserialize<'de> for GatewaySettings {
             secrets: wire.secrets,
             memory: wire.memory,
             thread_episodic: wire.thread_episodic,
+            workspaces: wire.workspaces,
             cli_runtimes: wire.cli_runtimes,
             remote_access: wire.remote_access,
             migrated: false,
@@ -246,6 +251,20 @@ struct GatewayThreadEpisodicSettingsOverride {
     vector_search: Option<GatewayThreadEpisodicVectorSearchConfig>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct GatewayWorkspaceSettingsOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thread_episodic: Option<GatewayWorkspaceThreadEpisodicSettingsOverride>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct GatewayWorkspaceThreadEpisodicSettingsOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vector_search: Option<GatewayThreadEpisodicVectorSearchConfig>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct GatewayCliRuntimeSettingsOverride {
@@ -404,6 +423,33 @@ impl GatewaySettings {
         }
     }
 
+    pub fn effective_thread_episodic_settings_for_workspace(
+        &self,
+        config: &GatewayThreadEpisodicConfig,
+        workspace_id: Option<&str>,
+    ) -> GatewayThreadEpisodicSettings {
+        let mut settings = self.effective_thread_episodic_settings(config);
+        if let Some(vector_search) = self.workspace_vector_search_override(workspace_id) {
+            settings.vector_search = vector_search.clone();
+        }
+        settings
+    }
+
+    pub fn workspace_thread_episodic_vector_search_configs(
+        &self,
+    ) -> BTreeMap<String, GatewayThreadEpisodicVectorSearchConfig> {
+        self.workspaces
+            .iter()
+            .filter_map(|(workspace_id, workspace)| {
+                workspace
+                    .thread_episodic
+                    .as_ref()
+                    .and_then(|thread_episodic| thread_episodic.vector_search.as_ref())
+                    .map(|vector_search| (workspace_id.clone(), vector_search.clone()))
+            })
+            .collect()
+    }
+
     pub fn effective_cli_runtime_settings(
         &self,
         config: &GatewayConfig,
@@ -481,12 +527,30 @@ impl GatewaySettings {
         has_remote_access_key: bool,
         remote_access_status: pioneer_protocol::GatewayRemoteAccessStatusSnapshot,
     ) -> pioneer_protocol::GatewaySettingsSnapshot {
+        self.snapshot_with_remote_access_status_for_workspace(
+            config,
+            None,
+            has_remote_access_key,
+            remote_access_status,
+        )
+    }
+
+    pub fn snapshot_with_remote_access_status_for_workspace(
+        &self,
+        config: &GatewayConfig,
+        workspace_id: Option<&str>,
+        has_remote_access_key: bool,
+        remote_access_status: pioneer_protocol::GatewayRemoteAccessStatusSnapshot,
+    ) -> pioneer_protocol::GatewaySettingsSnapshot {
         let general = self.effective_general_settings(config);
         pioneer_protocol::GatewaySettingsSnapshot {
             general,
             memory: self.effective_memory_settings(&config.memory).to_protocol(),
             thread_episodic: self
-                .effective_thread_episodic_settings(&config.thread_episodic)
+                .effective_thread_episodic_settings_for_workspace(
+                    &config.thread_episodic,
+                    workspace_id,
+                )
                 .to_protocol(),
             cli_runtimes: self.effective_cli_runtime_settings(config),
             remote_access: self.effective_remote_access_settings(
@@ -501,6 +565,14 @@ impl GatewaySettings {
         &mut self,
         update: pioneer_protocol::GatewaySettingsUpdate,
     ) -> Result<GatewaySettingsChangeSet> {
+        self.apply_protocol_update_for_workspace(update, None)
+    }
+
+    pub fn apply_protocol_update_for_workspace(
+        &mut self,
+        update: pioneer_protocol::GatewaySettingsUpdate,
+        workspace_id: Option<&str>,
+    ) -> Result<GatewaySettingsChangeSet> {
         let mut changes = GatewaySettingsChangeSet::default();
         if let Some(general) = update.general {
             changes.general = self.general.apply_protocol_update(general);
@@ -511,11 +583,29 @@ impl GatewaySettings {
             changes.memory = true;
         }
         if let Some(thread_episodic) = update.thread_episodic {
-            let previous_vector_identity = self.thread_episodic_vector_projection_identity_hash();
-            self.apply_thread_episodic_settings_update(thread_episodic);
+            let normalized_workspace_id = normalize_workspace_settings_key(workspace_id);
+            if thread_episodic.vector_search.is_some() && normalized_workspace_id.is_none() {
+                bail!(
+                    "workspace context is required to update thread episodic vector search settings"
+                );
+            }
+            let previous_vector_identity = self
+                .thread_episodic_vector_projection_identity_hash_for_workspace(
+                    normalized_workspace_id.as_deref(),
+                );
+            self.apply_thread_episodic_settings_update(
+                thread_episodic,
+                normalized_workspace_id.as_deref(),
+            );
             changes.thread_episodic = true;
-            changes.thread_episodic_vector_projection_changed =
-                previous_vector_identity != self.thread_episodic_vector_projection_identity_hash();
+            if normalized_workspace_id.is_some() {
+                changes.thread_episodic_vector_projection_workspace_id =
+                    normalized_workspace_id.clone();
+            }
+            changes.thread_episodic_vector_projection_changed = previous_vector_identity
+                != self.thread_episodic_vector_projection_identity_hash_for_workspace(
+                    normalized_workspace_id.as_deref(),
+                );
         }
         if let Some(cli_runtimes) = update.cli_runtimes {
             self.set_cli_runtime_settings(cli_runtimes)?;
@@ -529,21 +619,79 @@ impl GatewaySettings {
 
     fn apply_thread_episodic_settings_update(
         &mut self,
-        update: pioneer_protocol::GatewayThreadEpisodicSettingsUpdate,
+        mut update: pioneer_protocol::GatewayThreadEpisodicSettingsUpdate,
+        workspace_id: Option<&str>,
     ) {
-        self.thread_episodic
-            .get_or_insert_with(GatewayThreadEpisodicSettingsOverride::default)
-            .apply_protocol_update(update);
+        let vector_update = update.vector_search.take();
+        if thread_episodic_settings_update_has_global_fields(&update) {
+            self.thread_episodic
+                .get_or_insert_with(GatewayThreadEpisodicSettingsOverride::default)
+                .apply_protocol_update(update);
+        }
+        let Some(vector_update) = vector_update else {
+            return;
+        };
+
+        match workspace_id {
+            Some(workspace_id) => {
+                let mut vector_search = self
+                    .effective_thread_episodic_vector_search_config_for_workspace(Some(
+                        workspace_id,
+                    ));
+                apply_vector_search_protocol_update(&mut vector_search, vector_update);
+                self.workspaces
+                    .entry(workspace_id.to_owned())
+                    .or_default()
+                    .thread_episodic
+                    .get_or_insert_with(GatewayWorkspaceThreadEpisodicSettingsOverride::default)
+                    .vector_search = Some(vector_search);
+            }
+            None => {
+                let mut vector_search =
+                    self.effective_thread_episodic_vector_search_config_for_workspace(None);
+                apply_vector_search_protocol_update(&mut vector_search, vector_update);
+                self.thread_episodic
+                    .get_or_insert_with(GatewayThreadEpisodicSettingsOverride::default)
+                    .vector_search = Some(vector_search);
+            }
+        }
     }
 
-    fn thread_episodic_vector_projection_identity_hash(&self) -> String {
-        let vector_search = self
-            .thread_episodic
-            .as_ref()
-            .and_then(|thread_episodic| thread_episodic.vector_search.as_ref())
-            .cloned()
-            .unwrap_or_default();
+    fn thread_episodic_vector_projection_identity_hash_for_workspace(
+        &self,
+        workspace_id: Option<&str>,
+    ) -> String {
+        let vector_search =
+            self.effective_thread_episodic_vector_search_config_for_workspace(workspace_id);
         thread_episodic_vector_projection_identity_hash(&vector_search)
+    }
+
+    fn effective_thread_episodic_vector_search_config_for_workspace(
+        &self,
+        workspace_id: Option<&str>,
+    ) -> GatewayThreadEpisodicVectorSearchConfig {
+        self.workspace_vector_search_override(workspace_id)
+            .cloned()
+            .or_else(|| {
+                self.thread_episodic
+                    .as_ref()
+                    .and_then(|thread_episodic| thread_episodic.vector_search.clone())
+            })
+            .unwrap_or_default()
+    }
+
+    fn workspace_vector_search_override(
+        &self,
+        workspace_id: Option<&str>,
+    ) -> Option<&GatewayThreadEpisodicVectorSearchConfig> {
+        let workspace_id = workspace_id?.trim();
+        if workspace_id.is_empty() {
+            return None;
+        }
+        self.workspaces
+            .get(workspace_id)
+            .and_then(|workspace| workspace.thread_episodic.as_ref())
+            .and_then(|thread_episodic| thread_episodic.vector_search.as_ref())
     }
 
     pub fn apply_to_gateway_memory_config(
@@ -780,11 +928,19 @@ fn vector_search_config_to_protocol(
     config: &GatewayThreadEpisodicVectorSearchConfig,
 ) -> pioneer_protocol::GatewayThreadEpisodicVectorSearchSettings {
     let provider = config.provider.map(vector_provider_to_protocol);
+    let local_model = if matches!(
+        config.provider,
+        Some(GatewayThreadEpisodicVectorProviderConfig::Local)
+    ) {
+        config.local_model.clone().or_else(|| config.model.clone())
+    } else {
+        config.local_model.clone()
+    };
     let mut settings = pioneer_protocol::GatewayThreadEpisodicVectorSearchSettings {
         enabled: config.enabled,
         provider,
         model: config.model.clone(),
-        local_model: config.local_model.clone(),
+        local_model,
         embedding_dimension: config.embedding_dimension,
         embedding_normalized: config.embedding_normalized,
         provider_key: pioneer_protocol::GatewayThreadEpisodicVectorProviderKeyStatus {
@@ -840,7 +996,7 @@ pub fn thread_episodic_vector_projection_identity_hash(
         config.provider,
         Some(GatewayThreadEpisodicVectorProviderConfig::Local)
     ) {
-        config.local_model.as_deref().map(str::trim).unwrap_or("")
+        selected_local_vector_model(config).unwrap_or("")
     } else {
         config.model.as_deref().map(str::trim).unwrap_or("")
     };
@@ -954,6 +1110,35 @@ fn apply_vector_search_protocol_update(
     }
 }
 
+fn normalize_workspace_settings_key(workspace_id: Option<&str>) -> Option<String> {
+    workspace_id
+        .map(str::trim)
+        .filter(|workspace_id| !workspace_id.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn thread_episodic_settings_update_has_global_fields(
+    update: &pioneer_protocol::GatewayThreadEpisodicSettingsUpdate,
+) -> bool {
+    update.enabled.is_some()
+        || update.indexing_enabled.is_some()
+        || update.recall_enabled.is_some()
+        || update.default_prompt_chars.is_some()
+        || update.max_prompt_chars.is_some()
+        || update.max_hit_chars.is_some()
+        || update.default_max_candidates.is_some()
+        || update.max_candidate_work.is_some()
+        || update.max_segments.is_some()
+        || update.min_relevancy.is_some()
+        || update.min_results.is_some()
+        || update.snippet_chars.is_some()
+        || update.index_batch_limit.is_some()
+        || update.retry_base_delay_secs.is_some()
+        || update.retry_max_delay_secs.is_some()
+        || update.max_attempts.is_some()
+        || update.near_capacity_percent.is_some()
+}
+
 fn vector_provider_to_protocol(
     provider: GatewayThreadEpisodicVectorProviderConfig,
 ) -> pioneer_protocol::GatewayThreadEpisodicVectorProvider {
@@ -1027,7 +1212,7 @@ pub(crate) fn resolved_vector_embedding_dimension(
             }
         }
         Some(GatewayThreadEpisodicVectorProviderConfig::Local) => {
-            match config.local_model.as_deref().unwrap_or("").trim() {
+            match selected_local_vector_model(config).unwrap_or("") {
                 "bge-small-en-v1.5" => Some(384),
                 "bge-base-en-v1.5" | "nomic-embed-text-v1.5" => Some(768),
                 "gte-large" => Some(1024),
@@ -1036,6 +1221,15 @@ pub(crate) fn resolved_vector_embedding_dimension(
         }
         None => None,
     }
+}
+
+fn selected_local_vector_model(config: &GatewayThreadEpisodicVectorSearchConfig) -> Option<&str> {
+    config
+        .model
+        .as_deref()
+        .or(config.local_model.as_deref())
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -1054,6 +1248,7 @@ pub struct GatewaySettingsChangeSet {
     pub memory: bool,
     pub thread_episodic: bool,
     pub thread_episodic_vector_projection_changed: bool,
+    pub thread_episodic_vector_projection_workspace_id: Option<String>,
     pub cli_runtimes: bool,
     pub remote_access: GatewayRemoteAccessChangeSet,
 }
@@ -1649,6 +1844,7 @@ pub fn load_or_create_gateway_settings(
         secrets: GatewaySecretsSettings::default(),
         memory: None,
         thread_episodic: None,
+        workspaces: BTreeMap::new(),
         cli_runtimes: Some(GatewayCliRuntimeSettingsOverride::default_supported()?),
         remote_access: GatewayRemoteAccessSettingsOverride::default(),
         migrated: false,
@@ -2247,57 +2443,66 @@ embedding_normalized = true
         .expect("gateway settings should parse");
 
         let model_change = settings
-            .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
-                thread_episodic: Some(pioneer_protocol::GatewayThreadEpisodicSettingsUpdate {
-                    vector_search: Some(
-                        pioneer_protocol::GatewayThreadEpisodicVectorSearchSettingsUpdate {
-                            model: Some(Some("text-embedding-3-large".to_owned())),
-                            ..Default::default()
-                        },
-                    ),
+            .apply_protocol_update_for_workspace(
+                pioneer_protocol::GatewaySettingsUpdate {
+                    thread_episodic: Some(pioneer_protocol::GatewayThreadEpisodicSettingsUpdate {
+                        vector_search: Some(
+                            pioneer_protocol::GatewayThreadEpisodicVectorSearchSettingsUpdate {
+                                model: Some(Some("text-embedding-3-large".to_owned())),
+                                ..Default::default()
+                            },
+                        ),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            })
+                },
+                Some("workspace_a"),
+            )
             .expect("model update should apply");
         assert!(model_change.thread_episodic);
         assert!(model_change.thread_episodic_vector_projection_changed);
 
         let disable = settings
-            .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
-                thread_episodic: Some(pioneer_protocol::GatewayThreadEpisodicSettingsUpdate {
-                    vector_search: Some(
-                        pioneer_protocol::GatewayThreadEpisodicVectorSearchSettingsUpdate {
-                            enabled: Some(false),
-                            ..Default::default()
-                        },
-                    ),
+            .apply_protocol_update_for_workspace(
+                pioneer_protocol::GatewaySettingsUpdate {
+                    thread_episodic: Some(pioneer_protocol::GatewayThreadEpisodicSettingsUpdate {
+                        vector_search: Some(
+                            pioneer_protocol::GatewayThreadEpisodicVectorSearchSettingsUpdate {
+                                enabled: Some(false),
+                                ..Default::default()
+                            },
+                        ),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            })
+                },
+                Some("workspace_a"),
+            )
             .expect("disable update should apply");
         assert!(disable.thread_episodic_vector_projection_changed);
 
         let already_disabled = settings
-            .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
-                thread_episodic: Some(pioneer_protocol::GatewayThreadEpisodicSettingsUpdate {
-                    vector_search: Some(
-                        pioneer_protocol::GatewayThreadEpisodicVectorSearchSettingsUpdate {
-                            enabled: Some(false),
-                            provider: Some(Some(
-                                pioneer_protocol::GatewayThreadEpisodicVectorProvider::OpenRouter,
-                            )),
-                            model: Some(Some("different-disabled-model".to_owned())),
-                            local_model: Some(Some("different-disabled-local".to_owned())),
-                            embedding_dimension: Some(Some(1234)),
-                            embedding_normalized: Some(false),
-                        },
-                    ),
+            .apply_protocol_update_for_workspace(
+                pioneer_protocol::GatewaySettingsUpdate {
+                    thread_episodic: Some(pioneer_protocol::GatewayThreadEpisodicSettingsUpdate {
+                        vector_search: Some(
+                            pioneer_protocol::GatewayThreadEpisodicVectorSearchSettingsUpdate {
+                                enabled: Some(false),
+                                provider: Some(Some(
+                                    pioneer_protocol::GatewayThreadEpisodicVectorProvider::OpenRouter,
+                                )),
+                                model: Some(Some("different-disabled-model".to_owned())),
+                                local_model: Some(Some("different-disabled-local".to_owned())),
+                                embedding_dimension: Some(Some(1234)),
+                                embedding_normalized: Some(false),
+                            },
+                        ),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            })
+                },
+                Some("workspace_a"),
+            )
             .expect("already-disabled update should apply");
         assert!(!already_disabled.thread_episodic_vector_projection_changed);
     }
@@ -2432,50 +2637,164 @@ backend = "keystore"
         .expect("gateway settings should parse");
 
         let changes = settings
+            .apply_protocol_update_for_workspace(
+                pioneer_protocol::GatewaySettingsUpdate {
+                    thread_episodic: Some(pioneer_protocol::GatewayThreadEpisodicSettingsUpdate {
+                        vector_search: Some(
+                            pioneer_protocol::GatewayThreadEpisodicVectorSearchSettingsUpdate {
+                                enabled: Some(true),
+                                provider: Some(Some(
+                                    pioneer_protocol::GatewayThreadEpisodicVectorProvider::Local,
+                                )),
+                                model: Some(Some("bge-base-en-v1.5".to_owned())),
+                                local_model: Some(Some("bge-base-en-v1.5".to_owned())),
+                                embedding_dimension: Some(Some(768)),
+                                embedding_normalized: Some(true),
+                            },
+                        ),
+                        ..pioneer_protocol::GatewayThreadEpisodicSettingsUpdate::default()
+                    }),
+                    ..pioneer_protocol::GatewaySettingsUpdate::default()
+                },
+                Some("workspace_a"),
+            )
+            .expect("vector settings update should apply");
+
+        assert!(changes.thread_episodic);
+        let config = gateway_config_with_keepawake(false);
+        let snapshot = settings.snapshot_with_remote_access_status_for_workspace(
+            &config,
+            Some("workspace_a"),
+            false,
+            pioneer_protocol::GatewayRemoteAccessStatusSnapshot::default(),
+        );
+        let mapped = pioneer_config::GatewayThreadEpisodicVectorSearchConfig::from(
+            crate::settings::GatewayThreadEpisodicSettings::from_protocol(snapshot.thread_episodic)
+                .vector_search,
+        );
+        assert!(mapped.enabled);
+        assert_eq!(
+            mapped.provider,
+            Some(pioneer_config::GatewayThreadEpisodicVectorProviderConfig::Local)
+        );
+        assert_eq!(mapped.model.as_deref(), Some("bge-base-en-v1.5"));
+        assert_eq!(mapped.local_model.as_deref(), Some("bge-base-en-v1.5"));
+        assert_eq!(mapped.embedding_dimension, Some(768));
+
+        let serialized = toml::to_string(&settings).expect("settings should serialize");
+        assert!(serialized.contains("[workspaces.workspace_a.thread_episodic.vector_search]"));
+        assert!(serialized.contains("provider = \"local\""));
+        assert!(!serialized.contains("api_key"));
+        assert!(!serialized.contains("sk-"));
+    }
+
+    #[test]
+    fn gateway_thread_episodic_vector_update_requires_workspace_scope() {
+        let mut settings = toml::from_str::<super::GatewaySettings>(
+            r#"
+version = 1
+
+[secrets]
+backend = "keystore"
+"#,
+        )
+        .expect("gateway settings should parse");
+
+        let error = settings
             .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
                 thread_episodic: Some(pioneer_protocol::GatewayThreadEpisodicSettingsUpdate {
                     vector_search: Some(
                         pioneer_protocol::GatewayThreadEpisodicVectorSearchSettingsUpdate {
                             enabled: Some(true),
-                            provider: Some(Some(
-                                pioneer_protocol::GatewayThreadEpisodicVectorProvider::Local,
-                            )),
-                            model: Some(Some("bge-base-en-v1.5".to_owned())),
-                            local_model: Some(Some("bge-base-en-v1.5".to_owned())),
-                            embedding_dimension: Some(Some(768)),
-                            embedding_normalized: Some(true),
+                            ..Default::default()
                         },
                     ),
                     ..pioneer_protocol::GatewayThreadEpisodicSettingsUpdate::default()
                 }),
                 ..pioneer_protocol::GatewaySettingsUpdate::default()
             })
-            .expect("vector settings update should apply");
+            .expect_err("vector settings update without workspace should fail");
+
+        assert!(format!("{error:#}").contains(
+            "workspace context is required to update thread episodic vector search settings"
+        ));
+    }
+
+    #[test]
+    fn gateway_thread_episodic_workspace_vector_update_is_workspace_scoped() {
+        let mut settings = toml::from_str::<super::GatewaySettings>(
+            r#"
+version = 1
+
+[secrets]
+backend = "keystore"
+"#,
+        )
+        .expect("gateway settings should parse");
+
+        let update = pioneer_protocol::GatewaySettingsUpdate {
+            thread_episodic: Some(pioneer_protocol::GatewayThreadEpisodicSettingsUpdate {
+                vector_search: Some(
+                    pioneer_protocol::GatewayThreadEpisodicVectorSearchSettingsUpdate {
+                        enabled: Some(true),
+                        provider: Some(Some(
+                            pioneer_protocol::GatewayThreadEpisodicVectorProvider::OpenRouter,
+                        )),
+                        model: Some(Some("openai/text-embedding-3-small".to_owned())),
+                        local_model: Some(None),
+                        embedding_dimension: Some(Some(1536)),
+                        embedding_normalized: Some(true),
+                    },
+                ),
+                ..pioneer_protocol::GatewayThreadEpisodicSettingsUpdate::default()
+            }),
+            ..pioneer_protocol::GatewaySettingsUpdate::default()
+        };
+        let changes = settings
+            .apply_protocol_update_for_workspace(update, Some("workspace_a"))
+            .expect("workspace vector settings update should apply");
 
         assert!(changes.thread_episodic);
-        let mapped = settings.apply_to_gateway_thread_episodic_config(
+        assert!(changes.thread_episodic_vector_projection_changed);
+        assert_eq!(
+            changes
+                .thread_episodic_vector_projection_workspace_id
+                .as_deref(),
+            Some("workspace_a")
+        );
+
+        let global = settings.apply_to_gateway_thread_episodic_config(
             pioneer_config::GatewayThreadEpisodicConfig::default(),
         );
-        assert!(mapped.vector_search.enabled);
-        assert_eq!(
-            mapped.vector_search.provider,
-            Some(pioneer_config::GatewayThreadEpisodicVectorProviderConfig::Local)
-        );
-        assert_eq!(
-            mapped.vector_search.model.as_deref(),
-            Some("bge-base-en-v1.5")
-        );
-        assert_eq!(
-            mapped.vector_search.local_model.as_deref(),
-            Some("bge-base-en-v1.5")
-        );
-        assert_eq!(mapped.vector_search.embedding_dimension, Some(768));
+        assert!(!global.vector_search.enabled);
 
-        let serialized = toml::to_string(&settings).expect("settings should serialize");
-        assert!(serialized.contains("[thread_episodic.vector_search]"));
-        assert!(serialized.contains("provider = \"local\""));
-        assert!(!serialized.contains("api_key"));
-        assert!(!serialized.contains("sk-"));
+        let config = gateway_config_with_keepawake(false);
+        let workspace_a = settings.snapshot_with_remote_access_status_for_workspace(
+            &config,
+            Some("workspace_a"),
+            false,
+            pioneer_protocol::GatewayRemoteAccessStatusSnapshot::default(),
+        );
+        let workspace_b = settings.snapshot_with_remote_access_status_for_workspace(
+            &config,
+            Some("workspace_b"),
+            false,
+            pioneer_protocol::GatewayRemoteAccessStatusSnapshot::default(),
+        );
+
+        assert!(workspace_a.thread_episodic.vector_search.enabled);
+        assert_eq!(
+            workspace_a.thread_episodic.vector_search.provider,
+            Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::OpenRouter)
+        );
+        assert_eq!(
+            workspace_a.thread_episodic.vector_search.model.as_deref(),
+            Some("openai/text-embedding-3-small")
+        );
+        assert!(!workspace_b.thread_episodic.vector_search.enabled);
+        let workspace_configs = settings.workspace_thread_episodic_vector_search_configs();
+        assert_eq!(workspace_configs.len(), 1);
+        assert!(workspace_configs.contains_key("workspace_a"));
     }
 
     #[test]

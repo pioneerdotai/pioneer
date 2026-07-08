@@ -12,7 +12,10 @@ use pioneer_protocol::{
     GatewayThreadEpisodicVectorLocalModelStatus, GatewayThreadEpisodicVectorProvider,
     GatewayThreadEpisodicVectorSearchSettings,
 };
-use pioneer_provider::{EmbeddingRequest, Provider};
+use pioneer_provider::{
+    EmbeddingRequest, Provider,
+    providers::{LocalEmbeddingModelInfo, local_embedding_model_info},
+};
 use reqwest::blocking::Client as BlockingClient;
 use std::fmt::{Debug, Formatter};
 use std::fs::{File, OpenOptions};
@@ -24,7 +27,7 @@ use std::time::Duration;
 const OPENAI_PROVIDER_ID: &str = "openai";
 const OPENROUTER_PROVIDER_ID: &str = "openrouter";
 const LOCAL_PROVIDER_ID: &str = "local";
-const LOCAL_EMBEDDING_MODELS_RELATIVE_DIR: &[&str] = &["memory", "embedding-models", "text"];
+const LOCAL_EMBEDDING_MODELS_RELATIVE_DIR: &[&str] = &["models", "embedding", "text"];
 const LOCAL_EMBEDDING_DOWNLOAD_TIMEOUT_SECS: u64 = 15 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,62 +122,6 @@ pub(crate) fn openrouter_embedding_model_info(
         max_batch_size: 512,
         custom: true,
     })
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct LocalEmbeddingModelInfo {
-    pub id: &'static str,
-    pub display_name: &'static str,
-    pub dimension: usize,
-    pub max_tokens: usize,
-    pub model_url: &'static str,
-    pub tokenizer_url: &'static str,
-    pub default: bool,
-}
-
-pub(crate) const LOCAL_EMBEDDING_MODELS: &[LocalEmbeddingModelInfo] = &[
-    LocalEmbeddingModelInfo {
-        id: "bge-small-en-v1.5",
-        display_name: "BGE Small EN v1.5",
-        dimension: 384,
-        max_tokens: 512,
-        model_url: "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/onnx/model.onnx",
-        tokenizer_url: "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/tokenizer.json",
-        default: true,
-    },
-    LocalEmbeddingModelInfo {
-        id: "bge-base-en-v1.5",
-        display_name: "BGE Base EN v1.5",
-        dimension: 768,
-        max_tokens: 512,
-        model_url: "https://huggingface.co/BAAI/bge-base-en-v1.5/resolve/main/onnx/model.onnx",
-        tokenizer_url: "https://huggingface.co/BAAI/bge-base-en-v1.5/resolve/main/tokenizer.json",
-        default: false,
-    },
-    LocalEmbeddingModelInfo {
-        id: "nomic-embed-text-v1.5",
-        display_name: "Nomic Embed Text v1.5",
-        dimension: 768,
-        max_tokens: 512,
-        model_url: "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5/resolve/main/onnx/model.onnx",
-        tokenizer_url: "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5/resolve/main/tokenizer.json",
-        default: false,
-    },
-    LocalEmbeddingModelInfo {
-        id: "gte-large",
-        display_name: "GTE Large",
-        dimension: 1024,
-        max_tokens: 512,
-        model_url: "https://huggingface.co/thenlper/gte-large/resolve/main/onnx/model.onnx",
-        tokenizer_url: "https://huggingface.co/thenlper/gte-large/resolve/main/tokenizer.json",
-        default: false,
-    },
-];
-
-pub(crate) fn local_embedding_model_info(model: &str) -> Option<&'static LocalEmbeddingModelInfo> {
-    LOCAL_EMBEDDING_MODELS
-        .iter()
-        .find(|candidate| candidate.id == model)
 }
 
 pub(crate) fn local_embedding_models_root(runtime_home: &Path) -> PathBuf {
@@ -285,12 +232,7 @@ fn prepare_local_embedding_model_download(
         return Ok(None);
     }
 
-    let Some(model) = config
-        .local_model
-        .as_deref()
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-    else {
+    let Some(model) = selected_local_embedding_model(config) else {
         return Err("local embedding model is not selected".to_owned());
     };
     let info = local_embedding_model_info(model)
@@ -333,6 +275,17 @@ fn prepare_local_embedding_model_download(
     drop(marker);
 
     Ok(Some((files, info)))
+}
+
+fn selected_local_embedding_model(
+    config: &GatewayThreadEpisodicVectorSearchConfig,
+) -> Option<&str> {
+    config
+        .model
+        .as_deref()
+        .or(config.local_model.as_deref())
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
 }
 
 fn complete_local_embedding_model_download(
@@ -599,7 +552,11 @@ pub(crate) fn embedding_provider_readiness_from_error(
 
 fn selected_embedding_model(settings: &GatewayThreadEpisodicVectorSearchSettings) -> String {
     if settings.provider == Some(GatewayThreadEpisodicVectorProvider::Local) {
-        settings.local_model.clone().unwrap_or_default()
+        settings
+            .model
+            .clone()
+            .or_else(|| settings.local_model.clone())
+            .unwrap_or_default()
     } else {
         settings.model.clone().unwrap_or_default()
     }
@@ -1290,8 +1247,8 @@ mod tests {
             files.models_dir,
             runtime_home
                 .path()
-                .join("memory")
-                .join("embedding-models")
+                .join("models")
+                .join("embedding")
                 .join("text")
         );
         assert_eq!(
