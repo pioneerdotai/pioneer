@@ -3448,9 +3448,37 @@ impl CrudStore {
             .collect()
     }
 
+    pub async fn list_all_thread_episodic_capsules_for_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<ThreadEpisodicCapsuleRecord>> {
+        thread_episodic_repository::list_all_capsules_for_workspace(&self.connection, workspace_id)
+            .await?
+            .into_iter()
+            .map(crate::thread_episodic::thread_episodic_capsule_record_from_model)
+            .collect()
+    }
+
     pub async fn delete_all_thread_episodic_capsules(&self) -> Result<u64> {
         self.run_serialized_write(|| async move {
             thread_episodic_repository::delete_all_capsules(&self.connection).await
+        })
+        .await
+    }
+
+    pub async fn delete_thread_episodic_capsules_for_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Result<u64> {
+        self.run_serialized_write(|| {
+            let workspace_id = workspace_id.to_owned();
+            async move {
+                thread_episodic_repository::delete_capsules_for_workspace(
+                    &self.connection,
+                    workspace_id.as_str(),
+                )
+                .await
+            }
         })
         .await
     }
@@ -3462,9 +3490,43 @@ impl CrudStore {
         .await
     }
 
+    pub async fn delete_thread_episodic_items_for_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Result<u64> {
+        self.run_serialized_write(|| {
+            let workspace_id = workspace_id.to_owned();
+            async move {
+                thread_episodic_repository::delete_items_for_workspace(
+                    &self.connection,
+                    workspace_id.as_str(),
+                )
+                .await
+            }
+        })
+        .await
+    }
+
     pub async fn delete_all_thread_episodic_exclusions(&self) -> Result<u64> {
         self.run_serialized_write(|| async move {
             thread_episodic_repository::delete_all_exclusions(&self.connection).await
+        })
+        .await
+    }
+
+    pub async fn delete_thread_episodic_exclusions_for_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Result<u64> {
+        self.run_serialized_write(|| {
+            let workspace_id = workspace_id.to_owned();
+            async move {
+                thread_episodic_repository::delete_exclusions_for_workspace(
+                    &self.connection,
+                    workspace_id.as_str(),
+                )
+                .await
+            }
         })
         .await
     }
@@ -3476,9 +3538,43 @@ impl CrudStore {
         .await
     }
 
+    pub async fn delete_thread_episodic_index_jobs_for_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Result<u64> {
+        self.run_serialized_write(|| {
+            let workspace_id = workspace_id.to_owned();
+            async move {
+                thread_episodic_repository::delete_index_jobs_for_workspace(
+                    &self.connection,
+                    workspace_id.as_str(),
+                )
+                .await
+            }
+        })
+        .await
+    }
+
     pub async fn delete_all_thread_episodic_thread_directory_entries(&self) -> Result<u64> {
         self.run_serialized_write(|| async move {
             thread_episodic_repository::delete_all_thread_directory_entries(&self.connection).await
+        })
+        .await
+    }
+
+    pub async fn delete_thread_episodic_thread_directory_entries_for_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Result<u64> {
+        self.run_serialized_write(|| {
+            let workspace_id = workspace_id.to_owned();
+            async move {
+                thread_episodic_repository::delete_thread_directory_entries_for_workspace(
+                    &self.connection,
+                    workspace_id.as_str(),
+                )
+                .await
+            }
         })
         .await
     }
@@ -3847,10 +3943,32 @@ impl CrudStore {
         thread_episodic_repository::list_refill_threads(&self.connection).await
     }
 
+    pub async fn list_thread_episodic_refill_threads_for_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<ThreadEpisodicRefillThread>> {
+        thread_episodic_repository::list_refill_threads_for_workspace(
+            &self.connection,
+            workspace_id,
+        )
+        .await
+    }
+
     pub async fn count_thread_episodic_refill_sources(
         &self,
     ) -> Result<ThreadEpisodicRefillSourceCounts> {
         thread_episodic_repository::count_refill_sources(&self.connection).await
+    }
+
+    pub async fn count_thread_episodic_refill_sources_for_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Result<ThreadEpisodicRefillSourceCounts> {
+        thread_episodic_repository::count_refill_sources_for_workspace(
+            &self.connection,
+            workspace_id,
+        )
+        .await
     }
 
     pub async fn list_thread_episodic_refill_indexable_items(
@@ -3862,6 +3980,22 @@ impl CrudStore {
             .into_iter()
             .map(crate::thread_episodic::thread_episodic_item_record_from_model)
             .collect()
+    }
+
+    pub async fn list_thread_episodic_refill_indexable_items_for_workspace(
+        &self,
+        workspace_id: &str,
+        limit: u64,
+    ) -> Result<Vec<ThreadEpisodicItemRecord>> {
+        thread_episodic_repository::list_refill_indexable_items_for_workspace(
+            &self.connection,
+            workspace_id,
+            limit,
+        )
+        .await?
+        .into_iter()
+        .map(crate::thread_episodic::thread_episodic_item_record_from_model)
+        .collect()
     }
 
     pub async fn enqueue_thread_episodic_refill_index_jobs(
@@ -3912,8 +4046,75 @@ impl CrudStore {
         .await
     }
 
+    pub async fn enqueue_thread_episodic_refill_index_jobs_for_workspace(
+        &self,
+        workspace_id: &str,
+        now_unix: i64,
+        limit: u64,
+    ) -> Result<usize> {
+        self.run_serialized_write(|| {
+            let workspace_id = workspace_id.to_owned();
+            async move {
+                let items = thread_episodic_repository::list_refill_indexable_items_for_workspace(
+                    &self.connection,
+                    workspace_id.as_str(),
+                    limit,
+                )
+                .await?;
+                let now = unix_to_datetime(now_unix);
+                let mut enqueued = 0usize;
+                for item in items {
+                    if thread_episodic_repository::find_index_job_by_index_item(
+                        &self.connection,
+                        item.id.as_str(),
+                    )
+                    .await?
+                    .is_some()
+                    {
+                        continue;
+                    }
+
+                    thread_episodic_repository::insert_index_job_if_absent(
+                        &self.connection,
+                        NewThreadEpisodicIndexJobRecord {
+                            id: None,
+                            workspace_id: item.workspace_id,
+                            thread_id: item.thread_id,
+                            index_item_id: item.id,
+                            capsule_id: None,
+                            capsule_ref: None,
+                            segment_index: None,
+                            frame_uri: None,
+                            status: ThreadEpisodicIndexJobStatus::Queued,
+                            graph_enrichment_state:
+                                ThreadEpisodicGraphEnrichmentState::NotSupported,
+                            next_run_at: now,
+                            last_error: None,
+                        },
+                        now,
+                    )
+                    .await?;
+                    enqueued = enqueued.saturating_add(1);
+                }
+                Ok(enqueued)
+            }
+        })
+        .await
+    }
+
     pub async fn count_incomplete_thread_episodic_index_jobs(&self) -> Result<u64> {
         thread_episodic_repository::count_incomplete_index_jobs(&self.connection).await
+    }
+
+    pub async fn count_incomplete_thread_episodic_index_jobs_for_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Result<u64> {
+        thread_episodic_repository::count_incomplete_index_jobs_for_workspace(
+            &self.connection,
+            workspace_id,
+        )
+        .await
     }
 
     pub async fn insert_thread_episodic_index_job_if_absent(
@@ -4022,6 +4223,45 @@ impl CrudStore {
                 }
             }
             Ok(claimed)
+        })
+        .await
+    }
+
+    pub async fn claim_due_thread_episodic_index_jobs_for_workspace(
+        &self,
+        workspace_id: &str,
+        now_unix: i64,
+        limit: u64,
+    ) -> Result<Vec<ThreadEpisodicIndexJobRecord>> {
+        self.run_serialized_write(|| {
+            let workspace_id = workspace_id.to_owned();
+            async move {
+                let now = unix_to_datetime(now_unix);
+                let rows = thread_episodic_repository::list_due_index_jobs_for_workspace(
+                    &self.connection,
+                    workspace_id.as_str(),
+                    now,
+                    limit,
+                )
+                .await?;
+                let mut claimed = Vec::with_capacity(rows.len());
+                for row in rows {
+                    if let Some(row) = thread_episodic_repository::mark_index_job_running(
+                        &self.connection,
+                        row.id.as_str(),
+                        now,
+                    )
+                    .await?
+                    {
+                        claimed.push(
+                            crate::thread_episodic::thread_episodic_index_job_record_from_model(
+                                row,
+                            )?,
+                        );
+                    }
+                }
+                Ok(claimed)
+            }
         })
         .await
     }

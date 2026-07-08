@@ -290,11 +290,40 @@ pub async fn list_all_capsules<C: ConnectionTrait>(
         .context("failed to list thread episodic capsules")
 }
 
+pub async fn list_all_capsules_for_workspace<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+) -> Result<Vec<thread_episodic_capsules::Model>> {
+    thread_episodic_capsules::Entity::find()
+        .filter(thread_episodic_capsules::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .order_by_asc(thread_episodic_capsules::Column::ThreadId)
+        .order_by_asc(thread_episodic_capsules::Column::SegmentIndex)
+        .all(db)
+        .await
+        .with_context(|| {
+            format!("failed to list thread episodic capsules for workspace `{workspace_id}`")
+        })
+}
+
 pub async fn delete_all_capsules<C: ConnectionTrait>(db: &C) -> Result<u64> {
     let result = thread_episodic_capsules::Entity::delete_many()
         .exec(db)
         .await
         .context("failed to delete thread episodic capsule rows")?;
+    Ok(result.rows_affected)
+}
+
+pub async fn delete_capsules_for_workspace<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+) -> Result<u64> {
+    let result = thread_episodic_capsules::Entity::delete_many()
+        .filter(thread_episodic_capsules::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .exec(db)
+        .await
+        .with_context(|| {
+            format!("failed to delete thread episodic capsule rows for workspace `{workspace_id}`")
+        })?;
     Ok(result.rows_affected)
 }
 
@@ -306,11 +335,41 @@ pub async fn delete_all_items<C: ConnectionTrait>(db: &C) -> Result<u64> {
     Ok(result.rows_affected)
 }
 
+pub async fn delete_items_for_workspace<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+) -> Result<u64> {
+    let result = thread_episodic_items::Entity::delete_many()
+        .filter(thread_episodic_items::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .exec(db)
+        .await
+        .with_context(|| {
+            format!("failed to delete thread episodic item rows for workspace `{workspace_id}`")
+        })?;
+    Ok(result.rows_affected)
+}
+
 pub async fn delete_all_exclusions<C: ConnectionTrait>(db: &C) -> Result<u64> {
     let result = thread_episodic_exclusions::Entity::delete_many()
         .exec(db)
         .await
         .context("failed to delete thread episodic exclusion rows")?;
+    Ok(result.rows_affected)
+}
+
+pub async fn delete_exclusions_for_workspace<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+) -> Result<u64> {
+    let result = thread_episodic_exclusions::Entity::delete_many()
+        .filter(thread_episodic_exclusions::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .exec(db)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to delete thread episodic exclusion rows for workspace `{workspace_id}`"
+            )
+        })?;
     Ok(result.rows_affected)
 }
 
@@ -322,6 +381,20 @@ pub async fn delete_all_index_jobs<C: ConnectionTrait>(db: &C) -> Result<u64> {
     Ok(result.rows_affected)
 }
 
+pub async fn delete_index_jobs_for_workspace<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+) -> Result<u64> {
+    let result = thread_episodic_index_jobs::Entity::delete_many()
+        .filter(thread_episodic_index_jobs::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .exec(db)
+        .await
+        .with_context(|| {
+            format!("failed to delete thread episodic index jobs for workspace `{workspace_id}`")
+        })?;
+    Ok(result.rows_affected)
+}
+
 pub async fn delete_all_thread_directory_entries<C: ConnectionTrait>(db: &C) -> Result<u64> {
     let result = thread_episodic_thread_directory::Entity::delete_many()
         .exec(db)
@@ -330,10 +403,26 @@ pub async fn delete_all_thread_directory_entries<C: ConnectionTrait>(db: &C) -> 
     Ok(result.rows_affected)
 }
 
+pub async fn delete_thread_directory_entries_for_workspace<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+) -> Result<u64> {
+    let result = thread_episodic_thread_directory::Entity::delete_many()
+        .filter(thread_episodic_thread_directory::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .exec(db)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to delete thread episodic thread directory rows for workspace `{workspace_id}`"
+            )
+        })?;
+    Ok(result.rows_affected)
+}
+
 pub async fn list_refill_workspace_ids<C: ConnectionTrait>(db: &C) -> Result<Vec<String>> {
-    thread_episodic_items::Entity::find()
+    thread::Entity::find()
         .select_only()
-        .column(thread_episodic_items::Column::WorkspaceId)
+        .column(thread::Column::WorkspaceId)
         .distinct()
         .into_tuple::<String>()
         .all(db)
@@ -353,6 +442,31 @@ pub async fn list_refill_threads<C: ConnectionTrait>(
         .all(db)
         .await
         .context("failed to list thread episodic refill source threads")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(workspace_id, thread_id)| ThreadEpisodicRefillThread {
+            workspace_id,
+            thread_id,
+        })
+        .collect())
+}
+
+pub async fn list_refill_threads_for_workspace<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+) -> Result<Vec<ThreadEpisodicRefillThread>> {
+    let rows = thread::Entity::find()
+        .select_only()
+        .columns([thread::Column::WorkspaceId, thread::Column::Id])
+        .filter(thread::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .order_by_asc(thread::Column::Id)
+        .into_tuple::<(String, String)>()
+        .all(db)
+        .await
+        .with_context(|| {
+            format!("failed to list thread episodic refill source threads for workspace `{workspace_id}`")
+        })?;
 
     Ok(rows
         .into_iter()
@@ -403,6 +517,51 @@ pub async fn count_refill_sources<C: ConnectionTrait>(
     })
 }
 
+pub async fn count_refill_sources_for_workspace<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+) -> Result<ThreadEpisodicRefillSourceCounts> {
+    let rows = thread_episodic_items::Entity::find()
+        .select_only()
+        .columns([
+            thread_episodic_items::Column::ThreadId,
+            thread_episodic_items::Column::TurnId,
+            thread_episodic_items::Column::ItemId,
+        ])
+        .filter(thread_episodic_items::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .filter(
+            thread_episodic_items::Column::Status
+                .eq(item_status_to_db(ThreadEpisodicItemStatus::PendingIndex)),
+        )
+        .filter(thread_episodic_items::Column::DeletedAt.is_null())
+        .filter(
+            thread_episodic_items::Column::Visibility.ne(item_visibility_to_db(
+                ThreadEpisodicItemVisibility::InternalHidden,
+            )),
+        )
+        .into_tuple::<(String, String, String)>()
+        .all(db)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to count thread episodic refill source rows for workspace `{workspace_id}`"
+            )
+        })?;
+
+    let mut source_threads = HashSet::new();
+    let mut source_turns = HashSet::new();
+    for (thread_id, turn_id, _item_id) in rows.iter() {
+        source_threads.insert(thread_id.clone());
+        source_turns.insert((thread_id.clone(), turn_id.clone()));
+    }
+
+    Ok(ThreadEpisodicRefillSourceCounts {
+        source_thread_count: saturating_i64_from_usize(source_threads.len()),
+        source_turn_count: saturating_i64_from_usize(source_turns.len()),
+        source_turn_item_count: saturating_i64_from_usize(rows.len()),
+    })
+}
+
 pub async fn list_refill_indexable_items<C: ConnectionTrait>(
     db: &C,
     limit: u64,
@@ -434,6 +593,42 @@ pub async fn list_refill_indexable_items<C: ConnectionTrait>(
         .context("failed to list thread episodic refill indexable items")
 }
 
+pub async fn list_refill_indexable_items_for_workspace<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    limit: u64,
+) -> Result<Vec<thread_episodic_items::Model>> {
+    let items_with_jobs = Query::select()
+        .column(thread_episodic_index_jobs::Column::IndexItemId)
+        .from(thread_episodic_index_jobs::Entity)
+        .to_owned();
+
+    thread_episodic_items::Entity::find()
+        .filter(thread_episodic_items::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .filter(
+            thread_episodic_items::Column::Status
+                .eq(item_status_to_db(ThreadEpisodicItemStatus::PendingIndex)),
+        )
+        .filter(thread_episodic_items::Column::DeletedAt.is_null())
+        .filter(
+            thread_episodic_items::Column::Visibility.ne(item_visibility_to_db(
+                ThreadEpisodicItemVisibility::InternalHidden,
+            )),
+        )
+        .filter(thread_episodic_items::Column::Id.not_in_subquery(items_with_jobs))
+        .order_by_asc(thread_episodic_items::Column::ThreadId)
+        .order_by_asc(thread_episodic_items::Column::TurnId)
+        .order_by_asc(thread_episodic_items::Column::ItemId)
+        .limit(limit)
+        .all(db)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to list thread episodic refill indexable items for workspace `{workspace_id}`"
+            )
+        })
+}
+
 fn saturating_i64_from_usize(value: usize) -> i64 {
     value.min(i64::MAX as usize) as i64
 }
@@ -448,6 +643,26 @@ pub async fn count_incomplete_index_jobs<C: ConnectionTrait>(db: &C) -> Result<u
         .count(db)
         .await
         .context("failed to count incomplete thread episodic index jobs")
+}
+
+pub async fn count_incomplete_index_jobs_for_workspace<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+) -> Result<u64> {
+    thread_episodic_index_jobs::Entity::find()
+        .filter(thread_episodic_index_jobs::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .filter(thread_episodic_index_jobs::Column::Status.is_in([
+            index_job_status_to_db(ThreadEpisodicIndexJobStatus::Queued).to_owned(),
+            index_job_status_to_db(ThreadEpisodicIndexJobStatus::Running).to_owned(),
+            index_job_status_to_db(ThreadEpisodicIndexJobStatus::Failed).to_owned(),
+        ]))
+        .count(db)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to count incomplete thread episodic index jobs for workspace `{workspace_id}`"
+            )
+        })
 }
 
 pub async fn transition_capsule_write_state<C: ConnectionTrait>(
@@ -926,6 +1141,29 @@ pub async fn list_due_index_jobs<C: ConnectionTrait>(
         .all(db)
         .await
         .context("failed to list due thread episodic index jobs")
+}
+
+pub async fn list_due_index_jobs_for_workspace<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    now: DateTimeWithTimeZone,
+    limit: u64,
+) -> Result<Vec<thread_episodic_index_jobs::Model>> {
+    thread_episodic_index_jobs::Entity::find()
+        .filter(thread_episodic_index_jobs::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .filter(thread_episodic_index_jobs::Column::Status.is_in([
+            index_job_status_to_db(ThreadEpisodicIndexJobStatus::Queued).to_owned(),
+            index_job_status_to_db(ThreadEpisodicIndexJobStatus::Failed).to_owned(),
+        ]))
+        .filter(thread_episodic_index_jobs::Column::NextRunAt.lte(now))
+        .order_by_asc(thread_episodic_index_jobs::Column::NextRunAt)
+        .order_by_asc(thread_episodic_index_jobs::Column::CreatedAt)
+        .limit(limit)
+        .all(db)
+        .await
+        .with_context(|| {
+            format!("failed to list due thread episodic index jobs for workspace `{workspace_id}`")
+        })
 }
 
 pub async fn mark_index_job_running<C: ConnectionTrait>(
