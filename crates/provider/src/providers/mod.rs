@@ -6,6 +6,7 @@ mod copilot;
 mod echo;
 mod gemini;
 mod glm;
+mod local;
 mod ollama;
 mod openai;
 mod openrouter;
@@ -19,6 +20,9 @@ pub use copilot::CopilotProvider;
 pub use echo::EchoProvider;
 pub use gemini::GeminiProvider;
 pub use glm::GlmProvider;
+pub use local::{
+    LOCAL_EMBEDDING_MODELS, LocalEmbeddingModelInfo, LocalProvider, local_embedding_model_info,
+};
 pub use ollama::OllamaProvider;
 pub use openai::OpenAiProvider;
 pub use openrouter::OpenRouterProvider;

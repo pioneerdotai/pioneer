@@ -1,7 +1,7 @@
 use crate::providers::{
     AnthropicProvider, AuthStyle, AzureOpenAiProvider, BedrockProvider, CopilotProvider,
-    GeminiProvider, GlmProvider, OllamaProvider, OpenAiCompatibleProvider, OpenAiProvider,
-    OpenRouterProvider, TelnyxProvider,
+    GeminiProvider, GlmProvider, LocalProvider, OllamaProvider, OpenAiCompatibleProvider,
+    OpenAiProvider, OpenRouterProvider, TelnyxProvider,
 };
 use crate::traits::Provider;
 use crate::types::{InputTypeSupport, ProviderInputCapabilities, ProviderTimeoutPolicy};
@@ -34,6 +34,7 @@ pub fn create_provider_with_timeout_policy(
             api_key,
             timeout_policy,
         ))),
+        "local" => Ok(Box::new(LocalProvider::new())),
         "gemini" | "google" | "google-gemini" => Ok(Box::new(GeminiProvider::with_timeout_policy(
             api_key,
             timeout_policy,
@@ -360,6 +361,13 @@ mod tests {
     fn creates_ollama_provider() {
         let provider = create_provider("ollama", "").unwrap();
         assert_eq!(provider.name(), "ollama");
+    }
+
+    #[test]
+    fn creates_local_provider() {
+        let provider = create_provider("local", "").unwrap();
+        assert_eq!(provider.name(), "local");
+        assert!(provider.capabilities().embeddings);
     }
 
     #[test]
