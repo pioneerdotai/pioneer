@@ -277,6 +277,7 @@ if (-not (Test-Path -Path $appIconPath)) {
 }
 
 cargo build --release -p pioneer-desktop --target $Target
+cargo build --release -p pioneer-app-updater --target $Target
 cargo build --release -p pioneer-cli --features computer-use --target $Target
 
 $workDir = Join-Path $env:TEMP ("pioneer-msi-" + [Guid]::NewGuid().ToString("N"))
@@ -289,6 +290,13 @@ try {
     $signingContext = New-SigningContext -SigningRequired $signingRequired -WorkDir $workDir
 
     Copy-Item -Path "target/$Target/release/pioneer-app.exe" -Destination (Join-Path $stageDir "pioneer-app.exe") -Force
+    $helperStagePath = Join-Path $stageDir "pioneer-app-updater.exe"
+    Copy-Item -Path "target/$Target/release/pioneer-app-updater.exe" -Destination $helperStagePath -Force
+    if (-not (Test-Path -Path $helperStagePath)) {
+        throw "missing packaged desktop updater helper: $helperStagePath"
+    }
+    Sign-Artifact -Path $helperStagePath -SigningContext $signingContext
+
     $gatewayStageDir = Join-Path $stageDir "gateway"
     New-Item -ItemType Directory -Path $gatewayStageDir -Force | Out-Null
 
@@ -315,6 +323,9 @@ try {
         <Component Id="DesktopExeComponent" Guid="*">
           <File Id="DesktopExeFile" Source="`$(var.StageDir)\\pioneer-app.exe" KeyPath="yes" />
         </Component>
+        <Component Id="DesktopUpdaterComponent" Guid="*">
+          <File Id="DesktopUpdaterFile" Source="`$(var.StageDir)\\pioneer-app-updater.exe" KeyPath="yes" />
+        </Component>
         <Directory Id="GatewayBundleDir" Name="gateway">
           <Component Id="GatewayBootstrapComponent" Guid="*">
             <File Id="GatewayBootstrapFile" Source="`$(var.StageDir)\\gateway\\pioneer-bootstrap.exe" KeyPath="yes" />
@@ -331,6 +342,7 @@ try {
 
     <Feature Id="MainFeature" Title="Pioneer" Level="1">
       <ComponentRef Id="DesktopExeComponent" />
+      <ComponentRef Id="DesktopUpdaterComponent" />
       <ComponentRef Id="GatewayBootstrapComponent" />
       <ComponentRef Id="GatewayAssetComponent" />
       <ComponentRef Id="GatewayChecksumsComponent" />

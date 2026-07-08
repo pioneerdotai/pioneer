@@ -96,6 +96,7 @@ if [[ ! -x "$APPIMAGETOOL_BIN" ]] && ! command -v "$APPIMAGETOOL_BIN" >/dev/null
 fi
 
 cargo build --release -p pioneer-desktop --target "$TARGET"
+cargo build --release -p pioneer-app-updater --target "$TARGET"
 cargo build --release -p pioneer-cli --features computer-use --target "$TARGET"
 
 WORK_DIR="$(mktemp -d)"
@@ -112,6 +113,13 @@ fi
 
 cp "target/$TARGET/release/pioneer-app" "$APPDIR/usr/bin/pioneer-app"
 chmod 0755 "$APPDIR/usr/bin/pioneer-app"
+cp "target/$TARGET/release/pioneer-app-updater" "$APPDIR/usr/bin/pioneer-app-updater"
+chmod 0755 "$APPDIR/usr/bin/pioneer-app-updater"
+
+if [[ ! -x "$APPDIR/usr/bin/pioneer-app-updater" ]]; then
+  echo "missing packaged desktop updater helper: $APPDIR/usr/bin/pioneer-app-updater" >&2
+  exit 1
+fi
 
 GATEWAY_BUNDLE_DIR="$APPDIR/usr/bin/gateway"
 mkdir -p "$GATEWAY_BUNDLE_DIR"
@@ -147,6 +155,7 @@ cp "$APPDIR/pioneer.desktop" "$APPDIR/usr/share/applications/pioneer.desktop"
 cp "$LINUX_ICON_SOURCE" "$APPDIR/pioneer.png"
 cp "$APPDIR/pioneer.png" "$APPDIR/usr/share/icons/hicolor/256x256/apps/pioneer.png"
 ln -s "pioneer.png" "$APPDIR/.DirIcon"
+scripts/packaging/desktop/check-package-contents.sh linux-appdir "$APPDIR"
 
 APPIMAGE_NAME="pioneer-linux-${ARCH}.AppImage"
 APPIMAGE_PATH="$OUT_DIR/$APPIMAGE_NAME"

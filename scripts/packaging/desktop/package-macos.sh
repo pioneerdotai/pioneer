@@ -352,6 +352,7 @@ APP_VERSION="$(resolve_release_version)"
 require_cmd cargo
 require_cmd hdiutil
 require_cmd gzip
+require_cmd ditto
 ensure_macos_signing_prerequisites
 configure_macos_x86_64_onnxruntime
 
@@ -361,6 +362,7 @@ fi
 mkdir -p "$OUT_DIR"
 
 cargo build --release -p pioneer-desktop --target "$TARGET"
+cargo build --release -p pioneer-app-updater --target "$TARGET"
 cargo build --release -p pioneer-cli --features computer-use --target "$TARGET"
 
 WORK_DIR="$(mktemp -d)"
@@ -380,6 +382,7 @@ MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
 APP_ENTITLEMENTS_PATH="$WORK_DIR/${APP_NAME}.entitlements"
 DESKTOP_EXECUTABLE_NAME="pioneer-app"
+DESKTOP_UPDATER_EXECUTABLE_NAME="pioneer-app-updater"
 MACOS_ICON_NAME="Pioneer.icns"
 MACOS_ICON_SOURCE="$REPO_ROOT/crates/desktop/assets/app-icon.icns"
 DMG_BACKGROUND_SOURCE="$REPO_ROOT/assets/dmg-backgrond@2x.png"
@@ -399,6 +402,13 @@ cp "$MACOS_ICON_SOURCE" "$RESOURCES_DIR/$MACOS_ICON_NAME"
 
 cp "target/$TARGET/release/pioneer-app" "$MACOS_DIR/${DESKTOP_EXECUTABLE_NAME}"
 chmod 0755 "$MACOS_DIR/${DESKTOP_EXECUTABLE_NAME}"
+cp "target/$TARGET/release/pioneer-app-updater" "$MACOS_DIR/${DESKTOP_UPDATER_EXECUTABLE_NAME}"
+chmod 0755 "$MACOS_DIR/${DESKTOP_UPDATER_EXECUTABLE_NAME}"
+
+if [[ ! -x "$MACOS_DIR/${DESKTOP_UPDATER_EXECUTABLE_NAME}" ]]; then
+  echo "missing packaged desktop updater helper: $MACOS_DIR/${DESKTOP_UPDATER_EXECUTABLE_NAME}" >&2
+  exit 1
+fi
 
 GATEWAY_BUNDLE_DIR="$RESOURCES_DIR/gateway"
 mkdir -p "$GATEWAY_BUNDLE_DIR"
@@ -484,6 +494,8 @@ echo "APPL????" > "$CONTENTS_DIR/PkgInfo"
 
 if [[ -n "${MACOS_DESKTOP_SIGN_IDENTITY:-}" ]]; then
   require_cmd codesign
+  codesign --force --timestamp --options runtime --sign "$MACOS_DESKTOP_SIGN_IDENTITY" "$MACOS_DIR/${DESKTOP_UPDATER_EXECUTABLE_NAME}"
+  codesign --verify --strict "$MACOS_DIR/${DESKTOP_UPDATER_EXECUTABLE_NAME}"
   codesign --deep --force --timestamp --options runtime --entitlements "$APP_ENTITLEMENTS_PATH" --sign "$MACOS_DESKTOP_SIGN_IDENTITY" "$APP_DIR"
   codesign --verify --deep --strict "$APP_DIR"
   if ! codesign -d --entitlements :- "$APP_DIR" 2>/dev/null | grep -q "com.apple.security.device.audio-input"; then
@@ -491,6 +503,12 @@ if [[ -n "${MACOS_DESKTOP_SIGN_IDENTITY:-}" ]]; then
     exit 1
   fi
 fi
+
+APP_ZIP_NAME="Pioneer-${ARCH}.app.zip"
+APP_ZIP_PATH="$OUT_DIR/$APP_ZIP_NAME"
+rm -f "$APP_ZIP_PATH"
+ditto -c -k --keepParent "$APP_DIR" "$APP_ZIP_PATH"
+scripts/packaging/desktop/check-package-contents.sh macos-app-zip "$APP_ZIP_PATH"
 
 DMG_NAME="Pioneer-${ARCH}.dmg"
 DMG_PATH="$OUT_DIR/$DMG_NAME"
@@ -578,4 +596,5 @@ PY
   fi
 fi
 
+echo "Created: $APP_ZIP_PATH"
 echo "Created: $DMG_PATH"
