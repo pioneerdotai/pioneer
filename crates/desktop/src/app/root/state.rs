@@ -77,7 +77,6 @@ impl PioneerDesktop {
             settings_content_view: SettingsContentView::General,
             remote_access_settings_expanded: false,
             remote_access_key_input_revision: 0,
-            vector_search_settings_expanded: false,
             remote_access_status_poll_generation: 0,
             settings_tree_state,
             provider_tree_state,

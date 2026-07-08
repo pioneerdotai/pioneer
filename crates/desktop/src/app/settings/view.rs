@@ -30,12 +30,6 @@ use pioneer_protocol::{
 use std::rc::Rc;
 
 const SETTINGS_CONTENT_MAX_WIDTH_PX: f32 = 860.0;
-const VECTOR_LOCAL_MODELS: [&str; 4] = [
-    "bge-small-en-v1.5",
-    "bge-base-en-v1.5",
-    "nomic-embed-text-v1.5",
-    "gte-large",
-];
 
 struct RemoteAccessSettingsInputState {
     key: Entity<InputState>,
@@ -162,7 +156,6 @@ impl PioneerDesktop {
                 settings.memory.clone(),
                 settings.thread_episodic.enabled,
                 settings.thread_episodic.vector_search.clone(),
-                self.vector_search_settings_expanded,
                 desktop_entity,
                 window,
                 cx,
@@ -292,7 +285,6 @@ impl PioneerDesktop {
         memory: GatewayMemorySettings,
         thread_context_enabled: bool,
         vector_search: GatewayThreadEpisodicVectorSearchSettings,
-        vector_search_expanded: bool,
         desktop_entity: Entity<Self>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -344,7 +336,6 @@ impl PioneerDesktop {
             settings = settings.child(Self::render_settings_divider(cx)).child(
                 Self::render_vector_search_setting(
                     vector_search,
-                    vector_search_expanded,
                     desktop_entity.clone(),
                     window,
                     cx,
@@ -784,21 +775,16 @@ impl PioneerDesktop {
 
     fn render_vector_search_setting(
         settings: GatewayThreadEpisodicVectorSearchSettings,
-        expanded: bool,
         desktop_entity: Entity<Self>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let status_label = Self::vector_search_status_label(&settings);
-
         v_flex()
             .w_full()
-            .gap_0()
             .child(
                 h_flex()
                     .w_full()
-                    .gap_4()
-                    .px_0()
+                    .gap_6()
                     .py_3()
                     .justify_between()
                     .items_center()
@@ -807,129 +793,44 @@ impl PioneerDesktop {
                             .min_w_0()
                             .flex_1()
                             .child(
-                                div()
-                                    .text_sm()
-                                    .font_semibold()
-                                    .child(t!("settings.memory.vector_search.label").to_string()),
+                                h_flex()
+                                    .gap_1p5()
+                                    .items_start()
+                                    .child(div().text_sm().font_semibold().child(
+                                        t!("settings.memory.vector_search.label").to_string(),
+                                    ))
+                                    .child(Self::render_vector_status_badges(&settings, cx)),
                             )
-                            .child(
-                                div().text_xs().opacity(0.6).child(
-                                    t!("settings.memory.vector_search.description").to_string(),
-                                ),
-                            )
-                            .child(div().text_xs().mt_1().opacity(0.72).child(status_label)),
+                            .child(div().text_xs().opacity(0.6).child(
+                                t!("settings.memory.vector_search.description").to_string(),
+                            )),
                     )
                     .child(
-                        h_flex()
-                            .flex_none()
-                            .gap_2()
-                            .items_center()
-                            .child(
-                                Button::new("settings-vector-search-expand")
-                                    .small()
-                                    .ghost()
-                                    .icon(if expanded {
-                                        IconName::ChevronUp
-                                    } else {
-                                        IconName::ChevronDown
-                                    })
-                                    .tooltip(if expanded {
-                                        t!("settings.memory.vector_search.collapse").to_string()
-                                    } else {
-                                        t!("settings.memory.vector_search.expand").to_string()
-                                    })
-                                    .on_click({
-                                        let desktop_entity = desktop_entity.clone();
-                                        move |_, _, cx| {
-                                            let _ = desktop_entity.update(cx, |view, cx| {
-                                                view.toggle_vector_search_settings_expanded();
-                                                cx.notify();
-                                            });
-                                        }
-                                    }),
-                            )
-                            .child(
-                                Switch::new("settings-vector-search-enabled")
-                                    .checked(settings.enabled)
-                                    .on_click({
-                                        let desktop_entity = desktop_entity.clone();
-                                        move |enabled, _, cx| {
-                                            let _ = desktop_entity.update(cx, |view, cx| {
-                                                view.apply_vector_search_enabled(*enabled, cx);
-                                                cx.notify();
-                                            });
-                                        }
-                                    }),
-                            ),
+                        Switch::new("settings-vector-search-enabled")
+                            .checked(settings.enabled)
+                            .on_click({
+                                let desktop_entity = desktop_entity.clone();
+                                move |enabled, _, cx| {
+                                    let _ = desktop_entity.update(cx, |view, cx| {
+                                        view.apply_vector_search_enabled(*enabled, cx);
+                                        cx.notify();
+                                    });
+                                }
+                            }),
                     ),
             )
-            .when(expanded, |this| {
-                let details = if settings.enabled {
-                    Self::render_vector_search_enabled_details(settings, desktop_entity, window, cx)
-                } else {
-                    v_flex()
-                        .w_full()
-                        .py_3()
-                        .child(
-                            div().text_xs().opacity(0.65).child(
-                                t!("settings.memory.vector_search.disabled_hint").to_string(),
-                            ),
-                        )
-                        .into_any_element()
-                };
-
-                this.child(
-                    v_flex()
-                        .w_full()
-                        .border_t_1()
-                        .border_color(cx.theme().border)
-                        .child(details),
-                )
+            .when(settings.enabled, |this| {
+                this.child(Self::render_vector_embedding_model_selection(
+                    &settings,
+                    desktop_entity,
+                    window,
+                    cx,
+                ))
             })
             .into_any_element()
     }
 
-    fn render_vector_search_enabled_details(
-        settings: GatewayThreadEpisodicVectorSearchSettings,
-        desktop_entity: Entity<Self>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let refill_status_label = Self::vector_refill_status_label(settings.refill_status);
-        let local_model_status_label =
-            Self::vector_local_model_status_label(settings.local_model_status);
-
-        v_flex()
-            .w_full()
-            .py_3()
-            .gap_4()
-            .child(Self::render_vector_remote_model_selection(
-                &settings,
-                desktop_entity.clone(),
-                window,
-                cx,
-            ))
-            .child(Self::render_vector_local_model_selection(
-                &settings,
-                desktop_entity,
-                cx,
-            ))
-            .when(
-                settings.provider == Some(GatewayThreadEpisodicVectorProvider::Local),
-                |this| {
-                    this.child(
-                        div()
-                            .text_xs()
-                            .opacity(0.65)
-                            .child(local_model_status_label),
-                    )
-                },
-            )
-            .child(div().text_xs().opacity(0.65).child(refill_status_label))
-            .into_any_element()
-    }
-
-    fn render_vector_remote_model_selection(
+    fn render_vector_embedding_model_selection(
         settings: &GatewayThreadEpisodicVectorSearchSettings,
         desktop_entity: Entity<Self>,
         _window: &mut Window,
@@ -938,34 +839,27 @@ impl PioneerDesktop {
         let selected_provider = match settings.provider {
             Some(GatewayThreadEpisodicVectorProvider::OpenAi) => Some("openai".to_owned()),
             Some(GatewayThreadEpisodicVectorProvider::OpenRouter) => Some("openrouter".to_owned()),
-            _ => None,
+            Some(GatewayThreadEpisodicVectorProvider::Local) => Some("local".to_owned()),
+            None => None,
         };
-        let selected_model = selected_provider
-            .as_ref()
-            .and(settings.model.as_ref())
-            .cloned();
+        let selected_model = match settings.provider {
+            Some(GatewayThreadEpisodicVectorProvider::Local) => settings
+                .model
+                .clone()
+                .or_else(|| settings.local_model.clone()),
+            _ => selected_provider
+                .as_ref()
+                .and(settings.model.as_ref())
+                .cloned(),
+        };
         let selection_label = match (&selected_provider, &selected_model) {
             (Some(provider), Some(model)) => format!("{provider}/{model}"),
-            _ => t!("settings.memory.vector_search.remote_model_not_selected").to_string(),
+            _ => t!("settings.memory.vector_search.embedding_model_not_selected").to_string(),
         };
 
         v_flex()
             .w_full()
-            .gap_3()
-            .child(
-                v_flex()
-                    .min_w_0()
-                    .flex_1()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_medium()
-                            .child(t!("settings.memory.vector_search.remote_model_label").to_string()),
-                    )
-                    .child(div().text_xs().opacity(0.6).child(
-                        t!("settings.memory.vector_search.remote_model_description").to_string(),
-                    )),
-            )
+            .pb_4()
             .child(
                 h_flex()
                     .w_full()
@@ -984,9 +878,9 @@ impl PioneerDesktop {
                             .child(selection_label),
                     )
                     .child(h_flex().flex_none().gap_1().child(
-                        small_outline_button(("settings-vector-search-remote-model", 0usize))
+                        small_outline_button(("settings-vector-search-embedding-model", 0usize))
                             .label(
-                                t!("settings.memory.vector_search.select_remote_model")
+                                t!("settings.memory.vector_search.select_embedding_model")
                                     .to_string(),
                             )
                             .on_click({
@@ -999,7 +893,7 @@ impl PioneerDesktop {
                                         view.open_model_selector_dialog(
                                             ModelSelectorDialogOptions {
                                                 title: t!(
-                                                    "settings.memory.vector_search.remote_model_dialog_title"
+                                                    "settings.memory.vector_search.embedding_model_dialog_title"
                                                 )
                                                 .to_string(),
                                                 selected_provider: selected_provider.clone(),
@@ -1012,7 +906,7 @@ impl PioneerDesktop {
                                                     move |view: &mut PioneerDesktop,
                                                           selection: ModelSelectorSelection,
                                                           cx| {
-                                                        view.apply_vector_search_remote_model_selection(
+                                                        view.apply_vector_search_embedding_model_selection(
                                                             selection,
                                                             cx,
                                                         )
@@ -1028,88 +922,6 @@ impl PioneerDesktop {
                     )),
             )
             .into_any_element()
-    }
-
-    fn render_vector_local_model_selection(
-        settings: &GatewayThreadEpisodicVectorSearchSettings,
-        desktop_entity: Entity<Self>,
-        _cx: &mut Context<Self>,
-    ) -> AnyElement {
-        Self::render_vector_button_group_row(
-            "settings-vector-search-local-model",
-            t!("settings.memory.vector_search.local_model_label").to_string(),
-            t!("settings.memory.vector_search.local_model_description").to_string(),
-            VECTOR_LOCAL_MODELS
-                .iter()
-                .map(|model| Self::vector_local_model_label(model))
-                .collect(),
-            VECTOR_LOCAL_MODELS
-                .iter()
-                .map(|model| {
-                    settings.provider == Some(GatewayThreadEpisodicVectorProvider::Local)
-                        && settings.local_model.as_deref() == Some(*model)
-                })
-                .collect(),
-            {
-                let desktop_entity = desktop_entity.clone();
-                move |index, cx| {
-                    let Some(model) = VECTOR_LOCAL_MODELS.get(index) else {
-                        return;
-                    };
-                    let _ = desktop_entity.update(cx, |view, cx| {
-                        view.apply_vector_search_local_model((*model).to_owned(), cx);
-                        cx.notify();
-                    });
-                }
-            },
-        )
-    }
-
-    fn render_vector_button_group_row(
-        id: &'static str,
-        label: String,
-        description: String,
-        labels: Vec<String>,
-        selected: Vec<bool>,
-        on_select: impl Fn(usize, &mut App) + 'static,
-    ) -> AnyElement {
-        let on_select = Rc::new(on_select);
-
-        v_flex()
-            .w_full()
-            .gap_2()
-            .child(div().text_sm().font_medium().child(label))
-            .child(div().text_xs().opacity(0.6).child(description))
-            .child(
-                ButtonGroup::new(id)
-                    .children(labels.into_iter().enumerate().map(move |(index, label)| {
-                        small_outline_button((id, index))
-                            .selected(selected.get(index).copied().unwrap_or(false))
-                            .label(label)
-                    }))
-                    .on_click(move |selected_indices, _, cx| {
-                        let Some(index) = selected_indices.first().copied() else {
-                            return;
-                        };
-                        on_select(index, cx);
-                    }),
-            )
-            .into_any_element()
-    }
-
-    fn vector_search_status_label(settings: &GatewayThreadEpisodicVectorSearchSettings) -> String {
-        if !settings.enabled {
-            return t!("settings.memory.vector_search.status_disabled").to_string();
-        }
-        let Some(provider) = settings.provider else {
-            return Self::vector_refill_status_label(settings.refill_status);
-        };
-
-        format!(
-            "{} - {}",
-            Self::vector_provider_label(provider),
-            Self::vector_refill_status_label(settings.refill_status)
-        )
     }
 
     fn vector_refill_status_label(status: GatewayThreadEpisodicVectorRefillStatus) -> String {
@@ -1134,6 +946,65 @@ impl PioneerDesktop {
             }
         }
         .to_string()
+    }
+
+    fn render_vector_status_badges(
+        settings: &GatewayThreadEpisodicVectorSearchSettings,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut badges = h_flex().mt_0().gap_2().items_center().flex_wrap();
+        let refill_label = if settings.enabled {
+            Self::vector_refill_status_label(settings.refill_status)
+        } else {
+            t!("settings.memory.vector_search.status_disabled").to_string()
+        };
+        badges = badges.child(Self::render_vector_status_badge(
+            refill_label,
+            Self::vector_refill_status_color(settings.enabled, settings.refill_status, cx),
+        ));
+
+        if settings.enabled && settings.provider == Some(GatewayThreadEpisodicVectorProvider::Local)
+        {
+            badges = badges.child(Self::render_vector_status_badge(
+                Self::vector_local_model_status_label(settings.local_model_status),
+                Self::vector_local_model_status_color(settings.local_model_status, cx),
+            ));
+        }
+
+        badges.into_any_element()
+    }
+
+    fn render_vector_status_badge(label: String, color: Hsla) -> AnyElement {
+        div()
+            .px_1()
+            .py_0()
+            .rounded_md()
+            .border_1()
+            .border_color(color)
+            .text_size(px(10.))
+            .text_color(color)
+            .font_medium()
+            .child(label)
+            .into_any_element()
+    }
+
+    fn vector_refill_status_color(
+        enabled: bool,
+        status: GatewayThreadEpisodicVectorRefillStatus,
+        cx: &mut Context<Self>,
+    ) -> Hsla {
+        if !enabled {
+            return cx.theme().muted_foreground;
+        }
+
+        match status {
+            GatewayThreadEpisodicVectorRefillStatus::Disabled
+            | GatewayThreadEpisodicVectorRefillStatus::Unknown => cx.theme().muted_foreground,
+            GatewayThreadEpisodicVectorRefillStatus::Required
+            | GatewayThreadEpisodicVectorRefillStatus::Running => cx.theme().warning,
+            GatewayThreadEpisodicVectorRefillStatus::Complete => cx.theme().success,
+            GatewayThreadEpisodicVectorRefillStatus::Failed => cx.theme().danger,
+        }
     }
 
     fn vector_local_model_status_label(
@@ -1162,28 +1033,17 @@ impl PioneerDesktop {
         .to_string()
     }
 
-    fn vector_provider_label(provider: GatewayThreadEpisodicVectorProvider) -> String {
-        match provider {
-            GatewayThreadEpisodicVectorProvider::OpenAi => {
-                t!("settings.memory.vector_search.provider_openai")
-            }
-            GatewayThreadEpisodicVectorProvider::OpenRouter => {
-                t!("settings.memory.vector_search.provider_openrouter")
-            }
-            GatewayThreadEpisodicVectorProvider::Local => {
-                t!("settings.memory.vector_search.provider_local")
-            }
-        }
-        .to_string()
-    }
-
-    fn vector_local_model_label(model: &str) -> String {
-        match model {
-            "bge-small-en-v1.5" => format!("{model} - 384d"),
-            "bge-base-en-v1.5" => format!("{model} - 768d"),
-            "nomic-embed-text-v1.5" => format!("{model} - 768d"),
-            "gte-large" => format!("{model} - 1024d"),
-            _ => model.to_owned(),
+    fn vector_local_model_status_color(
+        status: GatewayThreadEpisodicVectorLocalModelStatus,
+        cx: &mut Context<Self>,
+    ) -> Hsla {
+        match status {
+            GatewayThreadEpisodicVectorLocalModelStatus::NotSelected
+            | GatewayThreadEpisodicVectorLocalModelStatus::Unknown => cx.theme().muted_foreground,
+            GatewayThreadEpisodicVectorLocalModelStatus::Missing
+            | GatewayThreadEpisodicVectorLocalModelStatus::Downloading => cx.theme().warning,
+            GatewayThreadEpisodicVectorLocalModelStatus::Installed => cx.theme().success,
+            GatewayThreadEpisodicVectorLocalModelStatus::Failed => cx.theme().danger,
         }
     }
 

@@ -23,12 +23,13 @@ use tracing::warn;
 const REMOTE_ACCESS_STATUS_POLL_ATTEMPTS: usize = 12;
 const REMOTE_ACCESS_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-fn vector_search_remote_provider_from_selector(
+fn vector_search_embedding_provider_from_selector(
     provider: &str,
 ) -> Option<GatewayThreadEpisodicVectorProvider> {
     match provider.trim().to_ascii_lowercase().as_str() {
         "openai" => Some(GatewayThreadEpisodicVectorProvider::OpenAi),
         "openrouter" => Some(GatewayThreadEpisodicVectorProvider::OpenRouter),
+        "local" => Some(GatewayThreadEpisodicVectorProvider::Local),
         _ => None,
     }
 }
@@ -162,10 +163,6 @@ impl PioneerDesktop {
         self.apply_remote_access_setting(settings.remote_access.enabled, Some(key), false, cx);
     }
 
-    pub(super) fn toggle_vector_search_settings_expanded(&mut self) {
-        self.vector_search_settings_expanded = !self.vector_search_settings_expanded;
-    }
-
     pub(super) fn apply_vector_search_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
         let Some(mut vector_search) = self.current_vector_search_settings() else {
             self.refresh_gateway_settings(cx);
@@ -175,7 +172,7 @@ impl PioneerDesktop {
         self.apply_vector_search_settings(vector_search, cx);
     }
 
-    pub(super) fn apply_vector_search_remote_model_selection(
+    pub(super) fn apply_vector_search_embedding_model_selection(
         &mut self,
         selection: crate::components::model_selector::ModelSelectorSelection,
         cx: &mut Context<Self>,
@@ -183,7 +180,7 @@ impl PioneerDesktop {
         let Some(provider) = selection
             .provider
             .as_deref()
-            .and_then(vector_search_remote_provider_from_selector)
+            .and_then(vector_search_embedding_provider_from_selector)
         else {
             return false;
         };
@@ -200,25 +197,13 @@ impl PioneerDesktop {
         };
 
         vector_search.provider = Some(provider);
-        vector_search.model = Some(model);
+        vector_search.model = Some(model.clone());
+        if provider == GatewayThreadEpisodicVectorProvider::Local {
+            vector_search.local_model = Some(model);
+        }
         vector_search.embedding_dimension = None;
         self.apply_vector_search_settings(vector_search, cx);
         true
-    }
-
-    pub(super) fn apply_vector_search_local_model(
-        &mut self,
-        local_model: String,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(mut vector_search) = self.current_vector_search_settings() else {
-            self.refresh_gateway_settings(cx);
-            return;
-        };
-        vector_search.provider = Some(GatewayThreadEpisodicVectorProvider::Local);
-        vector_search.local_model = Some(local_model);
-        vector_search.embedding_dimension = None;
-        self.apply_vector_search_settings(vector_search, cx);
     }
 
     pub(super) fn apply_memory_model_setting(
@@ -610,19 +595,21 @@ mod tests {
     }
 
     #[test]
-    fn settings_vector_search_remote_model_selection_writes_thread_episodic_settings_only() {
+    fn settings_vector_search_embedding_model_selection_writes_thread_episodic_settings_only() {
         let source = production_lifecycle_source();
-        let remote_model_fn = source
-            .split("pub(super) fn apply_vector_search_remote_model_selection")
+        let embedding_model_fn = source
+            .split("pub(super) fn apply_vector_search_embedding_model_selection")
             .nth(1)
-            .expect("vector remote model function exists")
+            .expect("vector embedding model function exists")
             .split("pub(super) fn apply_memory_model_setting")
             .next()
-            .expect("vector remote model function body exists");
+            .expect("vector embedding model function body exists");
 
-        assert!(remote_model_fn.contains("vector_search_remote_provider_from_selector"));
-        assert!(remote_model_fn.contains("self.apply_vector_search_settings"));
-        assert!(!remote_model_fn.contains("provider_set_api_key"));
-        assert!(!remote_model_fn.contains("settings_memory::gateway_settings_update_for_memory"));
+        assert!(embedding_model_fn.contains("vector_search_embedding_provider_from_selector"));
+        assert!(embedding_model_fn.contains("self.apply_vector_search_settings"));
+        assert!(!embedding_model_fn.contains("provider_set_api_key"));
+        assert!(
+            !embedding_model_fn.contains("settings_memory::gateway_settings_update_for_memory")
+        );
     }
 }

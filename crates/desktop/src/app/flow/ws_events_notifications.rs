@@ -159,6 +159,11 @@ impl PioneerDesktop {
             ClientRuntimeNotification::GatewayRemoteAccessStatusChanged(notification) => {
                 self.apply_remote_access_status_changed(notification.status, cx);
             }
+            ClientRuntimeNotification::GatewayThreadEpisodicVectorRefillStatusChanged(
+                notification,
+            ) => {
+                self.apply_thread_episodic_vector_refill_status_changed(notification.status, cx);
+            }
             ClientRuntimeNotification::WorkspaceChanged {
                 notification,
                 preference,
@@ -178,6 +183,18 @@ impl PioneerDesktop {
             return;
         };
         settings.remote_access.status = status;
+        cx.notify();
+    }
+
+    fn apply_thread_episodic_vector_refill_status_changed(
+        &mut self,
+        status: pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(settings) = self.gateway.settings.as_mut() else {
+            return;
+        };
+        settings.thread_episodic.vector_search.refill_status = status;
         cx.notify();
     }
 
