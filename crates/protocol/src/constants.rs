@@ -163,6 +163,8 @@ pub mod events {
     pub const MCP_SERVER_STATUS_CHANGED: &str = "mcp/server/status_changed";
     pub const MCP_SERVER_CATALOG_CHANGED: &str = "mcp/server/catalog_changed";
     pub const GATEWAY_REMOTE_ACCESS_STATUS_CHANGED: &str = "gateway/remote_access/status_changed";
+    pub const GATEWAY_THREAD_EPISODIC_VECTOR_REFILL_STATUS_CHANGED: &str =
+        "gateway/thread_episodic/vector_refill/status_changed";
     pub const CLI_RUNTIME_STATUS_CHANGED: &str = "cli_runtime/status_changed";
     pub const CLI_RUNTIME_ACCOUNT_UPDATED: &str = "cli_runtime/account_updated";
     pub const CLI_RUNTIME_REQUEST_OPENED: &str = "cli_runtime/request_opened";

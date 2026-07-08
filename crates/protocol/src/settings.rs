@@ -224,6 +224,12 @@ impl Default for GatewayThreadEpisodicVectorRefillStatus {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GatewayThreadEpisodicVectorRefillStatusChangedNotification {
+    pub workspace_id: String,
+    pub status: GatewayThreadEpisodicVectorRefillStatus,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GatewayThreadEpisodicVectorLocalModelStatus {

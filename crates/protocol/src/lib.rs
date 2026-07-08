@@ -139,8 +139,9 @@ pub use settings::{
     GatewaySettingsUpdateResponse, GatewayThreadEpisodicSettings,
     GatewayThreadEpisodicSettingsUpdate, GatewayThreadEpisodicVectorLocalModelStatus,
     GatewayThreadEpisodicVectorProvider, GatewayThreadEpisodicVectorProviderKeyStatus,
-    GatewayThreadEpisodicVectorRefillStatus, GatewayThreadEpisodicVectorSearchSettings,
-    GatewayThreadEpisodicVectorSearchSettingsUpdate,
+    GatewayThreadEpisodicVectorRefillStatus,
+    GatewayThreadEpisodicVectorRefillStatusChangedNotification,
+    GatewayThreadEpisodicVectorSearchSettings, GatewayThreadEpisodicVectorSearchSettingsUpdate,
 };
 pub use skills::{
     SkillArchiveFormat, SkillAuditTimelineItem, SkillChangedItem, SkillDependencyDiagnostic,

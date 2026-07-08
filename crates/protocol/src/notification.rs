@@ -6,13 +6,15 @@ use crate::{
     CLIRuntimeAppsChangedNotification, CLIRuntimeRequestOpenedNotification,
     CLIRuntimeRequestResolvedNotification, CLIRuntimeStatusChangedNotification,
     ContextCompressedNotification, ContextCompressingNotification,
-    GatewayRemoteAccessStatusChangedNotification, ItemCompletedNotification, ItemDeltaNotification,
-    ItemDeltaStream, ItemRecoveryAttachedNotification, ItemRecoveryExhaustedNotification,
-    ItemRecoveryOpenedNotification, ItemRecoverySucceededNotification,
-    ItemRetryAttemptStartedNotification, ItemRetryScheduledNotification, ItemStartedNotification,
-    ItemTimeoutDetectedNotification, ItemToolRetryExhaustedNotification,
-    ItemToolRetryResolvedNotification, ItemToolRetryScheduledNotification, ItemUpdatedNotification,
-    JsonRpcNotification, McpChangedNotification, McpServerCatalogChangedNotification,
+    GatewayRemoteAccessStatusChangedNotification,
+    GatewayThreadEpisodicVectorRefillStatusChangedNotification, ItemCompletedNotification,
+    ItemDeltaNotification, ItemDeltaStream, ItemRecoveryAttachedNotification,
+    ItemRecoveryExhaustedNotification, ItemRecoveryOpenedNotification,
+    ItemRecoverySucceededNotification, ItemRetryAttemptStartedNotification,
+    ItemRetryScheduledNotification, ItemStartedNotification, ItemTimeoutDetectedNotification,
+    ItemToolRetryExhaustedNotification, ItemToolRetryResolvedNotification,
+    ItemToolRetryScheduledNotification, ItemUpdatedNotification, JsonRpcNotification,
+    McpChangedNotification, McpServerCatalogChangedNotification,
     McpServerStatusChangedNotification, MemoryCandidateCreatedNotification,
     MemoryChangedNotification, MemoryForgottenNotification, SkillsChangedNotification,
     SkillsUploadChunkAckNotification, TaskCancelledNotification, TaskCompletedNotification,
@@ -147,6 +149,10 @@ pub enum GatewayNotification {
     CLIRuntimeAppsChanged(CLIRuntimeAppsChangedNotification),
     #[serde(rename = "gateway_remote_access_status_changed")]
     GatewayRemoteAccessStatusChanged(GatewayRemoteAccessStatusChangedNotification),
+    #[serde(rename = "gateway_thread_episodic_vector_refill_status_changed")]
+    GatewayThreadEpisodicVectorRefillStatusChanged(
+        GatewayThreadEpisodicVectorRefillStatusChangedNotification,
+    ),
     VoiceSessionResult(VoiceSessionResultNotification),
     Unknown(UnknownGatewayNotification),
 }
@@ -422,6 +428,17 @@ impl GatewayNotification {
                     params.clone(),
                 ) {
                     Ok(notification) => Some(Self::GatewayRemoteAccessStatusChanged(notification)),
+                    Err(_) => Some(Self::Unknown(unknown_notification(method, params))),
+                }
+            }
+            events::GATEWAY_THREAD_EPISODIC_VECTOR_REFILL_STATUS_CHANGED => {
+                match serde_json::from_value::<
+                    GatewayThreadEpisodicVectorRefillStatusChangedNotification,
+                >(params.clone())
+                {
+                    Ok(notification) => Some(Self::GatewayThreadEpisodicVectorRefillStatusChanged(
+                        notification,
+                    )),
                     Err(_) => Some(Self::Unknown(unknown_notification(method, params))),
                 }
             }
@@ -870,6 +887,31 @@ mod tests {
                 );
             }
             other => panic!("expected remote access status changed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maps_gateway_thread_episodic_vector_refill_status_changed_notification() {
+        let notification = JsonRpcNotification::from_params(
+            "gateway/thread_episodic/vector_refill/status_changed",
+            &json!({
+                "workspace_id": "workspace_a",
+                "status": "complete"
+            }),
+        )
+        .expect("vector refill status notification should encode");
+
+        let mapped = GatewayNotification::from_jsonrpc(notification)
+            .expect("vector refill status changed should map");
+        match mapped {
+            GatewayNotification::GatewayThreadEpisodicVectorRefillStatusChanged(notification) => {
+                assert_eq!(notification.workspace_id, "workspace_a");
+                assert_eq!(
+                    notification.status,
+                    crate::GatewayThreadEpisodicVectorRefillStatus::Complete
+                );
+            }
+            other => panic!("expected vector refill status changed, got {other:?}"),
         }
     }
 

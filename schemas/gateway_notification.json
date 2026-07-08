@@ -1351,6 +1351,22 @@
       "properties": {
         "kind": {
           "type": "string",
+          "const": "gateway_thread_episodic_vector_refill_status_changed"
+        },
+        "params": {
+          "$ref": "#/$defs/GatewayThreadEpisodicVectorRefillStatusChangedNotification"
+        }
+      },
+      "required": [
+        "kind",
+        "params"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
           "const": "voice_session_result"
         },
         "params": {
@@ -2413,6 +2429,32 @@
           "format": "int64"
         }
       }
+    },
+    "GatewayThreadEpisodicVectorRefillStatus": {
+      "type": "string",
+      "enum": [
+        "disabled",
+        "unknown",
+        "required",
+        "running",
+        "complete",
+        "failed"
+      ]
+    },
+    "GatewayThreadEpisodicVectorRefillStatusChangedNotification": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/GatewayThreadEpisodicVectorRefillStatus"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "status"
+      ]
     },
     "ItemCompletedNotification": {
       "type": "object",
