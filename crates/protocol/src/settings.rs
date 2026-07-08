@@ -258,8 +258,6 @@ pub struct GatewayThreadEpisodicVectorSearchSettingsUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_model: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub embedding_dimension: Option<Option<u32>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_normalized: Option<bool>,
 }
 
@@ -849,7 +847,6 @@ mod tests {
                     provider: Some(Some(GatewayThreadEpisodicVectorProvider::OpenRouter)),
                     model: Some(Some("openai/text-embedding-3-large".to_owned())),
                     local_model: Some(Some("bge-small-en-v1.5".to_owned())),
-                    embedding_dimension: Some(Some(3072)),
                     embedding_normalized: Some(true),
                 }),
                 ..GatewayThreadEpisodicSettingsUpdate::default()

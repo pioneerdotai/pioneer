@@ -502,7 +502,9 @@ pub(crate) fn embedding_provider_readiness_from_settings(
         }
     }
 
-    if settings.embedding_dimension.is_none() {
+    if settings.embedding_dimension.is_none()
+        && settings.provider != Some(GatewayThreadEpisodicVectorProvider::OpenRouter)
+    {
         return EmbeddingProviderReadinessDiagnostic::new(
             EmbeddingProviderReadinessState::MissingConfiguration,
             provider_id,
@@ -814,12 +816,28 @@ impl RemoteEmbeddingProvider {
         normalized: bool,
         provider: Arc<dyn Provider>,
     ) -> Result<Self, ThreadEpisodicEmbeddingError> {
-        let model_info = openrouter_embedding_model_info(model, explicit_dimension)?;
         Self::ensure_provider_supports_embeddings(
             OPENROUTER_PROVIDER_ID,
             model,
             provider.as_ref(),
         )?;
+        let model_info = match openrouter_embedding_model_info(model, explicit_dimension) {
+            Ok(model_info) => model_info,
+            Err(_) if explicit_dimension.is_none() => {
+                let dimension = Self::probe_embedding_dimension(
+                    OPENROUTER_PROVIDER_ID,
+                    model,
+                    provider.as_ref(),
+                )?;
+                OpenRouterEmbeddingModelInfo {
+                    model: model.to_owned(),
+                    dimension,
+                    max_batch_size: 512,
+                    custom: true,
+                }
+            }
+            Err(error) => return Err(error),
+        };
 
         Ok(Self {
             provider_id: OPENROUTER_PROVIDER_ID,
@@ -858,37 +876,83 @@ impl RemoteEmbeddingProvider {
         &self,
         request: EmbeddingRequest,
     ) -> Result<pioneer_provider::EmbeddingResponse, ThreadEpisodicEmbeddingError> {
+        Self::embed_request_via_provider(
+            self.provider_id(),
+            self.model(),
+            self.provider.as_ref(),
+            request,
+        )
+    }
+
+    fn embed_request_via_provider(
+        provider_id: &str,
+        model: &str,
+        provider: &dyn Provider,
+        request: EmbeddingRequest,
+    ) -> Result<pioneer_provider::EmbeddingResponse, ThreadEpisodicEmbeddingError> {
         let result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            tokio::task::block_in_place(|| handle.block_on(self.provider.embed(request)))
+            tokio::task::block_in_place(|| handle.block_on(provider.embed(request)))
         } else {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|error| {
                     ThreadEpisodicEmbeddingError::retryable_provider_failure(
-                        self.provider_id(),
-                        self.model(),
+                        provider_id,
+                        model,
                         format!("failed to create embedding runtime bridge: {error}"),
                     )
                 })?;
-            runtime.block_on(self.provider.embed(request))
+            runtime.block_on(provider.embed(request))
         };
 
-        result.map_err(|error| self.map_provider_error(error))
+        result.map_err(|error| Self::map_provider_error(provider_id, model, error))
     }
 
-    fn map_provider_error(&self, error: anyhow::Error) -> ThreadEpisodicEmbeddingError {
+    fn probe_embedding_dimension(
+        provider_id: &str,
+        model: &str,
+        provider: &dyn Provider,
+    ) -> Result<usize, ThreadEpisodicEmbeddingError> {
+        let response = Self::embed_request_via_provider(
+            provider_id,
+            model,
+            provider,
+            EmbeddingRequest::new(model, vec!["dimension probe".to_owned()]),
+        )?;
+        let Some(embedding) = response.embeddings.into_iter().next() else {
+            return Err(
+                ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
+                    provider_id,
+                    model,
+                    "embedding dimension probe returned no embedding",
+                ),
+            );
+        };
+        if embedding.is_empty() {
+            return Err(
+                ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
+                    provider_id,
+                    model,
+                    "embedding dimension probe returned an empty embedding",
+                ),
+            );
+        }
+        Ok(embedding.len())
+    }
+
+    fn map_provider_error(
+        provider_id: &str,
+        model: &str,
+        error: anyhow::Error,
+    ) -> ThreadEpisodicEmbeddingError {
         let message = format!("{error:#}");
         if provider_embedding_error_is_retryable(message.as_str()) {
-            ThreadEpisodicEmbeddingError::retryable_provider_failure(
-                self.provider_id(),
-                self.model(),
-                message,
-            )
+            ThreadEpisodicEmbeddingError::retryable_provider_failure(provider_id, model, message)
         } else {
             ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
-                self.provider_id(),
-                self.model(),
+                provider_id,
+                model,
                 message,
             )
         }
@@ -1212,6 +1276,27 @@ mod tests {
     }
 
     #[test]
+    fn openrouter_remote_embedding_provider_probes_custom_model_dimension() {
+        let provider = RemoteEmbeddingProvider::openrouter(
+            "qwen/qwen3-embedding-8b",
+            None,
+            true,
+            Arc::new(FakeRemoteProvider::with_responses(
+                "openrouter",
+                vec![
+                    Ok(embedding_response(vec![vec![0.1; 4096]])),
+                    Ok(embedding_response(vec![vec![0.2; 4096]])),
+                ],
+            )),
+        )
+        .expect("provider");
+
+        assert_eq!(provider.provider_id(), OPENROUTER_PROVIDER_ID);
+        assert_eq!(provider.dimension(), 4096);
+        assert_eq!(provider.embed_text("hello").unwrap().len(), 4096);
+    }
+
+    #[test]
     fn local_embedding_model_registry_resolves_supported_models() {
         let small = local_embedding_model_info("bge-small-en-v1.5").expect("small model");
         assert_eq!(small.display_name, "BGE Small EN v1.5");
@@ -1473,6 +1558,23 @@ mod tests {
         let ready = embedding_provider_readiness_from_settings(&ready_local);
         assert_eq!(ready.state, EmbeddingProviderReadinessState::Ready);
         assert!(ready.is_ready());
+
+        let openrouter_dynamic = GatewayThreadEpisodicVectorSearchSettings {
+            enabled: true,
+            provider: Some(GatewayThreadEpisodicVectorProvider::OpenRouter),
+            model: Some("qwen/qwen3-embedding-8b".to_owned()),
+            provider_key: pioneer_protocol::GatewayThreadEpisodicVectorProviderKeyStatus {
+                required: true,
+                present: true,
+            },
+            ..GatewayThreadEpisodicVectorSearchSettings::default()
+        };
+        let openrouter_readiness = embedding_provider_readiness_from_settings(&openrouter_dynamic);
+        assert_eq!(
+            openrouter_readiness.state,
+            EmbeddingProviderReadinessState::Ready
+        );
+        assert!(openrouter_readiness.is_ready());
     }
 
     #[test]

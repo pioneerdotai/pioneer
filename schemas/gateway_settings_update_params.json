@@ -396,14 +396,6 @@
     "GatewayThreadEpisodicVectorSearchSettingsUpdate": {
       "type": "object",
       "properties": {
-        "embedding_dimension": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint32",
-          "minimum": 0
-        },
         "embedding_normalized": {
           "type": [
             "boolean",

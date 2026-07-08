@@ -290,7 +290,6 @@ pub fn thread_episodic_vector_search_update_plan(
                     provider: Some(vector_search.provider),
                     model: Some(vector_search.model),
                     local_model: Some(vector_search.local_model),
-                    embedding_dimension: Some(vector_search.embedding_dimension),
                     embedding_normalized: Some(vector_search.embedding_normalized),
                 }),
                 ..GatewayThreadEpisodicSettingsUpdate::default()
@@ -654,6 +653,8 @@ mod tests {
         let update_json = serde_json::to_string(&plan.update).expect("serialize update");
         assert!(!update_json.contains("api_key"));
         assert!(!update_json.contains("secret"));
+        assert!(!update_json.contains("embedding_dimension"));
+        assert!(!update_json.contains("embeddingDimension"));
         assert!(update_json.contains("openrouter"));
     }
 

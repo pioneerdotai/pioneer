@@ -941,7 +941,7 @@ fn vector_search_config_to_protocol(
         provider,
         model: config.model.clone(),
         local_model,
-        embedding_dimension: config.embedding_dimension,
+        embedding_dimension: resolved_vector_embedding_dimension(config),
         embedding_normalized: config.embedding_normalized,
         provider_key: pioneer_protocol::GatewayThreadEpisodicVectorProviderKeyStatus {
             required: config.enabled && config.provider.is_some_and(vector_provider_requires_key),
@@ -974,7 +974,6 @@ fn vector_search_config_from_protocol(
         provider: settings.provider.map(vector_provider_from_protocol),
         model: settings.model,
         local_model: settings.local_model,
-        embedding_dimension: settings.embedding_dimension,
         embedding_normalized: settings.embedding_normalized,
     }
 }
@@ -1000,21 +999,37 @@ pub fn thread_episodic_vector_projection_identity_hash(
     } else {
         config.model.as_deref().map(str::trim).unwrap_or("")
     };
-    let dimension = if config.enabled {
-        resolved_vector_embedding_dimension(config)
+    thread_episodic_vector_projection_identity_hash_for_parts(
+        config.enabled,
+        provider,
+        model,
+        resolved_vector_embedding_dimension(config),
+        config.enabled && config.embedding_normalized,
+    )
+}
+
+pub(crate) fn thread_episodic_vector_projection_identity_hash_for_parts(
+    enabled: bool,
+    provider: &str,
+    model: &str,
+    dimension: Option<u32>,
+    normalized: bool,
+) -> String {
+    let dimension = if enabled {
+        dimension
             .map(|dimension| dimension.to_string())
             .unwrap_or_else(|| "unknown".to_owned())
     } else {
         "none".to_owned()
     };
-    let normalized = if config.enabled && config.embedding_normalized {
+    let normalized = if enabled && normalized {
         "true"
     } else {
         "false"
     };
     let identity = format!(
         "thread_episodic_vector_projection_v1\nenabled={}\nprovider={provider}\nmodel={model}\ndimension={dimension}\nnormalized={normalized}\n",
-        config.enabled
+        enabled
     );
     let digest = Sha256::digest(identity.as_bytes());
     hex_lower(digest.as_slice())
@@ -1038,7 +1053,10 @@ pub fn apply_thread_episodic_vector_search_status(
         return;
     }
 
-    let Some(dimension) = resolved_vector_embedding_dimension(&config) else {
+    let dimension = resolved_vector_embedding_dimension(&config);
+    vector_search.embedding_dimension = dimension;
+
+    if dimension.is_none() && !vector_provider_allows_runtime_dimension_probe(&config) {
         vector_search.refill_status =
             pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required;
         if matches!(
@@ -1049,8 +1067,7 @@ pub fn apply_thread_episodic_vector_search_status(
                 pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Missing;
         }
         return;
-    };
-    vector_search.embedding_dimension = Some(dimension);
+    }
 
     if config.provider.is_some_and(vector_provider_requires_key)
         && !vector_search.provider_key.present
@@ -1145,9 +1162,6 @@ fn apply_vector_search_protocol_update(
     if let Some(local_model) = update.local_model {
         config.local_model = local_model;
     }
-    if let Some(embedding_dimension) = update.embedding_dimension {
-        config.embedding_dimension = embedding_dimension;
-    }
     if let Some(embedding_normalized) = update.embedding_normalized {
         config.embedding_normalized = embedding_normalized;
     }
@@ -1235,10 +1249,6 @@ pub(crate) fn vector_provider_identity_name(
 pub(crate) fn resolved_vector_embedding_dimension(
     config: &GatewayThreadEpisodicVectorSearchConfig,
 ) -> Option<u32> {
-    if let Some(dimension) = config.embedding_dimension {
-        return Some(dimension);
-    }
-
     match config.provider {
         Some(GatewayThreadEpisodicVectorProviderConfig::OpenAi) => {
             match config.model.as_deref().unwrap_or("").trim() {
@@ -1264,6 +1274,19 @@ pub(crate) fn resolved_vector_embedding_dimension(
         }
         None => None,
     }
+}
+
+fn vector_provider_allows_runtime_dimension_probe(
+    config: &GatewayThreadEpisodicVectorSearchConfig,
+) -> bool {
+    matches!(
+        config.provider,
+        Some(GatewayThreadEpisodicVectorProviderConfig::OpenRouter)
+    ) && config
+        .model
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|model| !model.is_empty())
 }
 
 fn selected_local_vector_model(config: &GatewayThreadEpisodicVectorSearchConfig) -> Option<&str> {
@@ -2360,7 +2383,6 @@ embedding_normalized = true
             mapped.vector_search.local_model.as_deref(),
             Some("bge-base-en-v1.5")
         );
-        assert_eq!(mapped.vector_search.embedding_dimension, Some(1536));
         assert!(mapped.vector_search.embedding_normalized);
     }
 
@@ -2371,7 +2393,6 @@ embedding_normalized = true
             provider: Some(GatewayThreadEpisodicVectorProviderConfig::OpenAi),
             model: Some("text-embedding-3-small".to_owned()),
             local_model: Some("bge-small-en-v1.5".to_owned()),
-            embedding_dimension: None,
             embedding_normalized: true,
         };
         let disabled_changed_model = GatewayThreadEpisodicVectorSearchConfig {
@@ -2586,7 +2607,6 @@ embedding_normalized = true
                                 )),
                                 model: Some(Some("different-disabled-model".to_owned())),
                                 local_model: Some(Some("different-disabled-local".to_owned())),
-                                embedding_dimension: Some(Some(1234)),
                                 embedding_normalized: Some(false),
                             },
                         ),
@@ -2687,7 +2707,6 @@ backend = "keystore"
             Some(pioneer_config::GatewayThreadEpisodicVectorProviderConfig::OpenRouter);
         config.thread_episodic.vector_search.model =
             Some("openai/text-embedding-3-small".to_owned());
-        config.thread_episodic.vector_search.embedding_dimension = Some(1536);
 
         let snapshot = settings.snapshot(&config);
 
@@ -2741,7 +2760,6 @@ backend = "keystore"
                                 )),
                                 model: Some(Some("bge-base-en-v1.5".to_owned())),
                                 local_model: Some(Some("bge-base-en-v1.5".to_owned())),
-                                embedding_dimension: Some(Some(768)),
                                 embedding_normalized: Some(true),
                             },
                         ),
@@ -2772,7 +2790,6 @@ backend = "keystore"
         );
         assert_eq!(mapped.model.as_deref(), Some("bge-base-en-v1.5"));
         assert_eq!(mapped.local_model.as_deref(), Some("bge-base-en-v1.5"));
-        assert_eq!(mapped.embedding_dimension, Some(768));
 
         let serialized = toml::to_string(&settings).expect("settings should serialize");
         assert!(serialized.contains("[workspaces.workspace_a.thread_episodic.vector_search]"));
@@ -2835,7 +2852,6 @@ backend = "keystore"
                         )),
                         model: Some(Some("openai/text-embedding-3-small".to_owned())),
                         local_model: Some(None),
-                        embedding_dimension: Some(Some(1536)),
                         embedding_normalized: Some(true),
                     },
                 ),

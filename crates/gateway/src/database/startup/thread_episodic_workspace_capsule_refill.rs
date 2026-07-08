@@ -83,23 +83,73 @@ impl ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget {
     pub(crate) fn from_vector_search_config(
         config: &GatewayThreadEpisodicVectorSearchConfig,
     ) -> Self {
-        let config_hash = crate::settings::thread_episodic_vector_projection_identity_hash(config);
+        let provider = config.enabled.then(|| {
+            config
+                .provider
+                .map(crate::settings::vector_provider_identity_name)
+                .unwrap_or("missing")
+                .to_owned()
+        });
+        let model = config.enabled.then(|| projection_embedding_model(config));
+        let dimension = config
+            .enabled
+            .then(|| crate::settings::resolved_vector_embedding_dimension(config))
+            .flatten();
+        Self::from_projection_parts(
+            config.enabled,
+            provider,
+            model,
+            dimension,
+            config.enabled.then_some(config.embedding_normalized),
+        )
+    }
+
+    pub(crate) fn from_embedding_provider(
+        provider: &dyn ThreadEpisodicEmbeddingProvider,
+    ) -> Result<Self> {
+        let dimension = u32::try_from(provider.dimension()).with_context(|| {
+            format!(
+                "embedding dimension {} for `{}`/`{}` does not fit projection metadata",
+                provider.dimension(),
+                provider.provider_id(),
+                provider.model()
+            )
+        })?;
+        Ok(Self::from_projection_parts(
+            true,
+            Some(provider.provider_id().to_owned()),
+            Some(provider.model().to_owned()),
+            Some(dimension),
+            Some(provider.normalized()),
+        ))
+    }
+
+    fn from_projection_parts(
+        vector_search_enabled: bool,
+        provider: Option<String>,
+        model: Option<String>,
+        dimension: Option<u32>,
+        normalized: Option<bool>,
+    ) -> Self {
+        let config_hash =
+            crate::settings::thread_episodic_vector_projection_identity_hash_for_parts(
+                vector_search_enabled,
+                provider.as_deref().unwrap_or(if vector_search_enabled {
+                    "missing"
+                } else {
+                    "disabled"
+                }),
+                model.as_deref().unwrap_or(""),
+                dimension,
+                normalized.unwrap_or(false),
+            );
         let payload = ThreadEpisodicWorkspaceCapsuleRefillProjectionPayload {
             schema_version: THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_CONFIG_VERSION,
-            vector_search_enabled: config.enabled,
-            provider: config.enabled.then(|| {
-                config
-                    .provider
-                    .map(crate::settings::vector_provider_identity_name)
-                    .unwrap_or("missing")
-                    .to_owned()
-            }),
-            model: config.enabled.then(|| projection_embedding_model(config)),
-            dimension: config
-                .enabled
-                .then(|| crate::settings::resolved_vector_embedding_dimension(config))
-                .flatten(),
-            normalized: config.enabled.then_some(config.embedding_normalized),
+            vector_search_enabled,
+            provider,
+            model,
+            dimension,
+            normalized,
             config_hash: config_hash.clone(),
         };
         let payload_json = serde_json::to_string(&payload)
@@ -129,21 +179,49 @@ impl ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget {
             .is_ok_and(|payload| payload == self.payload)
     }
 
+    fn matches_projection_meta_selection(&self, meta: &ProjectionMetaRecordLike<'_>) -> bool {
+        let Some(payload_json) = meta.projection_config_json else {
+            return false;
+        };
+        serde_json::from_str::<ThreadEpisodicWorkspaceCapsuleRefillProjectionPayload>(payload_json)
+            .is_ok_and(|payload| {
+                payload.schema_version == self.payload.schema_version
+                    && payload.vector_search_enabled == self.payload.vector_search_enabled
+                    && payload.provider == self.payload.provider
+                    && payload.model == self.payload.model
+                    && payload.normalized == self.payload.normalized
+                    && match self.payload.dimension {
+                        Some(dimension) => payload.dimension == Some(dimension),
+                        None => true,
+                    }
+            })
+    }
+
     fn requires_embedding_provider(&self) -> bool {
         self.payload.vector_search_enabled
+    }
+
+    fn matches_embedding_provider_selection(
+        &self,
+        provider: &dyn ThreadEpisodicEmbeddingProvider,
+    ) -> bool {
+        if !self.payload.vector_search_enabled {
+            return true;
+        }
+        self.payload.provider.as_deref() == Some(provider.provider_id())
+            && self.payload.model.as_deref() == Some(provider.model())
+            && self.payload.normalized == Some(provider.normalized())
     }
 
     fn matches_embedding_provider(&self, provider: &dyn ThreadEpisodicEmbeddingProvider) -> bool {
         if !self.payload.vector_search_enabled {
             return true;
         }
-        self.payload.provider.as_deref() == Some(provider.provider_id())
-            && self.payload.model.as_deref() == Some(provider.model())
+        self.matches_embedding_provider_selection(provider)
             && self
                 .payload
                 .dimension
                 .is_some_and(|dimension| usize::try_from(dimension) == Ok(provider.dimension()))
-            && self.payload.normalized == Some(provider.normalized())
     }
 }
 
@@ -464,12 +542,42 @@ pub(crate) async fn refill_once_with_projection_resolver(
     crud_store: Arc<CrudStore>,
     thread_episodic_storage_root: &Path,
     workspace_id: &str,
-    projection_target: ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget,
-    embedding_provider_resolver: Option<Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>>,
+    mut projection_target: ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget,
+    mut embedding_provider_resolver: Option<Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>>,
     refill_status_sender: Option<&ThreadEpisodicWorkspaceCapsuleRefillStatusSender>,
 ) -> Result<ThreadEpisodicWorkspaceCapsuleRefillSummary> {
     let db = crud_store.database_connection();
-    if refill_is_current_for_workspace_target(crud_store.as_ref(), workspace_id, &projection_target)
+    let mut projection_resolution_error = None;
+    if projection_target.requires_embedding_provider() {
+        match resolve_refill_embedding_provider_for_target(
+            workspace_id,
+            &projection_target,
+            embedding_provider_resolver.as_ref(),
+        )
+        .await
+        {
+            Ok(provider) => {
+                projection_target =
+                    ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
+                        provider.as_ref(),
+                    )?;
+                embedding_provider_resolver = Some(Arc::new(
+                    FixedThreadEpisodicIndexEmbeddingProviderResolver::new(Some(provider)),
+                )
+                    as Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>);
+            }
+            Err(error) => {
+                projection_resolution_error = Some(error);
+            }
+        }
+    }
+
+    if projection_resolution_error.is_none()
+        && refill_is_current_for_workspace_target(
+            crud_store.as_ref(),
+            workspace_id,
+            &projection_target,
+        )
         .await?
     {
         return Ok(ThreadEpisodicWorkspaceCapsuleRefillSummary {
@@ -517,6 +625,9 @@ pub(crate) async fn refill_once_with_projection_resolver(
     );
 
     let result = async {
+        if let Some(error) = projection_resolution_error {
+            return Err(error);
+        }
         preflight_refill_embedding_resolver(
             workspace_id,
             &projection_target,
@@ -554,6 +665,40 @@ pub(crate) async fn refill_once_with_projection_resolver(
             Err(error)
         }
     }
+}
+
+async fn resolve_refill_embedding_provider_for_target(
+    workspace_id: &str,
+    projection_target: &ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget,
+    embedding_provider_resolver: Option<&Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>>,
+) -> Result<Arc<dyn ThreadEpisodicEmbeddingProvider>> {
+    let Some(embedding_provider_resolver) = embedding_provider_resolver else {
+        bail!("thread episodic vector refill requires an active embedding provider resolver");
+    };
+
+    let provider = embedding_provider_resolver
+        .resolve_active_embedding_provider(workspace_id)
+        .await
+        .map_err(|error| {
+            anyhow!(
+                "thread episodic vector refill provider preflight failed for workspace `{}`: {}",
+                workspace_id,
+                error.message
+            )
+        })?;
+    let Some(provider) = provider else {
+        bail!(
+            "thread episodic vector refill provider preflight returned no provider for workspace `{}`",
+            workspace_id
+        );
+    };
+    if !projection_target.matches_embedding_provider_selection(provider.as_ref()) {
+        bail!(
+            "thread episodic vector refill provider identity does not match projection target for workspace `{}`",
+            workspace_id
+        );
+    }
+    Ok(provider)
 }
 
 #[allow(dead_code)]
@@ -741,7 +886,8 @@ pub(crate) async fn refill_is_current_for_workspace_target(
     Ok(
         meta.projection_version == THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_VERSION
             && meta.status == PROJECTION_META_STATUS_COMPLETE
-            && projection_target.matches_projection_meta(&marker),
+            && (projection_target.matches_projection_meta(&marker)
+                || projection_target.matches_projection_meta_selection(&marker)),
     )
 }
 
@@ -773,7 +919,9 @@ pub(crate) async fn refill_status_for_workspace_target(
         projection_config_hash: meta.projection_config_hash.as_deref(),
         projection_config_json: meta.projection_config_json.as_deref(),
     };
-    if !projection_target.matches_projection_meta(&marker) {
+    if !projection_target.matches_projection_meta(&marker)
+        && !projection_target.matches_projection_meta_selection(&marker)
+    {
         return Ok(pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required);
     }
 
@@ -1721,7 +1869,6 @@ mod tests {
                     provider: Some(GatewayThreadEpisodicVectorProviderConfig::OpenAi),
                     model: Some("text-embedding-3-small".to_owned()),
                     local_model: Some("bge-small-en-v1.5".to_owned()),
-                    embedding_dimension: Some(1536),
                     embedding_normalized: true,
                 },
             );
@@ -1754,7 +1901,6 @@ mod tests {
             provider: Some(GatewayThreadEpisodicVectorProviderConfig::OpenAi),
             model: Some("text-embedding-3-small".to_owned()),
             local_model: Some("bge-small-en-v1.5".to_owned()),
-            embedding_dimension: Some(1536),
             embedding_normalized: true,
         };
         let base_target =
@@ -1772,11 +1918,6 @@ mod tests {
         for changed_config in [
             GatewayThreadEpisodicVectorSearchConfig {
                 model: Some("text-embedding-3-large".to_owned()),
-                embedding_dimension: Some(3072),
-                ..base_config.clone()
-            },
-            GatewayThreadEpisodicVectorSearchConfig {
-                embedding_dimension: Some(768),
                 ..base_config.clone()
             },
             GatewayThreadEpisodicVectorSearchConfig {
@@ -2132,7 +2273,6 @@ mod tests {
                     provider: Some(GatewayThreadEpisodicVectorProviderConfig::OpenAi),
                     model: Some("text-embedding-3-small".to_owned()),
                     local_model: Some("bge-small-en-v1.5".to_owned()),
-                    embedding_dimension: Some(1536),
                     embedding_normalized: true,
                 },
             );
@@ -2217,10 +2357,13 @@ mod tests {
             "vector refill should embed this workspace memory item",
         )
         .await;
-        let target = vector_projection_target(3);
         let embedding_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::new(vec![
             0.1, 0.2, 0.3,
         ]));
+        let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
+            embedding_provider.as_ref(),
+        )
+        .expect("test provider target");
 
         let summary = refill_once_with_projection(
             crud_store.clone(),
@@ -2270,7 +2413,6 @@ mod tests {
             "vector refill dimension mismatch should fail the projection",
         )
         .await;
-        let target = vector_projection_target(3);
         let embedding_provider = Arc::new(
             StaticThreadEpisodicEmbeddingProvider::with_declared_dimension(
                 "openai",
@@ -2279,6 +2421,10 @@ mod tests {
                 vec![0.1, 0.2, 0.3, 0.4],
             ),
         );
+        let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
+            embedding_provider.as_ref(),
+        )
+        .expect("test provider target");
 
         let error = refill_once_with_projection(
             crud_store.clone(),
@@ -2339,9 +2485,12 @@ mod tests {
             "vector refill provider failure should leave refill incomplete",
         )
         .await;
-        let target = vector_projection_target(3);
         let embedding_provider =
             Arc::new(StaticThreadEpisodicEmbeddingProvider::retryable_failure());
+        let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
+            embedding_provider.as_ref(),
+        )
+        .expect("test provider target");
 
         let error = refill_once_with_projection(
             crud_store.clone(),
@@ -2441,13 +2590,14 @@ mod tests {
             "text-embedding-3-small",
             3,
         );
-        let new_target =
-            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_vector_search_config(
-                &new_config,
-            );
         let embedding_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::new(vec![
             0.1, 0.2, 0.3,
         ]));
+        let new_target =
+            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
+                embedding_provider.as_ref(),
+            )
+            .expect("test provider target");
 
         let summary = refill_once_for_vector_search_config(
             crud_store.clone(),
@@ -2491,10 +2641,13 @@ mod tests {
             "text-embedding-3-small",
             3,
         );
-        let target =
-            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_vector_search_config(
-                &config,
-            );
+        let embedding_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::new(vec![
+            0.1, 0.2, 0.3,
+        ]));
+        let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
+            embedding_provider.as_ref(),
+        )
+        .expect("test provider target");
         mark_refill_marker_with_target(
             crud_store.as_ref(),
             PROJECTION_META_STATUS_COMPLETE,
@@ -2502,9 +2655,6 @@ mod tests {
             &target,
         )
         .await;
-        let embedding_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::new(vec![
-            0.1, 0.2, 0.3,
-        ]));
 
         let summary = refill_once_for_vector_search_config(
             crud_store,
@@ -2550,18 +2700,19 @@ mod tests {
         .await;
         let openrouter_config = vector_search_config(
             GatewayThreadEpisodicVectorProviderConfig::OpenRouter,
-            "openai/text-embedding-3-small",
+            "vendor/custom-embed",
             3,
         );
-        let openrouter_target =
-            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_vector_search_config(
-                &openrouter_config,
-            );
         let embedding_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::with_identity(
             "openrouter",
-            "openai/text-embedding-3-small",
+            "vendor/custom-embed",
             vec![0.1, 0.2, 0.3],
         ));
+        let openrouter_target =
+            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
+                embedding_provider.as_ref(),
+            )
+            .expect("openrouter test provider target");
 
         let summary = refill_once_for_vector_search_config(
             crud_store.clone(),
@@ -2710,18 +2861,18 @@ mod tests {
             provider: Some(GatewayThreadEpisodicVectorProviderConfig::OpenRouter),
             model: Some("smoke/test-embedding".to_owned()),
             local_model: Some("bge-small-en-v1.5".to_owned()),
-            embedding_dimension: Some(3),
             embedding_normalized: true,
         };
-        let projection_target =
-            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_vector_search_config(
-                &vector_config,
-            );
         let embedding_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::with_identity(
             "openrouter",
             "smoke/test-embedding",
             vec![0.57735026, 0.57735026, 0.57735026],
         ));
+        let projection_target =
+            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
+                embedding_provider.as_ref(),
+            )
+            .expect("smoke provider target");
 
         let summary = refill_once_for_vector_search_config(
             crud_store.clone(),
@@ -3052,29 +3203,16 @@ mod tests {
         );
     }
 
-    fn vector_projection_target(
-        dimension: u32,
-    ) -> ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget {
-        ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_vector_search_config(
-            &vector_search_config(
-                GatewayThreadEpisodicVectorProviderConfig::OpenAi,
-                "text-embedding-3-small",
-                dimension,
-            ),
-        )
-    }
-
     fn vector_search_config(
         provider: GatewayThreadEpisodicVectorProviderConfig,
         model: &str,
-        dimension: u32,
+        _legacy_dimension: u32,
     ) -> GatewayThreadEpisodicVectorSearchConfig {
         GatewayThreadEpisodicVectorSearchConfig {
             enabled: true,
             provider: Some(provider),
             model: Some(model.to_owned()),
             local_model: Some("bge-small-en-v1.5".to_owned()),
-            embedding_dimension: Some(dimension),
             embedding_normalized: true,
         }
     }

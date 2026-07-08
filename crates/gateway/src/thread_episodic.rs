@@ -553,9 +553,6 @@ impl ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver {
                         ThreadEpisodicEmbeddingError::missing_model("openrouter", ""),
                     ));
                 }
-                let explicit_dimension = config
-                    .embedding_dimension
-                    .and_then(|dimension| usize::try_from(dimension).ok());
                 let api_provider = self
                     .provider_registry
                     .get_or_create_for_workspace(workspace_id, "openrouter")
@@ -570,7 +567,7 @@ impl ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver {
                     })?;
                 let provider = RemoteEmbeddingProvider::openrouter(
                     model,
-                    explicit_dimension,
+                    None,
                     config.embedding_normalized,
                     api_provider,
                 )
@@ -4961,7 +4958,6 @@ mod tests {
             provider: Some(pioneer_config::GatewayThreadEpisodicVectorProviderConfig::OpenRouter),
             model: Some("custom/test-embedding".to_owned()),
             local_model: Some("bge-small-en-v1.5".to_owned()),
-            embedding_dimension: Some(3),
             embedding_normalized: true,
         };
         mark_thread_episodic_workspace_vector_refill_complete_for_test(
@@ -5051,7 +5047,6 @@ mod tests {
             provider: Some(pioneer_config::GatewayThreadEpisodicVectorProviderConfig::OpenRouter),
             model: Some("custom/test-embedding".to_owned()),
             local_model: Some("bge-small-en-v1.5".to_owned()),
-            embedding_dimension: Some(3),
             embedding_normalized: true,
         };
         mark_thread_episodic_workspace_vector_refill_complete_for_test(
@@ -5128,7 +5123,6 @@ mod tests {
             provider: Some(pioneer_config::GatewayThreadEpisodicVectorProviderConfig::OpenAi),
             model: Some("text-embedding-3-small".to_owned()),
             local_model: Some("bge-small-en-v1.5".to_owned()),
-            embedding_dimension: Some(1536),
             embedding_normalized: true,
         };
         mark_thread_episodic_workspace_vector_refill_complete_for_test(
@@ -5202,7 +5196,6 @@ mod tests {
             provider: Some(pioneer_config::GatewayThreadEpisodicVectorProviderConfig::Local),
             model: Some("text-embedding-3-small".to_owned()),
             local_model: Some("bge-small-en-v1.5".to_owned()),
-            embedding_dimension: Some(384),
             embedding_normalized: true,
         };
         mark_thread_episodic_workspace_vector_refill_complete_for_test(
@@ -5277,7 +5270,6 @@ mod tests {
             provider: Some(pioneer_config::GatewayThreadEpisodicVectorProviderConfig::OpenRouter),
             model: Some("custom/test-embedding".to_owned()),
             local_model: Some("bge-small-en-v1.5".to_owned()),
-            embedding_dimension: Some(3),
             embedding_normalized: true,
         };
         mark_thread_episodic_workspace_vector_refill_complete_for_test(
@@ -5559,7 +5551,6 @@ mod tests {
             provider: Some(pioneer_config::GatewayThreadEpisodicVectorProviderConfig::OpenRouter),
             model: Some("custom/test-embedding".to_owned()),
             local_model: Some("bge-small-en-v1.5".to_owned()),
-            embedding_dimension: Some(3),
             embedding_normalized: true,
         };
         mark_thread_episodic_workspace_vector_refill_complete_for_test(

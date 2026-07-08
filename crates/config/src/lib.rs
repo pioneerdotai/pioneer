@@ -691,9 +691,6 @@ pub struct GatewayThreadEpisodicVectorSearchConfig {
     /// not lose the user's local selection. Ignored while provider is not Local.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_model: Option<String>,
-    /// Embedding dimension for the active provider/model when known.
-    #[serde(default)]
-    pub embedding_dimension: Option<u32>,
     /// Whether embeddings are normalized before being written/searched.
     #[serde(default = "default_gateway_thread_episodic_vector_normalized")]
     pub embedding_normalized: bool,
@@ -706,7 +703,6 @@ impl Default for GatewayThreadEpisodicVectorSearchConfig {
             provider: None,
             model: None,
             local_model: None,
-            embedding_dimension: None,
             embedding_normalized: default_gateway_thread_episodic_vector_normalized(),
         }
     }
@@ -3823,14 +3819,6 @@ active_recall_model = { source = "custom", model_provider = "legacy-provider", m
             config.gateway.thread_episodic.vector_search.local_model,
             None
         );
-        assert_eq!(
-            config
-                .gateway
-                .thread_episodic
-                .vector_search
-                .embedding_dimension,
-            None
-        );
         assert!(
             config
                 .gateway
@@ -3917,7 +3905,6 @@ active_recall_model = { source = "custom", model_provider = "legacy-provider", m
         assert_eq!(config.vector_search.provider, None);
         assert_eq!(config.vector_search.model, None);
         assert_eq!(config.vector_search.local_model, None);
-        assert_eq!(config.vector_search.embedding_dimension, None);
         assert!(config.vector_search.embedding_normalized);
     }
 
@@ -3974,12 +3961,12 @@ embedding_normalized = true
             config.vector_search.local_model.as_deref(),
             Some("bge-base-en-v1.5")
         );
-        assert_eq!(config.vector_search.embedding_dimension, Some(1536));
         assert!(config.vector_search.embedding_normalized);
 
         let serialized =
             toml::to_string(&config.vector_search).expect("vector config should serialize");
         assert!(serialized.contains("provider = \"openrouter\""));
+        assert!(!serialized.contains("embedding_dimension"));
         assert!(!serialized.contains("api_key"));
         assert!(!serialized.contains("secret"));
 
@@ -4008,7 +3995,6 @@ embedding_dimension = 384
             local_config.vector_search.local_model.as_deref(),
             Some("bge-small-en-v1.5")
         );
-        assert_eq!(local_config.vector_search.embedding_dimension, Some(384));
     }
 
     #[test]
