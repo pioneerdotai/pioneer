@@ -460,19 +460,10 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         .resolve_capsules_root(runtime_home.as_path())?;
     let thread_episodic_workspace_vector_search_configs =
         gateway_settings.workspace_thread_episodic_vector_search_configs();
-    database::startup::spawn(
-        crud_store.clone(),
-        thread_episodic_storage_root.clone(),
-        config.gateway.thread_episodic.vector_search.clone(),
-        thread_episodic_workspace_vector_search_configs.clone(),
-        provider_registry.clone(),
-        runtime_home.clone(),
-    );
-    database::maintenance::spawn(crud_store.clone());
 
     let mut message_processor = MessageProcessor::new_with_memory_runtime_and_task_config(
         thread_manager,
-        provider_registry,
+        provider_registry.clone(),
         session_manager.clone(),
         workspace_manager,
         crud_store,
@@ -482,7 +473,7 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         tool_loop_config,
         memory_runtime,
         runtime_home.clone(),
-        thread_episodic_storage_root,
+        thread_episodic_storage_root.clone(),
         config.gateway.artifacts.clone(),
         task_runtime_config,
         thread_episodic_runtime_config_from_gateway_config(&config.gateway.thread_episodic),
@@ -496,7 +487,7 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         message_processor = message_processor.with_cli_runtime_manager(cli_runtime_manager);
     }
     message_processor.apply_thread_episodic_workspace_vector_search_configs(
-        thread_episodic_workspace_vector_search_configs,
+        thread_episodic_workspace_vector_search_configs.clone(),
     );
     message_processor = message_processor.with_voice_model_bootstrap(voice_model_bootstrap);
     message_processor = message_processor.with_voice_transcriber(
@@ -506,6 +497,18 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         message_processor.with_remote_access_supervisor(remote_access_supervisor.clone());
     let message_processor = Arc::new(message_processor);
     message_processor.start_remote_access_status_notifications();
+    message_processor.start_thread_episodic_vector_refill_status_notifications();
+
+    database::startup::spawn(
+        message_processor.crud_store.clone(),
+        thread_episodic_storage_root.clone(),
+        config.gateway.thread_episodic.vector_search.clone(),
+        thread_episodic_workspace_vector_search_configs.clone(),
+        provider_registry.clone(),
+        runtime_home.clone(),
+        Some(message_processor.thread_episodic_vector_refill_status_sender()),
+    );
+    database::maintenance::spawn(message_processor.crud_store.clone());
 
     message_processor
         .apply_keepawake_setting(config.gateway.keepawake)

@@ -2868,11 +2868,7 @@ impl MessageProcessor {
             )
             .await?;
         let mut snapshot = snapshot;
-        if changes.thread_episodic_vector_projection_changed {
-            crate::settings::force_thread_episodic_vector_refill_required(
-                &mut snapshot.thread_episodic.vector_search,
-            );
-        }
+        let mut vector_refill_started = false;
         if changes.memory {
             let memory_settings =
                 crate::settings::GatewayMemorySettings::from_protocol(snapshot.memory.clone());
@@ -2915,7 +2911,9 @@ impl MessageProcessor {
                         workspace_vector_search_configs,
                         self.provider_registry.clone(),
                         self.artifact_runtime_home.clone(),
+                        Some(self.thread_episodic_vector_refill_status_sender()),
                     );
+                    vector_refill_started = true;
                 } else {
                     crate::database::startup::spawn_thread_episodic_workspace_capsule_refill(
                         self.crud_store.clone(),
@@ -2924,10 +2922,17 @@ impl MessageProcessor {
                         workspace_vector_search_configs,
                         self.provider_registry.clone(),
                         self.artifact_runtime_home.clone(),
+                        Some(self.thread_episodic_vector_refill_status_sender()),
                     );
+                    vector_refill_started = true;
                 }
             }
             self.reinstall_memory_hook_runtime_if_bound().await;
+        }
+        if vector_refill_started {
+            crate::settings::mark_thread_episodic_vector_refill_running_if_ready(
+                &mut snapshot.thread_episodic.vector_search,
+            );
         }
 
         Ok(snapshot)

@@ -26,6 +26,7 @@ use pioneer_memory::{
     ThreadEpisodicMemvidFailureKind, ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidStats,
     thread_episodic_storage_uri_from_path,
 };
+use pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus;
 use pioneer_provider::ProviderRegistry;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use std::collections::BTreeMap;
@@ -46,6 +47,15 @@ const REFILL_JOB_CLAIM_LIMIT: u64 = 1;
 const REFILL_LOCK_FILE_NAME: &str = ".thread_episodic_workspace_capsule_refill.lock";
 const REFILL_INDEX_ERROR_MAX_CHARS: usize = 512;
 const LEGACY_REFILL_WORKSPACE_ID: &str = "__default__";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ThreadEpisodicWorkspaceCapsuleRefillStatusEvent {
+    pub(crate) workspace_id: String,
+    pub(crate) status: GatewayThreadEpisodicVectorRefillStatus,
+}
+
+pub(crate) type ThreadEpisodicWorkspaceCapsuleRefillStatusSender =
+    tokio::sync::broadcast::Sender<ThreadEpisodicWorkspaceCapsuleRefillStatusEvent>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget {
@@ -197,6 +207,7 @@ pub(super) async fn run(
     workspace_vector_search_configs: BTreeMap<String, GatewayThreadEpisodicVectorSearchConfig>,
     provider_registry: Arc<ProviderRegistry>,
     runtime_home: PathBuf,
+    refill_status_sender: Option<ThreadEpisodicWorkspaceCapsuleRefillStatusSender>,
 ) {
     let workspace_ids = match crud_store.list_thread_episodic_refill_workspace_ids().await {
         Ok(workspace_ids) => workspace_ids,
@@ -223,6 +234,7 @@ pub(super) async fn run(
             workspace_vector_search_configs.clone(),
             provider_registry.clone(),
             runtime_home.clone(),
+            refill_status_sender.clone(),
         )
         .await;
     }
@@ -237,6 +249,7 @@ pub(super) async fn run_workspace(
     workspace_vector_search_configs: BTreeMap<String, GatewayThreadEpisodicVectorSearchConfig>,
     provider_registry: Arc<ProviderRegistry>,
     runtime_home: PathBuf,
+    refill_status_sender: Option<ThreadEpisodicWorkspaceCapsuleRefillStatusSender>,
 ) {
     if !ensure_local_embedding_model_ready_for_workspace_refill(
         runtime_home.as_path(),
@@ -269,6 +282,7 @@ pub(super) async fn run_workspace(
         workspace_id.as_str(),
         projection_target,
         embedding_provider_resolver,
+        refill_status_sender.as_ref(),
     )
     .await
     {
@@ -441,6 +455,7 @@ pub(crate) async fn refill_once_with_workspace_projection(
         workspace_id,
         projection_target,
         embedding_provider_resolver,
+        None,
     )
     .await
 }
@@ -451,6 +466,7 @@ pub(crate) async fn refill_once_with_projection_resolver(
     workspace_id: &str,
     projection_target: ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget,
     embedding_provider_resolver: Option<Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>>,
+    refill_status_sender: Option<&ThreadEpisodicWorkspaceCapsuleRefillStatusSender>,
 ) -> Result<ThreadEpisodicWorkspaceCapsuleRefillSummary> {
     let db = crud_store.database_connection();
     if refill_is_current_for_workspace_target(crud_store.as_ref(), workspace_id, &projection_target)
@@ -471,15 +487,9 @@ pub(crate) async fn refill_once_with_projection_resolver(
         });
     };
 
-    preflight_refill_embedding_resolver(
-        workspace_id,
-        &projection_target,
-        embedding_provider_resolver.as_ref(),
-    )
-    .await?;
-
     let started_at = now_datetime();
     let projection_key = refill_projection_key_for_workspace(workspace_id)?;
+
     upsert_projection_meta_with_config(
         &db,
         ProjectionMetaRecord {
@@ -500,20 +510,47 @@ pub(crate) async fn refill_once_with_projection_resolver(
     )
     .await?;
 
-    let result = refill_after_marker(
-        crud_store.clone(),
-        thread_episodic_storage_root,
+    notify_refill_status(
+        refill_status_sender,
         workspace_id,
-        embedding_provider_resolver,
-    )
+        GatewayThreadEpisodicVectorRefillStatus::Running,
+    );
+
+    let result = async {
+        preflight_refill_embedding_resolver(
+            workspace_id,
+            &projection_target,
+            embedding_provider_resolver.as_ref(),
+        )
+        .await?;
+
+        refill_after_marker(
+            crud_store.clone(),
+            thread_episodic_storage_root,
+            workspace_id,
+            embedding_provider_resolver,
+        )
+        .await
+    }
     .await;
+
     match result {
         Ok(summary) => {
             mark_refill_complete(&db, workspace_id, &summary, &projection_target).await?;
+            notify_refill_status(
+                refill_status_sender,
+                workspace_id,
+                GatewayThreadEpisodicVectorRefillStatus::Complete,
+            );
             Ok(summary)
         }
         Err(error) => {
             mark_refill_failed(&db, workspace_id, &error, &projection_target).await?;
+            notify_refill_status(
+                refill_status_sender,
+                workspace_id,
+                GatewayThreadEpisodicVectorRefillStatus::Failed,
+            );
             Err(error)
         }
     }
@@ -1478,6 +1515,20 @@ async fn mark_refill_failed(
 
 fn now_datetime() -> DateTimeWithTimeZone {
     chrono::Utc::now().fixed_offset()
+}
+
+fn notify_refill_status(
+    sender: Option<&ThreadEpisodicWorkspaceCapsuleRefillStatusSender>,
+    workspace_id: &str,
+    status: GatewayThreadEpisodicVectorRefillStatus,
+) {
+    let Some(sender) = sender else {
+        return;
+    };
+    let _ = sender.send(ThreadEpisodicWorkspaceCapsuleRefillStatusEvent {
+        workspace_id: workspace_id.to_owned(),
+        status,
+    });
 }
 
 #[cfg(test)]

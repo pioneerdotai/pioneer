@@ -1079,11 +1079,54 @@ pub fn apply_thread_episodic_vector_search_status(
         pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required;
 }
 
-pub fn force_thread_episodic_vector_refill_required(
+pub fn mark_thread_episodic_vector_refill_running_if_ready(
     vector_search: &mut pioneer_protocol::GatewayThreadEpisodicVectorSearchSettings,
 ) {
+    if !vector_search.enabled
+        || vector_search.refill_status
+            != pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required
+    {
+        return;
+    }
+    if vector_search.provider_key.required && !vector_search.provider_key.present {
+        return;
+    }
+
+    match vector_search.provider {
+        Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::OpenAi)
+        | Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::OpenRouter) => {
+            if vector_search
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .is_none()
+            {
+                return;
+            }
+        }
+        Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::Local) => {
+            if vector_search
+                .model
+                .as_deref()
+                .or(vector_search.local_model.as_deref())
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .is_none()
+            {
+                return;
+            }
+            if vector_search.local_model_status
+                != pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Installed
+            {
+                return;
+            }
+        }
+        None => return,
+    }
+
     vector_search.refill_status =
-        pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required;
+        pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Running;
 }
 
 fn apply_vector_search_protocol_update(
@@ -2419,6 +2462,56 @@ embedding_normalized = true
         );
         assert_eq!(
             local.refill_status,
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required
+        );
+    }
+
+    #[test]
+    fn vector_refill_running_status_requires_startable_refill() {
+        let mut remote_ready = pioneer_protocol::GatewayThreadEpisodicVectorSearchSettings {
+            enabled: true,
+            provider: Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::OpenRouter),
+            model: Some("openai/text-embedding-3-small".to_owned()),
+            provider_key: pioneer_protocol::GatewayThreadEpisodicVectorProviderKeyStatus {
+                required: true,
+                present: true,
+            },
+            refill_status: pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required,
+            ..Default::default()
+        };
+        super::mark_thread_episodic_vector_refill_running_if_ready(&mut remote_ready);
+        assert_eq!(
+            remote_ready.refill_status,
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Running
+        );
+
+        let mut remote_missing_key = pioneer_protocol::GatewayThreadEpisodicVectorSearchSettings {
+            provider_key: pioneer_protocol::GatewayThreadEpisodicVectorProviderKeyStatus {
+                required: true,
+                present: false,
+            },
+            ..remote_ready.clone()
+        };
+        remote_missing_key.refill_status =
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required;
+        super::mark_thread_episodic_vector_refill_running_if_ready(&mut remote_missing_key);
+        assert_eq!(
+            remote_missing_key.refill_status,
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required
+        );
+
+        let mut local_missing = pioneer_protocol::GatewayThreadEpisodicVectorSearchSettings {
+            enabled: true,
+            provider: Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::Local),
+            model: Some("bge-small-en-v1.5".to_owned()),
+            local_model_status:
+                pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Missing,
+            refill_status: pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required,
+            ..Default::default()
+        };
+        super::mark_thread_episodic_vector_refill_running_if_ready(&mut local_missing);
+        assert_eq!(
+            local_missing.refill_status,
             pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required
         );
     }

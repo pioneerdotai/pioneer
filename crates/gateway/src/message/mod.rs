@@ -87,31 +87,32 @@ use pioneer_protocol::{
     CLIRuntimeThreadBindingGetResponse, CLIRuntimeThreadCompactParams, CLIRuntimeThreadForkParams,
     CLIRuntimeThreadForkResponse, CLIRuntimeTurnSteerParams, CLIRuntimeTurnSteerResponse,
     ContextCompressedNotification, ContextCompressingNotification,
-    GatewayRemoteAccessStatusChangedNotification, INVALID_PARAMS_CODE, INVALID_REQUEST_CODE,
-    ItemCompletedNotification, ItemDeltaNotification, ItemDeltaStream, ItemStartedNotification,
-    ItemTimeoutDetectedNotification, JSONRPC_VERSION, JsonRpcErrorResponse, JsonRpcNotification,
-    JsonRpcRequest, JsonRpcResponse, MARKDOWN_AST_VERSION, METHOD_NOT_FOUND_CODE,
-    McpAuditEventSummary, McpChangedAction, McpChangedItem, McpChangedNotification,
-    McpDiagnosticLevel, McpInstallParams, McpInstallResponse, McpInstallResult,
-    McpInstallResultStatus, McpInstallStatus, McpLifecycleAuditSummary, McpListItem, McpListParams,
-    McpListResponse, McpPolicySetParams, McpPolicySetResponse, McpPolicyState,
-    McpPromptCatalogItem, McpResourceCatalogItem, McpResourceTemplateCatalogItem, McpRuntimeState,
-    McpRuntimeStatus, McpServerCatalogDetails, McpServerDetailsParams, McpServerDetailsResponse,
-    McpServerHealthDetails, McpServerPolicy, McpServerRestartParams, McpServerRestartResponse,
-    McpServerStatus, McpSourceKind, McpToolAnnotationSummary, McpToolCatalogItem,
-    McpTransportSummary, McpTurnBindingSummary, McpUninstallParams, McpUninstallResponse,
-    McpValidationDiagnostic, PARSE_ERROR_CODE, ProviderDeleteApiKeyParams,
-    ProviderDeleteApiKeyResponse, ProviderListModelsParams, ProviderListModelsResponse,
-    ProviderListParams, ProviderListResponse, ProviderModelCapabilities, ProviderModelInfo,
-    ProviderModelLimits, ProviderModelPricing, ProviderModelReasoningCapabilities,
-    ProviderSetApiKeyParams, ProviderSetApiKeyResponse, ProviderSummary,
-    ProviderSummaryCapabilities, ReasoningCapabilitySource, RequestId, RuntimeAccountSnapshot,
-    RuntimeCapabilities, RuntimeDiagnostic, RuntimeDiagnosticLevel, RuntimeModelInfo,
-    RuntimeStatus, RuntimeSummary, SkillsUploadAbortParams, SkillsUploadFinishParams,
-    SkillsUploadStartParams, SystemEventLevel, TaskAcceptParams, TaskAgendaParams,
-    TaskCancelParams, TaskCreateParams, TaskDeliveriesParams, TaskDelivery, TaskDeliveryAttempt,
-    TaskDeliveryMode, TaskDetachParams, TaskEventsParams, TaskGetParams, TaskListParams,
-    TaskPauseParams, TaskRescheduleParams, TaskResumeParams, TaskReviseParams,
+    GatewayRemoteAccessStatusChangedNotification,
+    GatewayThreadEpisodicVectorRefillStatusChangedNotification, INVALID_PARAMS_CODE,
+    INVALID_REQUEST_CODE, ItemCompletedNotification, ItemDeltaNotification, ItemDeltaStream,
+    ItemStartedNotification, ItemTimeoutDetectedNotification, JSONRPC_VERSION,
+    JsonRpcErrorResponse, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
+    MARKDOWN_AST_VERSION, METHOD_NOT_FOUND_CODE, McpAuditEventSummary, McpChangedAction,
+    McpChangedItem, McpChangedNotification, McpDiagnosticLevel, McpInstallParams,
+    McpInstallResponse, McpInstallResult, McpInstallResultStatus, McpInstallStatus,
+    McpLifecycleAuditSummary, McpListItem, McpListParams, McpListResponse, McpPolicySetParams,
+    McpPolicySetResponse, McpPolicyState, McpPromptCatalogItem, McpResourceCatalogItem,
+    McpResourceTemplateCatalogItem, McpRuntimeState, McpRuntimeStatus, McpServerCatalogDetails,
+    McpServerDetailsParams, McpServerDetailsResponse, McpServerHealthDetails, McpServerPolicy,
+    McpServerRestartParams, McpServerRestartResponse, McpServerStatus, McpSourceKind,
+    McpToolAnnotationSummary, McpToolCatalogItem, McpTransportSummary, McpTurnBindingSummary,
+    McpUninstallParams, McpUninstallResponse, McpValidationDiagnostic, PARSE_ERROR_CODE,
+    ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse, ProviderListModelsParams,
+    ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
+    ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits, ProviderModelPricing,
+    ProviderModelReasoningCapabilities, ProviderSetApiKeyParams, ProviderSetApiKeyResponse,
+    ProviderSummary, ProviderSummaryCapabilities, ReasoningCapabilitySource, RequestId,
+    RuntimeAccountSnapshot, RuntimeCapabilities, RuntimeDiagnostic, RuntimeDiagnosticLevel,
+    RuntimeModelInfo, RuntimeStatus, RuntimeSummary, SkillsUploadAbortParams,
+    SkillsUploadFinishParams, SkillsUploadStartParams, SystemEventLevel, TaskAcceptParams,
+    TaskAgendaParams, TaskCancelParams, TaskCreateParams, TaskDeliveriesParams, TaskDelivery,
+    TaskDeliveryAttempt, TaskDeliveryMode, TaskDetachParams, TaskEventsParams, TaskGetParams,
+    TaskListParams, TaskPauseParams, TaskRescheduleParams, TaskResumeParams, TaskReviseParams,
     TaskTreeParams as TaskTreeTaskParams, TaskWaitParams, ThreadAgentsDocArchiveParams,
     ThreadAgentsDocArchiveResponse, ThreadAgentsDocChangedNotification, ThreadAgentsDocGetParams,
     ThreadAgentsDocGetResponse, ThreadAgentsDocPayload, ThreadAgentsDocResolveForThreadParams,
@@ -155,7 +156,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::RwLock as StdRwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, oneshot};
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, broadcast, oneshot};
 use tokio::task::JoinHandle;
 
 use pioneer_cli_agent_runtime::event::RuntimeEvent;
@@ -337,6 +338,7 @@ pub struct MessageProcessor {
     session_manager: Arc<SessionManager>,
     cli_runtime_manager: Option<Arc<CLIAgentRuntimeManager>>,
     remote_access_supervisor: Option<Arc<pioneer_tunnel::RemoteAccessSupervisor>>,
+    thread_episodic_vector_refill_status_tx: crate::database::startup::thread_episodic_workspace_capsule_refill::ThreadEpisodicWorkspaceCapsuleRefillStatusSender,
     workspace_manager: Arc<WorkspaceManager>,
     pub(crate) crud_store: Arc<CrudStore>,
     gateway_secrets: Arc<GatewaySecrets>,
@@ -586,6 +588,7 @@ impl MessageProcessor {
             .apply_config(thread_episodic_runtime_config.recall_service.clone());
         let thread_episodic_ingestion_enabled = thread_episodic_runtime_config.enabled
             && thread_episodic_runtime_config.indexing_enabled;
+        let (thread_episodic_vector_refill_status_tx, _) = broadcast::channel(64);
 
         Self {
             thread_manager,
@@ -594,6 +597,7 @@ impl MessageProcessor {
             session_manager,
             cli_runtime_manager: None,
             remote_access_supervisor: None,
+            thread_episodic_vector_refill_status_tx,
             workspace_manager,
             crud_store: crud_store.clone(),
             gateway_secrets,
@@ -721,6 +725,48 @@ impl MessageProcessor {
                     .send_notification_to_all_connections(
                         events::GATEWAY_REMOTE_ACCESS_STATUS_CHANGED,
                         &GatewayRemoteAccessStatusChangedNotification { status },
+                    )
+                    .await;
+            }
+        });
+    }
+
+    pub(crate) fn thread_episodic_vector_refill_status_sender(
+        &self,
+    ) -> crate::database::startup::thread_episodic_workspace_capsule_refill::ThreadEpisodicWorkspaceCapsuleRefillStatusSender{
+        self.thread_episodic_vector_refill_status_tx.clone()
+    }
+
+    pub fn start_thread_episodic_vector_refill_status_notifications(self: &Arc<Self>) {
+        let mut status_rx = self.thread_episodic_vector_refill_status_tx.subscribe();
+        let processor = Arc::downgrade(self);
+        let _status_notifications = tokio::spawn(async move {
+            loop {
+                let event = match status_rx.recv().await {
+                    Ok(event) => event,
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!(
+                            skipped,
+                            "thread episodic vector refill status notification receiver lagged"
+                        );
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                };
+
+                let Some(processor) = processor.upgrade() else {
+                    break;
+                };
+                let workspace_id = event.workspace_id;
+                let notification = GatewayThreadEpisodicVectorRefillStatusChangedNotification {
+                    workspace_id: workspace_id.clone(),
+                    status: event.status,
+                };
+                processor
+                    .send_notification_to_workspace_connections(
+                        workspace_id.as_str(),
+                        events::GATEWAY_THREAD_EPISODIC_VECTOR_REFILL_STATUS_CHANGED,
+                        &notification,
                     )
                     .await;
             }
@@ -2085,6 +2131,7 @@ impl MessageProcessor {
                 Some(thread_episodic_recall_embedding_provider_resolver),
             ),
         );
+        let (thread_episodic_vector_refill_status_tx, _) = broadcast::channel(64);
         Self {
             thread_manager,
             agent_manager,
@@ -2092,6 +2139,7 @@ impl MessageProcessor {
             session_manager,
             cli_runtime_manager: None,
             remote_access_supervisor: None,
+            thread_episodic_vector_refill_status_tx,
             workspace_manager,
             crud_store: crud_store.clone(),
             gateway_secrets,

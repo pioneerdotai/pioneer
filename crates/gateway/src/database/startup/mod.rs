@@ -13,6 +13,7 @@ use pioneer_provider::ProviderRegistry;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use thread_episodic_workspace_capsule_refill::ThreadEpisodicWorkspaceCapsuleRefillStatusSender;
 
 pub(crate) fn spawn(
     crud_store: Arc<CrudStore>,
@@ -24,6 +25,7 @@ pub(crate) fn spawn(
     >,
     provider_registry: Arc<ProviderRegistry>,
     runtime_home: PathBuf,
+    refill_status_sender: Option<ThreadEpisodicWorkspaceCapsuleRefillStatusSender>,
 ) {
     let _handle = tokio::spawn(async move {
         task_anchor_backfill::run(crud_store.as_ref()).await;
@@ -40,6 +42,7 @@ pub(crate) fn spawn(
             thread_episodic_workspace_vector_search_configs,
             provider_registry,
             runtime_home,
+            refill_status_sender,
         )
         .await;
     });
@@ -55,6 +58,7 @@ pub(crate) fn spawn_thread_episodic_workspace_capsule_refill(
     >,
     provider_registry: Arc<ProviderRegistry>,
     runtime_home: PathBuf,
+    refill_status_sender: Option<ThreadEpisodicWorkspaceCapsuleRefillStatusSender>,
 ) {
     let _handle = tokio::spawn(async move {
         run_thread_episodic_workspace_capsule_refill(
@@ -64,6 +68,7 @@ pub(crate) fn spawn_thread_episodic_workspace_capsule_refill(
             thread_episodic_workspace_vector_search_configs,
             provider_registry,
             runtime_home,
+            refill_status_sender,
         )
         .await;
     });
@@ -81,6 +86,7 @@ pub(crate) fn spawn_thread_episodic_workspace_capsule_refill_for_workspace(
     >,
     provider_registry: Arc<ProviderRegistry>,
     runtime_home: PathBuf,
+    refill_status_sender: Option<ThreadEpisodicWorkspaceCapsuleRefillStatusSender>,
 ) {
     let _handle = tokio::spawn(async move {
         run_thread_episodic_workspace_capsule_refill_for_workspace(
@@ -92,6 +98,7 @@ pub(crate) fn spawn_thread_episodic_workspace_capsule_refill_for_workspace(
             thread_episodic_workspace_vector_search_configs,
             provider_registry,
             runtime_home,
+            refill_status_sender,
         )
         .await;
     });
@@ -107,6 +114,7 @@ async fn run_thread_episodic_workspace_capsule_refill(
     >,
     provider_registry: Arc<ProviderRegistry>,
     runtime_home: PathBuf,
+    refill_status_sender: Option<ThreadEpisodicWorkspaceCapsuleRefillStatusSender>,
 ) {
     thread_episodic_workspace_capsule_refill::run(
         crud_store,
@@ -115,6 +123,7 @@ async fn run_thread_episodic_workspace_capsule_refill(
         thread_episodic_workspace_vector_search_configs,
         provider_registry,
         runtime_home,
+        refill_status_sender,
     )
     .await;
 }
@@ -131,6 +140,7 @@ async fn run_thread_episodic_workspace_capsule_refill_for_workspace(
     >,
     provider_registry: Arc<ProviderRegistry>,
     runtime_home: PathBuf,
+    refill_status_sender: Option<ThreadEpisodicWorkspaceCapsuleRefillStatusSender>,
 ) {
     thread_episodic_workspace_capsule_refill::run_workspace(
         crud_store,
@@ -141,6 +151,7 @@ async fn run_thread_episodic_workspace_capsule_refill_for_workspace(
         thread_episodic_workspace_vector_search_configs,
         provider_registry,
         runtime_home,
+        refill_status_sender,
     )
     .await;
 }
