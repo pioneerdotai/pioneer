@@ -10,6 +10,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/desktop/**"
+      - "crates/desktop-updater/**"
       - "crates/cli/**"
       - "scripts/packaging/desktop/**"
       - ".github/workflows/release-app.yml"
@@ -30,34 +31,46 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Desktop release assets have two roles:
+        # - asset_name is the manual install artifact that remains published for users.
+        # - update_asset_name is the v1 auto-update artifact included in desktop-update-manifest.json.
+        # Linux uses the AppImage for both roles. macOS keeps DMG for manual install and uses
+        # a signed .app.zip for auto-update. Windows keeps MSI for manual install and uses the
+        # WiX bundle .exe for auto-update.
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             package_kind: linux_appimage
             asset_name: pioneer-linux-x86_64.AppImage
+            update_asset_name: pioneer-linux-x86_64.AppImage
             appimagetool_arch: x86_64
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             package_kind: linux_appimage
             asset_name: pioneer-linux-aarch64.AppImage
+            update_asset_name: pioneer-linux-aarch64.AppImage
             appimagetool_arch: aarch64
           - os: macos-14
             target: x86_64-apple-darwin
             package_kind: macos_dmg
             asset_name: Pioneer-x86_64.dmg
+            update_asset_name: Pioneer-x86_64.app.zip
           - os: macos-14
             target: aarch64-apple-darwin
             package_kind: macos_dmg
             asset_name: Pioneer-aarch64.dmg
+            update_asset_name: Pioneer-aarch64.app.zip
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             package_kind: windows_msi
             asset_name: Pioneer-x86_64.msi
+            update_asset_name: Pioneer-x86_64.exe
             windows_exe_name: Pioneer-x86_64.exe
           - os: windows-latest
             target: aarch64-pc-windows-msvc
             package_kind: windows_msi
             asset_name: Pioneer-aarch64.msi
+            update_asset_name: Pioneer-aarch64.exe
             windows_exe_name: Pioneer-aarch64.exe
 
     steps:
@@ -222,23 +235,235 @@ jobs:
         run: |
           ./scripts/packaging/desktop/package-windows-msi.ps1 -Target "${{ matrix.target }}" -OutDir "dist"
 
-      - name: upload-release-assets
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+      - name: upload-desktop-artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: desktop-${{ matrix.target }}
+          path: |
+            dist/${{ matrix.asset_name }}
+            dist/${{ matrix.update_asset_name }}
+          if-no-files-found: error
+
+      - name: cleanup-macos-signing-keychain
+        if: always() && matrix.package_kind == 'macos_dmg' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          keychain_path="${RUNNER_TEMP}/pioneer-signing.keychain-db"
+          security default-keychain -d user -s login.keychain-db || true
+          security delete-keychain "$keychain_path" || true
+
+  publish-desktop-release:
+    name: publish-desktop-release
+    runs-on: ubuntu-latest
+    needs: package-desktop
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: download-artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: assemble-desktop-update-metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import datetime
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          dist = Path("dist")
+          tag = os.environ["GITHUB_REF_NAME"]
+          version = tag[1:] if tag.startswith(("v", "V")) else tag
+          channel = "stable"
+          if "-canary" in tag:
+              channel = "canary"
+          elif "-beta" in tag:
+              channel = "beta"
+          elif "-" in tag:
+              channel = "prerelease"
+
+          expected_assets = [
+              ("macos", "aarch64", "macos_app_zip", "Pioneer-aarch64.app.zip"),
+              ("macos", "x86_64", "macos_app_zip", "Pioneer-x86_64.app.zip"),
+              ("linux", "x86_64", "appimage", "pioneer-linux-x86_64.AppImage"),
+              ("linux", "aarch64", "appimage", "pioneer-linux-aarch64.AppImage"),
+              ("windows", "x86_64", "wix_bundle_exe", "Pioneer-x86_64.exe"),
+              ("windows", "aarch64", "wix_bundle_exe", "Pioneer-aarch64.exe"),
+          ]
+
+          assets = []
+          checksum_lines = []
+          for os_name, arch, kind, file_name in expected_assets:
+              path = dist / file_name
+              if not path.is_file():
+                  raise SystemExit(f"missing expected desktop update asset: {path}")
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              size_bytes = path.stat().st_size
+              assets.append(
+                  {
+                      "os": os_name,
+                      "arch": arch,
+                      "kind": kind,
+                      "name": file_name,
+                      "sha256": digest,
+                      "size_bytes": size_bytes,
+                  }
+              )
+              checksum_lines.append(f"sha256:{digest} {file_name}")
+
+          manifest = {
+              "schema_version": 1,
+              "product": "pioneer-desktop",
+              "version": version,
+              "tag": tag,
+              "channel": channel,
+              "published_at": datetime.datetime.now(datetime.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+              "assets": assets,
+          }
+
+          manifest_path = dist / "desktop-update-manifest.json"
+          manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+          manifest_digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+          checksum_lines.append(f"sha256:{manifest_digest} desktop-update-manifest.json")
+          (dist / "DESKTOP_SHA256SUMS").write_text("\n".join(checksum_lines) + "\n", encoding="utf-8")
+          PY
+
+      - name: validate-desktop-update-metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          jq -e '
+            .schema_version == 1
+            and .product == "pioneer-desktop"
+            and (.version | type == "string" and length > 0)
+            and (.tag | type == "string" and length > 0)
+            and (.channel | type == "string" and length > 0)
+            and (.published_at | type == "string" and length > 0)
+            and (.assets | type == "array")
+          ' dist/desktop-update-manifest.json >/dev/null
+
+          python3 <<'PY'
+          import hashlib
+          import json
+          import re
+          from pathlib import Path
+
+          dist = Path("dist")
+          manifest_path = dist / "desktop-update-manifest.json"
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          expected = {
+              ("macos", "aarch64"): ("macos_app_zip", "Pioneer-aarch64.app.zip"),
+              ("macos", "x86_64"): ("macos_app_zip", "Pioneer-x86_64.app.zip"),
+              ("linux", "x86_64"): ("appimage", "pioneer-linux-x86_64.AppImage"),
+              ("linux", "aarch64"): ("appimage", "pioneer-linux-aarch64.AppImage"),
+              ("windows", "x86_64"): ("wix_bundle_exe", "Pioneer-x86_64.exe"),
+              ("windows", "aarch64"): ("wix_bundle_exe", "Pioneer-aarch64.exe"),
+          }
+
+          seen = {}
+          rows = []
+          for index, asset in enumerate(manifest["assets"]):
+              for field in ("os", "arch", "kind", "name", "sha256", "size_bytes"):
+                  if field not in asset:
+                      raise SystemExit(f"manifest asset #{index} missing field: {field}")
+
+              key = (asset["os"], asset["arch"])
+              if key not in expected:
+                  raise SystemExit(f"unexpected desktop update asset platform: {key[0]}/{key[1]}")
+              if key in seen:
+                  raise SystemExit(f"duplicate desktop update asset platform: {key[0]}/{key[1]}")
+
+              expected_kind, expected_name = expected[key]
+              if asset["kind"] != expected_kind:
+                  raise SystemExit(f"{key[0]}/{key[1]} has kind {asset['kind']}, expected {expected_kind}")
+              if asset["name"] != expected_name:
+                  raise SystemExit(f"{key[0]}/{key[1]} has name {asset['name']}, expected {expected_name}")
+              if not re.fullmatch(r"[0-9a-f]{64}", asset["sha256"]):
+                  raise SystemExit(f"{asset['name']} has invalid sha256 format")
+
+              asset_path = dist / asset["name"]
+              if not asset_path.is_file():
+                  raise SystemExit(f"manifest asset file is missing: {asset_path}")
+              actual_sha256 = hashlib.sha256(asset_path.read_bytes()).hexdigest()
+              if actual_sha256 != asset["sha256"]:
+                  raise SystemExit(f"{asset['name']} sha256 mismatch: {actual_sha256} != {asset['sha256']}")
+              actual_size = asset_path.stat().st_size
+              if actual_size != asset["size_bytes"]:
+                  raise SystemExit(f"{asset['name']} size mismatch: {actual_size} != {asset['size_bytes']}")
+
+              seen[key] = asset
+              rows.append((asset["os"], asset["arch"], asset["kind"], asset["name"], actual_size, actual_sha256[:12]))
+
+          missing = sorted(set(expected) - set(seen))
+          if missing:
+              missing_text = ", ".join(f"{os_name}/{arch}" for os_name, arch in missing)
+              raise SystemExit(f"missing expected desktop update asset platforms: {missing_text}")
+
+          expected_checksums = {
+              asset["name"]: asset["sha256"]
+              for asset in manifest["assets"]
+          }
+          expected_checksums["desktop-update-manifest.json"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+
+          checksum_path = dist / "DESKTOP_SHA256SUMS"
+          actual_checksums = {}
+          for line_number, raw_line in enumerate(checksum_path.read_text(encoding="utf-8").splitlines(), start=1):
+              if not raw_line:
+                  continue
+              try:
+                  digest_part, file_name = raw_line.split(" ", 1)
+              except ValueError:
+                  raise SystemExit(f"DESKTOP_SHA256SUMS line {line_number} is malformed")
+              if not digest_part.startswith("sha256:"):
+                  raise SystemExit(f"DESKTOP_SHA256SUMS line {line_number} does not start with sha256:")
+              digest = digest_part.removeprefix("sha256:")
+              if not re.fullmatch(r"[0-9a-f]{64}", digest):
+                  raise SystemExit(f"DESKTOP_SHA256SUMS line {line_number} has invalid sha256")
+              if file_name in actual_checksums:
+                  raise SystemExit(f"DESKTOP_SHA256SUMS has duplicate entry: {file_name}")
+              actual_checksums[file_name] = digest
+
+          if actual_checksums != expected_checksums:
+              raise SystemExit("DESKTOP_SHA256SUMS does not match desktop update manifest assets")
+
+          print("Desktop update release assets:")
+          print(f"{'os':<8} {'arch':<8} {'kind':<16} {'name':<32} {'bytes':>12} {'sha256':<12}")
+          for row in rows:
+              print(f"{row[0]:<8} {row[1]:<8} {row[2]:<16} {row[3]:<32} {row[4]:>12} {row[5]:<12}")
+          PY
+
+      - name: publish-github-release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
-          files=()
-          if [[ -n "${{ matrix.asset_name }}" && -f "dist/${{ matrix.asset_name }}" ]]; then
-            files+=("dist/${{ matrix.asset_name }}")
-          fi
-          if [[ -n "${{ matrix.windows_exe_name }}" && -f "dist/${{ matrix.windows_exe_name }}" ]]; then
-            files+=("dist/${{ matrix.windows_exe_name }}")
-          fi
-
+          shopt -s nullglob
+          files=(
+            dist/Pioneer-*.app.zip
+            dist/Pioneer-*.dmg
+            dist/Pioneer-*.exe
+            dist/Pioneer-*.msi
+            dist/pioneer-linux-*.AppImage
+            dist/desktop-update-manifest.json
+            dist/DESKTOP_SHA256SUMS
+          )
           if [[ ${#files[@]} -eq 0 ]]; then
-            echo "no release assets found for matrix target ${{ matrix.target }}"
+            echo "no desktop release assets found in dist/"
             exit 1
           fi
 
@@ -251,12 +476,3 @@ jobs:
             gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" ${prerelease_flag} || true
 
           gh release upload "${GITHUB_REF_NAME}" "${files[@]}" --clobber
-
-      - name: cleanup-macos-signing-keychain
-        if: always() && matrix.package_kind == 'macos_dmg' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-        shell: bash
-        run: |
-          set -euo pipefail
-          keychain_path="${RUNNER_TEMP}/pioneer-signing.keychain-db"
-          security default-keychain -d user -s login.keychain-db || true
-          security delete-keychain "$keychain_path" || true
