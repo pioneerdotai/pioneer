@@ -8079,6 +8079,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "pioneer-app-updater"
+version = "0.26.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "windows-sys 0.61.2",
+ "zip 8.6.0",
+]
+
+[[package]]
 name = "pioneer-artifacts"
 version = "0.26.0"
 dependencies = [
@@ -8232,6 +8247,7 @@ dependencies = [
  "reqwest",
  "rust-embed",
  "rust-i18n 4.1.0",
+ "semver",
  "serde",
  "serde_json",
  "sha2 0.11.0",

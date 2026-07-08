@@ -12,6 +12,7 @@ mod menu;
 mod settings;
 mod state;
 mod theme;
+mod updater;
 mod window;
 
 use anyhow::Context as _;
@@ -99,6 +100,11 @@ impl HttpClient for DesktopHttpClient {
 }
 
 fn main() {
+    if let Some(version_probe) = version_probe_from_args(std::env::args().skip(1)) {
+        print_version_probe(version_probe);
+        return;
+    }
+
     let sentry_guard =
         pioneer_observability::init_sentry(pioneer_observability::SentryTarget::Desktop);
     pioneer_observability::init_tracing(sentry_guard.is_some());
@@ -150,4 +156,67 @@ fn main() {
 fn init_locale() {
     let locale = settings::resolve_app_locale();
     rust_i18n::set_locale(locale.as_str());
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VersionProbe {
+    Plain,
+    Json,
+}
+
+fn version_probe_from_args(args: impl IntoIterator<Item = String>) -> Option<VersionProbe> {
+    let args = args.into_iter().collect::<Vec<_>>();
+    match args.as_slice() {
+        [flag] if is_version_flag(flag) => Some(VersionProbe::Plain),
+        [flag, json] | [json, flag] if is_version_flag(flag) && json == "--json" => {
+            Some(VersionProbe::Json)
+        }
+        _ => None,
+    }
+}
+
+fn is_version_flag(flag: &str) -> bool {
+    flag == "--version" || flag == "-V"
+}
+
+fn print_version_probe(probe: VersionProbe) {
+    match probe {
+        VersionProbe::Plain => println!("{}", env!("CARGO_PKG_VERSION")),
+        VersionProbe::Json => println!(
+            "{}",
+            serde_json::json!({
+                "schema_version": 1,
+                "product": "pioneer-desktop",
+                "binary": "pioneer-app",
+                "version": env!("CARGO_PKG_VERSION"),
+            })
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{VersionProbe, version_probe_from_args};
+
+    #[test]
+    fn version_probe_does_not_require_window_startup() {
+        assert_eq!(
+            version_probe_from_args(["--version".to_owned()]),
+            Some(VersionProbe::Plain)
+        );
+        assert_eq!(
+            version_probe_from_args(["-V".to_owned()]),
+            Some(VersionProbe::Plain)
+        );
+        assert_eq!(
+            version_probe_from_args(["--version".to_owned(), "--json".to_owned()]),
+            Some(VersionProbe::Json)
+        );
+        assert_eq!(
+            version_probe_from_args(["--json".to_owned(), "-V".to_owned()]),
+            Some(VersionProbe::Json)
+        );
+        assert_eq!(version_probe_from_args(["--help".to_owned()]), None);
+        assert_eq!(version_probe_from_args(Vec::<String>::new()), None);
+    }
 }

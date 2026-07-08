@@ -21,6 +21,8 @@ pioneer-protocol.workspace = true
 pioneer-tools.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+semver.workspace = true
+sha2.workspace = true
 toml.workspace = true
 gpui.workspace = true
 gpui-terminal.workspace = true
@@ -42,7 +44,6 @@ winresource = "0.1"
 [dev-dependencies]
 base64.workspace = true
 hex.workspace = true
-sha2.workspace = true
 tempfile.workspace = true
 tokio-tungstenite.workspace = true
 
