@@ -794,8 +794,8 @@ impl PioneerDesktop {
                             .flex_1()
                             .child(
                                 h_flex()
-                                    .gap_1p5()
-                                    .items_start()
+                                    .gap_2()
+                                    .items_center()
                                     .child(div().text_sm().font_semibold().child(
                                         t!("settings.memory.vector_search.label").to_string(),
                                     ))

@@ -18,7 +18,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder};
 use serde::{Deserialize, Serialize};
 
 use pioneer_protocol::{
@@ -30,26 +30,6 @@ const BASE_URL: &str = "https://openrouter.ai/api/v1";
 const APP_REFERER: &str = "https://getpioneer.dev";
 const APP_TITLE: &str = "Pioneer";
 const APP_CATEGORIES: &str = "personal-agent,general-chat";
-
-#[derive(Clone, Copy)]
-struct OpenRouterEmbeddingModelDefinition {
-    id: &'static str,
-    name: &'static str,
-    description: &'static str,
-}
-
-const OPENROUTER_EMBEDDING_MODELS: &[OpenRouterEmbeddingModelDefinition] = &[
-    OpenRouterEmbeddingModelDefinition {
-        id: "openai/text-embedding-3-small",
-        name: "OpenAI Text Embedding 3 Small",
-        description: "1536-dimensional embedding model routed through OpenRouter.",
-    },
-    OpenRouterEmbeddingModelDefinition {
-        id: "openai/text-embedding-3-large",
-        name: "OpenAI Text Embedding 3 Large",
-        description: "3072-dimensional embedding model routed through OpenRouter.",
-    },
-];
 
 pub struct OpenRouterProvider {
     api_key: String,
@@ -653,6 +633,14 @@ impl OpenRouterProvider {
         format!("{}/models", self.base_url)
     }
 
+    fn models_request(&self) -> RequestBuilder {
+        Self::with_app_attribution(
+            self.client
+                .get(self.models_url())
+                .header("Authorization", format!("Bearer {}", self.api_key)),
+        )
+    }
+
     fn embeddings_url(&self) -> String {
         format!("{}/embeddings", self.base_url)
     }
@@ -671,6 +659,22 @@ impl OpenRouterProvider {
             .await
             .unwrap_or_else(|_| "<failed to read error body>".into());
         anyhow!("OpenRouter API error ({status}): {body}")
+    }
+
+    async fn list_model_entries(
+        &self,
+        request_builder: RequestBuilder,
+    ) -> Result<Vec<OpenRouterModelEntry>> {
+        let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(Self::api_error(response).await);
+        }
+
+        let api_response: ModelsListResponse = response.json().await?;
+        Ok(api_response.data)
     }
 }
 
@@ -967,32 +971,23 @@ impl crate::traits::Provider for OpenRouterProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
-        let request_builder = Self::with_app_attribution(
-            self.client
-                .get(self.models_url())
-                .header("Authorization", format!("Bearer {}", self.api_key)),
-        );
-        let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            return Err(Self::api_error(response).await);
-        }
-
-        let api_response: ModelsListResponse = response.json().await?;
-
-        Ok(api_response
-            .data
+        Ok(self
+            .list_model_entries(self.models_request())
+            .await?
             .into_iter()
             .map(provider_model_from_openrouter_model_entry)
             .collect())
     }
 
     async fn list_embedding_models(&self) -> Result<Vec<ProviderModelInfo>> {
-        Ok(OPENROUTER_EMBEDDING_MODELS
-            .iter()
-            .map(openrouter_embedding_model_info)
+        Ok(self
+            .list_model_entries(
+                self.models_request()
+                    .query(&[("output_modalities", "embeddings")]),
+            )
+            .await?
+            .into_iter()
+            .map(openrouter_embedding_model_from_openrouter_model_entry)
             .collect())
     }
 
@@ -1074,26 +1069,13 @@ fn provider_model_from_openrouter_model_entry(m: OpenRouterModelEntry) -> Provid
     }
 }
 
-fn openrouter_embedding_model_info(
-    model: &OpenRouterEmbeddingModelDefinition,
+fn openrouter_embedding_model_from_openrouter_model_entry(
+    m: OpenRouterModelEntry,
 ) -> ProviderModelInfo {
-    ProviderModelInfo {
-        id: model.id.to_owned(),
-        name: Some(model.name.to_owned()),
-        description: Some(model.description.to_owned()),
-        created: None,
-        provider: "openrouter".to_owned(),
-        owned_by: model.id.split('/').next().map(str::to_owned),
-        limits: ProviderModelLimits::default(),
-        capabilities: ProviderModelCapabilities {
-            embeddings: Some(true),
-            ..ProviderModelCapabilities::default()
-        },
-        pricing: None,
-        active: Some(true),
-        family: Some("embedding".to_owned()),
-        lifecycle_status: None,
-    }
+    let mut model = provider_model_from_openrouter_model_entry(m);
+    model.capabilities.embeddings = Some(true);
+    model.family = Some("embedding".to_owned());
+    model
 }
 
 fn openrouter_reasoning_capabilities(
@@ -1156,6 +1138,13 @@ mod tests {
         )
     }
 
+    fn embedding_model_from_json(json: &str) -> ProviderModelInfo {
+        let response: ModelsListResponse = serde_json::from_str(json).expect("models response");
+        openrouter_embedding_model_from_openrouter_model_entry(
+            response.data.into_iter().next().expect("fixture model"),
+        )
+    }
+
     #[test]
     fn model_reasoning_metadata_maps_supported_efforts_array() {
         let model = model_from_json(
@@ -1210,34 +1199,55 @@ mod tests {
     }
 
     #[test]
-    fn openrouter_embedding_model_list_exposes_only_embedding_models() {
-        let models = OPENROUTER_EMBEDDING_MODELS
-            .iter()
-            .map(openrouter_embedding_model_info)
-            .collect::<Vec<_>>();
+    fn openrouter_embedding_model_mapping_marks_embedding_capability() {
+        let model = embedding_model_from_json(
+            r#"{
+                "data": [{
+                    "id": "openai/text-embedding-3-large",
+                    "name": "OpenAI Text Embedding 3 Large",
+                    "description": "Embedding model returned by OpenRouter",
+                    "created": 1700000000,
+                    "pricing": { "prompt": "0.00000013" }
+                }]
+            }"#,
+        );
+
+        assert_eq!(model.id, "openai/text-embedding-3-large");
+        assert_eq!(model.name.as_deref(), Some("OpenAI Text Embedding 3 Large"));
+        assert_eq!(
+            model.description.as_deref(),
+            Some("Embedding model returned by OpenRouter")
+        );
+        assert_eq!(model.capabilities.embeddings, Some(true));
+        assert_eq!(model.family.as_deref(), Some("embedding"));
+        assert_eq!(
+            model
+                .pricing
+                .as_ref()
+                .and_then(|pricing| pricing.input_token),
+            Some(0.00000013)
+        );
+    }
+
+    #[test]
+    fn openrouter_embedding_models_request_filters_by_output_modality() {
+        let provider = OpenRouterProvider::with_base_url("key", "http://localhost:8080");
+        let request = provider
+            .models_request()
+            .query(&[("output_modalities", "embeddings")])
+            .build()
+            .expect("models request should build");
 
         assert_eq!(
-            models
-                .iter()
-                .map(|model| model.id.as_str())
-                .collect::<Vec<_>>(),
-            vec![
-                "openai/text-embedding-3-small",
-                "openai/text-embedding-3-large"
-            ]
+            request.url().as_str(),
+            "http://localhost:8080/models?output_modalities=embeddings"
         );
         assert_eq!(
-            models[0].name.as_deref(),
-            Some("OpenAI Text Embedding 3 Small")
-        );
-        assert_eq!(
-            models[1].description.as_deref(),
-            Some("3072-dimensional embedding model routed through OpenRouter.")
-        );
-        assert!(
-            models
-                .iter()
-                .all(|model| model.capabilities.embeddings == Some(true))
+            request
+                .headers()
+                .get("Authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer key")
         );
     }
 
