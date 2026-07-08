@@ -92,6 +92,7 @@ impl DesktopUpdateStateError {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn code(&self) -> DesktopUpdateStateErrorCode {
         self.code
     }

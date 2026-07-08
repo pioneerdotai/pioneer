@@ -104,6 +104,11 @@ add = "Añadir"
 cancel = "Cancelar"
 save = "Guardar"
 
+[desktop_update]
+ready_title = "Reiniciar para actualizar"
+downloading = "Descargando actualización..."
+apply_failed = "No se pudo iniciar el actualizador: %{error}"
+
 [artifacts]
 created = "Creado"
 empty = "No hay artefactos en este hilo"

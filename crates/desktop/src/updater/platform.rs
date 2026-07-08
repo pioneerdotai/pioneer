@@ -67,6 +67,7 @@ impl DesktopPlatformError {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn code(&self) -> DesktopPlatformErrorCode {
         self.code
     }

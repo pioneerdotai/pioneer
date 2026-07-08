@@ -104,6 +104,11 @@ add = "追加"
 cancel = "キャンセル"
 save = "保存"
 
+[desktop_update]
+ready_title = "更新するには再起動"
+downloading = "アップデートをダウンロード中..."
+apply_failed = "アップデーターを起動できませんでした: %{error}"
+
 [artifacts]
 created = "作成日時"
 empty = "このスレッドにアーティファクトはありません"

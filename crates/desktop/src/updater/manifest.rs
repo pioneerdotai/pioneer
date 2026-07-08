@@ -51,6 +51,7 @@ impl DesktopManifestError {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn code(&self) -> DesktopManifestErrorCode {
         self.code
     }

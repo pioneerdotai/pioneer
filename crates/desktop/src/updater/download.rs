@@ -65,6 +65,7 @@ impl DesktopDownloadError {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn code(&self) -> DesktopDownloadErrorCode {
         self.code
     }

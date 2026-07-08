@@ -104,6 +104,11 @@ add = "添加"
 cancel = "取消"
 save = "保存"
 
+[desktop_update]
+ready_title = "重新启动以更新"
+downloading = "正在下载更新..."
+apply_failed = "无法启动更新程序：%{error}"
+
 [artifacts]
 created = "创建时间"
 empty = "此线程中没有工件"

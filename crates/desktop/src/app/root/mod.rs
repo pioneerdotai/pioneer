@@ -1,3 +1,4 @@
+mod desktop_update;
 mod model_selection;
 mod mutations;
 mod queries;
@@ -20,6 +21,7 @@ use crate::{
     },
     gateway::{ClientRuntime, GatewayRuntime, GatewayWsCommandSender},
 };
+pub(super) use desktop_update::DesktopUpdateUiState;
 use gpui::{prelude::*, *};
 use gpui_component::{
     VirtualListScrollHandle, input::InputState, table::TableState, tree::TreeState,
@@ -318,6 +320,7 @@ pub struct PioneerDesktop {
     pub(super) desktop_voice_prepare_request: Option<PrepareVoiceComposerSnapshotRequest>,
     pub(super) desktop_voice_capture:
         Option<DesktopVoiceCaptureFlow<PlatformDesktopAudioInputBackend, GatewayWsCommandSender>>,
+    pub(super) desktop_update: DesktopUpdateUiState,
     pub(super) composer_model_selection_manually_selected: bool,
     pub(super) composer_model_display_cache: HashMap<ProviderModelDisplayKey, Option<String>>,
     pub(super) composer_model_display_loading_key: Option<ProviderModelDisplayKey>,

@@ -104,6 +104,11 @@ add = "Add"
 cancel = "Cancel"
 save = "Save"
 
+[desktop_update]
+ready_title = "Relaunch to update"
+downloading = "Downloading update..."
+apply_failed = "Failed to start updater: %{error}"
+
 [artifacts]
 created = "Created"
 empty = "No artifacts in this thread"

@@ -104,6 +104,11 @@ add = "जोड़ें"
 cancel = "रद्द करें"
 save = "सहेजें"
 
+[desktop_update]
+ready_title = "अपडेट के लिए रीस्टार्ट करें"
+downloading = "अपडेट डाउनलोड हो रहा है..."
+apply_failed = "अपडेटर शुरू नहीं हो सका: %{error}"
+
 [artifacts]
 created = "बनाया गया"
 empty = "इस थ्रेड में कोई आर्टिफैक्ट नहीं है"

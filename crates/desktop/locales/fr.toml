@@ -104,6 +104,11 @@ add = "Ajouter"
 cancel = "Annuler"
 save = "Enregistrer"
 
+[desktop_update]
+ready_title = "Relancer pour mettre à jour"
+downloading = "Téléchargement de la mise à jour..."
+apply_failed = "Impossible de lancer la mise à jour : %{error}"
+
 [artifacts]
 created = "Cree"
 empty = "Aucun artefact dans ce fil"

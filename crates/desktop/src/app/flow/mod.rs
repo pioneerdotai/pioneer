@@ -1,5 +1,7 @@
 mod bootstrap;
 mod client_effects;
+mod desktop_update_apply;
+mod desktop_update_check;
 mod helpers;
 mod lifecycle_gateway_ops;
 mod lifecycle_operation;
@@ -20,8 +22,8 @@ mod ws_events_notifications;
 mod ws_events_pump;
 
 use super::root::{
-    GatewayConnectionState, GatewayOperationSource, GatewaySetupAction, GatewayStatusLevel,
-    MainContentView, PioneerDesktop, TaskThreadNavigationEntry,
+    DesktopUpdateUiState, GatewayConnectionState, GatewayOperationSource, GatewaySetupAction,
+    GatewayStatusLevel, MainContentView, PioneerDesktop, TaskThreadNavigationEntry,
 };
 use crate::app::gateway_setup::GatewaySetupFormState;
 use crate::gateway::{GatewayInstallWarning, GatewayRuntime};

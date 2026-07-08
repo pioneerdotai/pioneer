@@ -104,6 +104,11 @@ add = "Добавить"
 cancel = "Отмена"
 save = "Сохранить"
 
+[desktop_update]
+ready_title = "Перезапустить для обновления"
+downloading = "Загрузка обновления..."
+apply_failed = "Не удалось запустить обновление: %{error}"
+
 [artifacts]
 created = "Создан"
 empty = "В этом треде нет артефактов"

@@ -1,6 +1,7 @@
 use crate::app::{
     root::{
-        MainContentView, PioneerDesktop, ThreadAgentsDocEditorScope, ThreadAgentsDocSummaryKey,
+        DesktopUpdateUiState, MainContentView, PioneerDesktop, ThreadAgentsDocEditorScope,
+        ThreadAgentsDocSummaryKey,
     },
     sidebar::{SidebarTreeDragItem, SidebarTreeDragPayload},
     thread::{ThreadCoordinator, thread_display_title},
@@ -11,6 +12,7 @@ use gpui_component::{
     button::*,
     list::ListItem,
     menu::ContextMenuExt,
+    spinner::Spinner,
     theme::ActiveTheme,
     tree::{TreeItem, tree},
     *,
@@ -126,6 +128,7 @@ impl PioneerDesktop {
         let root_context_area_top_px =
             self.build_sidebar_tree_model().visible_node_ids.len() as f32 * TREE_ROW_HEIGHT_PX;
         let tree_state = self.thread_tree_state().clone();
+        let desktop_update_panel = self.render_desktop_update_sidebar_panel(cx);
         let is_new_thread_active = self.main_content_view == MainContentView::Threads
             && match (self.current_active_thread_id(), self.draft_thread_id()) {
                 (Some(active_thread_id), Some(draft_thread_id)) => {
@@ -699,6 +702,102 @@ impl PioneerDesktop {
                         ),
                 ),
             )
+            .when_some(desktop_update_panel, |this, panel| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .px_2()
+                        .pb_2()
+                        .child(panel),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_desktop_update_sidebar_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.desktop_update.should_render_sidebar_panel() {
+            return None;
+        }
+
+        match &self.desktop_update {
+            DesktopUpdateUiState::Checking => {
+                Some(self.render_desktop_update_downloading_panel(cx))
+            }
+            DesktopUpdateUiState::Ready { version, .. } => {
+                Some(self.render_desktop_update_ready_panel(version.as_str(), cx))
+            }
+            _ => None,
+        }
+    }
+
+    fn render_desktop_update_ready_panel(
+        &self,
+        version: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let hover_bg = cx.theme().sidebar_accent;
+        let version_label = desktop_update_version_label(version);
+
+        h_flex()
+            .id("desktop-update-sidebar-ready")
+            .w_full()
+            .items_center()
+            .gap_4()
+            .px_3()
+            .py_2()
+            .rounded_xl()
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().muted.opacity(0.35))
+            .cursor_pointer()
+            .hover(move |this| this.bg(hover_bg))
+            .child(Icon::new(PioneerIconName::Leaf).size_5())
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .flex_1()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .child(t!("desktop_update.ready_title").to_string()),
+                    )
+                    .child(div().text_xs().opacity(0.6).child(version_label)),
+            )
+            .child(Icon::new(IconName::ArrowRight).size_5().opacity(0.6))
+            .on_click(cx.listener(|view, _, window, cx| {
+                view.restart_to_apply_desktop_update(window, cx);
+            }))
+            .into_any_element()
+    }
+
+    fn render_desktop_update_downloading_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        h_flex()
+            .id("desktop-update-sidebar-downloading")
+            .w_full()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .rounded_xl()
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().muted.opacity(0.35))
+            .child(
+                div().size_5().flex().items_center().justify_center().child(
+                    Spinner::new()
+                        .icon(IconName::Loader)
+                        .color(cx.theme().foreground.opacity(0.6)),
+                ),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .text_sm()
+                    .opacity(0.6)
+                    .child(t!("desktop_update.downloading").to_string()),
+            )
             .into_any_element()
     }
 
@@ -774,6 +873,14 @@ fn sidebar_thread_title_from_coordinator(coordinator: Option<&ThreadCoordinator>
     };
 
     thread_display_title(thread).unwrap_or_else(|| t!("sidebar.thread.untitled").to_string())
+}
+
+fn desktop_update_version_label(version: &str) -> String {
+    if version.starts_with('v') {
+        version.to_owned()
+    } else {
+        format!("v{version}")
+    }
 }
 
 fn thread_node_key(thread_id: &str) -> String {

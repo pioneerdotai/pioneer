@@ -74,6 +74,7 @@ impl DesktopReleaseError {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn code(&self) -> DesktopReleaseErrorCode {
         self.code
     }
@@ -219,6 +220,7 @@ fn fetch_channel_release_tag(
     select_channel_tag(channel, tags.iter().map(String::as_str))
 }
 
+#[cfg(test)]
 pub(crate) fn release_by_tag_api_url(config: &DesktopUpdateConfig, tag: &str) -> String {
     format!(
         "{}/tags/{tag}",

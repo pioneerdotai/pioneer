@@ -104,6 +104,11 @@ add = "Hinzufügen"
 cancel = "Abbrechen"
 save = "Speichern"
 
+[desktop_update]
+ready_title = "Zum Aktualisieren neu starten"
+downloading = "Update wird geladen..."
+apply_failed = "Aktualisierung konnte nicht gestartet werden: %{error}"
+
 [artifacts]
 created = "Erstellt"
 empty = "Keine Artefakte in diesem Thread"

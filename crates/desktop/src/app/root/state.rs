@@ -109,6 +109,7 @@ impl PioneerDesktop {
             desktop_voice_composer: DesktopVoiceComposerState::Idle,
             desktop_voice_prepare_request: None,
             desktop_voice_capture: None,
+            desktop_update: DesktopUpdateUiState::initial(),
             composer_model_selection_manually_selected: false,
             composer_model_display_cache: HashMap::new(),
             composer_model_display_loading_key: None,
@@ -198,6 +199,7 @@ impl PioneerDesktop {
         view.sync_provider_sidebar_tree_state(cx);
         view.start_gateway_ws_event_pump(cx);
         view.bootstrap_gateway_runtime(cx);
+        view.start_desktop_update_check(cx);
         view.prune_thread_artifact_preview_cache(cx);
 
         view
