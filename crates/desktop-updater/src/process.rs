@@ -125,12 +125,17 @@ fn is_process_running(pid: u32) -> bool {
     use windows_sys::Win32::{
         Foundation::{CloseHandle, WAIT_TIMEOUT},
         System::Threading::{
-            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, SYNCHRONIZE, WaitForSingleObject,
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+            WaitForSingleObject,
         },
     };
 
     unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid);
+        let handle = OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            0,
+            pid,
+        );
         if handle.is_null() {
             return false;
         }
