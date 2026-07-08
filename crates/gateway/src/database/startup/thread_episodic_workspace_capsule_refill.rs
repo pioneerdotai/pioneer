@@ -1068,6 +1068,12 @@ async fn execute_refill_jobs(
         .count_incomplete_thread_episodic_index_jobs_for_workspace(workspace_id)
         .await
         .context("failed to count incomplete thread episodic index jobs")?;
+    if summary.failed_terminal_jobs > 0 {
+        bail!(
+            "thread episodic workspace refill failed {} index jobs terminally",
+            summary.failed_terminal_jobs
+        );
+    }
     if summary.incomplete_jobs > 0 {
         bail!(
             "thread episodic workspace refill left {} incomplete index jobs",
@@ -1578,10 +1584,19 @@ mod tests {
             model: &'static str,
             embedding: Vec<f32>,
         ) -> Self {
+            Self::with_declared_dimension(provider_id, model, embedding.len(), embedding)
+        }
+
+        fn with_declared_dimension(
+            provider_id: &'static str,
+            model: &'static str,
+            dimension: usize,
+            embedding: Vec<f32>,
+        ) -> Self {
             Self {
                 provider_id,
                 model,
-                dimension: embedding.len(),
+                dimension,
                 normalized: true,
                 embedding,
                 error: None,
@@ -2239,6 +2254,75 @@ mod tests {
                 .as_deref()
                 .expect("frame uri should be persisted")
                 .starts_with("mv2://workspace/")
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_vector_refill_terminal_embedding_failure_does_not_complete_marker() {
+        let (crud_store, temp_dir, workspace_id) = setup_store().await;
+        let thread_id = "thread_vector_refill_terminal";
+        ingest_materialized_user_item(
+            crud_store.clone(),
+            workspace_id.as_str(),
+            thread_id,
+            "turn_vector_refill_terminal",
+            "item_vector_refill_terminal",
+            "vector refill dimension mismatch should fail the projection",
+        )
+        .await;
+        let target = vector_projection_target(3);
+        let embedding_provider = Arc::new(
+            StaticThreadEpisodicEmbeddingProvider::with_declared_dimension(
+                "openai",
+                "text-embedding-3-small",
+                3,
+                vec![0.1, 0.2, 0.3, 0.4],
+            ),
+        );
+
+        let error = refill_once_with_projection(
+            crud_store.clone(),
+            temp_dir.path(),
+            target.clone(),
+            Some(embedding_provider.clone()),
+        )
+        .await
+        .expect_err("terminal embedding failure should fail refill");
+
+        assert!(
+            error
+                .to_string()
+                .contains("thread episodic workspace refill failed 1 index jobs terminally"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(embedding_provider.calls(), 1);
+        assert!(
+            !refill_is_current_for_target(crud_store.as_ref(), &target)
+                .await
+                .expect("failed vector marker should not be current")
+        );
+        let meta = find_projection_meta(
+            &crud_store.database_connection(),
+            refill_projection_key_for_workspace(workspace_id.as_str())
+                .expect("workspace refill key should build")
+                .as_str(),
+        )
+        .await
+        .expect("meta query should succeed")
+        .expect("meta exists");
+        assert_eq!(meta.status, PROJECTION_META_STATUS_FAILED);
+
+        let jobs = crud_store
+            .list_thread_episodic_index_jobs_for_thread(workspace_id.as_str(), thread_id, 10)
+            .await
+            .expect("jobs should list");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].status, ThreadEpisodicIndexJobStatus::Canceled);
+        assert!(
+            jobs[0]
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("embedding dimension mismatch"))
         );
     }
 
