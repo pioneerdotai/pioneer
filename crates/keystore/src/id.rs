@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use crate::{KeystoreError, Result};
 
 pub const PROVIDER_API_KEY_SERVICE: &str = "pioneer.gateway.provider_api_key";
+pub const PROVIDER_PROXY_SERVICE: &str = "pioneer.gateway.provider_proxy";
+pub const CLI_RUNTIME_PROXY_SERVICE: &str = "pioneer.gateway.cli_runtime_proxy";
 pub const MCP_SECRET_SERVICE: &str = "pioneer.gateway.mcp_secret";
 pub const USER_JWT_TOKEN_SERVICE: &str = "pioneer.gateway.user_jwt_token";
 pub const SUPERUSER_JWT_TOKEN_SERVICE: &str = "pioneer.gateway.superuser_jwt_token";
@@ -30,6 +32,24 @@ impl SecretId {
         Self::from_service_user(
             PROVIDER_API_KEY_SERVICE,
             format!("workspace:{workspace_id}:provider:{provider}"),
+        )
+    }
+
+    pub fn workspace_provider_proxy(workspace_id: &str, provider: &str) -> Result<Self> {
+        let workspace_id = validate_user("workspace id", workspace_id)?;
+        let provider = validate_user("provider", provider)?.to_ascii_lowercase();
+        Self::from_service_user(
+            PROVIDER_PROXY_SERVICE,
+            format!("workspace:{workspace_id}:provider:{provider}"),
+        )
+    }
+
+    pub fn workspace_cli_runtime_proxy(workspace_id: &str, runtime_id: &str) -> Result<Self> {
+        let workspace_id = validate_user("workspace id", workspace_id)?;
+        let runtime_id = validate_user("CLI runtime id", runtime_id)?;
+        Self::from_service_user(
+            CLI_RUNTIME_PROXY_SERVICE,
+            format!("workspace:{workspace_id}:runtime:{runtime_id}"),
         )
     }
 
@@ -82,6 +102,8 @@ impl SecretId {
 #[serde(rename_all = "snake_case")]
 pub enum SecretKind {
     ProviderApiKey,
+    ProviderProxy,
+    CliRuntimeProxy,
     McpSecret,
     UserJwtToken,
     SuperuserJwtToken,
@@ -93,6 +115,8 @@ impl SecretKind {
     pub fn service(self) -> &'static str {
         match self {
             SecretKind::ProviderApiKey => PROVIDER_API_KEY_SERVICE,
+            SecretKind::ProviderProxy => PROVIDER_PROXY_SERVICE,
+            SecretKind::CliRuntimeProxy => CLI_RUNTIME_PROXY_SERVICE,
             SecretKind::McpSecret => MCP_SECRET_SERVICE,
             SecretKind::UserJwtToken => USER_JWT_TOKEN_SERVICE,
             SecretKind::SuperuserJwtToken => SUPERUSER_JWT_TOKEN_SERVICE,
@@ -104,6 +128,8 @@ impl SecretKind {
     pub fn from_service(service: &str) -> Option<Self> {
         match service {
             PROVIDER_API_KEY_SERVICE => Some(SecretKind::ProviderApiKey),
+            PROVIDER_PROXY_SERVICE => Some(SecretKind::ProviderProxy),
+            CLI_RUNTIME_PROXY_SERVICE => Some(SecretKind::CliRuntimeProxy),
             MCP_SECRET_SERVICE => Some(SecretKind::McpSecret),
             USER_JWT_TOKEN_SERVICE => Some(SecretKind::UserJwtToken),
             SUPERUSER_JWT_TOKEN_SERVICE => Some(SecretKind::SuperuserJwtToken),
@@ -220,6 +246,24 @@ mod tests {
 
         assert_eq!(id.service(), PROVIDER_API_KEY_SERVICE);
         assert_eq!(id.user(), "workspace:ws_1:provider:openrouter");
+    }
+
+    #[test]
+    fn workspace_provider_proxy_id_is_scoped_by_workspace() {
+        let id =
+            SecretId::workspace_provider_proxy("  ws_1  ", "  OpenRouter  ").expect("proxy id");
+
+        assert_eq!(id.service(), PROVIDER_PROXY_SERVICE);
+        assert_eq!(id.user(), "workspace:ws_1:provider:openrouter");
+    }
+
+    #[test]
+    fn workspace_cli_runtime_proxy_id_is_scoped_by_workspace() {
+        let id = SecretId::workspace_cli_runtime_proxy("  ws_1  ", "  codex_work  ")
+            .expect("runtime proxy id");
+
+        assert_eq!(id.service(), CLI_RUNTIME_PROXY_SERVICE);
+        assert_eq!(id.user(), "workspace:ws_1:runtime:codex_work");
     }
 
     #[test]
