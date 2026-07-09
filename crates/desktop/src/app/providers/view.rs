@@ -1433,3 +1433,89 @@ fn cli_runtime_diagnostics_panel(
         })
         .into_any_element()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{cli_runtime_inline_field_key, cli_runtime_inline_field_value};
+    use pioneer_client::providers::cli_runtime_settings::CLIRuntimeProviderDraftField;
+    use pioneer_protocol::{
+        CLIAgentRuntimeKind, RuntimeCapabilities, RuntimeStatus, RuntimeSummary,
+    };
+
+    fn runtime_summary() -> RuntimeSummary {
+        RuntimeSummary {
+            runtime_id: "codex".to_owned(),
+            kind: CLIAgentRuntimeKind::Codex,
+            display_name: "Codex Work".to_owned(),
+            enabled: true,
+            status: RuntimeStatus::Ready,
+            capabilities: RuntimeCapabilities::default(),
+            account: None,
+            version: None,
+            binary_path: Some("/usr/local/bin/codex-work".to_owned()),
+            home_path: Some("/tmp/codex-home".to_owned()),
+            shadow_home_path: Some("/tmp/codex-shadow".to_owned()),
+            proxy_url: Some("http://user:pass@127.0.0.1:8080".to_owned()),
+            debug_native_events_enabled: false,
+            models_refreshed_at_unix_ms: None,
+            diagnostics: Vec::new(),
+            recent_stderr: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn cli_runtime_inline_field_value_reads_settings_fields_and_proxy() {
+        let runtime = runtime_summary();
+
+        assert_eq!(
+            cli_runtime_inline_field_value(
+                &runtime,
+                Some(CLIRuntimeProviderDraftField::DisplayName),
+            ),
+            "Codex Work"
+        );
+        assert_eq!(
+            cli_runtime_inline_field_value(
+                &runtime,
+                Some(CLIRuntimeProviderDraftField::BinaryPath),
+            ),
+            "/usr/local/bin/codex-work"
+        );
+        assert_eq!(
+            cli_runtime_inline_field_value(&runtime, Some(CLIRuntimeProviderDraftField::HomePath)),
+            "/tmp/codex-home"
+        );
+        assert_eq!(
+            cli_runtime_inline_field_value(
+                &runtime,
+                Some(CLIRuntimeProviderDraftField::ShadowHomePath),
+            ),
+            "/tmp/codex-shadow"
+        );
+        assert_eq!(
+            cli_runtime_inline_field_value(&runtime, None),
+            "http://user:pass@127.0.0.1:8080"
+        );
+    }
+
+    #[test]
+    fn cli_runtime_inline_field_key_keeps_proxy_separate_from_settings_fields() {
+        assert_eq!(
+            cli_runtime_inline_field_key(Some(CLIRuntimeProviderDraftField::DisplayName)),
+            "display-name"
+        );
+        assert_eq!(
+            cli_runtime_inline_field_key(Some(CLIRuntimeProviderDraftField::BinaryPath)),
+            "binary-path"
+        );
+        assert_eq!(
+            cli_runtime_inline_field_key(Some(CLIRuntimeProviderDraftField::HomePath)),
+            "home-path"
+        );
+        assert_eq!(
+            cli_runtime_inline_field_key(Some(CLIRuntimeProviderDraftField::ShadowHomePath)),
+            "shadow-home-path"
+        );
+        assert_eq!(cli_runtime_inline_field_key(None), "proxy-url");
+    }
+}

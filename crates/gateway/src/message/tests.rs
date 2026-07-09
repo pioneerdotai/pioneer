@@ -9895,6 +9895,21 @@ async fn task_create_tool_persists_anchor_and_rejects_legacy_timeline_impl() {
         "terminal child result should refresh the parent task anchor preview"
     );
 
+    // Isolate the startup backfill assertion below: the live task event fanout
+    // can refresh this same parent anchor before the explicit backfill runs.
+    if let Some(handle) = processor.task_event_listener_worker.lock().await.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+    if let Some(handle) = processor.resilience_worker.lock().await.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+    if let Some(handle) = processor.hook_recovery_worker.lock().await.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+
     let mut stale_anchor = refreshed_anchor.clone();
     stale_anchor.child_thread_id = None;
     stale_anchor.child_turn_id = None;
