@@ -260,6 +260,34 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Provisional
         ),
         contract_type!(
+            "cli_runtime_proxy_set_params.json",
+            pioneer_protocol::CLIRuntimeProxySetParams,
+            Domain::Providers,
+            Kind::Command,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "cli_runtime_proxy_set_response.json",
+            pioneer_protocol::CLIRuntimeProxySetResponse,
+            Domain::Providers,
+            Kind::Snapshot,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "cli_runtime_proxy_delete_params.json",
+            pioneer_protocol::CLIRuntimeProxyDeleteParams,
+            Domain::Providers,
+            Kind::Command,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "cli_runtime_proxy_delete_response.json",
+            pioneer_protocol::CLIRuntimeProxyDeleteResponse,
+            Domain::Providers,
+            Kind::Snapshot,
+            Stability::Provisional
+        ),
+        contract_type!(
             "cli_runtime_list_params.json",
             pioneer_protocol::CLIRuntimeListParams,
             Domain::Providers,
@@ -1222,6 +1250,20 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Stable
         ),
         contract_type!(
+            "provider_configure_params.json",
+            pioneer_protocol::ProviderConfigureParams,
+            Domain::Providers,
+            Kind::Command,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "provider_configure_response.json",
+            pioneer_protocol::ProviderConfigureResponse,
+            Domain::Providers,
+            Kind::Snapshot,
+            Stability::Provisional
+        ),
+        contract_type!(
             "provider_list_params.json",
             pioneer_protocol::ProviderListParams,
             Domain::Providers,
@@ -1343,6 +1385,48 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
         contract_type!(
             "provider_set_api_key_action_request.json",
             crate::providers::actions::ProviderSetApiKeyActionRequest,
+            Domain::Providers,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "provider_configure_action_request.json",
+            crate::providers::actions::ProviderConfigureActionRequest,
+            Domain::Providers,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "provider_configure_plan.json",
+            crate::providers::actions::ProviderConfigurePlan,
+            Domain::Providers,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "cli_runtime_proxy_set_action_request.json",
+            crate::providers::actions::CLIRuntimeProxySetActionRequest,
+            Domain::Providers,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "cli_runtime_proxy_set_plan.json",
+            crate::providers::actions::CLIRuntimeProxySetPlan,
+            Domain::Providers,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "cli_runtime_proxy_delete_action_request.json",
+            crate::providers::actions::CLIRuntimeProxyDeleteActionRequest,
+            Domain::Providers,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "cli_runtime_proxy_delete_plan.json",
+            crate::providers::actions::CLIRuntimeProxyDeletePlan,
             Domain::Providers,
             Kind::ActionPlan,
             Stability::Provisional
@@ -2037,6 +2121,10 @@ mod tests {
             "cli_runtime_login_start_response.json",
             "cli_runtime_login_cancel_params.json",
             "cli_runtime_login_cancel_response.json",
+            "cli_runtime_proxy_set_params.json",
+            "cli_runtime_proxy_set_response.json",
+            "cli_runtime_proxy_delete_params.json",
+            "cli_runtime_proxy_delete_response.json",
             "cli_runtime_pending_request.json",
             "cli_runtime_request_kind.json",
             "cli_runtime_request_resolution.json",

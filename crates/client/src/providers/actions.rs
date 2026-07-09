@@ -2,7 +2,8 @@
 
 use super::{catalog, list::ProviderListState};
 use pioneer_protocol::{
-    CLIRuntimeLoginStartParams, CLIRuntimeLoginStartType, ProviderDeleteApiKeyParams,
+    CLIRuntimeLoginStartParams, CLIRuntimeLoginStartType, CLIRuntimeProxyDeleteParams,
+    CLIRuntimeProxySetParams, ProviderConfigureParams, ProviderDeleteApiKeyParams,
     ProviderSetApiKeyParams,
 };
 
@@ -22,6 +23,7 @@ pub struct ProviderApiKeyActionRequest<TParams> {
 }
 
 pub type ProviderSetApiKeyActionRequest = ProviderApiKeyActionRequest<ProviderSetApiKeyParams>;
+pub type ProviderConfigureActionRequest = ProviderApiKeyActionRequest<ProviderConfigureParams>;
 pub type ProviderDeleteApiKeyActionRequest =
     ProviderApiKeyActionRequest<ProviderDeleteApiKeyParams>;
 
@@ -35,8 +37,27 @@ pub struct CLIRuntimeLoginStartActionRequest {
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct CLIRuntimeProxyActionRequest<TParams> {
+    pub connection_id: u64,
+    pub runtime_id: String,
+    pub params: TParams,
+}
+
+pub type CLIRuntimeProxySetActionRequest = CLIRuntimeProxyActionRequest<CLIRuntimeProxySetParams>;
+pub type CLIRuntimeProxyDeleteActionRequest =
+    CLIRuntimeProxyActionRequest<CLIRuntimeProxyDeleteParams>;
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum ProviderSetApiKeyPlan {
     Send(ProviderSetApiKeyActionRequest),
+    Unavailable(ProviderApiKeyActionUnavailable),
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub enum ProviderConfigurePlan {
+    Send(ProviderConfigureActionRequest),
     Unavailable(ProviderApiKeyActionUnavailable),
 }
 
@@ -51,6 +72,20 @@ pub enum ProviderDeleteApiKeyPlan {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum CLIRuntimeLoginStartPlan {
     Send(CLIRuntimeLoginStartActionRequest),
+    Unavailable(ProviderApiKeyActionUnavailable),
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub enum CLIRuntimeProxySetPlan {
+    Send(CLIRuntimeProxySetActionRequest),
+    Unavailable(ProviderApiKeyActionUnavailable),
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub enum CLIRuntimeProxyDeletePlan {
+    Send(CLIRuntimeProxyDeleteActionRequest),
     Unavailable(ProviderApiKeyActionUnavailable),
 }
 
@@ -112,6 +147,40 @@ pub fn plan_provider_delete_api_key(
     })
 }
 
+pub fn plan_provider_configure(
+    gateway_connected: bool,
+    connection_id: Option<u64>,
+    workspace_id: Option<String>,
+    provider_id: String,
+    api_key: Option<String>,
+    proxy_url: Option<String>,
+    clear_proxy: bool,
+) -> ProviderConfigurePlan {
+    let Some(connection_id) = available_connection_id(gateway_connected, connection_id) else {
+        return ProviderConfigurePlan::Unavailable(
+            ProviderApiKeyActionUnavailable::GatewayNotConnected,
+        );
+    };
+    let Some(workspace_id) = workspace_id else {
+        return ProviderConfigurePlan::Unavailable(
+            ProviderApiKeyActionUnavailable::WorkspaceNotSelected,
+        );
+    };
+    let canonical_provider_id = catalog::canonical_provider_id(provider_id.as_str());
+
+    ProviderConfigurePlan::Send(ProviderConfigureActionRequest {
+        connection_id,
+        canonical_provider_id,
+        params: ProviderConfigureParams {
+            workspace_id,
+            provider: provider_id,
+            api_key,
+            proxy_url,
+            clear_proxy,
+        },
+    })
+}
+
 pub fn plan_cli_runtime_login_start(
     gateway_connected: bool,
     connection_id: Option<u64>,
@@ -141,6 +210,62 @@ pub fn plan_cli_runtime_login_start(
     })
 }
 
+pub fn plan_cli_runtime_proxy_set(
+    gateway_connected: bool,
+    connection_id: Option<u64>,
+    workspace_id: Option<String>,
+    runtime_id: String,
+    proxy_url: String,
+) -> CLIRuntimeProxySetPlan {
+    let Some(connection_id) = available_connection_id(gateway_connected, connection_id) else {
+        return CLIRuntimeProxySetPlan::Unavailable(
+            ProviderApiKeyActionUnavailable::GatewayNotConnected,
+        );
+    };
+    let Some(workspace_id) = workspace_id else {
+        return CLIRuntimeProxySetPlan::Unavailable(
+            ProviderApiKeyActionUnavailable::WorkspaceNotSelected,
+        );
+    };
+
+    CLIRuntimeProxySetPlan::Send(CLIRuntimeProxySetActionRequest {
+        connection_id,
+        runtime_id: runtime_id.clone(),
+        params: CLIRuntimeProxySetParams {
+            workspace_id,
+            runtime_id,
+            proxy_url,
+        },
+    })
+}
+
+pub fn plan_cli_runtime_proxy_delete(
+    gateway_connected: bool,
+    connection_id: Option<u64>,
+    workspace_id: Option<String>,
+    runtime_id: String,
+) -> CLIRuntimeProxyDeletePlan {
+    let Some(connection_id) = available_connection_id(gateway_connected, connection_id) else {
+        return CLIRuntimeProxyDeletePlan::Unavailable(
+            ProviderApiKeyActionUnavailable::GatewayNotConnected,
+        );
+    };
+    let Some(workspace_id) = workspace_id else {
+        return CLIRuntimeProxyDeletePlan::Unavailable(
+            ProviderApiKeyActionUnavailable::WorkspaceNotSelected,
+        );
+    };
+
+    CLIRuntimeProxyDeletePlan::Send(CLIRuntimeProxyDeleteActionRequest {
+        connection_id,
+        runtime_id: runtime_id.clone(),
+        params: CLIRuntimeProxyDeleteParams {
+            workspace_id,
+            runtime_id,
+        },
+    })
+}
+
 pub fn provider_api_key_action_matches_connection(
     action_connection_id: u64,
     current_connection_id: Option<u64>,
@@ -157,6 +282,27 @@ pub fn apply_provider_set_api_key_success(
     canonical_provider_id: String,
 ) {
     providers.insert_configured(canonical_provider_id);
+}
+
+pub fn apply_provider_configure_success(
+    providers: &mut ProviderListState,
+    canonical_provider_id: String,
+    api_key_updated: bool,
+    proxy_url: Option<String>,
+) {
+    if api_key_updated {
+        providers.insert_configured(canonical_provider_id.clone());
+    }
+    if let Some(proxy_url) = proxy_url {
+        providers.set_provider_proxy_url(canonical_provider_id, proxy_url);
+    }
+}
+
+pub fn apply_provider_proxy_deleted(
+    providers: &mut ProviderListState,
+    canonical_provider_id: &str,
+) {
+    providers.remove_provider_proxy_url(canonical_provider_id);
 }
 
 pub fn apply_provider_delete_api_key_success(

@@ -23,37 +23,40 @@ use pioneer_protocol::{
     ArtifactUploadFinishResponse, ArtifactUploadStartParams, ArtifactUploadStartResponse,
     CLIRuntimeListModelsParams, CLIRuntimeListModelsResponse, CLIRuntimeListParams,
     CLIRuntimeListResponse, CLIRuntimeLoginCancelParams, CLIRuntimeLoginCancelResponse,
-    CLIRuntimeLoginStartParams, CLIRuntimeLoginStartResponse, CLIRuntimeRefreshParams,
-    CLIRuntimeRefreshResponse, CLIRuntimeRequestRespondParams, CLIRuntimeRequestRespondResponse,
-    CLIRuntimeReviewStartParams, CLIRuntimeReviewStartResponse, CLIRuntimeStatusParams,
-    CLIRuntimeStatusResponse, CLIRuntimeThreadBindingGetParams, CLIRuntimeThreadBindingGetResponse,
-    CLIRuntimeThreadCompactParams, CLIRuntimeThreadCompactResponse, CLIRuntimeThreadForkParams,
-    CLIRuntimeThreadForkResponse, CLIRuntimeTurnSteerParams, CLIRuntimeTurnSteerResponse,
-    GatewaySettingsGetParams, GatewaySettingsGetResponse, GatewaySettingsUpdate,
-    GatewaySettingsUpdateParams, GatewaySettingsUpdateResponse, McpInstallParams,
-    McpInstallResponse, McpListParams, McpListResponse, McpPolicySetParams, McpPolicySetResponse,
-    McpServerDetailsParams, McpServerDetailsResponse, McpServerRestartParams,
-    McpServerRestartResponse, McpUninstallParams, McpUninstallResponse, ProviderDeleteApiKeyParams,
-    ProviderDeleteApiKeyResponse, ProviderListModelsParams, ProviderListModelsResponse,
-    ProviderListParams, ProviderListResponse, ProviderSetApiKeyParams, ProviderSetApiKeyResponse,
-    SkillListParams, SkillListResponse, SkillsHealthParams, SkillsHealthResponse,
-    SkillsInstallParams, SkillsInstallResponse, SkillsPolicyListParams, SkillsPolicyListResponse,
-    SkillsPolicySetParams, SkillsPolicySetResponse, SkillsUninstallParams, SkillsUninstallResponse,
-    SkillsUpdateParams, SkillsUpdateResponse, SkillsUploadAbortParams, SkillsUploadAbortResponse,
-    SkillsUploadFinishParams, SkillsUploadFinishResponse, SkillsUploadStartParams,
-    SkillsUploadStartResponse, TaskAcceptParams, TaskAcceptResponse, TaskCancelParams,
-    TaskCancelResponse, TaskReviseParams, TaskReviseResponse, ThreadAgentsDocArchiveParams,
-    ThreadAgentsDocArchiveResponse, ThreadAgentsDocGetParams, ThreadAgentsDocGetResponse,
-    ThreadAgentsDocResolveForThreadParams, ThreadAgentsDocResolveForThreadResponse,
-    ThreadAgentsDocSaveParams, ThreadAgentsDocSaveResponse, ThreadFolderCreateParams,
-    ThreadFolderCreateResponse, ThreadFolderDeleteParams, ThreadFolderDeleteResponse,
-    ThreadFolderMoveParams, ThreadFolderMoveResponse, ThreadGetParams, ThreadGetResponse,
-    ThreadMoveParams, ThreadMoveResponse, ThreadStartParams, ThreadStartResponse,
-    ThreadTimelinePageParams, ThreadTimelinePageResponse, ThreadTreeParams, ThreadTreeResponse,
-    ThreadUnsubscribeParams, ThreadUnsubscribeResponse, ThreadUpdateParams, ThreadUpdateResponse,
-    TurnCancelParams, TurnCancelResponse, TurnGetParams, TurnGetResponse, TurnItemsParams,
-    TurnItemsResponse, TurnPermissionRequestRespondParams, TurnPermissionRequestRespondResponse,
-    TurnStartParams, TurnStartResponse, TurnWorkPageParams, TurnWorkPageResponse, VoiceAudioFormat,
+    CLIRuntimeLoginStartParams, CLIRuntimeLoginStartResponse, CLIRuntimeProxyDeleteParams,
+    CLIRuntimeProxyDeleteResponse, CLIRuntimeProxySetParams, CLIRuntimeProxySetResponse,
+    CLIRuntimeRefreshParams, CLIRuntimeRefreshResponse, CLIRuntimeRequestRespondParams,
+    CLIRuntimeRequestRespondResponse, CLIRuntimeReviewStartParams, CLIRuntimeReviewStartResponse,
+    CLIRuntimeStatusParams, CLIRuntimeStatusResponse, CLIRuntimeThreadBindingGetParams,
+    CLIRuntimeThreadBindingGetResponse, CLIRuntimeThreadCompactParams,
+    CLIRuntimeThreadCompactResponse, CLIRuntimeThreadForkParams, CLIRuntimeThreadForkResponse,
+    CLIRuntimeTurnSteerParams, CLIRuntimeTurnSteerResponse, GatewaySettingsGetParams,
+    GatewaySettingsGetResponse, GatewaySettingsUpdate, GatewaySettingsUpdateParams,
+    GatewaySettingsUpdateResponse, McpInstallParams, McpInstallResponse, McpListParams,
+    McpListResponse, McpPolicySetParams, McpPolicySetResponse, McpServerDetailsParams,
+    McpServerDetailsResponse, McpServerRestartParams, McpServerRestartResponse, McpUninstallParams,
+    McpUninstallResponse, ProviderConfigureParams, ProviderConfigureResponse,
+    ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse, ProviderListModelsParams,
+    ProviderListModelsResponse, ProviderListParams, ProviderListResponse, ProviderSetApiKeyParams,
+    ProviderSetApiKeyResponse, SkillListParams, SkillListResponse, SkillsHealthParams,
+    SkillsHealthResponse, SkillsInstallParams, SkillsInstallResponse, SkillsPolicyListParams,
+    SkillsPolicyListResponse, SkillsPolicySetParams, SkillsPolicySetResponse,
+    SkillsUninstallParams, SkillsUninstallResponse, SkillsUpdateParams, SkillsUpdateResponse,
+    SkillsUploadAbortParams, SkillsUploadAbortResponse, SkillsUploadFinishParams,
+    SkillsUploadFinishResponse, SkillsUploadStartParams, SkillsUploadStartResponse,
+    TaskAcceptParams, TaskAcceptResponse, TaskCancelParams, TaskCancelResponse, TaskReviseParams,
+    TaskReviseResponse, ThreadAgentsDocArchiveParams, ThreadAgentsDocArchiveResponse,
+    ThreadAgentsDocGetParams, ThreadAgentsDocGetResponse, ThreadAgentsDocResolveForThreadParams,
+    ThreadAgentsDocResolveForThreadResponse, ThreadAgentsDocSaveParams,
+    ThreadAgentsDocSaveResponse, ThreadFolderCreateParams, ThreadFolderCreateResponse,
+    ThreadFolderDeleteParams, ThreadFolderDeleteResponse, ThreadFolderMoveParams,
+    ThreadFolderMoveResponse, ThreadGetParams, ThreadGetResponse, ThreadMoveParams,
+    ThreadMoveResponse, ThreadStartParams, ThreadStartResponse, ThreadTimelinePageParams,
+    ThreadTimelinePageResponse, ThreadTreeParams, ThreadTreeResponse, ThreadUnsubscribeParams,
+    ThreadUnsubscribeResponse, ThreadUpdateParams, ThreadUpdateResponse, TurnCancelParams,
+    TurnCancelResponse, TurnGetParams, TurnGetResponse, TurnItemsParams, TurnItemsResponse,
+    TurnPermissionRequestRespondParams, TurnPermissionRequestRespondResponse, TurnStartParams,
+    TurnStartResponse, TurnWorkPageParams, TurnWorkPageResponse, VoiceAudioFormat,
     VoiceSessionCancelParams, VoiceSessionCancelResponse, VoiceSessionFinalizeParams,
     VoiceSessionFinalizeResponse, VoiceSessionStartParams, VoiceSessionStartResponse,
     VoiceStatusParams, VoiceStatusResponse, WorkspaceCreateParams, WorkspaceCreateResponse,
@@ -1175,6 +1178,50 @@ where
     )
 }
 
+pub fn provider_configure<TTransport>(
+    transport: &TTransport,
+    params: ProviderConfigureParams,
+) -> Result<ProviderConfigureResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.workspace_id.as_str(),
+        "workspace_id",
+        methods::PROVIDER_CONFIGURE,
+    )?;
+    require_non_empty_field(
+        params.provider.as_str(),
+        "provider",
+        methods::PROVIDER_CONFIGURE,
+    )?;
+    require_optional_non_empty_field(
+        params.api_key.as_deref(),
+        "api_key",
+        methods::PROVIDER_CONFIGURE,
+    )?;
+    require_optional_non_empty_field(
+        params.proxy_url.as_deref(),
+        "proxy_url",
+        methods::PROVIDER_CONFIGURE,
+    )?;
+    require_condition(
+        params.api_key.is_some() || params.proxy_url.is_some() || params.clear_proxy,
+        "at least one field is required for provider/configure",
+    )?;
+    require_condition(
+        !(params.proxy_url.is_some() && params.clear_proxy),
+        "`proxy_url` and `clear_proxy` cannot both be set for provider/configure",
+    )?;
+
+    send_json_rpc_request_typed(
+        transport,
+        methods::PROVIDER_CONFIGURE,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
 pub fn provider_delete_api_key<TTransport>(
     transport: &TTransport,
     params: ProviderDeleteApiKeyParams,
@@ -1196,6 +1243,63 @@ where
     send_json_rpc_request_typed(
         transport,
         methods::PROVIDER_DELETE_API_KEY,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn cli_runtime_proxy_set<TTransport>(
+    transport: &TTransport,
+    params: CLIRuntimeProxySetParams,
+) -> Result<CLIRuntimeProxySetResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.workspace_id.as_str(),
+        "workspace_id",
+        methods::CLI_RUNTIME_PROXY_SET,
+    )?;
+    require_non_empty_field(
+        params.runtime_id.as_str(),
+        "runtime_id",
+        methods::CLI_RUNTIME_PROXY_SET,
+    )?;
+    require_non_empty_field(
+        params.proxy_url.as_str(),
+        "proxy_url",
+        methods::CLI_RUNTIME_PROXY_SET,
+    )?;
+
+    send_json_rpc_request_typed(
+        transport,
+        methods::CLI_RUNTIME_PROXY_SET,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn cli_runtime_proxy_delete<TTransport>(
+    transport: &TTransport,
+    params: CLIRuntimeProxyDeleteParams,
+) -> Result<CLIRuntimeProxyDeleteResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.workspace_id.as_str(),
+        "workspace_id",
+        methods::CLI_RUNTIME_PROXY_DELETE,
+    )?;
+    require_non_empty_field(
+        params.runtime_id.as_str(),
+        "runtime_id",
+        methods::CLI_RUNTIME_PROXY_DELETE,
+    )?;
+
+    send_json_rpc_request_typed(
+        transport,
+        methods::CLI_RUNTIME_PROXY_DELETE,
         &params,
         RPC_REQUEST_TIMEOUT,
     )

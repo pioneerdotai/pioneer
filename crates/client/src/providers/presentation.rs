@@ -342,6 +342,8 @@ mod tests {
         ProviderSummary {
             name: name.to_owned(),
             capabilities: Default::default(),
+            api_key_configured: true,
+            proxy_url: None,
         }
     }
 

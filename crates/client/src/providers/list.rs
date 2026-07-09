@@ -14,7 +14,7 @@ use pioneer_protocol::{
     ProviderModelReasoningCapabilities, ProviderSummary, ReasoningCapabilitySource,
     RuntimeModelInfo, RuntimeStatus, RuntimeSummary,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub const CLI_RUNTIME_REFRESH_AUTO_INTERVAL_MS: i64 = 60_000;
 pub const CLI_RUNTIME_REFRESH_STALE_AFTER_MS: i64 = 5 * 60_000;
@@ -89,6 +89,7 @@ impl CLIRuntimeRefreshStatus {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProviderListState {
     configured_names: HashSet<String>,
+    provider_proxy_urls: HashMap<String, String>,
     cli_runtimes: Vec<RuntimeSummary>,
     cli_refresh_status: CLIRuntimeRefreshStatus,
     filter: ProviderFilter,
@@ -105,6 +106,7 @@ impl Default for ProviderListState {
     fn default() -> Self {
         Self {
             configured_names: HashSet::new(),
+            provider_proxy_urls: HashMap::new(),
             cli_runtimes: Vec::new(),
             cli_refresh_status: CLIRuntimeRefreshStatus::default(),
             filter: ProviderFilter::Api,
@@ -128,12 +130,25 @@ impl ProviderListState {
         self.cli_runtimes.as_slice()
     }
 
+    pub fn cli_runtime_proxy_url(&self, runtime_id: &str) -> Option<&str> {
+        self.cli_runtimes
+            .iter()
+            .find(|runtime| runtime.runtime_id == runtime_id)
+            .and_then(|runtime| runtime.proxy_url.as_deref())
+    }
+
     pub fn cli_refresh_status(&self) -> &CLIRuntimeRefreshStatus {
         &self.cli_refresh_status
     }
 
     pub fn is_configured(&self, provider_id: &str) -> bool {
         self.configured_names.contains(provider_id)
+    }
+
+    pub fn provider_proxy_url(&self, provider_id: &str) -> Option<&str> {
+        self.provider_proxy_urls
+            .get(provider_id)
+            .map(String::as_str)
     }
 
     pub fn filter(&self) -> ProviderFilter {
@@ -196,14 +211,16 @@ impl ProviderListState {
 
     pub fn apply_refresh_success(&mut self, configured_names: HashSet<String>) {
         self.configured_names = configured_names;
+        self.provider_proxy_urls.clear();
         self.loading = false;
         self.error = None;
     }
 
     pub fn apply_refresh_response(&mut self, response: ProviderListResponse) {
-        self.apply_refresh_success(configured_provider_names_from_list(
-            response.providers.as_slice(),
-        ));
+        self.configured_names = configured_provider_names_from_list(response.providers.as_slice());
+        self.provider_proxy_urls = provider_proxy_urls_from_list(response.providers.as_slice());
+        self.loading = false;
+        self.error = None;
     }
 
     pub fn apply_cli_runtime_refresh_response(
@@ -255,6 +272,17 @@ impl ProviderListState {
         self.cli_error = Some(error);
     }
 
+    pub fn apply_cli_runtime_proxy_url(&mut self, runtime_id: &str, proxy_url: Option<String>) {
+        if let Some(runtime) = self
+            .cli_runtimes
+            .iter_mut()
+            .find(|runtime| runtime.runtime_id == runtime_id)
+        {
+            runtime.proxy_url = proxy_url;
+        }
+        self.cli_error = None;
+    }
+
     pub fn apply_cli_runtime_login_message(&mut self, message: String) {
         self.cli_error = None;
         self.cli_login_message = Some(message);
@@ -300,6 +328,7 @@ impl ProviderListState {
 
     fn clear_gateway_scoped_state(&mut self) {
         self.configured_names.clear();
+        self.provider_proxy_urls.clear();
         self.cli_runtimes.clear();
         self.cli_refresh_status = CLIRuntimeRefreshStatus::default();
         self.loading = false;
@@ -321,6 +350,16 @@ impl ProviderListState {
         self.error = None;
     }
 
+    pub fn set_provider_proxy_url(&mut self, provider_id: String, proxy_url: String) {
+        self.provider_proxy_urls.insert(provider_id, proxy_url);
+        self.error = None;
+    }
+
+    pub fn remove_provider_proxy_url(&mut self, provider_id: &str) {
+        self.provider_proxy_urls.remove(provider_id);
+        self.error = None;
+    }
+
     pub fn set_error(&mut self, error: Option<String>) {
         self.error = error;
     }
@@ -329,7 +368,22 @@ impl ProviderListState {
 pub fn configured_provider_names_from_list(providers: &[ProviderSummary]) -> HashSet<String> {
     providers
         .iter()
+        .filter(|provider| provider.api_key_configured)
         .map(|provider| catalog::canonical_provider_id(provider.name.as_str()))
+        .collect()
+}
+
+pub fn provider_proxy_urls_from_list(providers: &[ProviderSummary]) -> HashMap<String, String> {
+    providers
+        .iter()
+        .filter_map(|provider| {
+            provider.proxy_url.as_ref().map(|proxy_url| {
+                (
+                    catalog::canonical_provider_id(provider.name.as_str()),
+                    proxy_url.clone(),
+                )
+            })
+        })
         .collect()
 }
 
@@ -960,6 +1014,7 @@ mod tests {
             binary_path: None,
             home_path: None,
             shadow_home_path: None,
+            proxy_url: None,
             debug_native_events_enabled: false,
             models_refreshed_at_unix_ms: None,
             diagnostics: Vec::new(),
@@ -984,6 +1039,8 @@ mod tests {
             providers: vec![ProviderSummary {
                 name: "OpenAI".to_owned(),
                 capabilities: Default::default(),
+                api_key_configured: true,
+                proxy_url: None,
             }],
         });
         assert!(!state.loading());
@@ -1032,10 +1089,14 @@ mod tests {
             ProviderSummary {
                 name: "AWS_Bedrock".to_owned(),
                 capabilities: Default::default(),
+                api_key_configured: true,
+                proxy_url: None,
             },
             ProviderSummary {
                 name: "lm_studio".to_owned(),
                 capabilities: Default::default(),
+                api_key_configured: true,
+                proxy_url: None,
             },
         ];
 
@@ -1215,6 +1276,8 @@ mod tests {
             providers: vec![ProviderSummary {
                 name: "openai".to_owned(),
                 capabilities: Default::default(),
+                api_key_configured: true,
+                proxy_url: None,
             }],
         });
         assert!(state.loading_providers());
@@ -1290,6 +1353,8 @@ mod tests {
             providers: vec![ProviderSummary {
                 name: "openai".to_owned(),
                 capabilities: Default::default(),
+                api_key_configured: true,
+                proxy_url: None,
             }],
         });
         state.apply_cli_runtime_list_success(CLIRuntimeListResponse {
@@ -1334,10 +1399,14 @@ mod tests {
                     capabilities: pioneer_protocol::ProviderSummaryCapabilities {
                         embeddings: true,
                     },
+                    api_key_configured: true,
+                    proxy_url: None,
                 },
                 ProviderSummary {
                     name: "anthropic".to_owned(),
                     capabilities: Default::default(),
+                    api_key_configured: true,
+                    proxy_url: None,
                 },
             ],
         });
@@ -1387,10 +1456,14 @@ mod tests {
             ProviderSummary {
                 name: "openai".to_owned(),
                 capabilities: pioneer_protocol::ProviderSummaryCapabilities { embeddings: true },
+                api_key_configured: true,
+                proxy_url: None,
             },
             ProviderSummary {
                 name: "local".to_owned(),
                 capabilities: pioneer_protocol::ProviderSummaryCapabilities { embeddings: true },
+                api_key_configured: true,
+                proxy_url: None,
             },
         ];
 

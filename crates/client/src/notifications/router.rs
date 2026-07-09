@@ -1031,6 +1031,7 @@ mod tests {
             binary_path: None,
             home_path: None,
             shadow_home_path: None,
+            proxy_url: None,
             debug_native_events_enabled: false,
             models_refreshed_at_unix_ms: None,
             diagnostics: Vec::new(),

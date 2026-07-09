@@ -543,6 +543,22 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             pioneer_protocol::CLIRuntimeLoginCancelResponse
         ),
         schema_doc!(
+            "cli_runtime_proxy_set_params.json",
+            pioneer_protocol::CLIRuntimeProxySetParams
+        ),
+        schema_doc!(
+            "cli_runtime_proxy_set_response.json",
+            pioneer_protocol::CLIRuntimeProxySetResponse
+        ),
+        schema_doc!(
+            "cli_runtime_proxy_delete_params.json",
+            pioneer_protocol::CLIRuntimeProxyDeleteParams
+        ),
+        schema_doc!(
+            "cli_runtime_proxy_delete_response.json",
+            pioneer_protocol::CLIRuntimeProxyDeleteResponse
+        ),
+        schema_doc!(
             "cli_runtime_refresh_params.json",
             pioneer_protocol::CLIRuntimeRefreshParams
         ),
@@ -715,6 +731,14 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             crate::providers::diagnostics::CLIRuntimeProviderDiagnosticsBundle
         ),
         schema_doc!(
+            "provider_configure_params.json",
+            pioneer_protocol::ProviderConfigureParams
+        ),
+        schema_doc!(
+            "provider_configure_response.json",
+            pioneer_protocol::ProviderConfigureResponse
+        ),
+        schema_doc!(
             "provider_list_models_params.json",
             pioneer_protocol::ProviderListModelsParams
         ),
@@ -781,6 +805,30 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "provider_set_api_key_action_request.json",
             crate::providers::actions::ProviderSetApiKeyActionRequest
+        ),
+        schema_doc!(
+            "provider_configure_action_request.json",
+            crate::providers::actions::ProviderConfigureActionRequest
+        ),
+        schema_doc!(
+            "provider_configure_plan.json",
+            crate::providers::actions::ProviderConfigurePlan
+        ),
+        schema_doc!(
+            "cli_runtime_proxy_set_action_request.json",
+            crate::providers::actions::CLIRuntimeProxySetActionRequest
+        ),
+        schema_doc!(
+            "cli_runtime_proxy_set_plan.json",
+            crate::providers::actions::CLIRuntimeProxySetPlan
+        ),
+        schema_doc!(
+            "cli_runtime_proxy_delete_action_request.json",
+            crate::providers::actions::CLIRuntimeProxyDeleteActionRequest
+        ),
+        schema_doc!(
+            "cli_runtime_proxy_delete_plan.json",
+            crate::providers::actions::CLIRuntimeProxyDeletePlan
         ),
         schema_doc!(
             "provider_set_api_key_plan.json",

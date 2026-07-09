@@ -102,6 +102,7 @@ mod tests {
             binary_path: Some("codex".to_owned()),
             home_path: Some("~/.codex".to_owned()),
             shadow_home_path: Some("~/.pioneer/codex/personal".to_owned()),
+            proxy_url: Some("socks5://127.0.0.1:1080".to_owned()),
             debug_native_events_enabled: true,
             models_refreshed_at_unix_ms: None,
             diagnostics: Vec::new(),

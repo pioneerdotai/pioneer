@@ -456,11 +456,32 @@ impl GatewayWsCommandSender {
         client_ws_commands::provider_set_api_key(self, params)
     }
 
+    pub fn provider_configure(
+        &self,
+        params: ProviderConfigureParams,
+    ) -> Result<ProviderConfigureResponse> {
+        client_ws_commands::provider_configure(self, params)
+    }
+
     pub fn provider_delete_api_key(
         &self,
         params: ProviderDeleteApiKeyParams,
     ) -> Result<ProviderDeleteApiKeyResponse> {
         client_ws_commands::provider_delete_api_key(self, params)
+    }
+
+    pub fn cli_runtime_proxy_set(
+        &self,
+        params: CLIRuntimeProxySetParams,
+    ) -> Result<CLIRuntimeProxySetResponse> {
+        client_ws_commands::cli_runtime_proxy_set(self, params)
+    }
+
+    pub fn cli_runtime_proxy_delete(
+        &self,
+        params: CLIRuntimeProxyDeleteParams,
+    ) -> Result<CLIRuntimeProxyDeleteResponse> {
+        client_ws_commands::cli_runtime_proxy_delete(self, params)
     }
 
     pub fn turn_get(&self, params: TurnGetParams) -> Result<TurnGetResponse> {
