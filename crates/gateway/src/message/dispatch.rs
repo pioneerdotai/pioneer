@@ -2890,7 +2890,13 @@ impl MessageProcessor {
             self.apply_thread_episodic_workspace_vector_search_configs(
                 workspace_vector_search_configs.clone(),
             );
-            if changes.thread_episodic_vector_projection_changed && thread_episodic_settings.enabled
+            let vector_refill_startable =
+                crate::settings::thread_episodic_vector_refill_is_startable(
+                    &snapshot.thread_episodic.vector_search,
+                );
+            if changes.thread_episodic_vector_projection_changed
+                && thread_episodic_settings.enabled
+                && vector_refill_startable
             {
                 if let Some(workspace_id) = changes
                     .thread_episodic_vector_projection_workspace_id

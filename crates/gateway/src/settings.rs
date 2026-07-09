@@ -1105,8 +1105,22 @@ pub fn mark_thread_episodic_vector_refill_running_if_ready(
     {
         return;
     }
-    if vector_search.provider_key.required && !vector_search.provider_key.present {
+    if !thread_episodic_vector_refill_is_startable(vector_search) {
         return;
+    }
+
+    vector_search.refill_status =
+        pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Running;
+}
+
+pub fn thread_episodic_vector_refill_is_startable(
+    vector_search: &pioneer_protocol::GatewayThreadEpisodicVectorSearchSettings,
+) -> bool {
+    if !vector_search.enabled {
+        return true;
+    }
+    if vector_search.provider_key.required && !vector_search.provider_key.present {
+        return false;
     }
 
     match vector_search.provider {
@@ -1119,7 +1133,7 @@ pub fn mark_thread_episodic_vector_refill_running_if_ready(
                 .filter(|model| !model.is_empty())
                 .is_none()
             {
-                return;
+                return false;
             }
         }
         Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::Local) => {
@@ -1131,19 +1145,18 @@ pub fn mark_thread_episodic_vector_refill_running_if_ready(
                 .filter(|model| !model.is_empty())
                 .is_none()
             {
-                return;
+                return false;
             }
             if vector_search.local_model_status
                 != pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Installed
             {
-                return;
+                return false;
             }
         }
-        None => return,
+        None => return false,
     }
 
-    vector_search.refill_status =
-        pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Running;
+    true
 }
 
 fn apply_vector_search_protocol_update(
@@ -2489,6 +2502,36 @@ embedding_normalized = true
 
     #[test]
     fn vector_refill_running_status_requires_startable_refill() {
+        let enabled_without_model = pioneer_protocol::GatewayThreadEpisodicVectorSearchSettings {
+            enabled: true,
+            refill_status: pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required,
+            ..Default::default()
+        };
+        assert!(!super::thread_episodic_vector_refill_is_startable(
+            &enabled_without_model
+        ));
+
+        let remote_without_model = pioneer_protocol::GatewayThreadEpisodicVectorSearchSettings {
+            enabled: true,
+            provider: Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::OpenRouter),
+            provider_key: pioneer_protocol::GatewayThreadEpisodicVectorProviderKeyStatus {
+                required: true,
+                present: true,
+            },
+            refill_status: pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required,
+            ..Default::default()
+        };
+        assert!(!super::thread_episodic_vector_refill_is_startable(
+            &remote_without_model
+        ));
+
+        let disabled = pioneer_protocol::GatewayThreadEpisodicVectorSearchSettings {
+            enabled: false,
+            refill_status: pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required,
+            ..Default::default()
+        };
+        assert!(super::thread_episodic_vector_refill_is_startable(&disabled));
+
         let mut remote_ready = pioneer_protocol::GatewayThreadEpisodicVectorSearchSettings {
             enabled: true,
             provider: Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::OpenRouter),
