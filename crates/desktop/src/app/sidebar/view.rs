@@ -720,7 +720,7 @@ impl PioneerDesktop {
         }
 
         match &self.desktop_update {
-            DesktopUpdateUiState::Checking => {
+            DesktopUpdateUiState::Downloading { .. } => {
                 Some(self.render_desktop_update_downloading_panel(cx))
             }
             DesktopUpdateUiState::Ready { version, .. } => {

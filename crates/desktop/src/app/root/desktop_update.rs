@@ -13,6 +13,9 @@ enum DesktopUpdateStylePreview {
 pub(crate) enum DesktopUpdateUiState {
     Idle,
     Checking,
+    Downloading {
+        style_preview: bool,
+    },
     Ready {
         version: String,
         current_version: String,
@@ -41,7 +44,9 @@ impl DesktopUpdateUiState {
         {
             match desktop_update_style_preview_mode() {
                 Some(DesktopUpdateStylePreview::Ready) => Self::style_preview(),
-                Some(DesktopUpdateStylePreview::Downloading) => Self::Checking,
+                Some(DesktopUpdateStylePreview::Downloading) => Self::Downloading {
+                    style_preview: true,
+                },
                 None => Self::Idle,
             }
         }
@@ -81,11 +86,13 @@ impl DesktopUpdateUiState {
         #[cfg(debug_assertions)]
         {
             is_ready_preview
-                || (matches!(self, Self::Checking)
-                    && matches!(
-                        desktop_update_style_preview_mode(),
-                        Some(DesktopUpdateStylePreview::Downloading)
-                    ))
+                || matches!(
+                    self,
+                    Self::Downloading {
+                        style_preview: true,
+                        ..
+                    }
+                )
         }
 
         #[cfg(not(debug_assertions))]
@@ -95,7 +102,7 @@ impl DesktopUpdateUiState {
     }
 
     pub(crate) fn should_render_sidebar_panel(&self) -> bool {
-        matches!(self, Self::Checking | Self::Ready { .. })
+        matches!(self, Self::Downloading { .. } | Self::Ready { .. })
     }
 }
 
@@ -115,15 +122,20 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn sidebar_panel_renders_for_checking_and_ready() {
+    fn sidebar_panel_renders_for_downloading_and_ready() {
         let state = ready_state();
 
         assert!(state.should_render_sidebar_panel());
-        assert!(DesktopUpdateUiState::Checking.should_render_sidebar_panel());
+        assert!(
+            DesktopUpdateUiState::Downloading {
+                style_preview: false
+            }
+            .should_render_sidebar_panel()
+        );
     }
 
     #[test]
-    fn inactive_states_do_not_render_sidebar_panel() {
+    fn checking_and_inactive_states_do_not_render_sidebar_panel() {
         let idle = DesktopUpdateUiState::Idle;
         let failed = DesktopUpdateUiState::FailedSilent {
             checked_at_unix: 1_789_200_000,
@@ -131,6 +143,7 @@ mod tests {
         };
 
         assert!(!idle.should_render_sidebar_panel());
+        assert!(!DesktopUpdateUiState::Checking.should_render_sidebar_panel());
         assert!(!failed.should_render_sidebar_panel());
     }
 

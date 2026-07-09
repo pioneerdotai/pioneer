@@ -1,18 +1,18 @@
 use super::*;
 use crate::updater::{
     desktop_current_version, desktop_update_config_from_env,
-    download::download_update_asset_to_cache,
+    download::download_update_asset_to_cache_with_runtime_home,
     platform::select_update_candidate_for_current_platform,
     release::{DESKTOP_UPDATER_USER_AGENT, fetch_desktop_update_manifest_with_client},
     state::{
-        DesktopUpdatePersistedStatus, read_update_state, record_silent_failure_state_at,
-        sha256_file, verify_staged_download_and_record_ready_state,
+        DesktopUpdateConfig, DesktopUpdatePersistedStatus, read_update_state,
+        record_silent_failure_state_at, sha256_file, verify_staged_download_and_record_ready_state,
     },
 };
 use reqwest::blocking::Client;
 use semver::Version;
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -36,45 +36,91 @@ impl PioneerDesktop {
             return;
         }
 
-        self.desktop_update = DesktopUpdateUiState::Checking;
+        if self.desktop_update != DesktopUpdateUiState::Checking {
+            self.desktop_update = DesktopUpdateUiState::Checking;
+            cx.notify();
+        }
 
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
 
             async move {
-                let next_state = cx
+                let check_result = cx
                     .background_spawn(async move { run_desktop_update_check(config) })
                     .await;
 
+                let download = match check_result {
+                    DesktopUpdateCheckResult::Done(next_state) => {
+                        update_desktop_update_state(&this, &mut cx, next_state);
+                        return;
+                    }
+                    DesktopUpdateCheckResult::Download(download) => download,
+                };
+                let downloading_state = DesktopUpdateUiState::Downloading {
+                    style_preview: false,
+                };
                 let _ = this.update(&mut cx, |view, cx| {
-                    if view.desktop_update != next_state {
-                        view.desktop_update = next_state;
+                    if view.desktop_update != downloading_state {
+                        view.desktop_update = downloading_state;
                         cx.notify();
                     }
                 });
+                let next_state = cx
+                    .background_spawn(async move { run_desktop_update_download(download) })
+                    .await;
+                update_desktop_update_state(&this, &mut cx, next_state);
             }
         })
         .detach();
     }
 }
 
-fn run_desktop_update_check(config: crate::updater::DesktopUpdateConfig) -> DesktopUpdateUiState {
+struct DesktopUpdateDownload {
+    runtime_home: PathBuf,
+    checked_at_unix: u64,
+    client: Client,
+    config: DesktopUpdateConfig,
+    candidate: crate::updater::platform::DesktopUpdateCandidate,
+}
+
+enum DesktopUpdateCheckResult {
+    Done(DesktopUpdateUiState),
+    Download(DesktopUpdateDownload),
+}
+
+fn update_desktop_update_state(
+    this: &WeakEntity<PioneerDesktop>,
+    cx: &mut AsyncApp,
+    next_state: DesktopUpdateUiState,
+) {
+    let _ = this.update(cx, |view, cx| {
+        if view.desktop_update != next_state {
+            view.desktop_update = next_state;
+            cx.notify();
+        }
+    });
+}
+
+fn run_desktop_update_check(config: DesktopUpdateConfig) -> DesktopUpdateCheckResult {
     let checked_at_unix = current_unix_timestamp();
     let runtime_home = match crate::state::runtime_home_dir() {
         Ok(runtime_home) => runtime_home,
         Err(_) => {
-            return failed_silent(checked_at_unix, UPDATE_ERROR_RUNTIME_HOME);
+            return DesktopUpdateCheckResult::Done(failed_silent(
+                checked_at_unix,
+                UPDATE_ERROR_RUNTIME_HOME,
+            ));
         }
     };
 
     if let Some(state) = ready_ui_state_from_persisted(runtime_home.as_path(), checked_at_unix) {
-        return state;
+        return DesktopUpdateCheckResult::Done(state);
     }
     if !config.force_check {
         if let Some(state) =
             recent_failure_ui_state_from_persisted(runtime_home.as_path(), checked_at_unix)
         {
-            return state;
+            return DesktopUpdateCheckResult::Done(state);
         }
     }
 
@@ -84,22 +130,22 @@ fn run_desktop_update_check(config: crate::updater::DesktopUpdateConfig) -> Desk
     {
         Ok(client) => client,
         Err(_) => {
-            return record_failure(
+            return DesktopUpdateCheckResult::Done(record_failure(
                 runtime_home.as_path(),
                 checked_at_unix,
                 UPDATE_ERROR_HTTP_CLIENT,
-            );
+            ));
         }
     };
 
     let fetched = match fetch_desktop_update_manifest_with_client(&client, &config) {
         Ok(fetched) => fetched,
         Err(_) => {
-            return record_failure(
+            return DesktopUpdateCheckResult::Done(record_failure(
                 runtime_home.as_path(),
                 checked_at_unix,
                 UPDATE_ERROR_RELEASE_FETCH,
-            );
+            ));
         }
     };
 
@@ -108,31 +154,50 @@ fn run_desktop_update_check(config: crate::updater::DesktopUpdateConfig) -> Desk
         desktop_current_version(),
     ) {
         Ok(Some(candidate)) => candidate,
-        Ok(None) => return DesktopUpdateUiState::Idle,
+        Ok(None) => return DesktopUpdateCheckResult::Done(DesktopUpdateUiState::Idle),
         Err(_) => {
-            return record_failure(
+            return DesktopUpdateCheckResult::Done(record_failure(
                 runtime_home.as_path(),
                 checked_at_unix,
                 UPDATE_ERROR_PLATFORM_SELECTION,
-            );
+            ));
         }
     };
 
-    let staged = match download_update_asset_to_cache(&client, &config, &candidate) {
+    DesktopUpdateCheckResult::Download(DesktopUpdateDownload {
+        runtime_home,
+        checked_at_unix,
+        client,
+        config,
+        candidate,
+    })
+}
+
+fn run_desktop_update_download(download: DesktopUpdateDownload) -> DesktopUpdateUiState {
+    let staged = match download_update_asset_to_cache_with_runtime_home(
+        &download.client,
+        &download.config,
+        &download.candidate,
+        download.runtime_home.as_path(),
+    ) {
         Ok(staged) => staged,
         Err(_) => {
             return record_failure(
-                runtime_home.as_path(),
-                checked_at_unix,
+                download.runtime_home.as_path(),
+                download.checked_at_unix,
                 UPDATE_ERROR_DOWNLOAD,
             );
         }
     };
 
-    match verify_staged_download_and_record_ready_state(runtime_home.as_path(), &staged) {
+    match verify_staged_download_and_record_ready_state(download.runtime_home.as_path(), &staged) {
         Ok(state) => ready_ui_state_from_state(state, desktop_current_version().to_owned())
             .unwrap_or(DesktopUpdateUiState::Idle),
-        Err(_) => record_failure(runtime_home.as_path(), checked_at_unix, UPDATE_ERROR_VERIFY),
+        Err(_) => record_failure(
+            download.runtime_home.as_path(),
+            download.checked_at_unix,
+            UPDATE_ERROR_VERIFY,
+        ),
     }
 }
 

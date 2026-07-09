@@ -39,7 +39,6 @@ pub(crate) struct DesktopUpdateDownloadPaths {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DesktopDownloadErrorCode {
-    RuntimeHome,
     InvalidPathComponent,
     CreateDirectory,
     RemovePartial,
@@ -78,21 +77,6 @@ impl fmt::Display for DesktopDownloadError {
 }
 
 impl Error for DesktopDownloadError {}
-
-pub(crate) fn download_update_asset_to_cache(
-    client: &Client,
-    config: &DesktopUpdateConfig,
-    candidate: &DesktopUpdateCandidate,
-) -> Result<StagedDownload, DesktopDownloadError> {
-    let runtime_home = crate::state::runtime_home_dir().map_err(|error| {
-        DesktopDownloadError::new(
-            DesktopDownloadErrorCode::RuntimeHome,
-            format!("failed to resolve desktop update runtime home: {error:#}"),
-        )
-    })?;
-
-    download_update_asset_to_cache_with_runtime_home(client, config, candidate, &runtime_home)
-}
 
 pub(crate) fn download_update_asset_to_cache_with_runtime_home(
     client: &Client,
