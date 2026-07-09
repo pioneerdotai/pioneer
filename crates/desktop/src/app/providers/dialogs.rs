@@ -33,26 +33,53 @@ impl PioneerDesktop {
         let provider_title = provider.title();
         let provider_description = provider.description();
         let is_configured = self.providers.is_configured(provider.id);
+        let current_proxy_url = self
+            .providers
+            .provider_proxy_url(provider.id)
+            .map(str::to_owned);
         let api_key_input_state = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
                 .auto_grow(2, 7)
                 .placeholder(t!("providers.dialog.api_key_placeholder").to_string())
         });
+        let proxy_input_state = cx.new(|cx| {
+            let mut state = InputState::new(window, cx)
+                .placeholder(t!("providers.dialog.proxy_placeholder").to_string());
+            if let Some(proxy_url) = current_proxy_url.as_deref() {
+                state.set_value(proxy_url.to_owned(), window, cx);
+            }
+            state
+        });
         let desktop_entity = cx.entity().clone();
+        let did_focus_initial_field = Rc::new(Cell::new(false));
 
-        let save_api_key: Rc<dyn Fn(&mut App) -> bool> = Rc::new({
+        let save_provider_configuration: Rc<dyn Fn(&mut App) -> bool> = Rc::new({
             let desktop_entity = desktop_entity.clone();
             let provider_id = provider.id.to_owned();
             let api_key_input_state = api_key_input_state.clone();
+            let proxy_input_state = proxy_input_state.clone();
+            let current_proxy_url = current_proxy_url.clone();
             move |cx| {
                 let api_key = api_key_input_state.read(cx).value().trim().to_owned();
-                if api_key.is_empty() {
+                let proxy_url = proxy_input_state.read(cx).value().trim().to_owned();
+                let api_key = (!api_key.is_empty()).then_some(api_key);
+                let proxy_changed = current_proxy_url.as_deref() != Some(proxy_url.as_str());
+                let proxy_url = (proxy_changed && !proxy_url.is_empty()).then_some(proxy_url);
+                let clear_proxy =
+                    proxy_changed && proxy_url.is_none() && current_proxy_url.is_some();
+                if api_key.is_none() && proxy_url.is_none() && !clear_proxy {
                     return false;
                 }
 
                 let _ = desktop_entity.update(cx, |view, cx| {
-                    view.set_provider_api_key(provider_id.clone(), api_key.clone(), cx);
+                    view.configure_provider(
+                        provider_id.clone(),
+                        api_key.clone(),
+                        proxy_url.clone(),
+                        clear_proxy,
+                        cx,
+                    );
                     cx.notify();
                 });
 
@@ -63,7 +90,10 @@ impl PioneerDesktop {
         let delete_provider_id = is_configured.then(|| provider.id.to_owned());
 
         window.open_dialog(cx, move |dialog, window, cx| {
-            api_key_input_state.update(cx, |state, cx| state.focus(window, cx));
+            if !did_focus_initial_field.get() {
+                did_focus_initial_field.set(true);
+                api_key_input_state.update(cx, |state, cx| state.focus(window, cx));
+            }
 
             dialog
                 .gap_1()
@@ -86,11 +116,11 @@ impl PioneerDesktop {
                         ),
                 )
                 .on_ok({
-                    let save_api_key = save_api_key.clone();
-                    move |_, _, cx| save_api_key(cx)
+                    let save_provider_configuration = save_provider_configuration.clone();
+                    move |_, _, cx| save_provider_configuration(cx)
                 })
                 .footer({
-                    let save_api_key = save_api_key.clone();
+                    let save_provider_configuration = save_provider_configuration.clone();
                     let desktop_entity = desktop_entity.clone();
                     let delete_provider_id = delete_provider_id.clone();
 
@@ -106,9 +136,10 @@ impl PioneerDesktop {
                             default_primary_button("provider-dialog-save")
                                 .label(t!("providers.button.submit").to_string())
                                 .on_click({
-                                    let save_api_key = save_api_key.clone();
+                                    let save_provider_configuration =
+                                        save_provider_configuration.clone();
                                     move |_, window, cx| {
-                                        if save_api_key(cx) {
+                                        if save_provider_configuration(cx) {
                                             window.close_dialog(cx);
                                         }
                                     }
@@ -162,23 +193,11 @@ impl PioneerDesktop {
                                         .label(t!("providers.dialog.api_key_label").to_string())
                                         .child(Input::new(&api_key_input_state).min_w_0()),
                                 )
-                                .when(is_configured, |this| {
-                                    this.child(
-                                        field().label_indent(false).child(
-                                            div()
-                                                .text_xs()
-                                                .line_height(relative(1.3))
-                                                .opacity(0.6)
-                                                .child(
-                                                    t!(
-                                                        "providers.dialog.replace_hint",
-                                                        provider = provider_title.as_str()
-                                                    )
-                                                    .to_string(),
-                                                ),
-                                        ),
-                                    )
-                                }),
+                                .child(
+                                    field()
+                                        .label(t!("providers.dialog.proxy_label").to_string())
+                                        .child(Input::new(&proxy_input_state).min_w_0()),
+                                ),
                         ),
                 )
         });

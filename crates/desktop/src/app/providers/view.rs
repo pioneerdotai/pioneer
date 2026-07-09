@@ -755,13 +755,16 @@ impl PioneerDesktop {
                                 field().label_indent(false).child(
                                     v_flex()
                                         .w_full()
+                                        .px_4()
                                         .child(cli_runtime_inline_settings_row(
                                             runtime,
-                                            CLIRuntimeProviderDraftField::DisplayName,
+                                            Some(CLIRuntimeProviderDraftField::DisplayName),
                                             t!("providers.cli.inline.display_name_label")
                                                 .to_string(),
-                                            t!("providers.cli.inline.display_name_hint")
-                                                .to_string(),
+                                            Some(
+                                                t!("providers.cli.inline.display_name_hint")
+                                                    .to_string(),
+                                            ),
                                             cli_runtime_inline_field_placeholder(
                                                 runtime,
                                                 CLIRuntimeProviderDraftField::DisplayName,
@@ -775,9 +778,9 @@ impl PioneerDesktop {
                                         ))
                                         .child(cli_runtime_inline_settings_row(
                                             runtime,
-                                            CLIRuntimeProviderDraftField::BinaryPath,
+                                            Some(CLIRuntimeProviderDraftField::BinaryPath),
                                             t!("providers.cli.inline.binary_label").to_string(),
-                                            t!("providers.cli.inline.binary_hint").to_string(),
+                                            Some(t!("providers.cli.inline.binary_hint").to_string()),
                                             cli_runtime_inline_field_placeholder(
                                                 runtime,
                                                 CLIRuntimeProviderDraftField::BinaryPath,
@@ -791,9 +794,9 @@ impl PioneerDesktop {
                                         ))
                                         .child(cli_runtime_inline_settings_row(
                                             runtime,
-                                            CLIRuntimeProviderDraftField::HomePath,
+                                            Some(CLIRuntimeProviderDraftField::HomePath),
                                             t!("providers.cli.inline.home_label").to_string(),
-                                            t!("providers.cli.inline.home_hint").to_string(),
+                                            Some(t!("providers.cli.inline.home_hint").to_string()),
                                             cli_runtime_inline_field_placeholder(
                                                 runtime,
                                                 CLIRuntimeProviderDraftField::HomePath,
@@ -807,11 +810,28 @@ impl PioneerDesktop {
                                         ))
                                         .child(cli_runtime_inline_settings_row(
                                             runtime,
-                                            CLIRuntimeProviderDraftField::ShadowHomePath,
+                                            Some(CLIRuntimeProviderDraftField::ShadowHomePath),
                                             t!("providers.cli.inline.shadow_home_label")
                                                 .to_string(),
-                                            t!("providers.cli.inline.shadow_home_hint").to_string(),
+                                            Some(
+                                                t!("providers.cli.inline.shadow_home_hint")
+                                                    .to_string(),
+                                            ),
                                             t!("providers.cli.value.disabled").to_string(),
+                                            is_connected,
+                                            true,
+                                            input_scope_key,
+                                            desktop_entity.clone(),
+                                            window,
+                                            cx,
+                                        ))
+                                        .child(cli_runtime_inline_settings_row(
+                                            runtime,
+                                            None,
+                                            t!("providers.cli.inline.proxy_label").to_string(),
+                                            None,
+                                            t!("providers.cli.inline.proxy_placeholder")
+                                                .to_string(),
                                             is_connected,
                                             false,
                                             input_scope_key,
@@ -992,6 +1012,7 @@ fn cli_runtime_summary_from_settings(
         binary_path: Some(instance.binary_path.clone()),
         home_path: Some(instance.home_path.clone()),
         shadow_home_path: instance.shadow_home_path.clone(),
+        proxy_url: None,
         debug_native_events_enabled: false,
         models_refreshed_at_unix_ms: None,
         diagnostics: Vec::new(),
@@ -1141,9 +1162,9 @@ struct CliRuntimeInlineInputState {
 
 fn cli_runtime_inline_settings_row(
     runtime: &RuntimeSummary,
-    field_id: CLIRuntimeProviderDraftField,
+    field_id: Option<CLIRuntimeProviderDraftField>,
     label: String,
-    hint: String,
+    hint: Option<String>,
     placeholder: String,
     is_connected: bool,
     show_divider: bool,
@@ -1165,7 +1186,6 @@ fn cli_runtime_inline_settings_row(
 
     v_flex()
         .w_full()
-        .px_4()
         .py_3()
         .gap_1p5()
         .when(show_divider, |this| {
@@ -1178,19 +1198,21 @@ fn cli_runtime_inline_settings_row(
                 .min_w_0()
                 .disabled(!is_connected),
         )
-        .child(
-            div()
-                .text_xs()
-                .line_height(relative(1.35))
-                .opacity(0.6)
-                .child(hint),
-        )
+        .when_some(hint, |this, hint| {
+            this.child(
+                div()
+                    .text_xs()
+                    .line_height(relative(1.35))
+                    .opacity(0.6)
+                    .child(hint),
+            )
+        })
         .into_any_element()
 }
 
 fn cli_runtime_inline_input_state(
     runtime: &RuntimeSummary,
-    field_id: CLIRuntimeProviderDraftField,
+    field_id: Option<CLIRuntimeProviderDraftField>,
     placeholder: String,
     input_scope_key: &str,
     desktop_entity: Entity<PioneerDesktop>,
@@ -1214,20 +1236,43 @@ fn cli_runtime_inline_input_state(
         });
         let subscription = cx.subscribe(&input, {
             let runtime_id = runtime_id.clone();
-            move |_, input, event: &InputEvent, cx| {
-                if !matches!(event, InputEvent::Change) {
-                    return;
+            move |_, input, event: &InputEvent, cx| match field_id {
+                Some(field) => {
+                    if !matches!(event, InputEvent::Change) {
+                        return;
+                    }
+                    let value = input.read(cx).value().to_string();
+                    let _ = desktop_entity.update(cx, |view, cx| {
+                        view.save_cli_runtime_provider_inline_field(
+                            runtime_id.clone(),
+                            field,
+                            value,
+                            cx,
+                        );
+                        cx.notify();
+                    });
                 }
-                let value = input.read(cx).value().to_string();
-                let _ = desktop_entity.update(cx, |view, cx| {
-                    view.save_cli_runtime_provider_inline_field(
-                        runtime_id.clone(),
-                        field_id,
-                        value,
-                        cx,
-                    );
-                    cx.notify();
-                });
+                None => {
+                    if !matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
+                        return;
+                    }
+                    let proxy_url = input.read(cx).value().trim().to_owned();
+                    let _ = desktop_entity.update(cx, |view, cx| {
+                        let current_proxy_url = view
+                            .providers
+                            .cli_runtime_proxy_url(runtime_id.as_str())
+                            .unwrap_or_default();
+                        if current_proxy_url == proxy_url {
+                            return;
+                        }
+                        if proxy_url.is_empty() {
+                            view.delete_cli_runtime_proxy(runtime_id.clone(), cx);
+                        } else {
+                            view.set_cli_runtime_proxy(runtime_id.clone(), proxy_url.clone(), cx);
+                        }
+                        cx.notify();
+                    });
+                }
             }
         });
 
@@ -1240,23 +1285,27 @@ fn cli_runtime_inline_input_state(
 
 fn cli_runtime_inline_field_value(
     runtime: &RuntimeSummary,
-    field_id: CLIRuntimeProviderDraftField,
+    field_id: Option<CLIRuntimeProviderDraftField>,
 ) -> String {
     match field_id {
-        CLIRuntimeProviderDraftField::DisplayName => runtime.display_name.clone(),
-        CLIRuntimeProviderDraftField::BinaryPath => {
+        Some(CLIRuntimeProviderDraftField::DisplayName) => runtime.display_name.clone(),
+        Some(CLIRuntimeProviderDraftField::BinaryPath) => {
             runtime.binary_path.clone().unwrap_or_else(|| {
                 cli_provider_settings::cli_runtime_provider_default_binary_path(runtime.kind)
                     .to_owned()
             })
         }
-        CLIRuntimeProviderDraftField::HomePath => runtime.home_path.clone().unwrap_or_else(|| {
-            cli_provider_settings::cli_runtime_provider_default_home_path(runtime.kind).to_owned()
-        }),
-        CLIRuntimeProviderDraftField::ShadowHomePath => {
+        Some(CLIRuntimeProviderDraftField::HomePath) => {
+            runtime.home_path.clone().unwrap_or_else(|| {
+                cli_provider_settings::cli_runtime_provider_default_home_path(runtime.kind)
+                    .to_owned()
+            })
+        }
+        Some(CLIRuntimeProviderDraftField::ShadowHomePath) => {
             runtime.shadow_home_path.clone().unwrap_or_default()
         }
-        CLIRuntimeProviderDraftField::Id => String::new(),
+        Some(CLIRuntimeProviderDraftField::Id) => String::new(),
+        None => runtime.proxy_url.clone().unwrap_or_default(),
     }
 }
 
@@ -1285,13 +1334,14 @@ fn cli_runtime_inline_field_placeholder(
     }
 }
 
-fn cli_runtime_inline_field_key(field_id: CLIRuntimeProviderDraftField) -> &'static str {
+fn cli_runtime_inline_field_key(field_id: Option<CLIRuntimeProviderDraftField>) -> &'static str {
     match field_id {
-        CLIRuntimeProviderDraftField::BinaryPath => "binary-path",
-        CLIRuntimeProviderDraftField::HomePath => "home-path",
-        CLIRuntimeProviderDraftField::ShadowHomePath => "shadow-home-path",
-        CLIRuntimeProviderDraftField::Id => "id",
-        CLIRuntimeProviderDraftField::DisplayName => "display-name",
+        Some(CLIRuntimeProviderDraftField::BinaryPath) => "binary-path",
+        Some(CLIRuntimeProviderDraftField::HomePath) => "home-path",
+        Some(CLIRuntimeProviderDraftField::ShadowHomePath) => "shadow-home-path",
+        Some(CLIRuntimeProviderDraftField::Id) => "id",
+        Some(CLIRuntimeProviderDraftField::DisplayName) => "display-name",
+        None => "proxy-url",
     }
 }
 

@@ -447,6 +447,9 @@ refresh = "Refresh providers"
 title = "配置 %{provider}"
 api_key_label = "API 密钥 *"
 api_key_placeholder = "输入 API 密钥"
+proxy_label = "Proxy URL"
+proxy_placeholder = "http://user:pass@host:port or socks5://host:port"
+proxy_hint = "Optional workspace-scoped proxy for this provider."
 replace_hint = "%{provider} 已配置密钥。保存后将替换现有密钥。"
 
 [providers.error]
@@ -493,6 +496,8 @@ home_label = "Home/config path"
 home_hint = "Runtime home and configuration directory."
 shadow_home_label = "Shadow home path"
 shadow_home_hint = "Optional account-specific home; leave empty to disable."
+proxy_label = "Proxy URL"
+proxy_placeholder = "http://user:pass@host:port or socks5://host:port"
 
 [providers.cli.action]
 add = "Add CLI Provider"

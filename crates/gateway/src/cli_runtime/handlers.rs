@@ -6833,6 +6833,20 @@ mod tests {
     }
 
     #[test]
+    fn cli_runtime_summary_includes_prepared_proxy_url() {
+        let summary = super::cli_runtime_summary_from_instance(
+            effective_instance("codex_work", true),
+            Some("socks5://user:pass@127.0.0.1:1080".to_owned()),
+        );
+
+        assert_eq!(summary.runtime_id, "codex_work");
+        assert_eq!(
+            summary.proxy_url.as_deref(),
+            Some("socks5://user:pass@127.0.0.1:1080")
+        );
+    }
+
+    #[test]
     fn cli_runtime_status_maps_ready_account_probe() {
         let summary = cli_runtime_summary_from_instance(effective_instance("codex", true));
         let runtime = apply_codex_account_probe_to_summary(

@@ -447,6 +447,9 @@ refresh = "Refresh providers"
 title = "%{provider} कॉन्फ़िगर करें"
 api_key_label = "API कुंजी *"
 api_key_placeholder = "API कुंजी दर्ज करें"
+proxy_label = "Proxy URL"
+proxy_placeholder = "http://user:pass@host:port or socks5://host:port"
+proxy_hint = "Optional workspace-scoped proxy for this provider."
 replace_hint = "%{provider} के लिए पहले से एक कुंजी कॉन्फ़िगर है। सहेजने पर यह बदल जाएगी।"
 
 [providers.error]
@@ -493,6 +496,8 @@ home_label = "Home/config path"
 home_hint = "Runtime home and configuration directory."
 shadow_home_label = "Shadow home path"
 shadow_home_hint = "Optional account-specific home; leave empty to disable."
+proxy_label = "Proxy URL"
+proxy_placeholder = "http://user:pass@host:port or socks5://host:port"
 
 [providers.cli.action]
 add = "Add CLI Provider"

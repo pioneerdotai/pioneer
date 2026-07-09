@@ -10,22 +10,26 @@ use std::process::Command;
 use tracing::warn;
 
 impl PioneerDesktop {
-    pub(super) fn set_provider_api_key(
+    pub(super) fn configure_provider(
         &mut self,
         provider_id: String,
-        api_key: String,
+        api_key: Option<String>,
+        proxy_url: Option<String>,
+        clear_proxy: bool,
         cx: &mut Context<Self>,
     ) {
-        let plan = provider_actions::plan_provider_set_api_key(
+        let plan = provider_actions::plan_provider_configure(
             self.gateway.connection_state == GatewayConnectionState::Connected,
             self.gateway.ws_connection_id,
             self.active_workspace_id().map(str::to_owned),
             provider_id,
             api_key,
+            proxy_url,
+            clear_proxy,
         );
         let request = match plan {
-            provider_actions::ProviderSetApiKeyPlan::Send(request) => request,
-            provider_actions::ProviderSetApiKeyPlan::Unavailable(reason) => {
+            provider_actions::ProviderConfigurePlan::Send(request) => request,
+            provider_actions::ProviderConfigurePlan::Unavailable(reason) => {
                 self.apply_provider_api_key_unavailable(reason);
                 return;
             }
@@ -42,7 +46,7 @@ impl PioneerDesktop {
 
             async move {
                 let result = cx
-                    .background_spawn(async move { ws_sender.provider_set_api_key(params) })
+                    .background_spawn(async move { ws_sender.provider_configure(params) })
                     .await;
 
                 let _ = this.update(&mut cx, |view, cx| {
@@ -54,11 +58,19 @@ impl PioneerDesktop {
                     }
 
                     match result {
-                        Ok(_) => {
-                            provider_actions::apply_provider_set_api_key_success(
+                        Ok(response) => {
+                            provider_actions::apply_provider_configure_success(
                                 &mut view.providers,
                                 canonical_provider_id.clone(),
+                                response.api_key_updated,
+                                response.proxy_url,
                             );
+                            if response.proxy_deleted {
+                                provider_actions::apply_provider_proxy_deleted(
+                                    &mut view.providers,
+                                    canonical_provider_id.as_str(),
+                                );
+                            }
                         }
                         Err(error) => {
                             provider_actions::apply_provider_api_key_failure(
@@ -68,7 +80,7 @@ impl PioneerDesktop {
                             warn!(
                                 provider = canonical_provider_id.as_str(),
                                 error = %format!("{error:#}"),
-                                "failed to set provider api key"
+                                "failed to configure provider"
                             );
                         }
                     }
@@ -197,6 +209,138 @@ impl PioneerDesktop {
                                 runtime_id = runtime_id.as_str(),
                                 error = %format!("{error:#}"),
                                 "failed to start CLI runtime login"
+                            );
+                        }
+                    }
+
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub(super) fn set_cli_runtime_proxy(
+        &mut self,
+        runtime_id: String,
+        proxy_url: String,
+        cx: &mut Context<Self>,
+    ) {
+        let plan = provider_actions::plan_cli_runtime_proxy_set(
+            self.gateway.connection_state == GatewayConnectionState::Connected,
+            self.gateway.ws_connection_id,
+            self.active_workspace_id().map(str::to_owned),
+            runtime_id,
+            proxy_url,
+        );
+        let request = match plan {
+            provider_actions::CLIRuntimeProxySetPlan::Send(request) => request,
+            provider_actions::CLIRuntimeProxySetPlan::Unavailable(reason) => {
+                self.apply_cli_runtime_action_unavailable(reason);
+                return;
+            }
+        };
+
+        let ws_sender = self.gateway.ws_command_sender.clone();
+        provider_actions::mark_provider_api_key_action_started(&mut self.providers);
+
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            let connection_id = request.connection_id;
+            let runtime_id = request.runtime_id.clone();
+            let params = request.params;
+
+            async move {
+                let result = cx
+                    .background_spawn(async move { ws_sender.cli_runtime_proxy_set(params) })
+                    .await;
+
+                let _ = this.update(&mut cx, |view, cx| {
+                    if !provider_actions::provider_api_key_action_matches_connection(
+                        connection_id,
+                        view.gateway.ws_connection_id,
+                    ) {
+                        return;
+                    }
+
+                    match result {
+                        Ok(response) => {
+                            view.providers.apply_cli_runtime_proxy_url(
+                                response.runtime_id.as_str(),
+                                Some(response.proxy_url),
+                            );
+                        }
+                        Err(error) => {
+                            view.providers.apply_cli_runtime_action_failed(format!(
+                                "{}: {error:#}",
+                                t!("providers.error.save_failed")
+                            ));
+                            warn!(
+                                runtime_id = runtime_id.as_str(),
+                                error = %format!("{error:#}"),
+                                "failed to set CLI runtime proxy"
+                            );
+                        }
+                    }
+
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub(super) fn delete_cli_runtime_proxy(&mut self, runtime_id: String, cx: &mut Context<Self>) {
+        let plan = provider_actions::plan_cli_runtime_proxy_delete(
+            self.gateway.connection_state == GatewayConnectionState::Connected,
+            self.gateway.ws_connection_id,
+            self.active_workspace_id().map(str::to_owned),
+            runtime_id,
+        );
+        let request = match plan {
+            provider_actions::CLIRuntimeProxyDeletePlan::Send(request) => request,
+            provider_actions::CLIRuntimeProxyDeletePlan::Unavailable(reason) => {
+                self.apply_cli_runtime_action_unavailable(reason);
+                return;
+            }
+        };
+
+        let ws_sender = self.gateway.ws_command_sender.clone();
+        provider_actions::mark_provider_api_key_action_started(&mut self.providers);
+
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            let connection_id = request.connection_id;
+            let runtime_id = request.runtime_id.clone();
+            let params = request.params;
+
+            async move {
+                let result = cx
+                    .background_spawn(async move { ws_sender.cli_runtime_proxy_delete(params) })
+                    .await;
+
+                let _ = this.update(&mut cx, |view, cx| {
+                    if !provider_actions::provider_api_key_action_matches_connection(
+                        connection_id,
+                        view.gateway.ws_connection_id,
+                    ) {
+                        return;
+                    }
+
+                    match result {
+                        Ok(response) => {
+                            view.providers
+                                .apply_cli_runtime_proxy_url(response.runtime_id.as_str(), None);
+                        }
+                        Err(error) => {
+                            view.providers.apply_cli_runtime_action_failed(format!(
+                                "{}: {error:#}",
+                                t!("providers.error.delete_failed")
+                            ));
+                            warn!(
+                                runtime_id = runtime_id.as_str(),
+                                error = %format!("{error:#}"),
+                                "failed to delete CLI runtime proxy"
                             );
                         }
                     }

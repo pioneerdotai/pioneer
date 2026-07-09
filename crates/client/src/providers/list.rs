@@ -1107,6 +1107,86 @@ mod tests {
     }
 
     #[test]
+    fn provider_proxy_urls_are_canonicalized_and_cleared_with_gateway_state() {
+        let providers = vec![
+            ProviderSummary {
+                name: "OpenRouter".to_owned(),
+                capabilities: Default::default(),
+                api_key_configured: true,
+                proxy_url: Some("socks5://127.0.0.1:1080".to_owned()),
+            },
+            ProviderSummary {
+                name: "AWS_Bedrock".to_owned(),
+                capabilities: Default::default(),
+                api_key_configured: false,
+                proxy_url: Some("http://127.0.0.1:8080".to_owned()),
+            },
+        ];
+
+        let proxies = provider_proxy_urls_from_list(&providers);
+        assert_eq!(
+            proxies.get("openrouter").map(String::as_str),
+            Some("socks5://127.0.0.1:1080")
+        );
+        assert_eq!(
+            proxies.get("bedrock").map(String::as_str),
+            Some("http://127.0.0.1:8080")
+        );
+
+        let mut state = ProviderListState::default();
+        state.apply_refresh_response(ProviderListResponse { providers });
+        assert_eq!(
+            state.provider_proxy_url("openrouter"),
+            Some("socks5://127.0.0.1:1080")
+        );
+        assert_eq!(
+            state.provider_proxy_url("bedrock"),
+            Some("http://127.0.0.1:8080")
+        );
+
+        state.clear_for_gateway_switch();
+        assert_eq!(state.provider_proxy_url("openrouter"), None);
+        assert_eq!(state.provider_proxy_url("bedrock"), None);
+    }
+
+    #[test]
+    fn cli_runtime_proxy_url_sets_clears_and_uses_refresh_payload() {
+        let mut state = ProviderListState::default();
+        state.apply_cli_runtime_refresh_response(
+            CLIRuntimeRefreshResponse {
+                runtimes: vec![runtime_summary("codex", "Codex CLI", RuntimeStatus::Ready)],
+            },
+            1_000,
+        );
+
+        state.apply_cli_runtime_proxy_url(
+            "codex",
+            Some("http://user:pass@127.0.0.1:8080".to_owned()),
+        );
+        assert_eq!(
+            state.cli_runtime_proxy_url("codex"),
+            Some("http://user:pass@127.0.0.1:8080")
+        );
+
+        state.apply_cli_runtime_refresh_response(
+            CLIRuntimeRefreshResponse {
+                runtimes: vec![RuntimeSummary {
+                    proxy_url: Some("http://user:pass@127.0.0.1:8080".to_owned()),
+                    ..runtime_summary("codex", "Codex CLI", RuntimeStatus::Ready)
+                }],
+            },
+            2_000,
+        );
+        assert_eq!(
+            state.cli_runtime_proxy_url("codex"),
+            Some("http://user:pass@127.0.0.1:8080")
+        );
+
+        state.apply_cli_runtime_proxy_url("codex", None);
+        assert_eq!(state.cli_runtime_proxy_url("codex"), None);
+    }
+
+    #[test]
     fn provider_list_refresh_plan_requires_gateway_and_workspace() {
         assert!(matches!(
             plan_provider_list_refresh(false, Some(7), Some("ws".to_owned())),

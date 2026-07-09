@@ -447,6 +447,9 @@ refresh = "Refresh providers"
 title = "Configurer %{provider}"
 api_key_label = "Clé API *"
 api_key_placeholder = "Saisissez la clé API"
+proxy_label = "Proxy URL"
+proxy_placeholder = "http://user:pass@host:port or socks5://host:port"
+proxy_hint = "Optional workspace-scoped proxy for this provider."
 replace_hint = "Une clé est déjà configurée pour %{provider}. L'enregistrement la remplacera."
 
 [providers.error]
@@ -493,6 +496,8 @@ home_label = "Home/config path"
 home_hint = "Runtime home and configuration directory."
 shadow_home_label = "Shadow home path"
 shadow_home_hint = "Optional account-specific home; leave empty to disable."
+proxy_label = "Proxy URL"
+proxy_placeholder = "http://user:pass@host:port or socks5://host:port"
 
 [providers.cli.action]
 add = "Add CLI Provider"

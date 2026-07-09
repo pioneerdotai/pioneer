@@ -447,6 +447,9 @@ refresh = "Обновить провайдеров"
 title = "Настроить %{provider}"
 api_key_label = "API Key *"
 api_key_placeholder = "Введите API ключ"
+proxy_label = "Proxy URL"
+proxy_placeholder = "http://user:pass@host:port или socks5://host:port"
+proxy_hint = "Необязательный workspace-прокси для этого провайдера."
 replace_hint = "Для %{provider} уже настроен ключ. Сохранение заменит его."
 
 [providers.error]
@@ -493,6 +496,8 @@ home_label = "Домашняя директория/конфиг"
 home_hint = "Домашняя директория runtime и конфигов."
 shadow_home_label = "Shadow home"
 shadow_home_hint = "Необязательная отдельная домашняя директория аккаунта; оставьте пустым, чтобы отключить."
+proxy_label = "Proxy URL"
+proxy_placeholder = "http://user:pass@host:port или socks5://host:port"
 
 [providers.cli.action]
 add = "Добавить CLI провайдер"

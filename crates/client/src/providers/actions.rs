@@ -366,6 +366,50 @@ mod tests {
     }
 
     #[test]
+    fn configure_plan_builds_api_key_proxy_and_clear_params() {
+        let plan = plan_provider_configure(
+            true,
+            Some(42),
+            Some("workspace".to_owned()),
+            "OpenRouter".to_owned(),
+            Some("sk-test".to_owned()),
+            Some("socks5://127.0.0.1:1080".to_owned()),
+            false,
+        );
+
+        let ProviderConfigurePlan::Send(request) = plan else {
+            panic!("expected send plan");
+        };
+        assert_eq!(request.connection_id, 42);
+        assert_eq!(request.canonical_provider_id, "openrouter");
+        assert_eq!(request.params.workspace_id, "workspace");
+        assert_eq!(request.params.provider, "OpenRouter");
+        assert_eq!(request.params.api_key.as_deref(), Some("sk-test"));
+        assert_eq!(
+            request.params.proxy_url.as_deref(),
+            Some("socks5://127.0.0.1:1080")
+        );
+        assert!(!request.params.clear_proxy);
+
+        let plan = plan_provider_configure(
+            true,
+            Some(43),
+            Some("workspace".to_owned()),
+            "OpenRouter".to_owned(),
+            None,
+            None,
+            true,
+        );
+        let ProviderConfigurePlan::Send(request) = plan else {
+            panic!("expected send plan");
+        };
+        assert_eq!(request.connection_id, 43);
+        assert!(request.params.api_key.is_none());
+        assert!(request.params.proxy_url.is_none());
+        assert!(request.params.clear_proxy);
+    }
+
+    #[test]
     fn cli_runtime_login_start_plan_builds_runtime_params() {
         let plan = plan_cli_runtime_login_start(
             true,
@@ -417,6 +461,62 @@ mod tests {
     }
 
     #[test]
+    fn cli_runtime_proxy_plans_build_set_and_delete_params() {
+        let plan = plan_cli_runtime_proxy_set(
+            true,
+            Some(42),
+            Some("workspace".to_owned()),
+            "codex_work".to_owned(),
+            "http://user:pass@127.0.0.1:8080".to_owned(),
+        );
+
+        let CLIRuntimeProxySetPlan::Send(request) = plan else {
+            panic!("expected set plan");
+        };
+        assert_eq!(request.connection_id, 42);
+        assert_eq!(request.runtime_id, "codex_work");
+        assert_eq!(request.params.workspace_id, "workspace");
+        assert_eq!(request.params.runtime_id, "codex_work");
+        assert_eq!(request.params.proxy_url, "http://user:pass@127.0.0.1:8080");
+
+        let plan = plan_cli_runtime_proxy_delete(
+            true,
+            Some(43),
+            Some("workspace".to_owned()),
+            "codex_work".to_owned(),
+        );
+        let CLIRuntimeProxyDeletePlan::Send(request) = plan else {
+            panic!("expected delete plan");
+        };
+        assert_eq!(request.connection_id, 43);
+        assert_eq!(request.runtime_id, "codex_work");
+        assert_eq!(request.params.workspace_id, "workspace");
+        assert_eq!(request.params.runtime_id, "codex_work");
+    }
+
+    #[test]
+    fn cli_runtime_proxy_plans_report_unavailable_reasons() {
+        assert!(matches!(
+            plan_cli_runtime_proxy_set(
+                false,
+                None,
+                Some("workspace".to_owned()),
+                "codex".to_owned(),
+                "http://127.0.0.1:8080".to_owned(),
+            ),
+            CLIRuntimeProxySetPlan::Unavailable(
+                ProviderApiKeyActionUnavailable::GatewayNotConnected
+            )
+        ));
+        assert!(matches!(
+            plan_cli_runtime_proxy_delete(true, Some(7), None, "codex".to_owned()),
+            CLIRuntimeProxyDeletePlan::Unavailable(
+                ProviderApiKeyActionUnavailable::WorkspaceNotSelected
+            )
+        ));
+    }
+
+    #[test]
     fn api_key_result_helpers_update_provider_state() {
         let mut providers = ProviderListState::default();
 
@@ -431,6 +531,33 @@ mod tests {
         apply_provider_delete_api_key_success(&mut providers, "openai");
         assert!(!providers.is_configured("openai"));
         assert!(providers.error().is_none());
+    }
+
+    #[test]
+    fn provider_proxy_result_helpers_update_provider_state() {
+        let mut providers = ProviderListState::default();
+
+        apply_provider_configure_success(
+            &mut providers,
+            "openrouter".to_owned(),
+            false,
+            Some("socks5://127.0.0.1:1080".to_owned()),
+        );
+        assert_eq!(
+            providers.provider_proxy_url("openrouter"),
+            Some("socks5://127.0.0.1:1080")
+        );
+        assert!(!providers.is_configured("openrouter"));
+
+        apply_provider_configure_success(&mut providers, "openrouter".to_owned(), true, None);
+        assert!(providers.is_configured("openrouter"));
+        assert_eq!(
+            providers.provider_proxy_url("openrouter"),
+            Some("socks5://127.0.0.1:1080")
+        );
+
+        apply_provider_proxy_deleted(&mut providers, "openrouter");
+        assert_eq!(providers.provider_proxy_url("openrouter"), None);
     }
 
     #[test]
