@@ -23,7 +23,7 @@ const UPDATE_ERROR_PLATFORM_SELECTION: &str = "platform_selection";
 const UPDATE_ERROR_DOWNLOAD: &str = "download";
 const UPDATE_ERROR_VERIFY: &str = "verify";
 const UPDATE_ERROR_READY_STATE_HASH: &str = "ready_state_hash";
-const FAILED_CHECK_COOLDOWN_SECS: u64 = 6 * 60 * 60;
+const FAILED_CHECK_COOLDOWN_SECS: u64 = 5 * 60;
 
 impl PioneerDesktop {
     pub(crate) fn start_desktop_update_check(&mut self, cx: &mut Context<Self>) {
