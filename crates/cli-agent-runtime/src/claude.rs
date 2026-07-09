@@ -2,6 +2,7 @@
 
 use crate::process::expand_home_path;
 use serde_json::Value as JsonValue;
+use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -17,6 +18,7 @@ pub struct ClaudeAccountProbeConfig {
     pub executable: String,
     pub config_dir_path: String,
     pub home_dir: Option<PathBuf>,
+    pub env: BTreeMap<String, String>,
     pub request_timeout: Duration,
 }
 
@@ -112,6 +114,12 @@ impl ClaudeProbe {
         command.env("CLAUDE_CONFIG_DIR", &config_dir);
         command.env("CLAUDE_CODE_ENTRYPOINT", "sdk-rs");
         command.env("CLAUDE_AGENT_SDK_CLIENT_APP", "pioneer");
+        command.envs(
+            config
+                .env
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        );
         command.env_remove("CLAUDECODE");
 
         let output = match timeout(config.request_timeout, command.output()).await {
@@ -393,6 +401,12 @@ async fn run_initialize_probe(
         .env("CLAUDE_CODE_ENTRYPOINT", "sdk-rs")
         .env("CLAUDE_AGENT_SDK_CLIENT_APP", "pioneer")
         .env("CLAUDE_AGENT_SDK_VERSION", env!("CARGO_PKG_VERSION"))
+        .envs(
+            config
+                .env
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        )
         .env_remove("CLAUDECODE")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

@@ -763,6 +763,7 @@ pub struct CodexAccountProbeConfig {
     pub shadow_home_path: Option<String>,
     pub cwd: Option<PathBuf>,
     pub home_dir: Option<PathBuf>,
+    pub env: BTreeMap<String, String>,
     pub initialize_timeout: Duration,
     pub request_timeout: Duration,
     pub shutdown_grace: Duration,
@@ -973,6 +974,9 @@ pub fn codex_app_server_process_config(
     }
     if let Some(home_dir) = config.home_dir.as_ref() {
         process_config = process_config.with_home_dir(home_dir);
+    }
+    for (key, value) in &config.env {
+        process_config = process_config.with_env(key, value);
     }
     Ok(process_config)
 }
@@ -4933,6 +4937,7 @@ while read line; do :; done
             shadow_home_path: None,
             cwd: Some(root.to_path_buf()),
             home_dir: None,
+            env: BTreeMap::new(),
             initialize_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(5),
             shutdown_grace: Duration::from_millis(100),
