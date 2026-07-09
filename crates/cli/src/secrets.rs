@@ -153,6 +153,12 @@ pub(crate) fn format_status_human(report: &SecretsStatusReport) -> String {
         "Provider API keys: {}",
         report.counts.provider_api_key
     );
+    let _ = writeln!(output, "Provider proxies: {}", report.counts.provider_proxy);
+    let _ = writeln!(
+        output,
+        "CLI runtime proxies: {}",
+        report.counts.cli_runtime_proxy
+    );
     let _ = writeln!(output, "MCP secrets: {}", report.counts.mcp_secret);
     let _ = writeln!(
         output,
@@ -478,6 +484,8 @@ mod tests {
             },
             counts: SecretKindCounts {
                 provider_api_key: 1,
+                provider_proxy: 1,
+                cli_runtime_proxy: 1,
                 mcp_secret: 2,
                 superuser_jwt_token: 1,
                 user_jwt_token: 0,
@@ -485,7 +493,7 @@ mod tests {
                 gateway_remote_access_secret: 0,
                 unknown: 0,
             },
-            total_entries: 5,
+            total_entries: 7,
             permissions: vec![SecretPermissionHealthReport {
                 path: PathBuf::from("/tmp/pioneer"),
                 target: "runtime_home".to_owned(),
