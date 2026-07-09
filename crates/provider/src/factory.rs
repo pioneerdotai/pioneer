@@ -16,6 +16,26 @@ pub fn create_provider_with_timeout_policy(
     api_key: &str,
     timeout_policy: ProviderTimeoutPolicy,
 ) -> Result<Box<dyn Provider>> {
+    create_provider_with_timeout_policy_and_proxy(provider_name, api_key, timeout_policy, None)
+}
+
+pub fn create_provider_with_timeout_policy_and_proxy(
+    provider_name: &str,
+    api_key: &str,
+    timeout_policy: ProviderTimeoutPolicy,
+    proxy_url: Option<&str>,
+) -> Result<Box<dyn Provider>> {
+    let proxy_url = proxy_url.map(crate::http::validate_proxy_url).transpose()?;
+    crate::http::with_provider_proxy(proxy_url.as_deref(), || {
+        create_provider_with_timeout_policy_inner(provider_name, api_key, timeout_policy)
+    })
+}
+
+fn create_provider_with_timeout_policy_inner(
+    provider_name: &str,
+    api_key: &str,
+    timeout_policy: ProviderTimeoutPolicy,
+) -> Result<Box<dyn Provider>> {
     let compat = |name: &str, base_url: &str, api_key: &str| {
         compat(name, base_url, api_key).with_timeout_policy(timeout_policy)
     };

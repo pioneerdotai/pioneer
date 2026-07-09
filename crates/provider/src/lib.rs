@@ -26,6 +26,7 @@ pub use attachments::{
     set_default_attachment_pipeline_config,
 };
 pub use factory::create_provider;
+pub use http::validate_proxy_url;
 pub use registry::ProviderRegistry;
 pub use traits::Provider;
 pub use types::{

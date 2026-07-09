@@ -3,7 +3,7 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
 
-use crate::factory::create_provider_with_timeout_policy;
+use crate::factory::create_provider_with_timeout_policy_and_proxy;
 use crate::traits::Provider;
 use crate::types::ProviderTimeoutPolicy;
 
@@ -11,6 +11,7 @@ use crate::types::ProviderTimeoutPolicy;
 struct ProviderCacheKey {
     workspace_id: Option<String>,
     provider_name: String,
+    proxy_url: Option<String>,
 }
 
 impl ProviderCacheKey {
@@ -18,13 +19,15 @@ impl ProviderCacheKey {
         Self {
             workspace_id: None,
             provider_name: provider_name.to_owned(),
+            proxy_url: None,
         }
     }
 
-    fn workspace(workspace_id: &str, provider_name: &str) -> Self {
+    fn workspace(workspace_id: &str, provider_name: &str, proxy_url: Option<String>) -> Self {
         Self {
             workspace_id: Some(workspace_id.to_owned()),
             provider_name: provider_name.to_owned(),
+            proxy_url,
         }
     }
 }
@@ -38,6 +41,7 @@ impl ProviderCacheKey {
 pub struct ProviderRegistry {
     cache: RwLock<HashMap<ProviderCacheKey, Arc<dyn Provider>>>,
     key_resolver: Box<dyn Fn(Option<&str>, &str) -> String + Send + Sync>,
+    proxy_resolver: Box<dyn Fn(Option<&str>, &str) -> Option<String> + Send + Sync>,
     timeout_policy: ProviderTimeoutPolicy,
 }
 
@@ -57,6 +61,7 @@ impl ProviderRegistry {
         Self {
             cache: RwLock::new(HashMap::new()),
             key_resolver: Box::new(move |_, provider_name| key_resolver(provider_name)),
+            proxy_resolver: Box::new(|_, _| None),
             timeout_policy,
         }
     }
@@ -71,9 +76,18 @@ impl ProviderRegistry {
         key_resolver: impl Fn(Option<&str>, &str) -> String + Send + Sync + 'static,
         timeout_policy: ProviderTimeoutPolicy,
     ) -> Self {
+        Self::new_scoped_with_timeout_policy_and_proxy(key_resolver, |_, _| None, timeout_policy)
+    }
+
+    pub fn new_scoped_with_timeout_policy_and_proxy(
+        key_resolver: impl Fn(Option<&str>, &str) -> String + Send + Sync + 'static,
+        proxy_resolver: impl Fn(Option<&str>, &str) -> Option<String> + Send + Sync + 'static,
+        timeout_policy: ProviderTimeoutPolicy,
+    ) -> Self {
         Self {
             cache: RwLock::new(HashMap::new()),
             key_resolver: Box::new(key_resolver),
+            proxy_resolver: Box::new(proxy_resolver),
             timeout_policy,
         }
     }
@@ -87,7 +101,12 @@ impl ProviderRegistry {
         workspace_id: &str,
         provider_name: &str,
     ) -> Result<Arc<dyn Provider>> {
-        self.get_or_create_with_key(ProviderCacheKey::workspace(workspace_id, provider_name))
+        let proxy_url = (self.proxy_resolver)(Some(workspace_id), provider_name);
+        self.get_or_create_with_key(ProviderCacheKey::workspace(
+            workspace_id,
+            provider_name,
+            proxy_url,
+        ))
     }
 
     fn get_or_create_with_key(&self, key: ProviderCacheKey) -> Result<Arc<dyn Provider>> {
@@ -97,6 +116,7 @@ impl ProviderRegistry {
                 return Ok(provider.clone());
             }
             if key.workspace_id.is_some()
+                && key.proxy_url.is_none()
                 && let Some(provider) = cache.get(&ProviderCacheKey::global(&key.provider_name))
             {
                 return Ok(provider.clone());
@@ -108,16 +128,18 @@ impl ProviderRegistry {
             return Ok(provider.clone());
         }
         if key.workspace_id.is_some()
+            && key.proxy_url.is_none()
             && let Some(provider) = cache.get(&ProviderCacheKey::global(&key.provider_name))
         {
             return Ok(provider.clone());
         }
 
         let api_key = (self.key_resolver)(key.workspace_id.as_deref(), key.provider_name.as_str());
-        let provider: Arc<dyn Provider> = Arc::from(create_provider_with_timeout_policy(
+        let provider: Arc<dyn Provider> = Arc::from(create_provider_with_timeout_policy_and_proxy(
             &key.provider_name,
             &api_key,
             self.timeout_policy,
+            key.proxy_url.as_deref(),
         )?);
         cache.insert(key, provider.clone());
         Ok(provider)
@@ -143,6 +165,7 @@ impl ProviderRegistry {
         Self {
             cache: RwLock::new(cache),
             key_resolver: Box::new(|_, _| String::new()),
+            proxy_resolver: Box::new(|_, _| None),
             timeout_policy: ProviderTimeoutPolicy::default(),
         }
     }
@@ -235,5 +258,34 @@ mod tests {
                 (Some("workspace-2".to_owned()), "ollama".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn scoped_registry_cache_key_includes_workspace_proxy() {
+        use std::sync::Mutex;
+
+        let proxy_url = Arc::new(Mutex::new("http://127.0.0.1:8080".to_owned()));
+        let proxy_url_clone = proxy_url.clone();
+        let registry = ProviderRegistry::new_scoped_with_timeout_policy_and_proxy(
+            |_, _| String::new(),
+            move |workspace_id, _| {
+                workspace_id.map(|_| proxy_url_clone.lock().expect("proxy lock").clone())
+            },
+            ProviderTimeoutPolicy::default(),
+        );
+
+        let first = registry
+            .get_or_create_for_workspace("workspace-1", "ollama")
+            .unwrap();
+        let second = registry
+            .get_or_create_for_workspace("workspace-1", "ollama")
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+
+        *proxy_url.lock().expect("proxy lock") = "http://127.0.0.1:8081".to_owned();
+        let after_proxy_change = registry
+            .get_or_create_for_workspace("workspace-1", "ollama")
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first, &after_proxy_change));
     }
 }

@@ -138,7 +138,7 @@ rust-i18n = "4"
 sys-locale = "0.3"
 
 # HTTP
-reqwest = { version = "0.13", features = ["json", "query", "stream", "multipart", "blocking"] }
+reqwest = { version = "0.13", features = ["json", "query", "stream", "multipart", "blocking", "socks"] }
 http = "1"
 rathole = { git = "https://github.com/pioneerdotai/relay.git", default-features = false, features = ["client"] }
 
