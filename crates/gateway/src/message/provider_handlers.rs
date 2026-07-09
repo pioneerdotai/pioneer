@@ -37,10 +37,39 @@ impl MessageProcessor {
                 return;
             }
         };
+        let provider_proxies = match self
+            .gateway_secrets
+            .list_workspace_provider_proxies(workspace_id.as_str())
+        {
+            Ok(provider_proxies) => provider_proxies,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to list provider proxies: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
 
-        let providers = provider_names
+        let mut provider_configs = std::collections::BTreeMap::new();
+        for name in provider_names {
+            provider_configs.insert(name, (true, None));
+        }
+        for (name, proxy_url) in provider_proxies {
+            provider_configs
+                .entry(name)
+                .and_modify(|(_, existing_proxy)| *existing_proxy = Some(proxy_url.clone()))
+                .or_insert((false, Some(proxy_url)));
+        }
+
+        let providers = provider_configs
             .into_iter()
-            .map(|name| {
+            .map(|(name, (api_key_configured, proxy_url))| {
                 let capabilities = self
                     .provider_registry
                     .get_or_create_for_workspace(workspace_id.as_str(), name.as_str())
@@ -52,7 +81,12 @@ impl MessageProcessor {
                     })
                     .unwrap_or_default();
 
-                ProviderSummary { name, capabilities }
+                ProviderSummary {
+                    name,
+                    capabilities,
+                    api_key_configured,
+                    proxy_url,
+                }
             })
             .collect::<Vec<_>>();
 
@@ -290,6 +324,264 @@ impl MessageProcessor {
                 )
                 .await;
             }
+        }
+    }
+
+    pub(super) async fn provider_configure(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        params: ProviderConfigureParams,
+    ) {
+        let Some(workspace_id) = self
+            .validate_provider_workspace(
+                connection_id,
+                request_id.clone(),
+                methods::PROVIDER_CONFIGURE,
+                params.workspace_id.clone(),
+            )
+            .await
+        else {
+            return;
+        };
+
+        if params.provider.trim().is_empty() {
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_PARAMS_CODE,
+                    format!(
+                        "invalid params for `{}`: `provider` is required",
+                        methods::PROVIDER_CONFIGURE
+                    ),
+                ),
+            )
+            .await;
+            return;
+        }
+
+        let requested_provider = params.provider.as_str();
+        if let Err(error) = self
+            .gateway_secrets
+            .normalize_provider_name(requested_provider)
+        {
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_PARAMS_CODE,
+                    format!(
+                        "invalid params for `{}`: invalid `provider`: {error:#}",
+                        methods::PROVIDER_CONFIGURE
+                    ),
+                ),
+            )
+            .await;
+            return;
+        }
+
+        if params.clear_proxy && params.proxy_url.is_some() {
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_PARAMS_CODE,
+                    format!(
+                        "invalid params for `{}`: `proxy_url` and `clear_proxy` cannot both be set",
+                        methods::PROVIDER_CONFIGURE
+                    ),
+                ),
+            )
+            .await;
+            return;
+        }
+
+        let api_key = match params.api_key {
+            Some(api_key) => {
+                let trimmed = api_key.trim().to_owned();
+                if trimmed.is_empty() {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_PARAMS_CODE,
+                            format!(
+                                "invalid params for `{}`: `api_key` must not be empty when provided",
+                                methods::PROVIDER_CONFIGURE
+                            ),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+                Some(trimmed)
+            }
+            None => None,
+        };
+        let proxy_url = match params.proxy_url {
+            Some(proxy_url) => match pioneer_provider::validate_proxy_url(proxy_url.as_str()) {
+                Ok(proxy_url) => Some(proxy_url),
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_PARAMS_CODE,
+                            format!(
+                                "invalid params for `{}`: {error:#}",
+                                methods::PROVIDER_CONFIGURE
+                            ),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            },
+            None => None,
+        };
+
+        let raw_provider = params.provider;
+        let mut normalized_provider = match self
+            .gateway_secrets
+            .normalize_provider_name(raw_provider.as_str())
+        {
+            Ok(normalized_provider) => normalized_provider,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_PARAMS_CODE,
+                        format!(
+                            "invalid params for `{}`: invalid `provider`: {error:#}",
+                            methods::PROVIDER_CONFIGURE
+                        ),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+        let mut api_key_updated = false;
+        if let Some(api_key) = api_key {
+            match self.gateway_secrets.set_workspace_provider_api_key(
+                workspace_id.as_str(),
+                raw_provider.as_str(),
+                api_key.as_str(),
+            ) {
+                Ok(provider) => {
+                    normalized_provider = provider;
+                    api_key_updated = true;
+                }
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!("failed to save provider api key: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+
+        let mut proxy_updated = false;
+        let mut proxy_deleted = false;
+        let mut response_proxy_url = self
+            .gateway_secrets
+            .get_workspace_provider_proxy(workspace_id.as_str(), raw_provider.as_str())
+            .ok()
+            .flatten();
+        if let Some(proxy_url) = proxy_url {
+            match self.gateway_secrets.set_workspace_provider_proxy(
+                workspace_id.as_str(),
+                raw_provider.as_str(),
+                proxy_url.as_str(),
+            ) {
+                Ok(provider) => {
+                    normalized_provider = provider;
+                    proxy_updated = true;
+                    response_proxy_url = Some(proxy_url);
+                }
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!("failed to save provider proxy: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        } else if params.clear_proxy {
+            match self
+                .gateway_secrets
+                .delete_workspace_provider_proxy(workspace_id.as_str(), raw_provider.as_str())
+            {
+                Ok((provider, deleted)) => {
+                    normalized_provider = provider;
+                    proxy_deleted = deleted;
+                    response_proxy_url = None;
+                }
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!("failed to delete provider proxy: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+
+        if api_key_updated || proxy_updated || proxy_deleted {
+            self.provider_registry.invalidate(raw_provider.as_str());
+            if raw_provider != normalized_provider {
+                self.provider_registry
+                    .invalidate(normalized_provider.as_str());
+            }
+        }
+
+        let response = ProviderConfigureResponse {
+            provider: normalized_provider,
+            api_key_updated,
+            proxy_updated,
+            proxy_deleted,
+            proxy_url: response_proxy_url,
+        };
+        let response = match JsonRpcResponse::from_result(request_id, &response) {
+            Ok(response) => response,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        None,
+                        INVALID_REQUEST_CODE,
+                        format!("failed to encode response: {error}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+
+        if let Err(error) = self.send_json(connection_id, &response).await {
+            warn!(
+                connection_id,
+                error = %format!("{error:#}"),
+                "failed to send provider/configure response"
+            );
         }
     }
 

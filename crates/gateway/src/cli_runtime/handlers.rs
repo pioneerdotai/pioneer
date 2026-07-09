@@ -1,6 +1,7 @@
 use super::*;
 use crate::cli_runtime::config::{
-    claude_account_probe_config_from_instance, codex_account_probe_config_from_instance,
+    claude_account_probe_config_from_instance_with_proxy,
+    codex_account_probe_config_from_instance_with_proxy,
 };
 use crate::cli_runtime::manager::{
     CLIAgentRuntimeCodexEventReceivers, CLIAgentRuntimeSession, CLIAgentRuntimeSessionHandle,
@@ -53,7 +54,7 @@ impl MessageProcessor {
         request_id: RequestId,
         params: CLIRuntimeListParams,
     ) {
-        let Some(_workspace_id) = self
+        let Some(workspace_id) = self
             .validate_cli_runtime_workspace(
                 connection_id,
                 request_id.clone(),
@@ -65,7 +66,7 @@ impl MessageProcessor {
             return;
         };
 
-        let runtimes = match self.load_cli_runtime_summaries() {
+        let runtimes = match self.load_cli_runtime_summaries(workspace_id.as_str()).await {
             Ok(runtimes) => runtimes,
             Err(error) => {
                 self.send_error(
@@ -96,7 +97,7 @@ impl MessageProcessor {
         request_id: RequestId,
         params: CLIRuntimeGetParams,
     ) {
-        let Some(_workspace_id) = self
+        let Some(workspace_id) = self
             .validate_cli_runtime_workspace(
                 connection_id,
                 request_id.clone(),
@@ -112,6 +113,7 @@ impl MessageProcessor {
             .load_cli_runtime_live_summary_by_id(
                 connection_id,
                 request_id.clone(),
+                workspace_id.as_str(),
                 &params.runtime_id,
             )
             .await
@@ -134,7 +136,7 @@ impl MessageProcessor {
         request_id: RequestId,
         params: CLIRuntimeStatusParams,
     ) {
-        let Some(_workspace_id) = self
+        let Some(workspace_id) = self
             .validate_cli_runtime_workspace(
                 connection_id,
                 request_id.clone(),
@@ -147,7 +149,12 @@ impl MessageProcessor {
         };
 
         let Some(runtime) = self
-            .load_cli_runtime_summary_by_id(connection_id, request_id.clone(), &params.runtime_id)
+            .load_cli_runtime_summary_by_id(
+                connection_id,
+                request_id.clone(),
+                workspace_id.as_str(),
+                &params.runtime_id,
+            )
             .await
         else {
             return;
@@ -168,7 +175,7 @@ impl MessageProcessor {
         request_id: RequestId,
         params: CLIRuntimeRefreshParams,
     ) {
-        let Some(_workspace_id) = self
+        let Some(workspace_id) = self
             .validate_cli_runtime_workspace(
                 connection_id,
                 request_id.clone(),
@@ -210,7 +217,10 @@ impl MessageProcessor {
         };
         let mut runtimes = Vec::with_capacity(instances.len());
         for instance in instances {
-            runtimes.push(self.cli_runtime_live_summary_from_instance(instance).await);
+            runtimes.push(
+                self.cli_runtime_live_summary_from_instance(workspace_id.as_str(), instance)
+                    .await,
+            );
         }
 
         self.send_cli_runtime_response(
@@ -228,7 +238,7 @@ impl MessageProcessor {
         request_id: RequestId,
         params: CLIRuntimeListModelsParams,
     ) {
-        let Some(_workspace_id) = self
+        let Some(workspace_id) = self
             .validate_cli_runtime_workspace(
                 connection_id,
                 request_id.clone(),
@@ -250,14 +260,26 @@ impl MessageProcessor {
         let model_list = if instance.enabled {
             match instance.kind {
                 GatewayCliAgentRuntimeKindConfig::Codex => {
-                    let probe =
-                        CodexProbe::model_list(codex_account_probe_config_from_instance(&instance))
-                            .await;
+                    let proxy_url = self
+                        .cli_runtime_proxy_url(workspace_id.as_str(), instance.id.as_str())
+                        .await;
+                    let probe = CodexProbe::model_list(
+                        codex_account_probe_config_from_instance_with_proxy(
+                            &instance,
+                            proxy_url.as_deref(),
+                        ),
+                    )
+                    .await;
                     runtime_model_list_from_codex_probe(probe, &instance.custom_models)
                 }
                 GatewayCliAgentRuntimeKindConfig::Claude => runtime_model_list_from_claude_probe(
                     ClaudeProbe::model_list(
-                        claude_account_probe_config_from_instance(&instance),
+                        claude_account_probe_config_from_instance_with_proxy(
+                            &instance,
+                            self.cli_runtime_proxy_url(workspace_id.as_str(), instance.id.as_str())
+                                .await
+                                .as_deref(),
+                        ),
                         &instance.custom_models,
                     )
                     .await,
@@ -666,7 +688,19 @@ impl MessageProcessor {
                     return;
                 }
             };
-            let handle = match manager.get_or_start(key).await {
+            let proxy_url = self
+                .cli_runtime_proxy_url(workspace_id.as_str(), params.runtime_id.as_str())
+                .await;
+            let handle = match manager
+                .get_or_start_with_options(
+                    key,
+                    crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
+                        env: crate::cli_runtime::config::proxy_env(proxy_url.as_deref()),
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
                 Ok(handle) => handle,
                 Err(error) => {
                     self.send_error(
@@ -1167,7 +1201,7 @@ impl MessageProcessor {
         request_id: RequestId,
         params: CLIRuntimeLoginStartParams,
     ) {
-        let Some(_workspace_id) = self
+        let Some(workspace_id) = self
             .validate_cli_runtime_workspace(
                 connection_id,
                 request_id.clone(),
@@ -1189,8 +1223,14 @@ impl MessageProcessor {
         let response = if instance.enabled {
             match instance.kind {
                 GatewayCliAgentRuntimeKindConfig::Codex => {
+                    let proxy_url = self
+                        .cli_runtime_proxy_url(workspace_id.as_str(), instance.id.as_str())
+                        .await;
                     let snapshot = CodexProbe::login_start(
-                        codex_account_probe_config_from_instance(&instance),
+                        codex_account_probe_config_from_instance_with_proxy(
+                            &instance,
+                            proxy_url.as_deref(),
+                        ),
                         cli_runtime_login_start_type_to_codex(params.login_type),
                     )
                     .await;
@@ -1247,7 +1287,7 @@ impl MessageProcessor {
         request_id: RequestId,
         params: CLIRuntimeLoginCancelParams,
     ) {
-        let Some(_workspace_id) = self
+        let Some(workspace_id) = self
             .validate_cli_runtime_workspace(
                 connection_id,
                 request_id.clone(),
@@ -1269,8 +1309,14 @@ impl MessageProcessor {
         let cancelled = if instance.enabled {
             match instance.kind {
                 GatewayCliAgentRuntimeKindConfig::Codex => {
+                    let proxy_url = self
+                        .cli_runtime_proxy_url(workspace_id.as_str(), instance.id.as_str())
+                        .await;
                     CodexProbe::login_cancel(
-                        codex_account_probe_config_from_instance(&instance),
+                        codex_account_probe_config_from_instance_with_proxy(
+                            &instance,
+                            proxy_url.as_deref(),
+                        ),
                         params.login_id.clone(),
                     )
                     .await
@@ -1306,6 +1352,148 @@ impl MessageProcessor {
                 runtime_id: params.runtime_id,
                 login_id: params.login_id,
                 cancelled,
+            },
+        )
+        .await;
+    }
+
+    pub(super) async fn cli_runtime_proxy_set(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        params: CLIRuntimeProxySetParams,
+    ) {
+        let Some(workspace_id) = self
+            .validate_cli_runtime_workspace(
+                connection_id,
+                request_id.clone(),
+                methods::CLI_RUNTIME_PROXY_SET,
+                params.workspace_id,
+            )
+            .await
+        else {
+            return;
+        };
+
+        if self
+            .load_cli_runtime_instance_by_id(connection_id, request_id.clone(), &params.runtime_id)
+            .await
+            .is_none()
+        {
+            return;
+        }
+
+        let proxy_url = match pioneer_provider::validate_proxy_url(params.proxy_url.as_str()) {
+            Ok(proxy_url) => proxy_url,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_PARAMS_CODE,
+                        format!(
+                            "invalid params for `{}`: {error:#}",
+                            methods::CLI_RUNTIME_PROXY_SET
+                        ),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+
+        let runtime_id = match self.gateway_secrets.set_workspace_cli_runtime_proxy(
+            workspace_id.as_str(),
+            params.runtime_id.as_str(),
+            proxy_url.as_str(),
+        ) {
+            Ok(runtime_id) => runtime_id,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to save CLI runtime proxy: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+        self.cache_cli_runtime_proxy_url(
+            workspace_id.as_str(),
+            runtime_id.as_str(),
+            Some(proxy_url.clone()),
+        )
+        .await;
+
+        self.send_cli_runtime_response(
+            connection_id,
+            request_id,
+            methods::CLI_RUNTIME_PROXY_SET,
+            &CLIRuntimeProxySetResponse {
+                runtime_id,
+                proxy_url,
+            },
+        )
+        .await;
+    }
+
+    pub(super) async fn cli_runtime_proxy_delete(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        params: CLIRuntimeProxyDeleteParams,
+    ) {
+        let Some(workspace_id) = self
+            .validate_cli_runtime_workspace(
+                connection_id,
+                request_id.clone(),
+                methods::CLI_RUNTIME_PROXY_DELETE,
+                params.workspace_id,
+            )
+            .await
+        else {
+            return;
+        };
+
+        if self
+            .load_cli_runtime_instance_by_id(connection_id, request_id.clone(), &params.runtime_id)
+            .await
+            .is_none()
+        {
+            return;
+        }
+
+        let (runtime_id, deleted) = match self
+            .gateway_secrets
+            .delete_workspace_cli_runtime_proxy(workspace_id.as_str(), params.runtime_id.as_str())
+        {
+            Ok(result) => result,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to delete CLI runtime proxy: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+        self.cache_cli_runtime_proxy_url(workspace_id.as_str(), runtime_id.as_str(), None)
+            .await;
+
+        self.send_cli_runtime_response(
+            connection_id,
+            request_id,
+            methods::CLI_RUNTIME_PROXY_DELETE,
+            &CLIRuntimeProxyDeleteResponse {
+                runtime_id,
+                deleted,
             },
         )
         .await;
@@ -4759,19 +4947,30 @@ impl MessageProcessor {
         )
     }
 
-    fn load_cli_runtime_summaries(&self) -> anyhow::Result<Vec<RuntimeSummary>> {
-        Ok(cli_runtime_summaries_from_instances(
-            self.load_cli_runtime_instances()?,
-        ))
+    async fn load_cli_runtime_summaries(
+        &self,
+        workspace_id: &str,
+    ) -> anyhow::Result<Vec<RuntimeSummary>> {
+        let instances = self.load_cli_runtime_instances()?;
+        let mut summaries = Vec::with_capacity(instances.len());
+        for instance in instances {
+            let proxy_url = self
+                .prepare_cli_runtime_proxy_url(workspace_id, instance.id.as_str())
+                .await?;
+            summaries.push(cli_runtime_summary_from_instance(instance, proxy_url));
+        }
+        sort_cli_runtime_summary_display_order(summaries.as_mut_slice());
+        Ok(summaries)
     }
 
     async fn load_cli_runtime_summary_by_id(
         &self,
         connection_id: ConnectionId,
         request_id: RequestId,
+        workspace_id: &str,
         runtime_id: &str,
     ) -> Option<RuntimeSummary> {
-        let runtimes = match self.load_cli_runtime_summaries() {
+        let runtimes = match self.load_cli_runtime_summaries(workspace_id).await {
             Ok(runtimes) => runtimes,
             Err(error) => {
                 self.send_error(
@@ -4833,6 +5032,7 @@ impl MessageProcessor {
         &self,
         connection_id: ConnectionId,
         request_id: RequestId,
+        workspace_id: &str,
         runtime_id: &str,
     ) -> Option<RuntimeSummary> {
         let instances = match self.load_cli_runtime_instances() {
@@ -4852,7 +5052,10 @@ impl MessageProcessor {
         };
 
         match find_cli_runtime_instance(instances, runtime_id) {
-            Some(instance) => Some(self.cli_runtime_live_summary_from_instance(instance).await),
+            Some(instance) => Some(
+                self.cli_runtime_live_summary_from_instance(workspace_id, instance)
+                    .await,
+            ),
             None => {
                 self.send_unknown_cli_runtime_error(connection_id, request_id, runtime_id)
                     .await;
@@ -4863,9 +5066,13 @@ impl MessageProcessor {
 
     async fn cli_runtime_live_summary_from_instance(
         &self,
+        workspace_id: &str,
         instance: EffectiveGatewayCliAgentRuntimeInstanceConfig,
     ) -> RuntimeSummary {
-        let summary = cli_runtime_summary_from_instance(instance.clone());
+        let proxy_url = self
+            .cli_runtime_proxy_url(workspace_id, instance.id.as_str())
+            .await;
+        let summary = cli_runtime_summary_from_instance(instance.clone(), proxy_url.clone());
         if !instance.enabled {
             return summary;
         }
@@ -4873,17 +5080,75 @@ impl MessageProcessor {
         match instance.kind {
             GatewayCliAgentRuntimeKindConfig::Codex => {
                 let probe =
-                    CodexProbe::account_read(codex_account_probe_config_from_instance(&instance))
-                        .await;
+                    CodexProbe::account_read(codex_account_probe_config_from_instance_with_proxy(
+                        &instance,
+                        proxy_url.as_deref(),
+                    ))
+                    .await;
                 apply_codex_account_probe_to_summary(summary, probe)
             }
             GatewayCliAgentRuntimeKindConfig::Claude => {
-                let probe =
-                    ClaudeProbe::account_read(claude_account_probe_config_from_instance(&instance))
-                        .await;
+                let probe = ClaudeProbe::account_read(
+                    claude_account_probe_config_from_instance_with_proxy(
+                        &instance,
+                        proxy_url.as_deref(),
+                    ),
+                )
+                .await;
                 apply_claude_account_probe_to_summary(summary, probe)
             }
         }
+    }
+
+    pub(super) async fn prepare_cli_runtime_proxy_url(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let key = (workspace_id.to_owned(), runtime_id.to_owned());
+        if let Some(proxy_url) = self.cli_runtime_proxy_cache.lock().await.get(&key).cloned() {
+            return Ok(proxy_url);
+        }
+
+        let proxy_url = self
+            .gateway_secrets
+            .get_workspace_cli_runtime_proxy(workspace_id, runtime_id)
+            .map_err(anyhow::Error::from)?;
+        self.cli_runtime_proxy_cache
+            .lock()
+            .await
+            .insert(key, proxy_url.clone());
+        Ok(proxy_url)
+    }
+
+    async fn cli_runtime_proxy_url(&self, workspace_id: &str, runtime_id: &str) -> Option<String> {
+        match self
+            .prepare_cli_runtime_proxy_url(workspace_id, runtime_id)
+            .await
+        {
+            Ok(proxy_url) => proxy_url,
+            Err(error) => {
+                warn!(
+                    workspace_id,
+                    runtime_id,
+                    error = %format!("{error:#}"),
+                    "failed to prepare CLI runtime proxy settings"
+                );
+                None
+            }
+        }
+    }
+
+    async fn cache_cli_runtime_proxy_url(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        proxy_url: Option<String>,
+    ) {
+        self.cli_runtime_proxy_cache
+            .lock()
+            .await
+            .insert((workspace_id.to_owned(), runtime_id.to_owned()), proxy_url);
     }
 
     async fn send_unknown_cli_runtime_error(
@@ -5117,17 +5382,6 @@ fn normalize_cli_runtime_optional_field(
     Ok(Some(trimmed.to_owned()))
 }
 
-fn cli_runtime_summaries_from_instances(
-    instances: Vec<EffectiveGatewayCliAgentRuntimeInstanceConfig>,
-) -> Vec<RuntimeSummary> {
-    let mut summaries = instances
-        .into_iter()
-        .map(cli_runtime_summary_from_instance)
-        .collect::<Vec<_>>();
-    sort_cli_runtime_summary_display_order(summaries.as_mut_slice());
-    summaries
-}
-
 fn sort_cli_runtime_summary_display_order(summaries: &mut [RuntimeSummary]) {
     summaries.sort_by(|left, right| {
         let left_order = cli_runtime_default_display_order(left.runtime_id.as_str());
@@ -5152,6 +5406,7 @@ fn cli_runtime_default_display_order(runtime_id: &str) -> usize {
 
 fn cli_runtime_summary_from_instance(
     instance: EffectiveGatewayCliAgentRuntimeInstanceConfig,
+    proxy_url: Option<String>,
 ) -> RuntimeSummary {
     let status = if instance.enabled {
         RuntimeStatus::Degraded {
@@ -5182,6 +5437,7 @@ fn cli_runtime_summary_from_instance(
         binary_path: Some(instance.binary_path),
         home_path: Some(instance.home_path),
         shadow_home_path: instance.shadow_home_path,
+        proxy_url,
         debug_native_events_enabled: instance.debug_native_events,
         models_refreshed_at_unix_ms: None,
         diagnostics,
@@ -6486,6 +6742,23 @@ mod tests {
             stderr_ring_lines: 200,
             debug_native_events: false,
         }
+    }
+
+    fn cli_runtime_summaries_from_instances(
+        instances: Vec<EffectiveGatewayCliAgentRuntimeInstanceConfig>,
+    ) -> Vec<RuntimeSummary> {
+        let mut summaries = instances
+            .into_iter()
+            .map(|instance| super::cli_runtime_summary_from_instance(instance, None))
+            .collect::<Vec<_>>();
+        super::sort_cli_runtime_summary_display_order(summaries.as_mut_slice());
+        summaries
+    }
+
+    fn cli_runtime_summary_from_instance(
+        instance: EffectiveGatewayCliAgentRuntimeInstanceConfig,
+    ) -> RuntimeSummary {
+        super::cli_runtime_summary_from_instance(instance, None)
     }
 
     #[test]

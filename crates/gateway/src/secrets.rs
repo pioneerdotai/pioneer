@@ -10,7 +10,6 @@ use tracing::warn;
 use crate::helpers::{decode_hex, encode_hex, unix_timestamp_secs};
 
 const WORKSPACE_PROVIDER_API_KEY_PREFIX: &str = "workspace:";
-
 #[derive(Clone)]
 pub(crate) struct GatewaySecrets {
     store: Arc<dyn SecretStore>,
@@ -82,6 +81,30 @@ impl GatewaySecrets {
             .context("failed to read workspace provider api key from keystore")
     }
 
+    pub(crate) fn get_workspace_provider_proxy(
+        &self,
+        workspace_id: &str,
+        provider: &str,
+    ) -> Result<Option<String>> {
+        let id = SecretId::workspace_provider_proxy(workspace_id, provider)
+            .context("invalid workspace provider proxy id")?;
+        self.store
+            .get_string(&id)
+            .context("failed to read workspace provider proxy from keystore")
+    }
+
+    pub(crate) fn get_workspace_cli_runtime_proxy(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+    ) -> Result<Option<String>> {
+        let id = SecretId::workspace_cli_runtime_proxy(workspace_id, runtime_id)
+            .context("invalid workspace CLI runtime proxy id")?;
+        self.store
+            .get_string(&id)
+            .context("failed to read workspace CLI runtime proxy from keystore")
+    }
+
     #[allow(dead_code)]
     pub(crate) fn set_provider_api_key(&self, provider: &str, api_key: &str) -> Result<String> {
         if api_key.trim().is_empty() {
@@ -148,6 +171,78 @@ impl GatewaySecrets {
         Ok(normalized_provider)
     }
 
+    pub(crate) fn set_workspace_provider_proxy(
+        &self,
+        workspace_id: &str,
+        provider: &str,
+        proxy_url: &str,
+    ) -> Result<String> {
+        if proxy_url.trim().is_empty() {
+            bail!("provider proxy URL must not be empty");
+        }
+
+        let id = SecretId::workspace_provider_proxy(workspace_id, provider)
+            .context("invalid workspace provider proxy id")?;
+        let normalized_provider = Self::provider_name_from_workspace_provider_id(&id)
+            .unwrap_or_else(|| provider.trim().to_ascii_lowercase());
+        let now = current_unix_i64()?;
+        let created_at = self
+            .existing_provider_proxy_meta(&id)?
+            .and_then(|entry| entry.created_at_unix)
+            .unwrap_or(now);
+
+        self.store
+            .put_string(
+                &id,
+                proxy_url.trim(),
+                SecretMeta {
+                    kind: SecretKind::ProviderProxy,
+                    label: Some(normalized_provider.clone()),
+                    created_at_unix: created_at,
+                    updated_at_unix: now,
+                },
+            )
+            .context("failed to write workspace provider proxy to keystore")?;
+
+        Ok(normalized_provider)
+    }
+
+    pub(crate) fn set_workspace_cli_runtime_proxy(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        proxy_url: &str,
+    ) -> Result<String> {
+        if proxy_url.trim().is_empty() {
+            bail!("CLI runtime proxy URL must not be empty");
+        }
+
+        let id = SecretId::workspace_cli_runtime_proxy(workspace_id, runtime_id)
+            .context("invalid workspace CLI runtime proxy id")?;
+        let normalized_runtime = Self::runtime_id_from_workspace_cli_runtime_proxy_id(&id)
+            .unwrap_or_else(|| runtime_id.trim().to_owned());
+        let now = current_unix_i64()?;
+        let created_at = self
+            .existing_cli_runtime_proxy_meta(&id)?
+            .and_then(|entry| entry.created_at_unix)
+            .unwrap_or(now);
+
+        self.store
+            .put_string(
+                &id,
+                proxy_url.trim(),
+                SecretMeta {
+                    kind: SecretKind::CliRuntimeProxy,
+                    label: Some(normalized_runtime.clone()),
+                    created_at_unix: created_at,
+                    updated_at_unix: now,
+                },
+            )
+            .context("failed to write workspace CLI runtime proxy to keystore")?;
+
+        Ok(normalized_runtime)
+    }
+
     #[allow(dead_code)]
     pub(crate) fn delete_provider_api_key(&self, provider: &str) -> Result<(String, bool)> {
         let id = SecretId::provider_api_key(provider).context("invalid provider name")?;
@@ -173,6 +268,38 @@ impl GatewaySecrets {
             .delete(&id)
             .context("failed to delete workspace provider api key from keystore")?;
         Ok((normalized_provider, deleted))
+    }
+
+    pub(crate) fn delete_workspace_provider_proxy(
+        &self,
+        workspace_id: &str,
+        provider: &str,
+    ) -> Result<(String, bool)> {
+        let id = SecretId::workspace_provider_proxy(workspace_id, provider)
+            .context("invalid workspace provider proxy id")?;
+        let normalized_provider = Self::provider_name_from_workspace_provider_id(&id)
+            .unwrap_or_else(|| provider.trim().to_ascii_lowercase());
+        let deleted = self
+            .store
+            .delete(&id)
+            .context("failed to delete workspace provider proxy from keystore")?;
+        Ok((normalized_provider, deleted))
+    }
+
+    pub(crate) fn delete_workspace_cli_runtime_proxy(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+    ) -> Result<(String, bool)> {
+        let id = SecretId::workspace_cli_runtime_proxy(workspace_id, runtime_id)
+            .context("invalid workspace CLI runtime proxy id")?;
+        let normalized_runtime = Self::runtime_id_from_workspace_cli_runtime_proxy_id(&id)
+            .unwrap_or_else(|| runtime_id.trim().to_owned());
+        let deleted = self
+            .store
+            .delete(&id)
+            .context("failed to delete workspace CLI runtime proxy from keystore")?;
+        Ok((normalized_runtime, deleted))
     }
 
     #[allow(dead_code)]
@@ -215,6 +342,36 @@ impl GatewaySecrets {
         Ok(names.into_iter().collect())
     }
 
+    pub(crate) fn list_workspace_provider_proxies(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let prefix = Self::workspace_provider_proxy_user_prefix(workspace_id)?;
+        let entries = self
+            .store
+            .list(SecretFilter::Kind(SecretKind::ProviderProxy))
+            .context("failed to list provider proxies from keystore")?;
+
+        let mut proxies = Vec::new();
+        for entry in entries {
+            if !entry.id.user().starts_with(prefix.as_str()) {
+                continue;
+            }
+            let Some(proxy_url) = self
+                .store
+                .get_string(&entry.id)
+                .context("failed to read provider proxy from keystore")?
+            else {
+                continue;
+            };
+            let provider_name = Self::provider_name_from_workspace_provider_id(&entry.id)
+                .unwrap_or_else(|| entry.label.unwrap_or_else(|| entry.id.user().to_owned()));
+            proxies.push((provider_name, proxy_url));
+        }
+        proxies.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(proxies)
+    }
+
     pub(crate) fn resolve_provider_api_key(&self, provider_name: &str) -> String {
         if is_local_provider(provider_name) {
             return String::new();
@@ -254,6 +411,25 @@ impl GatewaySecrets {
                     "failed to resolve workspace provider api key from keystore"
                 );
                 String::new()
+            }
+        }
+    }
+
+    pub(crate) fn resolve_workspace_provider_proxy(
+        &self,
+        workspace_id: &str,
+        provider_name: &str,
+    ) -> Option<String> {
+        match self.get_workspace_provider_proxy(workspace_id, provider_name) {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(
+                    workspace_id,
+                    provider = provider_name,
+                    error = %format!("{error:#}"),
+                    "failed to resolve workspace provider proxy from keystore"
+                );
+                None
             }
         }
     }
@@ -361,11 +537,30 @@ impl GatewaySecrets {
             .to_owned())
     }
 
+    fn workspace_provider_proxy_user_prefix(workspace_id: &str) -> Result<String> {
+        const SENTINEL_PROVIDER: &str = "validation";
+
+        let id = SecretId::workspace_provider_proxy(workspace_id, SENTINEL_PROVIDER)
+            .context("invalid provider proxy workspace id")?;
+        Ok(id
+            .user()
+            .strip_suffix(SENTINEL_PROVIDER)
+            .unwrap_or(id.user())
+            .to_owned())
+    }
+
     fn provider_name_from_workspace_provider_id(id: &SecretId) -> Option<String> {
         id.user()
             .strip_prefix(WORKSPACE_PROVIDER_API_KEY_PREFIX)
             .and_then(|value| value.split_once(":provider:"))
             .map(|(_, provider)| provider.to_owned())
+    }
+
+    fn runtime_id_from_workspace_cli_runtime_proxy_id(id: &SecretId) -> Option<String> {
+        id.user()
+            .strip_prefix(WORKSPACE_PROVIDER_API_KEY_PREFIX)
+            .and_then(|value| value.split_once(":runtime:"))
+            .map(|(_, runtime_id)| runtime_id.to_owned())
     }
 
     pub(crate) fn load_or_create_superuser_jwt_material(
@@ -628,6 +823,22 @@ impl GatewaySecrets {
         Ok(entries.into_iter().find(|entry| entry.id == *id))
     }
 
+    fn existing_provider_proxy_meta(&self, id: &SecretId) -> Result<Option<SecretEntryMeta>> {
+        let entries = self
+            .store
+            .list(SecretFilter::Kind(SecretKind::ProviderProxy))
+            .context("failed to read provider proxy metadata from keystore")?;
+        Ok(entries.into_iter().find(|entry| entry.id == *id))
+    }
+
+    fn existing_cli_runtime_proxy_meta(&self, id: &SecretId) -> Result<Option<SecretEntryMeta>> {
+        let entries = self
+            .store
+            .list(SecretFilter::Kind(SecretKind::CliRuntimeProxy))
+            .context("failed to read CLI runtime proxy metadata from keystore")?;
+        Ok(entries.into_iter().find(|entry| entry.id == *id))
+    }
+
     fn existing_mcp_secret_meta(&self, id: &SecretId) -> Result<Option<SecretEntryMeta>> {
         let entries = self
             .store
@@ -710,6 +921,82 @@ mod tests {
             secrets
                 .get_provider_api_key("openrouter")
                 .expect("read deleted key"),
+            None
+        );
+    }
+
+    #[test]
+    fn provider_proxy_methods_write_list_read_resolve_and_delete() {
+        let secrets = GatewaySecrets::new(Arc::new(MemorySecretStore::new()));
+
+        let normalized = secrets
+            .set_workspace_provider_proxy(
+                "ws_default",
+                "  OpenRouter  ",
+                "socks5://user:pass@127.0.0.1:1080",
+            )
+            .expect("set provider proxy");
+        assert_eq!(normalized, "openrouter");
+
+        assert_eq!(
+            secrets
+                .get_workspace_provider_proxy("ws_default", "openrouter")
+                .expect("read proxy"),
+            Some("socks5://user:pass@127.0.0.1:1080".to_owned())
+        );
+        assert_eq!(
+            secrets
+                .resolve_workspace_provider_proxy("ws_default", "openrouter")
+                .as_deref(),
+            Some("socks5://user:pass@127.0.0.1:1080")
+        );
+        assert_eq!(
+            secrets
+                .list_workspace_provider_proxies("ws_default")
+                .expect("list provider proxies"),
+            vec![(
+                "openrouter".to_owned(),
+                "socks5://user:pass@127.0.0.1:1080".to_owned()
+            )]
+        );
+
+        let (normalized, deleted) = secrets
+            .delete_workspace_provider_proxy("ws_default", "OpenRouter")
+            .expect("delete provider proxy");
+        assert_eq!(normalized, "openrouter");
+        assert!(deleted);
+        assert_eq!(
+            secrets
+                .get_workspace_provider_proxy("ws_default", "openrouter")
+                .expect("read deleted proxy"),
+            None
+        );
+    }
+
+    #[test]
+    fn cli_runtime_proxy_methods_write_read_resolve_and_delete() {
+        let secrets = GatewaySecrets::new(Arc::new(MemorySecretStore::new()));
+
+        let normalized = secrets
+            .set_workspace_cli_runtime_proxy("ws_default", "codex_work", "http://127.0.0.1:8080")
+            .expect("set CLI runtime proxy");
+        assert_eq!(normalized, "codex_work");
+
+        assert_eq!(
+            secrets
+                .get_workspace_cli_runtime_proxy("ws_default", "codex_work")
+                .expect("read runtime proxy"),
+            Some("http://127.0.0.1:8080".to_owned())
+        );
+        let (normalized, deleted) = secrets
+            .delete_workspace_cli_runtime_proxy("ws_default", "codex_work")
+            .expect("delete runtime proxy");
+        assert_eq!(normalized, "codex_work");
+        assert!(deleted);
+        assert_eq!(
+            secrets
+                .get_workspace_cli_runtime_proxy("ws_default", "codex_work")
+                .expect("read deleted runtime proxy"),
             None
         );
     }

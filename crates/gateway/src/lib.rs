@@ -202,7 +202,7 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         config.gateway.provider.max_stream_duration_secs,
     );
 
-    let provider_registry = Arc::new(ProviderRegistry::new_scoped_with_timeout_policy(
+    let provider_registry = Arc::new(ProviderRegistry::new_scoped_with_timeout_policy_and_proxy(
         {
             let gateway_secrets = gateway_secrets.clone();
             move |workspace_id, provider_name| {
@@ -212,6 +212,14 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
                             .resolve_workspace_provider_api_key(workspace_id, provider_name)
                     })
                     .unwrap_or_else(|| gateway_secrets.resolve_provider_api_key(provider_name))
+            }
+        },
+        {
+            let gateway_secrets = gateway_secrets.clone();
+            move |workspace_id, provider_name| {
+                workspace_id.and_then(|workspace_id| {
+                    gateway_secrets.resolve_workspace_provider_proxy(workspace_id, provider_name)
+                })
             }
         },
         provider_timeout_policy,

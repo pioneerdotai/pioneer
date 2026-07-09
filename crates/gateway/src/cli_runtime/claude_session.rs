@@ -84,8 +84,9 @@ impl CLIAgentRuntimeSessionFactory for ClaudeCLIAgentRuntimeSessionFactory {
             );
         }
 
-        let probe =
-            ClaudeProbe::account_read(claude_account_probe_config_from_instance(&instance)).await;
+        let mut probe_config = claude_account_probe_config_from_instance(&instance);
+        probe_config.env.extend(options.env.clone());
+        let probe = ClaudeProbe::account_read(probe_config).await;
         match probe.status {
             ClaudeAccountProbeStatus::Ready => {}
             ClaudeAccountProbeStatus::NeedsAuth => {

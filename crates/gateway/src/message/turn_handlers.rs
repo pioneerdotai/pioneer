@@ -604,6 +604,18 @@ impl MessageProcessor {
                     return;
                 }
             }
+            let proxy_url = match self
+                .prepare_cli_runtime_proxy_url(thread.workspace_id.as_str(), runtime_id.as_str())
+                .await
+            {
+                Ok(proxy_url) => proxy_url,
+                Err(error) => {
+                    send_turn_start_failure!(format!(
+                        "failed to prepare CLI runtime proxy settings: {error:#}"
+                    ));
+                    return;
+                }
+            };
             if let Err(error) = self
                 .validate_artifact_user_inputs(
                     thread.workspace_id.as_str(),
@@ -849,12 +861,14 @@ impl MessageProcessor {
                     return;
                 }
             };
+            let proxy_env = crate::cli_runtime::config::proxy_env(proxy_url.as_deref());
             let session_handle = match manager
                 .get_or_start_with_options(
                     session_key.clone(),
                     crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
                         cwd: Some(std::path::PathBuf::from(native_cwd.as_str())),
                         approval_policy: Some(effective_approval_policy.clone()),
+                        env: proxy_env,
                         ..Default::default()
                     },
                 )

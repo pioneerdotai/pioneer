@@ -972,6 +972,29 @@ impl MessageProcessor {
                         }
                     }
                 }
+                methods::PROVIDER_CONFIGURE => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<ProviderConfigureParams>(params_value) {
+                        Ok(params) => {
+                            self.provider_configure(connection_id, request.id, params)
+                                .await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{}`: {error}",
+                                        methods::PROVIDER_CONFIGURE
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
                 methods::CLI_RUNTIME_LIST => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<CLIRuntimeListParams>(params_value) {
@@ -1241,6 +1264,52 @@ impl MessageProcessor {
                                     format!(
                                         "invalid params for `{}`: {error}",
                                         methods::CLI_RUNTIME_LOGIN_CANCEL
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::CLI_RUNTIME_PROXY_SET => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<CLIRuntimeProxySetParams>(params_value) {
+                        Ok(params) => {
+                            self.cli_runtime_proxy_set(connection_id, request.id, params)
+                                .await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{}`: {error}",
+                                        methods::CLI_RUNTIME_PROXY_SET
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::CLI_RUNTIME_PROXY_DELETE => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<CLIRuntimeProxyDeleteParams>(params_value) {
+                        Ok(params) => {
+                            self.cli_runtime_proxy_delete(connection_id, request.id, params)
+                                .await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{}`: {error}",
+                                        methods::CLI_RUNTIME_PROXY_DELETE
                                     ),
                                 ),
                             )
