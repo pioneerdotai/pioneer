@@ -5,8 +5,9 @@ use crate::updater::{
     platform::select_update_candidate_for_current_platform,
     release::{DESKTOP_UPDATER_USER_AGENT, fetch_desktop_update_manifest_with_client},
     state::{
-        DesktopUpdateConfig, DesktopUpdatePersistedStatus, read_update_state,
-        record_silent_failure_state_at, sha256_file, verify_staged_download_and_record_ready_state,
+        DesktopUpdateConfig, DesktopUpdatePersistedStatus, clear_applied_update_state_and_cache,
+        read_update_state, record_silent_failure_state_at, sha256_file,
+        verify_staged_download_and_record_ready_state,
     },
 };
 use reqwest::blocking::Client;
@@ -206,7 +207,14 @@ fn ready_ui_state_from_persisted(
     checked_at_unix: u64,
 ) -> Option<DesktopUpdateUiState> {
     let state = read_update_state(runtime_home).ok().flatten()?;
-    let ready_state = ready_ui_state_from_state(state, desktop_current_version().to_owned())?;
+    let current_version = desktop_current_version().to_owned();
+    let Some(ready_state) = ready_ui_state_from_state(state.clone(), current_version.clone())
+    else {
+        if persisted_ready_state_is_applied(state, current_version.as_str()) {
+            let _ = clear_applied_update_state_and_cache(runtime_home);
+        }
+        return None;
+    };
 
     let DesktopUpdateUiState::Ready {
         asset_path, sha256, ..
@@ -225,6 +233,18 @@ fn ready_ui_state_from_persisted(
             );
             None
         }
+    }
+}
+
+fn persisted_ready_state_is_applied(
+    state: crate::updater::state::DesktopUpdateStateFile,
+    current_version: &str,
+) -> bool {
+    match state.status {
+        DesktopUpdatePersistedStatus::Ready { version, .. } => {
+            !version_is_newer(version.as_str(), current_version)
+        }
+        _ => false,
     }
 }
 
@@ -325,6 +345,7 @@ mod tests {
     use crate::{
         app::root::DesktopUpdateUiState,
         updater::{
+            desktop_current_version,
             download::StagedDownload,
             state::{
                 DesktopUpdatePersistedStatus, DesktopUpdateStateFile, read_update_state,
@@ -357,6 +378,27 @@ mod tests {
     fn equal_or_older_ready_state_stays_quiet() {
         assert!(ready_ui_state_from_state(ready_state("0.25.0"), "0.25.0".to_owned()).is_none());
         assert!(ready_ui_state_from_state(ready_state("0.24.9"), "0.25.0".to_owned()).is_none());
+    }
+
+    #[test]
+    fn applied_persisted_ready_state_is_cleaned_up() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let update_root = temp_dir.path().join("desktop-updates");
+        let downloads_dir = update_root.join("downloads");
+        let staging_dir = update_root.join("staging");
+        fs::create_dir_all(downloads_dir.join("v0.26.0")).unwrap();
+        fs::create_dir_all(staging_dir.join("v0.26.0-123")).unwrap();
+        fs::write(downloads_dir.join("v0.26.0").join("asset.zip"), b"asset").unwrap();
+        fs::write(staging_dir.join("v0.26.0-123").join("plan.json"), b"plan").unwrap();
+        write_ready_state(temp_dir.path(), desktop_current_version());
+
+        let ui_state = ready_ui_state_from_persisted(temp_dir.path(), 1_789_200_100);
+
+        assert!(ui_state.is_none());
+        assert!(read_update_state(temp_dir.path()).unwrap().is_none());
+        assert!(downloads_dir.is_dir());
+        assert_eq!(fs::read_dir(downloads_dir).unwrap().count(), 0);
+        assert!(!staging_dir.exists());
     }
 
     #[test]
@@ -472,6 +514,16 @@ mod tests {
                 },
             })
             .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn write_ready_state(runtime_home: &std::path::Path, version: &str) {
+        let path = crate::updater::state::update_state_path(runtime_home);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            path.as_path(),
+            serde_json::to_vec_pretty(&ready_state(version)).unwrap(),
         )
         .unwrap();
     }

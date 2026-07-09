@@ -1,4 +1,5 @@
 use crate::{
+    cleanup,
     plan::{self, DesktopUpdatePlan},
     platform::{self, PlatformApplyOutcome},
     process,
@@ -60,6 +61,7 @@ fn apply_plan_inner(
     };
 
     record_success_best_effort(plan_path, &validated.plan, platform_outcome.result_details);
+    cleanup_success_best_effort(plan_path, &validated.plan);
     Ok(())
 }
 
@@ -246,6 +248,12 @@ fn record_success_best_effort(
         details,
     ) {
         eprintln!("failed to write desktop update result state: {error:#}");
+    }
+}
+
+fn cleanup_success_best_effort(plan_path: &Path, plan: &DesktopUpdatePlan) {
+    if let Err(error) = cleanup::cleanup_successful_apply(plan_path, plan) {
+        eprintln!("failed to clean successful desktop update cache: {error:#}");
     }
 }
 

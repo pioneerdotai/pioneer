@@ -1,6 +1,7 @@
 use super::{
-    download::{DESKTOP_UPDATES_DIR, StagedDownload},
+    download::{DESKTOP_DOWNLOADS_DIR, DESKTOP_UPDATES_DIR, StagedDownload},
     manifest::{DESKTOP_UPDATE_PRODUCT, DESKTOP_UPDATE_SCHEMA_VERSION},
+    plan::DESKTOP_UPDATE_STAGING_DIR,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -76,6 +77,10 @@ pub(crate) enum DesktopUpdateStateErrorCode {
     ReadState,
     ParseState,
     UnsupportedState,
+    RemoveState,
+    RemoveDownloads,
+    RecreateDownloads,
+    RemoveStaging,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,6 +259,34 @@ pub(crate) fn read_update_state(
     Ok(Some(state))
 }
 
+pub(crate) fn clear_applied_update_state_and_cache(
+    runtime_home: &Path,
+) -> Result<(), DesktopUpdateStateError> {
+    remove_file_if_exists(
+        update_state_path(runtime_home).as_path(),
+        DesktopUpdateStateErrorCode::RemoveState,
+        "desktop update state",
+    )?;
+    empty_dir(
+        runtime_home
+            .join(DESKTOP_UPDATES_DIR)
+            .join(DESKTOP_DOWNLOADS_DIR)
+            .as_path(),
+        DesktopUpdateStateErrorCode::RemoveDownloads,
+        DesktopUpdateStateErrorCode::RecreateDownloads,
+        "desktop update downloads",
+    )?;
+    remove_dir_if_exists(
+        runtime_home
+            .join(DESKTOP_UPDATES_DIR)
+            .join(DESKTOP_UPDATE_STAGING_DIR)
+            .as_path(),
+        DesktopUpdateStateErrorCode::RemoveStaging,
+        "desktop update staging",
+    )?;
+    Ok(())
+}
+
 pub(crate) fn update_state_path(runtime_home: &Path) -> PathBuf {
     runtime_home
         .join(DESKTOP_UPDATES_DIR)
@@ -295,6 +328,61 @@ pub(crate) fn sha256_file(path: &Path) -> Result<String, DesktopUpdateStateError
         write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
     }
     Ok(output)
+}
+
+fn remove_file_if_exists(
+    path: &Path,
+    code: DesktopUpdateStateErrorCode,
+    label: &str,
+) -> Result<(), DesktopUpdateStateError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(DesktopUpdateStateError::new(
+            code,
+            format!("failed to remove {label} `{}`: {error}", path.display()),
+        )),
+    }
+}
+
+fn empty_dir(
+    path: &Path,
+    remove_code: DesktopUpdateStateErrorCode,
+    recreate_code: DesktopUpdateStateErrorCode,
+    label: &str,
+) -> Result<(), DesktopUpdateStateError> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(DesktopUpdateStateError::new(
+                remove_code,
+                format!("failed to remove {label} `{}`: {error}", path.display()),
+            ));
+        }
+    }
+
+    fs::create_dir_all(path).map_err(|error| {
+        DesktopUpdateStateError::new(
+            recreate_code,
+            format!("failed to recreate {label} `{}`: {error}", path.display()),
+        )
+    })
+}
+
+fn remove_dir_if_exists(
+    path: &Path,
+    code: DesktopUpdateStateErrorCode,
+    label: &str,
+) -> Result<(), DesktopUpdateStateError> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(DesktopUpdateStateError::new(
+            code,
+            format!("failed to remove {label} `{}`: {error}", path.display()),
+        )),
+    }
 }
 
 fn write_update_state(
@@ -414,8 +502,9 @@ mod tests {
         DEFAULT_DESKTOP_UPDATE_CHANNEL, DEFAULT_RELEASE_REPO, DesktopUpdateConfig,
         DesktopUpdatePersistedStatus, DesktopUpdateStateErrorCode, ENV_DESKTOP_UPDATE_CHANNEL,
         ENV_DESKTOP_UPDATE_DISABLED, ENV_DESKTOP_UPDATE_FORCE_CHECK, ENV_RELEASE_API_BASE,
-        ENV_RELEASE_DOWNLOAD_BASE, ENV_RELEASE_REPO, SHA256_MISMATCH_ERROR_CODE, env_flag_enabled,
-        read_update_state, record_silent_failure_state_at, sha256_file, update_state_path,
+        ENV_RELEASE_DOWNLOAD_BASE, ENV_RELEASE_REPO, SHA256_MISMATCH_ERROR_CODE,
+        clear_applied_update_state_and_cache, env_flag_enabled, read_update_state,
+        record_silent_failure_state_at, sha256_file, update_state_path,
         verify_staged_download_and_record_ready_state_at,
     };
     use crate::updater::download::StagedDownload;
@@ -577,6 +666,26 @@ mod tests {
             }
         );
         assert_eq!(read_update_state(temp_dir.path()).unwrap(), Some(state));
+    }
+
+    #[test]
+    fn clear_applied_state_removes_state_staging_and_empties_downloads() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let update_root = temp_dir.path().join("desktop-updates");
+        let downloads_dir = update_root.join("downloads");
+        let staging_dir = update_root.join("staging");
+        fs::create_dir_all(downloads_dir.join("v0.26.0")).unwrap();
+        fs::create_dir_all(staging_dir.join("v0.26.0-123")).unwrap();
+        fs::write(update_state_path(temp_dir.path()), b"state").unwrap();
+        fs::write(downloads_dir.join("v0.26.0").join("asset.zip"), b"asset").unwrap();
+        fs::write(staging_dir.join("v0.26.0-123").join("plan.json"), b"plan").unwrap();
+
+        clear_applied_update_state_and_cache(temp_dir.path()).unwrap();
+
+        assert!(!update_state_path(temp_dir.path()).exists());
+        assert!(downloads_dir.is_dir());
+        assert_eq!(fs::read_dir(downloads_dir).unwrap().count(), 0);
+        assert!(!staging_dir.exists());
     }
 
     fn staged_download(asset_path: std::path::PathBuf, sha256: String) -> StagedDownload {

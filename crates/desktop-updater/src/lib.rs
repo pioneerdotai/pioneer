@@ -1,4 +1,5 @@
 pub mod apply;
+pub mod cleanup;
 pub mod plan;
 pub mod platform;
 pub mod process;
