@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ProviderConfigureParams",
+  "type": "object",
+  "properties": {
+    "api_key": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "clear_proxy": {
+      "type": "boolean",
+      "default": false
+    },
+    "provider": {
+      "type": "string"
+    },
+    "proxy_url": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_id",
+    "provider"
+  ]
+}

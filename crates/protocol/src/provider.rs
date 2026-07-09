@@ -18,6 +18,10 @@ pub struct ProviderSummary {
     pub name: String,
     #[serde(default)]
     pub capabilities: ProviderSummaryCapabilities,
+    #[serde(default)]
+    pub api_key_configured: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -113,6 +117,31 @@ pub struct ProviderModelInfo {
 }
 
 // --- Provider API key management ---
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProviderConfigureParams {
+    pub workspace_id: String,
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
+    #[serde(default)]
+    pub clear_proxy: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProviderConfigureResponse {
+    pub provider: String,
+    #[serde(default)]
+    pub api_key_updated: bool,
+    #[serde(default)]
+    pub proxy_updated: bool,
+    #[serde(default)]
+    pub proxy_deleted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ProviderSetApiKeyParams {

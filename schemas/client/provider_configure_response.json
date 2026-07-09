@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ProviderConfigureResponse",
+  "type": "object",
+  "properties": {
+    "api_key_updated": {
+      "type": "boolean",
+      "default": false
+    },
+    "provider": {
+      "type": "string"
+    },
+    "proxy_deleted": {
+      "type": "boolean",
+      "default": false
+    },
+    "proxy_updated": {
+      "type": "boolean",
+      "default": false
+    },
+    "proxy_url": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "provider"
+  ]
+}

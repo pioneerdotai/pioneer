@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ProviderApiKeyActionRequest",
+  "type": "object",
+  "properties": {
+    "canonical_provider_id": {
+      "type": "string"
+    },
+    "connection_id": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "params": {
+      "$ref": "#/$defs/ProviderConfigureParams"
+    }
+  },
+  "required": [
+    "connection_id",
+    "canonical_provider_id",
+    "params"
+  ],
+  "$defs": {
+    "ProviderConfigureParams": {
+      "type": "object",
+      "properties": {
+        "api_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "clear_proxy": {
+          "type": "boolean",
+          "default": false
+        },
+        "provider": {
+          "type": "string"
+        },
+        "proxy_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "provider"
+      ]
+    }
+  }
+}

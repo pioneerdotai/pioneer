@@ -87,7 +87,8 @@
           "present": false,
           "required": false
         },
-        "refill_status": "disabled"
+        "refill_status": "disabled",
+        "use_search_instructions": false
       }
     }
   },

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CLIRuntimeProxyDeleteResponse",
+  "type": "object",
+  "properties": {
+    "deleted": {
+      "type": "boolean"
+    },
+    "runtime_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "runtime_id",
+    "deleted"
+  ]
+}

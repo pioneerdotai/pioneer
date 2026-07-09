@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CLIRuntimeProxyDeletePlan",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "Send": {
+          "$ref": "#/$defs/CLIRuntimeProxyActionRequest"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Send"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "Unavailable": {
+          "$ref": "#/$defs/ProviderApiKeyActionUnavailable"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Unavailable"
+      ]
+    }
+  ],
+  "$defs": {
+    "CLIRuntimeProxyActionRequest": {
+      "type": "object",
+      "properties": {
+        "connection_id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "params": {
+          "$ref": "#/$defs/CLIRuntimeProxyDeleteParams"
+        },
+        "runtime_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "connection_id",
+        "runtime_id",
+        "params"
+      ]
+    },
+    "CLIRuntimeProxyDeleteParams": {
+      "type": "object",
+      "properties": {
+        "runtime_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "runtime_id"
+      ]
+    },
+    "ProviderApiKeyActionUnavailable": {
+      "type": "string",
+      "enum": [
+        "GatewayNotConnected",
+        "WorkspaceNotSelected"
+      ]
+    }
+  }
+}

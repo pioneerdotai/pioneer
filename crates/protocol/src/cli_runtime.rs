@@ -22,6 +22,8 @@ pub struct RuntimeSummary {
     pub home_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shadow_home_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub debug_native_events_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -652,6 +654,31 @@ pub struct CLIRuntimeLoginCancelResponse {
     pub cancelled: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct CLIRuntimeProxySetParams {
+    pub workspace_id: String,
+    pub runtime_id: String,
+    pub proxy_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct CLIRuntimeProxySetResponse {
+    pub runtime_id: String,
+    pub proxy_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct CLIRuntimeProxyDeleteParams {
+    pub workspace_id: String,
+    pub runtime_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct CLIRuntimeProxyDeleteResponse {
+    pub runtime_id: String,
+    pub deleted: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct CLIRuntimeRequestRespondParams {
     pub workspace_id: String,
@@ -826,6 +853,7 @@ mod tests {
             binary_path: Some("codex".to_owned()),
             home_path: Some("~/.codex".to_owned()),
             shadow_home_path: Some("~/.pioneer/codex/personal".to_owned()),
+            proxy_url: Some("socks5://127.0.0.1:1080".to_owned()),
             debug_native_events_enabled: true,
             models_refreshed_at_unix_ms: Some(1_700_000_000_000),
             diagnostics: vec![RuntimeDiagnostic {

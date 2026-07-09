@@ -58,8 +58,9 @@ pub use cli_runtime::{
     CLIRuntimeListParams, CLIRuntimeListResponse, CLIRuntimeLoginCancelParams,
     CLIRuntimeLoginCancelResponse, CLIRuntimeLoginStartParams, CLIRuntimeLoginStartResponse,
     CLIRuntimeLoginStartType, CLIRuntimePendingRequest, CLIRuntimePendingRequestStatus,
-    CLIRuntimeRefreshParams, CLIRuntimeRefreshResponse, CLIRuntimeRequestKind,
-    CLIRuntimeRequestOpenedNotification, CLIRuntimeRequestResolution,
+    CLIRuntimeProxyDeleteParams, CLIRuntimeProxyDeleteResponse, CLIRuntimeProxySetParams,
+    CLIRuntimeProxySetResponse, CLIRuntimeRefreshParams, CLIRuntimeRefreshResponse,
+    CLIRuntimeRequestKind, CLIRuntimeRequestOpenedNotification, CLIRuntimeRequestResolution,
     CLIRuntimeRequestResolvedNotification, CLIRuntimeRequestRespondParams,
     CLIRuntimeRequestRespondResponse, CLIRuntimeReviewDelivery, CLIRuntimeReviewStartParams,
     CLIRuntimeReviewStartResponse, CLIRuntimeReviewTarget, CLIRuntimeStatusChangedNotification,
@@ -122,11 +123,12 @@ pub use memory::{
 };
 pub use notification::{GatewayNotification, UnknownGatewayNotification};
 pub use provider::{
-    ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse, ProviderListModelsParams,
-    ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
-    ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits, ProviderModelPricing,
-    ProviderModelReasoningCapabilities, ProviderSetApiKeyParams, ProviderSetApiKeyResponse,
-    ProviderSummary, ProviderSummaryCapabilities, ReasoningCapabilitySource,
+    ProviderConfigureParams, ProviderConfigureResponse, ProviderDeleteApiKeyParams,
+    ProviderDeleteApiKeyResponse, ProviderListModelsParams, ProviderListModelsResponse,
+    ProviderListParams, ProviderListResponse, ProviderModelCapabilities, ProviderModelInfo,
+    ProviderModelLimits, ProviderModelPricing, ProviderModelReasoningCapabilities,
+    ProviderSetApiKeyParams, ProviderSetApiKeyResponse, ProviderSummary,
+    ProviderSummaryCapabilities, ReasoningCapabilitySource,
 };
 pub use settings::{
     GatewayCliRuntimeInstanceSettings, GatewayCliRuntimeSettings, GatewayGeneralSettings,

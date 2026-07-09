@@ -32,6 +32,7 @@ pub mod methods {
     pub const PROVIDER_LIST: &str = "provider/list";
     pub const PROVIDER_MODELS_LIST: &str = "provider/models/list";
     pub const PROVIDER_EMBEDDING_MODELS_LIST: &str = "provider/embedding_models/list";
+    pub const PROVIDER_CONFIGURE: &str = "provider/configure";
     pub const PROVIDER_SET_API_KEY: &str = "provider/set_api_key";
     pub const PROVIDER_DELETE_API_KEY: &str = "provider/delete_api_key";
     pub const CLI_RUNTIME_LIST: &str = "cli_runtime/list";
@@ -46,6 +47,8 @@ pub mod methods {
     pub const CLI_RUNTIME_REVIEW_START: &str = "cli_runtime/review/start";
     pub const CLI_RUNTIME_LOGIN_START: &str = "cli_runtime/login/start";
     pub const CLI_RUNTIME_LOGIN_CANCEL: &str = "cli_runtime/login/cancel";
+    pub const CLI_RUNTIME_PROXY_SET: &str = "cli_runtime/proxy/set";
+    pub const CLI_RUNTIME_PROXY_DELETE: &str = "cli_runtime/proxy/delete";
     pub const CLI_RUNTIME_REQUEST_RESPOND: &str = "cli_runtime/request/respond";
     pub const SETTINGS_GET: &str = "settings/get";
     pub const SETTINGS_UPDATE: &str = "settings/update";

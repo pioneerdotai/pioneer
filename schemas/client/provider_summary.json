@@ -3,6 +3,10 @@
   "title": "ProviderSummary",
   "type": "object",
   "properties": {
+    "api_key_configured": {
+      "type": "boolean",
+      "default": false
+    },
     "capabilities": {
       "$ref": "#/$defs/ProviderSummaryCapabilities",
       "default": {
@@ -11,6 +15,12 @@
     },
     "name": {
       "type": "string"
+    },
+    "proxy_url": {
+      "type": [
+        "string",
+        "null"
+      ]
     }
   },
   "required": [

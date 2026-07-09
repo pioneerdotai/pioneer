@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CLIRuntimeProxyActionRequest",
+  "type": "object",
+  "properties": {
+    "connection_id": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "params": {
+      "$ref": "#/$defs/CLIRuntimeProxySetParams"
+    },
+    "runtime_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "connection_id",
+    "runtime_id",
+    "params"
+  ],
+  "$defs": {
+    "CLIRuntimeProxySetParams": {
+      "type": "object",
+      "properties": {
+        "proxy_url": {
+          "type": "string"
+        },
+        "runtime_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "runtime_id",
+        "proxy_url"
+      ]
+    }
+  }
+}

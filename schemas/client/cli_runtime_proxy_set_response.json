@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CLIRuntimeProxySetResponse",
+  "type": "object",
+  "properties": {
+    "proxy_url": {
+      "type": "string"
+    },
+    "runtime_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "runtime_id",
+    "proxy_url"
+  ]
+}

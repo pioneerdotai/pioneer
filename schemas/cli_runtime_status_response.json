@@ -364,6 +364,12 @@
           ],
           "format": "int64"
         },
+        "proxy_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "recent_stderr": {
           "type": "array",
           "items": {
