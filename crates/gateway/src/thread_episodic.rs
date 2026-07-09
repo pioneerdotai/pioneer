@@ -702,7 +702,7 @@ fn attach_embedding_to_resolved_request(
 fn embedding_resolution_error(
     error: ThreadEpisodicEmbeddingError,
 ) -> ThreadEpisodicIndexResolutionError {
-    if error.is_retryable() || error.is_configuration_failure() {
+    if error.is_retryable() {
         ThreadEpisodicIndexResolutionError::retryable(error.message)
     } else {
         ThreadEpisodicIndexResolutionError::non_retryable(error.message)
@@ -1647,7 +1647,8 @@ impl ThreadEpisodicRecallService {
 
         let vector_search_config =
             self.vector_search_config_for_workspace(workspace_id, &config.vector_search);
-        let vector_search_enabled = vector_search_config.enabled;
+        let vector_search_enabled =
+            config.vector_search_enabled || vector_search_config.has_selected_embedding_model();
         let projection_target = self.recall_projection_target(workspace_id, &config);
         let gate = match self
             .resolve_recall_projection_gate(workspace_id, vector_search_enabled, &projection_target)

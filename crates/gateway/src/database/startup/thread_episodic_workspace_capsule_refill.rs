@@ -19,7 +19,7 @@ use pioneer_crud::{
     ThreadEpisodicIndexJobCompletionUpdate, ThreadEpisodicIndexJobFailureUpdate,
     ThreadEpisodicIndexJobRecord, ThreadEpisodicItemIndexedUpdate,
     ThreadEpisodicThreadDirectoryStatus, ThreadEpisodicThreadDirectoryVisibility,
-    find_projection_meta, upsert_projection_meta_with_config,
+    find_projection_meta, list_projection_meta_by_key_prefix, upsert_projection_meta_with_config,
 };
 use pioneer_memory::{
     MemvidThreadEpisodicBackend, ThreadEpisodicEmbeddingProvider, ThreadEpisodicMemvidBackend,
@@ -83,24 +83,24 @@ impl ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget {
     pub(crate) fn from_vector_search_config(
         config: &GatewayThreadEpisodicVectorSearchConfig,
     ) -> Self {
-        let provider = config.enabled.then(|| {
+        let vector_search_enabled = config.has_selected_embedding_model();
+        let provider = vector_search_enabled.then(|| {
             config
                 .provider
                 .map(crate::settings::vector_provider_identity_name)
                 .unwrap_or("missing")
                 .to_owned()
         });
-        let model = config.enabled.then(|| projection_embedding_model(config));
-        let dimension = config
-            .enabled
+        let model = vector_search_enabled.then(|| projection_embedding_model(config));
+        let dimension = vector_search_enabled
             .then(|| crate::settings::resolved_vector_embedding_dimension(config))
             .flatten();
         Self::from_projection_parts(
-            config.enabled,
+            vector_search_enabled,
             provider,
             model,
             dimension,
-            config.enabled.then_some(config.embedding_normalized),
+            vector_search_enabled.then_some(config.embedding_normalized),
         )
     }
 
@@ -314,6 +314,12 @@ pub(super) async fn run_workspace(
     runtime_home: PathBuf,
     refill_status_sender: Option<ThreadEpisodicWorkspaceCapsuleRefillStatusSender>,
 ) {
+    if workspace_vector_search_config.enabled
+        && !workspace_vector_search_config.has_selected_embedding_model()
+    {
+        return;
+    }
+
     if !ensure_local_embedding_model_ready_for_workspace_refill(
         runtime_home.as_path(),
         workspace_id.as_str(),
@@ -532,37 +538,24 @@ pub(crate) async fn refill_once_with_projection_resolver(
     refill_status_sender: Option<&ThreadEpisodicWorkspaceCapsuleRefillStatusSender>,
 ) -> Result<ThreadEpisodicWorkspaceCapsuleRefillSummary> {
     let db = crud_store.database_connection();
-    let mut projection_resolution_error = None;
     if projection_target.requires_embedding_provider() {
-        match resolve_refill_embedding_provider_for_target(
+        let provider = resolve_refill_embedding_provider_for_target(
             workspace_id,
             &projection_target,
             embedding_provider_resolver.as_ref(),
         )
-        .await
-        {
-            Ok(provider) => {
-                projection_target =
-                    ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
-                        provider.as_ref(),
-                    )?;
-                embedding_provider_resolver = Some(Arc::new(
-                    FixedThreadEpisodicIndexEmbeddingProviderResolver::new(Some(provider)),
-                )
-                    as Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>);
-            }
-            Err(error) => {
-                projection_resolution_error = Some(error);
-            }
-        }
+        .await?;
+        projection_target =
+            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
+                provider.as_ref(),
+            )?;
+        embedding_provider_resolver = Some(Arc::new(
+            FixedThreadEpisodicIndexEmbeddingProviderResolver::new(Some(provider)),
+        )
+            as Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>);
     }
 
-    if projection_resolution_error.is_none()
-        && refill_is_current_for_workspace_target(
-            crud_store.as_ref(),
-            workspace_id,
-            &projection_target,
-        )
+    if refill_is_current_for_workspace_target(crud_store.as_ref(), workspace_id, &projection_target)
         .await?
     {
         return Ok(ThreadEpisodicWorkspaceCapsuleRefillSummary {
@@ -610,9 +603,6 @@ pub(crate) async fn refill_once_with_projection_resolver(
     );
 
     let result = async {
-        if let Some(error) = projection_resolution_error {
-            return Err(error);
-        }
         preflight_refill_embedding_resolver(
             workspace_id,
             &projection_target,
@@ -827,26 +817,20 @@ pub(crate) async fn refill_is_current_for_target(
     crud_store: &CrudStore,
     projection_target: &ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget,
 ) -> Result<bool> {
-    if refill_is_current_for_workspace_target(
-        crud_store,
-        LEGACY_REFILL_WORKSPACE_ID,
-        projection_target,
-    )
-    .await?
+    let projection_key_prefix = THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_KEY;
+    let workspace_projection_key_prefix = format!("{projection_key_prefix}:");
+    for meta in
+        list_projection_meta_by_key_prefix(&crud_store.database_connection(), projection_key_prefix)
+            .await?
     {
-        return Ok(true);
-    }
-    for workspace_id in crud_store
-        .list_thread_episodic_refill_workspace_ids()
-        .await?
-    {
-        if refill_is_current_for_workspace_target(
-            crud_store,
-            workspace_id.as_str(),
-            projection_target,
-        )
-        .await?
+        if meta.projection_key != projection_key_prefix
+            && !meta
+                .projection_key
+                .starts_with(workspace_projection_key_prefix.as_str())
         {
+            continue;
+        }
+        if projection_meta_is_current_for_target(&meta, projection_target) {
             return Ok(true);
         }
     }
@@ -858,22 +842,29 @@ pub(crate) async fn refill_is_current_for_workspace_target(
     workspace_id: &str,
     projection_target: &ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget,
 ) -> Result<bool> {
-    let db = crud_store.database_connection();
-    let projection_key = refill_projection_key_for_workspace(workspace_id)?;
-    let Some(meta) = find_projection_meta(&db, projection_key.as_str()).await? else {
+    let Some(meta) = find_refill_projection_meta_for_workspace(crud_store, workspace_id).await?
+    else {
         return Ok(false);
     };
 
+    Ok(projection_meta_is_current_for_target(
+        &meta,
+        projection_target,
+    ))
+}
+
+fn projection_meta_is_current_for_target(
+    meta: &pioneer_entity::thread_timeline_projection_meta::Model,
+    projection_target: &ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget,
+) -> bool {
     let marker = ProjectionMetaRecordLike {
         projection_config_hash: meta.projection_config_hash.as_deref(),
         projection_config_json: meta.projection_config_json.as_deref(),
     };
-    Ok(
-        meta.projection_version == THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_VERSION
-            && meta.status == PROJECTION_META_STATUS_COMPLETE
-            && (projection_target.matches_projection_meta(&marker)
-                || projection_target.matches_projection_meta_selection(&marker)),
-    )
+    meta.projection_version == THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_VERSION
+        && meta.status == PROJECTION_META_STATUS_COMPLETE
+        && (projection_target.matches_projection_meta(&marker)
+            || projection_target.matches_projection_meta_selection(&marker))
 }
 
 #[allow(dead_code)]
@@ -890,9 +881,8 @@ pub(crate) async fn refill_status_for_workspace_target(
     workspace_id: &str,
     projection_target: &ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget,
 ) -> Result<pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus> {
-    let db = crud_store.database_connection();
-    let projection_key = refill_projection_key_for_workspace(workspace_id)?;
-    let Some(meta) = find_projection_meta(&db, projection_key.as_str()).await? else {
+    let Some(meta) = find_refill_projection_meta_for_workspace(crud_store, workspace_id).await?
+    else {
         return Ok(pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required);
     };
 
@@ -923,6 +913,21 @@ pub(crate) async fn refill_status_for_workspace_target(
         _ => pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required,
     };
     Ok(status)
+}
+
+async fn find_refill_projection_meta_for_workspace(
+    crud_store: &CrudStore,
+    workspace_id: &str,
+) -> Result<Option<pioneer_entity::thread_timeline_projection_meta::Model>> {
+    let db = crud_store.database_connection();
+    let projection_key = refill_projection_key_for_workspace(workspace_id)?;
+    if let Some(meta) = find_projection_meta(&db, projection_key.as_str()).await? {
+        return Ok(Some(meta));
+    }
+    if workspace_id == LEGACY_REFILL_WORKSPACE_ID {
+        return Ok(None);
+    }
+    find_projection_meta(&db, THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_KEY).await
 }
 
 async fn refill_after_marker(

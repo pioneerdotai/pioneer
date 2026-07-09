@@ -2296,7 +2296,7 @@ async fn provider_api_key_handlers_use_keystore_without_settings_write() {
     );
 
     let embedding_models_request_id =
-        pioneer_protocol::RequestId::new("provider-embedding-models").expect("request id");
+        pioneer_protocol::RequestId::new("provider-embed-models").expect("request id");
     processor
         .provider_list_embedding_models(
             connection_id,

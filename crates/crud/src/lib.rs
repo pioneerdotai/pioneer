@@ -351,9 +351,10 @@ pub use crate::repositories::thread_timeline_projection::{
     delete_thread_timeline_blocks_for_turn, delete_turn_work_items_for_turn,
     delete_turn_work_projection, find_projection_meta, find_thread_timeline_block_by_sort_key,
     find_turn_work_item_projection, find_turn_work_item_projection_by_order_key,
-    find_turn_work_projection, list_thread_timeline_blocks_page, list_turn_work_items_page,
-    update_projection_meta_status, upsert_projection_meta, upsert_projection_meta_with_config,
-    upsert_thread_timeline_block, upsert_turn_work_item_projection, upsert_turn_work_projection,
+    find_turn_work_projection, list_projection_meta_by_key_prefix,
+    list_thread_timeline_blocks_page, list_turn_work_items_page, update_projection_meta_status,
+    upsert_projection_meta, upsert_projection_meta_with_config, upsert_thread_timeline_block,
+    upsert_turn_work_item_projection, upsert_turn_work_projection,
 };
 use crate::repositories::{
     agent_memory, agent_memory_candidate, agent_memory_capsule, agent_memory_event,

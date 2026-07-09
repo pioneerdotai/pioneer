@@ -38,7 +38,7 @@ impl MessageProcessor {
             }
         };
 
-        let mut providers = provider_names
+        let providers = provider_names
             .into_iter()
             .map(|name| {
                 let capabilities = self
@@ -55,12 +55,6 @@ impl MessageProcessor {
                 ProviderSummary { name, capabilities }
             })
             .collect::<Vec<_>>();
-        if !providers.iter().any(|provider| provider.name == "local") {
-            providers.push(ProviderSummary {
-                name: "local".to_owned(),
-                capabilities: ProviderSummaryCapabilities { embeddings: true },
-            });
-        }
 
         let result = ProviderListResponse { providers };
 

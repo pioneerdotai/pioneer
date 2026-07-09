@@ -127,6 +127,25 @@ pub async fn find_projection_meta<C: ConnectionTrait>(
         .with_context(|| format!("failed to query timeline projection meta `{projection_key}`"))
 }
 
+pub async fn list_projection_meta_by_key_prefix<C: ConnectionTrait>(
+    db: &C,
+    projection_key_prefix: &str,
+) -> Result<Vec<thread_timeline_projection_meta::Model>> {
+    let rows = thread_timeline_projection_meta::Entity::find()
+        .order_by_asc(thread_timeline_projection_meta::Column::ProjectionKey)
+        .all(db)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to list timeline projection meta rows with key prefix `{projection_key_prefix}`"
+            )
+        })?;
+    Ok(rows
+        .into_iter()
+        .filter(|row| row.projection_key.starts_with(projection_key_prefix))
+        .collect())
+}
+
 pub async fn upsert_projection_meta<C: ConnectionTrait>(
     db: &C,
     record: ProjectionMetaRecord,

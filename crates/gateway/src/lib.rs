@@ -778,11 +778,12 @@ pub(crate) fn memory_loop_config_from_gateway_memory_settings(
 fn thread_episodic_runtime_config_from_gateway_config(
     config: &GatewayThreadEpisodicConfig,
 ) -> ThreadEpisodicRuntimeConfig {
+    let vector_search_enabled = config.vector_search.has_selected_embedding_model();
     ThreadEpisodicRuntimeConfig {
         enabled: config.enabled,
         indexing_enabled: config.indexing_enabled,
         recall_enabled: config.recall_enabled,
-        vector_search_enabled: config.vector_search.enabled,
+        vector_search_enabled,
         vector_search: config.vector_search.clone(),
         hook_max_prompt_chars: config.default_prompt_chars,
         hook_max_candidates: config.default_max_candidates,
@@ -795,7 +796,7 @@ fn thread_episodic_runtime_config_from_gateway_config(
         },
         recall_service: ThreadEpisodicRecallServiceConfig {
             enabled: config.enabled && config.recall_enabled,
-            vector_search_enabled: config.vector_search.enabled,
+            vector_search_enabled,
             vector_search: config.vector_search.clone(),
             default_prompt_chars: config.default_prompt_chars,
             max_prompt_chars: config.max_prompt_chars,
@@ -813,11 +814,12 @@ fn thread_episodic_runtime_config_from_gateway_config(
 pub(crate) fn thread_episodic_runtime_config_from_gateway_settings(
     settings: &GatewayThreadEpisodicSettings,
 ) -> ThreadEpisodicRuntimeConfig {
+    let vector_search_enabled = settings.vector_search.has_selected_embedding_model();
     ThreadEpisodicRuntimeConfig {
         enabled: settings.enabled,
         indexing_enabled: settings.indexing_enabled,
         recall_enabled: settings.recall_enabled,
-        vector_search_enabled: settings.vector_search.enabled,
+        vector_search_enabled,
         vector_search: settings.vector_search.clone(),
         hook_max_prompt_chars: settings.default_prompt_chars,
         hook_max_candidates: settings.default_max_candidates,
@@ -830,7 +832,7 @@ pub(crate) fn thread_episodic_runtime_config_from_gateway_settings(
         },
         recall_service: ThreadEpisodicRecallServiceConfig {
             enabled: settings.enabled && settings.recall_enabled,
-            vector_search_enabled: settings.vector_search.enabled,
+            vector_search_enabled,
             vector_search: settings.vector_search.clone(),
             default_prompt_chars: settings.default_prompt_chars,
             max_prompt_chars: settings.max_prompt_chars,
@@ -1212,6 +1214,13 @@ mod tests {
 
         let mut vector_settings = settings.clone();
         vector_settings.vector_search.enabled = true;
+        let vector_runtime = thread_episodic_runtime_config_from_gateway_settings(&vector_settings);
+        assert!(!vector_runtime.vector_search_enabled);
+        assert!(!vector_runtime.recall_service.vector_search_enabled);
+
+        vector_settings.vector_search.provider =
+            Some(pioneer_config::GatewayThreadEpisodicVectorProviderConfig::OpenAi);
+        vector_settings.vector_search.model = Some("text-embedding-3-small".to_owned());
         let vector_runtime = thread_episodic_runtime_config_from_gateway_settings(&vector_settings);
         assert!(vector_runtime.vector_search_enabled);
         assert!(vector_runtime.recall_service.vector_search_enabled);
