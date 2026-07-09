@@ -1870,6 +1870,7 @@ mod tests {
                     model: Some("text-embedding-3-small".to_owned()),
                     local_model: Some("bge-small-en-v1.5".to_owned()),
                     embedding_normalized: true,
+                    use_search_instructions: false,
                 },
             );
         mark_refill_marker_with_workspace_target(
@@ -1902,6 +1903,7 @@ mod tests {
             model: Some("text-embedding-3-small".to_owned()),
             local_model: Some("bge-small-en-v1.5".to_owned()),
             embedding_normalized: true,
+            use_search_instructions: false,
         };
         let base_target =
             ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_vector_search_config(
@@ -2274,6 +2276,7 @@ mod tests {
                     model: Some("text-embedding-3-small".to_owned()),
                     local_model: Some("bge-small-en-v1.5".to_owned()),
                     embedding_normalized: true,
+                    use_search_instructions: false,
                 },
             );
         mark_refill_marker_with_workspace_target(
@@ -2862,6 +2865,7 @@ mod tests {
             model: Some("smoke/test-embedding".to_owned()),
             local_model: Some("bge-small-en-v1.5".to_owned()),
             embedding_normalized: true,
+            use_search_instructions: false,
         };
         let embedding_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::with_identity(
             "openrouter",
@@ -3214,6 +3218,7 @@ mod tests {
             model: Some(model.to_owned()),
             local_model: Some("bge-small-en-v1.5".to_owned()),
             embedding_normalized: true,
+            use_search_instructions: false,
         }
     }
 

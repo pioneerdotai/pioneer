@@ -822,8 +822,14 @@ impl PioneerDesktop {
             .when(settings.enabled, |this| {
                 this.child(Self::render_vector_embedding_model_selection(
                     &settings,
-                    desktop_entity,
+                    desktop_entity.clone(),
                     window,
+                    cx,
+                ))
+                .child(Self::render_settings_divider(cx))
+                .child(Self::render_vector_search_instructions_setting(
+                    &settings,
+                    desktop_entity,
                     cx,
                 ))
             })
@@ -920,6 +926,44 @@ impl PioneerDesktop {
                                 }
                             }),
                     )),
+            )
+            .into_any_element()
+    }
+
+    fn render_vector_search_instructions_setting(
+        settings: &GatewayThreadEpisodicVectorSearchSettings,
+        desktop_entity: Entity<Self>,
+        _cx: &mut Context<Self>,
+    ) -> AnyElement {
+        h_flex()
+            .w_full()
+            .gap_6()
+            .py_3()
+            .justify_between()
+            .items_center()
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .flex_1()
+                    .child(div().text_sm().font_semibold().child(
+                        t!("settings.memory.vector_search.search_instructions_label").to_string(),
+                    ))
+                    .child(
+                        div().text_xs().opacity(0.6).child(
+                            t!("settings.memory.vector_search.search_instructions_description")
+                                .to_string(),
+                        ),
+                    ),
+            )
+            .child(
+                Switch::new("settings-vector-search-use-search-instructions")
+                    .checked(settings.use_search_instructions)
+                    .on_click(move |enabled, _, cx| {
+                        let _ = desktop_entity.update(cx, |view, cx| {
+                            view.apply_vector_search_use_search_instructions(*enabled, cx);
+                            cx.notify();
+                        });
+                    }),
             )
             .into_any_element()
     }
@@ -1522,6 +1566,19 @@ mod tests {
         assert!(memory_view.contains("render_vector_search_setting"));
         assert!(source.contains("settings.memory.vector_search"));
         assert!(source.contains("\"settings-vector-search-enabled\""));
+        assert!(source.contains("\"settings-vector-search-use-search-instructions\""));
+        assert!(source.contains("render_vector_search_instructions_setting"));
+        assert!(source.contains("settings.memory.vector_search.search_instructions_label"));
+        let vector_search_view = source
+            .split("fn render_vector_search_setting")
+            .nth(1)
+            .expect("vector search renderer exists")
+            .split("fn render_vector_embedding_model_selection")
+            .next()
+            .expect("vector search renderer body exists");
+        assert!(vector_search_view.contains("render_vector_embedding_model_selection"));
+        assert!(vector_search_view.contains(".child(Self::render_settings_divider(cx))"));
+        assert!(vector_search_view.contains("render_vector_search_instructions_setting"));
         assert!(!memory_view.contains("ThreadEpisodicSettingToggle::Indexing"));
         assert!(!memory_view.contains("ThreadEpisodicSettingToggle::Recall"));
         assert!(!memory_view.contains("render_preflight_model_setting"));

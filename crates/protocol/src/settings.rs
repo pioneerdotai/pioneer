@@ -157,6 +157,8 @@ pub struct GatewayThreadEpisodicVectorSearchSettings {
     #[serde(default = "default_gateway_thread_episodic_vector_normalized")]
     pub embedding_normalized: bool,
     #[serde(default)]
+    pub use_search_instructions: bool,
+    #[serde(default)]
     pub provider_key: GatewayThreadEpisodicVectorProviderKeyStatus,
     #[serde(default)]
     pub refill_status: GatewayThreadEpisodicVectorRefillStatus,
@@ -173,6 +175,7 @@ impl Default for GatewayThreadEpisodicVectorSearchSettings {
             local_model: None,
             embedding_dimension: None,
             embedding_normalized: default_gateway_thread_episodic_vector_normalized(),
+            use_search_instructions: false,
             provider_key: GatewayThreadEpisodicVectorProviderKeyStatus::default(),
             refill_status: GatewayThreadEpisodicVectorRefillStatus::Disabled,
             local_model_status: GatewayThreadEpisodicVectorLocalModelStatus::NotSelected,
@@ -259,6 +262,8 @@ pub struct GatewayThreadEpisodicVectorSearchSettingsUpdate {
     pub local_model: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_normalized: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_search_instructions: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -727,6 +732,7 @@ mod tests {
         assert_eq!(roundtrip.provider, None);
         assert_eq!(roundtrip.model, None);
         assert_eq!(roundtrip.local_model, None);
+        assert!(!roundtrip.use_search_instructions);
         assert_eq!(
             roundtrip.refill_status,
             GatewayThreadEpisodicVectorRefillStatus::Disabled
@@ -756,6 +762,7 @@ mod tests {
                 local_model: Some("bge-small-en-v1.5".to_owned()),
                 embedding_dimension: Some(1536),
                 embedding_normalized: true,
+                use_search_instructions: true,
                 provider_key: GatewayThreadEpisodicVectorProviderKeyStatus {
                     required: true,
                     present: true,
@@ -790,6 +797,7 @@ mod tests {
                     local_model: Some("bge-small-en-v1.5".to_owned()),
                     embedding_dimension: Some(1536),
                     embedding_normalized: true,
+                    use_search_instructions: true,
                     provider_key: GatewayThreadEpisodicVectorProviderKeyStatus {
                         required: true,
                         present: true,
@@ -821,6 +829,7 @@ mod tests {
             local_model: Some("bge-base-en-v1.5".to_owned()),
             embedding_dimension: Some(768),
             embedding_normalized: true,
+            use_search_instructions: true,
             provider_key: GatewayThreadEpisodicVectorProviderKeyStatus {
                 required: false,
                 present: false,
@@ -848,6 +857,7 @@ mod tests {
                     model: Some(Some("openai/text-embedding-3-large".to_owned())),
                     local_model: Some(Some("bge-small-en-v1.5".to_owned())),
                     embedding_normalized: Some(true),
+                    use_search_instructions: Some(true),
                 }),
                 ..GatewayThreadEpisodicSettingsUpdate::default()
             }),

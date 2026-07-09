@@ -29,6 +29,12 @@ const OPENROUTER_PROVIDER_ID: &str = "openrouter";
 const LOCAL_PROVIDER_ID: &str = "local";
 const LOCAL_EMBEDDING_MODELS_RELATIVE_DIR: &[&str] = &["models", "embedding", "text"];
 const LOCAL_EMBEDDING_DOWNLOAD_TIMEOUT_SECS: u64 = 15 * 60;
+const THREAD_EPISODIC_PERSONAL_ASSISTANT_QUERY_INSTRUCTION: &str = concat!(
+    "Given the user's current message in an ongoing personal assistant conversation, ",
+    "retrieve relevant prior conversation passages, user preferences, remembered facts, ",
+    "decisions, plans, commitments, and context that would help the assistant respond ",
+    "accurately and consistently."
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OpenAiEmbeddingModelInfo {
@@ -122,6 +128,10 @@ pub(crate) fn openrouter_embedding_model_info(
         max_batch_size: 512,
         custom: true,
     })
+}
+
+fn apply_search_instruction_to_query(query: &str) -> String {
+    format!("Instruct: {THREAD_EPISODIC_PERSONAL_ASSISTANT_QUERY_INSTRUCTION}\nQuery: {query}")
 }
 
 pub(crate) fn local_embedding_models_root(runtime_home: &Path) -> PathBuf {
@@ -637,6 +647,7 @@ pub(crate) struct LocalEmbeddingProvider {
     model_info: &'static LocalEmbeddingModelInfo,
     models_dir: PathBuf,
     normalized: bool,
+    use_search_instructions: bool,
     runtime: Arc<Mutex<Option<Arc<dyn LocalEmbeddingRuntime>>>>,
     runtime_factory: Arc<dyn LocalEmbeddingRuntimeFactory>,
 }
@@ -646,6 +657,7 @@ impl LocalEmbeddingProvider {
         runtime_home: &Path,
         model: &str,
         normalized: bool,
+        use_search_instructions: bool,
     ) -> Result<Self, ThreadEpisodicEmbeddingError> {
         let model_info = local_embedding_model_info(model)
             .ok_or_else(|| ThreadEpisodicEmbeddingError::missing_model(LOCAL_PROVIDER_ID, model))?;
@@ -654,6 +666,7 @@ impl LocalEmbeddingProvider {
             model_info,
             models_dir: local_embedding_models_root(runtime_home),
             normalized,
+            use_search_instructions,
             runtime: Arc::new(Mutex::new(None)),
             runtime_factory: Arc::new(MemvidLocalEmbeddingRuntimeFactory),
         })
@@ -664,9 +677,11 @@ impl LocalEmbeddingProvider {
         runtime_home: &Path,
         model: &str,
         normalized: bool,
+        use_search_instructions: bool,
         runtime_factory: Arc<dyn LocalEmbeddingRuntimeFactory>,
     ) -> Result<Self, ThreadEpisodicEmbeddingError> {
-        let mut provider = Self::from_runtime_home(runtime_home, model, normalized)?;
+        let mut provider =
+            Self::from_runtime_home(runtime_home, model, normalized, use_search_instructions)?;
         provider.runtime_factory = runtime_factory;
         Ok(provider)
     }
@@ -739,6 +754,7 @@ impl Debug for LocalEmbeddingProvider {
             .field("model", &self.model_info.id)
             .field("dimension", &self.model_info.dimension)
             .field("normalized", &self.normalized)
+            .field("use_search_instructions", &self.use_search_instructions)
             .field("models_dir", &self.models_dir)
             .field("runtime_initialized", &self.runtime_initialized())
             .finish()
@@ -768,6 +784,14 @@ impl ThreadEpisodicEmbeddingProvider for LocalEmbeddingProvider {
         Ok(embedding)
     }
 
+    fn embed_query(&self, text: &str) -> Result<Vec<f32>, ThreadEpisodicEmbeddingError> {
+        if self.use_search_instructions {
+            self.embed_text(apply_search_instruction_to_query(text).as_str())
+        } else {
+            self.embed_text(text)
+        }
+    }
+
     fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, ThreadEpisodicEmbeddingError> {
         let embeddings = self.ensure_runtime()?.embed_batch(texts)?;
         for embedding in &embeddings {
@@ -785,6 +809,7 @@ pub(crate) struct RemoteEmbeddingProvider {
     max_batch_size: usize,
     normalized: bool,
     custom_model: bool,
+    use_search_instructions: bool,
     provider: Arc<dyn Provider>,
 }
 
@@ -792,6 +817,7 @@ impl RemoteEmbeddingProvider {
     pub(crate) fn openai(
         model: &str,
         normalized: bool,
+        use_search_instructions: bool,
         provider: Arc<dyn Provider>,
     ) -> Result<Self, ThreadEpisodicEmbeddingError> {
         let model_info = openai_embedding_model_info(model).ok_or_else(|| {
@@ -806,6 +832,7 @@ impl RemoteEmbeddingProvider {
             max_batch_size: model_info.max_batch_size,
             normalized,
             custom_model: false,
+            use_search_instructions,
             provider,
         })
     }
@@ -814,6 +841,7 @@ impl RemoteEmbeddingProvider {
         model: &str,
         explicit_dimension: Option<usize>,
         normalized: bool,
+        use_search_instructions: bool,
         provider: Arc<dyn Provider>,
     ) -> Result<Self, ThreadEpisodicEmbeddingError> {
         Self::ensure_provider_supports_embeddings(
@@ -846,6 +874,7 @@ impl RemoteEmbeddingProvider {
             max_batch_size: model_info.max_batch_size,
             normalized,
             custom_model: model_info.custom,
+            use_search_instructions,
             provider,
         })
     }
@@ -982,6 +1011,7 @@ impl Debug for RemoteEmbeddingProvider {
             .field("max_batch_size", &self.max_batch_size)
             .field("normalized", &self.normalized)
             .field("custom_model", &self.custom_model)
+            .field("use_search_instructions", &self.use_search_instructions)
             .finish()
     }
 }
@@ -1015,17 +1045,42 @@ impl ThreadEpisodicEmbeddingProvider for RemoteEmbeddingProvider {
         })
     }
 
+    fn embed_query(&self, text: &str) -> Result<Vec<f32>, ThreadEpisodicEmbeddingError> {
+        if self.use_search_instructions {
+            let query = apply_search_instruction_to_query(text);
+            self.embed_input_batch(vec![query])
+                .and_then(|mut embeddings| {
+                    embeddings.pop().ok_or_else(|| {
+                        ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
+                            self.provider_id(),
+                            self.model(),
+                            "embedding response did not include an embedding",
+                        )
+                    })
+                })
+        } else {
+            self.embed_text(text)
+        }
+    }
+
     fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, ThreadEpisodicEmbeddingError> {
-        if texts.is_empty() {
+        self.embed_input_batch(texts.iter().map(|text| (*text).to_owned()).collect())
+    }
+}
+
+impl RemoteEmbeddingProvider {
+    fn embed_input_batch(
+        &self,
+        inputs: Vec<String>,
+    ) -> Result<Vec<Vec<f32>>, ThreadEpisodicEmbeddingError> {
+        if inputs.is_empty() {
             return Ok(Vec::new());
         }
 
-        let mut embeddings = Vec::with_capacity(texts.len());
-        for chunk in texts.chunks(self.max_batch_size) {
-            let response = self.embed_via_provider(EmbeddingRequest::new(
-                self.model(),
-                chunk.iter().map(|text| (*text).to_owned()).collect(),
-            ))?;
+        let mut embeddings = Vec::with_capacity(inputs.len());
+        for chunk in inputs.chunks(self.max_batch_size) {
+            let response =
+                self.embed_via_provider(EmbeddingRequest::new(self.model(), chunk.to_vec()))?;
             if response.embeddings.len() != chunk.len() {
                 return Err(
                     ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
@@ -1060,6 +1115,7 @@ mod tests {
     struct FakeRemoteProvider {
         name: &'static str,
         embeddings: bool,
+        requests: Mutex<Vec<pioneer_provider::EmbeddingRequest>>,
         responses: Mutex<Vec<anyhow::Result<pioneer_provider::EmbeddingResponse>>>,
     }
 
@@ -1071,6 +1127,7 @@ mod tests {
             Self {
                 name,
                 embeddings: true,
+                requests: Mutex::new(Vec::new()),
                 responses: Mutex::new(responses),
             }
         }
@@ -1079,8 +1136,13 @@ mod tests {
             Self {
                 name,
                 embeddings: false,
+                requests: Mutex::new(Vec::new()),
                 responses: Mutex::new(Vec::new()),
             }
+        }
+
+        fn requests(&self) -> Vec<pioneer_provider::EmbeddingRequest> {
+            self.requests.lock().expect("fake provider lock").clone()
         }
     }
 
@@ -1119,8 +1181,12 @@ mod tests {
 
         async fn embed(
             &self,
-            _request: pioneer_provider::EmbeddingRequest,
+            request: pioneer_provider::EmbeddingRequest,
         ) -> anyhow::Result<pioneer_provider::EmbeddingResponse> {
+            self.requests
+                .lock()
+                .expect("fake provider requests lock")
+                .push(request);
             self.responses.lock().expect("fake provider lock").remove(0)
         }
     }
@@ -1153,6 +1219,7 @@ mod tests {
         let error = RemoteEmbeddingProvider::openai(
             "text-embedding-3-small",
             true,
+            false,
             Arc::new(FakeRemoteProvider::without_embeddings("openai")),
         )
         .expect_err("provider without embeddings must fail");
@@ -1166,6 +1233,7 @@ mod tests {
         let provider = RemoteEmbeddingProvider::openai(
             "text-embedding-3-small",
             true,
+            false,
             Arc::new(FakeRemoteProvider::with_responses(
                 "openai",
                 vec![
@@ -1188,6 +1256,7 @@ mod tests {
         let rate_limited = RemoteEmbeddingProvider::openai(
             "text-embedding-3-small",
             true,
+            false,
             Arc::new(FakeRemoteProvider::with_responses(
                 "openai",
                 vec![Err(anyhow::anyhow!("OpenAI API error (429): rate limit"))],
@@ -1201,6 +1270,7 @@ mod tests {
         let invalid_key = RemoteEmbeddingProvider::openai(
             "text-embedding-3-small",
             true,
+            false,
             Arc::new(FakeRemoteProvider::with_responses(
                 "openai",
                 vec![Err(anyhow::anyhow!("OpenAI API error (401): invalid key"))],
@@ -1217,6 +1287,7 @@ mod tests {
         let provider = RemoteEmbeddingProvider::openai(
             "text-embedding-3-small",
             true,
+            false,
             Arc::new(FakeRemoteProvider::with_responses(
                 "openai",
                 vec![Ok(embedding_response(vec![vec![0.1; 3]]))],
@@ -1264,6 +1335,7 @@ mod tests {
             "vendor/custom-embed",
             Some(768),
             true,
+            false,
             Arc::new(FakeRemoteProvider::with_responses(
                 "openrouter",
                 vec![Ok(embedding_response(vec![vec![0.4; 768]]))],
@@ -1281,6 +1353,7 @@ mod tests {
             "qwen/qwen3-embedding-8b",
             None,
             true,
+            false,
             Arc::new(FakeRemoteProvider::with_responses(
                 "openrouter",
                 vec![
@@ -1294,6 +1367,55 @@ mod tests {
         assert_eq!(provider.provider_id(), OPENROUTER_PROVIDER_ID);
         assert_eq!(provider.dimension(), 4096);
         assert_eq!(provider.embed_text("hello").unwrap().len(), 4096);
+    }
+
+    #[test]
+    fn remote_embedding_provider_uses_search_instruction_only_for_queries_when_enabled() {
+        let fake = Arc::new(FakeRemoteProvider::with_responses(
+            "openai",
+            vec![
+                Ok(embedding_response(vec![vec![0.1; 1536]])),
+                Ok(embedding_response(vec![vec![0.2; 1536]])),
+            ],
+        ));
+        let provider =
+            RemoteEmbeddingProvider::openai("text-embedding-3-small", true, true, fake.clone())
+                .expect("provider");
+
+        provider
+            .embed_query("find my travel plans")
+            .expect("query embedding");
+        provider
+            .embed_batch(&["stored chat"])
+            .expect("batch embedding");
+
+        let requests = fake.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].input.len(), 1);
+        assert!(requests[0].input[0].starts_with(
+            "Instruct: Given the user's current message in an ongoing personal assistant conversation"
+        ));
+        assert!(requests[0].input[0].ends_with("\nQuery: find my travel plans"));
+        assert_eq!(requests[1].input, vec!["stored chat".to_owned()]);
+    }
+
+    #[test]
+    fn remote_embedding_provider_leaves_query_raw_when_search_instructions_are_disabled() {
+        let fake = Arc::new(FakeRemoteProvider::with_responses(
+            "openai",
+            vec![Ok(embedding_response(vec![vec![0.1; 1536]]))],
+        ));
+        let provider =
+            RemoteEmbeddingProvider::openai("text-embedding-3-small", true, false, fake.clone())
+                .expect("provider");
+
+        provider
+            .embed_query("find my travel plans")
+            .expect("query embedding");
+
+        let requests = fake.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].input, vec!["find my travel plans".to_owned()]);
     }
 
     #[test]
@@ -1637,10 +1759,15 @@ mod tests {
     #[derive(Debug)]
     struct FakeLocalEmbeddingRuntime {
         dimension: usize,
+        inputs: Arc<Mutex<Vec<String>>>,
     }
 
     impl LocalEmbeddingRuntime for FakeLocalEmbeddingRuntime {
-        fn embed_text(&self, _text: &str) -> Result<Vec<f32>, ThreadEpisodicEmbeddingError> {
+        fn embed_text(&self, text: &str) -> Result<Vec<f32>, ThreadEpisodicEmbeddingError> {
+            self.inputs
+                .lock()
+                .expect("fake local runtime inputs lock")
+                .push(text.to_owned());
             Ok(vec![0.25; self.dimension])
         }
 
@@ -1648,6 +1775,10 @@ mod tests {
             &self,
             texts: &[&str],
         ) -> Result<Vec<Vec<f32>>, ThreadEpisodicEmbeddingError> {
+            self.inputs
+                .lock()
+                .expect("fake local runtime inputs lock")
+                .extend(texts.iter().map(|text| (*text).to_owned()));
             Ok(texts.iter().map(|_| vec![0.5; self.dimension]).collect())
         }
     }
@@ -1655,6 +1786,7 @@ mod tests {
     #[derive(Debug)]
     struct FakeLocalEmbeddingRuntimeFactory {
         dimension: usize,
+        inputs: Arc<Mutex<Vec<String>>>,
         create_count: Arc<std::sync::atomic::AtomicUsize>,
     }
 
@@ -1662,12 +1794,17 @@ mod tests {
         fn new(dimension: usize) -> Self {
             Self {
                 dimension,
+                inputs: Arc::new(Mutex::new(Vec::new())),
                 create_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }
         }
 
         fn create_count(&self) -> usize {
             self.create_count.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn inputs(&self) -> Vec<String> {
+            self.inputs.lock().expect("fake local inputs lock").clone()
         }
     }
 
@@ -1680,6 +1817,7 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(Arc::new(FakeLocalEmbeddingRuntime {
                 dimension: self.dimension,
+                inputs: self.inputs.clone(),
             }))
         }
     }
@@ -1704,6 +1842,7 @@ mod tests {
             runtime_home.path(),
             "bge-small-en-v1.5",
             true,
+            false,
             factory.clone(),
         )
         .expect("provider");
@@ -1730,6 +1869,7 @@ mod tests {
             runtime_home.path(),
             "bge-small-en-v1.5",
             true,
+            false,
             factory.clone(),
         )
         .expect("provider");
@@ -1754,6 +1894,7 @@ mod tests {
             runtime_home.path(),
             "bge-base-en-v1.5",
             true,
+            false,
             Arc::new(FakeLocalEmbeddingRuntimeFactory::new(768)),
         )
         .expect("provider");
@@ -1768,6 +1909,36 @@ mod tests {
     }
 
     #[test]
+    fn local_embedding_provider_uses_search_instruction_only_for_queries_when_enabled() {
+        let runtime_home = tempfile::tempdir().expect("runtime home");
+        install_fake_local_model_files(runtime_home.path(), "bge-base-en-v1.5");
+        let factory = Arc::new(FakeLocalEmbeddingRuntimeFactory::new(768));
+        let provider = LocalEmbeddingProvider::with_runtime_factory(
+            runtime_home.path(),
+            "bge-base-en-v1.5",
+            true,
+            true,
+            factory.clone(),
+        )
+        .expect("provider");
+
+        provider
+            .embed_query("find my travel plans")
+            .expect("query embedding");
+        provider
+            .embed_batch(&["stored chat"])
+            .expect("batch embedding");
+
+        let inputs = factory.inputs();
+        assert_eq!(inputs.len(), 2);
+        assert!(inputs[0].starts_with(
+            "Instruct: Given the user's current message in an ongoing personal assistant conversation"
+        ));
+        assert!(inputs[0].ends_with("\nQuery: find my travel plans"));
+        assert_eq!(inputs[1], "stored chat");
+    }
+
+    #[test]
     fn local_embedding_provider_memvid_embedder_uses_same_identity() {
         let runtime_home = tempfile::tempdir().expect("runtime home");
         install_fake_local_model_files(runtime_home.path(), "gte-large");
@@ -1776,6 +1947,7 @@ mod tests {
                 runtime_home.path(),
                 "gte-large",
                 true,
+                false,
                 Arc::new(FakeLocalEmbeddingRuntimeFactory::new(1024)),
             )
             .expect("provider"),
@@ -1804,6 +1976,7 @@ mod tests {
         let provider = RemoteEmbeddingProvider::openai(
             model.as_str(),
             true,
+            false,
             Arc::new(pioneer_provider::providers::OpenAiProvider::new(api_key)),
         )
         .expect("OpenAI smoke provider should initialize");
@@ -1839,6 +2012,7 @@ mod tests {
             model.as_str(),
             explicit_dimension,
             true,
+            false,
             Arc::new(pioneer_provider::providers::OpenRouterProvider::new(
                 api_key,
             )),
@@ -1877,9 +2051,13 @@ mod tests {
             );
             return;
         }
-        let provider =
-            LocalEmbeddingProvider::from_runtime_home(runtime_home.as_path(), model.as_str(), true)
-                .expect("local smoke provider should initialize");
+        let provider = LocalEmbeddingProvider::from_runtime_home(
+            runtime_home.as_path(),
+            model.as_str(),
+            true,
+            false,
+        )
+        .expect("local smoke provider should initialize");
 
         let embedding = provider
             .embed_text("Pioneer thread episodic vector search smoke test")

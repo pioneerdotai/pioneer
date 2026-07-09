@@ -271,10 +271,17 @@ pub fn thread_episodic_vector_search_update_plan(
     vector_search.provider_key.present = vector_search.provider_key.required
         && previous.provider == vector_search.provider
         && previous.provider_key.present;
+    let projection_changed = previous.enabled != vector_search.enabled
+        || previous.provider != vector_search.provider
+        || previous.model != vector_search.model
+        || previous.local_model != vector_search.local_model
+        || previous.embedding_normalized != vector_search.embedding_normalized;
     if !vector_search.enabled {
         vector_search.refill_status = GatewayThreadEpisodicVectorRefillStatus::Disabled;
-    } else {
+    } else if projection_changed {
         vector_search.refill_status = GatewayThreadEpisodicVectorRefillStatus::Required;
+    } else {
+        vector_search.refill_status = previous.refill_status;
     }
 
     snapshot.thread_episodic.vector_search = vector_search.clone();
@@ -291,6 +298,7 @@ pub fn thread_episodic_vector_search_update_plan(
                     model: Some(vector_search.model),
                     local_model: Some(vector_search.local_model),
                     embedding_normalized: Some(vector_search.embedding_normalized),
+                    use_search_instructions: Some(vector_search.use_search_instructions),
                 }),
                 ..GatewayThreadEpisodicSettingsUpdate::default()
             }),
@@ -656,6 +664,36 @@ mod tests {
         assert!(!update_json.contains("embedding_dimension"));
         assert!(!update_json.contains("embeddingDimension"));
         assert!(update_json.contains("openrouter"));
+    }
+
+    #[test]
+    fn vector_search_update_plan_does_not_require_refill_for_search_instruction_toggle() {
+        let mut current = snapshot(true);
+        current.thread_episodic.vector_search = GatewayThreadEpisodicVectorSearchSettings {
+            enabled: true,
+            provider: Some(GatewayThreadEpisodicVectorProvider::OpenAi),
+            model: Some("text-embedding-3-small".to_owned()),
+            refill_status: GatewayThreadEpisodicVectorRefillStatus::Complete,
+            ..GatewayThreadEpisodicVectorSearchSettings::default()
+        };
+
+        let next = GatewayThreadEpisodicVectorSearchSettings {
+            use_search_instructions: true,
+            ..current.thread_episodic.vector_search.clone()
+        };
+        let plan = thread_episodic_vector_search_update_plan(Some(&current), next).expect("plan");
+
+        assert_eq!(
+            plan.snapshot.thread_episodic.vector_search.refill_status,
+            GatewayThreadEpisodicVectorRefillStatus::Complete
+        );
+        assert_eq!(
+            plan.update
+                .thread_episodic
+                .and_then(|update| update.vector_search)
+                .and_then(|update| update.use_search_instructions),
+            Some(true)
+        );
     }
 
     #[test]

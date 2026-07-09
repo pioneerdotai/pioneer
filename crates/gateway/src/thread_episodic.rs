@@ -541,6 +541,7 @@ impl ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver {
                 let provider = RemoteEmbeddingProvider::openai(
                     model,
                     config.embedding_normalized,
+                    config.use_search_instructions,
                     api_provider,
                 )
                 .map_err(embedding_resolution_error)?;
@@ -569,6 +570,7 @@ impl ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver {
                     model,
                     None,
                     config.embedding_normalized,
+                    config.use_search_instructions,
                     api_provider,
                 )
                 .map_err(embedding_resolution_error)?;
@@ -598,6 +600,7 @@ impl ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver {
                     self.runtime_home.as_path(),
                     model,
                     config.embedding_normalized,
+                    config.use_search_instructions,
                 )
                 .map_err(embedding_resolution_error)?;
                 Ok(Arc::new(provider))
@@ -4959,6 +4962,7 @@ mod tests {
             model: Some("custom/test-embedding".to_owned()),
             local_model: Some("bge-small-en-v1.5".to_owned()),
             embedding_normalized: true,
+            use_search_instructions: false,
         };
         mark_thread_episodic_workspace_vector_refill_complete_for_test(
             crud_store.as_ref(),
@@ -5048,6 +5052,7 @@ mod tests {
             model: Some("custom/test-embedding".to_owned()),
             local_model: Some("bge-small-en-v1.5".to_owned()),
             embedding_normalized: true,
+            use_search_instructions: false,
         };
         mark_thread_episodic_workspace_vector_refill_complete_for_test(
             crud_store.as_ref(),
@@ -5124,6 +5129,7 @@ mod tests {
             model: Some("text-embedding-3-small".to_owned()),
             local_model: Some("bge-small-en-v1.5".to_owned()),
             embedding_normalized: true,
+            use_search_instructions: false,
         };
         mark_thread_episodic_workspace_vector_refill_complete_for_test(
             crud_store.as_ref(),
@@ -5197,6 +5203,7 @@ mod tests {
             model: Some("text-embedding-3-small".to_owned()),
             local_model: Some("bge-small-en-v1.5".to_owned()),
             embedding_normalized: true,
+            use_search_instructions: false,
         };
         mark_thread_episodic_workspace_vector_refill_complete_for_test(
             crud_store.as_ref(),
@@ -5271,6 +5278,7 @@ mod tests {
             model: Some("custom/test-embedding".to_owned()),
             local_model: Some("bge-small-en-v1.5".to_owned()),
             embedding_normalized: true,
+            use_search_instructions: false,
         };
         mark_thread_episodic_workspace_vector_refill_complete_for_test(
             crud_store.as_ref(),
@@ -5552,6 +5560,7 @@ mod tests {
             model: Some("custom/test-embedding".to_owned()),
             local_model: Some("bge-small-en-v1.5".to_owned()),
             embedding_normalized: true,
+            use_search_instructions: false,
         };
         mark_thread_episodic_workspace_vector_refill_complete_for_test(
             crud_store.as_ref(),

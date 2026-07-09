@@ -64,7 +64,7 @@
         "max_segments": 16,
         "min_relevancy": 0.25,
         "min_results": 1,
-        "near_capacity_percent": 85.0,
+        "near_capacity_percent": 85,
         "recall_enabled": true,
         "retry_base_delay_secs": 30,
         "retry_max_delay_secs": 900,
@@ -543,6 +543,10 @@
         "refill_status": {
           "$ref": "#/$defs/GatewayThreadEpisodicVectorRefillStatus",
           "default": "disabled"
+        },
+        "use_search_instructions": {
+          "type": "boolean",
+          "default": false
         }
       }
     }

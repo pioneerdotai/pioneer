@@ -429,6 +429,12 @@
               "type": "null"
             }
           ]
+        },
+        "use_search_instructions": {
+          "type": [
+            "boolean",
+            "null"
+          ]
         }
       }
     }

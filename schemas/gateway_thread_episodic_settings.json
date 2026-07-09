@@ -209,6 +209,10 @@
         "refill_status": {
           "$ref": "#/$defs/GatewayThreadEpisodicVectorRefillStatus",
           "default": "disabled"
+        },
+        "use_search_instructions": {
+          "type": "boolean",
+          "default": false
         }
       }
     }

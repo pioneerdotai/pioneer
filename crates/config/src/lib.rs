@@ -694,6 +694,10 @@ pub struct GatewayThreadEpisodicVectorSearchConfig {
     /// Whether embeddings are normalized before being written/searched.
     #[serde(default = "default_gateway_thread_episodic_vector_normalized")]
     pub embedding_normalized: bool,
+    /// Adds a retrieval task instruction to query embeddings. Document/refill
+    /// embeddings remain unchanged.
+    #[serde(default)]
+    pub use_search_instructions: bool,
 }
 
 impl Default for GatewayThreadEpisodicVectorSearchConfig {
@@ -704,6 +708,7 @@ impl Default for GatewayThreadEpisodicVectorSearchConfig {
             model: None,
             local_model: None,
             embedding_normalized: default_gateway_thread_episodic_vector_normalized(),
+            use_search_instructions: false,
         }
     }
 }
@@ -3826,6 +3831,13 @@ active_recall_model = { source = "custom", model_provider = "legacy-provider", m
                 .vector_search
                 .embedding_normalized
         );
+        assert!(
+            !config
+                .gateway
+                .thread_episodic
+                .vector_search
+                .use_search_instructions
+        );
     }
 
     #[test]
@@ -3906,6 +3918,7 @@ active_recall_model = { source = "custom", model_provider = "legacy-provider", m
         assert_eq!(config.vector_search.model, None);
         assert_eq!(config.vector_search.local_model, None);
         assert!(config.vector_search.embedding_normalized);
+        assert!(!config.vector_search.use_search_instructions);
     }
 
     #[test]
@@ -3929,6 +3942,7 @@ default_prompt_chars = 1000
         assert_eq!(config.vector_search.provider, None);
         assert_eq!(config.vector_search.model, None);
         assert_eq!(config.vector_search.local_model, None);
+        assert!(!config.vector_search.use_search_instructions);
     }
 
     #[test]
@@ -3944,6 +3958,7 @@ model = "openai/text-embedding-3-small"
 local_model = "bge-base-en-v1.5"
 embedding_dimension = 1536
 embedding_normalized = true
+use_search_instructions = true
 "#,
         )
         .expect("gateway thread episodic vector search config should deserialize");
@@ -3962,10 +3977,12 @@ embedding_normalized = true
             Some("bge-base-en-v1.5")
         );
         assert!(config.vector_search.embedding_normalized);
+        assert!(config.vector_search.use_search_instructions);
 
         let serialized =
             toml::to_string(&config.vector_search).expect("vector config should serialize");
         assert!(serialized.contains("provider = \"openrouter\""));
+        assert!(serialized.contains("use_search_instructions = true"));
         assert!(!serialized.contains("embedding_dimension"));
         assert!(!serialized.contains("api_key"));
         assert!(!serialized.contains("secret"));

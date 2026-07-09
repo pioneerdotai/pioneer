@@ -172,6 +172,19 @@ impl PioneerDesktop {
         self.apply_vector_search_settings(vector_search, cx);
     }
 
+    pub(super) fn apply_vector_search_use_search_instructions(
+        &mut self,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut vector_search) = self.current_vector_search_settings() else {
+            self.refresh_gateway_settings(cx);
+            return;
+        };
+        vector_search.use_search_instructions = enabled;
+        self.apply_vector_search_settings(vector_search, cx);
+    }
+
     pub(super) fn apply_vector_search_embedding_model_selection(
         &mut self,
         selection: crate::components::model_selector::ModelSelectorSelection,
@@ -611,5 +624,21 @@ mod tests {
         assert!(
             !embedding_model_fn.contains("settings_memory::gateway_settings_update_for_memory")
         );
+    }
+
+    #[test]
+    fn settings_vector_search_instruction_toggle_writes_thread_episodic_settings_only() {
+        let source = production_lifecycle_source();
+        let instruction_fn = source
+            .split("pub(super) fn apply_vector_search_use_search_instructions")
+            .nth(1)
+            .expect("vector search instruction function exists")
+            .split("pub(super) fn apply_vector_search_embedding_model_selection")
+            .next()
+            .expect("vector search instruction function body exists");
+
+        assert!(instruction_fn.contains("vector_search.use_search_instructions = enabled"));
+        assert!(instruction_fn.contains("self.apply_vector_search_settings"));
+        assert!(!instruction_fn.contains("settings_memory::gateway_settings_update_for_memory"));
     }
 }

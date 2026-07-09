@@ -943,6 +943,7 @@ fn vector_search_config_to_protocol(
         local_model,
         embedding_dimension: resolved_vector_embedding_dimension(config),
         embedding_normalized: config.embedding_normalized,
+        use_search_instructions: config.use_search_instructions,
         provider_key: pioneer_protocol::GatewayThreadEpisodicVectorProviderKeyStatus {
             required: config.enabled && config.provider.is_some_and(vector_provider_requires_key),
             present: false,
@@ -975,6 +976,7 @@ fn vector_search_config_from_protocol(
         model: settings.model,
         local_model: settings.local_model,
         embedding_normalized: settings.embedding_normalized,
+        use_search_instructions: settings.use_search_instructions,
     }
 }
 
@@ -1177,6 +1179,9 @@ fn apply_vector_search_protocol_update(
     }
     if let Some(embedding_normalized) = update.embedding_normalized {
         config.embedding_normalized = embedding_normalized;
+    }
+    if let Some(use_search_instructions) = update.use_search_instructions {
+        config.use_search_instructions = use_search_instructions;
     }
 }
 
@@ -2339,6 +2344,7 @@ model = "openai/text-embedding-3-small"
 local_model = "bge-base-en-v1.5"
 embedding_dimension = 1536
 embedding_normalized = true
+use_search_instructions = true
 "#,
         )
         .expect("gateway settings should parse");
@@ -2397,6 +2403,7 @@ embedding_normalized = true
             Some("bge-base-en-v1.5")
         );
         assert!(mapped.vector_search.embedding_normalized);
+        assert!(mapped.vector_search.use_search_instructions);
     }
 
     #[test]
@@ -2407,6 +2414,7 @@ embedding_normalized = true
             model: Some("text-embedding-3-small".to_owned()),
             local_model: Some("bge-small-en-v1.5".to_owned()),
             embedding_normalized: true,
+            use_search_instructions: false,
         };
         let disabled_changed_model = GatewayThreadEpisodicVectorSearchConfig {
             model: Some("text-embedding-3-large".to_owned()),
@@ -2430,6 +2438,26 @@ embedding_normalized = true
         assert_ne!(
             super::thread_episodic_vector_projection_identity_hash(&enabled_openai),
             super::thread_episodic_vector_projection_identity_hash(&enabled_openrouter)
+        );
+
+        let enabled_openai_with_query_instructions = GatewayThreadEpisodicVectorSearchConfig {
+            use_search_instructions: true,
+            ..enabled_openai
+        };
+        assert_eq!(
+            super::thread_episodic_vector_projection_identity_hash(
+                &enabled_openai_with_query_instructions
+            ),
+            super::thread_episodic_vector_projection_identity_hash(
+                &GatewayThreadEpisodicVectorSearchConfig {
+                    enabled: true,
+                    provider: Some(GatewayThreadEpisodicVectorProviderConfig::OpenAi),
+                    model: Some("text-embedding-3-small".to_owned()),
+                    local_model: Some("bge-small-en-v1.5".to_owned()),
+                    embedding_normalized: true,
+                    use_search_instructions: false,
+                }
+            )
         );
     }
 
@@ -2651,6 +2679,7 @@ embedding_normalized = true
                                 model: Some(Some("different-disabled-model".to_owned())),
                                 local_model: Some(Some("different-disabled-local".to_owned())),
                                 embedding_normalized: Some(false),
+                                use_search_instructions: None,
                             },
                         ),
                         ..Default::default()
@@ -2661,6 +2690,57 @@ embedding_normalized = true
             )
             .expect("already-disabled update should apply");
         assert!(!already_disabled.thread_episodic_vector_projection_changed);
+    }
+
+    #[test]
+    fn vector_search_instruction_setting_change_does_not_mark_projection_changed() {
+        let mut settings = toml::from_str::<super::GatewaySettings>(
+            r#"
+version = 1
+
+[secrets]
+backend = "keystore"
+
+[thread_episodic.vector_search]
+enabled = true
+provider = "openai"
+model = "text-embedding-3-small"
+local_model = "bge-small-en-v1.5"
+embedding_normalized = true
+use_search_instructions = false
+"#,
+        )
+        .expect("gateway settings should parse");
+
+        let changes = settings
+            .apply_protocol_update_for_workspace(
+                pioneer_protocol::GatewaySettingsUpdate {
+                    thread_episodic: Some(pioneer_protocol::GatewayThreadEpisodicSettingsUpdate {
+                        vector_search: Some(
+                            pioneer_protocol::GatewayThreadEpisodicVectorSearchSettingsUpdate {
+                                use_search_instructions: Some(true),
+                                ..Default::default()
+                            },
+                        ),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                Some("workspace_a"),
+            )
+            .expect("instruction setting update should apply");
+
+        assert!(changes.thread_episodic);
+        assert!(!changes.thread_episodic_vector_projection_changed);
+        assert!(
+            settings
+                .effective_thread_episodic_settings_for_workspace(
+                    &pioneer_config::GatewayThreadEpisodicConfig::default(),
+                    Some("workspace_a"),
+                )
+                .vector_search
+                .use_search_instructions
+        );
     }
 
     #[test]
@@ -2804,6 +2884,7 @@ backend = "keystore"
                                 model: Some(Some("bge-base-en-v1.5".to_owned())),
                                 local_model: Some(Some("bge-base-en-v1.5".to_owned())),
                                 embedding_normalized: Some(true),
+                                use_search_instructions: None,
                             },
                         ),
                         ..pioneer_protocol::GatewayThreadEpisodicSettingsUpdate::default()
@@ -2896,6 +2977,7 @@ backend = "keystore"
                         model: Some(Some("openai/text-embedding-3-small".to_owned())),
                         local_model: Some(None),
                         embedding_normalized: Some(true),
+                        use_search_instructions: None,
                     },
                 ),
                 ..pioneer_protocol::GatewayThreadEpisodicSettingsUpdate::default()
