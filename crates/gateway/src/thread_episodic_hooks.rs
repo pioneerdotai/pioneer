@@ -112,12 +112,15 @@ impl ThreadEpisodicMemoryRecallProvider {
 impl AgentEpisodicRecallProvider for ThreadEpisodicMemoryRecallProvider {
     async fn recall_capabilities(
         &self,
-        _context: pioneer_memory::hooks::MemoryTurnContext,
+        context: pioneer_memory::hooks::MemoryTurnContext,
     ) -> MemoryEpisodicRecallCapabilities {
         MemoryEpisodicRecallCapabilities {
             current_thread_search: true,
             related_thread_search: self.workspace_service.is_some(),
             workspace_thread_search: self.workspace_service.is_some(),
+            full_input_query: self
+                .service
+                .full_input_query_enabled_for_workspace(context.workspace_id.as_str()),
             current_task_context: false,
             completed_task_summary: false,
         }

@@ -298,7 +298,8 @@ impl DurableMemoryRecallPlan {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EpisodicMemoryRecallQuery {
     pub mode: ActiveRecallMode,
-    pub query: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
     #[serde(default)]
     pub targets: Vec<ActiveRecallTarget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -309,7 +310,9 @@ pub struct EpisodicMemoryRecallQuery {
 
 impl EpisodicMemoryRecallQuery {
     fn normalized(mut self) -> Option<Self> {
-        self.query = bounded_nonempty_text(self.query.as_str(), 500)?;
+        self.query = self
+            .query
+            .and_then(|query| bounded_nonempty_text(query.as_str(), 500));
         self.targets = self
             .targets
             .into_iter()
@@ -1282,7 +1285,7 @@ fn active_recall_mode_requests(input: &ActiveRecallExecutionInput) -> Vec<Active
     {
         requests.push(ActiveRecallModeRequest {
             mode: query.mode,
-            query: Some(query.query.clone()),
+            query: query.query.clone(),
             targets: query.targets.clone(),
             budget: ActiveRecallModeBudget {
                 top_k: query.top_k.unwrap_or(input.config.top_k_per_query),
@@ -1753,7 +1756,7 @@ pub(super) fn deterministic_active_recall_plan(
     let mut episodic_queries = Vec::new();
     let mut diagnostics = Vec::new();
     if input.has_task_context && input.episodic_capabilities.current_task_context {
-        if let Some(query) = bounded_nonempty_text(input.input_text_preview.as_str(), 500) {
+        if let Some(query) = deterministic_episodic_query_for_input(input) {
             episodic_queries.push(EpisodicMemoryRecallQuery {
                 mode: ActiveRecallMode::CurrentTask,
                 query: query.clone(),
@@ -1772,7 +1775,7 @@ pub(super) fn deterministic_active_recall_plan(
         diagnostics.push("structured_task_context_available".to_owned());
     }
     if input.thread_episodic.current_thread_recall_available {
-        if let Some(query) = bounded_nonempty_text(input.input_text_preview.as_str(), 500) {
+        if let Some(query) = deterministic_episodic_query_for_input(input) {
             episodic_queries.push(EpisodicMemoryRecallQuery {
                 mode: ActiveRecallMode::CurrentThread,
                 query,
@@ -1829,6 +1832,15 @@ pub(super) fn deterministic_active_recall_plan(
         },
         diagnostics,
     })
+}
+
+fn deterministic_episodic_query_for_input(
+    input: &ActiveRecallPlannerInput,
+) -> Option<Option<String>> {
+    if input.episodic_capabilities.full_input_query {
+        return (input.input_text_char_count > 0).then_some(None);
+    }
+    bounded_nonempty_text(input.input_text_preview.as_str(), 500).map(Some)
 }
 
 fn active_recall_input_length_bucket(char_count: usize) -> ActiveRecallInputLengthBucket {
@@ -1980,7 +1992,7 @@ pub(super) fn normalize_active_recall_plan_for_input(
             if let Some(query) = bounded_nonempty_text(input.input_text_preview.as_str(), 500) {
                 episodic_queries.push(EpisodicMemoryRecallQuery {
                     mode,
-                    query,
+                    query: Some(query),
                     targets: plan.durable.targets.clone(),
                     top_k: None,
                     max_chars: None,
@@ -1995,7 +2007,7 @@ pub(super) fn normalize_active_recall_plan_for_input(
             durable_modes.push(mode);
         }
     }
-    for query in original_queries {
+    for mut query in original_queries {
         let mode = query.mode;
         let drop_reason = match mode {
             ActiveRecallMode::TaskContext | ActiveRecallMode::CurrentTask
@@ -2052,11 +2064,21 @@ pub(super) fn normalize_active_recall_plan_for_input(
             _ if mode.episodic_source_kind().is_none() => {
                 Some("dropped_query=episodic_query:non_episodic_mode")
             }
+            _ if query.query.is_none() && !input.episodic_capabilities.full_input_query => {
+                Some("dropped_query=episodic_query:missing_query")
+            }
             _ => None,
         };
         if let Some(reason) = drop_reason {
             diagnostics.push(reason.to_owned());
         } else {
+            if input.episodic_capabilities.full_input_query && query.query.is_some() {
+                diagnostics.push(format!(
+                    "ignored_query_text_for_full_input_mode:{}",
+                    mode.as_str()
+                ));
+                query.query = None;
+            }
             episodic_queries.push(query);
         }
     }
@@ -2341,6 +2363,14 @@ fn validate_active_memory_recall_plan(plan: &ActiveMemoryRecallPlan) -> Result<(
     }
     if plan.episodic.status == ActiveMemoryDecisionStatus::Run && plan.episodic.queries.is_empty() {
         return Err("episodic recall run plan requires at least one query".to_owned());
+    }
+    if plan.episodic.queries.iter().any(|query| {
+        query
+            .query
+            .as_deref()
+            .is_none_or(|query| query.trim().is_empty())
+    }) {
+        return Err("active recall episodic provider query requires query text".to_owned());
     }
     if plan.episodic.status != ActiveMemoryDecisionStatus::Run && !plan.episodic.queries.is_empty()
     {

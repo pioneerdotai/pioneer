@@ -92,7 +92,7 @@ pub struct ThreadEpisodicMemvidFeatureAudit {
 impl ThreadEpisodicMemvidFeatureAudit {
     pub fn current() -> Self {
         Self {
-            memvid_core_version: "3.1.1".to_owned(),
+            memvid_core_version: "3.1.2".to_owned(),
             enabled_features: vec![
                 "lex".to_owned(),
                 "temporal_track".to_owned(),
@@ -1859,7 +1859,7 @@ mod tests {
     #[test]
     fn feature_audit_records_current_memvid_feature_set() {
         let audit = ThreadEpisodicMemvidFeatureAudit::current();
-        assert_eq!(audit.memvid_core_version, "3.1.0");
+        assert_eq!(audit.memvid_core_version, "3.1.2");
         assert!(audit.enabled_features.contains(&"lex".to_owned()));
         assert!(
             audit

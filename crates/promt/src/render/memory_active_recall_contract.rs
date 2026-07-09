@@ -15,6 +15,22 @@ pub struct MemoryActiveRecallProviderOutputContractInput {
     pub output_path: MemoryActiveRecallProviderOutputPath,
     pub max_output_chars: Option<usize>,
     pub include_host_owned_field_rule: bool,
+    pub sections: MemoryActiveRecallProviderOutputSections,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryActiveRecallProviderOutputSections {
+    pub durable: bool,
+    pub episodic: bool,
+}
+
+impl MemoryActiveRecallProviderOutputSections {
+    pub const fn all() -> Self {
+        Self {
+            durable: true,
+            episodic: true,
+        }
+    }
 }
 
 impl MemoryActiveRecallProviderOutputContractInput {
@@ -23,6 +39,7 @@ impl MemoryActiveRecallProviderOutputContractInput {
             output_path: MemoryActiveRecallProviderOutputPath::PreflightMemoryActiveRecall,
             max_output_chars: None,
             include_host_owned_field_rule: false,
+            sections: MemoryActiveRecallProviderOutputSections::all(),
         }
     }
 }
@@ -31,18 +48,39 @@ pub fn render_memory_active_recall_provider_output_contract(
     input: &MemoryActiveRecallProviderOutputContractInput,
 ) -> String {
     let output_path = input.output_path.as_str();
+
+    let envelope_fields = match (input.sections.durable, input.sections.episodic) {
+        (true, true) => "`durable`, `episodic`, and `diagnostics`",
+        (true, false) => "`durable` and `diagnostics`",
+        (false, true) => "`episodic` and `diagnostics`",
+        (false, false) => "`diagnostics`",
+    };
+
     let mut contract = format!(
         concat!(
             "Active recall output contract for {output_path}:\n",
             "\n",
             "Purpose:\n",
             "- Return recall strategy only. Do not return remembered facts, retrieved context, or a user-facing answer.\n",
-            "- Durable recall plans long-lived memory lookup.\n",
-            "- Episodic recall plans thread/task history lookup.\n",
+        ),
+        output_path = output_path,
+    );
+
+    if input.sections.durable {
+        contract.push_str("- Durable recall plans long-lived memory lookup.\n");
+    }
+
+    if input.sections.episodic {
+        contract.push_str("- Episodic recall plans thread/task history lookup.\n");
+    }
+
+    contract.push_str(
+        format!(
+            concat!(
             "- The host validates this plan before executing any read.\n",
             "\n",
             "Top-level envelope:\n",
-            "- Return an envelope object with exactly these top-level fields: `durable`, `episodic`, and `diagnostics`.\n",
+                "- Return an envelope object with exactly these top-level fields: {envelope_fields}.\n",
             "- `diagnostics`: array of short operational strings about the overall planning decision.\n",
             "\n",
             "Subplan status fields:\n",
@@ -53,6 +91,14 @@ pub fn render_memory_active_recall_provider_output_contract(
             "- Use `run` when that memory domain is likely to improve correctness, continuity, personalization, or consistency.\n",
             "- Use `uncertain` when structured input is insufficient to choose safely.\n",
             "\n",
+            ),
+            envelope_fields = envelope_fields,
+        )
+        .as_str(),
+    );
+
+    if input.sections.durable {
+        contract.push_str(concat!(
             "Durable subplan schema:\n",
             "- `durable.status`: one of `skip`, `run`, `uncertain`.\n",
             "- `durable.reasonCode`: one of `provider_skip`, `provider_run`, `provider_uncertain`, `memory_likely`.\n",
@@ -68,6 +114,11 @@ pub fn render_memory_active_recall_provider_output_contract(
             "- For `durable.status=skip` or `uncertain`, `durable.modes` must be [] and `durable.targets` must be [].\n",
             "- Do not include durable mode `exact_canonical` unless an exact canonical target is present.\n",
             "\n",
+        ));
+    }
+
+    if input.sections.episodic {
+        contract.push_str(concat!(
             "Episodic subplan schema:\n",
             "- `episodic.status`: one of `skip`, `run`, `uncertain`.\n",
             "- `episodic.reasonCode`: one of `provider_skip`, `provider_run`, `provider_uncertain`, `memory_likely`.\n",
@@ -105,6 +156,11 @@ pub fn render_memory_active_recall_provider_output_contract(
             "- Do not include episodic query mode `related_thread` unless related thread search capability is available.\n",
             "- Do not include episodic query mode `workspace_thread` unless workspace thread search capability is available and workspace context is present.\n",
             "\n",
+        ));
+    }
+
+    if input.sections.durable || input.sections.episodic {
+        contract.push_str(concat!(
             "Target object fields:\n",
             "- `scopeKind`: `user`, `workspace`, `thread`, `agent`, or `task`.\n",
             "- `factClass`: `user_identity`, `user_biography`, `user_relationship`, `stable_user_preference`, `communication_preference`, `recurring_user_instruction`, `project_policy`, `project_decision`, `project_procedure`, `project_constraint`, `task_lifecycle_state`, `operational_observation`, `thread_local_state`, `tool_result_fact`, `assistant_self_description`, `generated_summary_fact`, `domain_owned_state`, `secret_or_credential`, or `regulated_sensitive_fact`.\n",
@@ -112,16 +168,25 @@ pub fn render_memory_active_recall_provider_output_contract(
             "- `subject`: `current_user`, `current_agent`, `workspace`, `project`, `person`, `organization`, `artifact`, or `custom`.\n",
             "- `attribute`: `name`, `birthday`, `preferred_language`, `communication_style`, `migration_policy`, `review_style`, `phase_naming`, or `custom`.\n",
             "- `canonicalKey`: string or null.\n\n",
+        ));
+    }
+
+    if input.sections.durable && input.sections.episodic {
+        contract.push_str(concat!(
             "Cross-domain validation:\n",
             "- Do not place episodic modes in `durable.modes`; use `episodic.queries` instead.\n",
             "- Do not place durable modes in `episodic.queries[].mode`; use `durable.modes` instead.\n",
+        ));
+    } else {
+        contract.push_str("Output validation:\n");
+    }
+
+    contract.push_str(concat!(
             "- Use target fields exactly as listed; never output free-form strings for enum fields.\n",
             "- Do not use category names such as `identity` as `factClass`; use `user_identity` for the current user's name or identity facts.\n",
             "- Do not use category names such as `preference` as `attribute`; use `category=\"preference\"` and omit `attribute`, or use `attribute=\"custom\"` only for a clearly custom preference attribute.\n",
             "- Keep diagnostics short and operational.",
-        ),
-        output_path = output_path
-    );
+    ));
 
     if input.include_host_owned_field_rule {
         contract.push_str("\n- Do not output host-owned active recall fields: `source`, `fallbackReason`, `debugFallback`, `providerUsed`, `providerFallbackUsed`, `providerInputChars`, `providerOutputChars`, `providerCall`, `provider`, `model`, `attempt`, `inputChars`, `outputChars`, or `elapsedMs`.");
@@ -197,6 +262,10 @@ mod tests {
         assert!(contract.contains("do not guess missing context"));
         assert!(contract.contains("Never output a vague, generic, or invented query"));
         assert!(contract.contains("Do not translate, romanize, transliterate"));
+        assert!(contract.contains(
+            "`query`: compact search text for thread/task context recall, not a remembered fact and not the final answer"
+        ));
+        assert!(!contract.contains("fullInputQuery"));
         assert!(!contract.contains("Bad query:"));
         assert!(!contract.contains("Good query"));
         assert!(!contract.contains("recentThreadContext"));

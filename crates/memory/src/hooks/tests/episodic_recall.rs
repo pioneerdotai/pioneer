@@ -716,6 +716,61 @@ async fn related_thread_recall_filters_workspace_and_visibility_boundaries() {
 }
 
 #[tokio::test]
+async fn full_input_episodic_recall_uses_turn_input_when_planned_query_is_omitted() {
+    let durable_provider = Arc::new(TestRecallMemoryProvider::with_recall(
+        MemoryRecallSnapshot::empty(),
+    ));
+    let episodic = Arc::new(FakeEpisodicRecallProvider::with_capabilities(
+        MemoryEpisodicRecallCapabilities {
+            current_thread_search: true,
+            full_input_query: true,
+            ..MemoryEpisodicRecallCapabilities::default()
+        },
+    ));
+
+    let result = execute_active_recall_plan(
+        durable_provider.as_ref(),
+        ActiveRecallExecutionInput {
+            context: test_memory_turn_context(),
+            plan: ActiveMemoryRecallPlan {
+                durable: DurableMemoryRecallPlan::skip(
+                    ActiveMemoryDecisionReasonCode::ProviderSkip,
+                    1.0,
+                    Vec::new(),
+                ),
+                episodic: EpisodicMemoryRecallPlan::run(
+                    ActiveMemoryDecisionReasonCode::ProviderRun,
+                    0.9,
+                    vec![EpisodicMemoryRecallQuery {
+                        mode: ActiveRecallMode::CurrentThread,
+                        query: None,
+                        targets: Vec::new(),
+                        top_k: None,
+                        max_chars: None,
+                    }],
+                    Vec::new(),
+                ),
+                diagnostics: Vec::new(),
+            },
+            deterministic: DeterministicRecallContextSummary::default(),
+            config: MemoryActiveRecallConfig::default(),
+            episodic_provider: Some(episodic.clone()),
+            episodic_capabilities: MemoryEpisodicRecallCapabilities {
+                current_thread_search: true,
+                full_input_query: true,
+                ..MemoryEpisodicRecallCapabilities::default()
+            },
+        },
+    )
+    .await;
+
+    assert_eq!(durable_provider.recall_call_count(), 0);
+    assert_eq!(episodic.calls(), vec!["current_thread"]);
+    assert_eq!(episodic.queries(), vec!["remember my preference"]);
+    assert!(result.items.is_empty());
+}
+
+#[tokio::test]
 async fn workspace_thread_recall_uses_workspace_provider_mode_and_boundaries() {
     let durable_provider = Arc::new(TestRecallMemoryProvider::with_recall(
         MemoryRecallSnapshot::empty(),

@@ -1,20 +1,22 @@
 #![allow(dead_code)]
 
 use pioneer_memory::hooks::{
-    ActiveRecallPlan, DeterministicRecallContextSummary, MemoryActiveRecallDecisionContext,
-    MemoryActiveRecallDecisionRequest, MemoryActiveRecallLocalPlan,
-    MemoryActiveRecallProviderFallbackContext, active_recall_planned_query_count,
+    ActiveRecallPlan, DeterministicRecallContextSummary, DurableMemoryRecallPlan,
+    EpisodicMemoryRecallPlan, MemoryActiveRecallDecisionContext, MemoryActiveRecallDecisionRequest,
+    MemoryActiveRecallLocalPlan, MemoryActiveRecallProviderFallbackContext,
+    MemoryActiveRecallProviderSections, active_recall_planned_query_count,
     active_recall_preflight_provider_fallback, active_recall_preflight_provider_success,
     normalize_active_recall_plan, parse_active_memory_decision_json,
 };
 use pioneer_promt::{
-    TurnPreflightMemoryActiveRecallPromptInput, TurnPreflightPromptInput,
-    render_turn_preflight_prompt,
+    MemoryActiveRecallProviderOutputSections, TurnPreflightMemoryActiveRecallPromptInput,
+    TurnPreflightPromptInput, render_turn_preflight_prompt,
 };
 use pioneer_protocol::ThreadMode;
 use pioneer_provider::{ChatMessage, ChatRequest, Provider, ProviderRegistry, ReasoningConfig};
 use pioneer_tools::{BuiltinToolDomain, PreflightToolIndex};
-use serde::de::{self, Visitor};
+use serde::de::{self, Error as _, Visitor};
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -90,11 +92,30 @@ pub(crate) struct TurnPreflightMemoryInput {
     pub active_recall: Option<TurnPreflightMemoryActiveRecallInput>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct TurnPreflightMemoryActiveRecallInput {
     pub decision_context: MemoryActiveRecallDecisionContext,
     pub decision_request: MemoryActiveRecallDecisionRequest,
+    #[serde(skip)]
+    pub provider_sections: MemoryActiveRecallProviderSections,
+}
+
+impl Serialize for TurnPreflightMemoryActiveRecallInput {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("TurnPreflightMemoryActiveRecallInput", 2)?;
+        state.serialize_field("decisionContext", &self.decision_context)?;
+        state.serialize_field(
+            "decisionRequest",
+            &self
+                .decision_request
+                .provider_input(&self.decision_context, self.provider_sections),
+        )?;
+        state.end()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -120,6 +141,8 @@ pub(crate) enum TurnPreflightLocalActiveRecallState {
     ProviderNeeded {
         input: TurnPreflightMemoryActiveRecallInput,
         fallback_context: MemoryActiveRecallProviderFallbackContext,
+        provider_sections: MemoryActiveRecallProviderSections,
+        host_local_plan: TurnPreflightMemoryActiveRecallPlan,
     },
 }
 
@@ -129,14 +152,23 @@ pub(crate) fn build_local_preflight_module_plans(
     active_recall: MemoryActiveRecallLocalPlan,
 ) -> TurnPreflightLocalModulePlans {
     let active_recall = if active_recall.provider_planning_needed {
+        let provider_sections = active_recall.provider_sections;
+        let host_local_plan = wrap_memory_active_recall_plan(
+            TurnPreflightPlanSource::HostLocal,
+            None,
+            active_recall.local_decision.clone(),
+        );
         TurnPreflightLocalActiveRecallState::ProviderNeeded {
             input: TurnPreflightMemoryActiveRecallInput {
                 decision_context: active_recall.decision_context,
                 decision_request: active_recall.decision_request,
+                provider_sections,
             },
             fallback_context: active_recall
                 .provider_fallback_context
                 .expect("provider-needed active recall must include memory-owned fallback context"),
+            provider_sections,
+            host_local_plan,
         }
     } else {
         TurnPreflightLocalActiveRecallState::HostLocalFinal(wrap_memory_active_recall_plan(
@@ -171,6 +203,17 @@ impl TurnPreflightLocalModulePlans {
             self.memory.active_recall,
             TurnPreflightLocalActiveRecallState::ProviderNeeded { .. }
         )
+    }
+
+    pub(crate) fn active_recall_provider_sections(&self) -> MemoryActiveRecallProviderSections {
+        match &self.memory.active_recall {
+            TurnPreflightLocalActiveRecallState::ProviderNeeded {
+                provider_sections, ..
+            } => *provider_sections,
+            TurnPreflightLocalActiveRecallState::HostLocalFinal(_) => {
+                MemoryActiveRecallProviderSections::all()
+            }
+        }
     }
 
     pub(crate) fn host_local_active_recall_plan(
@@ -464,9 +507,21 @@ pub(crate) fn render_turn_preflight_prompt_from_local_modules(
         structured_input_json,
         memory_active_recall: TurnPreflightMemoryActiveRecallPromptInput {
             provider_planning_needed: local_modules.active_recall_provider_planning_needed(),
+            provider_sections: prompt_provider_sections(
+                local_modules.active_recall_provider_sections(),
+            ),
         },
         max_output_chars,
     }))
+}
+
+fn prompt_provider_sections(
+    sections: MemoryActiveRecallProviderSections,
+) -> MemoryActiveRecallProviderOutputSections {
+    MemoryActiveRecallProviderOutputSections {
+        durable: sections.durable,
+        episodic: sections.episodic,
+    }
 }
 
 async fn call_turn_preflight_provider_once(
@@ -720,7 +775,28 @@ pub(crate) struct ProviderTurnPreflightToolsPlan {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ProviderTurnPreflightMemoryPlan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_recall: Option<ActiveRecallPlan>,
+    pub active_recall: Option<ProviderActiveRecallPlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ProviderActiveRecallPlan {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable: Option<DurableMemoryRecallPlan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episodic: Option<EpisodicMemoryRecallPlan>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<String>,
+}
+
+impl From<ActiveRecallPlan> for ProviderActiveRecallPlan {
+    fn from(plan: ActiveRecallPlan) -> Self {
+        Self {
+            durable: Some(plan.durable),
+            episodic: Some(plan.episodic),
+            diagnostics: plan.diagnostics,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -907,8 +983,11 @@ pub(crate) fn validate_provider_turn_preflight_plan(
         .memory
         .as_ref()
         .and_then(|memory| memory.active_recall.as_ref())
+        && !active_recall.has_any_provider_section()
     {
-        parse_provider_memory_active_recall_plan(active_recall)?;
+        return Err(serde_json::Error::custom(
+            "provider memory.activeRecall must include at least one enabled recall section",
+        ));
     }
     Ok(())
 }
@@ -943,10 +1022,64 @@ pub(crate) fn normalize_module_diagnostics(
 }
 
 pub(crate) fn parse_provider_memory_active_recall_plan(
-    plan: &ActiveRecallPlan,
+    plan: &ProviderActiveRecallPlan,
+    sections: MemoryActiveRecallProviderSections,
 ) -> Result<ActiveRecallPlan, serde_json::Error> {
-    let raw = serde_json::to_string(plan)?;
+    if !sections.any() {
+        return Err(serde_json::Error::custom(
+            "provider memory.activeRecall has no enabled recall sections",
+        ));
+    }
+
+    let durable = match (sections.durable, plan.durable.clone()) {
+        (true, Some(durable)) => durable,
+        (true, None) => {
+            return Err(serde_json::Error::custom(
+                "provider memory.activeRecall missing required durable section",
+            ));
+        }
+        (false, Some(_)) => {
+            return Err(serde_json::Error::custom(
+                "provider memory.activeRecall included disabled durable section",
+            ));
+        }
+        (false, None) => DurableMemoryRecallPlan::skip(
+            pioneer_memory::hooks::ActiveMemoryDecisionReasonCode::ProviderSkip,
+            1.0,
+            Vec::new(),
+        ),
+    };
+    let episodic = match (sections.episodic, plan.episodic.clone()) {
+        (true, Some(episodic)) => episodic,
+        (true, None) => {
+            return Err(serde_json::Error::custom(
+                "provider memory.activeRecall missing required episodic section",
+            ));
+        }
+        (false, Some(_)) => {
+            return Err(serde_json::Error::custom(
+                "provider memory.activeRecall included disabled episodic section",
+            ));
+        }
+        (false, None) => EpisodicMemoryRecallPlan::skip(
+            pioneer_memory::hooks::ActiveMemoryDecisionReasonCode::ProviderSkip,
+            1.0,
+            Vec::new(),
+        ),
+    };
+
+    let raw = serde_json::to_string(&ActiveRecallPlan {
+        durable,
+        episodic,
+        diagnostics: plan.diagnostics.clone(),
+    })?;
     parse_active_memory_decision_json(raw.as_str())
+}
+
+impl ProviderActiveRecallPlan {
+    fn has_any_provider_section(&self) -> bool {
+        self.durable.is_some() || self.episodic.is_some()
+    }
 }
 
 pub(crate) fn wrap_memory_active_recall_plan(
@@ -1228,7 +1361,10 @@ fn compose_successful_memory_active_recall_plan(
     match &local_modules.memory.active_recall {
         TurnPreflightLocalActiveRecallState::HostLocalFinal(plan) => plan.clone(),
         TurnPreflightLocalActiveRecallState::ProviderNeeded {
-            fallback_context, ..
+            fallback_context,
+            provider_sections,
+            host_local_plan,
+            ..
         } => {
             let Some(provider_active_recall) =
                 provider_memory.and_then(|memory| memory.active_recall.as_ref())
@@ -1248,12 +1384,20 @@ fn compose_successful_memory_active_recall_plan(
                 );
             };
 
-            match parse_provider_memory_active_recall_plan(provider_active_recall) {
+            match parse_provider_memory_active_recall_plan(
+                provider_active_recall,
+                *provider_sections,
+            ) {
                 Ok(decision) => {
                     let decision = active_recall_preflight_provider_success(
                         decision,
                         Some(provider_call.input_chars),
                         Some(provider_call.output_chars),
+                    );
+                    let decision = merge_provider_active_recall_sections(
+                        decision,
+                        &host_local_plan.decision,
+                        *provider_sections,
                     );
                     wrap_memory_active_recall_plan(
                         TurnPreflightPlanSource::Provider,
@@ -1279,6 +1423,31 @@ fn compose_successful_memory_active_recall_plan(
             }
         }
     }
+}
+
+fn merge_provider_active_recall_sections(
+    provider_decision: ActiveRecallPlan,
+    host_decision: &ActiveRecallPlan,
+    sections: MemoryActiveRecallProviderSections,
+) -> ActiveRecallPlan {
+    let mut diagnostics = provider_decision.diagnostics.clone();
+    if !sections.durable || !sections.episodic {
+        diagnostics.extend(host_decision.diagnostics.clone());
+    }
+
+    normalize_active_recall_plan(ActiveRecallPlan {
+        durable: if sections.durable {
+            provider_decision.durable
+        } else {
+            host_decision.durable.clone()
+        },
+        episodic: if sections.episodic {
+            provider_decision.episodic
+        } else {
+            host_decision.episodic.clone()
+        },
+        diagnostics,
+    })
 }
 
 fn compose_fallback_turn_preflight_plan(
@@ -1829,6 +1998,7 @@ mod tests {
                             current_thread_search: true,
                             related_thread_search: false,
                             workspace_thread_search: false,
+                            full_input_query: false,
                             current_task_context: false,
                             completed_task_summary: false,
                         },
@@ -1842,6 +2012,7 @@ mod tests {
                         max_output_chars: 2_000,
                         fallback_policy: MemoryActiveRecallPlannerFallbackPolicy::Deterministic,
                     },
+                    provider_sections: MemoryActiveRecallProviderSections::all(),
                 }),
             },
         }
@@ -2091,6 +2262,7 @@ mod tests {
             decision_context: active_recall.decision_context,
             decision_request: active_recall.decision_request,
             local_decision,
+            provider_sections: MemoryActiveRecallProviderSections::all(),
             provider_planning_needed,
             provider_fallback_context: None,
         }
@@ -2135,6 +2307,13 @@ mod tests {
     fn sample_memory_local_plan_with_current_thread_episodic(
         deterministic: DeterministicRecallContextSummary,
     ) -> MemoryActiveRecallLocalPlan {
+        sample_memory_local_plan_with_current_thread_episodic_capability(deterministic, false)
+    }
+
+    fn sample_memory_local_plan_with_current_thread_episodic_capability(
+        deterministic: DeterministicRecallContextSummary,
+        full_input_query: bool,
+    ) -> MemoryActiveRecallLocalPlan {
         build_active_recall_local_preflight_plan_with_thread_summary(
             &MemoryTurnContext {
                 workspace_id: "ws_1".to_owned(),
@@ -2157,6 +2336,7 @@ mod tests {
                 current_thread_search: true,
                 related_thread_search: false,
                 workspace_thread_search: false,
+                full_input_query,
                 current_task_context: false,
                 completed_task_summary: false,
             },
@@ -2424,6 +2604,48 @@ mod tests {
     }
 
     #[test]
+    fn preflight_prompt_omits_provider_episodic_section_when_host_owns_full_input_recall() {
+        let local_plan = sample_memory_local_plan_with_current_thread_episodic_capability(
+            sample_deterministic_summary(),
+            true,
+        );
+        let host_episodic = local_plan.local_decision.episodic.clone();
+        let modules = build_local_preflight_module_plans(
+            sample_tool_index(),
+            sample_deterministic_summary(),
+            local_plan,
+        );
+        let provider_input = modules.provider_input(sample_turn_input());
+        let provider_input_json =
+            serde_json::to_string(&provider_input).expect("provider input serializes");
+
+        let prompt =
+            render_turn_preflight_prompt_from_local_modules(&modules, sample_turn_input(), 2_000)
+                .expect("preflight prompt renders");
+
+        assert!(modules.active_recall_provider_planning_needed());
+        assert_eq!(
+            modules.active_recall_provider_sections(),
+            MemoryActiveRecallProviderSections {
+                durable: true,
+                episodic: false,
+            }
+        );
+        assert!(provider_input_json.contains("\"availableDurableModes\""));
+        assert!(!provider_input_json.contains("availableEpisodicModes"));
+        assert!(!provider_input_json.contains("episodicCapabilities"));
+        assert!(!provider_input_json.contains("threadEpisodic"));
+        assert!(prompt.contains("Durable subplan schema:"));
+        assert!(!prompt.contains("Episodic subplan schema:"));
+        assert!(!prompt.contains("Episodic query construction"));
+        assert!(!prompt.contains(r#""episodic""#));
+        assert!(!prompt.contains("Every `query` must be written"));
+        assert_eq!(host_episodic.status, ActiveMemoryDecisionStatus::Run);
+        assert_eq!(host_episodic.queries.len(), 1);
+        assert_eq!(host_episodic.queries[0].query, None);
+    }
+
+    #[test]
     fn preflight_keeps_provider_input_when_deterministic_recall_is_nonempty() {
         let modules = build_local_preflight_module_plans(
             sample_tool_index(),
@@ -2538,17 +2760,18 @@ mod tests {
             .expect("memory plan")
             .active_recall
             .expect("active recall plan");
-        assert_eq!(active_recall.status, ActiveMemoryDecisionStatus::Run);
+        let durable = active_recall.durable.expect("durable provider section");
+        assert_eq!(durable.status, ActiveMemoryDecisionStatus::Run);
         assert_eq!(
-            active_recall.reason_code,
+            durable.reason_code,
             ActiveMemoryDecisionReasonCode::MemoryLikely
         );
         assert_eq!(
-            active_recall.modes,
+            durable.modes,
             vec![ActiveRecallMode::ExactCanonical, ActiveRecallMode::Profile]
         );
         assert_eq!(
-            active_recall.targets[0].canonical_key.as_deref(),
+            durable.targets[0].canonical_key.as_deref(),
             Some("identity.current_user.name")
         );
     }
@@ -2814,8 +3037,11 @@ mod tests {
             .memory
             .and_then(|memory| memory.active_recall)
             .expect("provider returned active recall");
-        let parsed = parse_provider_memory_active_recall_plan(&active_recall)
-            .expect("nested memory active recall must use existing memory parser");
+        let parsed = parse_provider_memory_active_recall_plan(
+            &active_recall,
+            MemoryActiveRecallProviderSections::all(),
+        )
+        .expect("nested memory active recall must use existing memory parser");
         assert_eq!(parsed.status, ActiveMemoryDecisionStatus::Run);
         assert_eq!(
             parsed.reason_code,
@@ -3038,6 +3264,58 @@ mod tests {
             plan.memory.active_recall.decision.all_diagnostics()[0],
             "memory.active_recall.provider_called"
         );
+    }
+
+    #[test]
+    fn preflight_compose_merges_provider_durable_with_host_owned_full_input_episodic() {
+        let modules = build_local_preflight_module_plans(
+            sample_tool_index(),
+            sample_deterministic_summary(),
+            sample_memory_local_plan_with_current_thread_episodic_capability(
+                sample_deterministic_summary(),
+                true,
+            ),
+        );
+        let mut provider_value = sample_provider_plan_json();
+        provider_value["memory"]["activeRecall"]
+            .as_object_mut()
+            .expect("activeRecall object")
+            .remove("episodic");
+        let provider_plan = parse_provider_turn_preflight_plan_json(
+            serde_json::to_string(&provider_value)
+                .expect("provider plan serializes")
+                .as_str(),
+        )
+        .expect("provider plan without episodic section parses by shape");
+
+        let plan = compose_turn_preflight_plan(
+            &modules,
+            TurnPreflightProviderCallResult::Success(TurnPreflightProviderSuccess {
+                plan: provider_plan,
+                provider_call: sample_provider_call_metadata(1),
+                diagnostics: Vec::new(),
+            }),
+        );
+
+        assert_eq!(plan.source, TurnPreflightPlanSource::Provider);
+        assert_eq!(
+            plan.memory.active_recall.decision.durable.reason_code,
+            ActiveMemoryDecisionReasonCode::MemoryLikely
+        );
+        assert_eq!(
+            plan.memory.active_recall.decision.episodic.status,
+            ActiveMemoryDecisionStatus::Run
+        );
+        assert_eq!(plan.memory.active_recall.decision.episodic.queries.len(), 1);
+        assert_eq!(
+            plan.memory.active_recall.decision.episodic.queries[0].mode,
+            ActiveRecallMode::CurrentThread
+        );
+        assert_eq!(
+            plan.memory.active_recall.decision.episodic.queries[0].query,
+            None
+        );
+        assert!(plan.memory.active_recall.decision.provider_used);
     }
 
     #[test]
@@ -3586,20 +3864,19 @@ mod tests {
             .active_recall
             .expect("active recall plan");
 
-        let error = parse_provider_memory_active_recall_plan(&active_recall)
-            .expect_err("memory parser should reject invalid active recall semantics");
+        let error = parse_provider_memory_active_recall_plan(
+            &active_recall,
+            MemoryActiveRecallProviderSections::all(),
+        )
+        .expect_err("memory parser should reject invalid active recall semantics");
         assert!(
             error.to_string().contains("requires at least one mode"),
             "unexpected error: {error}"
         );
 
         let raw = serde_json::to_string(&value).expect("provider plan serializes");
-        let error = parse_provider_turn_preflight_plan_json(raw.as_str())
-            .expect_err("full provider parse helper should validate active recall");
-        assert!(
-            error.to_string().contains("requires at least one mode"),
-            "unexpected error: {error}"
-        );
+        parse_provider_turn_preflight_plan_json(raw.as_str())
+            .expect("generic provider parse validates shape before section-specific semantics");
     }
 
     #[test]

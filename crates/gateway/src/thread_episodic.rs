@@ -1496,6 +1496,20 @@ impl ThreadEpisodicRecallService {
             .unwrap_or_else(|| default_config.clone())
     }
 
+    pub(crate) fn full_input_query_enabled_for_workspace(&self, workspace_id: &str) -> bool {
+        let config = self
+            .config
+            .read()
+            .map(|config| config.clone())
+            .unwrap_or_default();
+        if !config.enabled {
+            return false;
+        }
+        let vector_search =
+            self.vector_search_config_for_workspace(workspace_id, &config.vector_search);
+        vector_search.has_selected_embedding_model()
+    }
+
     fn recall_projection_target(
         &self,
         workspace_id: &str,

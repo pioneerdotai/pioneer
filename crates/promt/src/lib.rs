@@ -36,6 +36,7 @@ pub use render::{
     },
     memory_active_recall_contract::{
         MemoryActiveRecallProviderOutputContractInput, MemoryActiveRecallProviderOutputPath,
+        MemoryActiveRecallProviderOutputSections,
         render_memory_active_recall_provider_output_contract,
         render_memory_active_recall_provider_output_example,
     },

@@ -1025,8 +1025,8 @@ fn active_recall_provider_plan_parses_envelope_with_durable_and_episodic_plans()
         ActiveRecallMode::CurrentThread
     );
     assert_eq!(
-        plan.episodic.queries[0].query.as_str(),
-        "weather forecast Moscow tomorrow"
+        plan.episodic.queries[0].query.as_deref(),
+        Some("weather forecast Moscow tomorrow")
     );
     assert_eq!(plan.diagnostics, vec!["envelope_ok".to_owned()]);
 }
@@ -1221,6 +1221,22 @@ fn active_recall_decision_request_renders_sanitized_preflight_input() {
     assert!(!json.contains("turn-secret-id"));
     assert!(!json.contains("tool schema"));
     assert!(!json.contains("hidden system prompt content"));
+
+    let without_episodic_section_json = serde_json::to_string_pretty(&request.provider_input(
+        &context,
+        MemoryActiveRecallProviderSections {
+            durable: true,
+            episodic: false,
+        },
+    ))
+    .expect("provider input without episodic section serializes");
+    assert!(without_episodic_section_json.contains(r#""availableDurableModes""#));
+    assert!(!without_episodic_section_json.contains(r#""availableEpisodicModes""#));
+    assert!(!without_episodic_section_json.contains(r#""episodicCapabilities""#));
+    assert!(!without_episodic_section_json.contains(r#""threadEpisodic""#));
+    assert!(without_episodic_section_json.contains(r#""availableScopedContexts": ["#));
+    assert!(without_episodic_section_json.contains(r#""workspace""#));
+    assert!(!without_episodic_section_json.contains(r#""thread""#));
 }
 
 #[test]
@@ -1262,6 +1278,7 @@ fn active_recall_thread_episodic_summary_is_bounded_and_metadata_only() {
             current_thread_search: true,
             related_thread_search: true,
             workspace_thread_search: false,
+            full_input_query: false,
             current_task_context: false,
             completed_task_summary: false,
         },

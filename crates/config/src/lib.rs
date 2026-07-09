@@ -713,6 +713,22 @@ impl Default for GatewayThreadEpisodicVectorSearchConfig {
     }
 }
 
+impl GatewayThreadEpisodicVectorSearchConfig {
+    pub fn selected_embedding_model(&self) -> Option<&str> {
+        let model = if self.provider == Some(GatewayThreadEpisodicVectorProviderConfig::Local) {
+            self.model.as_deref().or(self.local_model.as_deref())
+        } else {
+            self.model.as_deref()
+        }?;
+        let model = model.trim();
+        (!model.is_empty()).then_some(model)
+    }
+
+    pub fn has_selected_embedding_model(&self) -> bool {
+        self.enabled && self.selected_embedding_model().is_some()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum GatewayThreadEpisodicVectorProviderConfig {
     #[serde(rename = "openai")]

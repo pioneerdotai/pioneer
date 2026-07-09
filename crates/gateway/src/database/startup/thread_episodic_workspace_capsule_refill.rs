@@ -231,25 +231,10 @@ struct ProjectionMetaRecordLike<'a> {
 }
 
 fn projection_embedding_model(config: &GatewayThreadEpisodicVectorSearchConfig) -> String {
-    match config.provider {
-        Some(GatewayThreadEpisodicVectorProviderConfig::Local) => config
-            .model
-            .as_deref()
-            .or(config.local_model.as_deref())
-            .map(str::trim)
-            .unwrap_or("")
-            .to_owned(),
-        Some(
-            GatewayThreadEpisodicVectorProviderConfig::OpenAi
-            | GatewayThreadEpisodicVectorProviderConfig::OpenRouter,
-        ) => config
-            .model
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or("")
-            .to_owned(),
-        None => String::new(),
-    }
+    config
+        .selected_embedding_model()
+        .unwrap_or_default()
+        .to_owned()
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]

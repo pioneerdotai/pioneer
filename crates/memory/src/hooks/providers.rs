@@ -101,6 +101,8 @@ pub struct MemoryEpisodicRecallCapabilities {
     pub related_thread_search: bool,
     #[serde(default)]
     pub workspace_thread_search: bool,
+    #[serde(default)]
+    pub full_input_query: bool,
     pub current_task_context: bool,
     pub completed_task_summary: bool,
 }
@@ -143,6 +145,32 @@ impl MemoryEpisodicRecallCapabilities {
             names.push("completed_tasks".to_owned());
         }
         names
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MemoryActiveRecallProviderSections {
+    pub durable: bool,
+    pub episodic: bool,
+}
+
+impl Default for MemoryActiveRecallProviderSections {
+    fn default() -> Self {
+        Self::all()
+    }
+}
+
+impl MemoryActiveRecallProviderSections {
+    pub const fn all() -> Self {
+        Self {
+            durable: true,
+            episodic: true,
+        }
+    }
+
+    pub const fn any(self) -> bool {
+        self.durable || self.episodic
     }
 }
 
@@ -461,7 +489,34 @@ pub struct MemoryActiveRecallDecisionRequest {
 
 impl MemoryActiveRecallDecisionRequest {
     pub fn sanitized_input_json(&self, context: &MemoryActiveRecallDecisionContext) -> String {
-        let payload = MemoryActiveRecallPlannerSanitizedInput {
+        let payload = self.provider_input(context, MemoryActiveRecallProviderSections::all());
+        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_owned())
+    }
+
+    pub fn provider_input(
+        &self,
+        context: &MemoryActiveRecallDecisionContext,
+        sections: MemoryActiveRecallProviderSections,
+    ) -> MemoryActiveRecallDecisionProviderInput {
+        let available_modes = self
+            .available_modes
+            .iter()
+            .filter(|mode| {
+                (sections.durable && self.available_durable_modes.contains(mode))
+                    || (sections.episodic && self.available_episodic_modes.contains(mode))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let available_scoped_contexts = if sections.episodic {
+            self.available_scoped_contexts.clone()
+        } else {
+            self.available_scoped_contexts
+                .iter()
+                .filter(|context| matches!(context.as_str(), "workspace" | "agent"))
+                .cloned()
+                .collect()
+        };
+        MemoryActiveRecallDecisionProviderInput {
             workspace_id_present: !context.workspace_id.trim().is_empty(),
             thread_id_present: !context.thread_id.trim().is_empty(),
             turn_id_present: !context.turn_id.trim().is_empty(),
@@ -490,12 +545,18 @@ impl MemoryActiveRecallDecisionRequest {
             read_allowed: self.read_allowed,
             active_memory_allowed: self.active_memory_allowed,
             explicit_no_memory: self.explicit_no_memory,
-            available_modes: self.available_modes.clone(),
-            available_durable_modes: self.available_durable_modes.clone(),
-            available_episodic_modes: self.available_episodic_modes.clone(),
-            available_scoped_contexts: self.available_scoped_contexts.clone(),
-            episodic_capabilities: self.episodic_capabilities.clone(),
-            thread_episodic: self.thread_episodic.clone(),
+            available_modes,
+            available_durable_modes: sections
+                .durable
+                .then(|| self.available_durable_modes.clone()),
+            available_episodic_modes: sections
+                .episodic
+                .then(|| self.available_episodic_modes.clone()),
+            available_scoped_contexts,
+            episodic_capabilities: sections
+                .episodic
+                .then(|| self.episodic_capabilities.clone()),
+            thread_episodic: sections.episodic.then(|| self.thread_episodic.clone()),
             budgets: MemoryActiveRecallPlannerBudgetInput {
                 max_queries: self.max_queries,
                 top_k_per_query: self.top_k_per_query,
@@ -504,8 +565,7 @@ impl MemoryActiveRecallDecisionRequest {
                 max_output_chars: self.max_output_chars,
             },
             fallback_policy: self.fallback_policy.as_str().to_owned(),
-        };
-        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_owned())
+        }
     }
 }
 
@@ -527,7 +587,7 @@ pub struct MemoryActiveRecallThreadEpisodicSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct MemoryActiveRecallPlannerSanitizedInput {
+pub struct MemoryActiveRecallDecisionProviderInput {
     workspace_id_present: bool,
     thread_id_present: bool,
     turn_id_present: bool,
@@ -548,11 +608,15 @@ struct MemoryActiveRecallPlannerSanitizedInput {
     active_memory_allowed: bool,
     explicit_no_memory: bool,
     available_modes: Vec<String>,
-    available_durable_modes: Vec<String>,
-    available_episodic_modes: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    available_durable_modes: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    available_episodic_modes: Option<Vec<String>>,
     available_scoped_contexts: Vec<String>,
-    episodic_capabilities: MemoryEpisodicRecallCapabilities,
-    thread_episodic: MemoryActiveRecallThreadEpisodicSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    episodic_capabilities: Option<MemoryEpisodicRecallCapabilities>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thread_episodic: Option<MemoryActiveRecallThreadEpisodicSummary>,
     budgets: MemoryActiveRecallPlannerBudgetInput,
     fallback_policy: String,
 }

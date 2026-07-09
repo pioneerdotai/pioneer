@@ -139,6 +139,7 @@ pub struct MemoryActiveRecallLocalPlan {
     pub decision_context: MemoryActiveRecallDecisionContext,
     pub decision_request: MemoryActiveRecallDecisionRequest,
     pub local_decision: ActiveMemoryDecision,
+    pub provider_sections: MemoryActiveRecallProviderSections,
     pub provider_planning_needed: bool,
     pub provider_fallback_context: Option<MemoryActiveRecallProviderFallbackContext>,
 }
@@ -190,8 +191,11 @@ pub fn build_active_recall_local_preflight_plan_with_thread_summary(
         episodic_capabilities,
         thread_episodic,
     );
-    let provider_planning_needed =
-        !local.local_final && config.planner.enabled && provider_available;
+    let provider_sections = active_recall_provider_sections(&local.planner_input);
+    let provider_planning_needed = !local.local_final
+        && config.planner.enabled
+        && provider_available
+        && provider_sections.any();
     let local_decision = if provider_planning_needed || local.local_final {
         normalize_active_recall_plan_for_input(local.local_plan.clone(), &local.planner_input)
     } else {
@@ -213,6 +217,7 @@ pub fn build_active_recall_local_preflight_plan_with_thread_summary(
         decision_context: local.decision_context,
         decision_request: local.decision_request,
         local_decision,
+        provider_sections,
         provider_planning_needed,
         provider_fallback_context,
     }
@@ -332,6 +337,15 @@ fn active_recall_local_plan_is_final(local_plan: &ActiveMemoryDecision) -> bool 
     )
 }
 
+fn active_recall_provider_sections(
+    planner_input: &ActiveRecallPlannerInput,
+) -> MemoryActiveRecallProviderSections {
+    MemoryActiveRecallProviderSections {
+        durable: true,
+        episodic: !planner_input.episodic_capabilities.full_input_query,
+    }
+}
+
 fn active_recall_no_provider_local_decision(
     mut local_plan: ActiveMemoryDecision,
     planner_input: &ActiveRecallPlannerInput,
@@ -422,6 +436,7 @@ mod active_recall_local_preflight_tests {
             current_thread_search: true,
             related_thread_search: false,
             workspace_thread_search: false,
+            full_input_query: false,
             current_task_context: false,
             completed_task_summary: false,
         }
@@ -529,6 +544,41 @@ mod active_recall_local_preflight_tests {
             ActiveMemoryDecisionStatus::Run
         );
         assert!(!plan.local_decision.episodic.queries.is_empty());
+    }
+
+    #[test]
+    fn active_recall_local_preflight_disables_provider_episodic_section_for_full_input_query() {
+        let mut capabilities = current_thread_capabilities();
+        capabilities.full_input_query = true;
+        let plan = build_active_recall_local_preflight_plan_with_thread_summary(
+            &test_context(None),
+            &TurnPrePromptContextHookInput::from_parts(
+                "а завтра какая?",
+                Some("thread-model"),
+                Some("thread-provider"),
+            ),
+            &MemoryTurnPolicy::normal_default_allow(),
+            &MemoryActiveRecallConfig::default(),
+            &empty_deterministic(),
+            capabilities,
+            current_thread_summary(),
+            true,
+        );
+
+        assert!(plan.provider_planning_needed);
+        assert_eq!(
+            plan.provider_sections,
+            MemoryActiveRecallProviderSections {
+                durable: true,
+                episodic: false,
+            }
+        );
+        assert_eq!(
+            plan.local_decision.episodic.status,
+            ActiveMemoryDecisionStatus::Run
+        );
+        assert_eq!(plan.local_decision.episodic.queries.len(), 1);
+        assert_eq!(plan.local_decision.episodic.queries[0].query, None);
     }
 
     #[test]

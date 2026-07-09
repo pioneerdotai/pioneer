@@ -1592,6 +1592,7 @@ async fn run_agent_turn_preflight_stage(
         current_thread_search: !thread_id.trim().is_empty(),
         related_thread_search: false,
         workspace_thread_search: false,
+        full_input_query: false,
         current_task_context: hook_runtime_context
             .task_id
             .as_ref()

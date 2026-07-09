@@ -1,5 +1,5 @@
 use super::memory_active_recall_contract::{
-    MemoryActiveRecallProviderOutputContractInput,
+    MemoryActiveRecallProviderOutputContractInput, MemoryActiveRecallProviderOutputSections,
     render_memory_active_recall_provider_output_contract,
 };
 
@@ -12,12 +12,14 @@ pub struct TurnPreflightPromptInput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TurnPreflightMemoryActiveRecallPromptInput {
     pub provider_planning_needed: bool,
+    pub provider_sections: MemoryActiveRecallProviderOutputSections,
 }
 
 impl TurnPreflightMemoryActiveRecallPromptInput {
     pub const fn disabled() -> Self {
         Self {
             provider_planning_needed: false,
+            provider_sections: MemoryActiveRecallProviderOutputSections::all(),
         }
     }
 }
@@ -25,7 +27,10 @@ impl TurnPreflightMemoryActiveRecallPromptInput {
 pub fn render_turn_preflight_prompt(input: &TurnPreflightPromptInput) -> String {
     let max_output_chars = input.max_output_chars.max(1);
     let memory_active_recall_requested = input.memory_active_recall.provider_planning_needed;
-    let output_example = render_turn_preflight_output_example(memory_active_recall_requested);
+    let output_example = render_turn_preflight_output_example(
+        memory_active_recall_requested,
+        input.memory_active_recall.provider_sections,
+    );
 
     let mut prompt = format!(concat!(
         "You are an internal turn preflight planner for Pioneer.\n",
@@ -59,7 +64,13 @@ pub fn render_turn_preflight_prompt(input: &TurnPreflightPromptInput) -> String 
 
     if memory_active_recall_requested {
         prompt.push_str("- `memory.activeRecall` is required and must contain an active recall strategy object, not remembered facts.\n");
-        prompt.push_str("- `memory.activeRecall` must use the durable/episodic envelope from the contract below.\n");
+        if input.memory_active_recall.provider_sections.durable
+            && input.memory_active_recall.provider_sections.episodic
+        {
+            prompt.push_str("- `memory.activeRecall` must use the durable/episodic envelope from the contract below.\n");
+        } else {
+            prompt.push_str("- `memory.activeRecall` must include only the sections listed by the contract below.\n");
+        }
         prompt.push_str("- `memory.activeRecall.diagnostics` is an array of short strings; do not use the top-level diagnostics object shape inside it.\n");
     }
 
@@ -80,7 +91,10 @@ pub fn render_turn_preflight_prompt(input: &TurnPreflightPromptInput) -> String 
 
     if memory_active_recall_requested {
         let memory_contract = render_memory_active_recall_provider_output_contract(
-            &MemoryActiveRecallProviderOutputContractInput::nested_preflight(),
+            &MemoryActiveRecallProviderOutputContractInput {
+                sections: input.memory_active_recall.provider_sections,
+                ..MemoryActiveRecallProviderOutputContractInput::nested_preflight()
+            },
         );
         prompt.push('\n');
         prompt.push_str(memory_contract.as_str());
@@ -105,8 +119,11 @@ pub fn render_turn_preflight_prompt(input: &TurnPreflightPromptInput) -> String 
     prompt
 }
 
-fn render_turn_preflight_output_example(memory_active_recall_requested: bool) -> &'static str {
-    if memory_active_recall_requested {
+fn render_turn_preflight_output_example(
+    memory_active_recall_requested: bool,
+    sections: MemoryActiveRecallProviderOutputSections,
+) -> &'static str {
+    if memory_active_recall_requested && sections.durable && sections.episodic {
         concat!(
             "{\n",
             "  \"tools\": {\n",
@@ -144,6 +161,65 @@ fn render_turn_preflight_output_example(memory_active_recall_requested: bool) ->
             "  ]\n",
             "}"
         )
+    } else if memory_active_recall_requested && sections.durable {
+        concat!(
+            "{\n",
+            "  \"tools\": {\n",
+            "    \"visibleTools\": [\"memory_search\", \"memory_get\"]\n",
+            "  },\n",
+            "  \"memory\": {\n",
+            "    \"activeRecall\": {\n",
+            "      \"durable\": {\n",
+            "        \"status\": \"run\",\n",
+            "        \"reasonCode\": \"memory_likely\",\n",
+            "        \"confidence\": 0.86,\n",
+            "        \"modes\": [\"profile\"],\n",
+            "        \"targets\": [\n",
+            "          {\n",
+            "            \"scopeKind\": \"user\",\n",
+            "            \"factClass\": \"user_identity\",\n",
+            "            \"category\": \"identity\",\n",
+            "            \"subject\": \"current_user\",\n",
+            "            \"attribute\": \"name\",\n",
+            "            \"canonicalKey\": null\n",
+            "          }\n",
+            "        ]\n",
+            "      },\n",
+            "      \"diagnostics\": [\"identity_lookup\"]\n",
+            "    }\n",
+            "  },\n",
+            "  \"diagnostics\": [\n",
+            "    { \"code\": \"memory_identity_lookup\" }\n",
+            "  ]\n",
+            "}"
+        )
+    } else if memory_active_recall_requested && sections.episodic {
+        concat!(
+            "{\n",
+            "  \"tools\": {\n",
+            "    \"visibleTools\": []\n",
+            "  },\n",
+            "  \"memory\": {\n",
+            "    \"activeRecall\": {\n",
+            "      \"episodic\": {\n",
+            "        \"status\": \"run\",\n",
+            "        \"reasonCode\": \"memory_likely\",\n",
+            "        \"confidence\": 0.78,\n",
+            "        \"queries\": [\n",
+            "          {\n",
+            "            \"mode\": \"current_thread\",\n",
+            "            \"query\": \"previous architecture decision\",\n",
+            "            \"targets\": [],\n",
+            "            \"topK\": 5,\n",
+            "            \"maxChars\": 1500\n",
+            "          }\n",
+            "        ]\n",
+            "      },\n",
+            "      \"diagnostics\": [\"thread_context_lookup\"]\n",
+            "    }\n",
+            "  }\n",
+            "}"
+        )
     } else {
         concat!(
             "{\n",
@@ -175,6 +251,21 @@ mod tests {
             structured_input_json: r#"{"turn":{"inputTextPreview":"как меня зовут?"},"tools":{"coreTools":["exec_command","request_tools"],"candidateTools":[{"name":"memory_search","domain":"memory","summary":"Search memory.","mutation":false},{"name":"memory_get","domain":"memory","summary":"Read memory.","mutation":false}]},"memory":{"activeRecall":{"providerPlanningNeeded":true,"decisionRequest":{"availableModes":["profile","project","durable","current_thread"],"availableDurableModes":["profile","project","durable"],"availableEpisodicModes":["current_thread"],"availableScopedContexts":["workspace","thread"],"deterministicRecallEmpty":true,"inputTextCharCount":15}}}}"#.to_owned(),
             memory_active_recall: TurnPreflightMemoryActiveRecallPromptInput {
                 provider_planning_needed: true,
+                provider_sections: MemoryActiveRecallProviderOutputSections::all(),
+            },
+            max_output_chars: 1_600,
+        })
+    }
+
+    fn sample_prompt_without_episodic_active_recall_section() -> String {
+        render_turn_preflight_prompt(&TurnPreflightPromptInput {
+            structured_input_json: r#"{"turn":{"inputTextPreview":"а завтра какая?","inputTextCharCount":15},"tools":{"coreTools":["exec_command","request_tools"],"candidateTools":[]},"memory":{"activeRecall":{"providerPlanningNeeded":true,"decisionRequest":{"availableModes":["profile","project","durable"],"availableDurableModes":["profile","project","durable"],"availableScopedContexts":["workspace"],"deterministicRecallEmpty":true,"inputTextCharCount":15}}}}"#.to_owned(),
+            memory_active_recall: TurnPreflightMemoryActiveRecallPromptInput {
+                provider_planning_needed: true,
+                provider_sections: MemoryActiveRecallProviderOutputSections {
+                    durable: true,
+                    episodic: false,
+                },
             },
             max_output_chars: 1_600,
         })
@@ -247,6 +338,20 @@ mod tests {
                 "forbidden field `{forbidden}` must not be shown as an output field"
             );
         }
+    }
+
+    #[test]
+    fn turn_preflight_prompt_omits_episodic_contract_when_provider_section_is_disabled() {
+        let prompt = sample_prompt_without_episodic_active_recall_section();
+
+        assert!(prompt.contains("Durable subplan schema:"));
+        assert!(!prompt.contains("Episodic subplan schema:"));
+        assert!(!prompt.contains("Episodic query construction:"));
+        assert!(!prompt.contains("availableEpisodicModes"));
+        assert!(!prompt.contains("episodicCapabilities"));
+        assert!(!prompt.contains("threadEpisodic"));
+        assert!(!prompt.contains(r#""episodic""#));
+        assert!(!prompt.contains("Every `query` must be written"));
     }
 
     #[test]
@@ -359,10 +464,24 @@ mod tests {
 
     #[test]
     fn turn_preflight_prompt_uses_one_valid_final_output_example() {
-        serde_json::from_str::<serde_json::Value>(render_turn_preflight_output_example(false))
-            .expect("no-memory preflight output example must be valid JSON");
-        serde_json::from_str::<serde_json::Value>(render_turn_preflight_output_example(true))
-            .expect("memory preflight output example must be valid JSON");
+        serde_json::from_str::<serde_json::Value>(render_turn_preflight_output_example(
+            false,
+            MemoryActiveRecallProviderOutputSections::all(),
+        ))
+        .expect("no-memory preflight output example must be valid JSON");
+        serde_json::from_str::<serde_json::Value>(render_turn_preflight_output_example(
+            true,
+            MemoryActiveRecallProviderOutputSections::all(),
+        ))
+        .expect("memory preflight output example must be valid JSON");
+        serde_json::from_str::<serde_json::Value>(render_turn_preflight_output_example(
+            true,
+            MemoryActiveRecallProviderOutputSections {
+                durable: true,
+                episodic: false,
+            },
+        ))
+        .expect("memory preflight output example without episodic section must be valid JSON");
 
         let prompt = sample_prompt_with_active_recall();
         assert_eq!(prompt.matches("Valid output example:").count(), 1);
