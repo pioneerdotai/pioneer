@@ -179,8 +179,8 @@ impl MessageProcessor {
             .turn_start(connection_id, params)
             .await
             .map_err(|error| format!("failed to start turn: {error:#}"))?;
-        if let Err(message) = self
-            .validate_turn_reasoning_effort(
+        let effective_reasoning_effort = match self
+            .resolve_turn_reasoning_effort(
                 outcome.started_notification.workspace_id.as_str(),
                 ReasoningModelLookupBackend::ApiProvider {
                     provider: outcome.materialization.thread.model_provider.as_str(),
@@ -190,14 +190,14 @@ impl MessageProcessor {
             )
             .await
         {
-            self.thread_manager
-                .rollback_turn_start(outcome.rollback_context.clone())
-                .await;
-            return Err(message);
-        }
-
-        let effective_reasoning_effort =
-            requested_reasoning_effort.map(normalized_reasoning_effort_for_comparison);
+            Ok(effort) => effort,
+            Err(message) => {
+                self.thread_manager
+                    .rollback_turn_start(outcome.rollback_context.clone())
+                    .await;
+                return Err(message);
+            }
+        };
         if let Err(error) = self
             .validate_artifact_user_inputs(
                 outcome.started_notification.workspace_id.as_str(),
@@ -716,8 +716,8 @@ impl MessageProcessor {
                     return;
                 }
             };
-            if let Err(message) = self
-                .validate_turn_reasoning_effort(
+            let effective_cli_runtime_effort = match self
+                .resolve_turn_reasoning_effort(
                     outcome.started_notification.workspace_id.as_str(),
                     ReasoningModelLookupBackend::CliRuntime {
                         runtime_id: runtime_id.as_str(),
@@ -728,12 +728,15 @@ impl MessageProcessor {
                 )
                 .await
             {
-                self.thread_manager
-                    .rollback_turn_start(outcome.rollback_context.clone())
-                    .await;
-                send_turn_start_failure!(message);
-                return;
-            }
+                Ok(effort) => effort,
+                Err(message) => {
+                    self.thread_manager
+                        .rollback_turn_start(outcome.rollback_context.clone())
+                        .await;
+                    send_turn_start_failure!(message);
+                    return;
+                }
+            };
             let profile_selected_audit = match self.turn_profile_selected_audit_event(&outcome) {
                 Ok(event) => event,
                 Err(error) => {
@@ -2536,31 +2539,34 @@ impl MessageProcessor {
         model
     }
 
-    async fn validate_turn_reasoning_effort(
+    async fn resolve_turn_reasoning_effort(
         &self,
         workspace_id: &str,
         backend: ReasoningModelLookupBackend<'_>,
         model_id: &str,
         effort: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<Option<String>, String> {
         let Some(effort) = effort.map(str::trim).filter(|effort| !effort.is_empty()) else {
-            return Ok(());
+            return Ok(None);
         };
         let backend_label = reasoning_model_lookup_backend_label(backend);
+        let validation_policy = backend.reasoning_effort_validation_policy();
         let model = self
             .lookup_reasoning_model_capabilities(workspace_id, backend, model_id)
             .await;
 
-        let result = validate_reasoning_effort_for_model(
+        let result = resolve_reasoning_effort_for_model(
+            validation_policy,
             backend_label.as_str(),
             model_id,
             effort,
             model.as_ref(),
-        );
+        )
+        .map(Some);
         let capability_source = reasoning_capability_source_for_model(model.as_ref());
         let supported_efforts = reasoning_effort_options_for_model(model.as_ref());
         match &result {
-            Ok(()) => {
+            Ok(_) => {
                 debug!(
                     workspace_id,
                     backend = backend_label.as_str(),
@@ -2766,6 +2772,23 @@ enum ReasoningModelLookupBackend<'a> {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReasoningEffortValidationPolicy {
+    // API adapters consume the typed Pioneer ReasoningEffort enum.
+    KnownOnly,
+    // CLI runtimes consume the exact values advertised by their model metadata.
+    MetadataDefined,
+}
+
+impl ReasoningModelLookupBackend<'_> {
+    fn reasoning_effort_validation_policy(self) -> ReasoningEffortValidationPolicy {
+        match self {
+            Self::ApiProvider { .. } => ReasoningEffortValidationPolicy::KnownOnly,
+            Self::CliRuntime { .. } => ReasoningEffortValidationPolicy::MetadataDefined,
+        }
+    }
+}
+
 fn reasoning_model_lookup_backend_label(backend: ReasoningModelLookupBackend<'_>) -> String {
     match backend {
         ReasoningModelLookupBackend::ApiProvider { provider } => {
@@ -2801,14 +2824,36 @@ fn reasoning_effort_options_for_model(model: Option<&ProviderModelInfo>) -> Opti
         .map(|reasoning| reasoning.effort_options.as_slice())
 }
 
-fn supported_efforts_for_error(reasoning: &ProviderModelReasoningCapabilities) -> String {
+fn normalized_reasoning_effort_for_policy(
+    policy: ReasoningEffortValidationPolicy,
+    value: &str,
+) -> Option<String> {
+    match policy {
+        ReasoningEffortValidationPolicy::KnownOnly => {
+            pioneer_protocol::ReasoningEffort::canonical_value(value).map(str::to_owned)
+        }
+        ReasoningEffortValidationPolicy::MetadataDefined => {
+            pioneer_protocol::normalize_metadata_reasoning_effort(value)
+        }
+    }
+}
+
+fn reasoning_effort_comparison_key(value: &str) -> String {
+    pioneer_protocol::reasoning_effort_comparison_key(value).unwrap_or_default()
+}
+
+fn supported_efforts_for_error(
+    reasoning: &ProviderModelReasoningCapabilities,
+    policy: ReasoningEffortValidationPolicy,
+) -> String {
     let mut effort_options = Vec::new();
     for effort in &reasoning.effort_options {
-        let Some(effort) = pioneer_protocol::ReasoningEffort::canonical_value(effort.as_str())
-        else {
+        let Some(effort) = normalized_reasoning_effort_for_policy(policy, effort.as_str()) else {
             continue;
         };
-        if reasoning.mandatory == Some(true) && effort == "none" {
+        if reasoning.mandatory == Some(true)
+            && reasoning_effort_comparison_key(effort.as_str()) == "none"
+        {
             continue;
         }
         if !effort_options.contains(&effort) {
@@ -2823,18 +2868,19 @@ fn supported_efforts_for_error(reasoning: &ProviderModelReasoningCapabilities) -
     }
 }
 
-fn validate_reasoning_effort_for_model(
+fn resolve_reasoning_effort_for_model(
+    policy: ReasoningEffortValidationPolicy,
     backend_label: &str,
     model_id: &str,
     effort: &str,
     model: Option<&ProviderModelInfo>,
-) -> Result<(), String> {
-    let normalized_effort =
-        pioneer_protocol::ReasoningEffort::canonical_value(effort).ok_or_else(|| {
-            format!(
-                "reasoning effort `{effort}` is not recognized by Pioneer for {backend_label} model `{model_id}`"
-            )
-        })?;
+) -> Result<String, String> {
+    let normalized_effort = normalized_reasoning_effort_for_policy(policy, effort).ok_or_else(|| {
+        format!(
+            "reasoning effort `{effort}` is not recognized by Pioneer for {backend_label} model `{model_id}`"
+        )
+    })?;
+    let normalized_effort_key = reasoning_effort_comparison_key(normalized_effort.as_str());
     let Some(model) = model else {
         return Err(format!(
             "reasoning effort `{effort}` cannot be used with {backend_label} model `{model_id}` because model capability metadata is unavailable; capability source: unknown"
@@ -2851,7 +2897,7 @@ fn validate_reasoning_effort_for_model(
     if reasoning.supported == Some(false) {
         return Err(format!(
             "reasoning effort `{effort}` is not supported by {backend_label} model `{model_id}`; supported efforts: {}; capability source: {capability_source}",
-            supported_efforts_for_error(reasoning)
+            supported_efforts_for_error(reasoning, policy)
         ));
     }
 
@@ -2861,33 +2907,54 @@ fn validate_reasoning_effort_for_model(
         ));
     }
 
-    if reasoning.mandatory == Some(true) && normalized_effort == "none" {
+    if reasoning.mandatory == Some(true) && normalized_effort_key == "none" {
         return Err(format!(
             "reasoning effort `{effort}` is not supported by {backend_label} model `{model_id}`; supported efforts: {}; capability source: {capability_source}",
-            supported_efforts_for_error(reasoning)
+            supported_efforts_for_error(reasoning, policy)
         ));
     }
 
-    if !reasoning
+    let matched_effort = reasoning
         .effort_options
         .iter()
         .filter_map(|supported_effort| {
             let supported_effort =
-                pioneer_protocol::ReasoningEffort::canonical_value(supported_effort.as_str())?;
-            if reasoning.mandatory == Some(true) && supported_effort == "none" {
+                normalized_reasoning_effort_for_policy(policy, supported_effort.as_str())?;
+            if reasoning.mandatory == Some(true)
+                && reasoning_effort_comparison_key(supported_effort.as_str()) == "none"
+            {
                 return None;
             }
             Some(supported_effort)
         })
-        .any(|supported_effort| supported_effort == normalized_effort)
-    {
+        .find(|supported_effort| {
+            reasoning_effort_comparison_key(supported_effort.as_str()) == normalized_effort_key
+        });
+    let Some(matched_effort) = matched_effort else {
         return Err(format!(
             "reasoning effort `{effort}` is not supported by {backend_label} model `{model_id}`; supported efforts: {}; capability source: {capability_source}",
-            supported_efforts_for_error(reasoning)
+            supported_efforts_for_error(reasoning, policy)
         ));
-    }
+    };
 
-    Ok(())
+    Ok(matched_effort)
+}
+
+#[cfg(test)]
+fn validate_reasoning_effort_for_model(
+    backend_label: &str,
+    model_id: &str,
+    effort: &str,
+    model: Option<&ProviderModelInfo>,
+) -> Result<(), String> {
+    resolve_reasoning_effort_for_model(
+        ReasoningEffortValidationPolicy::KnownOnly,
+        backend_label,
+        model_id,
+        effort,
+        model,
+    )
+    .map(|_| ())
 }
 
 fn effective_cli_runtime_effort(
@@ -2912,9 +2979,7 @@ fn effective_cli_runtime_effort(
 }
 
 fn normalized_reasoning_effort_for_comparison(value: &str) -> String {
-    pioneer_protocol::ReasoningEffort::canonical_value(value)
-        .map(str::to_owned)
-        .unwrap_or_else(|| value.trim().to_owned())
+    reasoning_effort_comparison_key(value)
 }
 
 fn runtime_model_from_codex_snapshot_for_reasoning_lookup(
@@ -3312,6 +3377,48 @@ mod tests {
     }
 
     #[test]
+    fn cli_reasoning_effort_validation_accepts_metadata_defined_values() {
+        let mut model = reasoning_test_model(Some(reasoning_capabilities(
+            Some(true),
+            &["low", "high", "xhigh", "max", "ultra"],
+        )));
+        model
+            .capabilities
+            .reasoning
+            .as_mut()
+            .expect("reasoning capabilities")
+            .source = Some(ReasoningCapabilitySource::CliMetadata);
+
+        let resolved = resolve_reasoning_effort_for_model(
+            ReasoningEffortValidationPolicy::MetadataDefined,
+            "CLI runtime `codex`",
+            "gpt-5.6-sol",
+            "Ultra",
+            Some(&model),
+        )
+        .expect("runtime-defined effort should pass validation");
+
+        assert_eq!(resolved, "ultra");
+    }
+
+    #[test]
+    fn api_reasoning_effort_validation_keeps_closed_provider_contract() {
+        let model =
+            reasoning_test_model(Some(reasoning_capabilities(Some(true), &["low", "ultra"])));
+
+        let error = resolve_reasoning_effort_for_model(
+            ReasoningEffortValidationPolicy::KnownOnly,
+            "provider `openai`",
+            "gpt-future",
+            "ultra",
+            Some(&model),
+        )
+        .expect_err("API providers require an implemented Pioneer effort mapping");
+
+        assert!(error.contains("is not recognized by Pioneer"));
+    }
+
+    #[test]
     fn reasoning_effort_validation_rejects_none_for_mandatory_reasoning() {
         let mut model = reasoning_test_model(Some(reasoning_capabilities(
             Some(true),
@@ -3357,6 +3464,11 @@ mod tests {
         assert_eq!(
             effective_cli_runtime_effort(None, None).expect("no effort"),
             None
+        );
+        assert_eq!(
+            effective_cli_runtime_effort(Some("Ultra"), Some("ultra"))
+                .expect("runtime-defined efforts compare case-insensitively"),
+            Some("ultra".to_owned())
         );
     }
 

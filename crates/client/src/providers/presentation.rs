@@ -2,6 +2,7 @@
 
 use pioneer_protocol::{
     ProviderListModelsParams, ProviderListModelsResponse, ProviderModelInfo, ProviderSummary,
+    ReasoningCapabilitySource, reasoning_effort_comparison_key,
 };
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -185,19 +186,7 @@ pub fn model_selector_selected_model_display_state(
 }
 
 pub fn normalize_reasoning_effort(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let compact = trimmed
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect::<String>();
-    pioneer_protocol::ReasoningEffort::canonical_value(compact.as_str())
-        .map(str::to_owned)
-        .or_else(|| (!compact.is_empty()).then_some(compact))
+    pioneer_protocol::normalize_metadata_reasoning_effort(value)
 }
 
 pub fn reasoning_effort_display_label(value: &str) -> String {
@@ -214,7 +203,7 @@ pub fn reasoning_effort_display_label(value: &str) -> String {
     }
 }
 
-pub fn ordered_reasoning_effort_options(options: &[String]) -> Vec<String> {
+fn ordered_known_reasoning_effort_options(options: &[String]) -> Vec<String> {
     let mut normalized = Vec::new();
     for option in options {
         let Some(effort) =
@@ -245,6 +234,25 @@ pub fn ordered_reasoning_effort_options(options: &[String]) -> Vec<String> {
     normalized
 }
 
+fn metadata_defined_reasoning_effort_options(options: &[String]) -> Vec<String> {
+    let mut normalized = Vec::new();
+    let mut keys = Vec::new();
+    for option in options {
+        let Some(effort) = normalize_reasoning_effort(option) else {
+            continue;
+        };
+        let Some(key) = reasoning_effort_comparison_key(effort.as_str()) else {
+            continue;
+        };
+        if keys.contains(&key) {
+            continue;
+        }
+        keys.push(key);
+        normalized.push(effort);
+    }
+    normalized
+}
+
 pub fn reasoning_effort_rows_for_model(
     model: &ProviderModelInfo,
     selected_effort: Option<&str>,
@@ -256,15 +264,26 @@ pub fn reasoning_effort_rows_for_model(
         return Vec::new();
     }
 
-    let selected_effort =
-        selected_effort.and_then(pioneer_protocol::ReasoningEffort::canonical_value);
-    ordered_reasoning_effort_options(reasoning.effort_options.as_slice())
+    let metadata_defined = reasoning.source == Some(ReasoningCapabilitySource::CliMetadata);
+    let selected_effort = selected_effort.and_then(reasoning_effort_comparison_key);
+    let options = if metadata_defined {
+        metadata_defined_reasoning_effort_options(reasoning.effort_options.as_slice())
+    } else {
+        ordered_known_reasoning_effort_options(reasoning.effort_options.as_slice())
+    };
+    options
         .into_iter()
-        .filter(|effort| reasoning.mandatory != Some(true) || effort != "none")
-        .map(|effort| ReasoningEffortRow {
-            label: reasoning_effort_display_label(effort.as_str()),
-            selected: selected_effort == Some(effort.as_str()),
-            effort,
+        .filter(|effort| {
+            reasoning.mandatory != Some(true)
+                || reasoning_effort_comparison_key(effort.as_str()).as_deref() != Some("none")
+        })
+        .map(|effort| {
+            let effort_key = reasoning_effort_comparison_key(effort.as_str());
+            ReasoningEffortRow {
+                label: reasoning_effort_display_label(effort.as_str()),
+                selected: selected_effort.as_ref() == effort_key.as_ref(),
+                effort,
+            }
         })
         .collect()
 }
@@ -381,6 +400,15 @@ mod tests {
         let mut model = reasoning_model(options, Some(true));
         if let Some(reasoning) = model.capabilities.reasoning.as_mut() {
             reasoning.mandatory = Some(true);
+        }
+        model
+    }
+
+    fn cli_reasoning_model(options: Vec<&str>) -> ProviderModelInfo {
+        let mut model = reasoning_model(options, Some(true));
+        model.provider = "cli_runtime:codex".to_owned();
+        if let Some(reasoning) = model.capabilities.reasoning.as_mut() {
+            reasoning.source = Some(ReasoningCapabilitySource::CliMetadata);
         }
         model
     }
@@ -539,7 +567,7 @@ mod tests {
     #[test]
     fn reasoning_effort_order_preserves_ordered_provider_values() {
         assert_eq!(
-            ordered_reasoning_effort_options(&[
+            ordered_known_reasoning_effort_options(&[
                 "low".to_owned(),
                 "medium".to_owned(),
                 "high".to_owned()
@@ -551,7 +579,7 @@ mod tests {
     #[test]
     fn reasoning_effort_order_sorts_unordered_known_values() {
         assert_eq!(
-            ordered_reasoning_effort_options(&[
+            ordered_known_reasoning_effort_options(&[
                 "high".to_owned(),
                 "low".to_owned(),
                 "x-high".to_owned(),
@@ -564,7 +592,7 @@ mod tests {
     #[test]
     fn reasoning_effort_order_drops_unknown_provider_values() {
         assert_eq!(
-            ordered_reasoning_effort_options(&[
+            ordered_known_reasoning_effort_options(&[
                 "low".to_owned(),
                 "turbo-high".to_owned(),
                 "maximum".to_owned(),
@@ -609,6 +637,45 @@ mod tests {
                 ReasoningEffortRow {
                     effort: "xhigh".to_owned(),
                     label: "Extra High".to_owned(),
+                    selected: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_rows_preserve_cli_runtime_metadata_values_and_order() {
+        let rows = reasoning_effort_rows_for_model(
+            &cli_reasoning_model(vec!["low", "high", "xhigh", "max", "ultra"]),
+            Some("Ultra"),
+        );
+
+        assert_eq!(
+            rows,
+            vec![
+                ReasoningEffortRow {
+                    effort: "low".to_owned(),
+                    label: "Low".to_owned(),
+                    selected: false,
+                },
+                ReasoningEffortRow {
+                    effort: "high".to_owned(),
+                    label: "High".to_owned(),
+                    selected: false,
+                },
+                ReasoningEffortRow {
+                    effort: "xhigh".to_owned(),
+                    label: "Extra High".to_owned(),
+                    selected: false,
+                },
+                ReasoningEffortRow {
+                    effort: "max".to_owned(),
+                    label: "Max".to_owned(),
+                    selected: false,
+                },
+                ReasoningEffortRow {
+                    effort: "ultra".to_owned(),
+                    label: "Ultra".to_owned(),
                     selected: true,
                 },
             ]

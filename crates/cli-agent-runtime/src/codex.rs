@@ -7,6 +7,7 @@ use crate::driver::{
 };
 use crate::input::CLIRuntimeTurnInputItem;
 use crate::process::{CLIAgentProcessSpawnConfig, expand_home_path, spawn_cli_agent_process};
+use pioneer_protocol::normalize_metadata_reasoning_effort;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
@@ -2245,27 +2246,7 @@ impl CodexReasoningEffort {
                 reasoning_effort, ..
             } => reasoning_effort?,
         };
-        normalize_reasoning_effort(value.as_str())
-    }
-}
-
-fn normalize_reasoning_effort(value: &str) -> Option<String> {
-    let compact = value
-        .trim()
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect::<String>();
-
-    match compact.as_str() {
-        "none" | "off" | "disabled" => Some("none".to_owned()),
-        "minimal" | "min" => Some("minimal".to_owned()),
-        "low" => Some("low".to_owned()),
-        "medium" | "med" => Some("medium".to_owned()),
-        "high" => Some("high".to_owned()),
-        "xhigh" | "extrahigh" | "xtrahigh" => Some("xhigh".to_owned()),
-        "max" | "maximum" => Some("max".to_owned()),
-        _ => None,
+        normalize_metadata_reasoning_effort(value.as_str())
     }
 }
 
@@ -3353,13 +3334,17 @@ while read line; do :; done
                 "low",
                 { "reasoningEffort": "Extra High" },
                 { "id": "maximum" },
+                "ultra",
                 " "
             ]
         }))
         .expect("model metadata should decode");
 
         let snapshot = model.into_snapshot().expect("model snapshot");
-        assert_eq!(snapshot.effort_options, vec!["low", "xhigh", "max"]);
+        assert_eq!(
+            snapshot.effort_options,
+            vec!["low", "xhigh", "max", "ultra"]
+        );
         assert_eq!(snapshot.supports_reasoning, Some(true));
     }
 
@@ -4393,7 +4378,7 @@ while read line; do :; done
                         })),
                         permissions: None,
                         model: Some("gpt-5".to_owned()),
-                        effort: Some("medium".to_owned()),
+                        effort: Some("ultra".to_owned()),
                         personality: None,
                         summary: Some("concise".to_owned()),
                     },
@@ -4417,7 +4402,7 @@ while read line; do :; done
                     "networkAccess": true
                 },
                 "model": "gpt-5",
-                "effort": "medium",
+                "effort": "ultra",
                 "summary": "concise"
             })
         );

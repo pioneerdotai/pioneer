@@ -29,8 +29,10 @@ impl PioneerDesktop {
             ProviderModelDisplayState::Label(_) => self
                 .composer_selected_reasoning_effort
                 .as_deref()
-                .and_then(pioneer_protocol::ReasoningEffort::canonical_value)
-                .map(provider_presentation::reasoning_effort_display_label)
+                .and_then(provider_presentation::normalize_reasoning_effort)
+                .map(|effort| {
+                    provider_presentation::reasoning_effort_display_label(effort.as_str())
+                })
                 .filter(|label| !label.is_empty()),
             ProviderModelDisplayState::Loading | ProviderModelDisplayState::Missing => None,
         };

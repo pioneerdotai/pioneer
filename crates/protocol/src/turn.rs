@@ -1197,9 +1197,13 @@ pub fn resolve_turn_permission_profile(
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 pub struct TurnReasoningSelection {
+    /// String-valued because CLI runtimes may advertise efforts newer than
+    /// Pioneer API-provider adapters understand.
     pub effort: String,
 }
 
+/// Closed effort set implemented by Pioneer API-provider adapters.
+/// CLI runtime efforts remain metadata-defined strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReasoningEffort {
     Max,
@@ -1247,6 +1251,24 @@ impl ReasoningEffort {
     pub fn canonical_value(value: &str) -> Option<&'static str> {
         Self::from_str(value).map(Self::as_str)
     }
+}
+
+/// Canonicalize known aliases while preserving values declared by model
+/// metadata so CLI runtimes remain forward compatible.
+pub fn normalize_metadata_reasoning_effort(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    ReasoningEffort::canonical_value(trimmed)
+        .map(str::to_owned)
+        .or_else(|| Some(trimmed.to_owned()))
+}
+
+/// Build a stable key for matching a user selection to model metadata.
+pub fn reasoning_effort_comparison_key(value: &str) -> Option<String> {
+    normalize_metadata_reasoning_effort(value).map(|value| value.to_ascii_lowercase())
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
@@ -4981,6 +5003,27 @@ mod tests {
         );
         assert_eq!(ReasoningEffort::canonical_value("x-high"), Some("xhigh"));
         assert_eq!(ReasoningEffort::from_str("turbo"), None);
+    }
+
+    #[test]
+    fn reasoning_effort_metadata_values_preserve_runtime_defined_options() {
+        assert_eq!(
+            normalize_metadata_reasoning_effort(" Extra High "),
+            Some("xhigh".to_owned())
+        );
+        assert_eq!(
+            normalize_metadata_reasoning_effort(" ultra "),
+            Some("ultra".to_owned())
+        );
+        assert_eq!(
+            normalize_metadata_reasoning_effort("future-level"),
+            Some("future-level".to_owned())
+        );
+        assert_eq!(
+            reasoning_effort_comparison_key("Ultra"),
+            Some("ultra".to_owned())
+        );
+        assert_eq!(normalize_metadata_reasoning_effort("  "), None);
     }
 
     #[test]

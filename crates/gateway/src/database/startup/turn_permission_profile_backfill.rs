@@ -18,7 +18,7 @@ use sea_orm::{
 use serde_json::Value as JsonValue;
 use std::path::Path;
 use std::time::Duration;
-use tracing::info;
+use tracing::{info, warn};
 
 const TURN_PERMISSION_PROFILE_BACKFILL_KEY: &str = "turn_permission_profile_payload_backfill";
 const TURN_PERMISSION_PROFILE_BACKFILL_VERSION: i64 = 2;

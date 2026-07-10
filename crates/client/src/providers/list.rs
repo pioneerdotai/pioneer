@@ -1580,7 +1580,7 @@ mod tests {
                     family: Some("gpt-5".to_owned()),
                     is_custom: false,
                     active: Some(true),
-                    effort_options: vec!["low".to_owned(), "high".to_owned()],
+                    effort_options: vec!["low".to_owned(), "high".to_owned(), "ultra".to_owned()],
                     input_modalities: vec!["text".to_owned()],
                     output_modalities: vec!["text".to_owned()],
                     supports_reasoning: None,
@@ -1610,7 +1610,7 @@ mod tests {
         assert_eq!(reasoning.supported, Some(true));
         assert_eq!(
             reasoning.effort_options,
-            vec!["low".to_owned(), "high".to_owned()]
+            vec!["low".to_owned(), "high".to_owned(), "ultra".to_owned()]
         );
         assert_eq!(
             reasoning.source,

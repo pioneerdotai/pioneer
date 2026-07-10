@@ -8131,6 +8131,7 @@ version = "0.26.1"
 dependencies = [
  "anyhow",
  "libc",
+ "pioneer-protocol",
  "process-wrap",
  "serde",
  "serde_json",

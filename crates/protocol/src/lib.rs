@@ -291,7 +291,8 @@ pub use turn::{
     UserMessageAttachment, WebFetchLink, WebSearchResultItem,
     build_execution_checkpoint_original_request_summary, build_execution_checkpoint_payload,
     build_execution_checkpoint_provider_budget_summary, build_execution_checkpoint_tool_summary,
-    collect_execution_checkpoint_strict_obligations, resolve_turn_permission_profile,
+    collect_execution_checkpoint_strict_obligations, normalize_metadata_reasoning_effort,
+    reasoning_effort_comparison_key, resolve_turn_permission_profile,
 };
 pub use turn_permissions::{
     compile_turn_permission_profile, composer_turn_permission_profile_snapshot,

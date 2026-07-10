@@ -1,6 +1,7 @@
 //! Claude CLI streaming runtime primitives.
 
 use crate::process::expand_home_path;
+use pioneer_protocol::normalize_metadata_reasoning_effort;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
@@ -713,7 +714,7 @@ fn claude_model_from_initialize_model(value: &JsonValue) -> Option<ClaudeModelSn
             values
                 .iter()
                 .filter_map(JsonValue::as_str)
-                .filter_map(normalize_reasoning_effort)
+                .filter_map(normalize_metadata_reasoning_effort)
                 .collect::<Vec<_>>()
         })
         .filter(|values| !values.is_empty())
@@ -753,26 +754,6 @@ fn claude_model_from_initialize_model(value: &JsonValue) -> Option<ClaudeModelSn
         max_input_tokens: None,
         max_output_tokens: None,
     })
-}
-
-fn normalize_reasoning_effort(value: &str) -> Option<String> {
-    let compact = value
-        .trim()
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect::<String>();
-
-    match compact.as_str() {
-        "none" | "off" | "disabled" => Some("none".to_owned()),
-        "minimal" | "min" => Some("minimal".to_owned()),
-        "low" => Some("low".to_owned()),
-        "medium" | "med" => Some("medium".to_owned()),
-        "high" => Some("high".to_owned()),
-        "xhigh" | "extrahigh" | "xtrahigh" => Some("xhigh".to_owned()),
-        "max" | "maximum" => Some("max".to_owned()),
-        _ => None,
-    }
 }
 
 fn stderr_lines(bytes: &[u8]) -> Vec<String> {
@@ -896,6 +877,18 @@ mod tests {
             vec!["low", "medium", "high", "xhigh", "max"]
         );
         assert_eq!(model.supports_reasoning, Some(true));
+    }
+
+    #[test]
+    fn claude_model_parser_preserves_runtime_defined_effort_metadata() {
+        let model = claude_model_from_initialize_model(&json!({
+            "id": "claude-future",
+            "supportsEffort": true,
+            "supportedEffortLevels": ["low", "future-level"]
+        }))
+        .expect("model metadata");
+
+        assert_eq!(model.effort_options, vec!["low", "future-level"]);
     }
 
     #[test]
