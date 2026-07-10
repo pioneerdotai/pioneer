@@ -1187,7 +1187,6 @@ seconds = "%{seconds} sec"
 
 [timeline.running]
 turn = "Running"
-stalled = "Waiting for runtime"
 
 [timeline.task.status]
 draft = "Draft"

@@ -1187,7 +1187,6 @@ seconds = "%{seconds} से"
 
 [timeline.running]
 turn = "काम कर रहा हूँ"
-stalled = "रनटाइम की प्रतीक्षा"
 
 [timeline.task.status]
 draft = "ड्राफ्ट"

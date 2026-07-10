@@ -1187,7 +1187,6 @@ seconds = "%{seconds} сек"
 
 [timeline.running]
 turn = "Работаю"
-stalled = "Ожидание среды выполнения"
 
 [timeline.task.status]
 draft = "Черновик"
