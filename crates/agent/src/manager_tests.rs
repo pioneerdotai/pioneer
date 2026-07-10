@@ -292,7 +292,11 @@ fn test_tools_permission_context(turn_id: &str) -> pioneer_tools::PermissionEval
 }
 
 fn test_full_access_security_snapshot() -> pioneer_protocol::TurnExecutionSecuritySnapshot {
-    pioneer_protocol::TurnExecutionSecuritySnapshot::unrestricted_full_access(".", 1)
+    let cwd = std::env::current_dir().expect("test cwd should resolve");
+    pioneer_protocol::TurnExecutionSecuritySnapshot::unrestricted_full_access(
+        cwd.to_string_lossy(),
+        1,
+    )
 }
 
 fn test_manager() -> AgentManager {
@@ -11655,7 +11659,11 @@ async fn dynamic_skill_tool_executes_and_emits_dynamic_tool_call() {
         dynamic_result.name.as_deref(),
         Some("skill.user-tests-my-skill.echo-shell")
     );
-    assert!(dynamic_result.content.contains("shell-ok"));
+    assert!(
+        dynamic_result.content.contains("shell-ok"),
+        "unexpected dynamic tool result: {}",
+        dynamic_result.content
+    );
 
     let completed_dynamic_item = observed_events
         .iter()
