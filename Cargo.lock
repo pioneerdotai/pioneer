@@ -8052,6 +8052,7 @@ dependencies = [
  "pioneer-promt",
  "pioneer-protocol",
  "pioneer-provider",
+ "pioneer-runtime-events",
  "pioneer-skills",
  "pioneer-tools",
  "serde",
@@ -8132,6 +8133,7 @@ dependencies = [
  "anyhow",
  "libc",
  "pioneer-protocol",
+ "pioneer-runtime-events",
  "process-wrap",
  "serde",
  "serde_json",
@@ -8285,6 +8287,7 @@ dependencies = [
  "pioneer-promt",
  "pioneer-protocol",
  "pioneer-provider",
+ "pioneer-runtime-events",
  "pioneer-skills",
  "pioneer-sqlite",
  "pioneer-tasks",
@@ -8454,6 +8457,16 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "pioneer-runtime-events"
+version = "0.27.0"
+dependencies = [
+ "pioneer-protocol",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

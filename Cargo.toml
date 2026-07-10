@@ -22,6 +22,7 @@ members = [
   "crates/memory",
   "crates/protocol",
   "crates/provider",
+  "crates/runtime-events",
   "crates/tunnel",
   "crates/skills",
   "crates/sqlite",
@@ -57,6 +58,7 @@ pioneer-mcp = { path = "crates/mcp" }
 pioneer-memory = { path = "crates/memory" }
 pioneer-protocol = { path = "crates/protocol" }
 pioneer-provider = { path = "crates/provider" }
+pioneer-runtime-events = { path = "crates/runtime-events" }
 pioneer-tunnel = { path = "crates/tunnel" }
 pioneer-skills = { path = "crates/skills" }
 pioneer-tasks = { path = "crates/tasks" }

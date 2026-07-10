@@ -33,7 +33,7 @@ pub fn render_semantic_timeline_rows(
     projection.items.clear();
     projection.timeline.clear();
 
-    let live_work_started_at = live_work_started_at_by_turn(semantic_rows);
+    let live_work = live_work_by_turn(semantic_rows);
     let mut inserted_running_rows = std::collections::HashSet::<String>::new();
     let mut rows = Vec::<TimelineRow>::new();
     let mut semantic_row_ids = HashMap::<String, SemanticTimelineRowId>::new();
@@ -49,7 +49,7 @@ pub fn render_semantic_timeline_rows(
         let next_turn_id = semantic_rows.get(index + 1).and_then(semantic_row_turn_id);
         if let Some(turn_id) = current_turn_id
             && next_turn_id != Some(turn_id)
-            && let Some(started_at_unix_ms) = live_work_started_at.get(turn_id).copied()
+            && let Some((started_at_unix_ms, state)) = live_work.get(turn_id).copied()
             && inserted_running_rows.insert(turn_id.to_owned())
         {
             let running_key = format!("semantic-running-turn::{turn_id}");
@@ -59,6 +59,8 @@ pub fn render_semantic_timeline_rows(
                     &projection,
                     turn_id,
                     started_at_unix_ms,
+                    Some(state),
+                    None,
                 )),
             });
             semantic_row_ids.insert(running_key, row.id.clone());
@@ -243,10 +245,13 @@ fn push_turn_state(
     rows: &mut Vec<TimelineRow>,
     block: &TimelineBlock,
 ) {
-    let TimelineBlockKind::TurnState { state, .. } = &block.kind else {
+    let TimelineBlockKind::TurnState { state, message } = &block.kind else {
         return;
     };
-    if !matches!(state, TurnWorkState::Starting | TurnWorkState::Running) {
+    if !matches!(
+        state,
+        TurnWorkState::Starting | TurnWorkState::Running | TurnWorkState::Stalled
+    ) {
         return;
     }
     let Some(turn_id) = block.turn_id.as_deref() else {
@@ -258,6 +263,8 @@ fn push_turn_state(
             projection,
             turn_id,
             block.started_at_unix_ms.or(block.updated_at_unix_ms),
+            Some(*state),
+            message.clone(),
         )),
     });
 }
@@ -266,10 +273,14 @@ fn running_turn_display_for_projection(
     projection: &ConversationViewState,
     turn_id: &str,
     started_at_unix_ms: Option<i64>,
+    state: Option<TurnWorkState>,
+    message: Option<String>,
 ) -> RunningTurnDisplay {
     RunningTurnDisplay {
         turn_id: turn_id.to_owned(),
         started_at_unix_ms,
+        state,
+        message,
         permission_profile: projection.turn_permission_profile(turn_id).cloned(),
         security_summary: projection.turn_security_summary(turn_id).cloned(),
     }
@@ -327,7 +338,9 @@ fn push_item_row(
     });
 }
 
-fn live_work_started_at_by_turn(rows: &[SemanticTimelineRow]) -> HashMap<String, Option<i64>> {
+fn live_work_by_turn(
+    rows: &[SemanticTimelineRow],
+) -> HashMap<String, (Option<i64>, TurnWorkState)> {
     rows.iter()
         .filter_map(|row| {
             let SemanticTimelineRowKind::WorkHeader { work, .. } = &row.kind else {
@@ -336,10 +349,13 @@ fn live_work_started_at_by_turn(rows: &[SemanticTimelineRow]) -> HashMap<String,
             if work.presentation != TurnWorkPresentation::ExpandedLive {
                 return None;
             }
-            if !matches!(work.state, TurnWorkState::Starting | TurnWorkState::Running) {
+            if !matches!(
+                work.state,
+                TurnWorkState::Starting | TurnWorkState::Running | TurnWorkState::Stalled
+            ) {
                 return None;
             }
-            Some((work.turn_id.clone(), work.started_at_unix_ms))
+            Some((work.turn_id.clone(), (work.started_at_unix_ms, work.state)))
         })
         .collect()
 }
@@ -494,21 +510,27 @@ mod tests {
     }
 
     #[test]
-    fn turn_state_rows_render_only_starting_or_running() {
-        let running_model = render_semantic_timeline_rows(
-            &[semantic_row(SemanticTimelineRowKind::TurnState {
-                block: turn_state_block(TurnWorkState::Running),
-            })],
-            ConversationViewState::default(),
-        );
-        assert_eq!(running_model.rows.len(), 1);
-        assert!(matches!(
-            &running_model.rows[0],
-            TimelineRow {
-                kind: TimelineRowKind::RunningTurn(display),
-                ..
-            } if display.turn_id == "turn_a"
-        ));
+    fn turn_state_rows_preserve_running_indicator_while_stalled() {
+        for state in [
+            TurnWorkState::Starting,
+            TurnWorkState::Running,
+            TurnWorkState::Stalled,
+        ] {
+            let model = render_semantic_timeline_rows(
+                &[semantic_row(SemanticTimelineRowKind::TurnState {
+                    block: turn_state_block(state),
+                })],
+                ConversationViewState::default(),
+            );
+            assert_eq!(model.rows.len(), 1, "state {state:?}");
+            assert!(matches!(
+                &model.rows[0],
+                TimelineRow {
+                    kind: TimelineRowKind::RunningTurn(display),
+                    ..
+                } if display.turn_id == "turn_a" && display.state == Some(state)
+            ));
+        }
 
         let terminal_model = render_semantic_timeline_rows(
             &[semantic_row(SemanticTimelineRowKind::TurnState {
@@ -517,6 +539,27 @@ mod tests {
             ConversationViewState::default(),
         );
         assert!(terminal_model.rows.is_empty());
+    }
+
+    #[test]
+    fn stalled_live_work_keeps_running_row_after_work_items() {
+        let mut work = work_payload(TurnWorkPresentation::ExpandedLive, 1);
+        work.state = TurnWorkState::Stalled;
+        let model = render_semantic_timeline_rows(
+            &[semantic_row(SemanticTimelineRowKind::WorkHeader {
+                block: work_block(TurnWorkPresentation::ExpandedLive, 1),
+                work,
+                expanded: true,
+                loaded_range: None,
+            })],
+            ConversationViewState::default(),
+        );
+        assert!(model.rows.iter().any(|row| matches!(
+            &row.kind,
+            TimelineRowKind::RunningTurn(display)
+                if display.turn_id == "turn_a"
+                    && display.state == Some(TurnWorkState::Stalled)
+        )));
     }
 
     #[test]

@@ -212,6 +212,7 @@ pub(super) async fn run_agent_loop(
     let mut last_turn_request: Option<ActiveTurnRequest> = None;
     let mut active_turn_run_id: Option<u64> = None;
     let mut active_recovery: Option<RecoveryAttemptContext> = None;
+    let mut last_turn_observation: Option<(String, super::ExecutionTurnObservation)> = None;
     let mut next_turn_run_id: u64 = 1;
 
     while let Some(command) = command_rx.recv().await {
@@ -286,6 +287,7 @@ pub(super) async fn run_agent_loop(
                 active_turn_request = Some(turn_request.clone());
                 last_turn_request = Some(turn_request.clone());
                 active_recovery = None;
+                last_turn_observation = None;
                 let task_recovery = None;
 
                 let run_id = next_turn_run_id;
@@ -345,6 +347,13 @@ pub(super) async fn run_agent_loop(
 
                 match result {
                     Ok(TurnTaskSuccess::Completed) => {
+                        last_turn_observation = Some((
+                            turn_id.clone(),
+                            super::ExecutionTurnObservation {
+                                status: super::ExecutionTurnStatus::Completed,
+                                message: None,
+                            },
+                        ));
                         active_turn_id = None;
                         active_turn_request = None;
                         publish_loop_durable_event(
@@ -374,6 +383,13 @@ pub(super) async fn run_agent_loop(
                             let blocked_reason =
                                 "execution window continuation could not resume: active turn request missing"
                                     .to_owned();
+                            last_turn_observation = Some((
+                                turn_id.clone(),
+                                super::ExecutionTurnObservation {
+                                    status: super::ExecutionTurnStatus::Blocked,
+                                    message: Some(blocked_reason.clone()),
+                                },
+                            ));
                             active_turn_id = None;
                             active_turn_run_id = None;
                             active_turn_control = None;
@@ -433,6 +449,13 @@ pub(super) async fn run_agent_loop(
                             }
                             ExecutionWindowTotalBudgetDecision::Block(block) => {
                                 let blocked_reason = block.reason.clone();
+                                last_turn_observation = Some((
+                                    turn_id.clone(),
+                                    super::ExecutionTurnObservation {
+                                        status: super::ExecutionTurnStatus::Blocked,
+                                        message: Some(blocked_reason.clone()),
+                                    },
+                                ));
                                 active_turn_id = None;
                                 active_turn_run_id = None;
                                 active_turn_control = None;
@@ -497,6 +520,17 @@ pub(super) async fn run_agent_loop(
                         ) {
                             Ok(provider) => provider,
                             Err(error) => {
+                                let failure_message = format!(
+                                    "failed to recreate provider `{}` for execution window continuation: {error}",
+                                    next_turn_request.provider_name
+                                );
+                                last_turn_observation = Some((
+                                    turn_id.clone(),
+                                    super::ExecutionTurnObservation {
+                                        status: super::ExecutionTurnStatus::Failed,
+                                        message: Some(failure_message.clone()),
+                                    },
+                                ));
                                 active_turn_id = None;
                                 active_turn_request = None;
                                 publish_loop_durable_event(
@@ -504,10 +538,7 @@ pub(super) async fn run_agent_loop(
                                     AgentDurableEvent::TurnFailed {
                                         thread_id: thread_id.clone(),
                                         turn_id: turn_id.clone(),
-                                        error: format!(
-                                            "failed to recreate provider `{}` for execution window continuation: {error}",
-                                            next_turn_request.provider_name
-                                        ),
+                                        error: failure_message,
                                         recovery,
                                     },
                                 )
@@ -572,6 +603,13 @@ pub(super) async fn run_agent_loop(
                         ));
                     }
                     Err(TurnTaskFailure::Terminal(error)) => {
+                        last_turn_observation = Some((
+                            turn_id.clone(),
+                            super::ExecutionTurnObservation {
+                                status: super::ExecutionTurnStatus::Failed,
+                                message: Some(error.clone()),
+                            },
+                        ));
                         active_turn_id = None;
                         active_turn_request = None;
                         cleanup_attached_tasks(
@@ -610,6 +648,13 @@ pub(super) async fn run_agent_loop(
                         );
                     }
                     Err(TurnTaskFailure::Blocked(reason)) => {
+                        last_turn_observation = Some((
+                            turn_id.clone(),
+                            super::ExecutionTurnObservation {
+                                status: super::ExecutionTurnStatus::Blocked,
+                                message: Some(reason.clone()),
+                            },
+                        ));
                         active_turn_id = None;
                         active_turn_request = None;
                         let reason_for_dispatch = reason.clone();
@@ -773,6 +818,13 @@ pub(super) async fn run_agent_loop(
                 }
                 let turn_request_snapshot = active_turn_request.clone();
                 let recovery = active_recovery.take();
+                last_turn_observation = Some((
+                    turn_id.clone(),
+                    super::ExecutionTurnObservation {
+                        status: super::ExecutionTurnStatus::Interrupted,
+                        message: Some(reason.clone()),
+                    },
+                ));
                 active_turn_id = None;
                 active_turn_control = None;
                 active_turn_request = None;
@@ -812,6 +864,21 @@ pub(super) async fn run_agent_loop(
                     interrupted_dispatch,
                 );
             }
+            AgentCommand::ObserveTurn { turn_id, ack } => {
+                let observation = if active_turn_id.as_deref() == Some(turn_id.as_str()) {
+                    Some(super::ExecutionTurnObservation {
+                        status: super::ExecutionTurnStatus::InProgress,
+                        message: None,
+                    })
+                } else {
+                    last_turn_observation
+                        .as_ref()
+                        .and_then(|(observed_turn_id, observation)| {
+                            (observed_turn_id == &turn_id).then(|| observation.clone())
+                        })
+                };
+                let _ = ack.send(observation);
+            }
             AgentCommand::StartRecoveryAttempt { request, ack } => {
                 if active_turn_id.is_none()
                     && !request.item_type.is_tool_item()
@@ -845,6 +912,7 @@ pub(super) async fn run_agent_loop(
 
                     active_turn_run_id = Some(run_id);
                     active_turn_id = Some(request.turn_id.clone());
+                    last_turn_observation = None;
 
                     let turn_control = TurnExecutionControl::new(command_tx.clone(), run_id);
                     active_turn_control = Some(turn_control.clone());
@@ -941,6 +1009,7 @@ pub(super) async fn run_agent_loop(
                 let run_id = next_turn_run_id;
                 next_turn_run_id = next_turn_run_id.saturating_add(1);
                 active_turn_run_id = Some(run_id);
+                last_turn_observation = None;
                 active_turn_request = Some(turn_request.clone());
                 last_turn_request = Some(turn_request.clone());
                 let recovery = recovery_context(&request);

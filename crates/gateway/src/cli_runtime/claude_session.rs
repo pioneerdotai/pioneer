@@ -2,9 +2,10 @@ use crate::cli_runtime::config::{
     claude_account_probe_config_from_instance, load_effective_cli_runtime_instances,
 };
 use crate::cli_runtime::manager::{
-    CLIAgentRuntimeEventReceivers, CLIAgentRuntimeSession, CLIAgentRuntimeSessionFactory,
-    CLIAgentRuntimeSessionKey, CLIAgentRuntimeSessionStartOptions, CLIAgentRuntimeThreadOpenParams,
-    CLIAgentRuntimeThreadOpenSnapshot, CLIAgentRuntimeTurnStartParams,
+    CLIAgentRuntimeEventReceivers, CLIAgentRuntimeObservedTurnStatus, CLIAgentRuntimeSession,
+    CLIAgentRuntimeSessionFactory, CLIAgentRuntimeSessionKey, CLIAgentRuntimeSessionStartOptions,
+    CLIAgentRuntimeThreadOpenParams, CLIAgentRuntimeThreadOpenSnapshot,
+    CLIAgentRuntimeTurnObservation, CLIAgentRuntimeTurnStartParams,
     CLIAgentRuntimeTurnStartSnapshot, CLIAgentRuntimeTurnSteerRequest,
     CLIAgentRuntimeTurnSteerResult,
 };
@@ -24,6 +25,7 @@ use pioneer_cli_agent_runtime::process::{
 use pioneer_config::{
     EffectiveGatewayCliAgentRuntimeInstanceConfig, GatewayCliAgentRuntimeKindConfig,
 };
+use pioneer_runtime_events::{OrderedEventIngress, OrderedIngressConfig, OrderedIngressOffer};
 use serde_json::{Value as JsonValue, json};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -334,6 +336,29 @@ impl CLIAgentRuntimeSession for ClaudeCLIAgentRuntimeSession {
         Ok(())
     }
 
+    async fn observe_turn(
+        &self,
+        native_thread_id: &str,
+        native_turn_id: &str,
+    ) -> Result<Option<CLIAgentRuntimeTurnObservation>> {
+        let state = self.client.state.lock().await;
+        if state.native_thread_id.as_deref() == Some(native_thread_id)
+            && state.active_turn_id.as_deref() == Some(native_turn_id)
+        {
+            return Ok(Some(CLIAgentRuntimeTurnObservation {
+                status: CLIAgentRuntimeObservedTurnStatus::InProgress,
+                message: None,
+                reconciliation_events: Vec::new(),
+            }));
+        }
+        if state.native_thread_id.as_deref() == Some(native_thread_id)
+            && state.observed_turn_id.as_deref() == Some(native_turn_id)
+        {
+            return Ok(state.last_turn_observation.clone());
+        }
+        Ok(None)
+    }
+
     async fn steer_turn(
         &self,
         request: CLIAgentRuntimeTurnSteerRequest,
@@ -346,7 +371,7 @@ impl CLIAgentRuntimeSession for ClaudeCLIAgentRuntimeSession {
 struct ClaudeStreamClient {
     stdin: Mutex<ChildStdin>,
     pending: Mutex<HashMap<String, oneshot::Sender<Result<JsonValue, String>>>>,
-    event_tx: mpsc::Sender<RuntimeEvent>,
+    event_ingress: OrderedEventIngress<RuntimeEvent>,
     state: Mutex<ClaudeStreamState>,
     request_counter: AtomicU64,
 }
@@ -355,6 +380,9 @@ struct ClaudeStreamClient {
 struct ClaudeStreamState {
     native_thread_id: Option<String>,
     active_turn_id: Option<String>,
+    observed_turn_id: Option<String>,
+    reconciliation_events: Vec<RuntimeEvent>,
+    last_turn_observation: Option<CLIAgentRuntimeTurnObservation>,
     active_text_item_id: Option<String>,
     active_reasoning_item_id: Option<String>,
     active_text_item_started: bool,
@@ -376,7 +404,7 @@ impl ClaudeStreamClient {
         Self {
             stdin: Mutex::new(stdin),
             pending: Mutex::new(HashMap::new()),
-            event_tx,
+            event_ingress: OrderedEventIngress::spawn(event_tx, OrderedIngressConfig::default()),
             state: Mutex::new(ClaudeStreamState::default()),
             request_counter: AtomicU64::new(0),
         }
@@ -433,6 +461,9 @@ impl ClaudeStreamClient {
             let mut state = self.state.lock().await;
             state.native_thread_id = Some(native_thread_id.clone());
             state.active_turn_id = Some(native_turn_id.clone());
+            state.observed_turn_id = Some(native_turn_id.clone());
+            state.reconciliation_events.clear();
+            state.last_turn_observation = None;
             state.active_text_item_id = None;
             state.active_reasoning_item_id = None;
             state.active_text_item_started = false;
@@ -589,6 +620,7 @@ impl ClaudeStreamClient {
             }))
             .await;
         }
+        self.event_ingress.close();
     }
 
     async fn handle_incoming(&self, value: JsonValue) {
@@ -1099,7 +1131,74 @@ impl ClaudeStreamClient {
     }
 
     async fn emit(&self, event: RuntimeEvent) {
-        let _ = self.event_tx.send(event).await;
+        self.record_turn_observation(&event).await;
+        match self.event_ingress.offer(event).await {
+            OrderedIngressOffer::Accepted => {}
+            OrderedIngressOffer::CoalescedKeyLimit(_) => {
+                tracing::debug!("Claude runtime progress coalescer reached its key limit")
+            }
+            OrderedIngressOffer::Closed(_) => {
+                tracing::warn!("Claude runtime event ingress is closed")
+            }
+        }
+    }
+
+    async fn record_turn_observation(&self, event: &RuntimeEvent) {
+        let mut state = self.state.lock().await;
+        match event {
+            RuntimeEvent::TurnStarted(started) => {
+                state.observed_turn_id = Some(started.native_turn_id.clone());
+                state.reconciliation_events.clear();
+                state.last_turn_observation = None;
+            }
+            RuntimeEvent::ItemCompleted(completed)
+                if state.observed_turn_id.as_deref() == Some(completed.native_turn_id.as_str()) =>
+            {
+                if let Some(existing) = state.reconciliation_events.iter_mut().find(|candidate| {
+                    matches!(
+                        candidate,
+                        RuntimeEvent::ItemCompleted(item)
+                            if item.native_item_id == completed.native_item_id
+                    )
+                }) {
+                    *existing = event.clone();
+                } else {
+                    state.reconciliation_events.push(event.clone());
+                }
+            }
+            RuntimeEvent::TurnCompleted(completed)
+                if state.observed_turn_id.as_deref() == Some(completed.native_turn_id.as_str()) =>
+            {
+                let reconciliation_events = state.reconciliation_events.clone();
+                state.last_turn_observation = Some(CLIAgentRuntimeTurnObservation {
+                    status: CLIAgentRuntimeObservedTurnStatus::Completed,
+                    message: None,
+                    reconciliation_events,
+                });
+            }
+            RuntimeEvent::TurnFailed(failed)
+                if failed.native_turn_id.as_deref() == state.observed_turn_id.as_deref() =>
+            {
+                let reconciliation_events = state.reconciliation_events.clone();
+                state.last_turn_observation = Some(CLIAgentRuntimeTurnObservation {
+                    status: CLIAgentRuntimeObservedTurnStatus::Failed,
+                    message: Some(failed.message.clone()),
+                    reconciliation_events,
+                });
+            }
+            RuntimeEvent::TurnInterrupted(interrupted)
+                if state.observed_turn_id.as_deref()
+                    == Some(interrupted.native_turn_id.as_str()) =>
+            {
+                let reconciliation_events = state.reconciliation_events.clone();
+                state.last_turn_observation = Some(CLIAgentRuntimeTurnObservation {
+                    status: CLIAgentRuntimeObservedTurnStatus::Interrupted,
+                    message: Some(interrupted.reason.clone()),
+                    reconciliation_events,
+                });
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1654,6 +1753,65 @@ done
                 .iter()
                 .all(|line| line["request"]["subtype"] != "apply_flag_settings")
         );
+
+        let _ = child.kill().await;
+    }
+
+    #[tokio::test]
+    async fn claude_turn_ledger_retains_terminal_state_and_final_items_after_stream_closes() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let log_path = temp_dir.path().join("claude-jsonl.log");
+        let (client, mut child) = fake_claude_stream_client(log_path.as_path()).await;
+        client
+            .start_turn(
+                "claude-thread".to_owned(),
+                "claude-turn".to_owned(),
+                None,
+                None,
+                json!([{ "type": "text", "text": "Run tests" }]),
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("start turn should succeed");
+
+        client
+            .emit(RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                native_thread_id: Some("claude-thread".to_owned()),
+                native_turn_id: "claude-turn".to_owned(),
+                native_item_id: "claude-final".to_owned(),
+                item_kind: "agentMessage".to_owned(),
+                text: Some("final answer".to_owned()),
+                summary: Vec::new(),
+                content: Vec::new(),
+                phase: RuntimeAgentMessagePhase::FinalAnswer,
+                metadata: None,
+                native_item_redacted: None,
+                native: None,
+            }))
+            .await;
+        client
+            .emit(RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
+                native_thread_id: Some("claude-thread".to_owned()),
+                native_turn_id: "claude-turn".to_owned(),
+                status: "completed".to_owned(),
+                native: None,
+            }))
+            .await;
+
+        let state = client.state.lock().await;
+        let observation = state
+            .last_turn_observation
+            .as_ref()
+            .expect("terminal observation should remain available");
+        assert_eq!(
+            observation.status,
+            CLIAgentRuntimeObservedTurnStatus::Completed
+        );
+        assert!(matches!(
+            observation.reconciliation_events.as_slice(),
+            [RuntimeEvent::ItemCompleted(item)] if item.native_item_id == "claude-final"
+        ));
+        drop(state);
 
         let _ = child.kill().await;
     }

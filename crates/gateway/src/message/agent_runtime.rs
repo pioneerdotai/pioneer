@@ -499,12 +499,7 @@ impl MessageProcessor {
         let handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    durable = durable_receiver.recv() => {
-                        let Some(event) = durable else {
-                            break;
-                        };
-                        this.handle_durable_agent_event(event).await;
-                    }
+                    biased;
                     live = async {
                         match live_receiver.as_mut() {
                             Some(receiver) => Some(receiver.recv().await),
@@ -526,6 +521,17 @@ impl MessageProcessor {
                                 live_receiver = None;
                             }
                         }
+                    }
+                    durable = durable_receiver.recv() => {
+                        let Some(event) = durable else {
+                            break;
+                        };
+                        let committed = this.handle_durable_agent_event(event).await;
+                        durable_receiver.acknowledge_last(if committed {
+                            Ok(())
+                        } else {
+                            Err("gateway failed to commit durable agent event".to_owned())
+                        });
                     }
                 }
             }
@@ -768,7 +774,7 @@ impl MessageProcessor {
         }
     }
 
-    pub(super) async fn handle_durable_agent_event(&self, event: AgentDurableEvent) {
+    pub(super) async fn handle_durable_agent_event(&self, event: AgentDurableEvent) -> bool {
         let thread_id = durable_event_thread_id(&event).map(str::to_owned);
         let committed = message_future(self.persist_durable_agent_event(event.clone())).await;
         if committed {
@@ -781,6 +787,7 @@ impl MessageProcessor {
                     .await;
             }
         }
+        committed
     }
 
     pub(super) async fn handle_snapshot_agent_event(
@@ -2666,7 +2673,37 @@ impl MessageProcessor {
             .await?;
         let now_unix_ms = now_unix.saturating_mul(1_000);
         let mut timed_out = Vec::new();
+        let mut cli_runtime_activity = HashMap::<String, bool>::new();
+        let mut native_runtime_activity = HashMap::<String, bool>::new();
         for candidate in candidates {
+            let cli_active = if let Some(active) = cli_runtime_activity.get(&candidate.turn_id) {
+                *active
+            } else {
+                let active = self
+                    .renew_active_cli_runtime_turn_deadlines(candidate.turn_id.as_str(), now_unix)
+                    .await?;
+                cli_runtime_activity.insert(candidate.turn_id.clone(), active);
+                active
+            };
+            if cli_active {
+                continue;
+            }
+            let native_active =
+                if let Some(active) = native_runtime_activity.get(&candidate.turn_id) {
+                    *active
+                } else {
+                    let active = self
+                        .renew_active_native_runtime_turn_deadlines(
+                            candidate.turn_id.as_str(),
+                            now_unix,
+                        )
+                        .await?;
+                    native_runtime_activity.insert(candidate.turn_id.clone(), active);
+                    active
+                };
+            if native_active {
+                continue;
+            }
             if self
                 .reconcile_cli_runtime_human_wait_for_turn(
                     candidate.turn_id.as_str(),
@@ -2686,6 +2723,46 @@ impl MessageProcessor {
             }
         }
         Ok(timed_out)
+    }
+
+    async fn renew_active_native_runtime_turn_deadlines(
+        &self,
+        turn_id: &str,
+        now_unix: i64,
+    ) -> Result<bool> {
+        let Some((thread_id, _workspace_id)) = self.crud_store.get_turn_location(turn_id).await?
+        else {
+            return Ok(false);
+        };
+        self.ensure_agent_listener_task(thread_id.as_str()).await;
+        let Some(observation) = self
+            .agent_manager
+            .observe_turn(thread_id.as_str(), turn_id)
+            .await
+        else {
+            return Ok(false);
+        };
+        if observation.status != pioneer_agent::ExecutionTurnStatus::InProgress {
+            debug!(
+                thread_id,
+                turn_id,
+                status = ?observation.status,
+                "native runtime has queued a terminal lifecycle event; deferring item timeout until the durable listener commits it"
+            );
+            return Ok(true);
+        }
+
+        let renewed = self
+            .timeout_supervisor
+            .renew_running_attempt_deadlines_for_turn(turn_id, now_unix)
+            .await?;
+        debug!(
+            thread_id,
+            turn_id,
+            renewed,
+            "renewed item deadlines from authoritative active native runtime turn"
+        );
+        Ok(true)
     }
 
     pub(super) async fn handle_recovery_terminal_outcome(

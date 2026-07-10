@@ -2,22 +2,24 @@ use crate::cli_runtime::config::{
     codex_account_probe_config_from_instance, load_effective_cli_runtime_instances,
 };
 use crate::cli_runtime::manager::{
-    CLIAgentRuntimeCodexEventReceivers, CLIAgentRuntimeManager, CLIAgentRuntimeSession,
-    CLIAgentRuntimeSessionFactory, CLIAgentRuntimeSessionKey, CLIAgentRuntimeSessionStartOptions,
-    CLIAgentRuntimeThreadForkRequest, CLIAgentRuntimeThreadForkResult,
-    CLIAgentRuntimeThreadNameSetRequest, CLIAgentRuntimeThreadNameSetResult,
-    CLIAgentRuntimeThreadOpenParams, CLIAgentRuntimeThreadOpenSnapshot,
+    CLIAgentRuntimeCodexEventReceivers, CLIAgentRuntimeManager, CLIAgentRuntimeObservedTurnStatus,
+    CLIAgentRuntimeSession, CLIAgentRuntimeSessionFactory, CLIAgentRuntimeSessionKey,
+    CLIAgentRuntimeSessionStartOptions, CLIAgentRuntimeThreadForkRequest,
+    CLIAgentRuntimeThreadForkResult, CLIAgentRuntimeThreadNameSetRequest,
+    CLIAgentRuntimeThreadNameSetResult, CLIAgentRuntimeThreadOpenParams,
+    CLIAgentRuntimeThreadOpenSnapshot, CLIAgentRuntimeTurnObservation,
     CLIAgentRuntimeTurnStartParams, CLIAgentRuntimeTurnStartSnapshot,
     CLIAgentRuntimeTurnSteerRequest, CLIAgentRuntimeTurnSteerResult,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use pioneer_cli_agent_runtime::codex::{
-    CodexAppServerClient, CodexJsonlRpcClient, CodexThreadForkParams, CodexThreadNameSetParams,
-    CodexThreadStartParams, CodexTurnStartParams, CodexTurnSteerParams,
-    codex_app_server_process_config,
+    CodexAppServerClient, CodexJsonlRpcClient, CodexJsonlRpcNotificationEvent,
+    CodexThreadForkParams, CodexThreadNameSetParams, CodexThreadStartParams, CodexTurnStartParams,
+    CodexTurnSteerParams, codex_app_server_process_config,
 };
 use pioneer_cli_agent_runtime::driver::JsonlRpcId;
+use pioneer_cli_agent_runtime::event::{RuntimeEventMappingOptions, map_codex_notification_event};
 use pioneer_cli_agent_runtime::process::{CLIAgentProcess, spawn_cli_agent_process};
 use pioneer_config::{
     EffectiveGatewayCliAgentRuntimeInstanceConfig, GatewayCliAgentRuntimeKindConfig,
@@ -352,6 +354,73 @@ impl CLIAgentRuntimeSession for CodexCLIAgentRuntimeSession {
             .await
             .context("Codex turn/interrupt failed")?;
         Ok(())
+    }
+
+    async fn observe_turn(
+        &self,
+        native_thread_id: &str,
+        native_turn_id: &str,
+    ) -> Result<Option<CLIAgentRuntimeTurnObservation>> {
+        let snapshot = self
+            .client
+            .thread_read_raw(native_thread_id, true, self.request_timeout)
+            .await
+            .context("Codex thread/read reconciliation failed")?;
+        let Some(turn) = snapshot
+            .pointer("/thread/turns")
+            .and_then(JsonValue::as_array)
+            .and_then(|turns| {
+                turns
+                    .iter()
+                    .find(|turn| turn.get("id").and_then(JsonValue::as_str) == Some(native_turn_id))
+            })
+        else {
+            return Ok(None);
+        };
+        let status = match turn.get("status").and_then(JsonValue::as_str) {
+            Some("inProgress" | "in_progress") => CLIAgentRuntimeObservedTurnStatus::InProgress,
+            Some("completed") => CLIAgentRuntimeObservedTurnStatus::Completed,
+            Some("failed") => CLIAgentRuntimeObservedTurnStatus::Failed,
+            Some("blocked") => CLIAgentRuntimeObservedTurnStatus::Blocked,
+            Some("interrupted") => CLIAgentRuntimeObservedTurnStatus::Interrupted,
+            _ => return Ok(None),
+        };
+        let message = turn
+            .pointer("/error/message")
+            .and_then(JsonValue::as_str)
+            .map(str::to_owned);
+        let reconciliation_events = if status == CLIAgentRuntimeObservedTurnStatus::InProgress {
+            Vec::new()
+        } else {
+            turn.get("items")
+                .and_then(JsonValue::as_array)
+                .into_iter()
+                .flatten()
+                .map(|item| {
+                    let params = serde_json::json!({
+                        "threadId": native_thread_id,
+                        "turnId": native_turn_id,
+                        "item": item,
+                    });
+                    map_codex_notification_event(
+                        &CodexJsonlRpcNotificationEvent {
+                            method: "item/completed".to_owned(),
+                            params: Some(params.clone()),
+                            raw: serde_json::json!({
+                                "method": "item/completed",
+                                "params": params,
+                            }),
+                        },
+                        RuntimeEventMappingOptions::default(),
+                    )
+                })
+                .collect()
+        };
+        Ok(Some(CLIAgentRuntimeTurnObservation {
+            status,
+            message,
+            reconciliation_events,
+        }))
     }
 
     async fn set_thread_name(

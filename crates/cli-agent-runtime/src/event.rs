@@ -1,6 +1,7 @@
 //! Canonical CLI agent runtime events and Codex native event mapping.
 
 use crate::codex::{CodexJsonlRpcNotificationEvent, CodexJsonlRpcServerRequest};
+use pioneer_runtime_events::{OrderedIngressClass, OrderedIngressEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
@@ -31,6 +32,77 @@ pub enum RuntimeEvent {
     ReviewModeChanged(RuntimeReviewModeChanged),
     Error(RuntimeErrorEvent),
     Raw(RuntimeRawEvent),
+}
+
+const RUNTIME_EVENT_MAX_COALESCED_DELTA_BYTES: usize = 64 * 1024;
+
+impl OrderedIngressEvent for RuntimeEvent {
+    type Key = String;
+
+    fn ingress_class(&self) -> OrderedIngressClass<Self::Key> {
+        let key = match self {
+            Self::ItemDelta(delta) => format!(
+                "item:{:?}:{}:{}:{}",
+                delta.delta_kind,
+                delta.native_thread_id.as_deref().unwrap_or_default(),
+                delta.native_turn_id,
+                delta.native_item_id,
+            ),
+            Self::ItemUpdated(updated) => format!(
+                "item_updated:{}:{}:{}",
+                updated.native_thread_id.as_deref().unwrap_or_default(),
+                updated.native_turn_id,
+                updated.native_item_id,
+            ),
+            Self::PlanUpdated(plan) => format!(
+                "plan:{}:{}",
+                plan.native_thread_id.as_deref().unwrap_or_default(),
+                plan.native_turn_id,
+            ),
+            Self::DiffUpdated(diff) => format!(
+                "diff:{}:{}",
+                diff.native_thread_id.as_deref().unwrap_or_default(),
+                diff.native_turn_id,
+            ),
+            Self::AccountUpdated(_) => "account".to_owned(),
+            Self::AppListUpdated(_) => "apps".to_owned(),
+            _ => return OrderedIngressClass::Durable,
+        };
+        OrderedIngressClass::Coalesced(key)
+    }
+
+    fn coalesce(&mut self, newer: Self) {
+        match (self, newer) {
+            (Self::ItemDelta(current), Self::ItemDelta(mut next)) => {
+                if matches!(current.delta_kind, RuntimeItemDeltaKind::ToolProgress) {
+                    current.delta = next.delta;
+                } else {
+                    current.delta.push_str(next.delta.as_str());
+                    truncate_runtime_event_delta(&mut current.delta);
+                }
+                if next.metadata.is_some() {
+                    current.metadata = next.metadata.take();
+                }
+                if next.native.is_some() {
+                    current.native = next.native.take();
+                }
+            }
+            (current, newer) => *current = newer,
+        }
+    }
+}
+
+fn truncate_runtime_event_delta(delta: &mut String) {
+    if delta.len() <= RUNTIME_EVENT_MAX_COALESCED_DELTA_BYTES {
+        return;
+    }
+    const SUFFIX: &str = "\n[progress truncated]";
+    let mut boundary = RUNTIME_EVENT_MAX_COALESCED_DELTA_BYTES.saturating_sub(SUFFIX.len());
+    while boundary > 0 && !delta.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    delta.truncate(boundary);
+    delta.push_str(SUFFIX);
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

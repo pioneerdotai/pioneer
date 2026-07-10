@@ -614,7 +614,34 @@ pub async fn list_native_events<C: ConnectionTrait>(
     db: &C,
     filter: CliRuntimeNativeEventListFilter,
 ) -> Result<Vec<CliRuntimeNativeEventRecord>> {
-    let mut query = cli_runtime_native_event::Entity::find();
+    let query = filter_native_events(cli_runtime_native_event::Entity::find(), filter);
+    query
+        .order_by_asc(cli_runtime_native_event::Column::Sequence)
+        .all(db)
+        .await
+        .context("failed to list CLI runtime native events")?
+        .into_iter()
+        .map(native_event_record_from_model)
+        .collect()
+}
+
+pub async fn latest_native_event<C: ConnectionTrait>(
+    db: &C,
+    filter: CliRuntimeNativeEventListFilter,
+) -> Result<Option<CliRuntimeNativeEventRecord>> {
+    filter_native_events(cli_runtime_native_event::Entity::find(), filter)
+        .order_by_desc(cli_runtime_native_event::Column::Sequence)
+        .one(db)
+        .await
+        .context("failed to query latest CLI runtime native event")?
+        .map(native_event_record_from_model)
+        .transpose()
+}
+
+fn filter_native_events(
+    mut query: sea_orm::Select<cli_runtime_native_event::Entity>,
+    filter: CliRuntimeNativeEventListFilter,
+) -> sea_orm::Select<cli_runtime_native_event::Entity> {
     if let Some(runtime_id) = filter.runtime_id {
         query = query.filter(cli_runtime_native_event::Column::RuntimeId.eq(runtime_id));
     }
@@ -633,15 +660,7 @@ pub async fn list_native_events<C: ConnectionTrait>(
     if let Some(limit) = filter.limit {
         query = query.limit(limit);
     }
-
     query
-        .order_by_asc(cli_runtime_native_event::Column::Sequence)
-        .all(db)
-        .await
-        .context("failed to list CLI runtime native events")?
-        .into_iter()
-        .map(native_event_record_from_model)
-        .collect()
 }
 
 async fn update_pending_request_metadata<C: ConnectionTrait>(

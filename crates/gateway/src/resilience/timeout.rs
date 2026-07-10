@@ -374,6 +374,9 @@ impl TimeoutSupervisor {
         turn_id: &str,
         now_unix: i64,
     ) -> Result<usize> {
+        self.crud_store
+            .observe_turn_runtime_activity(turn_id, "runtime/observed_in_progress", now_unix)
+            .await?;
         let attempts = self
             .crud_store
             .list_running_turn_item_attempts_for_turn(turn_id)

@@ -134,6 +134,11 @@ impl PioneerDesktop {
         ));
         let is_dark = cx.theme().mode.is_dark();
         let dino_image_source = running_turn_dino_image_source(is_dark);
+        let status_label = if running_turn.state == Some(pioneer_protocol::TurnWorkState::Stalled) {
+            t!("timeline.running.stalled").to_string()
+        } else {
+            t!("timeline.running.turn").to_string()
+        };
 
         let content = h_flex()
             .w_full()
@@ -159,11 +164,7 @@ impl PioneerDesktop {
                         v_flex()
                             .pt_1()
                             .gap_1()
-                            .child(
-                                div()
-                                    .font_semibold()
-                                    .child(t!("timeline.running.turn").to_string()),
-                            )
+                            .child(div().font_semibold().child(status_label))
                             .when_some(running_turn.security_summary.as_ref(), |this, summary| {
                                 this.child(self.render_turn_security_summary(summary, cx))
                             }),

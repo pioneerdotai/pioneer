@@ -1187,6 +1187,7 @@ seconds = "%{seconds} s"
 
 [timeline.running]
 turn = "Travaille"
+stalled = "En attente du moteur d'exécution"
 
 [timeline.task.status]
 draft = "Brouillon"

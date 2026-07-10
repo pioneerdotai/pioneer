@@ -372,6 +372,7 @@
       "type": "object",
       "properties": {
         "effort": {
+          "description": "String-valued because CLI runtimes may advertise efforts newer than\nPioneer API-provider adapters understand.",
           "type": "string"
         }
       },

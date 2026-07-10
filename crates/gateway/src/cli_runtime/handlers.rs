@@ -4,8 +4,8 @@ use crate::cli_runtime::config::{
     codex_account_probe_config_from_instance_with_proxy,
 };
 use crate::cli_runtime::manager::{
-    CLIAgentRuntimeCodexEventReceivers, CLIAgentRuntimeSession, CLIAgentRuntimeSessionHandle,
-    CLIAgentRuntimeSessionKey, CLIAgentRuntimeThreadForkRequest,
+    CLIAgentRuntimeCodexEventReceivers, CLIAgentRuntimeObservedTurnStatus, CLIAgentRuntimeSession,
+    CLIAgentRuntimeSessionHandle, CLIAgentRuntimeSessionKey, CLIAgentRuntimeThreadForkRequest,
     CLIAgentRuntimeThreadNameSetRequest, CLIAgentRuntimeTurnSteerRequest,
 };
 use anyhow::Context as AnyhowContext;
@@ -2045,13 +2045,127 @@ impl MessageProcessor {
         session: Arc<dyn CLIAgentRuntimeSession>,
         debug_native_events: bool,
     ) {
-        if let Some(receivers) = session.take_event_receivers() {
+        let event_receivers = session.take_event_receivers();
+        let codex_receivers = session.take_codex_event_receivers();
+        if event_receivers.is_none() && codex_receivers.is_none() {
+            return;
+        }
+
+        self.ensure_cli_runtime_execution_event_hub(key).await;
+        if let Some(receivers) = event_receivers {
             self.spawn_cli_runtime_event_pump(key.clone(), receivers, debug_native_events);
         }
-        let Some(receivers) = session.take_codex_event_receivers() else {
-            return;
-        };
-        self.spawn_codex_event_pumps(key.clone(), receivers, debug_native_events);
+        if let Some(receivers) = codex_receivers {
+            self.spawn_codex_event_pumps(key.clone(), receivers, debug_native_events);
+        }
+    }
+
+    async fn ensure_cli_runtime_execution_event_hub(
+        &self,
+        key: &CLIAgentRuntimeSessionKey,
+    ) -> Arc<ExecutionEventHub> {
+        let mut hubs = self.cli_runtime_event_hubs.lock().await;
+        if let Some(hub) = hubs.get(key) {
+            return hub.clone();
+        }
+
+        let hub = Arc::new(ExecutionEventHub::new());
+        let durable_receiver = hub
+            .take_durable_receiver()
+            .await
+            .expect("new execution event hub must expose its durable receiver");
+        let snapshot_receiver = hub
+            .take_snapshot_receiver()
+            .await
+            .expect("new execution event hub must expose its snapshot receiver");
+        let live_receiver = hub.subscribe_live();
+        hubs.insert(key.clone(), hub.clone());
+        drop(hubs);
+
+        self.spawn_cli_runtime_execution_event_listener(
+            key.clone(),
+            durable_receiver,
+            snapshot_receiver,
+            live_receiver,
+        );
+        hub
+    }
+
+    fn spawn_cli_runtime_execution_event_listener(
+        &self,
+        key: CLIAgentRuntimeSessionKey,
+        mut durable_receiver: pioneer_runtime_events::DurableEventReceiver,
+        mut snapshot_receiver: pioneer_runtime_events::SnapshotEventReceiver,
+        mut live_receiver: tokio::sync::broadcast::Receiver<AgentProgressEvent>,
+    ) {
+        let processor = self.clone();
+        tokio::spawn(async move {
+            let mut durable_open = true;
+            let mut snapshot_open = true;
+            let mut live_open = true;
+            while durable_open || snapshot_open || live_open {
+                tokio::select! {
+                    biased;
+                    snapshot = snapshot_receiver.recv(), if snapshot_open => {
+                        match snapshot {
+                            Some(event) => processor.handle_snapshot_agent_event(event).await,
+                            None => snapshot_open = false,
+                        }
+                    }
+                    live = live_receiver.recv(), if live_open => {
+                        match live {
+                            Ok(event) => processor.handle_progress_agent_event(event).await,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                warn!(
+                                    workspace_id = key.workspace_id.as_str(),
+                                    runtime_id = key.runtime_id.as_str(),
+                                    thread_id = key.thread_id.as_str(),
+                                    skipped,
+                                    "CLI runtime live progress listener lagged"
+                                );
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                live_open = false;
+                            }
+                        }
+                    }
+                    durable = durable_receiver.recv(), if durable_open => {
+                        match durable {
+                            Some(event) => {
+                                let committed = processor.handle_durable_agent_event(event).await;
+                                durable_receiver.acknowledge_last(if committed {
+                                    Ok(())
+                                } else {
+                                    Err("gateway failed to commit durable CLI runtime event".to_owned())
+                                });
+                            }
+                            None => durable_open = false,
+                        }
+                    }
+                }
+            }
+            debug!(
+                workspace_id = key.workspace_id.as_str(),
+                runtime_id = key.runtime_id.as_str(),
+                thread_id = key.thread_id.as_str(),
+                "CLI runtime execution event listener closed"
+            );
+        });
+    }
+
+    async fn close_cli_runtime_execution_event_hub(&self, key: &CLIAgentRuntimeSessionKey) {
+        let hub = self.cli_runtime_event_hubs.lock().await.remove(key);
+        if let Some(hub) = hub {
+            hub.shutdown_progress().await;
+        }
+        self.cli_runtime_turn_binding_cache
+            .lock()
+            .await
+            .retain(|cached, _| {
+                cached.workspace_id != key.workspace_id
+                    || cached.runtime_id != key.runtime_id
+                    || cached.thread_id != key.thread_id
+            });
     }
 
     fn spawn_cli_runtime_event_pump(
@@ -2065,14 +2179,16 @@ impl MessageProcessor {
             let mut events = receivers.events;
             let runtime_kind = receivers.runtime_kind;
             while let Some(event) = events.recv().await {
-                processor
-                    .persist_cli_runtime_canonical_event(
-                        &key,
-                        runtime_kind.as_str(),
-                        &event,
-                        debug_native_events,
-                    )
-                    .await;
+                if cli_runtime_event_requires_native_journal(&event) {
+                    processor
+                        .persist_cli_runtime_canonical_event(
+                            &key,
+                            runtime_kind.as_str(),
+                            &event,
+                            debug_native_events,
+                        )
+                        .await;
+                }
                 processor.handle_cli_runtime_event(&key, event).await;
             }
             debug!(
@@ -2081,6 +2197,7 @@ impl MessageProcessor {
                 thread_id = key.thread_id.as_str(),
                 "CLI runtime canonical event pump closed"
             );
+            processor.close_cli_runtime_execution_event_hub(&key).await;
             processor
                 .remove_cli_runtime_command_items_for_session(&key)
                 .await;
@@ -2102,16 +2219,18 @@ impl MessageProcessor {
         tokio::spawn(async move {
             let mut notifications = receivers.notifications;
             while let Some(notification) = notifications.recv().await {
-                notification_processor
-                    .persist_codex_native_transport_event(
-                        &notification_key,
-                        "notification",
-                        notification.method.as_str(),
-                        notification.params.as_ref(),
-                        debug_native_events,
-                    )
-                    .await;
                 let event = map_codex_notification_event(&notification, options);
+                if cli_runtime_event_requires_native_journal(&event) {
+                    notification_processor
+                        .persist_codex_native_transport_event(
+                            &notification_key,
+                            "notification",
+                            notification.method.as_str(),
+                            notification.params.as_ref(),
+                            debug_native_events,
+                        )
+                        .await;
+                }
                 notification_processor
                     .handle_cli_runtime_timeline_event(&notification_key, event)
                     .await;
@@ -2122,6 +2241,9 @@ impl MessageProcessor {
                 thread_id = notification_key.thread_id.as_str(),
                 "Codex CLI runtime notification pump closed"
             );
+            notification_processor
+                .close_cli_runtime_execution_event_hub(&notification_key)
+                .await;
             notification_processor
                 .remove_cli_runtime_command_items_for_session(&notification_key)
                 .await;
@@ -2649,7 +2771,7 @@ impl MessageProcessor {
         key: &CLIAgentRuntimeSessionKey,
         turn_binding: pioneer_crud::CliRuntimeTurnBindingRecord,
         event: RuntimeEvent,
-    ) {
+    ) -> bool {
         let native_turn_id = cli_runtime_native_turn_id_for_event(&event);
         let native_turn_id_label = native_turn_id.unwrap_or("<none>");
         let native_thread_id = cli_runtime_native_thread_id_for_event(&event);
@@ -2673,13 +2795,14 @@ impl MessageProcessor {
                 binding_status = turn_binding.status.as_str(),
                 "ignored CLI runtime event for non-active Pioneer turn"
             );
-            return;
+            return false;
         }
         let context = crate::cli_runtime::projector::CLIRuntimeProjectorContext {
             workspace_id: key.workspace_id.clone(),
             thread_id: key.thread_id.clone(),
             turn_id: turn_binding.turn_id.clone(),
         };
+        let event_hub = self.ensure_cli_runtime_execution_event_hub(key).await;
         let projected = crate::cli_runtime::projector::project_cli_runtime_event(&context, &event);
         if cli_runtime_turn_status_for_terminal_event(&event).is_some()
             && let Some(native_turn_id) = native_turn_id
@@ -2688,24 +2811,66 @@ impl MessageProcessor {
                 .await;
         }
         for durable in projected.durable {
-            self.handle_durable_agent_event(durable).await;
+            if let Err(error) = event_hub.publish_durable_and_wait(durable).await {
+                warn!(
+                    workspace_id = key.workspace_id.as_str(),
+                    runtime_id = key.runtime_id.as_str(),
+                    thread_id = key.thread_id.as_str(),
+                    turn_id = turn_binding.turn_id.as_str(),
+                    native_turn_id = native_turn_id_label,
+                    event = %event_label,
+                    error = %error,
+                    "failed to commit CLI runtime durable event"
+                );
+                return false;
+            }
         }
         for snapshot in projected.snapshot {
-            self.handle_snapshot_agent_event(snapshot).await;
+            if !event_hub.publish_snapshot(snapshot) {
+                warn!(
+                    workspace_id = key.workspace_id.as_str(),
+                    runtime_id = key.runtime_id.as_str(),
+                    thread_id = key.thread_id.as_str(),
+                    turn_id = turn_binding.turn_id.as_str(),
+                    event = %event_label,
+                    "failed to enqueue CLI runtime snapshot because execution hub is closed"
+                );
+                return false;
+            }
         }
         for progress in projected.progress {
-            self.handle_progress_agent_event(progress).await;
+            event_hub.publish_progress(progress);
         }
         self.update_cli_runtime_command_item_registry(key, &turn_binding, &event)
             .await;
-        if let Some(status) = cli_runtime_turn_status_for_terminal_event(&event) {
-            self.cleanup_cli_runtime_terminal_turn_status(
-                &turn_binding,
-                status,
-                event_label.as_str(),
-            )
-            .await;
+        if cli_runtime_turn_status_for_terminal_event(&event).is_some() {
+            match self
+                .cli_runtime_turn_status_for_binding(&turn_binding)
+                .await
+            {
+                Ok(Some(status)) if status != TurnStatus::InProgress => {
+                    self.cleanup_cli_runtime_terminal_turn_status(
+                        &turn_binding,
+                        status,
+                        event_label.as_str(),
+                    )
+                    .await;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(
+                        workspace_id = key.workspace_id.as_str(),
+                        runtime_id = key.runtime_id.as_str(),
+                        thread_id = key.thread_id.as_str(),
+                        turn_id = turn_binding.turn_id.as_str(),
+                        event = %event_label,
+                        error = %format!("{error:#}"),
+                        "failed to reconcile Pioneer turn status after CLI runtime terminal event"
+                    );
+                }
+            }
         }
+        true
     }
 
     async fn commit_cli_runtime_final_diff_snapshot(
@@ -3058,17 +3223,79 @@ impl MessageProcessor {
         Ok(true)
     }
 
+    pub(super) async fn renew_active_cli_runtime_turn_deadlines(
+        &self,
+        turn_id: &str,
+        now_unix: i64,
+    ) -> anyhow::Result<bool> {
+        let Some(binding) = self
+            .crud_store
+            .get_cli_runtime_turn_binding(turn_id)
+            .await?
+        else {
+            return Ok(false);
+        };
+        if !cli_runtime_turn_binding_status_is_active(binding.status.as_str()) {
+            return Ok(false);
+        }
+        let Some((workspace_id, turn)) = (if let Some((workspace_id, turn)) = self
+            .thread_manager
+            .turn_get(binding.thread_id.as_str(), binding.turn_id.as_str())
+            .await
+        {
+            Some((workspace_id, turn))
+        } else {
+            self.crud_store
+                .get_turn(binding.thread_id.as_str(), binding.turn_id.as_str())
+                .await?
+        }) else {
+            return Ok(false);
+        };
+        if turn.status != TurnStatus::InProgress {
+            self.cleanup_cli_runtime_terminal_turn_status(
+                &binding,
+                turn.status,
+                "timeout supervisor observed terminal Pioneer turn",
+            )
+            .await;
+            return Ok(false);
+        }
+
+        match self
+            .reconcile_cli_runtime_turn_from_runtime(
+                &binding,
+                now_unix.saturating_mul(1_000),
+                workspace_id.as_str(),
+                &turn,
+            )
+            .await
+        {
+            Ok(reconciled) => Ok(reconciled),
+            Err(error) => {
+                warn!(
+                    workspace_id = binding.workspace_id.as_str(),
+                    runtime_id = binding.runtime_id.as_str(),
+                    thread_id = binding.thread_id.as_str(),
+                    turn_id = binding.turn_id.as_str(),
+                    error = %format!("{error:#}"),
+                    "runtime observation failed while evaluating item timeout; deferring destructive timeout transition"
+                );
+                Ok(true)
+            }
+        }
+    }
+
     async fn fail_stale_cli_runtime_turn_binding(
         &self,
         binding: pioneer_crud::CliRuntimeTurnBindingRecord,
         now_unix_ms: i64,
     ) -> anyhow::Result<()> {
-        let (workspace_id, turn, turn_loaded_in_memory) = if let Some((workspace_id, turn)) = self
+        let (workspace_id, turn) = if let Some((workspace_id, turn)) = self
             .thread_manager
             .turn_get(binding.thread_id.as_str(), binding.turn_id.as_str())
             .await
         {
-            (workspace_id, turn, true)
+            (workspace_id, turn)
         } else {
             let Some((workspace_id, turn)) = self
                 .crud_store
@@ -3077,7 +3304,7 @@ impl MessageProcessor {
             else {
                 return Ok(());
             };
-            (workspace_id, turn, false)
+            (workspace_id, turn)
         };
         if turn.status != TurnStatus::InProgress {
             self.cleanup_cli_runtime_terminal_turn_status(
@@ -3103,9 +3330,18 @@ impl MessageProcessor {
         let latest_native_event_ms = self
             .latest_cli_runtime_native_event_timestamp_ms(&binding)
             .await?;
+        let turn_liveness_ms = self
+            .crud_store
+            .get_turn_liveness(binding.turn_id.as_str())
+            .await?
+            .map(|liveness| liveness.last_activity_at_unix.saturating_mul(1_000));
+        let observed_activity_ms = latest_native_event_ms
+            .into_iter()
+            .chain(turn_liveness_ms)
+            .max();
         let last_activity_ms =
-            latest_native_event_ms.unwrap_or(binding.updated_at.timestamp_millis());
-        let stale_after_ms = if latest_native_event_ms.is_some() {
+            observed_activity_ms.unwrap_or(binding.updated_at.timestamp_millis());
+        let stale_after_ms = if observed_activity_ms.is_some() {
             CLI_RUNTIME_EVENTED_TURN_STALE_AFTER_MS
         } else {
             CLI_RUNTIME_SILENT_TURN_STALE_AFTER_MS
@@ -3114,8 +3350,20 @@ impl MessageProcessor {
             return Ok(());
         }
 
+        if self
+            .reconcile_cli_runtime_turn_from_runtime(
+                &binding,
+                now_unix_ms,
+                workspace_id.as_str(),
+                &turn,
+            )
+            .await?
+        {
+            return Ok(());
+        }
+
         let message = if let Some(native_turn_id) = binding.native_turn_id.as_deref() {
-            if latest_native_event_ms.is_some() {
+            if observed_activity_ms.is_some() {
                 format!(
                     "CLI runtime turn `{}` stopped emitting native events for native turn `{native_turn_id}` and was marked failed after {} ms of inactivity",
                     binding.turn_id, stale_after_ms
@@ -3133,22 +3381,15 @@ impl MessageProcessor {
             )
         };
 
-        let did_mark_failed = if turn_loaded_in_memory {
-            self.mark_turn_failed_terminal(
-                binding.thread_id.clone(),
-                binding.turn_id.clone(),
-                message,
-            )
-            .await
-        } else {
-            self.materialize_db_only_cli_runtime_turn_failed(
-                workspace_id,
-                binding.thread_id.clone(),
-                turn,
-                message,
-            )
-            .await?
-        };
+        self.ensure_cli_runtime_turn_loaded_for_lifecycle(
+            workspace_id.as_str(),
+            binding.thread_id.as_str(),
+            &turn,
+        )
+        .await?;
+        let did_mark_failed = self
+            .mark_turn_failed_terminal(binding.thread_id.clone(), binding.turn_id.clone(), message)
+            .await;
 
         if did_mark_failed {
             self.cleanup_cli_runtime_terminal_turn_status(
@@ -3162,35 +3403,178 @@ impl MessageProcessor {
         Ok(())
     }
 
-    async fn materialize_db_only_cli_runtime_turn_failed(
+    async fn reconcile_cli_runtime_turn_from_runtime(
         &self,
-        workspace_id: String,
-        thread_id: String,
-        mut turn: Turn,
-        message: String,
+        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+        now_unix_ms: i64,
+        workspace_id: &str,
+        turn: &Turn,
     ) -> anyhow::Result<bool> {
-        if turn.status != TurnStatus::InProgress {
+        let Some(native_turn_id) = binding.native_turn_id.as_deref() else {
             return Ok(false);
-        }
-        turn.status = TurnStatus::Failed;
-        turn.error = Some(message);
-
-        let notification = TurnFailedNotification {
-            workspace_id,
-            thread_id,
-            turn,
         };
-        let event_timestamp = now_timestamp_secs();
-        self.crud_store
-            .materialize_turn_failed(notification.clone(), event_timestamp)
-            .await?;
-        self.send_notification_to_workspace_connections(
-            notification.workspace_id.as_str(),
-            events::TURN_FAILED,
-            &notification,
+        let Some(manager) = self.cli_runtime_manager.as_ref() else {
+            return Ok(false);
+        };
+        let key = CLIAgentRuntimeSessionKey::new(
+            binding.workspace_id.clone(),
+            binding.runtime_id.clone(),
+            binding.thread_id.clone(),
+        )?;
+        let Some(handle) = manager.existing_session(&key).await else {
+            return Ok(false);
+        };
+        let Some(observation) = handle
+            .session()
+            .observe_turn(binding.native_thread_id.as_str(), native_turn_id)
+            .await?
+        else {
+            return Ok(false);
+        };
+
+        if observation.status == CLIAgentRuntimeObservedTurnStatus::InProgress {
+            let renewed = self
+                .timeout_supervisor
+                .renew_running_attempt_deadlines_for_turn(
+                    binding.turn_id.as_str(),
+                    now_unix_ms.saturating_div(1_000),
+                )
+                .await?;
+            debug!(
+                workspace_id = binding.workspace_id.as_str(),
+                runtime_id = binding.runtime_id.as_str(),
+                thread_id = binding.thread_id.as_str(),
+                turn_id = binding.turn_id.as_str(),
+                native_turn_id,
+                renewed,
+                "runtime reconciliation confirmed stale Pioneer turn is still active"
+            );
+            return Ok(true);
+        }
+
+        for event in observation.reconciliation_events.iter().cloned() {
+            if !self
+                .process_bound_cli_runtime_event(&key, binding.clone(), event)
+                .await
+            {
+                anyhow::bail!(
+                    "failed to commit canonical runtime snapshot before terminal reconciliation"
+                );
+            }
+        }
+        self.commit_cli_runtime_final_diff_snapshot(&key, binding, native_turn_id)
+            .await;
+        let (event, status) = match observation.status {
+            CLIAgentRuntimeObservedTurnStatus::Completed => (
+                AgentDurableEvent::TurnCompleted {
+                    thread_id: binding.thread_id.clone(),
+                    turn_id: binding.turn_id.clone(),
+                    recovery: None,
+                },
+                TurnStatus::Completed,
+            ),
+            CLIAgentRuntimeObservedTurnStatus::Failed => (
+                AgentDurableEvent::TurnFailed {
+                    thread_id: binding.thread_id.clone(),
+                    turn_id: binding.turn_id.clone(),
+                    error: observation
+                        .message
+                        .unwrap_or_else(|| "CLI runtime reported turn failure".to_owned()),
+                    recovery: None,
+                },
+                TurnStatus::Failed,
+            ),
+            CLIAgentRuntimeObservedTurnStatus::Blocked => (
+                AgentDurableEvent::TurnBlocked {
+                    thread_id: binding.thread_id.clone(),
+                    turn_id: binding.turn_id.clone(),
+                    reason: observation
+                        .message
+                        .unwrap_or_else(|| "CLI runtime reported a blocked turn".to_owned()),
+                    recovery: None,
+                },
+                TurnStatus::Blocked,
+            ),
+            CLIAgentRuntimeObservedTurnStatus::Interrupted => (
+                AgentDurableEvent::TurnInterrupted {
+                    thread_id: binding.thread_id.clone(),
+                    turn_id: binding.turn_id.clone(),
+                    reason: observation
+                        .message
+                        .unwrap_or_else(|| "CLI runtime reported turn interruption".to_owned()),
+                    recovery: None,
+                },
+                TurnStatus::Interrupted,
+            ),
+            CLIAgentRuntimeObservedTurnStatus::InProgress => unreachable!(),
+        };
+        self.ensure_cli_runtime_turn_loaded_for_lifecycle(
+            workspace_id,
+            binding.thread_id.as_str(),
+            turn,
         )
-        .await;
+        .await?;
+        self.ensure_cli_runtime_execution_event_hub(&key)
+            .await
+            .publish_durable_and_wait(event)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("failed to commit reconciled terminal event: {error}")
+            })?;
+        if let Some(actual_status) = self.cli_runtime_turn_status_for_binding(binding).await?
+            && actual_status != TurnStatus::InProgress
+        {
+            self.cleanup_cli_runtime_terminal_turn_status(
+                binding,
+                actual_status,
+                "runtime reconciliation observed terminal turn",
+            )
+            .await;
+        } else {
+            debug!(
+                workspace_id = binding.workspace_id.as_str(),
+                runtime_id = binding.runtime_id.as_str(),
+                thread_id = binding.thread_id.as_str(),
+                turn_id = binding.turn_id.as_str(),
+                native_turn_id,
+                observed_status = ?status,
+                "runtime terminal observation entered Pioneer recovery without closing the turn binding"
+            );
+        }
         Ok(true)
+    }
+
+    async fn ensure_cli_runtime_turn_loaded_for_lifecycle(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn: &Turn,
+    ) -> anyhow::Result<()> {
+        if self
+            .thread_manager
+            .turn_get(thread_id, turn.id.as_str())
+            .await
+            .is_some()
+        {
+            return Ok(());
+        }
+        let mut thread = self
+            .crud_store
+            .get_thread_model(thread_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("thread `{thread_id}` not found"))?;
+        if thread.workspace_id != workspace_id {
+            anyhow::bail!(
+                "thread `{thread_id}` belongs to workspace `{}` instead of `{workspace_id}`",
+                thread.workspace_id
+            );
+        }
+        thread.status = pioneer_protocol::ThreadStatus::Active;
+        thread.turns = vec![turn.clone()];
+        let sandbox = self.crud_store.get_thread_sandbox_mode(thread_id).await?;
+        self.thread_manager
+            .system_thread_restore_persisted(thread, sandbox)
+            .await
     }
 
     async fn latest_cli_runtime_native_event_timestamp_ms(
@@ -3200,9 +3584,9 @@ impl MessageProcessor {
         let Some(native_turn_id) = binding.native_turn_id.as_ref() else {
             return Ok(None);
         };
-        let events = self
+        let event = self
             .crud_store
-            .list_cli_runtime_native_events(pioneer_crud::CliRuntimeNativeEventListFilter {
+            .latest_cli_runtime_native_event(pioneer_crud::CliRuntimeNativeEventListFilter {
                 runtime_id: Some(binding.runtime_id.clone()),
                 thread_id: Some(binding.thread_id.clone()),
                 turn_id: None,
@@ -3211,10 +3595,7 @@ impl MessageProcessor {
                 limit: None,
             })
             .await?;
-        Ok(events
-            .into_iter()
-            .map(|event| event.sequence.max(event.created_at.timestamp_millis()))
-            .max())
+        Ok(event.map(|event| event.sequence.max(event.created_at.timestamp_millis())))
     }
 
     async fn prune_stale_cli_runtime_pending_turn_events(&self, now_unix_ms: i64) {
@@ -3818,17 +4199,43 @@ impl MessageProcessor {
         native_thread_id: &str,
         native_turn_id: &str,
     ) -> Option<pioneer_crud::CliRuntimeTurnBindingRecord> {
+        let cache_key = CLIRuntimeNativeTurnKey {
+            workspace_id: key.workspace_id.clone(),
+            runtime_id: key.runtime_id.clone(),
+            thread_id: key.thread_id.clone(),
+            native_thread_id: native_thread_id.to_owned(),
+            native_turn_id: native_turn_id.to_owned(),
+        };
+        if let Some(binding) = self
+            .cli_runtime_turn_binding_cache
+            .lock()
+            .await
+            .get(&cache_key)
+            .cloned()
+        {
+            return Some(binding);
+        }
+
         match self
             .crud_store
             .list_cli_runtime_turn_bindings_for_thread(key.thread_id.as_str())
             .await
         {
-            Ok(bindings) => bindings.into_iter().find(|binding| {
-                binding.workspace_id == key.workspace_id
-                    && binding.runtime_id == key.runtime_id
-                    && binding.native_turn_id.as_deref() == Some(native_turn_id)
-                    && binding.native_thread_id == native_thread_id
-            }),
+            Ok(bindings) => {
+                let binding = bindings.into_iter().find(|binding| {
+                    binding.workspace_id == key.workspace_id
+                        && binding.runtime_id == key.runtime_id
+                        && binding.native_turn_id.as_deref() == Some(native_turn_id)
+                        && binding.native_thread_id == native_thread_id
+                });
+                if let Some(binding) = binding.as_ref() {
+                    self.cli_runtime_turn_binding_cache
+                        .lock()
+                        .await
+                        .insert(cache_key, binding.clone());
+                }
+                binding
+            }
             Err(error) => {
                 warn!(
                     workspace_id = key.workspace_id.as_str(),
@@ -3841,6 +4248,25 @@ impl MessageProcessor {
                 None
             }
         }
+    }
+
+    async fn invalidate_cli_runtime_turn_binding_cache(
+        &self,
+        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+    ) {
+        let Some(native_turn_id) = binding.native_turn_id.as_deref() else {
+            return;
+        };
+        self.cli_runtime_turn_binding_cache
+            .lock()
+            .await
+            .remove(&CLIRuntimeNativeTurnKey {
+                workspace_id: binding.workspace_id.clone(),
+                runtime_id: binding.runtime_id.clone(),
+                thread_id: binding.thread_id.clone(),
+                native_thread_id: binding.native_thread_id.clone(),
+                native_turn_id: native_turn_id.to_owned(),
+            });
     }
 
     async fn cli_runtime_running_turn_binding_for_timeline_event(
@@ -4273,6 +4699,8 @@ impl MessageProcessor {
             }
         }
         if status != TurnStatus::InProgress {
+            self.invalidate_cli_runtime_turn_binding_cache(binding)
+                .await;
             self.compact_cli_runtime_terminal_native_events_for_turn(
                 binding.turn_id.as_str(),
                 reason,
@@ -6644,6 +7072,26 @@ fn cli_runtime_turn_status_for_terminal_event(event: &RuntimeEvent) -> Option<Tu
         RuntimeEvent::TurnFailed(_) | RuntimeEvent::Error(_) => Some(TurnStatus::Failed),
         RuntimeEvent::TurnInterrupted(_) => Some(TurnStatus::Interrupted),
         _ => None,
+    }
+}
+
+fn cli_runtime_event_requires_native_journal(event: &RuntimeEvent) -> bool {
+    match event {
+        RuntimeEvent::ItemDelta(_)
+        | RuntimeEvent::DiffUpdated(_)
+        | RuntimeEvent::AccountUpdated(_)
+        | RuntimeEvent::AppListUpdated(_) => false,
+        RuntimeEvent::Raw(raw) => !matches!(
+            raw.native_method.as_str(),
+            "thread/tokenUsage/updated"
+                | "account/rateLimits/updated"
+                | "item/agentMessage/delta"
+                | "item/commandExecution/outputDelta"
+                | "item/reasoning/textDelta"
+                | "item/reasoning/summaryTextDelta"
+                | "turn/diff/updated"
+        ),
+        _ => true,
     }
 }
 

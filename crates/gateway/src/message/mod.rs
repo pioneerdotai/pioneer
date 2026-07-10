@@ -144,6 +144,7 @@ use pioneer_protocol::{
     validate_voice_streaming_audio_format,
 };
 use pioneer_provider::{ChatMessage, ProviderRegistry};
+use pioneer_runtime_events::ExecutionEventHub;
 use pioneer_sqlite::{
     DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS,
     is_anyhow_sqlite_transient_access, retry_with_backoff,
@@ -355,6 +356,10 @@ pub struct MessageProcessor {
         Arc<Mutex<HashMap<CLIRuntimePendingTurnEventKey, Vec<CLIRuntimePendingTurnServerRequest>>>>,
     cli_runtime_proxy_cache: Arc<Mutex<HashMap<(String, String), Option<String>>>>,
     cli_runtime_pending_turn_activity_sequence: Arc<AtomicU64>,
+    cli_runtime_event_hubs:
+        Arc<Mutex<HashMap<CLIAgentRuntimeSessionKey, Arc<ExecutionEventHub>>>>,
+    cli_runtime_turn_binding_cache:
+        Arc<Mutex<HashMap<CLIRuntimeNativeTurnKey, pioneer_crud::CliRuntimeTurnBindingRecord>>>,
     cli_runtime_command_heartbeats: CliRuntimeCommandHeartbeatTracker,
     turn_llm_context_sequences: Arc<Mutex<HashMap<String, i64>>>,
     artifact_tool_states: Arc<Mutex<HashMap<String, Arc<ArtifactToolState>>>>,
@@ -411,6 +416,15 @@ struct MemoryBridgeProviders {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct CLIRuntimePendingTurnEventKey {
+    workspace_id: String,
+    runtime_id: String,
+    thread_id: String,
+    native_thread_id: String,
+    native_turn_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct CLIRuntimeNativeTurnKey {
     workspace_id: String,
     runtime_id: String,
     thread_id: String,
@@ -613,6 +627,8 @@ impl MessageProcessor {
             cli_runtime_pending_turn_server_requests: Arc::new(Mutex::new(HashMap::new())),
             cli_runtime_proxy_cache: Arc::new(Mutex::new(HashMap::new())),
             cli_runtime_pending_turn_activity_sequence: Arc::new(AtomicU64::new(0)),
+            cli_runtime_event_hubs: Arc::new(Mutex::new(HashMap::new())),
+            cli_runtime_turn_binding_cache: Arc::new(Mutex::new(HashMap::new())),
             cli_runtime_command_heartbeats,
             turn_llm_context_sequences: Arc::new(Mutex::new(HashMap::new())),
             artifact_tool_states: Arc::new(Mutex::new(HashMap::new())),
@@ -2164,6 +2180,8 @@ impl MessageProcessor {
             cli_runtime_pending_turn_server_requests: Arc::new(Mutex::new(HashMap::new())),
             cli_runtime_proxy_cache: Arc::new(Mutex::new(HashMap::new())),
             cli_runtime_pending_turn_activity_sequence: Arc::new(AtomicU64::new(0)),
+            cli_runtime_event_hubs: Arc::new(Mutex::new(HashMap::new())),
+            cli_runtime_turn_binding_cache: Arc::new(Mutex::new(HashMap::new())),
             cli_runtime_command_heartbeats: CliRuntimeCommandHeartbeatTracker::new(
                 MessageProcessorResilienceConfig::default()
                     .cli_runtime_command_heartbeat

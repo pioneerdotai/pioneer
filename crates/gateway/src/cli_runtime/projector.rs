@@ -15,6 +15,7 @@ use pioneer_protocol::{
     ToolDisplayPayload, ToolMetadata, ToolOutputPolicySnapshot, ToolOutputSummary,
     ToolStoragePayload, TurnItem,
 };
+pub(crate) use pioneer_runtime_events::ExecutionSnapshotEvent as AgentSnapshotEvent;
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,13 +31,6 @@ pub(crate) struct CLIRuntimeProjectedEvents {
     pub snapshot: Vec<AgentSnapshotEvent>,
     pub progress: Vec<AgentProgressEvent>,
     pub ignored: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum AgentSnapshotEvent {
-    ItemUpdated {
-        notification: ItemUpdatedNotification,
-    },
 }
 
 impl CLIRuntimeProjectedEvents {

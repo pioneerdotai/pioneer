@@ -14,6 +14,7 @@ pioneer-hooks.workspace = true
 pioneer-memory.workspace = true
 pioneer-protocol.workspace = true
 pioneer-provider.workspace = true
+pioneer-runtime-events.workspace = true
 pioneer-skills.workspace = true
 pioneer-tools.workspace = true
 pioneer-promt.workspace = true

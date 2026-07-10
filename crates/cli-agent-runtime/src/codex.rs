@@ -8,6 +8,10 @@ use crate::driver::{
 use crate::input::CLIRuntimeTurnInputItem;
 use crate::process::{CLIAgentProcessSpawnConfig, expand_home_path, spawn_cli_agent_process};
 use pioneer_protocol::normalize_metadata_reasoning_effort;
+use pioneer_runtime_events::{
+    OrderedEventIngress, OrderedIngressClass, OrderedIngressConfig, OrderedIngressEvent,
+    OrderedIngressOffer,
+};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
@@ -80,6 +84,14 @@ impl CodexJsonlRpcClient {
         let (notification_tx, notification_rx) = mpsc::channel(notification_capacity.max(1));
         let (server_request_tx, server_request_rx) = mpsc::channel(server_request_capacity.max(1));
         let (diagnostic_tx, diagnostic_rx) = mpsc::channel(diagnostic_capacity.max(1));
+        let notification_ingress = OrderedEventIngress::spawn(
+            notification_tx,
+            OrderedIngressConfig {
+                flush_interval: CODEX_NOTIFICATION_PROGRESS_FLUSH_INTERVAL,
+                max_pending_coalesced_keys: CODEX_NOTIFICATION_MAX_PENDING_PROGRESS_KEYS,
+                max_pending_durable_events: CODEX_NOTIFICATION_MAX_PENDING_DURABLE_EVENTS,
+            },
+        );
 
         tokio::spawn(run_codex_jsonl_rpc_reader(reader, incoming_tx));
         tokio::spawn(run_codex_jsonl_rpc_worker(
@@ -87,7 +99,7 @@ impl CodexJsonlRpcClient {
             command_rx,
             incoming_rx,
             CodexJsonlRpcEventSinks {
-                notification_tx,
+                notification_ingress,
                 server_request_tx,
                 diagnostic_tx,
             },
@@ -452,6 +464,24 @@ impl CodexAppServerClient {
         }
 
         Ok(models)
+    }
+
+    pub async fn thread_read_raw(
+        &self,
+        thread_id: &str,
+        include_turns: bool,
+        timeout: Duration,
+    ) -> Result<JsonValue, CodexJsonlRpcClientError> {
+        self.rpc
+            .request_value(
+                "thread/read",
+                Some(json!({
+                    "threadId": thread_id,
+                    "includeTurns": include_turns,
+                })),
+                timeout,
+            )
+            .await
     }
 
     pub async fn thread_start(
@@ -2786,9 +2816,25 @@ struct PendingCodexJsonlRpcRequest {
 }
 
 struct CodexJsonlRpcEventSinks {
-    notification_tx: mpsc::Sender<CodexJsonlRpcNotificationEvent>,
+    notification_ingress: OrderedEventIngress<CodexJsonlRpcNotificationEvent>,
     server_request_tx: mpsc::Sender<CodexJsonlRpcServerRequest>,
     diagnostic_tx: mpsc::Sender<CodexJsonlRpcClientDiagnostic>,
+}
+
+impl OrderedIngressEvent for CodexJsonlRpcNotificationEvent {
+    type Key = String;
+
+    fn ingress_class(&self) -> OrderedIngressClass<Self::Key> {
+        if codex_notification_is_progress(self.method.as_str()) {
+            OrderedIngressClass::Coalesced(codex_notification_progress_key(self))
+        } else {
+            OrderedIngressClass::Durable
+        }
+    }
+
+    fn coalesce(&mut self, newer: Self) {
+        merge_codex_progress_notification(self, newer);
+    }
 }
 
 #[derive(Default)]
@@ -2820,6 +2866,115 @@ impl PendingCodexJsonlRpcRequests {
         }
         count
     }
+}
+
+const CODEX_NOTIFICATION_PROGRESS_FLUSH_INTERVAL: Duration = Duration::from_millis(25);
+const CODEX_NOTIFICATION_MAX_PENDING_PROGRESS_KEYS: usize = 4096;
+const CODEX_NOTIFICATION_MAX_PENDING_DURABLE_EVENTS: usize = 1024;
+const CODEX_NOTIFICATION_MAX_PENDING_PROGRESS_BYTES: usize = 64 * 1024;
+
+fn codex_notification_is_progress(method: &str) -> bool {
+    matches!(
+        method,
+        "thread/tokenUsage/updated"
+            | "account/rateLimits/updated"
+            | "turn/plan/updated"
+            | "turn/diff/updated"
+            | "item/agentMessage/delta"
+            | "item/reasoning/textDelta"
+            | "item/reasoning/summaryTextDelta"
+            | "item/reasoning/summaryPartAdded"
+            | "item/plan/delta"
+            | "item/commandExecution/outputDelta"
+            | "item/fileChange/outputDelta"
+            | "item/fileChange/patchUpdated"
+    )
+}
+
+fn codex_notification_progress_key(notification: &CodexJsonlRpcNotificationEvent) -> String {
+    let params = notification.params.as_ref();
+    let part = |names: &[&str]| {
+        names.iter().find_map(|name| {
+            params
+                .and_then(|params| params.get(*name))
+                .and_then(JsonValue::as_str)
+        })
+    };
+    format!(
+        "{}:{}:{}:{}",
+        notification.method,
+        part(&["threadId", "thread_id"]).unwrap_or_default(),
+        part(&["turnId", "turn_id"]).unwrap_or_default(),
+        part(&["itemId", "item_id", "callId", "call_id"]).unwrap_or_default(),
+    )
+}
+
+fn merge_codex_progress_notification(
+    pending: &mut CodexJsonlRpcNotificationEvent,
+    next: CodexJsonlRpcNotificationEvent,
+) {
+    if codex_notification_progress_is_snapshot(pending.method.as_str()) {
+        *pending = next;
+        return;
+    }
+
+    let next_delta = next
+        .params
+        .as_ref()
+        .and_then(|params| params.get("delta").or_else(|| params.get("text")))
+        .and_then(JsonValue::as_str);
+    let Some(next_delta) = next_delta else {
+        *pending = next;
+        return;
+    };
+    let mut delta = pending
+        .params
+        .as_ref()
+        .and_then(|params| params.get("delta").or_else(|| params.get("text")))
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    delta.push_str(next_delta);
+    let truncated =
+        truncate_codex_progress_delta(&mut delta, CODEX_NOTIFICATION_MAX_PENDING_PROGRESS_BYTES);
+
+    let mut params = next.params.unwrap_or_else(|| json!({}));
+    if let Some(object) = params.as_object_mut() {
+        object.insert("delta".to_owned(), JsonValue::String(delta));
+        object.insert("coalesced".to_owned(), JsonValue::Bool(true));
+        if truncated {
+            object.insert("truncated".to_owned(), JsonValue::Bool(true));
+        }
+    }
+    pending.params = Some(params.clone());
+    pending.raw = next.raw;
+    if let Some(raw) = pending.raw.as_object_mut() {
+        raw.insert("params".to_owned(), params);
+    }
+}
+
+fn codex_notification_progress_is_snapshot(method: &str) -> bool {
+    matches!(
+        method,
+        "thread/tokenUsage/updated"
+            | "account/rateLimits/updated"
+            | "turn/plan/updated"
+            | "turn/diff/updated"
+            | "item/reasoning/summaryPartAdded"
+            | "item/fileChange/patchUpdated"
+    )
+}
+
+fn truncate_codex_progress_delta(delta: &mut String, max_bytes: usize) -> bool {
+    if delta.len() <= max_bytes {
+        return false;
+    }
+    let mut boundary = max_bytes.min(delta.len());
+    while boundary > 0 && !delta.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    delta.truncate(boundary);
+    true
 }
 
 async fn run_codex_jsonl_rpc_reader<R>(
@@ -2936,7 +3091,7 @@ async fn run_codex_jsonl_rpc_worker<W>(
                             &mut pending,
                             &mut pending_server_requests,
                             &event_sinks,
-                        );
+                        ).await;
                     }
                     Some(CodexJsonlRpcIncoming::DecodeError(error)) => {
                         break CodexJsonlRpcClientError::TransportClosed {
@@ -2961,9 +3116,10 @@ async fn run_codex_jsonl_rpc_worker<W>(
     if !pending.is_empty() {
         let _ = pending.fail_all(close_error);
     }
+    event_sinks.notification_ingress.close();
 }
 
-fn handle_codex_jsonl_rpc_incoming(
+async fn handle_codex_jsonl_rpc_incoming(
     message: JsonlRpcIncomingMessage,
     pending: &mut PendingCodexJsonlRpcRequests,
     pending_server_requests: &mut HashMap<JsonlRpcId, ()>,
@@ -2996,48 +3152,44 @@ fn handle_codex_jsonl_rpc_incoming(
             let _ = pending_request.response_tx.send(Ok(result));
         }
         JsonlRpcIncomingMessage::Notification(notification) => {
-            dispatch_notification(notification.into(), event_sinks);
+            dispatch_notification(notification.into(), event_sinks).await;
         }
         JsonlRpcIncomingMessage::ServerRequest(request) => {
-            dispatch_server_request(request.into(), pending_server_requests, event_sinks);
+            dispatch_server_request(request.into(), pending_server_requests, event_sinks).await;
         }
     }
 }
 
-fn dispatch_notification(
+async fn dispatch_notification(
     notification: CodexJsonlRpcNotificationEvent,
     event_sinks: &CodexJsonlRpcEventSinks,
 ) {
-    match event_sinks.notification_tx.try_send(notification) {
-        Ok(()) => {}
-        Err(mpsc::error::TrySendError::Full(notification)) => {
-            emit_diagnostic(
-                event_sinks,
-                CodexJsonlRpcClientDiagnostic {
-                    kind: CodexJsonlRpcClientDiagnosticKind::NotificationChannelFull,
-                    message: "codex jsonl-rpc notification channel is full; notification dropped"
+    match event_sinks.notification_ingress.offer(notification).await {
+        OrderedIngressOffer::Accepted => {}
+        OrderedIngressOffer::CoalescedKeyLimit(notification) => emit_diagnostic(
+            event_sinks,
+            CodexJsonlRpcClientDiagnostic {
+                kind: CodexJsonlRpcClientDiagnosticKind::NotificationChannelFull,
+                message:
+                    "codex progress coalescer reached its key limit; transient progress dropped"
                         .to_owned(),
-                    method: Some(notification.method),
-                    raw: Some(notification.raw),
-                },
-            );
-        }
-        Err(mpsc::error::TrySendError::Closed(notification)) => {
-            emit_diagnostic(
-                event_sinks,
-                CodexJsonlRpcClientDiagnostic {
-                    kind: CodexJsonlRpcClientDiagnosticKind::NotificationChannelClosed,
-                    message: "codex jsonl-rpc notification channel is closed; notification dropped"
-                        .to_owned(),
-                    method: Some(notification.method),
-                    raw: Some(notification.raw),
-                },
-            );
-        }
+                method: Some(notification.method),
+                raw: Some(notification.raw),
+            },
+        ),
+        OrderedIngressOffer::Closed(notification) => emit_diagnostic(
+            event_sinks,
+            CodexJsonlRpcClientDiagnostic {
+                kind: CodexJsonlRpcClientDiagnosticKind::NotificationChannelClosed,
+                message: "codex jsonl-rpc notification ingress is closed".to_owned(),
+                method: Some(notification.method),
+                raw: Some(notification.raw),
+            },
+        ),
     }
 }
 
-fn dispatch_server_request(
+async fn dispatch_server_request(
     request: CodexJsonlRpcServerRequest,
     pending_server_requests: &mut HashMap<JsonlRpcId, ()>,
     event_sinks: &CodexJsonlRpcEventSinks,
@@ -3059,34 +3211,18 @@ fn dispatch_server_request(
     }
 
     pending_server_requests.insert(request.id.clone(), ());
-    match event_sinks.server_request_tx.try_send(request) {
-        Ok(()) => {}
-        Err(mpsc::error::TrySendError::Full(request)) => {
-            pending_server_requests.remove(&request.id);
-            emit_diagnostic(
-                event_sinks,
-                CodexJsonlRpcClientDiagnostic {
-                    kind: CodexJsonlRpcClientDiagnosticKind::ServerRequestChannelFull,
-                    message: "codex jsonl-rpc server request channel is full; request dropped"
-                        .to_owned(),
-                    method: Some(request.method),
-                    raw: Some(request.raw),
-                },
-            );
-        }
-        Err(mpsc::error::TrySendError::Closed(request)) => {
-            pending_server_requests.remove(&request.id);
-            emit_diagnostic(
-                event_sinks,
-                CodexJsonlRpcClientDiagnostic {
-                    kind: CodexJsonlRpcClientDiagnosticKind::ServerRequestChannelClosed,
-                    message: "codex jsonl-rpc server request channel is closed; request dropped"
-                        .to_owned(),
-                    method: Some(request.method),
-                    raw: Some(request.raw),
-                },
-            );
-        }
+    if let Err(error) = event_sinks.server_request_tx.send(request).await {
+        let request = error.0;
+        pending_server_requests.remove(&request.id);
+        emit_diagnostic(
+            event_sinks,
+            CodexJsonlRpcClientDiagnostic {
+                kind: CodexJsonlRpcClientDiagnosticKind::ServerRequestChannelClosed,
+                message: "codex jsonl-rpc server request ingress is closed".to_owned(),
+                method: Some(request.method),
+                raw: Some(request.raw),
+            },
+        );
     }
 }
 
@@ -3653,7 +3789,7 @@ while read line; do :; done
     }
 
     #[tokio::test]
-    async fn notifications_do_not_block_request_response_when_channel_is_full() {
+    async fn notification_ingress_preserves_events_without_blocking_request_responses() {
         let (client, mut server_reader, mut server_writer) = client_pair_with_capacities(1, 1, 4);
         let mut notifications = client
             .take_notification_receiver()
@@ -3668,15 +3804,6 @@ while read line; do :; done
             )
             .await
             .expect("write notifications");
-
-        let diagnostic = tokio::time::timeout(Duration::from_secs(2), diagnostics.recv())
-            .await
-            .expect("diagnostic should arrive")
-            .expect("diagnostic channel should stay open");
-        assert_eq!(
-            diagnostic.kind,
-            CodexJsonlRpcClientDiagnosticKind::NotificationChannelFull
-        );
 
         let queued_notification = notifications
             .recv()
@@ -3702,6 +3829,86 @@ while read line; do :; done
         assert_eq!(
             request.await.expect("request join").expect("response"),
             json!({"ok": true})
+        );
+
+        let queued_notification = notifications
+            .recv()
+            .await
+            .expect("second notification should remain queued");
+        assert_eq!(queued_notification.method, "n/two");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), diagnostics.recv())
+                .await
+                .is_err(),
+            "normal backpressure must not be reported as dropped lifecycle data"
+        );
+    }
+
+    #[tokio::test]
+    async fn notification_ingress_survives_delta_storm_and_retains_terminal_events() {
+        let (client, mut server_reader, mut server_writer) = client_pair_with_capacities(1, 1, 4);
+        let mut notifications = client
+            .take_notification_receiver()
+            .expect("notification receiver should be available");
+        let mut diagnostics = client
+            .take_diagnostic_receiver()
+            .expect("diagnostic receiver should be available");
+
+        let mut payload = String::new();
+        for _ in 0..10_000 {
+            payload.push_str(
+                "{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"thread_1\",\"turnId\":\"turn_1\",\"itemId\":\"item_1\",\"delta\":\"x\"}}\n",
+            );
+        }
+        payload.push_str(
+            "{\"method\":\"item/completed\",\"params\":{\"threadId\":\"thread_1\",\"turnId\":\"turn_1\",\"item\":{\"id\":\"item_1\",\"type\":\"agentMessage\",\"text\":\"done\"}}}\n",
+        );
+        payload.push_str(
+            "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thread_1\",\"turn\":{\"id\":\"turn_1\",\"status\":\"completed\"}}}\n",
+        );
+        server_writer
+            .write_all(payload.as_bytes())
+            .await
+            .expect("write delta storm");
+
+        let request = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                client
+                    .request_value("account/read", Some(json!({})), Duration::from_secs(2))
+                    .await
+            })
+        };
+        let server_request = read_server_line(&mut server_reader).await;
+        server_writer
+            .write_all(b"{\"id\":0,\"result\":{\"ok\":true}}\n")
+            .await
+            .expect("write response");
+        assert_eq!(server_request["id"], json!(0));
+        assert_eq!(
+            request.await.expect("request join").expect("response"),
+            json!({"ok": true})
+        );
+
+        let mut progress_batches = 0usize;
+        loop {
+            let notification = notifications.recv().await.expect("notification");
+            if notification.method == "item/completed" {
+                break;
+            }
+            assert_eq!(notification.method, "item/agentMessage/delta");
+            progress_batches = progress_batches.saturating_add(1);
+        }
+        assert!(progress_batches > 0);
+        assert_eq!(
+            notifications.recv().await.expect("turn completion").method,
+            "turn/completed"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), diagnostics.recv())
+                .await
+                .is_err(),
+            "delta coalescing must not report lifecycle loss"
         );
     }
 

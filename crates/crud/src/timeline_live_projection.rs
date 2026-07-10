@@ -18,9 +18,8 @@ use crate::repositories::{thread, turn};
 use crate::timeline_projection::{ProjectionPlacement, classify_turn_item_row};
 use crate::timeline_projection_model::{
     ItemEventOrder, approval_block_id, assistant_block_id, classification_metadata_json,
-    elapsed_ms, is_stale_running_turn_item, terminal_completed_at, turn_block_sort_key,
-    turn_work_presentation, turn_work_state, user_block_id, work_block_id, work_item_order_key,
-    work_item_projection_id,
+    elapsed_ms, terminal_completed_at, turn_block_sort_key, turn_work_presentation,
+    turn_work_state, user_block_id, work_block_id, work_item_order_key, work_item_projection_id,
 };
 use crate::{
     ProjectionPageAnchor, ThreadTimelineBlockRecord, TurnWorkItemProjectionRecord,
@@ -773,28 +772,58 @@ async fn find_running_item_state<C: ConnectionTrait>(
     turn_id: &str,
     now: DateTimeWithTimeZone,
 ) -> Result<RunningItemState> {
-    let row = turn_item_entity::Entity::find()
+    let running = Condition::any()
+        .add(turn_item_entity::Column::Status.eq("in_progress"))
+        .add(turn_item_entity::Column::ActiveAttemptStatus.eq("running"));
+    let active = turn_item_entity::Entity::find()
         .filter(turn_item_entity::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(running.clone())
         .filter(
             Condition::any()
-                .add(turn_item_entity::Column::Status.eq("in_progress"))
-                .add(turn_item_entity::Column::ActiveAttemptStatus.eq("running")),
+                .add(turn_item_entity::Column::LeaseExpiresAt.is_null())
+                .add(turn_item_entity::Column::LeaseExpiresAt.gt(now)),
         )
-        .order_by_asc(turn_item_entity::Column::CreatedAt)
+        .order_by_desc(turn_item_entity::Column::CreatedAt)
         .one(db)
         .await
         .with_context(|| format!("failed to query running turn item state for turn `{turn_id}`"))?;
+    if let Some(active) = active {
+        return Ok(select_running_item_state(Some(active.item_id), None));
+    }
 
-    let Some(row) = row else {
-        return Ok(RunningItemState::default());
+    let latest = turn_item_entity::Entity::find()
+        .filter(turn_item_entity::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(running)
+        .order_by_desc(turn_item_entity::Column::CreatedAt)
+        .one(db)
+        .await
+        .with_context(|| format!("failed to query stalled turn item state for turn `{turn_id}`"))?;
+
+    Ok(select_running_item_state(
+        None,
+        latest.map(|item| item.item_id),
+    ))
+}
+
+fn select_running_item_state(
+    active_item_id: Option<String>,
+    latest_stale_item_id: Option<String>,
+) -> RunningItemState {
+    if let Some(item_id) = active_item_id {
+        return RunningItemState {
+            item_id: Some(item_id),
+            stale: false,
+            stale_reason: None,
+        };
+    }
+    let Some(item_id) = latest_stale_item_id else {
+        return RunningItemState::default();
     };
-
-    let stale = is_stale_running_turn_item(&row, now);
-    Ok(RunningItemState {
-        item_id: Some(row.item_id),
-        stale,
-        stale_reason: stale.then_some("expired_lease"),
-    })
+    RunningItemState {
+        item_id: Some(item_id),
+        stale: true,
+        stale_reason: Some("expired_lease"),
+    }
 }
 
 async fn count_pending_cli_runtime_requests<C: ConnectionTrait>(
@@ -870,4 +899,28 @@ fn count_to_i64(count: u64) -> i64 {
 
 fn max_datetime(left: DateTimeWithTimeZone, right: DateTimeWithTimeZone) -> DateTimeWithTimeZone {
     if left >= right { left } else { right }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn newer_active_item_wins_over_stale_orphan() {
+        let selected = select_running_item_state(
+            Some("active_command".to_owned()),
+            Some("old_reasoning".to_owned()),
+        );
+        assert_eq!(selected.item_id.as_deref(), Some("active_command"));
+        assert!(!selected.stale);
+        assert_eq!(selected.stale_reason, None);
+    }
+
+    #[test]
+    fn all_stale_items_keep_stalled_turn_visible() {
+        let selected = select_running_item_state(None, Some("old_command".to_owned()));
+        assert_eq!(selected.item_id.as_deref(), Some("old_command"));
+        assert!(selected.stale);
+        assert_eq!(selected.stale_reason, Some("expired_lease"));
+    }
 }

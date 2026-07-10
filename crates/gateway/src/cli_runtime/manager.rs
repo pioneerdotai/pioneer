@@ -146,6 +146,17 @@ pub(crate) struct CLIAgentRuntimeTurnStartSnapshot {
     pub raw: JsonValue,
 }
 
+pub(crate) use pioneer_runtime_events::ExecutionTurnStatus as CLIAgentRuntimeObservedTurnStatus;
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CLIAgentRuntimeTurnObservation {
+    pub status: CLIAgentRuntimeObservedTurnStatus,
+    pub message: Option<String>,
+    /// Canonical runtime events reconstructed from an authoritative snapshot.
+    /// They are replayed before a repaired terminal lifecycle event.
+    pub reconciliation_events: Vec<RuntimeEvent>,
+}
+
 #[async_trait]
 pub(crate) trait CLIAgentRuntimeSession: Send + Sync {
     async fn close(&self) -> Result<()>;
@@ -206,6 +217,15 @@ pub(crate) trait CLIAgentRuntimeSession: Send + Sync {
     ) -> Result<()> {
         let _ = (native_thread_id, native_turn_id);
         bail!("CLI runtime session does not support turn interrupt");
+    }
+
+    async fn observe_turn(
+        &self,
+        native_thread_id: &str,
+        native_turn_id: &str,
+    ) -> Result<Option<CLIAgentRuntimeTurnObservation>> {
+        let _ = (native_thread_id, native_turn_id);
+        Ok(None)
     }
 
     async fn thread_compact(

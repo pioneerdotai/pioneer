@@ -7,7 +7,8 @@ use crate::{
 };
 use pioneer_protocol::{
     AgentMessagePhase, ArtifactRef, SystemEventLevel, ToolDisplayPayload, ToolMetadataValue,
-    ToolStoragePayload, TurnItem, TurnPermissionProfileSnapshot, UserMessageAttachment,
+    ToolStoragePayload, TurnItem, TurnPermissionProfileSnapshot, TurnWorkState,
+    UserMessageAttachment,
 };
 use serde_json::Value as JsonValue;
 use std::{
@@ -54,6 +55,10 @@ pub struct RunningTurnDisplay {
     pub turn_id: String,
     pub started_at_unix_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<TurnWorkState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_profile: Option<TurnPermissionProfileSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub security_summary: Option<ClientTurnSecuritySummary>,
@@ -92,6 +97,8 @@ pub fn running_turn_display(projection: &ConversationViewState) -> Option<Runnin
         started_at_unix_ms: active_turn
             .started_at_unix_ms
             .or_else(|| first_turn_item_started_at(projection, active_turn.id.as_str())),
+        state: Some(TurnWorkState::Running),
+        message: None,
         permission_profile: active_turn.permission_profile.clone(),
         security_summary: active_turn.security_summary.clone(),
     })
@@ -2100,6 +2107,8 @@ mod tests {
             Some(RunningTurnDisplay {
                 turn_id: "turn_1".to_owned(),
                 started_at_unix_ms: Some(42),
+                state: Some(TurnWorkState::Running),
+                message: None,
                 permission_profile: None,
                 security_summary: None,
             })

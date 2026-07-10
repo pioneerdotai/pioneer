@@ -155,6 +155,8 @@ mod tests {
                 TimelineRowKind::RunningTurn(RunningTurnDisplay {
                     turn_id: "turn_a".to_owned(),
                     started_at_unix_ms: None,
+                    state: Some(pioneer_protocol::TurnWorkState::Running),
+                    message: None,
                     permission_profile: None,
                     security_summary: None,
                 }),

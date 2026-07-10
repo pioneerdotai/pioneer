@@ -2,13 +2,14 @@ use super::{
     AgentCommand, AgentEvent, AgentManager, AgentMcpAvailability, AgentMcpMaterialization,
     AgentMcpMaterializationRequest, AgentMcpToolProvider, AgentMemoryProvider,
     AgentMemoryTurnPolicyProvider, AgentPostTurnHookDispatchPolicy, AgentStartError,
-    AgentTurnHookRuntimeContext, MemoryExtractionPolicy, MemoryRecallItem, MemoryRecallRequest,
-    MemoryRecallSnapshot, MemoryToolMaterialization, MemoryTurnContext, MemoryTurnPolicy,
-    MemoryTurnPolicyContext, MemoryTurnPolicyRequest, PendingAttachedTask, RecoveryAttemptRequest,
-    ResolvedArtifactInput, ReviewRequiredTaskObservation, TaskToolMaterialization,
-    TaskToolProvider, TaskTurnContext, ToolLoopConfig, TurnExecutionControl,
-    TurnFinalizationContext, TurnFinalizationDecision, TurnFinalizationProvider, TurnToolContext,
-    TurnToolMaterialization, TurnToolProvider, WorkspaceSkillPolicy,
+    AgentTurnHookRuntimeContext, DurableEventReceiver, ExecutionTurnStatus, MemoryExtractionPolicy,
+    MemoryRecallItem, MemoryRecallRequest, MemoryRecallSnapshot, MemoryToolMaterialization,
+    MemoryTurnContext, MemoryTurnPolicy, MemoryTurnPolicyContext, MemoryTurnPolicyRequest,
+    PendingAttachedTask, RecoveryAttemptRequest, ResolvedArtifactInput,
+    ReviewRequiredTaskObservation, TaskToolMaterialization, TaskToolProvider, TaskTurnContext,
+    ToolLoopConfig, TurnExecutionControl, TurnFinalizationContext, TurnFinalizationDecision,
+    TurnFinalizationProvider, TurnToolContext, TurnToolMaterialization, TurnToolProvider,
+    WorkspaceSkillPolicy,
 };
 use futures_util::StreamExt;
 use pioneer_hooks::{
@@ -3266,7 +3267,7 @@ async fn recv_events_until_loop_budget_action(
 }
 
 async fn recv_durable_events_until_turn_blocked(
-    events: &mut tokio::sync::mpsc::Receiver<AgentDurableEvent>,
+    events: &mut DurableEventReceiver,
 ) -> Vec<AgentDurableEvent> {
     let mut observed = Vec::new();
 
@@ -9341,6 +9342,17 @@ async fn max_windows_cap_blocks_continuation_without_turn_failed() {
         .expect("turn should start");
 
     let observed_events = recv_durable_events_until_turn_blocked(&mut durable_events).await;
+    let observation = manager
+        .observe_turn(thread_id, turn_id)
+        .await
+        .expect("blocked turn should remain observable after task exit");
+    assert_eq!(observation.status, ExecutionTurnStatus::Blocked);
+    assert!(
+        observation
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("max execution windows per turn reached"))
+    );
     let blocked = observed_events
         .iter()
         .find_map(|event| {

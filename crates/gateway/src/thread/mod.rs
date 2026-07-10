@@ -155,6 +155,58 @@ impl ThreadManager {
             .await
     }
 
+    /// Restores persisted thread state for background lifecycle processing.
+    /// Unlike `system_thread_start_seeded`, this preserves existing turns and
+    /// status because the caller is resuming projection of an already-running
+    /// turn rather than starting a new thread session.
+    pub async fn system_thread_restore_persisted(
+        &self,
+        thread: Thread,
+        sandbox_mode: Option<SandboxMode>,
+    ) -> Result<()> {
+        let thread_id = thread.id.clone();
+        let workspace_id = thread.workspace_id.clone();
+        let mut state = self.state.write().await;
+        if let Some(entry) = state.threads.get_mut(thread_id.as_str()) {
+            if entry.thread.workspace_id != workspace_id {
+                bail!(
+                    "thread `{thread_id}` belongs to workspace `{}`",
+                    entry.thread.workspace_id
+                );
+            }
+            merge_thread_metadata(&mut entry.thread, &thread);
+            for turn in thread.turns {
+                if !entry
+                    .thread
+                    .turns
+                    .iter()
+                    .any(|existing| existing.id == turn.id)
+                {
+                    entry.thread.turns.push(turn);
+                }
+            }
+            if entry
+                .thread
+                .turns
+                .iter()
+                .any(|turn| turn.status == TurnStatus::InProgress)
+            {
+                entry.thread.status = ThreadStatus::Active;
+            }
+            return Ok(());
+        }
+
+        state.threads.insert(
+            thread_id,
+            ThreadEntry {
+                thread,
+                sandbox_mode: sandbox_mode.unwrap_or(DEFAULT_SANDBOX_MODE),
+                connection_ids: HashSet::new(),
+            },
+        );
+        Ok(())
+    }
+
     async fn thread_start_with_seed(
         &self,
         connection_id: Option<ConnectionId>,
@@ -1075,6 +1127,54 @@ mod tests {
             outcome.response.thread.name.as_deref(),
             Some("Обновленный заголовок")
         );
+    }
+
+    #[tokio::test]
+    async fn persisted_thread_restore_preserves_running_turn_for_terminal_lifecycle() {
+        let manager = ThreadManager::new("o4-mini", "openai");
+        let thread_id = "thr_000000000000000121";
+        let turn_id = "turn_000000000000000121";
+        let thread = Thread {
+            workspace_id: "ws_000000000000000001".to_owned(),
+            id: thread_id.to_owned(),
+            name: Some("restored".to_owned()),
+            preview: "running work".to_owned(),
+            mode: ThreadMode::Agent,
+            model: "o4-mini".to_owned(),
+            model_provider: "openai".to_owned(),
+            reasoning_effort: None,
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_010,
+            status: ThreadStatus::Active,
+            origin_kind: ThreadOriginKind::User,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            turns: vec![pioneer_protocol::Turn {
+                id: turn_id.to_owned(),
+                status: TurnStatus::InProgress,
+                turn_kind: Default::default(),
+                origin: Default::default(),
+                error: None,
+                prompt_manifest: None,
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+            }],
+        };
+
+        manager
+            .system_thread_restore_persisted(thread, None)
+            .await
+            .expect("persisted thread restore should succeed");
+        manager
+            .turn_finish(thread_id, turn_id, TurnStatus::Completed, None)
+            .await
+            .expect("restored turn should use the normal terminal lifecycle");
+
+        let (_, turn) = manager
+            .turn_get(thread_id, turn_id)
+            .await
+            .expect("restored turn should remain addressable");
+        assert_eq!(turn.status, TurnStatus::Completed);
     }
 
     #[tokio::test]

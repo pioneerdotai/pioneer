@@ -1226,6 +1226,13 @@ impl CrudStore {
         cli_runtime_binding::list_native_events(&self.connection, filter).await
     }
 
+    pub async fn latest_cli_runtime_native_event(
+        &self,
+        filter: CliRuntimeNativeEventListFilter,
+    ) -> Result<Option<CliRuntimeNativeEventRecord>> {
+        cli_runtime_binding::latest_native_event(&self.connection, filter).await
+    }
+
     pub async fn compact_terminal_cli_runtime_native_events(
         &self,
         batch_limit: u64,
@@ -9602,6 +9609,37 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         .await
     }
 
+    pub async fn observe_turn_runtime_activity(
+        &self,
+        turn_id: &str,
+        activity_kind: &str,
+        observed_at_unix: i64,
+    ) -> Result<bool> {
+        self.run_serialized_write(|| async {
+            let Some(turn_model) = turn::find_turn_by_id(&self.connection, turn_id).await? else {
+                return Ok(false);
+            };
+            let source_sequence = turn_event::latest_event_for_turn(&self.connection, turn_id)
+                .await?
+                .map(|event| event.sequence)
+                .unwrap_or(0);
+            turn_liveness::observe_activity(
+                &self.connection,
+                turn_liveness::TurnLivenessObservation {
+                    turn_id: turn_id.to_owned(),
+                    thread_id: turn_model.thread_id,
+                    activity_sequence: source_sequence,
+                    activity_kind: activity_kind.to_owned(),
+                    item_id: None,
+                    item_type: None,
+                    observed_at: unix_to_datetime(observed_at_unix),
+                },
+            )
+            .await
+        })
+        .await
+    }
+
     pub async fn get_turn_liveness(&self, turn_id: &str) -> Result<Option<TurnLivenessRecord>> {
         Ok(turn_liveness::find_by_turn_id(&self.connection, turn_id)
             .await?
@@ -13763,6 +13801,21 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].sequence, 1);
         assert_eq!(events[1].native_method, "item/completed");
+
+        let latest = store
+            .latest_cli_runtime_native_event(CliRuntimeNativeEventListFilter {
+                runtime_id: Some("codex".to_owned()),
+                thread_id: Some("thread_cli_native".to_owned()),
+                turn_id: Some("turn_cli_native".to_owned()),
+                native_thread_id: Some("codex-thread-native".to_owned()),
+                native_turn_id: Some("codex-turn-native".to_owned()),
+                ..Default::default()
+            })
+            .await
+            .expect("latest native event query should succeed")
+            .expect("latest native event should exist");
+        assert_eq!(latest.sequence, 2);
+        assert_eq!(latest.native_method, "item/completed");
     }
 
     #[tokio::test]
@@ -17236,6 +17289,52 @@ mod tests {
             Some("reasoning")
         );
         assert_eq!(liveness.last_activity_at_unix, timestamp + 5);
+    }
+
+    #[tokio::test]
+    async fn turn_liveness_tracks_authoritative_runtime_observation_without_item() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+
+        let store = CrudStore::new(connection);
+        let timestamp = 1_700_000_000;
+        let workspace_id = "ws_turn_runtime_observation";
+        let thread_id = "thr_turn_runtime_observation";
+        let turn_id = "turn_runtime_observation";
+        store
+            .materialize_turn_start(
+                &sample_thread(workspace_id, thread_id, timestamp),
+                SandboxMode::FullAccess,
+                &sample_turn(turn_id),
+                &[],
+            )
+            .await
+            .expect("turn start should persist");
+
+        assert!(
+            store
+                .observe_turn_runtime_activity(
+                    turn_id,
+                    "runtime/observed_in_progress",
+                    timestamp + 30,
+                )
+                .await
+                .expect("runtime observation should persist")
+        );
+        let liveness = store
+            .get_turn_liveness(turn_id)
+            .await
+            .expect("liveness query should succeed")
+            .expect("liveness row should exist");
+        assert_eq!(liveness.thread_id, thread_id);
+        assert_eq!(liveness.last_activity_kind, "runtime/observed_in_progress");
+        assert_eq!(liveness.last_activity_item_id, None);
+        assert_eq!(liveness.last_activity_item_type, None);
+        assert_eq!(liveness.last_activity_at_unix, timestamp + 30);
     }
 
     #[tokio::test]

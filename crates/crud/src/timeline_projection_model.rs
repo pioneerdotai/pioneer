@@ -137,15 +137,3 @@ pub(crate) fn terminal_completed_at(turn: &turn::Model) -> Option<DateTimeWithTi
         None
     }
 }
-
-pub(crate) fn is_stale_running_turn_item(
-    item: &turn_item::Model,
-    now: DateTimeWithTimeZone,
-) -> bool {
-    let running = item.status.as_deref() == Some("in_progress")
-        || item.active_attempt_status.as_deref() == Some("running");
-    running
-        && item
-            .lease_expires_at
-            .is_some_and(|deadline| deadline <= now)
-}

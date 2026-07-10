@@ -52,6 +52,8 @@ pub fn timeline_row_layout_hash(
             3u8.hash(&mut hasher);
             running_turn.turn_id.hash(&mut hasher);
             running_turn.started_at_unix_ms.hash(&mut hasher);
+            running_turn.state.hash(&mut hasher);
+            running_turn.message.hash(&mut hasher);
             running_turn
                 .permission_profile
                 .as_ref()

@@ -1,14 +1,14 @@
 use super::{MessageProcessor, message_future, record_resilience_worker_poll_error};
 use crate::bootstrap::bootstrap;
 use crate::cli_runtime::manager::{
-    CLIAgentRuntimeManager, CLIAgentRuntimeSession, CLIAgentRuntimeSessionFactory,
-    CLIAgentRuntimeSessionKey, CLIAgentRuntimeThreadCompactRequest,
+    CLIAgentRuntimeManager, CLIAgentRuntimeObservedTurnStatus, CLIAgentRuntimeSession,
+    CLIAgentRuntimeSessionFactory, CLIAgentRuntimeSessionKey, CLIAgentRuntimeThreadCompactRequest,
     CLIAgentRuntimeThreadCompactResult, CLIAgentRuntimeThreadForkRequest,
     CLIAgentRuntimeThreadForkResult, CLIAgentRuntimeThreadNameSetRequest,
     CLIAgentRuntimeThreadNameSetResult, CLIAgentRuntimeThreadOpenParams,
-    CLIAgentRuntimeThreadOpenSnapshot, CLIAgentRuntimeTurnStartParams,
-    CLIAgentRuntimeTurnStartSnapshot, CLIAgentRuntimeTurnSteerRequest,
-    CLIAgentRuntimeTurnSteerResult,
+    CLIAgentRuntimeThreadOpenSnapshot, CLIAgentRuntimeTurnObservation,
+    CLIAgentRuntimeTurnStartParams, CLIAgentRuntimeTurnStartSnapshot,
+    CLIAgentRuntimeTurnSteerRequest, CLIAgentRuntimeTurnSteerResult,
 };
 use crate::memory_runtime::GatewayMemoryRuntime;
 use crate::secrets::GatewaySecrets;
@@ -32,8 +32,9 @@ use pioneer_cli_agent_runtime::codex::{
 };
 use pioneer_cli_agent_runtime::driver::JsonlRpcId;
 use pioneer_cli_agent_runtime::event::{
-    RuntimeEvent, RuntimeEventMappingOptions, RuntimeRequestOpened, RuntimeRequestResolved,
-    RuntimeThreadStateChanged, RuntimeTurnCompleted, map_codex_server_request_event,
+    RuntimeAgentMessagePhase, RuntimeEvent, RuntimeEventMappingOptions, RuntimeItemCompleted,
+    RuntimeRequestOpened, RuntimeRequestResolved, RuntimeThreadStateChanged, RuntimeTurnCompleted,
+    map_codex_server_request_event,
 };
 use pioneer_config::{GatewayHookRecoveryConfig, GatewayMemoryConfig, GatewayWebToolsConfig};
 use pioneer_crud::{
@@ -201,6 +202,7 @@ struct RecordingCliRuntimeSession {
     thread_fork_result: TokioMutex<Option<CLIAgentRuntimeThreadForkResult>>,
     turn_steers: TokioMutex<Vec<CLIAgentRuntimeTurnSteerRequest>>,
     turn_steer_result: TokioMutex<Option<CLIAgentRuntimeTurnSteerResult>>,
+    turn_observation: TokioMutex<Option<CLIAgentRuntimeTurnObservation>>,
     closes: AtomicUsize,
 }
 
@@ -298,6 +300,14 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
             native_turn_id.map(str::to_owned),
         ));
         Ok(())
+    }
+
+    async fn observe_turn(
+        &self,
+        _native_thread_id: &str,
+        _native_turn_id: &str,
+    ) -> anyhow::Result<Option<CLIAgentRuntimeTurnObservation>> {
+        Ok(self.turn_observation.lock().await.clone())
     }
 
     async fn thread_compact(
@@ -15608,7 +15618,12 @@ async fn cli_runtime_stale_silent_running_binding_marks_turn_failed() {
         .expect("test CLI runtime session should start");
 
     processor
-        .fail_stale_cli_runtime_turns(chrono::Utc::now().fixed_offset().timestamp_millis())
+        .fail_stale_cli_runtime_turns(
+            chrono::Utc::now()
+                .fixed_offset()
+                .timestamp_millis()
+                .saturating_add(20 * 60 * 1_000),
+        )
         .await;
 
     let (_workspace_id, turn) = crud_store
@@ -15621,8 +15636,8 @@ async fn cli_runtime_stale_silent_running_binding_marks_turn_failed() {
         turn.error
             .as_deref()
             .unwrap_or_default()
-            .contains("did not emit any native events"),
-        "turn error should mention missing native events: {:?}",
+            .contains("marked failed"),
+        "turn error should describe the stale runtime failure: {:?}",
         turn.error
     );
     let binding = crud_store
@@ -15643,6 +15658,403 @@ async fn cli_runtime_stale_silent_running_binding_marks_turn_failed() {
         )]
     );
     assert_eq!(cli_session.closes.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_reconciliation_preserves_active_turn_and_repairs_missed_terminal_events() {
+    let (tx, mut rx) = mpsc::channel(64);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        Arc::new(DelayedProvider {
+            delay: Duration::from_secs(30),
+            text: "late".to_owned(),
+        }),
+    ));
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
+    let processor = MessageProcessor::new(
+        thread_manager,
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+
+    let thread_id = "thread_cli_runtime_reconciliation";
+    let turn_id = "turn_cli_runtime_reconciliation";
+    let native_thread_id = "native_thread_cli_runtime_reconciliation";
+    let native_turn_id = "native_turn_cli_runtime_reconciliation";
+    start_loaded_thread_and_turn_for_cli_runtime_test(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+    )
+    .await;
+
+    let old = chrono::Utc::now().fixed_offset() - chrono::Duration::hours(1);
+    crud_store
+        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+            turn_id: turn_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            workspace_id: workspace_id.clone(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            native_thread_id: native_thread_id.to_owned(),
+            native_turn_id: Some(native_turn_id.to_owned()),
+            request_id: None,
+            status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING.to_owned(),
+            model: Some("gpt-5".to_owned()),
+            cwd: Some("/tmp/project".to_owned()),
+            sandbox_json: None,
+            approval_policy: None,
+            input_mapping_json: "{}".to_owned(),
+            created_at: old,
+            updated_at: old,
+        })
+        .await
+        .expect("turn binding should upsert");
+    let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
+        .expect("session key should build");
+    cli_manager
+        .get_or_start(key)
+        .await
+        .expect("test CLI runtime session should start");
+
+    *cli_session.turn_observation.lock().await = Some(CLIAgentRuntimeTurnObservation {
+        status: CLIAgentRuntimeObservedTurnStatus::InProgress,
+        message: None,
+        reconciliation_events: Vec::new(),
+    });
+    let first_probe_ms = chrono::Utc::now()
+        .fixed_offset()
+        .timestamp_millis()
+        .saturating_add(20 * 60 * 1_000);
+    processor.fail_stale_cli_runtime_turns(first_probe_ms).await;
+    let (_workspace_id, turn) = crud_store
+        .get_turn(thread_id, turn_id)
+        .await
+        .expect("turn lookup should succeed")
+        .expect("turn should exist");
+    assert_eq!(turn.status, TurnStatus::InProgress);
+    let liveness = crud_store
+        .get_turn_liveness(turn_id)
+        .await
+        .expect("turn liveness should load")
+        .expect("turn liveness should exist");
+    assert_eq!(liveness.last_activity_kind, "runtime/observed_in_progress");
+
+    *cli_session.turn_observation.lock().await = Some(CLIAgentRuntimeTurnObservation {
+        status: CLIAgentRuntimeObservedTurnStatus::Completed,
+        message: None,
+        reconciliation_events: vec![RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+            native_thread_id: Some(native_thread_id.to_owned()),
+            native_turn_id: native_turn_id.to_owned(),
+            native_item_id: "reconciled_final_item".to_owned(),
+            item_kind: "agentMessage".to_owned(),
+            text: Some("reconciled final answer".to_owned()),
+            summary: Vec::new(),
+            content: Vec::new(),
+            phase: RuntimeAgentMessagePhase::FinalAnswer,
+            metadata: None,
+            native_item_redacted: None,
+            native: None,
+        })],
+    });
+    processor
+        .fail_stale_cli_runtime_turns(first_probe_ms.saturating_add(20 * 60 * 1_000))
+        .await;
+
+    let (_workspace_id, turn) = crud_store
+        .get_turn(thread_id, turn_id)
+        .await
+        .expect("turn lookup should succeed")
+        .expect("turn should exist");
+    assert_eq!(turn.status, TurnStatus::Completed);
+    let item = crud_store
+        .get_turn_item(turn_id, "reconciled_final_item")
+        .await
+        .expect("reconciled item should load")
+        .expect("reconciled item should exist");
+    assert!(matches!(
+        item,
+        TurnItem::AgentMessage { text, .. } if text == "reconciled final answer"
+    ));
+    assert!(cli_session.interrupts.lock().await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_reconciliation_uses_full_terminal_lifecycle_for_unloaded_thread() {
+    let session_manager = Arc::new(SessionManager::new());
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+
+    let thread_id = "thread_cli_runtime_reconciliation_unloaded";
+    let turn_id = "turn_cli_runtime_reconciliation_unloaded";
+    let native_thread_id = "native_thread_cli_runtime_reconciliation_unloaded";
+    let native_turn_id = "native_turn_cli_runtime_reconciliation_unloaded";
+    let now_secs = chrono::Utc::now().timestamp();
+    let thread = Thread {
+        workspace_id: workspace_id.clone(),
+        id: thread_id.to_owned(),
+        name: Some("Unloaded reconciliation".to_owned()),
+        preview: "background turn".to_owned(),
+        mode: ThreadMode::Agent,
+        model: "gpt-5".to_owned(),
+        model_provider: "cli_runtime:codex".to_owned(),
+        reasoning_effort: None,
+        created_at: now_secs,
+        updated_at: now_secs,
+        status: ThreadStatus::Active,
+        origin_kind: ThreadOriginKind::User,
+        sidebar_visibility: ThreadSidebarVisibility::Visible,
+        agent_nickname: None,
+        agent_role: None,
+        turns: Vec::new(),
+    };
+    let turn = Turn {
+        id: turn_id.to_owned(),
+        status: TurnStatus::InProgress,
+        turn_kind: TurnKind::default(),
+        origin: TurnOrigin::User,
+        error: None,
+        prompt_manifest: None,
+        permission_profile: default_test_permission_profile(),
+    };
+    crud_store
+        .materialize_turn_start(
+            &thread,
+            SandboxMode::FullAccess,
+            &turn,
+            &[UserInput::Text {
+                text: "run in background".to_owned(),
+                text_elements: Vec::new(),
+            }],
+        )
+        .await
+        .expect("unloaded turn should materialize");
+    assert!(
+        processor
+            .handle_durable_agent_event(AgentDurableEvent::TurnExecutionWindowStarted {
+                notification: pioneer_protocol::TurnExecutionWindowStartedNotification {
+                    workspace_id: workspace_id.clone(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    window_id: "runtime_window_unloaded".to_owned(),
+                    window_index: 1,
+                    status: ExecutionWindowStatus::Running,
+                    started_at_unix_ms: now_secs.saturating_mul(1_000),
+                },
+            })
+            .await
+    );
+
+    let old = chrono::Utc::now().fixed_offset() - chrono::Duration::hours(1);
+    crud_store
+        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+            turn_id: turn_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            workspace_id: workspace_id.clone(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            native_thread_id: native_thread_id.to_owned(),
+            native_turn_id: Some(native_turn_id.to_owned()),
+            request_id: None,
+            status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING.to_owned(),
+            model: Some("gpt-5".to_owned()),
+            cwd: Some("/tmp/project".to_owned()),
+            sandbox_json: None,
+            approval_policy: None,
+            input_mapping_json: "{}".to_owned(),
+            created_at: old,
+            updated_at: old,
+        })
+        .await
+        .expect("turn binding should upsert");
+    let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
+        .expect("session key should build");
+    cli_manager
+        .get_or_start(key)
+        .await
+        .expect("test CLI runtime session should start");
+    *cli_session.turn_observation.lock().await = Some(CLIAgentRuntimeTurnObservation {
+        status: CLIAgentRuntimeObservedTurnStatus::Completed,
+        message: None,
+        reconciliation_events: vec![RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+            native_thread_id: Some(native_thread_id.to_owned()),
+            native_turn_id: native_turn_id.to_owned(),
+            native_item_id: "reconciled_unloaded_final_item".to_owned(),
+            item_kind: "agentMessage".to_owned(),
+            text: Some("reconciled unloaded final answer".to_owned()),
+            summary: Vec::new(),
+            content: Vec::new(),
+            phase: RuntimeAgentMessagePhase::FinalAnswer,
+            metadata: None,
+            native_item_redacted: None,
+            native: None,
+        })],
+    });
+
+    processor
+        .fail_stale_cli_runtime_turns(
+            chrono::Utc::now()
+                .fixed_offset()
+                .timestamp_millis()
+                .saturating_add(20 * 60 * 1_000),
+        )
+        .await;
+
+    let (_, completed_turn) = crud_store
+        .get_turn(thread_id, turn_id)
+        .await
+        .expect("turn lookup should succeed")
+        .expect("turn should exist");
+    assert_eq!(completed_turn.status, TurnStatus::Completed);
+    let completed_window = crud_store
+        .latest_turn_execution_window(turn_id)
+        .await
+        .expect("execution window lookup should succeed")
+        .expect("execution window should exist");
+    assert_eq!(completed_window.status, ExecutionWindowStatus::Completed);
+    let completed_thread = crud_store
+        .get_thread_model(thread_id)
+        .await
+        .expect("thread lookup should succeed")
+        .expect("thread should exist");
+    assert_eq!(completed_thread.status, ThreadStatus::Idle);
+    assert!(
+        crud_store
+            .get_turn_item(turn_id, "reconciled_unloaded_final_item")
+            .await
+            .expect("item lookup should succeed")
+            .is_some()
+    );
+    let binding = crud_store
+        .get_cli_runtime_turn_binding(turn_id)
+        .await
+        .expect("binding lookup should succeed")
+        .expect("binding should exist");
+    assert_eq!(
+        binding.status,
+        crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_COMPLETED
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_failure_keeps_binding_active_while_pioneer_recovery_is_pending() {
+    let (tx, mut rx) = mpsc::channel(64);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+    let thread_id = "thread_cli_runtime_failure_recovery";
+    let turn_id = "turn_cli_runtime_failure_recovery";
+    let native_thread_id = "native_thread_cli_runtime_failure_recovery";
+    let native_turn_id = "native_turn_cli_runtime_failure_recovery";
+    start_loaded_thread_and_turn_for_cli_runtime_test(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+    )
+    .await;
+    let now = chrono::Utc::now().fixed_offset();
+    crud_store
+        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+            turn_id: turn_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            workspace_id: workspace_id.clone(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            native_thread_id: native_thread_id.to_owned(),
+            native_turn_id: Some(native_turn_id.to_owned()),
+            request_id: None,
+            status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING.to_owned(),
+            model: Some("gpt-5".to_owned()),
+            cwd: Some("/tmp/project".to_owned()),
+            sandbox_json: None,
+            approval_policy: None,
+            input_mapping_json: "{}".to_owned(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("turn binding should upsert");
+    let key = CLIAgentRuntimeSessionKey::new(workspace_id, "codex", thread_id)
+        .expect("session key should build");
+
+    processor
+        .handle_cli_runtime_timeline_event(
+            &key,
+            RuntimeEvent::TurnFailed(pioneer_cli_agent_runtime::event::RuntimeTurnFailed {
+                native_thread_id: Some(native_thread_id.to_owned()),
+                native_turn_id: Some(native_turn_id.to_owned()),
+                message: "runtime transport failed".to_owned(),
+                code: Some("transport_failed".to_owned()),
+                native: None,
+            }),
+        )
+        .await;
+
+    let (_, turn) = crud_store
+        .get_turn(thread_id, turn_id)
+        .await
+        .expect("turn lookup should succeed")
+        .expect("turn should exist");
+    assert_eq!(turn.status, TurnStatus::InProgress);
+    let binding = crud_store
+        .get_cli_runtime_turn_binding(turn_id)
+        .await
+        .expect("binding lookup should succeed")
+        .expect("binding should exist");
+    assert_eq!(
+        binding.status,
+        crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING
+    );
+    let pending_jobs = crud_store
+        .find_recovery_jobs_by_turn_and_status(turn_id, RecoveryJobStatus::Pending)
+        .await
+        .expect("pending recovery jobs should load");
+    assert_eq!(pending_jobs.len(), 1);
+    assert_eq!(pending_jobs[0].trigger, RecoveryTrigger::RuntimeFailure);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -15841,7 +16253,12 @@ async fn cli_runtime_stale_db_only_running_binding_marks_turn_failed() {
         .expect("turn binding should upsert");
 
     processor
-        .fail_stale_cli_runtime_turns(chrono::Utc::now().fixed_offset().timestamp_millis())
+        .fail_stale_cli_runtime_turns(
+            chrono::Utc::now()
+                .fixed_offset()
+                .timestamp_millis()
+                .saturating_add(20 * 60 * 1_000),
+        )
         .await;
 
     let (_workspace_id, turn) = crud_store
@@ -15854,8 +16271,8 @@ async fn cli_runtime_stale_db_only_running_binding_marks_turn_failed() {
         turn.error
             .as_deref()
             .unwrap_or_default()
-            .contains("did not emit any native events"),
-        "turn error should mention missing native events: {:?}",
+            .contains("marked failed"),
+        "turn error should describe the stale runtime failure: {:?}",
         turn.error
     );
     let thread = crud_store
