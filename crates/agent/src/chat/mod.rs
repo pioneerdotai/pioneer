@@ -98,6 +98,7 @@ use pioneer_tools::{
 };
 use serde_json::{Value as JsonValue, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -2800,6 +2801,16 @@ fn terminal_task_status_label(status: &str) -> bool {
     matches!(status, "completed" | "failed" | "cancelled")
 }
 
+fn workdir_from_execution_security_snapshot(
+    snapshot: Option<&TurnExecutionSecuritySnapshot>,
+) -> Result<PathBuf, ChatTurnError> {
+    snapshot
+        .map(|snapshot| PathBuf::from(snapshot.sandbox.cwd.as_str()))
+        .ok_or_else(|| {
+            ChatTurnError::Terminal("turn execution security snapshot is required".to_owned())
+        })
+}
+
 async fn execute_agent_provider_response(
     provider_registry: Arc<ProviderRegistry>,
     provider: &Arc<dyn Provider>,
@@ -2837,8 +2848,7 @@ async fn execute_agent_provider_response(
     message_item_id: &str,
     event_tx: Arc<AgentEventHub>,
 ) -> Result<ChatTurnOutcome, ChatTurnError> {
-    let workdir = std::env::current_dir()
-        .map_err(|error| ChatTurnError::Terminal(format!("failed to resolve cwd: {error}")))?;
+    let workdir = workdir_from_execution_security_snapshot(execution_security_snapshot.as_ref())?;
 
     let tool_loop_config = tool_loop_config.normalized();
     let provider_tool_calling = provider.capabilities().tool_calling && !disable_tool_calling;
@@ -5411,7 +5421,7 @@ mod tests {
         review_required_observation_payload, review_required_observation_signature,
         runtime_sections_with_artifact_reference_policy,
         runtime_sections_with_execution_continuation_context,
-        sync_review_action_tools_to_observations,
+        sync_review_action_tools_to_observations, workdir_from_execution_security_snapshot,
     };
     use crate::{
         ExecutionCheckpointContext, ResolvedArtifactInput, RetainedToolLlmContext,
@@ -5426,7 +5436,7 @@ mod tests {
         ExecutionCheckpointProviderBudgetSummary, ExecutionCheckpointToolSummary,
         ExecutionCheckpointWindowSummary, ExecutionWindowExhaustionReason, McpScopeKind,
         TurnCapability, TurnCapabilityAcceptedReason, TurnCapabilityKind,
-        TurnCapabilityRejectedReason, TurnItemType, UserInput,
+        TurnCapabilityRejectedReason, TurnExecutionSecuritySnapshot, TurnItemType, UserInput,
     };
     use pioneer_provider::{
         AttachmentDataSource, ChatMessage, InputContentType, MessageAttachment, MessageContentPart,
@@ -5460,6 +5470,20 @@ mod tests {
         ) -> Result<Box<dyn ToolOutput>, ToolError> {
             Ok(Box::new(FunctionToolOutput::new("ok", true)))
         }
+    }
+
+    #[test]
+    fn native_tool_workdir_comes_from_execution_security_snapshot() {
+        let snapshot =
+            TurnExecutionSecuritySnapshot::unrestricted_full_access("/tmp/pioneer-snapshot-cwd", 1);
+
+        let workdir = workdir_from_execution_security_snapshot(Some(&snapshot))
+            .expect("snapshot cwd should resolve");
+
+        assert_eq!(
+            workdir,
+            std::path::PathBuf::from("/tmp/pioneer-snapshot-cwd")
+        );
     }
 
     fn execution_checkpoint_context_fixture() -> ExecutionCheckpointContext {

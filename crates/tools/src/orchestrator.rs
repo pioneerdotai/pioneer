@@ -1319,21 +1319,31 @@ fn filesystem_access_requirements(
                 grant_access: TurnFilesystemAccess::Write,
             })
             .collect(),
-        PermissionActionKind::ShellCommand if invocation.tool_name == "exec_command" => intent
-            .scope
-            .entries
-            .get("cwd")
-            .map(|cwd| {
-                let cwd = normalize_path_lexically(PathBuf::from(cwd));
-                FilesystemAccessRequirement {
-                    requested_path: cwd.clone(),
-                    grant_root: cwd,
-                    operation: FilePolicyOperation::Write,
-                    grant_access: TurnFilesystemAccess::Write,
-                }
-            })
-            .into_iter()
-            .collect(),
+        PermissionActionKind::ShellCommand
+            if invocation.tool_name == "exec_command"
+                && matches!(
+                    &invocation.payload,
+                    crate::context::ToolPayload::LocalShell(
+                        crate::context::LocalShellPayload::ExecCommand(args)
+                    ) if args.workdir.as_deref().is_some_and(|workdir| !workdir.trim().is_empty())
+                ) =>
+        {
+            intent
+                .scope
+                .entries
+                .get("cwd")
+                .map(|cwd| {
+                    let cwd = normalize_path_lexically(PathBuf::from(cwd));
+                    FilesystemAccessRequirement {
+                        requested_path: cwd.clone(),
+                        grant_root: cwd,
+                        operation: FilePolicyOperation::Write,
+                        grant_access: TurnFilesystemAccess::Write,
+                    }
+                })
+                .into_iter()
+                .collect()
+        }
         PermissionActionKind::Network if invocation.tool_name == "download_url" => intent
             .scope
             .entries
@@ -2268,6 +2278,25 @@ mod tests {
         );
         assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn shell_without_explicit_workdir_does_not_expand_filesystem_write_access() {
+        let mut invocation = invocation_for_tool(
+            "exec_command",
+            ToolPayload::LocalShell(LocalShellPayload::ExecCommand(ExecCommandArgs {
+                command: Some(vec!["pwd".to_owned()]),
+                workdir: None,
+                timeout_ms: None,
+                max_output_tokens: None,
+                yield_time_ms: None,
+                tty: None,
+            })),
+        );
+        invocation.workdir = PathBuf::from("/");
+        let intent = extract_permission_intent(&invocation);
+
+        assert!(filesystem_access_requirements(&invocation, &intent).is_empty());
     }
 
     #[tokio::test]

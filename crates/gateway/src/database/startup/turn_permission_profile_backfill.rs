@@ -4,17 +4,24 @@ use pioneer_crud::{
     PROJECTION_META_STATUS_FAILED, ProjectionMetaRecord, find_projection_meta,
     upsert_projection_meta,
 };
-use pioneer_entity::turn_event;
+use pioneer_entity::{turn, turn_event};
+use pioneer_protocol::{
+    TaskAgentSecurityCap, TurnExecutionSecuritySnapshot, TurnFilesystemSandboxEntry,
+    TurnFilesystemSandboxPath, TurnNetworkPolicySnapshot, TurnPermissionMode,
+    TurnPermissionProfileSnapshot, TurnProcessPolicySnapshot, TurnSandboxMode,
+    TurnSecurityRuleProvenance, TurnSecuritySnapshotSource,
+};
 use sea_orm::{
     ActiveModelTrait, ConnectionTrait, DatabaseConnection, FromQueryResult, Set, Statement,
     entity::prelude::DateTimeWithTimeZone,
 };
 use serde_json::Value as JsonValue;
+use std::path::Path;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::info;
 
 const TURN_PERMISSION_PROFILE_BACKFILL_KEY: &str = "turn_permission_profile_payload_backfill";
-const TURN_PERMISSION_PROFILE_BACKFILL_VERSION: i64 = 1;
+const TURN_PERMISSION_PROFILE_BACKFILL_VERSION: i64 = 2;
 const TURN_PERMISSION_PROFILE_BACKFILL_BATCH_SIZE: u64 = 512;
 const TURN_PERMISSION_PROFILE_BACKFILL_YIELD_MS: u64 = 10;
 const DEFAULT_TURN_PERMISSION_PROFILE_MODE: &str = "full_access";
@@ -27,29 +34,48 @@ struct LegacyTurnEventPayload {
     payload: String,
 }
 
+#[derive(Debug, FromQueryResult)]
+struct LegacyFullAccessTurnSecuritySnapshot {
+    id: String,
+    permission_profile_snapshot_json: String,
+    created_at: DateTimeWithTimeZone,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct SyntheticWorkspaceTurnSecuritySnapshot {
+    id: String,
+    execution_security_snapshot_json: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct TurnPermissionProfileBackfillSummary {
     pub(crate) skipped: bool,
     pub(crate) batches: u64,
     pub(crate) turn_events_updated: u64,
     pub(crate) turns_updated: u64,
+    pub(crate) task_agent_caps_updated: u64,
+    pub(crate) security_snapshots_updated: u64,
+    pub(crate) security_snapshots_repaired: u64,
 }
 
-pub(super) async fn run(crud_store: &CrudStore) {
-    match backfill_once(crud_store).await {
+pub(super) async fn run(crud_store: &CrudStore, runtime_home: &Path) {
+    match backfill_once(crud_store, runtime_home).await {
         Ok(summary) if summary.skipped => {}
         Ok(summary) => {
             info!(
                 batches = summary.batches,
                 turn_events_updated = summary.turn_events_updated,
                 turns_updated = summary.turns_updated,
-                "turn permission profile payload backfill completed"
+                task_agent_caps_updated = summary.task_agent_caps_updated,
+                security_snapshots_updated = summary.security_snapshots_updated,
+                security_snapshots_repaired = summary.security_snapshots_repaired,
+                "turn permission profile and security snapshot backfill completed"
             );
         }
         Err(error) => {
             warn!(
                 error = %format!("{error:#}"),
-                "turn permission profile payload backfill failed at startup"
+                "turn permission profile  and security snapshot backfill failed at startup"
             );
         }
     }
@@ -57,6 +83,7 @@ pub(super) async fn run(crud_store: &CrudStore) {
 
 pub(crate) async fn backfill_once(
     crud_store: &CrudStore,
+    runtime_home: &Path,
 ) -> Result<TurnPermissionProfileBackfillSummary> {
     let db = crud_store.database_connection();
     if backfill_is_current(&db).await? {
@@ -86,7 +113,7 @@ pub(crate) async fn backfill_once(
     )
     .await?;
 
-    let result = backfill_all_batches(&db).await;
+    let result = backfill_all_batches(&db, runtime_home).await;
     match result {
         Ok(summary) => {
             mark_backfill_complete(&db, &summary).await?;
@@ -101,8 +128,12 @@ pub(crate) async fn backfill_once(
 
 async fn backfill_all_batches(
     db: &DatabaseConnection,
+    runtime_home: &Path,
 ) -> Result<TurnPermissionProfileBackfillSummary> {
     let mut summary = TurnPermissionProfileBackfillSummary::default();
+    let cwd = std::env::current_dir()
+        .context("failed to resolve gateway cwd for legacy turn security snapshots")?;
+    let cwd = cwd.to_string_lossy().into_owned();
 
     loop {
         let turn_events_updated = backfill_turn_event_batch(db)
@@ -111,8 +142,24 @@ async fn backfill_all_batches(
         let turns_updated = backfill_turn_batch(db)
             .await
             .context("failed to backfill turn permission profile columns")?;
+        let task_agent_caps_updated = backfill_task_agent_cap_batch(db)
+            .await
+            .context("failed to backfill task agent permission and security caps")?;
+        let security_snapshots_updated =
+            backfill_full_access_turn_security_snapshot_batch(db, cwd.as_str())
+                .await
+                .context("failed to backfill full access turn security snapshots")?;
+        let security_snapshots_repaired =
+            repair_synthetic_workspace_security_snapshot_batch(db, runtime_home, cwd.as_str())
+                .await
+                .context("failed to repair synthetic workspace paths in turn security snapshots")?;
 
-        if turn_events_updated == 0 && turns_updated == 0 {
+        if turn_events_updated == 0
+            && turns_updated == 0
+            && task_agent_caps_updated == 0
+            && security_snapshots_updated == 0
+            && security_snapshots_repaired == 0
+        {
             break;
         }
 
@@ -121,6 +168,15 @@ async fn backfill_all_batches(
             .turn_events_updated
             .saturating_add(turn_events_updated);
         summary.turns_updated = summary.turns_updated.saturating_add(turns_updated);
+        summary.task_agent_caps_updated = summary
+            .task_agent_caps_updated
+            .saturating_add(task_agent_caps_updated);
+        summary.security_snapshots_updated = summary
+            .security_snapshots_updated
+            .saturating_add(security_snapshots_updated);
+        summary.security_snapshots_repaired = summary
+            .security_snapshots_repaired
+            .saturating_add(security_snapshots_repaired);
 
         tokio::time::sleep(Duration::from_millis(
             TURN_PERMISSION_PROFILE_BACKFILL_YIELD_MS,
@@ -129,6 +185,194 @@ async fn backfill_all_batches(
     }
 
     Ok(summary)
+}
+
+async fn backfill_task_agent_cap_batch(db: &DatabaseConnection) -> Result<u64> {
+    let permission_cap =
+        pioneer_protocol::task_permission_cap_for_mode(TurnPermissionMode::FullAccess);
+    let security_cap = TaskAgentSecurityCap {
+        max_permission_profile: permission_cap.clone(),
+        max_filesystem_entries: Vec::new(),
+        max_network_policy: TurnNetworkPolicySnapshot::enabled(),
+        max_sandbox_mode: TurnSandboxMode::Unrestricted,
+        max_process_policy: TurnProcessPolicySnapshot::unrestricted(),
+    };
+    let permission_cap_json = serde_json::to_string(&permission_cap)
+        .context("failed to serialize legacy full access task permission cap")?;
+    let security_cap_json = serde_json::to_string(&security_cap)
+        .context("failed to serialize legacy full access task security cap")?;
+    let result = db
+        .execute_raw(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            format!(
+                "UPDATE task_agent_spec \
+                 SET permission_cap_json = COALESCE(permission_cap_json, ?), \
+                     security_cap_json = COALESCE(security_cap_json, ?) \
+                 WHERE id IN (\
+                    SELECT id FROM (\
+                        SELECT id \
+                        FROM task_agent_spec \
+                        WHERE permission_cap_json IS NULL \
+                           OR security_cap_json IS NULL \
+                        ORDER BY created_at, id \
+                        LIMIT {TURN_PERMISSION_PROFILE_BACKFILL_BATCH_SIZE}\
+                    )\
+                 )",
+            ),
+            vec![permission_cap_json.into(), security_cap_json.into()],
+        ))
+        .await
+        .context("failed to update legacy task agent caps")?;
+    Ok(result.rows_affected())
+}
+
+async fn repair_synthetic_workspace_security_snapshot_batch(
+    db: &DatabaseConnection,
+    runtime_home: &Path,
+    cwd: &str,
+) -> Result<u64> {
+    let workspace_segment = format!(
+        "{}workspaces{}",
+        std::path::MAIN_SEPARATOR,
+        std::path::MAIN_SEPARATOR
+    );
+    let candidates =
+        SyntheticWorkspaceTurnSecuritySnapshot::find_by_statement(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            format!(
+                "SELECT t.id, t.execution_security_snapshot_json \
+                 FROM turn AS t \
+                 JOIN thread AS th ON th.id = t.thread_id \
+                 WHERE t.execution_security_snapshot_json IS NOT NULL \
+                   AND json_extract(t.execution_security_snapshot_json, '$.sandbox.cwd') = ? || ? || th.workspace_id \
+                 ORDER BY t.created_at, t.id \
+                 LIMIT {TURN_PERMISSION_PROFILE_BACKFILL_BATCH_SIZE}",
+            ),
+            vec![
+                runtime_home.to_string_lossy().into_owned().into(),
+                workspace_segment.into(),
+            ],
+        ))
+        .all(db)
+        .await
+        .context("failed to list turn snapshots with synthetic workspace cwd")?;
+
+    let mut updated = 0_u64;
+    for candidate in candidates {
+        let mut snapshot: TurnExecutionSecuritySnapshot =
+            serde_json::from_str(candidate.execution_security_snapshot_json.as_str())
+                .with_context(|| {
+                    format!(
+                        "failed to decode security snapshot for turn `{}`",
+                        candidate.id
+                    )
+                })?;
+        let synthetic_cwd = snapshot.sandbox.cwd.clone();
+        snapshot.sandbox.cwd = cwd.to_owned();
+        for entry in &mut snapshot.sandbox.filesystem.entries {
+            repair_synthetic_workspace_entry(entry, synthetic_cwd.as_str(), cwd);
+        }
+        if let Some(parent_cap) = snapshot.parent_cap.as_mut() {
+            for entry in &mut parent_cap.max_filesystem_entries {
+                repair_synthetic_workspace_entry(entry, synthetic_cwd.as_str(), cwd);
+            }
+        }
+        let snapshot_version = i64::from(snapshot.version);
+        let snapshot_json = serde_json::to_string(&snapshot).with_context(|| {
+            format!(
+                "failed to serialize repaired security snapshot for turn `{}`",
+                candidate.id
+            )
+        })?;
+
+        turn::ActiveModel {
+            id: Set(candidate.id),
+            execution_security_snapshot_version: Set(Some(snapshot_version)),
+            execution_security_snapshot_json: Set(Some(snapshot_json)),
+            ..Default::default()
+        }
+        .update(db)
+        .await
+        .context("failed to update turn snapshot with repaired cwd")?;
+        updated = updated.saturating_add(1);
+    }
+
+    Ok(updated)
+}
+
+fn repair_synthetic_workspace_entry(
+    entry: &mut TurnFilesystemSandboxEntry,
+    synthetic_cwd: &str,
+    cwd: &str,
+) {
+    if entry.resolved_path.as_deref() != Some(synthetic_cwd) {
+        return;
+    }
+    entry.resolved_path = Some(cwd.to_owned());
+    if entry.path == TurnFilesystemSandboxPath::WorkspaceRoot {
+        entry.path = TurnFilesystemSandboxPath::CurrentWorkingDirectory;
+        entry.provenance = TurnSecurityRuleProvenance::Runtime;
+    }
+}
+
+async fn backfill_full_access_turn_security_snapshot_batch(
+    db: &DatabaseConnection,
+    cwd: &str,
+) -> Result<u64> {
+    let candidates =
+        LegacyFullAccessTurnSecuritySnapshot::find_by_statement(Statement::from_string(
+            db.get_database_backend(),
+            format!(
+                "SELECT id, permission_profile_snapshot_json, created_at \
+                 FROM turn \
+                 WHERE execution_security_snapshot_json IS NULL \
+                   AND permission_profile_mode = 'full_access' \
+                   AND permission_profile_snapshot_json IS NOT NULL \
+                 ORDER BY created_at, id \
+                 LIMIT {TURN_PERMISSION_PROFILE_BACKFILL_BATCH_SIZE}",
+            ),
+        ))
+        .all(db)
+        .await
+        .context("failed to list legacy full access turns without security snapshots")?;
+
+    let mut updated = 0_u64;
+    for candidate in candidates {
+        let permission_profile: TurnPermissionProfileSnapshot =
+            serde_json::from_str(candidate.permission_profile_snapshot_json.as_str())
+                .with_context(|| {
+                    format!(
+                        "failed to decode permission profile for legacy turn `{}`",
+                        candidate.id
+                    )
+                })?;
+        let mut snapshot = TurnExecutionSecuritySnapshot::unrestricted_full_access(
+            cwd,
+            candidate.created_at.timestamp_millis(),
+        );
+        snapshot.source = TurnSecuritySnapshotSource::BackfilledLegacy;
+        snapshot.permission_profile = permission_profile;
+        let snapshot_version = i64::from(snapshot.version);
+        let snapshot_json = serde_json::to_string(&snapshot).with_context(|| {
+            format!(
+                "failed to serialize security snapshot for legacy turn `{}`",
+                candidate.id
+            )
+        })?;
+
+        turn::ActiveModel {
+            id: Set(candidate.id),
+            execution_security_snapshot_version: Set(Some(snapshot_version)),
+            execution_security_snapshot_json: Set(Some(snapshot_json)),
+            ..Default::default()
+        }
+        .update(db)
+        .await
+        .context("failed to update legacy full access turn security snapshot")?;
+        updated = updated.saturating_add(1);
+    }
+
+    Ok(updated)
 }
 
 async fn backfill_turn_event_batch(db: &DatabaseConnection) -> Result<u64> {
@@ -245,7 +489,10 @@ async fn mark_backfill_complete(
             projection_version: TURN_PERMISSION_PROFILE_BACKFILL_VERSION,
             status: PROJECTION_META_STATUS_COMPLETE.to_owned(),
             source_thread_count: 0,
-            source_turn_count: summary.turns_updated as i64,
+            source_turn_count: summary
+                .turns_updated
+                .max(summary.security_snapshots_updated)
+                .max(summary.security_snapshots_repaired) as i64,
             source_turn_item_count: 0,
             source_turn_event_count: summary.turn_events_updated as i64,
             last_error: None,
@@ -345,14 +592,23 @@ fn has_non_null_field(object: &serde_json::Map<String, JsonValue>, field: &str) 
 
 #[cfg(test)]
 mod tests {
-    use super::{TURN_PERMISSION_PROFILE_BACKFILL_KEY, backfill_once, now_datetime};
+    use super::{
+        TURN_PERMISSION_PROFILE_BACKFILL_KEY, TURN_PERMISSION_PROFILE_BACKFILL_VERSION,
+        backfill_once, now_datetime,
+    };
     use anyhow::Context;
     use migration::{Migrator, MigratorTrait};
     use pioneer_crud::{
         CrudStore, PROJECTION_META_STATUS_COMPLETE, ProjectionMetaRecord, find_projection_meta,
         upsert_projection_meta,
     };
-    use pioneer_entity::{turn, turn_event};
+    use pioneer_entity::{task, task_agent_spec, thread, turn, turn_event, workspace};
+    use pioneer_protocol::{
+        TurnExecutionSecuritySnapshot, TurnFilesystemAccess, TurnFilesystemSandboxEntry,
+        TurnFilesystemSandboxKind, TurnFilesystemSandboxPath, TurnPermissionMode,
+        TurnPermissionProfileSnapshot, TurnPermissionProfileSource, TurnSandboxMode,
+        TurnSecuritySnapshotSource,
+    };
     use sea_orm::{Database, EntityTrait, Set};
     use sea_orm::{FromQueryResult, Statement};
     use serde_json::Value as JsonValue;
@@ -413,6 +669,22 @@ mod tests {
         Ok(row.map_or(0, |row| row.count))
     }
 
+    async fn count_missing_full_access_turn_security_snapshots(
+        db: &sea_orm::DatabaseConnection,
+    ) -> anyhow::Result<i64> {
+        let row = CandidateCount::find_by_statement(Statement::from_string(
+            db.get_database_backend(),
+            "SELECT COUNT(*) AS count \
+             FROM turn \
+             WHERE permission_profile_mode = 'full_access' \
+               AND execution_security_snapshot_json IS NULL",
+        ))
+        .one(db)
+        .await
+        .context("failed to count missing full access turn security snapshots")?;
+        Ok(row.map_or(0, |row| row.count))
+    }
+
     #[tokio::test]
     async fn startup_backfill_patches_legacy_permission_profiles_without_resetting_refill_marker() {
         let connection = Database::connect("sqlite::memory:")
@@ -423,13 +695,51 @@ mod tests {
             .expect("migrations must succeed");
 
         let store = CrudStore::new(connection.clone());
+        let runtime_home = tempfile::tempdir().expect("runtime home should create");
         let now = now_datetime();
         let turn_id = "turn_legacy_permission_profile";
+        let synthetic_turn_id = "turn_synthetic_workspace_snapshot";
+        let task_id = "task_legacy_agent_caps";
+        let thread_id = "thread_legacy_permission_profile";
+        let workspace_id = "workspace_legacy_permission_profile";
         let refill_key = "thread_episodic_workspace_capsule_refill";
+
+        workspace::Entity::insert(workspace::ActiveModel {
+            id: Set(workspace_id.to_owned()),
+            name: Set("Legacy workspace".to_owned()),
+            is_active: Set(true),
+            is_current: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+        })
+        .exec(&connection)
+        .await
+        .expect("workspace should insert");
+        thread::Entity::insert(thread::ActiveModel {
+            id: Set(thread_id.to_owned()),
+            workspace_id: Set(workspace_id.to_owned()),
+            name: Set(Some("Legacy thread".to_owned())),
+            preview: Set(String::new()),
+            mode: Set("agent".to_owned()),
+            model: Set("o4-mini".to_owned()),
+            model_provider: Set("openai".to_owned()),
+            status: Set("idle".to_owned()),
+            origin_kind: Set("user".to_owned()),
+            sidebar_visibility: Set("visible".to_owned()),
+            agent_nickname: Set(None),
+            agent_role: Set(None),
+            summary: Set(None),
+            summary_turn_count: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        })
+        .exec(&connection)
+        .await
+        .expect("thread should insert");
 
         turn::Entity::insert(turn::ActiveModel {
             id: Set(turn_id.to_owned()),
-            thread_id: Set("thread_legacy_permission_profile".to_owned()),
+            thread_id: Set(thread_id.to_owned()),
             status: Set("completed".to_owned()),
             error: Set(None),
             prompt_manifest_json: Set("{}".to_owned()),
@@ -452,6 +762,115 @@ mod tests {
         .exec(&connection)
         .await
         .expect("legacy turn should insert");
+
+        task::Entity::insert(task::ActiveModel {
+            id: Set(task_id.to_owned()),
+            workspace_id: Set(workspace_id.to_owned()),
+            owner_kind: Set("thread".to_owned()),
+            owner_id: Set(Some(thread_id.to_owned())),
+            created_by_thread_id: Set(Some(thread_id.to_owned())),
+            created_by_turn_id: Set(Some(turn_id.to_owned())),
+            root_task_id: Set(None),
+            parent_task_id: Set(None),
+            executor_kind: Set("agent".to_owned()),
+            status: Set("scheduled".to_owned()),
+            title: Set("Legacy task caps".to_owned()),
+            goal: Set("Verify legacy task cap backfill".to_owned()),
+            priority: Set(0),
+            lifecycle_policy_json: Set(None),
+            delivery_policy_json: Set(None),
+            retry_policy_json: Set(None),
+            timeout_policy_json: Set(None),
+            concurrency_policy_json: Set(None),
+            metadata_json: Set(None),
+            result_json: Set(None),
+            error_json: Set(None),
+            revision: Set(1),
+            created_at: Set(now),
+            updated_at: Set(now),
+            completed_at: Set(None),
+        })
+        .exec(&connection)
+        .await
+        .expect("legacy task should insert");
+        task_agent_spec::Entity::insert(task_agent_spec::ActiveModel {
+            id: Set("agent_spec_legacy_caps".to_owned()),
+            task_id: Set(task_id.to_owned()),
+            run_id: Set(None),
+            agent_role: Set(None),
+            agent_nickname: Set(None),
+            model: Set(Some("o4-mini".to_owned())),
+            model_provider: Set(Some("openai".to_owned())),
+            prompt_json: Set(serde_json::json!({
+                "goal": "Verify legacy task cap backfill",
+                "instructions": []
+            })
+            .to_string()),
+            context_policy_json: Set(None),
+            tool_policy_json: Set(None),
+            result_contract_json: Set(None),
+            review_policy_json: Set(None),
+            depth: Set(0),
+            max_depth: Set(4),
+            created_at: Set(now),
+            updated_at: Set(now),
+            permission_cap_json: Set(None),
+            security_cap_json: Set(None),
+        })
+        .exec(&connection)
+        .await
+        .expect("legacy task agent spec should insert");
+
+        let synthetic_cwd = runtime_home
+            .path()
+            .join("workspaces")
+            .join(workspace_id)
+            .to_string_lossy()
+            .into_owned();
+        let synthetic_profile = TurnPermissionProfileSnapshot::from_mode(
+            TurnPermissionMode::AutoAcceptEdits,
+            TurnPermissionProfileSource::Composer,
+        );
+        let synthetic_snapshot = TurnExecutionSecuritySnapshot::workspace_write(
+            synthetic_profile.clone(),
+            synthetic_cwd.clone(),
+            vec![TurnFilesystemSandboxEntry::workspace_root(
+                TurnFilesystemAccess::Write,
+                synthetic_cwd,
+            )],
+            now.timestamp_millis(),
+        );
+        turn::Entity::insert(turn::ActiveModel {
+            id: Set(synthetic_turn_id.to_owned()),
+            thread_id: Set(thread_id.to_owned()),
+            status: Set("completed".to_owned()),
+            error: Set(None),
+            prompt_manifest_json: Set("{}".to_owned()),
+            prompt_compiler_version: Set(None),
+            prompt_profile: Set(None),
+            prompt_fingerprint_stable: Set(None),
+            prompt_fingerprint_dynamic: Set(None),
+            prompt_fingerprint_full: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            turn_kind: Set("conversation".to_owned()),
+            origin: Set("user".to_owned()),
+            reasoning_effort: Set(None),
+            permission_profile_mode: Set(Some("auto_accept_edits".to_owned())),
+            permission_profile_source: Set(Some("composer".to_owned())),
+            permission_profile_snapshot_json: Set(Some(
+                serde_json::to_string(&synthetic_profile)
+                    .expect("synthetic permission profile should serialize"),
+            )),
+            execution_security_snapshot_version: Set(Some(1)),
+            execution_security_snapshot_json: Set(Some(
+                serde_json::to_string(&synthetic_snapshot)
+                    .expect("synthetic security snapshot should serialize"),
+            )),
+        })
+        .exec(&connection)
+        .await
+        .expect("turn with synthetic workspace snapshot should insert");
 
         turn_event::Entity::insert(turn_event::ActiveModel {
             id: Set("evt_legacy_permission_profile".to_owned()),
@@ -552,10 +971,34 @@ mod tests {
         )
         .await
         .expect("refill marker should insert");
-        let summary = backfill_once(&store).await.expect("backfill should run");
+        upsert_projection_meta(
+            &connection,
+            ProjectionMetaRecord {
+                projection_key: TURN_PERMISSION_PROFILE_BACKFILL_KEY.to_owned(),
+                projection_version: 1,
+                status: PROJECTION_META_STATUS_COMPLETE.to_owned(),
+                source_thread_count: 0,
+                source_turn_count: 1,
+                source_turn_item_count: 0,
+                source_turn_event_count: 2,
+                last_error: None,
+                backfill_started_at: Some(now),
+                backfilled_at: Some(now),
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("version one backfill marker should insert");
+        let summary = backfill_once(&store, runtime_home.path())
+            .await
+            .expect("backfill should run");
         assert!(!summary.skipped);
         assert_eq!(summary.turn_events_updated, 2);
         assert_eq!(summary.turns_updated, 1);
+        assert_eq!(summary.task_agent_caps_updated, 1);
+        assert_eq!(summary.security_snapshots_updated, 1);
+        assert_eq!(summary.security_snapshots_repaired, 1);
 
         assert_eq!(
             count_missing_turn_event_permission_profiles(&connection)
@@ -569,6 +1012,36 @@ mod tests {
                 .expect("must count turn candidates"),
             0
         );
+        assert_eq!(
+            count_missing_full_access_turn_security_snapshots(&connection)
+                .await
+                .expect("must count security snapshot candidates"),
+            0
+        );
+
+        let task = store
+            .get_task(task_id)
+            .await
+            .expect("legacy task should load")
+            .expect("legacy task should exist");
+        let agent_spec = task
+            .agent_specs
+            .first()
+            .expect("legacy task agent spec should load");
+        let permission_cap = agent_spec
+            .permission_cap
+            .as_ref()
+            .expect("permission cap should be backfilled");
+        let security_cap = agent_spec
+            .security_cap
+            .as_ref()
+            .expect("security cap should be backfilled");
+        assert_eq!(permission_cap.mode, TurnPermissionMode::FullAccess);
+        assert_eq!(
+            security_cap.max_permission_profile.mode,
+            TurnPermissionMode::FullAccess
+        );
+        assert_eq!(security_cap.max_sandbox_mode, TurnSandboxMode::Unrestricted);
 
         let event = turn_event::Entity::find_by_id("evt_legacy_permission_profile".to_owned())
             .one(&connection)
@@ -619,6 +1092,66 @@ mod tests {
         assert_eq!(turn.permission_profile_mode.as_deref(), Some("full_access"));
         assert_eq!(turn.permission_profile_source.as_deref(), Some("defaulted"));
         assert!(turn.permission_profile_snapshot_json.is_some());
+        assert_eq!(turn.execution_security_snapshot_version, Some(1));
+        let snapshot: TurnExecutionSecuritySnapshot = serde_json::from_str(
+            turn.execution_security_snapshot_json
+                .as_deref()
+                .expect("security snapshot should be backfilled"),
+        )
+        .expect("security snapshot should decode");
+        assert_eq!(
+            snapshot.source,
+            TurnSecuritySnapshotSource::BackfilledLegacy
+        );
+        assert_eq!(
+            snapshot.permission_profile.mode,
+            TurnPermissionMode::FullAccess
+        );
+        assert_eq!(
+            snapshot.sandbox.filesystem.kind,
+            TurnFilesystemSandboxKind::Unrestricted
+        );
+        assert_eq!(
+            snapshot.sandbox.cwd,
+            std::env::current_dir()
+                .expect("test cwd should resolve")
+                .to_string_lossy()
+                .into_owned()
+        );
+
+        let synthetic_turn = turn::Entity::find_by_id(synthetic_turn_id.to_owned())
+            .one(&connection)
+            .await
+            .expect("synthetic turn should load")
+            .expect("synthetic turn should exist");
+        let synthetic_snapshot: TurnExecutionSecuritySnapshot = serde_json::from_str(
+            synthetic_turn
+                .execution_security_snapshot_json
+                .as_deref()
+                .expect("repaired snapshot should remain present"),
+        )
+        .expect("repaired snapshot should decode");
+        assert_eq!(
+            synthetic_snapshot.sandbox.cwd,
+            std::env::current_dir()
+                .expect("test cwd should resolve")
+                .to_string_lossy()
+                .into_owned()
+        );
+        let repaired_entry = synthetic_snapshot
+            .sandbox
+            .filesystem
+            .entries
+            .first()
+            .expect("repaired restricted snapshot should keep its cwd entry");
+        assert_eq!(
+            repaired_entry.path,
+            TurnFilesystemSandboxPath::CurrentWorkingDirectory
+        );
+        assert_eq!(
+            repaired_entry.resolved_path.as_deref(),
+            Some(synthetic_snapshot.sandbox.cwd.as_str())
+        );
 
         let refill_meta = find_projection_meta(&connection, refill_key)
             .await
@@ -631,9 +1164,12 @@ mod tests {
             .expect("own meta should query")
             .expect("own marker should exist");
         assert_eq!(own_meta.status, PROJECTION_META_STATUS_COMPLETE);
-        assert_eq!(own_meta.projection_version, 1);
+        assert_eq!(
+            own_meta.projection_version,
+            TURN_PERMISSION_PROFILE_BACKFILL_VERSION
+        );
 
-        let skipped = backfill_once(&store)
+        let skipped = backfill_once(&store, runtime_home.path())
             .await
             .expect("second backfill should skip");
         assert!(skipped.skipped);

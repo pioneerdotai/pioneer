@@ -29,7 +29,7 @@ pub(crate) fn spawn(
 ) {
     let _handle = tokio::spawn(async move {
         task_anchor_backfill::run(crud_store.as_ref()).await;
-        turn_permission_profile_backfill::run(crud_store.as_ref()).await;
+        turn_permission_profile_backfill::run(crud_store.as_ref(), runtime_home.as_path()).await;
         timeline_pagination_backfill::run(crud_store.as_ref()).await;
         agent_diff_event_compaction::run(crud_store.as_ref()).await;
         cli_runtime_native_event_compaction::run(crud_store.as_ref()).await;

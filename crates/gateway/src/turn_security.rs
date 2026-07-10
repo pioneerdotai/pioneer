@@ -59,7 +59,7 @@ impl TurnSecurityResolverExecutionBackend {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TurnSecurityResolverInputContext {
     pub workspace_id: String,
-    pub workspace_root: Option<PathBuf>,
+    pub cwd: Option<PathBuf>,
     pub project_roots: Vec<PathBuf>,
     pub app_read_roots: Vec<PathBuf>,
     pub effective_model_provider: String,
@@ -74,7 +74,7 @@ pub(crate) struct TurnSecurityResolverInput {
     pub workspace_id: String,
     pub thread_id: String,
     pub turn_id: String,
-    pub workspace_root: PathBuf,
+    pub cwd: PathBuf,
     pub project_roots: Vec<PathBuf>,
     pub app_read_roots: Vec<PathBuf>,
     pub composer_permission_selection: Option<TurnPermissionProfileSelection>,
@@ -93,7 +93,7 @@ impl TurnSecurityResolverInput {
         let thread_id = required_trimmed("thread_id", params.thread_id.as_str())?;
         let turn_id = required_trimmed("turn_id", params.turn_id.as_str())?;
         let workspace_id = required_trimmed("workspace_id", context.workspace_id.as_str())?;
-        let workspace_root = required_path("workspace_root", context.workspace_root)?;
+        let cwd = required_path("cwd", context.cwd)?;
         let project_roots = context
             .project_roots
             .into_iter()
@@ -113,7 +113,7 @@ impl TurnSecurityResolverInput {
             workspace_id,
             thread_id,
             turn_id,
-            workspace_root,
+            cwd,
             project_roots,
             app_read_roots,
             composer_permission_selection: params.permission_profile.clone(),
@@ -131,7 +131,7 @@ pub(crate) fn resolve_turn_execution_security(
 ) -> Result<TurnExecutionSecuritySnapshot> {
     let mode = effective_permission_mode(input);
     let permission_profile = input.resolved_permission_profile.clone();
-    let cwd = input.workspace_root.to_string_lossy().into_owned();
+    let cwd = input.cwd.to_string_lossy().into_owned();
     let created_at_unix_ms = input.created_at_unix_ms;
 
     let mut snapshot = match mode {
@@ -171,6 +171,7 @@ pub(crate) fn task_security_cap_from_snapshot(
 }
 
 pub(crate) fn resolve_task_child_execution_security(
+    workspace_id: &str,
     parent_turn_id: &str,
     parent_snapshot: &TurnExecutionSecuritySnapshot,
     task_cap: &TaskAgentSecurityCap,
@@ -250,10 +251,10 @@ pub(crate) fn resolve_task_child_execution_security(
     });
 
     let resolver_input = TurnSecurityResolverInput {
-        workspace_id: parent_snapshot.sandbox.cwd.clone(),
+        workspace_id: workspace_id.to_owned(),
         thread_id: child_thread_id,
         turn_id: child_turn_id,
-        workspace_root: PathBuf::from(cwd),
+        cwd: PathBuf::from(cwd),
         project_roots: Vec::new(),
         app_read_roots: Vec::new(),
         composer_permission_selection: None,
@@ -508,9 +509,9 @@ fn filesystem_entries(
 ) -> Vec<TurnFilesystemSandboxEntry> {
     let mut entries =
         Vec::with_capacity(1 + input.project_roots.len() + input.app_read_roots.len());
-    entries.push(TurnFilesystemSandboxEntry::workspace_root(
+    entries.push(TurnFilesystemSandboxEntry::current_working_directory(
         access,
-        input.workspace_root.to_string_lossy().into_owned(),
+        input.cwd.to_string_lossy().into_owned(),
     ));
     for project_root in &input.project_roots {
         entries.push(TurnFilesystemSandboxEntry {
@@ -539,7 +540,7 @@ fn task_cap_filesystem_entries(
     snapshot: &TurnExecutionSecuritySnapshot,
 ) -> Vec<TurnFilesystemSandboxEntry> {
     if snapshot.sandbox.filesystem.kind == TurnFilesystemSandboxKind::Unrestricted {
-        vec![TurnFilesystemSandboxEntry::workspace_root(
+        vec![TurnFilesystemSandboxEntry::current_working_directory(
             TurnFilesystemAccess::Write,
             snapshot.sandbox.cwd.clone(),
         )]
@@ -928,7 +929,7 @@ mod tests {
     fn context() -> TurnSecurityResolverInputContext {
         TurnSecurityResolverInputContext {
             workspace_id: "workspace_1".to_owned(),
-            workspace_root: Some(PathBuf::from("/tmp/workspace_1")),
+            cwd: Some(PathBuf::from("/tmp/workspace_1")),
             project_roots: vec![PathBuf::from("/tmp/workspace_1/project")],
             app_read_roots: Vec::new(),
             effective_model_provider: "openai".to_owned(),
@@ -967,7 +968,7 @@ mod tests {
         assert_eq!(input.workspace_id, "workspace_1");
         assert_eq!(input.thread_id, "thread_1");
         assert_eq!(input.turn_id, "turn_1");
-        assert_eq!(input.workspace_root, PathBuf::from("/tmp/workspace_1"));
+        assert_eq!(input.cwd, PathBuf::from("/tmp/workspace_1"));
         assert_eq!(
             input.project_roots,
             vec![PathBuf::from("/tmp/workspace_1/project")]
@@ -991,7 +992,7 @@ mod tests {
     }
 
     #[test]
-    fn security_resolver_input_rejects_missing_workspace_root() {
+    fn security_resolver_input_rejects_missing_cwd() {
         let params = TurnStartParams {
             thread_id: "thread_1".to_owned(),
             turn_id: "turn_1".to_owned(),
@@ -1007,12 +1008,12 @@ mod tests {
             cli_runtime_options: None,
         };
         let mut context = context();
-        context.workspace_root = None;
+        context.cwd = None;
 
         let error = TurnSecurityResolverInput::from_turn_start_params(&params, context)
             .expect_err("missing workspace root should fail");
         assert!(
-            format!("{error:#}").contains("workspace_root is required"),
+            format!("{error:#}").contains("cwd is required"),
             "unexpected error: {error:#}"
         );
     }
@@ -1166,14 +1167,15 @@ mod tests {
 
         let snapshot = resolve_turn_execution_security(&input).expect("snapshot should resolve");
 
-        let workspace_entry = snapshot
+        let cwd_entry = snapshot
             .sandbox
             .filesystem
             .entries
             .iter()
-            .find(|entry| entry.provenance == TurnSecurityRuleProvenance::Workspace)
-            .expect("workspace root should be included");
-        assert_eq!(workspace_entry.access, TurnFilesystemAccess::Write);
+            .find(|entry| entry.path == TurnFilesystemSandboxPath::CurrentWorkingDirectory)
+            .expect("cwd root should be included");
+        assert_eq!(cwd_entry.access, TurnFilesystemAccess::Write);
+        assert_eq!(cwd_entry.provenance, TurnSecurityRuleProvenance::Runtime);
 
         let app_entry = snapshot
             .sandbox
@@ -1794,6 +1796,7 @@ mod tests {
         );
 
         let snapshot = resolve_task_child_execution_security(
+            "workspace_1",
             "parent_turn",
             &parent,
             &cap,
@@ -1834,6 +1837,7 @@ mod tests {
         );
 
         let snapshot = resolve_task_child_execution_security(
+            "workspace_1",
             "parent_turn",
             &parent,
             &cap,
@@ -1874,6 +1878,7 @@ mod tests {
         )];
 
         let error = resolve_task_child_execution_security(
+            "workspace_1",
             "parent_turn",
             &parent,
             &cap,
@@ -1909,6 +1914,7 @@ mod tests {
         cap.max_network_policy = pioneer_protocol::TurnNetworkPolicySnapshot::enabled();
 
         let error = resolve_task_child_execution_security(
+            "workspace_1",
             "parent_turn",
             &parent,
             &cap,
@@ -1945,6 +1951,7 @@ mod tests {
         cap.max_process_policy.shell.enabled = true;
 
         let error = resolve_task_child_execution_security(
+            "workspace_1",
             "parent_turn",
             &parent,
             &cap,
@@ -1967,7 +1974,7 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let outside = tempfile::tempdir().expect("outside tempdir");
         let mut context = context();
-        context.workspace_root = Some(workspace.path().to_path_buf());
+        context.cwd = Some(workspace.path().to_path_buf());
         context.project_roots = Vec::new();
         context.resolved_permission_profile = TurnPermissionProfileSnapshot::from_mode(
             TurnPermissionMode::AutoAcceptEdits,

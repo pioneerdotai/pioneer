@@ -3,7 +3,7 @@ use pioneer_cli_agent_runtime::claude::ClaudeAccountProbeConfig;
 use pioneer_cli_agent_runtime::codex::CodexAccountProbeConfig;
 use pioneer_config::{AppConfig, EffectiveGatewayCliAgentRuntimeInstanceConfig};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 pub(crate) fn load_effective_cli_runtime_instances(
@@ -90,12 +90,6 @@ pub(crate) fn proxy_env(proxy_url: Option<&str>) -> BTreeMap<String, String> {
     env.insert("NO_PROXY".to_owned(), no_proxy.to_owned());
     env.insert("no_proxy".to_owned(), no_proxy.to_owned());
     env
-}
-
-pub(crate) fn current_process_cwd() -> Result<String> {
-    let cwd: PathBuf =
-        std::env::current_dir().context("failed to resolve current working directory")?;
-    Ok(cwd.to_string_lossy().into_owned())
 }
 
 #[cfg(test)]

@@ -846,21 +846,7 @@ impl MessageProcessor {
                 &context_bundle,
                 cli_runtime_context_label(runtime_kind),
             );
-            let native_cwd = match crate::cli_runtime::config::current_process_cwd() {
-                Ok(cwd) => cwd,
-                Err(error) => {
-                    self.mark_turn_blocked(
-                        outcome.started_notification.thread_id.clone(),
-                        outcome.started_notification.turn.id.clone(),
-                        format!("failed to resolve CLI runtime cwd: {error:#}"),
-                    )
-                    .await;
-                    send_turn_start_failure!(format!(
-                        "failed to resolve CLI runtime cwd: {error:#}"
-                    ));
-                    return;
-                }
-            };
+            let native_cwd = security_snapshot.sandbox.cwd.clone();
             let proxy_env = crate::cli_runtime::config::proxy_env(proxy_url.as_deref());
             let session_handle = match manager
                 .get_or_start_with_options(
@@ -1325,9 +1311,11 @@ impl MessageProcessor {
                 )
             })?;
         let workspace_id = outcome.started_notification.workspace_id.clone();
+        let cwd = std::env::current_dir()
+            .map_err(|error| format!("failed to resolve turn cwd: {error}"))?;
         let input_context = crate::turn_security::TurnSecurityResolverInputContext {
             workspace_id: workspace_id.clone(),
-            workspace_root: Some(self.turn_security_workspace_root(workspace_id.as_str())),
+            cwd: Some(cwd),
             project_roots: Vec::new(),
             app_read_roots: self.turn_security_app_read_roots(),
             effective_model_provider: outcome.materialization.thread.model_provider.clone(),
@@ -1528,12 +1516,6 @@ impl MessageProcessor {
             reason: None,
             cached: false,
         }
-    }
-
-    fn turn_security_workspace_root(&self, workspace_id: &str) -> std::path::PathBuf {
-        self.artifact_runtime_home
-            .join("workspaces")
-            .join(workspace_id)
     }
 
     fn turn_security_app_read_roots(&self) -> Vec<std::path::PathBuf> {

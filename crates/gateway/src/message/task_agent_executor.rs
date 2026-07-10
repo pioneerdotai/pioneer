@@ -318,6 +318,7 @@ impl TaskAgentExecutor {
         };
         let child_security_snapshot = match resolve_task_child_execution_security_snapshot(
             processor,
+            context.workspace_id.as_str(),
             parent,
             agent_spec,
             turn_permission_profile.clone(),
@@ -804,6 +805,7 @@ impl TaskAgentExecutor {
         };
         let child_security_snapshot = match resolve_task_child_execution_security_snapshot(
             processor,
+            task.workspace_id.as_str(),
             &parent,
             agent_spec,
             turn_permission_profile.clone(),
@@ -1934,6 +1936,7 @@ impl TaskAgentExecutor {
         };
         let child_security_snapshot = match resolve_task_child_execution_security_snapshot(
             processor,
+            task.workspace_id.as_str(),
             &parent,
             agent_spec,
             turn_permission_profile.clone(),
@@ -2413,6 +2416,7 @@ async fn ensure_task_run_occurrence_context(
     let effective_model = effective_agent_model(agent_spec)?;
     let occurrence_security_snapshot = resolve_task_child_execution_security_snapshot(
         processor,
+        task_response.task.workspace_id.as_str(),
         &parent,
         agent_spec,
         permission_profile.clone(),
@@ -3448,6 +3452,7 @@ fn effective_task_child_permission_profile(
 
 async fn resolve_task_child_execution_security_snapshot(
     processor: &Arc<MessageProcessor>,
+    workspace_id: &str,
     parent: &TaskParentRuntimeContext,
     agent_spec: &TaskAgentSpec,
     child_permission_profile: TurnPermissionProfileSnapshot,
@@ -3481,6 +3486,7 @@ async fn resolve_task_child_execution_security_snapshot(
         .snapshot;
 
     crate::turn_security::resolve_task_child_execution_security(
+        workspace_id,
         parent_turn_id,
         &parent_snapshot,
         security_cap,

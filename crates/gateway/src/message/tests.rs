@@ -13948,6 +13948,26 @@ async fn turn_start_security_snapshot_native_turn_is_persisted_before_dispatch()
         persisted.snapshot.enforcement,
         pioneer_protocol::TurnSecurityEnforcementStatus::Active
     );
+    let expected_cwd = std::env::current_dir()
+        .expect("gateway test cwd should resolve")
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(persisted.snapshot.sandbox.cwd, expected_cwd);
+    let cwd_entry = persisted
+        .snapshot
+        .sandbox
+        .filesystem
+        .entries
+        .first()
+        .expect("restricted snapshot should include cwd root");
+    assert_eq!(
+        cwd_entry.path,
+        pioneer_protocol::TurnFilesystemSandboxPath::CurrentWorkingDirectory
+    );
+    assert_eq!(
+        cwd_entry.resolved_path.as_deref(),
+        Some(persisted.snapshot.sandbox.cwd.as_str())
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -14268,6 +14288,7 @@ async fn codex_cli_runtime_supervised_sets_read_only_permissions_profile() {
     );
     assert_eq!(thread_starts[0].sandbox.as_ref(), None);
     assert_eq!(thread_starts[0].permissions.as_deref(), Some(":read-only"));
+    let cli_cwd = thread_starts[0].cwd.clone();
     drop(thread_starts);
 
     let persisted =
@@ -14289,6 +14310,7 @@ async fn codex_cli_runtime_supervised_sets_read_only_permissions_profile() {
         persisted.snapshot.enforcement,
         pioneer_protocol::TurnSecurityEnforcementStatus::Active
     );
+    assert_eq!(cli_cwd, persisted.snapshot.sandbox.cwd);
 }
 
 #[tokio::test]

@@ -573,6 +573,18 @@ pub struct TurnFilesystemSandboxEntry {
 }
 
 impl TurnFilesystemSandboxEntry {
+    pub fn current_working_directory(
+        access: TurnFilesystemAccess,
+        resolved_path: impl Into<String>,
+    ) -> Self {
+        Self {
+            path: TurnFilesystemSandboxPath::CurrentWorkingDirectory,
+            access,
+            provenance: TurnSecurityRuleProvenance::Runtime,
+            resolved_path: Some(resolved_path.into()),
+        }
+    }
+
     pub fn workspace_root(access: TurnFilesystemAccess, resolved_path: impl Into<String>) -> Self {
         Self {
             path: TurnFilesystemSandboxPath::WorkspaceRoot,
