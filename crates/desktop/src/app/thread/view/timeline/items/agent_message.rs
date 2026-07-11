@@ -1,3 +1,4 @@
+use super::super::markdown::CodeHighlightPolicy;
 use super::format_elapsed;
 use crate::{
     app::{
@@ -50,6 +51,7 @@ impl PioneerDesktop {
             .unwrap_or_default();
 
         let copy_text = text.to_owned();
+        let code_highlight_policy = CodeHighlightPolicy::for_timeline_status(item_view.status);
 
         let is_commentary = matches!(
             item,
@@ -62,9 +64,9 @@ impl PioneerDesktop {
         if is_task_timeline_agent_message(item_view) {
             let body_element =
                 if let Some(document) = markdown.or(item_view.partial_markdown.as_ref()) {
-                    self.render_markdown_document(document, cx)
+                    self.render_markdown_document(document, code_highlight_policy, cx)
                 } else {
-                    self.render_markdown_auto(text, None, cx)
+                    self.render_markdown_auto(text, None, CodeHighlightPolicy::Disabled, cx)
                 };
             let elapsed_label = format_elapsed(item_view);
             let open = self
@@ -174,9 +176,9 @@ impl PioneerDesktop {
                 .group(format!("agent-message-{}", item_view.id))
                 .child(div().w_full().overflow_hidden().child(
                     if let Some(document) = markdown.or(item_view.partial_markdown.as_ref()) {
-                        self.render_markdown_document(document, cx)
+                        self.render_markdown_document(document, code_highlight_policy, cx)
                     } else {
-                        self.render_markdown_auto(text, None, cx)
+                        self.render_markdown_auto(text, None, CodeHighlightPolicy::Disabled, cx)
                     },
                 ))
                 .when(!is_commentary, |this| {

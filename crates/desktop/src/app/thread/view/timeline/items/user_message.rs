@@ -1,3 +1,4 @@
+use super::super::markdown::CodeHighlightPolicy;
 use crate::app::{
     conversation::{ItemView, TimelineEntry},
     root::PioneerDesktop,
@@ -84,6 +85,7 @@ impl PioneerDesktop {
                             this.child(self.render_markdown_auto(
                                 raw_text,
                                 item_view.partial_markdown.as_ref(),
+                                CodeHighlightPolicy::Disabled,
                                 cx,
                             ))
                         })),

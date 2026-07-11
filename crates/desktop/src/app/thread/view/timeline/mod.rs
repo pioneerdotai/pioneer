@@ -1,3 +1,4 @@
+mod code_highlighting;
 mod items;
 mod markdown;
 pub(crate) mod model;

@@ -1,3 +1,4 @@
+use super::super::markdown::CodeHighlightPolicy;
 use super::{format_elapsed, format_elapsed_ms, now_unix_ms};
 use crate::{
     app::{
@@ -32,8 +33,13 @@ impl PioneerDesktop {
 
         let has_body = !body.trim().is_empty();
 
-        let body_element =
-            self.render_markdown_auto(body.as_str(), item_view.partial_markdown.as_ref(), cx);
+        let code_highlight_policy = CodeHighlightPolicy::for_timeline_status(item_view.status);
+        let body_element = self.render_markdown_auto(
+            body.as_str(),
+            item_view.partial_markdown.as_ref(),
+            code_highlight_policy,
+            cx,
+        );
 
         let elapsed_label = format_elapsed(item_view);
         let running_elapsed_label = item_view

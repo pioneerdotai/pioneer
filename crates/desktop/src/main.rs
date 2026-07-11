@@ -6,6 +6,7 @@ i18n!("locales", fallback = "en");
 mod app;
 mod assets;
 mod audio;
+mod code_highlight;
 mod components;
 mod gateway;
 mod menu;

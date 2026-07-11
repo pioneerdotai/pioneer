@@ -154,6 +154,7 @@ impl PioneerDesktop {
             thread_timeline_view_state: RefCell::new(ThreadTimelineViewState::default()),
             thread_timeline_item_expanded: RefCell::new(HashSet::new()),
             thread_timeline_terminal_item: RefCell::new(HashMap::new()),
+            code_highlight_cache: RefCell::new(DesktopCodeHighlightCache::default()),
             semantic_timelines: SemanticTimelineState::default(),
             semantic_timeline_revision: 0,
             semantic_timeline_in_flight: HashSet::new(),

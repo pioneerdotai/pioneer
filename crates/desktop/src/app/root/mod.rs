@@ -19,6 +19,7 @@ use crate::{
         },
         microphone::DesktopMicrophoneGateReport,
     },
+    code_highlight::DesktopCodeHighlightCache,
     gateway::{ClientRuntime, GatewayRuntime, GatewayWsCommandSender},
 };
 pub(super) use desktop_update::DesktopUpdateUiState;
@@ -365,6 +366,7 @@ pub struct PioneerDesktop {
     pub(super) thread_timeline_view_state: RefCell<ThreadTimelineViewState>,
     pub(super) thread_timeline_item_expanded: RefCell<HashSet<String>>,
     pub(super) thread_timeline_terminal_item: RefCell<HashMap<String, CachedTimelineTerminal>>,
+    pub(super) code_highlight_cache: RefCell<DesktopCodeHighlightCache>,
     pub(super) semantic_timelines: SemanticTimelineState,
     pub(super) semantic_timeline_revision: u64,
     pub(super) semantic_timeline_in_flight: HashSet<SemanticTimelineRequestKey>,

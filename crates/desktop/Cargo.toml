@@ -37,6 +37,9 @@ rust-embed.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
 image.workspace = true
 cpal.workspace = true
+syntect.workspace = true
+two-face.workspace = true
+unicode-width.workspace = true
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

@@ -1,6 +1,7 @@
 use crate::app::PioneerDesktop;
 use gpui::{prelude::*, *};
-use gpui_component::{StyledExt, h_flex, theme::ActiveTheme, v_flex};
+use gpui_component::{StyledExt, clipboard::Clipboard, h_flex, theme::ActiveTheme, v_flex};
+use pioneer_client::conversation::TimelineEntryStatus;
 use pioneer_protocol::{
     MarkdownBlock, MarkdownDocument, MarkdownInline, MarkdownList, MarkdownMark, MarkdownMarkKind,
 };
@@ -12,15 +13,32 @@ enum MarkdownTextVariant {
     Heading(u8),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CodeHighlightPolicy {
+    Disabled,
+    FinalMessage,
+}
+
+impl CodeHighlightPolicy {
+    pub(super) fn for_timeline_status(status: TimelineEntryStatus) -> Self {
+        if status == TimelineEntryStatus::Completed {
+            Self::FinalMessage
+        } else {
+            Self::Disabled
+        }
+    }
+}
+
 impl PioneerDesktop {
     pub(super) fn render_markdown_auto(
         &self,
         text: &str,
         document: Option<&MarkdownDocument>,
+        code_highlight_policy: CodeHighlightPolicy,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if let Some(document) = document {
-            self.render_markdown_document(document, cx)
+            self.render_markdown_document(document, code_highlight_policy, cx)
         } else {
             self.render_markdown_plain(text, cx)
         }
@@ -40,6 +58,7 @@ impl PioneerDesktop {
     pub(super) fn render_markdown_document(
         &self,
         document: &MarkdownDocument,
+        code_highlight_policy: CodeHighlightPolicy,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if document.blocks.is_empty() {
@@ -57,7 +76,7 @@ impl PioneerDesktop {
             if top_spacing > px(0.) {
                 content = content.child(div().w_full().h(top_spacing));
             }
-            content = content.child(self.render_markdown_block(block, cx));
+            content = content.child(self.render_markdown_block(block, code_highlight_policy, cx));
             previous_block = Some(block);
         }
         content.into_any_element()
@@ -83,7 +102,12 @@ impl PioneerDesktop {
         px(8.)
     }
 
-    fn render_markdown_block(&self, block: &MarkdownBlock, cx: &mut Context<Self>) -> AnyElement {
+    fn render_markdown_block(
+        &self,
+        block: &MarkdownBlock,
+        code_highlight_policy: CodeHighlightPolicy,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         match block {
             MarkdownBlock::Paragraph(inline) => {
                 self.render_markdown_inline(inline, MarkdownTextVariant::Paragraph, cx)
@@ -91,11 +115,16 @@ impl PioneerDesktop {
             MarkdownBlock::Heading { level, content } => {
                 self.render_markdown_inline(content, MarkdownTextVariant::Heading(*level), cx)
             }
-            MarkdownBlock::List(list) => self.render_markdown_list(list, cx),
-            MarkdownBlock::Quote { blocks } => self.render_markdown_quote(blocks, cx),
-            MarkdownBlock::Code { language, text } => {
-                self.render_markdown_code_block(language.as_deref(), text.as_str(), cx)
+            MarkdownBlock::List(list) => self.render_markdown_list(list, code_highlight_policy, cx),
+            MarkdownBlock::Quote { blocks } => {
+                self.render_markdown_quote(blocks, code_highlight_policy, cx)
             }
+            MarkdownBlock::Code { language, text } => self.render_markdown_code_block(
+                language.as_deref(),
+                text.as_str(),
+                code_highlight_policy,
+                cx,
+            ),
             MarkdownBlock::Rule => div()
                 .w_full()
                 .h(px(1.))
@@ -180,7 +209,12 @@ impl PioneerDesktop {
         }
     }
 
-    fn render_markdown_list(&self, list: &MarkdownList, cx: &mut Context<Self>) -> AnyElement {
+    fn render_markdown_list(
+        &self,
+        list: &MarkdownList,
+        code_highlight_policy: CodeHighlightPolicy,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let mut rows = v_flex().w_full().overflow_hidden().gap_1();
         for (index, item) in list.items.iter().enumerate() {
             let prefix = if let Some(checked) = item.checked {
@@ -197,7 +231,8 @@ impl PioneerDesktop {
 
             let mut content = v_flex().w_full().gap_2();
             for block in &item.blocks {
-                content = content.child(self.render_markdown_block(block, cx));
+                content =
+                    content.child(self.render_markdown_block(block, code_highlight_policy, cx));
             }
 
             rows = rows.child(
@@ -224,19 +259,18 @@ impl PioneerDesktop {
     fn render_markdown_quote(
         &self,
         blocks: &[MarkdownBlock],
+        code_highlight_policy: CodeHighlightPolicy,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let mut content = v_flex().w_full().gap_2();
         for block in blocks {
-            content = content.child(self.render_markdown_block(block, cx));
+            content = content.child(self.render_markdown_block(block, code_highlight_policy, cx));
         }
 
         div()
             .w_full()
             .overflow_hidden()
             .bg(cx.theme().muted.opacity(0.5))
-            .border_1()
-            .border_color(cx.theme().border)
             .rounded_2xl()
             .p_3()
             .child(content)
@@ -247,41 +281,92 @@ impl PioneerDesktop {
         &self,
         language: Option<&str>,
         text: &str,
+        code_highlight_policy: CodeHighlightPolicy,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let mut body = v_flex().w_full().gap_2();
-        if let Some(language) = language.filter(|language| !language.trim().is_empty()) {
-            body = body.child(
+        let language_label = sanitized_language_label(language);
+        let clipboard_id = code_block_clipboard_id(language_label.as_deref(), text);
+        let header = h_flex()
+            .w_full()
+            .h(px(20.))
+            .items_center()
+            .justify_between()
+            .child(
                 div()
                     .text_xs()
                     .opacity(0.65)
                     .line_height(relative(1.1))
-                    .child(language.trim().to_owned()),
+                    .when_some(language_label, |this, language| this.child(language)),
+            )
+            .child(
+                div()
+                    .opacity(0.65)
+                    .child(Clipboard::new(clipboard_id).value(text.to_owned())),
             );
-        }
-        let code_text = if text.is_empty() { " " } else { text };
+        let mut body = v_flex().w_full().gap_2().child(header);
+        let styled_code = match code_highlight_policy {
+            CodeHighlightPolicy::Disabled => {
+                StyledText::new(SharedString::new(Arc::<str>::from(text)))
+            }
+            CodeHighlightPolicy::FinalMessage => {
+                self.render_code_highlighted_text(text, language, cx)
+            }
+        };
         body = body.child(
             div()
                 .w_full()
+                .min_h(px(20.))
                 .overflow_hidden()
+                // In GPUI `WhiteSpace::Normal` controls soft wrapping; it does not rewrite the
+                // `StyledText` source. This keeps newlines/tabs copyable while avoiding nested
+                // horizontal-scroll arbitration inside the virtualized timeline.
                 .whitespace_normal()
                 .text_sm()
                 .line_height(relative(1.45))
                 .font_family("monospace")
-                .child(code_text.to_owned()),
+                .child(styled_code),
         );
 
         div()
             .w_full()
             .overflow_hidden()
-            .bg(cx.theme().muted.opacity(0.65))
-            .border_1()
-            .border_color(cx.theme().border)
+            .bg(cx.theme().muted.opacity(0.75))
             .rounded_2xl()
             .p_3()
             .child(body)
             .into_any_element()
     }
+}
+
+fn code_block_clipboard_id(language: Option<&str>, text: &str) -> SharedString {
+    use std::{
+        collections::hash_map::DefaultHasher,
+        hash::{Hash, Hasher},
+    };
+
+    let mut hasher = DefaultHasher::new();
+    language.hash(&mut hasher);
+    text.hash(&mut hasher);
+    SharedString::from(format!("copy-code-block-{:016x}", hasher.finish()))
+}
+
+fn sanitized_language_label(language: Option<&str>) -> Option<String> {
+    let token = language?
+        .trim_matches(|character: char| character.is_ascii_whitespace())
+        .split_ascii_whitespace()
+        .next()?;
+    if token.is_empty() {
+        return None;
+    }
+    let mut end = token.len().min(64);
+    while !token.is_char_boundary(end) {
+        end -= 1;
+    }
+    let label: String = token[..end]
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    (!label.is_empty()).then_some(label)
 }
 
 fn normalize_mark_range(text: &str, mark: &MarkdownMark) -> (usize, usize) {
@@ -323,4 +408,50 @@ fn snap_to_char_boundary_forward(text: &str, mut index: usize) -> usize {
         index += 1;
     }
     index
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CodeHighlightPolicy, sanitized_language_label};
+    use pioneer_client::conversation::TimelineEntryStatus;
+
+    #[test]
+    fn code_highlighting_is_limited_to_completed_timeline_items() {
+        assert_eq!(
+            CodeHighlightPolicy::for_timeline_status(TimelineEntryStatus::Completed),
+            CodeHighlightPolicy::FinalMessage
+        );
+        for status in [
+            TimelineEntryStatus::Running,
+            TimelineEntryStatus::Failed,
+            TimelineEntryStatus::Cancelled,
+            TimelineEntryStatus::Blocked,
+        ] {
+            assert_eq!(
+                CodeHighlightPolicy::for_timeline_status(status),
+                CodeHighlightPolicy::Disabled
+            );
+        }
+    }
+
+    #[test]
+    fn code_highlight_language_label_is_single_token_control_free_and_byte_bounded() {
+        assert_eq!(
+            sanitized_language_label(Some("  rust metadata\nignored")),
+            Some("rust".to_owned())
+        );
+        assert_eq!(sanitized_language_label(Some("\n\t")), None);
+        assert!(
+            sanitized_language_label(Some(&"x".repeat(80)))
+                .unwrap()
+                .len()
+                <= 64
+        );
+        assert!(
+            sanitized_language_label(Some(&"界".repeat(30)))
+                .unwrap()
+                .len()
+                <= 64
+        );
+    }
 }
