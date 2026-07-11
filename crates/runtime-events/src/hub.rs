@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::future::Future;
 
 use pioneer_protocol::{AgentDurableEvent, AgentProgressEvent, TurnItemType};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
@@ -36,7 +37,7 @@ impl Error for ExecutionEventHubError {}
 
 #[derive(Debug)]
 struct DurableEventEnvelope {
-    event: AgentDurableEvent,
+    event: Box<AgentDurableEvent>,
     committed_tx: Option<oneshot::Sender<Result<(), String>>>,
 }
 
@@ -56,7 +57,7 @@ impl DurableEventReceiver {
         ));
         let envelope = self.inner.recv().await?;
         self.pending_commit = envelope.committed_tx;
-        Some(envelope.event)
+        Some(*envelope.event)
     }
 
     pub fn acknowledge_last(&mut self, result: Result<(), String>) {
@@ -113,29 +114,32 @@ impl ExecutionEventHub {
         }
     }
 
-    pub async fn publish_durable(
+    pub fn publish_durable(
         &self,
         event: AgentDurableEvent,
-    ) -> Result<(), ExecutionEventHubError> {
-        self.publish_durable_envelope(event, None).await
+    ) -> impl Future<Output = Result<(), ExecutionEventHubError>> + Send + '_ {
+        self.publish_durable_envelope(Box::new(event), None)
     }
 
-    pub async fn publish_durable_and_wait(
+    pub fn publish_durable_and_wait(
         &self,
         event: AgentDurableEvent,
-    ) -> Result<(), ExecutionEventHubError> {
-        let (committed_tx, committed_rx) = oneshot::channel();
-        self.publish_durable_envelope(event, Some(committed_tx))
-            .await?;
-        committed_rx
-            .await
-            .map_err(|_| ExecutionEventHubError::CommitAcknowledgementDropped)?
-            .map_err(ExecutionEventHubError::CommitRejected)
+    ) -> impl Future<Output = Result<(), ExecutionEventHubError>> + Send + '_ {
+        let event = Box::new(event);
+        async move {
+            let (committed_tx, committed_rx) = oneshot::channel();
+            self.publish_durable_envelope(event, Some(committed_tx))
+                .await?;
+            committed_rx
+                .await
+                .map_err(|_| ExecutionEventHubError::CommitAcknowledgementDropped)?
+                .map_err(ExecutionEventHubError::CommitRejected)
+        }
     }
 
     async fn publish_durable_envelope(
         &self,
-        event: AgentDurableEvent,
+        event: Box<AgentDurableEvent>,
         committed_tx: Option<oneshot::Sender<Result<(), String>>>,
     ) -> Result<(), ExecutionEventHubError> {
         self.flush_progress_for_durable(&event).await;
