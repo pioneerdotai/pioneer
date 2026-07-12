@@ -318,20 +318,7 @@ fn desktop_qa_size_matrix_highlights_within_cap_and_falls_back_above_it() {
 fn desktop_theme_token_colors_keep_readable_contrast() {
     let source = "fn main() { let message = \"hello\"; println!(\"{message}\"); }\n";
     for theme_id in [CodeThemeId::Light, CodeThemeId::Dark] {
-        let background = match theme_id {
-            CodeThemeId::Light => syntect::highlighting::Color {
-                r: 0xf5,
-                g: 0xf5,
-                b: 0xf5,
-                a: 0xff,
-            },
-            CodeThemeId::Dark => syntect::highlighting::Color {
-                r: 0x26,
-                g: 0x26,
-                b: 0x26,
-                a: 0xff,
-            },
-        };
+        let background = super::theme::render_background(theme_id);
         let code = highlighted(source, "rust", theme_id);
         for span in code.spans {
             let contrast = contrast_ratio(span.foreground, background);

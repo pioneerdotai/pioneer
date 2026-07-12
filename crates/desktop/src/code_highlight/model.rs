@@ -1,6 +1,6 @@
 use std::{fmt, ops::Range};
 
-pub(crate) const HIGHLIGHT_ENGINE_REVISION: u16 = 1;
+pub(crate) const HIGHLIGHT_ENGINE_REVISION: u16 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum CodeThemeId {

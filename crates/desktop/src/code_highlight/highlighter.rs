@@ -14,6 +14,7 @@ use super::{
 };
 
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
+const MIN_TOKEN_CONTRAST: f64 = 3.0;
 
 pub(crate) fn highlight_code(
     source: &str,
@@ -73,7 +74,11 @@ pub(crate) fn highlight_code(
             if source.get(start..end) != Some(token) {
                 return Err(HighlightError::SourceReconstruction);
             }
-            push_merged_span(&mut spans, start..end, rgba(style.foreground));
+            push_merged_span(
+                &mut spans,
+                start..end,
+                readable_foreground(style.foreground, theme_id),
+            );
             if spans.len() > limits.max_spans {
                 return Ok(HighlightOutcome::Fallback(
                     HighlightFallbackReason::SpanLimit,
@@ -104,13 +109,78 @@ fn resolve_syntax(syntaxes: &SyntaxSet, language: CanonicalLanguage) -> Option<&
         .and_then(|token| syntaxes.find_syntax_by_token(token))
 }
 
-fn rgba(color: Color) -> Rgba8 {
-    Rgba8 {
+fn readable_foreground(color: Color, theme_id: CodeThemeId) -> Rgba8 {
+    let background = super::theme::render_background(theme_id);
+    let original = Rgba8 {
         red: color.r,
         green: color.g,
         blue: color.b,
         alpha: color.a,
+    };
+    if contrast_ratio(original, background) >= MIN_TOKEN_CONTRAST {
+        return original;
     }
+
+    let target = if relative_luminance(background.r, background.g, background.b) > 0.5 {
+        0
+    } else {
+        255
+    };
+    let mut low = 1u16;
+    let mut high = 255u16;
+    while low < high {
+        let amount = (low + high) / 2;
+        let candidate = mix_toward(original, target, amount);
+        if contrast_ratio(candidate, background) >= MIN_TOKEN_CONTRAST {
+            high = amount;
+        } else {
+            low = amount + 1;
+        }
+    }
+    mix_toward(original, target, low)
+}
+
+fn mix_toward(color: Rgba8, target: u8, amount: u16) -> Rgba8 {
+    fn channel(value: u8, target: u8, amount: u16) -> u8 {
+        let value = u16::from(value);
+        let target = u16::from(target);
+        let mixed = if target >= value {
+            value + ((target - value) * amount + 127) / 255
+        } else {
+            value - ((value - target) * amount + 127) / 255
+        };
+        mixed as u8
+    }
+
+    Rgba8 {
+        red: channel(color.red, target, amount),
+        green: channel(color.green, target, amount),
+        blue: channel(color.blue, target, amount),
+        alpha: color.alpha,
+    }
+}
+
+fn contrast_ratio(foreground: Rgba8, background: Color) -> f64 {
+    let foreground = relative_luminance(foreground.red, foreground.green, foreground.blue);
+    let background = relative_luminance(background.r, background.g, background.b);
+    let (lighter, darker) = if foreground >= background {
+        (foreground, background)
+    } else {
+        (background, foreground)
+    };
+    (lighter + 0.05) / (darker + 0.05)
+}
+
+fn relative_luminance(red: u8, green: u8, blue: u8) -> f64 {
+    fn channel(value: u8) -> f64 {
+        let value = f64::from(value) / 255.0;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    0.2126 * channel(red) + 0.7152 * channel(green) + 0.0722 * channel(blue)
 }
 
 fn push_merged_span(spans: &mut Vec<HighlightSpan>, range: std::ops::Range<usize>, color: Rgba8) {
