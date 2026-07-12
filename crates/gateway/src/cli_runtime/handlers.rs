@@ -2776,6 +2776,7 @@ impl MessageProcessor {
         let native_turn_id_label = native_turn_id.unwrap_or("<none>");
         let native_thread_id = cli_runtime_native_thread_id_for_event(&event);
         let event_label = cli_runtime_event_log_label(&event);
+        let terminal_status = cli_runtime_turn_status_for_terminal_event(&event);
         if !self
             .cli_runtime_turn_binding_accepts_native_activity(
                 key,
@@ -2804,7 +2805,7 @@ impl MessageProcessor {
         };
         let event_hub = self.ensure_cli_runtime_execution_event_hub(key).await;
         let projected = crate::cli_runtime::projector::project_cli_runtime_event(&context, &event);
-        if cli_runtime_turn_status_for_terminal_event(&event).is_some()
+        if terminal_status.is_some()
             && let Some(native_turn_id) = native_turn_id
         {
             self.commit_cli_runtime_final_diff_snapshot(key, &turn_binding, native_turn_id)
@@ -2822,6 +2823,14 @@ impl MessageProcessor {
                     error = %error,
                     "failed to commit CLI runtime durable event"
                 );
+                if let Some(status) = terminal_status {
+                    self.cleanup_cli_runtime_terminal_turn_status(
+                        &turn_binding,
+                        status,
+                        event_label.as_str(),
+                    )
+                    .await;
+                }
                 return false;
             }
         }
@@ -2835,6 +2844,14 @@ impl MessageProcessor {
                     event = %event_label,
                     "failed to enqueue CLI runtime snapshot because execution hub is closed"
                 );
+                if let Some(status) = terminal_status {
+                    self.cleanup_cli_runtime_terminal_turn_status(
+                        &turn_binding,
+                        status,
+                        event_label.as_str(),
+                    )
+                    .await;
+                }
                 return false;
             }
         }
@@ -2843,7 +2860,7 @@ impl MessageProcessor {
         }
         self.update_cli_runtime_command_item_registry(key, &turn_binding, &event)
             .await;
-        if cli_runtime_turn_status_for_terminal_event(&event).is_some() {
+        if terminal_status.is_some() {
             match self
                 .cli_runtime_turn_status_for_binding(&turn_binding)
                 .await
