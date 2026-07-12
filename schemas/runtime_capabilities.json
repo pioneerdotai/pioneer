@@ -48,6 +48,10 @@
     "supports_review": {
       "type": "boolean"
     },
+    "supports_skills": {
+      "type": "boolean",
+      "default": false
+    },
     "supports_steer": {
       "type": "boolean"
     },

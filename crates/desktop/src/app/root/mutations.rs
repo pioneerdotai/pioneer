@@ -117,7 +117,7 @@ impl PioneerDesktop {
         let value =
             composer_draft::normalize_composer_draft_text(&self.composer_state.read(cx).value());
         let attachments = self.composer_attachments.clone();
-        let capabilities = self.composer_capabilities.clone();
+        let capabilities = self.effective_composer_capabilities();
         let permission_mode = self.composer_permission_mode;
         composer_draft::remember_thread_composer_draft(
             thread_id.as_str(),
@@ -159,13 +159,18 @@ impl PioneerDesktop {
             state.set_value(draft.text.clone(), window, cx)
         });
         self.composer_permission_mode = draft.permission_mode;
-        if self.composer_selected_provider_is_cli_runtime() {
-            self.composer_attachments = draft.attachments;
-            self.composer_capabilities.clear();
-        } else {
-            self.composer_attachments = draft.attachments;
-            self.composer_capabilities = draft.capabilities;
+        self.composer_attachments = draft.attachments;
+        let target = self.composer_capability_target();
+        let filtered =
+            pioneer_client::composer::capabilities::filter_composer_capabilities_for_target(
+                draft.capabilities.as_slice(),
+                target,
+            );
+        if filtered.len() != draft.capabilities.len() {
+            self.composer_upload_error =
+                Some(t!("chat.composer.capabilities_removed_for_provider").to_string());
         }
+        self.composer_capabilities = filtered;
     }
 
     pub(in crate::app) fn activate_thread_with_draft_restore(

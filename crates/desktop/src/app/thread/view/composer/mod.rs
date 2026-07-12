@@ -25,7 +25,7 @@ impl PioneerDesktop {
         }
 
         let composer_text = self.composer_state.read(cx).value();
-        let cli_runtime_selected = self.composer_selected_provider_is_cli_runtime();
+        let effective_capabilities = self.effective_composer_capabilities();
         can_submit_composer_message(ComposerSubmitAvailabilityInput {
             gateway_connected: self.gateway.connection_state == GatewayConnectionState::Connected,
             upload_in_progress: self.composer_upload_in_progress,
@@ -36,7 +36,7 @@ impl PioneerDesktop {
                 .is_some_and(|conversation| conversation.can_submit_message()),
             text: composer_text.as_str(),
             has_attachments: !self.composer_attachments.is_empty(),
-            has_capabilities: !cli_runtime_selected && !self.composer_capabilities.is_empty(),
+            has_capabilities: !effective_capabilities.is_empty(),
         })
     }
 }

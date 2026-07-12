@@ -4,6 +4,7 @@ _version = 1
 placeholder = "सहायक को संदेश भेजें"
 stop_reason = "उपयोगकर्ता ने टर्न रद्द किया"
 steer_cli_runtime = "चल रहे CLI टर्न को भेजें"
+capabilities_removed_for_provider = "कुछ क्षमताएँ इस प्रदाता के लिए उपलब्ध नहीं हैं और हटा दी गईं।"
 
 [chat.composer.mode]
 agent_label = "एजेंट"

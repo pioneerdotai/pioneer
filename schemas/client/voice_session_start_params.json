@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "VoiceSessionStartParams",
+  "type": "object",
+  "properties": {
+    "audio_format": {
+      "$ref": "#/$defs/VoiceAudioFormat"
+    },
+    "context": {
+      "$ref": "#/$defs/VoiceSessionStartContext"
+    }
+  },
+  "required": [
+    "context",
+    "audio_format"
+  ],
+  "$defs": {
+    "VoiceAudioEncoding": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "pcm_s16_le"
+          ]
+        },
+        {
+          "description": "Reserved for future client adapters. The initial gateway intake\ncontract accepts only `pcm_s16le`.",
+          "type": "string",
+          "const": "pcm_f32_le"
+        }
+      ]
+    },
+    "VoiceAudioFormat": {
+      "description": "Audio format metadata for a voice session.\n\nThis is control metadata only. It does not carry audio bytes.",
+      "type": "object",
+      "properties": {
+        "channels": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "encoding": {
+          "$ref": "#/$defs/VoiceAudioEncoding"
+        },
+        "sample_rate_hz": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "sample_rate_hz",
+        "channels",
+        "encoding"
+      ]
+    },
+    "VoiceSessionStartContext": {
+      "description": "Minimal context required to route and own a streaming voice session.\n\nFull turn materialization context is provided on commit/finalize so clients can\nstart microphone streaming before slower attachment/capability preparation.",
+      "type": "object",
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        },
+        "turn_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "thread_id",
+        "turn_id"
+      ]
+    }
+  }
+}

@@ -197,12 +197,16 @@ fn claude_process_config_from_instance(
         "stdio".to_owned(),
         "--permission-mode".to_owned(),
         permission_mode.clone(),
-        "--setting-sources=".to_owned(),
+        if options.enable_user_skills {
+            "--setting-sources=user".to_owned()
+        } else {
+            "--setting-sources=".to_owned()
+        },
         "--include-partial-messages".to_owned(),
         "--input-format".to_owned(),
         "stream-json".to_owned(),
     ];
-    if permission_mode != "bypassPermissions" {
+    if !options.enable_user_skills && permission_mode != "bypassPermissions" {
         args.push("--safe-mode".to_owned());
     }
     args.extend(instance.app_server_args.clone());
@@ -1582,6 +1586,7 @@ done
                 approval_policy: Some("acceptEdits".to_owned()),
                 app_server_args: Vec::new(),
                 env: Default::default(),
+                enable_user_skills: false,
             },
         )
         .expect("config should build");
@@ -1604,6 +1609,7 @@ done
                 approval_policy: Some("bypassPermissions".to_owned()),
                 app_server_args: Vec::new(),
                 env: Default::default(),
+                enable_user_skills: false,
             },
         )
         .expect("config should build");
@@ -1631,6 +1637,7 @@ done
                     approval_policy: Some(permission_mode.to_owned()),
                     app_server_args: Vec::new(),
                     env: Default::default(),
+                    enable_user_skills: false,
                 },
             )
             .expect("config should build");
@@ -1643,6 +1650,78 @@ done
                 has_arg(config.args.as_slice(), "--safe-mode"),
                 "restricted Claude mode `{permission_mode}` should keep safe-mode"
             );
+        }
+    }
+
+    #[test]
+    fn claude_process_config_skill_enabled_mode_uses_complete_user_source() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config_dir = temp_dir.path().join("effective-config");
+        for relative in [
+            "settings.json",
+            "hooks/hook.json",
+            "commands/command.md",
+            "agents/agent.md",
+            "rules/rule.md",
+            "CLAUDE.md",
+            "skills/unrelated/SKILL.md",
+        ] {
+            let path = config_dir.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, relative).unwrap();
+        }
+        let mut instance =
+            claude_instance(temp_dir.path().join("home").to_string_lossy().into_owned());
+        instance.shadow_home_path = Some(config_dir.to_string_lossy().into_owned());
+
+        for permission_mode in ["default", "acceptEdits", "bypassPermissions"] {
+            let normal = claude_process_config_from_instance(
+                &instance,
+                &CLIAgentRuntimeSessionStartOptions {
+                    approval_policy: Some(permission_mode.to_owned()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let enabled = claude_process_config_from_instance(
+                &instance,
+                &CLIAgentRuntimeSessionStartOptions {
+                    approval_policy: Some(permission_mode.to_owned()),
+                    enable_user_skills: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            assert!(has_arg(&normal.args, "--setting-sources="));
+            assert!(!has_arg(&normal.args, "--setting-sources=user"));
+            assert!(has_arg(&enabled.args, "--setting-sources=user"));
+            assert!(!has_arg(&enabled.args, "--setting-sources="));
+            assert!(!has_arg(&enabled.args, "--safe-mode"));
+            assert_eq!(
+                arg_value_after(&enabled.args, "--permission-mode").as_deref(),
+                Some(permission_mode)
+            );
+            assert_eq!(normal.executable, enabled.executable);
+            assert_eq!(normal.cwd, enabled.cwd);
+            assert_eq!(normal.home_path, enabled.home_path);
+            assert_eq!(normal.env, enabled.env);
+            assert_eq!(
+                enabled.env.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+                Some(config_dir.to_string_lossy().as_ref())
+            );
+        }
+
+        for relative in [
+            "settings.json",
+            "hooks/hook.json",
+            "commands/command.md",
+            "agents/agent.md",
+            "rules/rule.md",
+            "CLAUDE.md",
+            "skills/unrelated/SKILL.md",
+        ] {
+            assert!(config_dir.join(relative).exists());
         }
     }
 
@@ -1690,6 +1769,115 @@ done
                 },
             ])
         );
+    }
+
+    #[test]
+    fn claude_prompt_from_input_keeps_native_skill_directive_as_text() {
+        let directive = "Before completing the user's task, invoke every selected skill through Claude's native Skill tool in this order: pdf, slides.";
+        let content = claude_prompt_from_input(json!([
+            { "type": "text", "text": directive },
+            { "type": "text", "text": "Create the report" }
+        ]))
+        .unwrap();
+        assert_eq!(
+            content,
+            json!([
+                { "type": "text", "text": directive },
+                { "type": "text", "text": "Create the report" }
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_skill_fake_stream_preserves_directive_tree_and_zero_skill_regression() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config_dir = temp_dir.path().join("custom-claude-config");
+        let installed = config_dir.join("skills/proposal-51-sentinel");
+        std::fs::create_dir_all(installed.join("references")).unwrap();
+        std::fs::write(installed.join("SKILL.md"), b"# sentinel\n").unwrap();
+        std::fs::write(
+            installed.join("references/guide.txt"),
+            b"CLAUDE SUPPORTING FILE SENTINEL\n",
+        )
+        .unwrap();
+        let mut instance = claude_instance(temp_dir.path().join("home").to_string_lossy().into());
+        instance.shadow_home_path = Some(config_dir.to_string_lossy().into_owned());
+        let skill_config = claude_process_config_from_instance(
+            &instance,
+            &CLIAgentRuntimeSessionStartOptions {
+                cwd: Some(temp_dir.path().join("workspace")),
+                approval_policy: Some("acceptEdits".to_owned()),
+                enable_user_skills: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let zero_config = claude_process_config_from_instance(
+            &instance,
+            &CLIAgentRuntimeSessionStartOptions {
+                cwd: Some(temp_dir.path().join("workspace")),
+                approval_policy: Some("acceptEdits".to_owned()),
+                enable_user_skills: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(has_arg(&skill_config.args, "--setting-sources=user"));
+        assert!(!has_arg(&skill_config.args, "--safe-mode"));
+        assert!(has_arg(&zero_config.args, "--setting-sources="));
+        assert!(has_arg(&zero_config.args, "--safe-mode"));
+        assert_eq!(skill_config.executable, zero_config.executable);
+        assert_eq!(skill_config.cwd, zero_config.cwd);
+        assert_eq!(
+            skill_config
+                .env
+                .get("CLAUDE_CONFIG_DIR")
+                .map(String::as_str),
+            Some(config_dir.to_string_lossy().as_ref())
+        );
+
+        let directive = "Before completing the user's task, invoke every selected skill through Claude's native Skill tool in this order: proposal-51-sentinel.";
+        let log_path = temp_dir.path().join("claude-skill-jsonl.log");
+        let (client, mut child) = fake_claude_stream_client(log_path.as_path()).await;
+        client
+            .start_turn(
+                "claude-thread".to_owned(),
+                "claude-skill-turn".to_owned(),
+                None,
+                None,
+                json!([
+                    { "type": "text", "text": directive },
+                    { "type": "text", "text": "Create the report" }
+                ]),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        client
+            .start_turn(
+                "claude-thread".to_owned(),
+                "claude-zero-turn".to_owned(),
+                None,
+                None,
+                json!([{ "type": "text", "text": "Ordinary follow-up" }]),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+
+        let lines = wait_logged_json_lines(log_path.as_path(), 2).await;
+        let skill_line = serde_json::to_string(&lines[0]).unwrap();
+        let zero_line = serde_json::to_string(&lines[1]).unwrap();
+        assert!(skill_line.contains("proposal-51-sentinel"));
+        assert!(skill_line.contains("Create the report"));
+        assert!(!zero_line.contains("native Skill tool"));
+        assert!(zero_line.contains("Ordinary follow-up"));
+        assert_eq!(
+            std::fs::read(installed.join("references/guide.txt")).unwrap(),
+            b"CLAUDE SUPPORTING FILE SENTINEL\n"
+        );
+
+        let _ = child.kill().await;
     }
 
     #[tokio::test]

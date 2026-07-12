@@ -4,6 +4,7 @@ _version = 1
 placeholder = "向助手发送消息"
 stop_reason = "用户取消了回合"
 steer_cli_runtime = "发送到正在运行的 CLI 回合"
+capabilities_removed_for_provider = "部分功能不适用于此提供商，已被移除。"
 
 [chat.composer.mode]
 agent_label = "智能体"

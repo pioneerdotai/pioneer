@@ -14,6 +14,7 @@ use gpui_component::{
     theme::ActiveTheme,
     *,
 };
+use pioneer_client::composer::capabilities::ComposerCapabilityTarget;
 
 const COMPOSER_ATTACHMENT_TEXT_FADE_WIDTH: Pixels = px(24.);
 
@@ -21,12 +22,11 @@ impl PioneerDesktop {
     pub(crate) fn render_composer(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let composer_state = self.composer_state.clone();
         let attachments = self.composer_attachments.clone();
-        let capabilities = self.composer_capabilities.clone();
+        let capabilities = self.effective_composer_capabilities();
         let upload_error = self.composer_upload_error.clone();
         let microphone_error = self.desktop_microphone_error_message();
         let task_child_locked = self.active_task_thread_navigation().is_some();
         let can_send = self.can_submit_message(cx);
-        let cli_runtime_selected = self.composer_selected_provider_is_cli_runtime();
         let active_thread_snapshot = self.client_snapshot().active_thread;
         let gateway_connected =
             self.gateway.connection_state == crate::app::root::GatewayConnectionState::Connected;
@@ -115,8 +115,7 @@ impl PioneerDesktop {
                                 .bg(cx.theme().background)
                                 .rounded_t_2xl()
                                 .when(
-                                    !attachments.is_empty()
-                                        || (!cli_runtime_selected && !capabilities.is_empty()),
+                                    !attachments.is_empty() || !capabilities.is_empty(),
                                     |this| this.child(self.render_composer_chip_badges(cx)),
                                 )
                                 .when_some(upload_error, |this, error| {
@@ -262,7 +261,7 @@ impl PioneerDesktop {
         let disabled = self.composer_upload_in_progress
             || self.active_task_thread_navigation().is_some()
             || self.desktop_voice_context_locked();
-        let cli_runtime_selected = self.composer_selected_provider_is_cli_runtime();
+        let capability_target = self.composer_capability_target();
 
         Button::new("composer-add-attachment")
             .small()
@@ -285,9 +284,7 @@ impl PioneerDesktop {
                     },
                 ));
 
-                if cli_runtime_selected {
-                    menu
-                } else {
+                let menu = if capability_target != ComposerCapabilityTarget::UnsupportedCli {
                     menu.item(Self::composer_add_menu_item(
                         t!("chat.composer.add_menu.skills").to_string().into(),
                         PioneerIconName::Zap,
@@ -301,7 +298,12 @@ impl PioneerDesktop {
                             }
                         },
                     ))
-                    .item(Self::composer_add_menu_item(
+                } else {
+                    menu
+                };
+
+                if capability_target == ComposerCapabilityTarget::Native {
+                    menu.item(Self::composer_add_menu_item(
                         t!("chat.composer.add_menu.mcp").to_string().into(),
                         PioneerIconName::Mcp,
                         {
@@ -314,6 +316,8 @@ impl PioneerDesktop {
                             }
                         },
                     ))
+                } else {
+                    menu
                 }
             })
             .into_any_element()
@@ -347,16 +351,15 @@ impl PioneerDesktop {
                     start_index: row_index * 3,
                     items: chunk.to_vec(),
                 });
-        let cli_runtime_selected = self.composer_selected_provider_is_cli_runtime();
-        let capability_rows = self
-            .composer_capabilities
-            .chunks(3)
-            .enumerate()
-            .filter(move |_| !cli_runtime_selected)
-            .map(|(row_index, chunk)| ComposerChipRow::Capabilities {
-                start_index: row_index * 3,
-                items: chunk.to_vec(),
-            });
+        let effective_capabilities = self.effective_composer_capabilities();
+        let capability_rows =
+            effective_capabilities
+                .chunks(3)
+                .enumerate()
+                .map(|(row_index, chunk)| ComposerChipRow::Capabilities {
+                    start_index: row_index * 3,
+                    items: chunk.to_vec(),
+                });
         let rows = attachment_rows.chain(capability_rows).collect::<Vec<_>>();
 
         v_flex()

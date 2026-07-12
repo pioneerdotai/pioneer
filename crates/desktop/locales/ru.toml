@@ -4,6 +4,7 @@ _version = 1
 placeholder = "Отправьте сообщение ассистенту"
 stop_reason = "Ход остановлен пользователем"
 steer_cli_runtime = "Отправить в текущий ход CLI"
+capabilities_removed_for_provider = "Некоторые возможности недоступны для этого провайдера и были удалены."
 
 [chat.composer.mode]
 agent_label = "Агент"

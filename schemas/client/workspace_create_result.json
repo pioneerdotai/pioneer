@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WorkspaceCreateResult",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "reduction": {
+          "$ref": "#/$defs/WorkspaceCreateSuccessReduction"
+        },
+        "status": {
+          "type": "string",
+          "const": "created"
+        }
+      },
+      "required": [
+        "status",
+        "reduction"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string",
+          "const": "empty_name"
+        }
+      },
+      "required": [
+        "status"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string",
+          "const": "busy"
+        }
+      },
+      "required": [
+        "status"
+      ]
+    }
+  ],
+  "$defs": {
+    "Workspace": {
+      "type": "object",
+      "properties": {
+        "created_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "id": {
+          "type": "string"
+        },
+        "is_active": {
+          "type": "boolean"
+        },
+        "is_current": {
+          "type": "boolean"
+        },
+        "name": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "is_active",
+        "is_current",
+        "created_at",
+        "updated_at"
+      ]
+    },
+    "WorkspaceCreateSuccessReduction": {
+      "type": "object",
+      "properties": {
+        "clear_workspaces_error": {
+          "type": "boolean"
+        },
+        "switch_workspace_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        },
+        "workspaces": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Workspace"
+          }
+        }
+      },
+      "required": [
+        "workspaces",
+        "workspace_id",
+        "switch_workspace_id",
+        "clear_workspaces_error"
+      ]
+    }
+  }
+}

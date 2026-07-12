@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ClientGatewayWsTimings",
+  "type": "object",
+  "properties": {
+    "connect_timeout_ms": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "ping_interval_ms": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "pong_timeout_ms": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "reconnect_initial_ms": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "reconnect_jitter_percent": {
+      "type": "integer",
+      "format": "uint8",
+      "maximum": 255,
+      "minimum": 0
+    },
+    "reconnect_max_ms": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "connect_timeout_ms",
+    "ping_interval_ms",
+    "pong_timeout_ms",
+    "reconnect_initial_ms",
+    "reconnect_max_ms",
+    "reconnect_jitter_percent"
+  ]
+}

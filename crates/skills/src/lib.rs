@@ -4,6 +4,8 @@ pub mod compile;
 pub mod contract;
 pub mod dependencies;
 pub mod error;
+mod external_runtime_installer;
+mod external_runtime_receipt;
 pub mod file_metadata;
 pub mod installer;
 pub mod path_match;
@@ -31,6 +33,17 @@ pub use dependencies::{
     DependencyCheckInput, DependencyCheckResult, DependencyDiagnostic, DependencyKind,
     DependencyStatus, evaluate_dependency_set, evaluate_skill_dependencies,
 };
+pub use external_runtime_installer::{
+    ExternalRuntimeCopyResult, compute_skill_folder_hash, replace_external_runtime_skill,
+    sanitize_name,
+};
+pub use external_runtime_receipt::{
+    EXTERNAL_RUNTIME_RECEIPT_FILE_NAME, EXTERNAL_RUNTIME_RECEIPT_VERSION,
+    ExternalRuntimeSkillReceipt, ExternalRuntimeSkillReceiptEntry,
+    external_runtime_skill_is_current, find_external_runtime_receipt_entry,
+    read_external_runtime_receipt, remove_external_runtime_receipt_entry,
+    upsert_external_runtime_receipt_entry, write_external_runtime_receipt_atomic,
+};
 pub use file_metadata::file_link_count;
 pub use installer::{
     CommitPreparedSkillRequest, InstallOperation, InstallSkillRequest, InstallSkillResult,
@@ -49,7 +62,8 @@ pub use provenance::{
 };
 pub use resolver::{
     ExcludedSkill, ResolvedSkill, SkillExcludedReason, SkillExplicitRef, SkillResolutionInput,
-    SkillResolutionResult, SkillResolvedReason, SkillValidationPolicy, resolve_skills,
+    SkillResolutionResult, SkillResolvedReason, SkillValidationPolicy, explicit_ref_matches_skill,
+    resolve_skills,
 };
 pub use runtime::{
     DynamicDeltaOutputRequest, DynamicDiagnosticExcerptRequest, DynamicLlmOutputRequest,

@@ -143,7 +143,7 @@ fn normalize_key(value: &str) -> String {
         .join("-")
 }
 
-fn explicit_ref_matches_skill(input: &SkillExplicitRef, skill: &SkillDefinition) -> bool {
+pub fn explicit_ref_matches_skill(input: &SkillExplicitRef, skill: &SkillDefinition) -> bool {
     if !input.source_kind.trim().is_empty()
         && input.source_kind.as_str() != skill.identity.source_kind.as_db_value()
     {

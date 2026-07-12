@@ -774,20 +774,89 @@ impl MessageProcessor {
         }
     }
 
-    pub(super) async fn handle_durable_agent_event(&self, event: AgentDurableEvent) -> bool {
-        let thread_id = durable_event_thread_id(&event).map(str::to_owned);
-        let committed = message_future(self.persist_durable_agent_event(event.clone())).await;
-        if committed {
-            if let AgentDurableEvent::ItemCompleted { notification } = &event {
-                self.ingest_committed_thread_item(notification).await;
-            }
-            if let Some(thread_id) = thread_id {
-                self.agent_manager
-                    .publish_committed(thread_id.as_str(), event)
-                    .await;
-            }
+    pub(super) fn handle_durable_agent_event<'a>(
+        &'a self,
+        event: AgentDurableEvent,
+    ) -> MessageFuture<'a, bool> {
+        match event {
+            AgentDurableEvent::TurnSkillsResolved {
+                thread_id,
+                turn_id,
+                bindings,
+            } => self.handle_turn_skills_resolved_event(thread_id, turn_id, bindings),
+            event => message_future(async move {
+                let thread_id = durable_event_thread_id(&event).map(str::to_owned);
+                let committed =
+                    message_future(self.persist_durable_agent_event(event.clone())).await;
+                if committed {
+                    if let AgentDurableEvent::ItemCompleted { notification } = &event {
+                        self.ingest_committed_thread_item(notification).await;
+                    }
+                    if let Some(thread_id) = thread_id {
+                        self.agent_manager
+                            .publish_committed(thread_id.as_str(), event)
+                            .await;
+                    }
+                }
+                committed
+            }),
         }
-        committed
+    }
+
+    fn handle_turn_skills_resolved_event<'a>(
+        &'a self,
+        thread_id: String,
+        turn_id: String,
+        bindings: Vec<pioneer_protocol::TurnSkillBinding>,
+    ) -> MessageFuture<'a, bool> {
+        message_future(async move {
+            self.persist_turn_skill_bindings(
+                thread_id.as_str(),
+                turn_id.as_str(),
+                bindings.as_slice(),
+            )
+            .await;
+            let committed_event = AgentDurableEvent::TurnSkillsResolved {
+                thread_id: thread_id.clone(),
+                turn_id,
+                bindings,
+            };
+            self.agent_manager
+                .publish_committed(thread_id.as_str(), committed_event)
+                .await;
+            true
+        })
+    }
+
+    async fn persist_turn_skill_bindings(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        bindings: &[pioneer_protocol::TurnSkillBinding],
+    ) {
+        let event_timestamp = now_timestamp_secs();
+        let binding_records = bindings
+            .iter()
+            .map(|binding| pioneer_crud::TurnSkillBindingRecord {
+                skill_slug: binding.skill_slug.clone(),
+                skill_version: binding.skill_version.clone(),
+                fingerprint: binding.fingerprint.clone(),
+                source_kind: binding.source_kind.clone(),
+                resolved_reason: binding.resolved_reason.clone(),
+            })
+            .collect::<Vec<_>>();
+        if let Err(error) = self
+            .crud_store
+            .replace_turn_skill_bindings(turn_id, binding_records.as_slice(), event_timestamp)
+            .await
+        {
+            warn!(
+                thread_id,
+                turn_id,
+                error = %format!("{error:#}"),
+                "failed to persist turn skill bindings; continuing without persistence"
+            );
+        }
     }
 
     pub(super) async fn handle_snapshot_agent_event(
@@ -948,33 +1017,12 @@ impl MessageProcessor {
                 turn_id,
                 bindings,
             } => {
-                let event_timestamp = now_timestamp_secs();
-                let binding_records = bindings
-                    .iter()
-                    .map(|binding| pioneer_crud::TurnSkillBindingRecord {
-                        skill_slug: binding.skill_slug.clone(),
-                        skill_version: binding.skill_version.clone(),
-                        fingerprint: binding.fingerprint.clone(),
-                        source_kind: binding.source_kind.clone(),
-                        resolved_reason: binding.resolved_reason.clone(),
-                    })
-                    .collect::<Vec<_>>();
-                if let Err(error) = self
-                    .crud_store
-                    .replace_turn_skill_bindings(
-                        turn_id.as_str(),
-                        binding_records.as_slice(),
-                        event_timestamp,
-                    )
-                    .await
-                {
-                    warn!(
-                        thread_id,
-                        turn_id,
-                        error = %format!("{error:#}"),
-                        "failed to persist turn skill bindings; continuing without persistence"
-                    );
-                }
+                self.persist_turn_skill_bindings(
+                    thread_id.as_str(),
+                    turn_id.as_str(),
+                    bindings.as_slice(),
+                )
+                .await;
             }
             AgentDurableEvent::TurnCapabilitiesResolved {
                 thread_id,

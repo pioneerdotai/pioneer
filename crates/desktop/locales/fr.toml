@@ -4,6 +4,7 @@ _version = 1
 placeholder = "Envoyez un message à l'assistant"
 stop_reason = "Tour annule par l'utilisateur"
 steer_cli_runtime = "Envoyer au tour CLI en cours"
+capabilities_removed_for_provider = "Certaines capacités ne sont pas disponibles pour ce fournisseur et ont été supprimées."
 
 [chat.composer.mode]
 agent_label = "Agent"

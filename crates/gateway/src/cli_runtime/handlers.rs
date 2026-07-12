@@ -5906,6 +5906,7 @@ fn cli_runtime_capabilities_for_kind(
 ) -> RuntimeCapabilities {
     match kind {
         GatewayCliAgentRuntimeKindConfig::Codex => RuntimeCapabilities {
+            supports_skills: true,
             supports_threads: true,
             supports_resume: true,
             supports_fork: true,
@@ -5927,6 +5928,7 @@ fn cli_runtime_capabilities_for_kind(
             supports_generated_schema_probe: true,
         },
         GatewayCliAgentRuntimeKindConfig::Claude => RuntimeCapabilities {
+            supports_skills: true,
             supports_threads: true,
             supports_resume: false,
             supports_fork: false,
@@ -7252,12 +7254,14 @@ mod tests {
     #[test]
     fn cli_runtime_capability_matrix_matches_runtime_contracts() {
         let codex = cli_runtime_capabilities_for_kind(GatewayCliAgentRuntimeKindConfig::Codex);
+        assert!(codex.supports_skills);
         assert!(codex.supports_resume);
         assert!(codex.supports_fork);
         assert!(codex.supports_steer);
         assert!(codex.supports_auth_management);
 
         let claude = cli_runtime_capabilities_for_kind(GatewayCliAgentRuntimeKindConfig::Claude);
+        assert!(claude.supports_skills);
         assert!(claude.supports_threads);
         assert!(claude.supports_model_list);
         assert!(claude.supports_interrupt);

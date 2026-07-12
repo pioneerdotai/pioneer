@@ -16,7 +16,7 @@ use pioneer_protocol::{
 use pioneer_skills::{
     DependencyCheckInput, SkillCatalogLoadParams, SkillExplicitRef, SkillPolicy, SkillPolicyKey,
     SkillPolicySet, SkillResolutionInput, SkillSecurityPolicy, SkillSourceKind,
-    SkillValidationPolicy, effective_policy_for_skill,
+    SkillValidationPolicy, effective_policy_for_skill, explicit_ref_matches_skill,
     is_qualified_skill_slug as is_qualified_slug, load_catalog, qualified_skill_slug,
     resolve_skills, skill_implicit_invocation_editable,
 };

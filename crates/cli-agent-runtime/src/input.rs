@@ -47,6 +47,7 @@ pub enum CLIRuntimeTurnInputItem {
     Text { text: String },
     Image { url: String },
     LocalImage { path: String },
+    Skill { name: String, path: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -300,6 +301,24 @@ mod tests {
             serde_json::json!({
                 "type": "localImage",
                 "path": "/tmp/image.png"
+            })
+        );
+    }
+
+    #[test]
+    fn serializes_skill_as_app_server_structured_input() {
+        let value = serde_json::to_value(CLIRuntimeTurnInputItem::Skill {
+            name: "pdf".to_owned(),
+            path: "/absolute/pdf/SKILL.md".to_owned(),
+        })
+        .expect("serialize skill input");
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "skill",
+                "name": "pdf",
+                "path": "/absolute/pdf/SKILL.md"
             })
         );
     }

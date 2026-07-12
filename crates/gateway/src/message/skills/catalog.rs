@@ -1,6 +1,236 @@
 use super::*;
 
+fn ordered_cli_runtime_explicit_skills(
+    attachments: &[crate::cli_runtime::skills::CliRuntimeSkillAttachment],
+    explicit_refs: &[SkillExplicitRef],
+    catalog: &pioneer_skills::SkillCatalogSnapshot,
+    resolution: &pioneer_skills::SkillResolutionResult,
+) -> anyhow::Result<Vec<pioneer_skills::ResolvedSkill>> {
+    let mut ordered = Vec::with_capacity(attachments.len());
+    for (attachment, explicit_ref) in attachments.iter().zip(explicit_refs) {
+        let matching_catalog = catalog
+            .skills
+            .iter()
+            .filter(|definition| explicit_ref_matches_skill(explicit_ref, definition))
+            .collect::<Vec<_>>();
+        if matching_catalog.len() != 1 {
+            anyhow::bail!(
+                "cli_runtime.skill_resolve_failed: capability `{}` skill `{}` ({}) matched {} authoritative catalog entries",
+                attachment.capability_id,
+                attachment.slug,
+                attachment.claimed_source_kind,
+                matching_catalog.len()
+            );
+        }
+        let definition = matching_catalog[0];
+        let qualified_slug = qualified_skill_slug(
+            definition.identity.owner.as_str(),
+            definition.identity.slug.as_str(),
+        );
+        if let Some(resolved) = resolution.active.iter().find(|resolved| {
+            matches!(
+                resolved.reason,
+                pioneer_skills::SkillResolvedReason::ExplicitCapability
+            ) && resolved.slug == qualified_slug
+                && resolved.definition.identity.source_kind == definition.identity.source_kind
+        }) {
+            ordered.push(resolved.clone());
+            continue;
+        }
+        let excluded_reason = resolution
+            .excluded
+            .iter()
+            .find(|excluded| {
+                excluded.slug == qualified_slug
+                    && excluded.source_kind == definition.identity.source_kind.as_db_value()
+            })
+            .map(|excluded| excluded.reason.as_db_value())
+            .unwrap_or("not_matched");
+        anyhow::bail!(
+            "cli_runtime.skill_resolve_failed: capability `{}` skill `{}` ({}) was excluded at resolve stage: {excluded_reason}",
+            attachment.capability_id,
+            attachment.slug,
+            attachment.claimed_source_kind
+        );
+    }
+    Ok(ordered)
+}
+
+#[cfg(test)]
+mod cli_runtime_resolver_tests {
+    use super::*;
+    use pioneer_skills::{
+        SkillCatalogSnapshot, SkillDependencies, SkillPolicy, SkillPolicyKey, SkillPolicySet,
+        SkillSourceKind, SkillTrustLevel,
+        compile::{CompileSkillInput, compile_skill_definition},
+        contract::default_skill_conformance,
+    };
+
+    fn definition(slug: &str, source_kind: SkillSourceKind) -> pioneer_skills::SkillDefinition {
+        compile_skill_definition(CompileSkillInput {
+            owner: "workspace".to_owned(),
+            slug: slug.to_owned(),
+            name: slug.to_owned(),
+            display_name: slug.to_owned(),
+            description: "description".to_owned(),
+            body: "body".to_owned(),
+            source_kind,
+            source_root: "/tmp".to_owned(),
+            skill_dir: format!("/tmp/{slug}"),
+            skill_file: format!("/tmp/{slug}/SKILL.md"),
+            version_hint: None,
+            fingerprint: format!("fingerprint-{slug}"),
+            user_invocable: true,
+            disable_model_invocation: false,
+            paths: Vec::new(),
+            allowed_tools: Vec::new(),
+            runtime_tools: Vec::new(),
+            trust_level: SkillTrustLevel::Community,
+            dependencies: SkillDependencies::default(),
+            license: None,
+            compatibility: None,
+            metadata_raw: serde_json::json!({}),
+            conformance: default_skill_conformance(),
+        })
+    }
+
+    fn attachment(
+        id: &str,
+        slug: &str,
+        source_kind: &str,
+    ) -> crate::cli_runtime::skills::CliRuntimeSkillAttachment {
+        crate::cli_runtime::skills::CliRuntimeSkillAttachment {
+            capability_id: id.to_owned(),
+            label: Some(slug.to_owned()),
+            slug: slug.to_owned(),
+            claimed_source_kind: source_kind.to_owned(),
+        }
+    }
+
+    fn resolve_for(
+        catalog: &SkillCatalogSnapshot,
+        attachments: &[crate::cli_runtime::skills::CliRuntimeSkillAttachment],
+        policy_set: &SkillPolicySet,
+    ) -> anyhow::Result<Vec<pioneer_skills::ResolvedSkill>> {
+        let refs = attachments
+            .iter()
+            .map(|attachment| SkillExplicitRef {
+                capability_id: attachment.capability_id.clone(),
+                label: attachment.label.clone(),
+                slug: attachment.slug.clone(),
+                source_kind: attachment.claimed_source_kind.clone(),
+            })
+            .collect::<Vec<_>>();
+        let resolution = resolve_skills(SkillResolutionInput {
+            explicit_refs: &refs,
+            touched_paths: &[],
+            catalog,
+            policy_set,
+            validation_policy: SkillValidationPolicy::default(),
+            dependency_input: &DependencyCheckInput::baseline(),
+        });
+        ordered_cli_runtime_explicit_skills(attachments, &refs, catalog, &resolution)
+    }
+
+    #[test]
+    fn cli_runtime_skill_resolver_restores_user_and_registry_attachment_order() {
+        let catalog = SkillCatalogSnapshot {
+            version: 1,
+            generated_at_unix: 1,
+            skills: vec![
+                definition("alpha", SkillSourceKind::User),
+                definition("zeta", SkillSourceKind::Registry),
+            ],
+        };
+        let attachments = [
+            attachment("z", "zeta", "registry"),
+            attachment("a", "alpha", "user"),
+        ];
+        let resolved = resolve_for(&catalog, &attachments, &SkillPolicySet::default()).unwrap();
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].definition.identity.slug, "zeta");
+        assert_eq!(resolved[1].definition.identity.slug, "alpha");
+    }
+
+    #[test]
+    fn cli_runtime_skill_resolver_rejects_mismatch_disabled_and_missing() {
+        let catalog = SkillCatalogSnapshot {
+            version: 1,
+            generated_at_unix: 1,
+            skills: vec![definition("alpha", SkillSourceKind::User)],
+        };
+        for attachments in [
+            vec![attachment("mismatch", "alpha", "registry")],
+            vec![attachment("missing", "missing", "user")],
+        ] {
+            assert!(
+                resolve_for(&catalog, &attachments, &SkillPolicySet::default())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("cli_runtime.skill_resolve_failed")
+            );
+        }
+
+        let mut policy_set = SkillPolicySet::default();
+        policy_set.workspace_by_key.insert(
+            SkillPolicyKey::new("workspace/alpha", "user"),
+            SkillPolicy {
+                enabled: Some(false),
+                allow_implicit_invocation: None,
+            },
+        );
+        let error = resolve_for(
+            &catalog,
+            &[attachment("disabled", "alpha", "user")],
+            &policy_set,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("disabled_by_policy"));
+    }
+}
+
 impl MessageProcessor {
+    pub(crate) async fn resolve_cli_runtime_skill_attachments(
+        &self,
+        workspace_id: &str,
+        attachments: &[crate::cli_runtime::skills::CliRuntimeSkillAttachment],
+    ) -> anyhow::Result<Vec<pioneer_skills::ResolvedSkill>> {
+        if attachments.is_empty() {
+            return Ok(Vec::new());
+        }
+        let context = self.skills_runtime_context(workspace_id)?;
+        let catalog = load_catalog(&context.catalog_params)?;
+        let workspace_policies = self
+            .crud_store
+            .list_workspace_skill_policies(workspace_id)
+            .await?;
+        let policy_set = self.build_policy_set(
+            catalog.skills.as_slice(),
+            workspace_policies.as_slice(),
+            &context,
+        );
+        let explicit_refs = attachments
+            .iter()
+            .map(|attachment| SkillExplicitRef {
+                capability_id: attachment.capability_id.clone(),
+                label: attachment.label.clone(),
+                slug: attachment.slug.clone(),
+                source_kind: attachment.claimed_source_kind.clone(),
+            })
+            .collect::<Vec<_>>();
+        let resolution = resolve_skills(SkillResolutionInput {
+            explicit_refs: explicit_refs.as_slice(),
+            touched_paths: &[],
+            catalog: &catalog,
+            policy_set: &policy_set,
+            validation_policy: context.validation_policy,
+            dependency_input: &DependencyCheckInput::baseline(),
+        });
+
+        ordered_cli_runtime_explicit_skills(attachments, &explicit_refs, &catalog, &resolution)
+    }
+
     pub(crate) async fn skills_list(
         &self,
         connection_id: ConnectionId,

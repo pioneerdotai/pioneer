@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WorkspaceRenameResult",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "reduction": {
+          "$ref": "#/$defs/WorkspaceRenameSuccessReduction"
+        },
+        "status": {
+          "type": "string",
+          "const": "renamed"
+        }
+      },
+      "required": [
+        "status",
+        "reduction"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string",
+          "const": "empty_name"
+        }
+      },
+      "required": [
+        "status"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string",
+          "const": "busy"
+        }
+      },
+      "required": [
+        "status"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string",
+          "const": "unchanged"
+        }
+      },
+      "required": [
+        "status"
+      ]
+    }
+  ],
+  "$defs": {
+    "Workspace": {
+      "type": "object",
+      "properties": {
+        "created_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "id": {
+          "type": "string"
+        },
+        "is_active": {
+          "type": "boolean"
+        },
+        "is_current": {
+          "type": "boolean"
+        },
+        "name": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "is_active",
+        "is_current",
+        "created_at",
+        "updated_at"
+      ]
+    },
+    "WorkspaceRenameSuccessReduction": {
+      "type": "object",
+      "properties": {
+        "clear_workspaces_error": {
+          "type": "boolean"
+        },
+        "workspace_id": {
+          "type": "string"
+        },
+        "workspaces": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Workspace"
+          }
+        }
+      },
+      "required": [
+        "workspaces",
+        "workspace_id",
+        "clear_workspaces_error"
+      ]
+    }
+  }
+}

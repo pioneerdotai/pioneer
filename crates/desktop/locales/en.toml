@@ -4,6 +4,7 @@ _version = 1
 placeholder = "Send a message to the assistant"
 stop_reason = "Turn cancelled by user"
 steer_cli_runtime = "Send to running CLI turn"
+capabilities_removed_for_provider = "Some capabilities are not available for this provider and were removed."
 
 [chat.composer.mode]
 agent_label = "Agent"

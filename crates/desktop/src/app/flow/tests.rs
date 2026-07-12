@@ -2,8 +2,14 @@ use super::{
     build_remote_candidate_ws_connect_spec, build_ws_connect_spec,
     default_user_command_bin_dir_label, warning_notification_messages,
 };
+use crate::app::root::composer_capability_target_for_provider;
 use crate::gateway::{GatewayInstallWarning, GatewayRuntime};
+use pioneer_client::composer::capabilities::{
+    ComposerCapability, ComposerCapabilityKind, ComposerCapabilityTarget,
+    filter_composer_capabilities_for_target,
+};
 use pioneer_client::gateway::types::{GatewayEndpoint, GatewayEndpointKind};
+use pioneer_protocol::{CLIAgentRuntimeKind, RuntimeCapabilities, RuntimeStatus, RuntimeSummary};
 use std::time::Duration;
 
 #[test]
@@ -104,4 +110,98 @@ fn warning_notification_keeps_one_message_per_warning() {
     assert!(messages[0].contains(default_user_command_bin_dir_label()));
     assert!(messages[1].contains(default_user_command_bin_dir_label()));
     assert_eq!(messages[2], "third");
+}
+
+#[test]
+fn desktop_composer_cli_target_and_capability_matrix_match_runtime_summary() {
+    let runtime = RuntimeSummary {
+        runtime_id: "codex".to_owned(),
+        kind: CLIAgentRuntimeKind::Codex,
+        display_name: "Codex".to_owned(),
+        enabled: true,
+        status: RuntimeStatus::Ready,
+        capabilities: RuntimeCapabilities {
+            supports_skills: true,
+            ..Default::default()
+        },
+        account: None,
+        version: None,
+        binary_path: None,
+        home_path: None,
+        shadow_home_path: None,
+        proxy_url: None,
+        debug_native_events_enabled: false,
+        models_refreshed_at_unix_ms: None,
+        diagnostics: Vec::new(),
+        recent_stderr: Vec::new(),
+    };
+    let capabilities = vec![
+        ComposerCapability {
+            id: "user".to_owned(),
+            label: "User".to_owned(),
+            kind: ComposerCapabilityKind::Skill {
+                slug: "user".to_owned(),
+                source_kind: "user".to_owned(),
+            },
+        },
+        ComposerCapability {
+            id: "system".to_owned(),
+            label: "System".to_owned(),
+            kind: ComposerCapabilityKind::Skill {
+                slug: "system".to_owned(),
+                source_kind: "system".to_owned(),
+            },
+        },
+    ];
+
+    let target = composer_capability_target_for_provider(
+        Some("cli_runtime:codex"),
+        std::slice::from_ref(&runtime),
+    );
+    assert_eq!(target, ComposerCapabilityTarget::SkillCapableCli);
+    assert_eq!(
+        filter_composer_capabilities_for_target(capabilities.as_slice(), target)
+            .iter()
+            .map(|capability| capability.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["user"]
+    );
+    assert_eq!(
+        composer_capability_target_for_provider(Some("cli_runtime:missing"), &[runtime]),
+        ComposerCapabilityTarget::UnsupportedCli
+    );
+    assert_eq!(
+        composer_capability_target_for_provider(Some("openai"), &[]),
+        ComposerCapabilityTarget::Native
+    );
+}
+
+#[test]
+fn desktop_composer_cli_target_fails_closed_for_unavailable_runtime() {
+    let runtime = RuntimeSummary {
+        runtime_id: "codex".to_owned(),
+        kind: CLIAgentRuntimeKind::Codex,
+        display_name: "Codex".to_owned(),
+        enabled: true,
+        status: RuntimeStatus::NeedsAuth,
+        capabilities: RuntimeCapabilities {
+            supports_skills: true,
+            ..Default::default()
+        },
+        account: None,
+        version: None,
+        binary_path: None,
+        home_path: None,
+        shadow_home_path: None,
+        proxy_url: None,
+        debug_native_events_enabled: false,
+        models_refreshed_at_unix_ms: None,
+        diagnostics: Vec::new(),
+        recent_stderr: Vec::new(),
+    };
+
+    assert_eq!(
+        composer_capability_target_for_provider(Some("cli_runtime:codex"), &[runtime]),
+        ComposerCapabilityTarget::UnsupportedCli
+    );
 }

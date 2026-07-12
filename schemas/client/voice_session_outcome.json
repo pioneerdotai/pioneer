@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "VoiceSessionOutcome",
+  "type": "string",
+  "enum": [
+    "turn_started",
+    "cancelled",
+    "no_speech",
+    "failed"
+  ]
+}

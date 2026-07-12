@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WorkspaceSwitchRequest",
+  "type": "object",
+  "properties": {
+    "action_in_progress": {
+      "type": "boolean",
+      "default": false
+    },
+    "current_workspace_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "workspace_id": {
+      "type": "string"
+    },
+    "workspaces": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/Workspace"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "workspace_id"
+  ],
+  "$defs": {
+    "Workspace": {
+      "type": "object",
+      "properties": {
+        "created_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "id": {
+          "type": "string"
+        },
+        "is_active": {
+          "type": "boolean"
+        },
+        "is_current": {
+          "type": "boolean"
+        },
+        "name": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "is_active",
+        "is_current",
+        "created_at",
+        "updated_at"
+      ]
+    }
+  }
+}

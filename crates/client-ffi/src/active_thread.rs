@@ -6,7 +6,9 @@ use pioneer_client::{
     cli_runtime::approvals::{PendingRequest, PendingRequestState},
     composer::{
         attachments::ComposerAttachment,
-        capabilities::ComposerCapability,
+        capabilities::{
+            ComposerCapability, ComposerCapabilityTarget, filter_composer_capabilities_for_target,
+        },
         model_selection as composer_model_selection,
         turn_prepare::{
             ComposerSubmitAvailabilityInput, PrepareComposerTurnRequest,
@@ -52,8 +54,8 @@ use pioneer_client::{
 };
 use pioneer_protocol::TurnPermissionMode;
 use pioneer_protocol::{
-    AgentExecutionBackend, GatewayNotification, Thread, ThreadGetParams, ThreadMode,
-    ThreadTimelinePageResponse, TurnWorkPageResponse,
+    AgentExecutionBackend, GatewayNotification, RuntimeSummary, Thread, ThreadGetParams,
+    ThreadMode, ThreadTimelinePageResponse, TurnWorkPageResponse,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -545,17 +547,16 @@ impl ClientFfiActiveThreadState {
                 !capabilities.is_empty(),
             )?
         };
-        let selected_cli_runtime_backend = resolve_selected_cli_runtime_backend(
+        let execution_target = resolve_selected_execution_target(
             runtime,
             workspace_id.as_str(),
             Some(selection.selected_provider.as_str()),
         )?;
-        let cli_runtime_selected = selected_cli_runtime_backend.is_some();
-        let capabilities = if cli_runtime_selected {
-            Vec::new()
-        } else {
-            capabilities
-        };
+        let cli_runtime_selected = execution_target.execution_backend.is_some();
+        let capabilities = filter_composer_capabilities_for_target(
+            capabilities.as_slice(),
+            execution_target.capability_target,
+        );
         if !composer_has_sendable_content(
             text.as_str(),
             !attachments.is_empty(),
@@ -593,7 +594,7 @@ impl ClientFfiActiveThreadState {
                 turn_model_provider,
                 selected_mode: Some(selection.selected_mode),
                 permission_mode,
-                execution_backend: selected_cli_runtime_backend,
+                execution_backend: execution_target.execution_backend,
                 selected_reasoning_effort,
                 cli_runtime_options: None,
                 updated_at_unix: now_unix_seconds(),
@@ -718,17 +719,16 @@ impl ClientFfiActiveThreadState {
                 selected_mode,
             )?
         };
-        let selected_cli_runtime_backend = resolve_selected_cli_runtime_backend(
+        let execution_target = resolve_selected_execution_target(
             runtime,
             workspace_id.as_str(),
             Some(selection.selected_provider.as_str()),
         )?;
-        let cli_runtime_selected = selected_cli_runtime_backend.is_some();
-        let capabilities = if cli_runtime_selected {
-            Vec::new()
-        } else {
-            capabilities
-        };
+        let cli_runtime_selected = execution_target.execution_backend.is_some();
+        let capabilities = filter_composer_capabilities_for_target(
+            capabilities.as_slice(),
+            execution_target.capability_target,
+        );
         let turn_model_provider = if cli_runtime_selected {
             None
         } else {
@@ -750,7 +750,7 @@ impl ClientFfiActiveThreadState {
                 turn_model_provider,
                 selected_mode: Some(selection.selected_mode),
                 permission_mode,
-                execution_backend: selected_cli_runtime_backend,
+                execution_backend: execution_target.execution_backend,
                 selected_reasoning_effort,
                 cli_runtime_options: None,
             },
@@ -1400,19 +1400,31 @@ fn non_empty_string(value: Option<String>) -> Option<String> {
     })
 }
 
-fn resolve_selected_cli_runtime_backend(
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SelectedExecutionTarget {
+    execution_backend: Option<AgentExecutionBackend>,
+    capability_target: ComposerCapabilityTarget,
+}
+
+fn resolve_selected_execution_target(
     runtime: &ClientRuntime,
     workspace_id: &str,
     selected_provider: Option<&str>,
-) -> anyhow::Result<Option<AgentExecutionBackend>> {
+) -> anyhow::Result<SelectedExecutionTarget> {
     let Some(provider_key) = selected_provider
         .map(str::trim)
         .filter(|provider| !provider.is_empty())
     else {
-        return Ok(None);
+        return Ok(SelectedExecutionTarget {
+            execution_backend: None,
+            capability_target: ComposerCapabilityTarget::Native,
+        });
     };
     let Some(_) = runtime_id_from_cli_runtime_provider_key(provider_key) else {
-        return Ok(None);
+        return Ok(SelectedExecutionTarget {
+            execution_backend: None,
+            capability_target: ComposerCapabilityTarget::Native,
+        });
     };
 
     let runtimes = ws_commands::cli_runtime_list(
@@ -1421,8 +1433,48 @@ fn resolve_selected_cli_runtime_backend(
     )?
     .runtimes;
 
-    resolve_cli_runtime_execution_backend(Some(provider_key), runtimes.as_slice(), None)
-        .map_err(anyhow::Error::msg)
+    selected_execution_target_from_runtimes(Some(provider_key), runtimes.as_slice())
+}
+
+fn selected_execution_target_from_runtimes(
+    selected_provider: Option<&str>,
+    runtimes: &[RuntimeSummary],
+) -> anyhow::Result<SelectedExecutionTarget> {
+    let Some(provider_key) = selected_provider
+        .map(str::trim)
+        .filter(|provider| !provider.is_empty())
+    else {
+        return Ok(SelectedExecutionTarget {
+            execution_backend: None,
+            capability_target: ComposerCapabilityTarget::Native,
+        });
+    };
+    let Some(runtime_id) = runtime_id_from_cli_runtime_provider_key(provider_key) else {
+        return Ok(SelectedExecutionTarget {
+            execution_backend: None,
+            capability_target: ComposerCapabilityTarget::Native,
+        });
+    };
+
+    let execution_backend =
+        resolve_cli_runtime_execution_backend(Some(provider_key), runtimes, None)
+            .map_err(anyhow::Error::msg)?;
+    let selected_runtime = runtimes
+        .iter()
+        .find(|runtime| runtime.runtime_id == runtime_id && runtime.enabled)
+        .ok_or_else(|| {
+            anyhow::anyhow!("CLI runtime `{runtime_id}` is not available for message submission")
+        })?;
+    let capability_target = if selected_runtime.capabilities.supports_skills {
+        ComposerCapabilityTarget::SkillCapableCli
+    } else {
+        ComposerCapabilityTarget::UnsupportedCli
+    };
+
+    Ok(SelectedExecutionTarget {
+        execution_backend,
+        capability_target,
+    })
 }
 
 fn resolve_turn_selection(
@@ -1757,7 +1809,8 @@ mod tests {
     use pioneer_client::cli_runtime::approvals::{PendingRequest, PendingRequestsReduction};
     use pioneer_client::conversation::reducer::{TurnPhase, TurnView};
     use pioneer_protocol::{
-        ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus, Turn, TurnKind, TurnOrigin,
+        CLIAgentRuntimeKind, McpScopeKind, RuntimeCapabilities, RuntimeStatus, ThreadOriginKind,
+        ThreadSidebarVisibility, ThreadStatus, Turn, TurnKind, TurnOrigin,
         TurnPermissionApprovalRequest, TurnStatus,
     };
     use serde_json::json;
@@ -1809,6 +1862,118 @@ mod tests {
             summary: None,
             details: Vec::new(),
         })
+    }
+
+    fn runtime_summary(id: &str, supports_skills: bool) -> RuntimeSummary {
+        RuntimeSummary {
+            runtime_id: id.to_owned(),
+            kind: CLIAgentRuntimeKind::Codex,
+            display_name: id.to_owned(),
+            enabled: true,
+            status: RuntimeStatus::Ready,
+            capabilities: RuntimeCapabilities {
+                supports_skills,
+                supports_threads: true,
+                supports_model_list: true,
+                ..Default::default()
+            },
+            account: None,
+            version: None,
+            binary_path: None,
+            home_path: None,
+            shadow_home_path: None,
+            proxy_url: None,
+            debug_native_events_enabled: false,
+            models_refreshed_at_unix_ms: None,
+            diagnostics: Vec::new(),
+            recent_stderr: Vec::new(),
+        }
+    }
+
+    fn capability(slug: &str, source_kind: &str) -> ComposerCapability {
+        ComposerCapability {
+            id: format!("skill:{source_kind}:{slug}"),
+            label: slug.to_owned(),
+            kind: pioneer_client::composer::capabilities::ComposerCapabilityKind::Skill {
+                slug: slug.to_owned(),
+                source_kind: source_kind.to_owned(),
+            },
+        }
+    }
+
+    fn mcp_capability() -> ComposerCapability {
+        ComposerCapability {
+            id: "mcp-server:workspace:docs".to_owned(),
+            label: "docs".to_owned(),
+            kind: pioneer_client::composer::capabilities::ComposerCapabilityKind::McpServer {
+                name: "docs".to_owned(),
+                scope_kind: McpScopeKind::Workspace,
+            },
+        }
+    }
+
+    #[test]
+    fn text_and_voice_execution_targets_share_the_cli_capability_matrix() {
+        let capabilities = vec![
+            capability("user", "user"),
+            mcp_capability(),
+            capability("registry", "registry"),
+            capability("system", "system"),
+        ];
+        let supported = selected_execution_target_from_runtimes(
+            Some("cli_runtime:codex"),
+            &[runtime_summary("codex", true)],
+        )
+        .expect("supported CLI should resolve");
+        let unsupported = selected_execution_target_from_runtimes(
+            Some("cli_runtime:legacy"),
+            &[runtime_summary("legacy", false)],
+        )
+        .expect("unsupported CLI should resolve");
+        let native = selected_execution_target_from_runtimes(Some("openai"), &[])
+            .expect("native provider should resolve");
+
+        let filter_for_path = |target: &SelectedExecutionTarget| {
+            filter_composer_capabilities_for_target(
+                capabilities.as_slice(),
+                target.capability_target,
+            )
+        };
+        let text_filtered = filter_for_path(&supported);
+        let voice_filtered = filter_for_path(&supported);
+        for filtered in [&text_filtered, &voice_filtered] {
+            assert_eq!(
+                filtered
+                    .iter()
+                    .map(|capability| capability.id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["skill:user:user", "skill:registry:registry"]
+            );
+            assert!(composer_has_sendable_content(
+                "",
+                false,
+                !filtered.is_empty()
+            ));
+        }
+        assert_eq!(text_filtered, voice_filtered);
+
+        assert!(
+            filter_composer_capabilities_for_target(
+                capabilities.as_slice(),
+                unsupported.capability_target,
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            filter_composer_capabilities_for_target(
+                capabilities.as_slice(),
+                native.capability_target,
+            ),
+            capabilities
+        );
+        assert!(supported.execution_backend.is_some());
+        assert!(unsupported.execution_backend.is_some());
+        assert!(native.execution_backend.is_none());
     }
 
     #[test]

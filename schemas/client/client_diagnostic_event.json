@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ClientDiagnosticEvent",
+  "type": "object",
+  "properties": {
+    "code": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "level": {
+      "$ref": "#/$defs/ClientDiagnosticLevel"
+    },
+    "message": {
+      "type": "string"
+    },
+    "operation": {
+      "type": "string"
+    },
+    "sequence": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "unix_ms": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "sequence",
+    "unix_ms",
+    "level",
+    "operation",
+    "message"
+  ],
+  "$defs": {
+    "ClientDiagnosticLevel": {
+      "type": "string",
+      "enum": [
+        "breadcrumb",
+        "error"
+      ]
+    }
+  }
+}

@@ -1,10 +1,39 @@
 use super::*;
 use pioneer_client::agents_doc::scope as agents_doc_scope;
+use pioneer_client::composer::capabilities::{
+    ComposerCapabilityTarget, filter_composer_capabilities_for_target,
+};
 use pioneer_client::providers::list as provider_list;
 use pioneer_client::state::selectors as client_selectors;
 use pioneer_client::state::snapshot::{ClientSnapshot, ClientSnapshotInput};
 use pioneer_client::threads::tree as thread_tree;
 use pioneer_client::workspaces::selectors as workspace_selectors;
+use pioneer_protocol::{RuntimeStatus, RuntimeSummary};
+
+pub(crate) fn composer_capability_target_for_provider(
+    provider: Option<&str>,
+    runtimes: &[RuntimeSummary],
+) -> ComposerCapabilityTarget {
+    let Some(runtime_id) =
+        provider.and_then(provider_list::runtime_id_from_cli_runtime_provider_key)
+    else {
+        return ComposerCapabilityTarget::Native;
+    };
+
+    if runtimes.iter().any(|runtime| {
+        runtime.runtime_id == runtime_id
+            && runtime.enabled
+            && matches!(
+                runtime.status,
+                RuntimeStatus::Ready | RuntimeStatus::Degraded { .. }
+            )
+            && runtime.capabilities.supports_skills
+    }) {
+        ComposerCapabilityTarget::SkillCapableCli
+    } else {
+        ComposerCapabilityTarget::UnsupportedCli
+    }
+}
 
 impl PioneerDesktop {
     pub(in crate::app) fn thread_tree_state(&self) -> &Entity<TreeState> {
@@ -114,6 +143,20 @@ impl PioneerDesktop {
             .as_deref()
             .and_then(provider_list::runtime_id_from_cli_runtime_provider_key)
             .is_some()
+    }
+
+    pub(in crate::app) fn composer_capability_target(&self) -> ComposerCapabilityTarget {
+        composer_capability_target_for_provider(
+            self.composer_selected_provider.as_deref(),
+            self.providers.cli_runtimes(),
+        )
+    }
+
+    pub(in crate::app) fn effective_composer_capabilities(&self) -> Vec<ComposerCapability> {
+        filter_composer_capabilities_for_target(
+            self.composer_capabilities.as_slice(),
+            self.composer_capability_target(),
+        )
     }
 
     pub(in crate::app) fn model_selector_workspace_id(&self) -> String {

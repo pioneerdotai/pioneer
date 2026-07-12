@@ -46,6 +46,9 @@ impl PioneerDesktop {
                 .clone(),
         );
         self.set_preferred_workspace_id(Some(reduction.selected.set_preferred_workspace_id));
+        // The connection effect can run before workspace bootstrap establishes a scope,
+        // so ensure CLI runtime summaries are loaded once that scope is available.
+        self.refresh_cli_providers_auto(cx);
         self.load_thread_folder_expansion_for_workspace(workspace_id.as_str(), cx);
         if reduction.selected.refresh_thread_list {
             self.refresh_thread_list(cx);

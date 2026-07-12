@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadAgentsDocPayload",
+  "type": "object",
+  "properties": {
+    "content": {
+      "type": "string"
+    },
+    "content_sha256": {
+      "type": "string"
+    },
+    "created_at": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "folder_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "id": {
+      "type": "string"
+    },
+    "status": {
+      "$ref": "#/$defs/ThreadAgentsDocStatus"
+    },
+    "title": {
+      "type": "string"
+    },
+    "updated_at": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "version": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "workspace_id",
+    "status",
+    "title",
+    "content",
+    "content_sha256",
+    "version",
+    "created_at",
+    "updated_at"
+  ],
+  "$defs": {
+    "ThreadAgentsDocStatus": {
+      "type": "string",
+      "enum": [
+        "draft",
+        "active",
+        "archived"
+      ]
+    }
+  }
+}

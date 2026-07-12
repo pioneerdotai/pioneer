@@ -513,6 +513,14 @@ impl GatewaySettings {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_cli_runtime_settings_for_tests(
+        &mut self,
+        cli_runtimes: pioneer_protocol::GatewayCliRuntimeSettings,
+    ) -> Result<()> {
+        self.set_cli_runtime_settings(cli_runtimes)
+    }
+
     pub fn snapshot(&self, config: &GatewayConfig) -> pioneer_protocol::GatewaySettingsSnapshot {
         self.snapshot_with_remote_access_status(
             config,

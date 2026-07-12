@@ -64,6 +64,8 @@ pub enum RuntimeStatus {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct RuntimeCapabilities {
+    #[serde(default)]
+    pub supports_skills: bool,
     pub supports_threads: bool,
     pub supports_resume: bool,
     pub supports_fork: bool,
@@ -821,6 +823,7 @@ mod tests {
             enabled: true,
             status: RuntimeStatus::Ready,
             capabilities: RuntimeCapabilities {
+                supports_skills: true,
                 supports_threads: true,
                 supports_resume: true,
                 supports_fork: true,
@@ -869,6 +872,7 @@ mod tests {
         assert_eq!(encoded["runtime_id"], "codex_personal");
         assert_eq!(encoded["kind"], "codex");
         assert_eq!(encoded["status"], json!({ "state": "ready" }));
+        assert_eq!(encoded["capabilities"]["supports_skills"], true);
         assert_eq!(encoded["account"]["email"], "user@example.com");
         assert_eq!(encoded["debug_native_events_enabled"], true);
         assert_eq!(encoded["recent_stderr"][0], "app-server ready");
@@ -876,6 +880,37 @@ mod tests {
         let decoded: RuntimeSummary =
             serde_json::from_value(encoded).expect("summary should deserialize");
         assert_eq!(decoded, summary);
+    }
+
+    #[test]
+    fn runtime_capabilities_default_and_legacy_payload_do_not_enable_skills() {
+        assert!(!RuntimeCapabilities::default().supports_skills);
+
+        let legacy = json!({
+            "supports_threads": true,
+            "supports_resume": false,
+            "supports_fork": false,
+            "supports_steer": false,
+            "supports_interrupt": true,
+            "supports_approvals": false,
+            "supports_file_change_approvals": false,
+            "supports_command_approvals": false,
+            "supports_user_input_requests": false,
+            "supports_model_list": true,
+            "supports_apps": false,
+            "supports_review": false,
+            "supports_compaction": false,
+            "supports_goal": false,
+            "supports_diff_updates": false,
+            "supports_history_read": false,
+            "supports_thread_archive": false,
+            "supports_auth_management": false,
+            "supports_generated_schema_probe": false
+        });
+
+        let decoded: RuntimeCapabilities =
+            serde_json::from_value(legacy).expect("legacy capabilities should deserialize");
+        assert!(!decoded.supports_skills);
     }
 
     #[test]

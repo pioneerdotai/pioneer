@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "VoiceAudioEncoding",
+  "oneOf": [
+    {
+      "type": "string",
+      "enum": [
+        "pcm_s16_le"
+      ]
+    },
+    {
+      "description": "Reserved for future client adapters. The initial gateway intake\ncontract accepts only `pcm_s16le`.",
+      "type": "string",
+      "const": "pcm_f32_le"
+    }
+  ]
+}

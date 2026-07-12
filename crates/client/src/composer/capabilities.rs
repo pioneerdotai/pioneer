@@ -34,6 +34,43 @@ pub enum ComposerCapabilityKind {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComposerCapabilityTarget {
+    Native,
+    UnsupportedCli,
+    SkillCapableCli,
+}
+
+fn is_cli_exportable_skill_source(source_kind: &str) -> bool {
+    matches!(source_kind, "user" | "registry")
+}
+
+pub fn composer_capability_is_eligible_for_target(
+    capability: &ComposerCapability,
+    target: ComposerCapabilityTarget,
+) -> bool {
+    match target {
+        ComposerCapabilityTarget::Native => true,
+        ComposerCapabilityTarget::UnsupportedCli => false,
+        ComposerCapabilityTarget::SkillCapableCli => matches!(
+            &capability.kind,
+            ComposerCapabilityKind::Skill { source_kind, .. }
+                if is_cli_exportable_skill_source(source_kind)
+        ),
+    }
+}
+
+pub fn filter_composer_capabilities_for_target(
+    capabilities: &[ComposerCapability],
+    target: ComposerCapabilityTarget,
+) -> Vec<ComposerCapability> {
+    capabilities
+        .iter()
+        .filter(|capability| composer_capability_is_eligible_for_target(capability, target))
+        .cloned()
+        .collect()
+}
+
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct SelectableSkillCapability {
@@ -44,6 +81,29 @@ pub struct SelectableSkillCapability {
     pub source_kind: String,
     pub selectable: bool,
     pub unavailable_reason: Option<SkillCapabilityUnavailableReason>,
+}
+
+pub fn selectable_skill_capability_is_eligible_for_target(
+    row: &SelectableSkillCapability,
+    target: ComposerCapabilityTarget,
+) -> bool {
+    match target {
+        ComposerCapabilityTarget::Native => true,
+        ComposerCapabilityTarget::UnsupportedCli => false,
+        ComposerCapabilityTarget::SkillCapableCli => {
+            is_cli_exportable_skill_source(row.source_kind.as_str())
+        }
+    }
+}
+
+pub fn filter_selectable_skill_capabilities_for_target(
+    rows: &[SelectableSkillCapability],
+    target: ComposerCapabilityTarget,
+) -> Vec<SelectableSkillCapability> {
+    rows.iter()
+        .filter(|row| selectable_skill_capability_is_eligible_for_target(row, target))
+        .cloned()
+        .collect()
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -829,12 +889,16 @@ mod tests {
     };
 
     fn skill_capability(slug: &str) -> ComposerCapability {
+        skill_capability_from_source(slug, "user")
+    }
+
+    fn skill_capability_from_source(slug: &str, source_kind: &str) -> ComposerCapability {
         ComposerCapability {
-            id: format!("skill:user:{slug}"),
+            id: format!("skill:{source_kind}:{slug}"),
             label: slug.to_owned(),
             kind: ComposerCapabilityKind::Skill {
                 slug: slug.to_owned(),
-                source_kind: "user".to_owned(),
+                source_kind: source_kind.to_owned(),
             },
         }
     }
@@ -933,6 +997,98 @@ mod tests {
             input_schema_summary: None,
             annotations: None,
         }
+    }
+
+    #[test]
+    fn capability_target_filter_preserves_native_and_exports_only_supported_cli_skills() {
+        let input = vec![
+            skill_capability_from_source("user-first", "user"),
+            mcp_server_capability("docs"),
+            skill_capability_from_source("registry-second", "registry"),
+            skill_capability_from_source("system", "system"),
+            mcp_tool_capability("docs", "search"),
+            skill_capability_from_source("unknown", "future"),
+        ];
+        let original = input.clone();
+
+        let cases = [
+            (
+                ComposerCapabilityTarget::Native,
+                vec![
+                    "skill:user:user-first",
+                    "mcp-server:workspace:docs",
+                    "skill:registry:registry-second",
+                    "skill:system:system",
+                    "mcp-tool:workspace:docs:search",
+                    "skill:future:unknown",
+                ],
+            ),
+            (ComposerCapabilityTarget::UnsupportedCli, vec![]),
+            (
+                ComposerCapabilityTarget::SkillCapableCli,
+                vec!["skill:user:user-first", "skill:registry:registry-second"],
+            ),
+        ];
+
+        for (target, expected_ids) in cases {
+            let filtered = filter_composer_capabilities_for_target(&input, target);
+            assert_eq!(
+                filtered
+                    .iter()
+                    .map(|capability| capability.id.as_str())
+                    .collect::<Vec<_>>(),
+                expected_ids
+            );
+        }
+
+        assert_eq!(input, original);
+    }
+
+    #[test]
+    fn selectable_skill_target_filter_uses_the_same_exact_source_rule() {
+        let rows = ["user", "registry", "system", "future"]
+            .into_iter()
+            .map(|source_kind| {
+                let mut item = skill_item(source_kind);
+                item.source_kind = source_kind.to_owned();
+                selectable_skill_from_item(&item)
+            })
+            .collect::<Vec<_>>();
+        let original = rows.clone();
+
+        assert_eq!(
+            filter_selectable_skill_capabilities_for_target(
+                &rows,
+                ComposerCapabilityTarget::Native
+            ),
+            rows
+        );
+        assert!(
+            filter_selectable_skill_capabilities_for_target(
+                &rows,
+                ComposerCapabilityTarget::UnsupportedCli
+            )
+            .is_empty()
+        );
+
+        let cli_rows = filter_selectable_skill_capabilities_for_target(
+            &rows,
+            ComposerCapabilityTarget::SkillCapableCli,
+        );
+        assert_eq!(
+            cli_rows
+                .iter()
+                .map(|row| row.source_kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["user", "registry"]
+        );
+        assert!(cli_rows.iter().all(|row| {
+            selectable_skill_capability_is_eligible_for_target(
+                row,
+                ComposerCapabilityTarget::SkillCapableCli,
+            )
+        }));
+        assert_eq!(rows, original);
     }
 
     fn mcp_details(server_name: &str, tools: Vec<McpToolCatalogItem>) -> McpServerDetailsResponse {

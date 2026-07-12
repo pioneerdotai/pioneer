@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadAgentsDocGetResponse",
+  "type": "object",
+  "properties": {
+    "effective": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ThreadAgentsDocResolvedPayload"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "explicit": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ThreadAgentsDocPayload"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "ThreadAgentsDocPayload": {
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "content_sha256": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "folder_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/ThreadAgentsDocStatus"
+        },
+        "title": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "version": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "workspace_id",
+        "status",
+        "title",
+        "content",
+        "content_sha256",
+        "version",
+        "created_at",
+        "updated_at"
+      ]
+    },
+    "ThreadAgentsDocResolvedPayload": {
+      "type": "object",
+      "properties": {
+        "doc": {
+          "$ref": "#/$defs/ThreadAgentsDocPayload"
+        },
+        "inherited": {
+          "type": "boolean"
+        },
+        "resolved_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "resolved_for_folder_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_folder_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_path": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "doc",
+        "inherited",
+        "resolved_at"
+      ]
+    },
+    "ThreadAgentsDocStatus": {
+      "type": "string",
+      "enum": [
+        "draft",
+        "active",
+        "archived"
+      ]
+    }
+  }
+}

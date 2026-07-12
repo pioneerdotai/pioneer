@@ -56,6 +56,8 @@ use pioneer_protocol::{
     SkillHealthItem, SkillListItem, Thread, ThreadAgentsDocSummary, ThreadFolder, ThreadMode,
     ThreadPlacement, TurnPermissionMode, VoiceStatus, Workspace,
 };
+#[cfg(test)]
+pub(crate) use queries::composer_capability_target_for_provider;
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},

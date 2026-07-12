@@ -543,12 +543,16 @@ impl MessageProcessor {
             };
             params.model_provider = Some(cli_runtime_provider_key(runtime_id.as_str()));
 
-            if !params.capabilities.is_empty() {
-                send_turn_start_failure!(
-                    "CLI runtime providers do not support skills, MCP capabilities, or tool attachments".to_owned()
-                );
-                return;
-            }
+            let skill_capabilities =
+                match crate::cli_runtime::skills::partition_cli_runtime_skill_capabilities(
+                    &params.capabilities,
+                ) {
+                    Ok(partition) => partition,
+                    Err(message) => {
+                        send_turn_start_failure!(message);
+                        return;
+                    }
+                };
             if let Some(input_kind) = params
                 .input
                 .iter()
@@ -603,6 +607,192 @@ impl MessageProcessor {
                     ));
                     return;
                 }
+            }
+            let (installed_skills, resolved_skill_bindings) = match skill_capabilities {
+                crate::cli_runtime::skills::CliRuntimeSkillCapabilityPartition::NoSkills => {
+                    (Vec::new(), Vec::new())
+                }
+                crate::cli_runtime::skills::CliRuntimeSkillCapabilityPartition::Skills(
+                    attachments,
+                ) => {
+                    let preflight_started = std::time::Instant::now();
+                    let resolved = match self
+                        .resolve_cli_runtime_skill_attachments(
+                            thread.workspace_id.as_str(),
+                            &attachments,
+                        )
+                        .await
+                    {
+                        Ok(resolved) => resolved,
+                        Err(error) => {
+                            let failure_reason =
+                                format!("failed to resolve CLI runtime skills: {error:#}");
+                            for attachment in &attachments {
+                                warn!(
+                                    event = "cli_runtime_skill_preflight",
+                                    runtime_id = runtime_id.as_str(),
+                                    runtime_kind = ?runtime_kind,
+                                    skill_slug = attachment.slug.as_str(),
+                                    source_kind = attachment.claimed_source_kind.as_str(),
+                                    result = "failed",
+                                    failure_reason = failure_reason.as_str(),
+                                    elapsed_ms = preflight_started.elapsed().as_millis(),
+                                    "CLI runtime skill preflight failed"
+                                );
+                            }
+                            send_turn_start_failure!(failure_reason);
+                            return;
+                        }
+                    };
+                    if let Err(error) =
+                        crate::cli_runtime::skills::ensure_cli_runtime_skills_exportable(&resolved)
+                    {
+                        warn!(
+                            event = "cli_runtime_skill_preflight",
+                            runtime_id = runtime_id.as_str(),
+                            runtime_kind = ?runtime_kind,
+                            skill_slug = error.skill_slug.as_str(),
+                            source_kind = "system",
+                            result = "failed",
+                            failure_reason = crate::cli_runtime::skills::CLI_RUNTIME_SYSTEM_SKILL_NOT_EXPORTABLE,
+                            elapsed_ms = preflight_started.elapsed().as_millis(),
+                            "CLI runtime skill preflight rejected Pioneer-only system skill"
+                        );
+                        send_turn_start_failure!(error.to_string());
+                        return;
+                    }
+                    if let Err(error) =
+                        crate::cli_runtime::skills::ensure_cli_runtime_skill_invocation_eligible(
+                            runtime_kind,
+                            &runtime_config.display_name,
+                            &resolved,
+                        )
+                    {
+                        if let Some(skill) = resolved
+                            .iter()
+                            .find(|skill| skill.definition.runtime.disable_model_invocation)
+                        {
+                            warn!(
+                                event = "cli_runtime_skill_preflight",
+                                runtime_id = runtime_id.as_str(),
+                                runtime_kind = ?runtime_kind,
+                                skill_slug = skill.slug.as_str(),
+                                source_kind = skill.definition.identity.source_kind.as_db_value(),
+                                result = "failed",
+                                failure_reason = crate::cli_runtime::skills::CLI_RUNTIME_CLAUDE_SKILL_NOT_MODEL_INVOCABLE,
+                                elapsed_ms = preflight_started.elapsed().as_millis(),
+                                "CLI runtime skill preflight rejected unsupported native invocation"
+                            );
+                        }
+                        send_turn_start_failure!(error.to_string());
+                        return;
+                    }
+                    let resolved_skill_bindings =
+                        crate::cli_runtime::skills::cli_runtime_turn_skill_bindings(&resolved);
+                    let receipt_path = self
+                        .artifact_runtime_home
+                        .join(pioneer_skills::EXTERNAL_RUNTIME_RECEIPT_FILE_NAME);
+                    let plans =
+                        match crate::cli_runtime::skills::build_cli_runtime_skill_install_plans(
+                            &runtime_config,
+                            runtime_kind,
+                            &resolved,
+                            &receipt_path,
+                        ) {
+                            Ok(plans) => plans,
+                            Err(error) => {
+                                let failure_reason =
+                                    format!("failed to plan CLI runtime skills: {error:#}");
+                                for skill in &resolved {
+                                    warn!(
+                                        event = "cli_runtime_skill_preflight",
+                                        runtime_id = runtime_id.as_str(),
+                                        runtime_kind = ?runtime_kind,
+                                        skill_slug = skill.slug.as_str(),
+                                        source_kind = skill.definition.identity.source_kind.as_db_value(),
+                                        install_name = pioneer_skills::sanitize_name(
+                                            &skill.definition.identity.name
+                                        ),
+                                        result = "failed",
+                                        failure_reason = failure_reason.as_str(),
+                                        elapsed_ms = preflight_started.elapsed().as_millis(),
+                                        "CLI runtime skill preflight planning failed"
+                                    );
+                                }
+                                send_turn_start_failure!(failure_reason);
+                                return;
+                            }
+                        };
+                    let mut installed = Vec::with_capacity(plans.len());
+                    for plan in &plans {
+                        let install_started = std::time::Instant::now();
+                        match self.install_one_cli_runtime_skill(plan).await {
+                            Ok(result) => {
+                                let result_name = match result.status {
+                                    crate::cli_runtime::skills::CliRuntimeSkillInstallStatus::Current => "current",
+                                    crate::cli_runtime::skills::CliRuntimeSkillInstallStatus::Installed => "installed",
+                                    crate::cli_runtime::skills::CliRuntimeSkillInstallStatus::Updated => "updated",
+                                };
+                                let source_hash_prefix = &result.source_folder_hash
+                                    [..result.source_folder_hash.len().min(12)];
+                                info!(
+                                    event = "cli_runtime_skill_preflight",
+                                    runtime_id = plan.runtime_id.as_str(),
+                                    runtime_kind = plan.runtime_kind.as_str(),
+                                    skill_slug = plan.skill_slug.as_str(),
+                                    source_kind = plan.source_kind.as_str(),
+                                    install_name = plan.install_name.as_str(),
+                                    destination = %plan.destination.display(),
+                                    result = result_name,
+                                    source_hash_prefix,
+                                    elapsed_ms = install_started.elapsed().as_millis(),
+                                    "CLI runtime skill preflight completed"
+                                );
+                                installed.push(result);
+                            }
+                            Err(error) => {
+                                let failure_reason = format!(
+                                    "failed to prepare CLI runtime skill `{}`: {error:#}",
+                                    plan.skill_slug
+                                );
+                                warn!(
+                                    event = "cli_runtime_skill_preflight",
+                                    runtime_id = plan.runtime_id.as_str(),
+                                    runtime_kind = plan.runtime_kind.as_str(),
+                                    skill_slug = plan.skill_slug.as_str(),
+                                    source_kind = plan.source_kind.as_str(),
+                                    install_name = plan.install_name.as_str(),
+                                    destination = %plan.destination.display(),
+                                    result = "failed",
+                                    failure_reason = failure_reason.as_str(),
+                                    elapsed_ms = install_started.elapsed().as_millis(),
+                                    "CLI runtime skill preflight failed"
+                                );
+                                send_turn_start_failure!(failure_reason);
+                                return;
+                            }
+                        }
+                    }
+                    (installed, resolved_skill_bindings)
+                }
+            };
+            #[cfg(test)]
+            self.cli_runtime_skill_preflight_test_events
+                .lock()
+                .await
+                .push("preflight_complete".to_owned());
+            if let Some(cutoff_ms) = installed_skills
+                .iter()
+                .map(|skill| skill.receipt_updated_at_unix_ms)
+                .max()
+                && let Err(error) = manager
+                    .close_session_if_started_at_or_before(&session_key, cutoff_ms)
+                    .await
+            {
+                send_turn_start_failure!(format!(
+                    "failed to refresh CLI runtime session for selected skills: {error:#}"
+                ));
+                return;
             }
             let proxy_url = match self
                 .prepare_cli_runtime_proxy_url(thread.workspace_id.as_str(), runtime_id.as_str())
@@ -663,6 +853,17 @@ impl MessageProcessor {
                     return;
                 }
             };
+            if matches!(runtime_kind, CLIAgentRuntimeKind::Codex) {
+                crate::cli_runtime::skills::prepend_codex_installed_skill_inputs(
+                    &installed_skills,
+                    &mut input_mapping,
+                );
+            } else {
+                crate::cli_runtime::skills::prepend_claude_installed_skill_directive(
+                    &installed_skills,
+                    &mut input_mapping,
+                );
+            }
             let permission_adapter =
                 crate::cli_runtime::permissions::adapt_cli_runtime_permissions_for_turn(
                     runtime_kind,
@@ -707,6 +908,11 @@ impl MessageProcessor {
                 .and_then(|options| options.summary.clone());
 
             let security_params = params.clone();
+            #[cfg(test)]
+            self.cli_runtime_skill_preflight_test_events
+                .lock()
+                .await
+                .push("thread_manager_turn_start".to_owned());
             let outcome = match self.thread_manager.turn_start(connection_id, params).await {
                 Ok(outcome) => outcome,
                 Err(error) => {
@@ -770,6 +976,22 @@ impl MessageProcessor {
                     "failed to persist CLI runtime turn/start state and permission audit: {error:#}"
                 ));
                 return;
+            }
+            if !resolved_skill_bindings.is_empty() {
+                let event = AgentDurableEvent::TurnSkillsResolved {
+                    thread_id: outcome.started_notification.thread_id.clone(),
+                    turn_id: outcome.started_notification.turn.id.clone(),
+                    bindings: resolved_skill_bindings,
+                };
+                if !self.handle_durable_agent_event(event).await {
+                    self.thread_manager
+                        .rollback_turn_start(outcome.rollback_context.clone())
+                        .await;
+                    send_turn_start_failure!(
+                        "failed to commit CLI runtime turn skill bindings".to_owned()
+                    );
+                    return;
+                }
             }
             let security_snapshot = match self
                 .persist_turn_execution_security_snapshot(&security_params, &outcome)
@@ -858,6 +1080,8 @@ impl MessageProcessor {
                         cwd: Some(std::path::PathBuf::from(native_cwd.as_str())),
                         approval_policy: Some(effective_approval_policy.clone()),
                         env: proxy_env,
+                        enable_user_skills: matches!(runtime_kind, CLIAgentRuntimeKind::Claude)
+                            && !installed_skills.is_empty(),
                         ..Default::default()
                     },
                 )

@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "upstream": { "package": "skills", "version": "1.5.15", "commit": "4ce6d48ac44c8b637db87b2102fea3baca719df1" },
+  "sanitize": [
+    { "input": "MySkill", "output": "myskill" },
+    { "input": "Convex Best Practices", "output": "convex-best-practices" },
+    { "input": "skill@#$name", "output": "skill-name" },
+    { "input": "../../secret", "output": "secret" },
+    { "input": "..\\..\\secret", "output": "secret" },
+    { "input": ".-.-skill", "output": "skill" },
+    { "input": "", "output": "unnamed-skill" },
+    { "input": "...", "output": "unnamed-skill" },
+    { "input": "日本語", "output": "unnamed-skill" },
+    { "input": "émoji🎉skill", "output": "moji-skill" }
+  ],
+  "folder_hash": "f8e26339fec945e49a6485c444661fd1f2c883cd99521d4c38ab4947bddc3e4f",
+  "hash_order": ["__pycache__/cache.pyc", "__pypackages__/3.12/lib/pkg.py", ".hidden", "assets/blob.bin", "metadata.json", "order/_under.txt", "order/a.txt", "order/éclair.txt", "order/Z.txt", "order/日本語.txt", "references/guide.md", "references/metadata.json", "scripts/run.sh", "SKILL.md"],
+  "copy_file_hashes": {
+    ".hidden": "e83e0ca964304979aba0d46a9ce6d38222d3623931b0e8a53afa9df7c8411bbd",
+    "assets/blob.bin": "d44e31ff775b3674c54c7e5a3c488e0f496ed285197d5e57a7ee62942fb9b123",
+    "guide-link.md": "6ff132058b594e7b6c892444a47ad93ca90ac873b361c331ad11881eb1331544",
+    "node_modules/oracle/index.js": "3fefc0330e439d5399d16ae1bde2d3194f9ec7060786157ff797ed12a05b31ab",
+    "order/_under.txt": "10af960b268d98ed1e95acc1c1d7e9a655b0967acca44fdc4e4af2559ae05ce3",
+    "order/a.txt": "4eac1223ac98a480e97d540d3dab6c04aa08888a0b6fda68a2c3ad1c19f256f9",
+    "order/éclair.txt": "7adb7dee0c5ae33a1f03d598b94bde3ab69e602fcc33a4bf68f7215dd08d0bd8",
+    "order/Z.txt": "a6657f91652abf6d193fc9944c3e999d9aebfe5b33ebf3f733be673576f7af03",
+    "order/日本語.txt": "074aef428c82cb2679496c0964232422b37a86e0974a8f2e394ce2e8915f886b",
+    "reference-link/guide.md": "6ff132058b594e7b6c892444a47ad93ca90ac873b361c331ad11881eb1331544",
+    "reference-link/metadata.json": "90c007279f19881d63461d098c6412995c9a3e8d0a95e27f5a15e4e7d92a7fb2",
+    "references/guide.md": "6ff132058b594e7b6c892444a47ad93ca90ac873b361c331ad11881eb1331544",
+    "scripts/run.sh": "19143e1a848a1f51c7a3570cee63bd81bf23e09d06e74669129cef57e4484380",
+    "SKILL.md": "a22f4e4b95a201a2b405817a45714a4be5b824add9d5fbed879b1bfbf9efb2c2",
+    "symlink-exclusions/.git/guide.md": "6ff132058b594e7b6c892444a47ad93ca90ac873b361c331ad11881eb1331544",
+    "symlink-exclusions/.git/metadata.json": "90c007279f19881d63461d098c6412995c9a3e8d0a95e27f5a15e4e7d92a7fb2",
+    "symlink-exclusions/__pycache__/guide.md": "6ff132058b594e7b6c892444a47ad93ca90ac873b361c331ad11881eb1331544",
+    "symlink-exclusions/__pycache__/metadata.json": "90c007279f19881d63461d098c6412995c9a3e8d0a95e27f5a15e4e7d92a7fb2"
+  },
+  "skill_md_sha256": "a22f4e4b95a201a2b405817a45714a4be5b824add9d5fbed879b1bfbf9efb2c2",
+  "copy_selection": { "excluded_files": ["metadata.json"], "excluded_real_directories": [".git", "__pycache__", "__pypackages__"], "copied_real_directory": "node_modules", "dereferences_symlinks": true, "broken_symlinks": "skip" },
+  "hash_selection": { "excluded_real_directories": [".git", "node_modules"], "includes_metadata_json": true, "includes_python_cache_files": true, "ignores_symlinks": true },
+  "rm_error_contract": "recursive rm errors are ignored; subsequent mkdir/copy determines success"
+}

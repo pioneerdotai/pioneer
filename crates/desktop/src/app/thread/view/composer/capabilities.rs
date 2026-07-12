@@ -14,8 +14,8 @@ use gpui_component::{
 };
 use pioneer_client::composer::capabilities as composer_capabilities;
 use pioneer_client::composer::capabilities::{
-    McpCapabilityUnavailableReason, SelectableMcpCapability, SelectableSkillCapability,
-    SkillCapabilityUnavailableReason,
+    ComposerCapabilityTarget, McpCapabilityUnavailableReason, SelectableMcpCapability,
+    SelectableSkillCapability, SkillCapabilityUnavailableReason,
 };
 use pioneer_client::mcp::{details as mcp_details, list as mcp_list};
 use pioneer_client::skills::catalog as skill_catalog;
@@ -211,7 +211,7 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.composer_selected_provider_is_cli_runtime() {
+        if self.composer_capability_target() == ComposerCapabilityTarget::UnsupportedCli {
             return;
         }
 
@@ -309,7 +309,7 @@ impl PioneerDesktop {
     }
 
     pub(super) fn open_composer_mcp_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.composer_selected_provider_is_cli_runtime() {
+        if self.composer_capability_target() != ComposerCapabilityTarget::Native {
             return;
         }
 
@@ -465,9 +465,13 @@ impl PioneerDesktop {
         &self,
         query: &str,
     ) -> Vec<SelectableSkillCapability> {
-        composer_capabilities::filter_installed_skill_capability_rows(
+        let rows = composer_capabilities::filter_installed_skill_capability_rows(
             self.installed_skills.as_slice(),
             query,
+        );
+        composer_capabilities::filter_selectable_skill_capabilities_for_target(
+            rows.as_slice(),
+            self.composer_capability_target(),
         )
     }
 
@@ -501,6 +505,7 @@ impl PioneerDesktop {
         };
 
         let ws_sender = self.gateway.ws_command_sender.clone();
+        let capability_target = self.composer_capability_target();
         cx.spawn(move |_this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let cx = cx.clone();
             async move {
@@ -517,7 +522,13 @@ impl PioneerDesktop {
                                 composer_capabilities::reduce_composer_skill_picker_rows_response(
                                     response, "",
                                 );
-                            state.finish_loading_skills(reduction.rows, cx);
+                            state.finish_loading_skills(
+                                composer_capabilities::filter_selectable_skill_capabilities_for_target(
+                                    reduction.rows.as_slice(),
+                                    capability_target,
+                                ),
+                                cx,
+                            );
                         }
                         Err(error) => {
                             state.fail_loading_skills(

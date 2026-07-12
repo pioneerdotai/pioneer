@@ -4565,7 +4565,7 @@ while read line; do :; done
     }
 
     #[tokio::test]
-    async fn codex_turn_start_maps_request_and_response() {
+    async fn codex_skill_turn_start_serializes_structured_installed_path() {
         let mut fake = FakeCodexAppServer::new();
         let client = fake.client.clone();
         let turn_start = tokio::spawn(async move {
@@ -4573,9 +4573,15 @@ while read line; do :; done
                 .turn_start(
                     CodexTurnStartParams {
                         thread_id: "codex-thread-existing".to_owned(),
-                        input: vec![CLIRuntimeTurnInputItem::Text {
-                            text: "Run tests".to_owned(),
-                        }],
+                        input: vec![
+                            CLIRuntimeTurnInputItem::Text {
+                                text: "Run tests".to_owned(),
+                            },
+                            CLIRuntimeTurnInputItem::Skill {
+                                name: "proposal-51-sentinel".to_owned(),
+                                path: "/configured/skills/proposal-51-sentinel/SKILL.md".to_owned(),
+                            },
+                        ],
                         cwd: Some("/tmp/project".to_owned()),
                         approval_policy: Some("on-request".to_owned()),
                         sandbox_policy: Some(json!({
@@ -4600,7 +4606,14 @@ while read line; do :; done
             request["params"],
             json!({
                 "threadId": "codex-thread-existing",
-                "input": [{"type": "text", "text": "Run tests"}],
+                "input": [
+                    {"type": "text", "text": "Run tests"},
+                    {
+                        "type": "skill",
+                        "name": "proposal-51-sentinel",
+                        "path": "/configured/skills/proposal-51-sentinel/SKILL.md"
+                    }
+                ],
                 "cwd": "/tmp/project",
                 "approvalPolicy": "on-request",
                 "sandboxPolicy": {

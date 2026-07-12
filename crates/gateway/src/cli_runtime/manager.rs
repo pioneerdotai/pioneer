@@ -94,6 +94,7 @@ pub(crate) struct CLIAgentRuntimeSessionStartOptions {
     pub approval_policy: Option<String>,
     pub app_server_args: Vec<String>,
     pub env: BTreeMap<String, String>,
+    pub enable_user_skills: bool,
 }
 
 pub(crate) struct CLIAgentRuntimeCodexEventReceivers {
@@ -361,10 +362,6 @@ impl CLIAgentRuntimeManager {
         options: CLIAgentRuntimeSessionStartOptions,
         now_ms: u64,
     ) -> Result<CLIAgentRuntimeSessionHandle> {
-        if let Some(handle) = self.touch_existing_session(&key, &options, now_ms).await {
-            return Ok(handle);
-        }
-
         let start_lock = self.start_lock_for_key(&key).await;
         let _guard = start_lock.lock().await;
 
@@ -404,6 +401,34 @@ impl CLIAgentRuntimeManager {
             },
         );
         Ok(handle)
+    }
+
+    pub(crate) async fn close_session_if_started_at_or_before(
+        &self,
+        key: &CLIAgentRuntimeSessionKey,
+        cutoff_ms: u64,
+    ) -> Result<bool> {
+        let start_lock = self.start_lock_for_key(key).await;
+        let _start_guard = start_lock.lock().await;
+        let stale = {
+            let mut sessions = self.sessions.lock().await;
+            let should_close = sessions
+                .get(key)
+                .is_some_and(|cached| cached.started_at_ms <= cutoff_ms);
+            should_close.then(|| sessions.remove(key)).flatten()
+        };
+        let Some(stale) = stale else {
+            return Ok(false);
+        };
+        stale.session.close().await.map_err(|error| {
+            anyhow!(
+                "failed to close stale CLI runtime session `{}/{}/{}` for receipt cutoff `{cutoff_ms}`: {error:#}",
+                key.workspace_id,
+                key.runtime_id,
+                key.thread_id
+            )
+        })?;
+        Ok(true)
     }
 
     async fn touch_existing_session(
@@ -578,6 +603,8 @@ mod tests {
         starts: AtomicUsize,
         closes: Arc<AtomicUsize>,
         release: Option<Arc<Notify>>,
+        close_started: Option<Arc<Notify>>,
+        close_release: Option<Arc<Notify>>,
     }
 
     #[async_trait]
@@ -593,6 +620,8 @@ mod tests {
             Ok(Arc::new(FakeSession {
                 id,
                 closes: self.closes.clone(),
+                close_started: self.close_started.clone(),
+                close_release: self.close_release.clone(),
             }))
         }
     }
@@ -600,6 +629,8 @@ mod tests {
     struct FakeSession {
         id: usize,
         closes: Arc<AtomicUsize>,
+        close_started: Option<Arc<Notify>>,
+        close_release: Option<Arc<Notify>>,
     }
 
     #[async_trait]
@@ -607,6 +638,12 @@ mod tests {
         async fn close(&self) -> Result<()> {
             let _ = self.id;
             self.closes.fetch_add(1, Ordering::SeqCst);
+            if let Some(started) = self.close_started.as_ref() {
+                started.notify_one();
+            }
+            if let Some(release) = self.close_release.as_ref() {
+                release.notified().await;
+            }
             Ok(())
         }
     }
@@ -660,12 +697,14 @@ mod tests {
             approval_policy: Some("on-request".to_owned()),
             app_server_args: vec!["-c".to_owned(), "model=\"gpt-5-codex\"".to_owned()],
             env: Default::default(),
+            enable_user_skills: false,
         };
         let options_b = CLIAgentRuntimeSessionStartOptions {
             cwd: None,
             approval_policy: Some("never".to_owned()),
             app_server_args: vec!["-c".to_owned(), "model=\"gpt-5\"".to_owned()],
             env: Default::default(),
+            enable_user_skills: false,
         };
 
         let first = manager
@@ -686,6 +725,29 @@ mod tests {
         assert_eq!(factory.starts.load(Ordering::SeqCst), 2);
         assert_eq!(factory.closes.load(Ordering::SeqCst), 1);
         assert_eq!(manager.session_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn cli_runtime_manager_restarts_session_when_user_skills_mode_changes() {
+        let factory = Arc::new(FakeFactory::default());
+        let manager = manager_with_factory(factory.clone());
+        let key = key("thread-skill-mode");
+        let normal = CLIAgentRuntimeSessionStartOptions::default();
+        let skill_enabled = CLIAgentRuntimeSessionStartOptions {
+            enable_user_skills: true,
+            ..Default::default()
+        };
+
+        manager
+            .get_or_start_at(key.clone(), normal, 1_000)
+            .await
+            .unwrap();
+        manager
+            .get_or_start_at(key, skill_enabled, 1_001)
+            .await
+            .unwrap();
+        assert_eq!(factory.starts.load(Ordering::SeqCst), 2);
+        assert_eq!(factory.closes.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -782,6 +844,98 @@ mod tests {
         );
         assert_eq!(factory.closes.load(Ordering::SeqCst), 2);
         assert_eq!(manager.session_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn cli_runtime_manager_closes_sessions_not_proven_newer_than_receipt() {
+        for (started_at_ms, cutoff_ms, expected_closed) in [
+            (1_000, 999, false),
+            (1_000, 1_000, true),
+            (1_000, 1_001, true),
+        ] {
+            let factory = Arc::new(FakeFactory::default());
+            let manager = manager_with_factory(factory.clone());
+            let key = key(&format!("freshness-{started_at_ms}-{cutoff_ms}"));
+            manager
+                .get_or_start_at(
+                    key.clone(),
+                    CLIAgentRuntimeSessionStartOptions::default(),
+                    started_at_ms,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                manager
+                    .close_session_if_started_at_or_before(&key, cutoff_ms)
+                    .await
+                    .unwrap(),
+                expected_closed
+            );
+            assert_eq!(
+                factory.closes.load(Ordering::SeqCst),
+                usize::from(expected_closed)
+            );
+            assert_eq!(manager.session_count().await, usize::from(!expected_closed));
+        }
+
+        let factory = Arc::new(FakeFactory::default());
+        let manager = manager_with_factory(factory);
+        assert!(
+            !manager
+                .close_session_if_started_at_or_before(&key("missing"), u64::MAX)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_runtime_manager_freshness_close_serializes_concurrent_restart() {
+        let close_started = Arc::new(Notify::new());
+        let close_release = Arc::new(Notify::new());
+        let factory = Arc::new(FakeFactory {
+            close_started: Some(close_started.clone()),
+            close_release: Some(close_release.clone()),
+            ..FakeFactory::default()
+        });
+        let manager = Arc::new(manager_with_factory(factory.clone()));
+        let key = key("freshness-concurrent");
+        manager
+            .get_or_start_at(
+                key.clone(),
+                CLIAgentRuntimeSessionStartOptions::default(),
+                1_000,
+            )
+            .await
+            .unwrap();
+
+        let closer = {
+            let manager = manager.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                manager
+                    .close_session_if_started_at_or_before(&key, 1_000)
+                    .await
+            })
+        };
+        close_started.notified().await;
+        let starter = {
+            let manager = manager.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                manager
+                    .get_or_start_at(key, CLIAgentRuntimeSessionStartOptions::default(), 2_000)
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert_eq!(factory.starts.load(Ordering::SeqCst), 1);
+        close_release.notify_waiters();
+        assert!(closer.await.unwrap().unwrap());
+        starter.await.unwrap().unwrap();
+        assert_eq!(factory.closes.load(Ordering::SeqCst), 1);
+        assert_eq!(factory.starts.load(Ordering::SeqCst), 2);
+        assert_eq!(manager.cached_started_at_ms(&key).await, Some(2_000));
+        assert_eq!(manager.session_count().await, 1);
     }
 
     #[tokio::test]

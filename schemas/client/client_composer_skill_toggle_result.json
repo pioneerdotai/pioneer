@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ClientComposerSkillToggleResult",
+  "type": "object",
+  "properties": {
+    "selected_keys": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "selected_keys"
+  ]
+}

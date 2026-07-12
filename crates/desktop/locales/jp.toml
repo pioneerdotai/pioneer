@@ -4,6 +4,7 @@ _version = 1
 placeholder = "アシスタントにメッセージを送信"
 stop_reason = "ユーザーがターンをキャンセルしました"
 steer_cli_runtime = "実行中の CLI ターンへ送信"
+capabilities_removed_for_provider = "このプロバイダーで利用できない機能が削除されました。"
 
 [chat.composer.mode]
 agent_label = "エージェント"

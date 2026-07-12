@@ -115,10 +115,15 @@ impl PioneerDesktop {
         self.composer_selected_model = model;
         self.composer_selected_reasoning_effort = reasoning_effort;
         self.composer_model_selection_manually_selected = manually_selected;
+        let filtered = self.effective_composer_capabilities();
+        let removed = filtered.len() != self.composer_capabilities.len();
+        self.composer_capabilities = filtered;
         if self.composer_selected_provider_is_cli_runtime() {
-            self.composer_capabilities.clear();
             self.composer_upload_in_progress = false;
-            self.composer_upload_error = None;
+        }
+        if removed {
+            self.composer_upload_error =
+                Some(t!("chat.composer.capabilities_removed_for_provider").to_string());
         }
     }
 

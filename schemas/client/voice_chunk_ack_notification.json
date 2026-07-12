@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "VoiceChunkAckNotification",
+  "type": "object",
+  "properties": {
+    "sequence": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "session_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id",
+    "sequence"
+  ]
+}

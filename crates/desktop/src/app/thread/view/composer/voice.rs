@@ -260,11 +260,7 @@ impl PioneerDesktop {
             selected_provider.clone()
         };
         let composer_attachments = self.composer_attachments.clone();
-        let composer_capabilities = if cli_runtime_selected {
-            Vec::new()
-        } else {
-            self.composer_capabilities.clone()
-        };
+        let composer_capabilities = self.effective_composer_capabilities();
         let endpoint_kind = self
             .gateway
             .runtime

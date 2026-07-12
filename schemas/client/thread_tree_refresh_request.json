@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadTreeRefreshRequest",
+  "type": "object",
+  "properties": {
+    "active_thread_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "existing_draft_thread_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "existing_draft_thread_workspace_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "has_known_threads_for_workspace": {
+      "type": "boolean",
+      "default": false
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "workspace_id"
+  ]
+}

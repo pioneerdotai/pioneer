@@ -168,6 +168,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::cli_runtime::command_heartbeat::CliRuntimeCommandHeartbeatTracker;
 use crate::cli_runtime::manager::{CLIAgentRuntimeManager, CLIAgentRuntimeSessionKey};
+use crate::cli_runtime::skills::{
+    CliRuntimeSkillDestinationLocks, new_cli_runtime_skill_destination_locks,
+};
 use crate::mcp_service::McpService;
 use crate::memory_runtime::GatewayMemoryRuntime;
 use crate::resilience::{
@@ -383,6 +386,9 @@ pub struct MessageProcessor {
     mcp_snapshot_version: Arc<AtomicU64>,
     mcp_service: Arc<McpService>,
     skills_write_lock: Arc<tokio::sync::Mutex<()>>,
+    cli_runtime_skill_destination_locks: CliRuntimeSkillDestinationLocks,
+    #[cfg(test)]
+    cli_runtime_skill_preflight_test_events: Arc<Mutex<Vec<String>>>,
     skill_upload_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     pub(crate) task_agent_executor: Arc<task_agent_executor::TaskAgentExecutor>,
     pub(crate) task_runtime: Arc<TaskRuntime>,
@@ -653,6 +659,9 @@ impl MessageProcessor {
             mcp_snapshot_version,
             mcp_service,
             skills_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            cli_runtime_skill_destination_locks: new_cli_runtime_skill_destination_locks(),
+            #[cfg(test)]
+            cli_runtime_skill_preflight_test_events: Arc::new(Mutex::new(Vec::new())),
             skill_upload_locks: Arc::new(Mutex::new(HashMap::new())),
             task_agent_executor,
             task_runtime,
@@ -839,6 +848,17 @@ impl MessageProcessor {
     ) -> Self {
         self.cli_runtime_manager = Some(manager);
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_runtime_home_for_tests(mut self, runtime_home: PathBuf) -> Self {
+        self.artifact_runtime_home = runtime_home;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cli_runtime_skill_preflight_test_events(&self) -> Arc<Mutex<Vec<String>>> {
+        self.cli_runtime_skill_preflight_test_events.clone()
     }
 
     #[cfg(test)]
@@ -1580,6 +1600,18 @@ impl MessageProcessor {
         self.skills_write_lock.clone().lock_owned().await
     }
 
+    pub(crate) async fn install_one_cli_runtime_skill(
+        &self,
+        plan: &crate::cli_runtime::skills::CliRuntimeSkillInstallPlan,
+    ) -> anyhow::Result<crate::cli_runtime::skills::CliRuntimeSkillInstallResult> {
+        crate::cli_runtime::skills::install_one_cli_runtime_skill(
+            &self.cli_runtime_skill_destination_locks,
+            &self.skills_write_lock,
+            plan,
+        )
+        .await
+    }
+
     pub(crate) async fn acquire_skill_upload_lock(&self, upload_id: &str) -> OwnedMutexGuard<()> {
         let lock = {
             let mut guard = self.skill_upload_locks.lock().await;
@@ -2210,6 +2242,9 @@ impl MessageProcessor {
             mcp_snapshot_version,
             mcp_service,
             skills_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            cli_runtime_skill_destination_locks: new_cli_runtime_skill_destination_locks(),
+            #[cfg(test)]
+            cli_runtime_skill_preflight_test_events: Arc::new(Mutex::new(Vec::new())),
             skill_upload_locks: Arc::new(Mutex::new(HashMap::new())),
             task_agent_executor,
             task_runtime,

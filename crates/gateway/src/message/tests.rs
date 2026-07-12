@@ -204,6 +204,19 @@ struct RecordingCliRuntimeSession {
     turn_steer_result: TokioMutex<Option<CLIAgentRuntimeTurnSteerResult>>,
     turn_observation: TokioMutex<Option<CLIAgentRuntimeTurnObservation>>,
     closes: AtomicUsize,
+    event_log: TokioMutex<Option<Arc<TokioMutex<Vec<String>>>>>,
+}
+
+impl RecordingCliRuntimeSession {
+    async fn set_event_log(&self, event_log: Arc<TokioMutex<Vec<String>>>) {
+        *self.event_log.lock().await = Some(event_log);
+    }
+
+    async fn record_event(&self, event: &str) {
+        if let Some(event_log) = self.event_log.lock().await.clone() {
+            event_log.lock().await.push(event.to_owned());
+        }
+    }
 }
 
 #[async_trait]
@@ -222,6 +235,7 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
         params: CLIAgentRuntimeThreadOpenParams,
         _timeout: Duration,
     ) -> anyhow::Result<CLIAgentRuntimeThreadOpenSnapshot> {
+        self.record_event("native_thread_start").await;
         self.thread_starts.lock().await.push(params.clone());
         Ok(CLIAgentRuntimeThreadOpenSnapshot {
             native_thread_id: "native_thread_default".to_owned(),
@@ -442,6 +456,903 @@ async fn setup_cli_runtime_security_harness() -> CliRuntimeSecurityHarness {
     }
 }
 
+struct CliRuntimeSkillPreflightHarness {
+    _temp: tempfile::TempDir,
+    rx: mpsc::Receiver<Message>,
+    connection_id: ConnectionId,
+    thread_manager: Arc<ThreadManager>,
+    crud_store: Arc<CrudStore>,
+    workspace_id: String,
+    cli_session: Arc<RecordingCliRuntimeSession>,
+    cli_manager: Arc<CLIAgentRuntimeManager>,
+    processor: MessageProcessor,
+    runtime_id: String,
+    runtime_kind: CLIAgentRuntimeKind,
+    runtime_home: std::path::PathBuf,
+    native_home: std::path::PathBuf,
+    system_root: std::path::PathBuf,
+    user_root: std::path::PathBuf,
+    registry_root: std::path::PathBuf,
+    event_log: Arc<TokioMutex<Vec<String>>>,
+}
+
+async fn setup_cli_runtime_skill_preflight_harness(
+    runtime_kind: CLIAgentRuntimeKind,
+    native_home_is_file: bool,
+) -> CliRuntimeSkillPreflightHarness {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime_home = temp.path().join("gateway-runtime");
+    let native_home = temp.path().join("native-home");
+    let system_root = temp.path().join("catalog/system");
+    let user_root = temp.path().join("catalog/user");
+    let registry_root = temp.path().join("catalog/registry");
+    std::fs::create_dir_all(&runtime_home).unwrap();
+    if native_home_is_file {
+        std::fs::write(&native_home, b"not a directory").unwrap();
+    }
+
+    let app_config = pioneer_config::AppConfig::load().unwrap();
+    let settings_name = crate::settings::normalize_settings_file_name(
+        app_config.gateway.settings_file_name.as_str(),
+    )
+    .unwrap();
+    let settings_path = runtime_home.join(&settings_name);
+    let mut settings = crate::settings::load_or_create_gateway_settings(
+        &settings_path,
+        app_config.gateway.settings_version,
+        &settings_name,
+    )
+    .unwrap();
+    let runtime_id = match runtime_kind {
+        CLIAgentRuntimeKind::Codex => "codex_proposal_51",
+        CLIAgentRuntimeKind::Claude => "claude_proposal_51",
+    }
+    .to_owned();
+    settings
+        .set_cli_runtime_settings_for_tests(pioneer_protocol::GatewayCliRuntimeSettings {
+            instances: vec![pioneer_protocol::GatewayCliRuntimeInstanceSettings {
+                id: runtime_id.clone(),
+                kind: runtime_kind,
+                display_name: format!("Proposal 51 {runtime_id}"),
+                enabled: true,
+                binary_path: "recording-runtime".to_owned(),
+                home_path: native_home.to_string_lossy().into_owned(),
+                shadow_home_path: None,
+            }],
+        })
+        .unwrap();
+    crate::settings::save_gateway_settings(&settings_path, &settings).unwrap();
+
+    let (tx, rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let mut tool_loop_config =
+        test_tool_loop_config_with_roots(&system_root, &user_root, temp.path(), &registry_root);
+    tool_loop_config.skills.security.allow_untrusted_install = true;
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
+    let processor = MessageProcessor::new(
+        thread_manager.clone(),
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        tool_loop_config,
+    )
+    .with_runtime_home_for_tests(runtime_home.clone())
+    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+    let event_log = processor.cli_runtime_skill_preflight_test_events();
+    cli_session.set_event_log(event_log.clone()).await;
+
+    CliRuntimeSkillPreflightHarness {
+        _temp: temp,
+        rx,
+        connection_id,
+        thread_manager,
+        crud_store,
+        workspace_id,
+        cli_session,
+        cli_manager,
+        processor,
+        runtime_id,
+        runtime_kind,
+        runtime_home,
+        native_home,
+        system_root,
+        user_root,
+        registry_root,
+        event_log,
+    }
+}
+
+fn cli_runtime_turn_start_request_with_capabilities(
+    request_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    runtime_id: &str,
+    runtime_kind: CLIAgentRuntimeKind,
+    capabilities: Vec<JsonValue>,
+) -> String {
+    let mut request: JsonValue = serde_json::from_str(&cli_runtime_turn_start_request(
+        request_id,
+        thread_id,
+        turn_id,
+        cli_runtime_execution_backend(runtime_id, runtime_kind),
+        "full_access",
+        "use selected skill",
+        None,
+    ))
+    .unwrap();
+    request["params"]["capabilities"] = JsonValue::Array(capabilities);
+    serde_json::from_value::<pioneer_protocol::TurnStartParams>(request["params"].clone())
+        .expect("proposal 51 turn/start fixture must match protocol");
+    request.to_string()
+}
+
+fn cli_runtime_skill_capability(slug: &str, source_kind: &str) -> JsonValue {
+    serde_json::to_value(pioneer_protocol::TurnCapability {
+        id: format!("skill:{source_kind}:{slug}"),
+        kind: pioneer_protocol::TurnCapabilityKind::Skill {
+            slug: slug.to_owned(),
+            source_kind: source_kind.to_owned(),
+        },
+        label: Some(slug.to_owned()),
+    })
+    .unwrap()
+}
+
+fn write_test_skill_with_declared_name(
+    root: &std::path::Path,
+    slug: &str,
+    name: &str,
+) -> std::path::PathBuf {
+    let skill_dir = root.join("tests").join(slug);
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        format!(
+            "---\nname: {name}\nslug: {slug}\ndescription: {slug} description\n---\n# {slug}\n"
+        ),
+    )
+    .unwrap();
+    skill_dir
+}
+
+async fn seed_cli_runtime_skill_preflight_thread(
+    harness: &CliRuntimeSkillPreflightHarness,
+    thread_id: &str,
+) {
+    harness
+        .thread_manager
+        .thread_start(
+            harness.connection_id,
+            harness.workspace_id.clone(),
+            ThreadStartParams {
+                thread_id: thread_id.to_owned(),
+                workspace_id: harness.workspace_id.clone(),
+                name: Some("Proposal 51 skill preflight".to_owned()),
+                model: Some(
+                    match harness.runtime_kind {
+                        CLIAgentRuntimeKind::Codex => "o4-mini",
+                        CLIAgentRuntimeKind::Claude => "claude-sonnet",
+                    }
+                    .to_owned(),
+                ),
+                model_provider: Some("openai".to_owned()),
+                sandbox: Some(SandboxMode::FullAccess),
+                mode: Some(ThreadMode::Agent),
+                origin_kind: None,
+                sidebar_visibility: None,
+                agent_nickname: None,
+                agent_role: None,
+            },
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_skill_preflight_ordering_installs_before_materialization_and_native() {
+    for runtime_kind in [CLIAgentRuntimeKind::Codex, CLIAgentRuntimeKind::Claude] {
+        let harness = setup_cli_runtime_skill_preflight_harness(runtime_kind, false).await;
+        write_test_skill(&harness.user_root, "alpha", "", "# alpha\n");
+        write_test_skill(&harness.registry_root, "beta", "", "# beta\n");
+        let thread_id = format!("thread_preflight_{runtime_kind:?}").to_ascii_lowercase();
+        let turn_id = format!("turn_preflight_{runtime_kind:?}").to_ascii_lowercase();
+        seed_cli_runtime_skill_preflight_thread(&harness, &thread_id).await;
+        harness
+            .processor
+            .agent_manager
+            .ensure_thread(&thread_id, &harness.workspace_id)
+            .await
+            .expect("agent thread should be registered for committed subscription");
+        let mut committed_rx = harness
+            .processor
+            .agent_manager
+            .subscribe_committed(&thread_id)
+            .await
+            .expect("committed subscription should exist");
+        let request_id = generate_test_request_id(
+            "p51order",
+            match runtime_kind {
+                CLIAgentRuntimeKind::Codex => "codex",
+                CLIAgentRuntimeKind::Claude => "claude",
+            },
+        );
+        let request = cli_runtime_turn_start_request_with_capabilities(
+            &request_id,
+            &thread_id,
+            &turn_id,
+            &harness.runtime_id,
+            runtime_kind,
+            vec![
+                cli_runtime_skill_capability("tests/beta", "registry"),
+                cli_runtime_skill_capability("tests/alpha", "user"),
+            ],
+        );
+        harness
+            .processor
+            .process_request(harness.connection_id, &request)
+            .await;
+        let native_turn = wait_for_recorded_cli_runtime_turn_start(&harness.cli_session).await;
+
+        assert_eq!(
+            harness.event_log.lock().await.as_slice(),
+            [
+                "preflight_complete",
+                "thread_manager_turn_start",
+                "native_thread_start"
+            ]
+        );
+        assert_eq!(
+            std::fs::read(harness.native_home.join("skills/alpha/SKILL.md")).unwrap(),
+            std::fs::read(harness.user_root.join("tests/alpha/SKILL.md")).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(harness.native_home.join("skills/beta/SKILL.md")).unwrap(),
+            std::fs::read(harness.registry_root.join("tests/beta/SKILL.md")).unwrap()
+        );
+        assert!(
+            harness
+                .runtime_home
+                .join(pioneer_skills::EXTERNAL_RUNTIME_RECEIPT_FILE_NAME)
+                .exists()
+        );
+        assert!(
+            harness
+                .crud_store
+                .get_turn(&thread_id, &turn_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let skill_bindings = harness
+            .crud_store
+            .find_turn_skill_bindings(&turn_id)
+            .await
+            .expect("must read persisted CLI runtime turn skill bindings");
+        assert_eq!(skill_bindings.len(), 2);
+        assert_eq!(skill_bindings[0].skill_slug, "tests/alpha");
+        assert_eq!(skill_bindings[0].source_kind, "user");
+        assert_eq!(
+            skill_bindings[0].resolved_reason,
+            "explicit_composer_capability"
+        );
+        assert_eq!(skill_bindings[1].skill_slug, "tests/beta");
+        assert_eq!(skill_bindings[1].source_kind, "registry");
+        assert_eq!(
+            skill_bindings[1].resolved_reason,
+            "explicit_composer_capability"
+        );
+        assert!(
+            skill_bindings
+                .iter()
+                .all(|binding| !binding.fingerprint.is_empty())
+        );
+        let committed = timeout(Duration::from_secs(1), committed_rx.recv())
+            .await
+            .expect("committed skill binding event should arrive")
+            .expect("committed lane should stay open");
+        assert!(matches!(
+            committed,
+            AgentDurableEvent::TurnSkillsResolved {
+                turn_id: committed_turn_id,
+                bindings,
+                ..
+            } if committed_turn_id == turn_id && bindings.len() == 2
+        ));
+        if matches!(runtime_kind, CLIAgentRuntimeKind::Codex) {
+            let input = native_turn.input.as_array().unwrap();
+            let skill_items = input
+                .iter()
+                .filter(|item| item["type"] == "skill")
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                skill_items,
+                vec![
+                    json!({
+                        "type": "skill",
+                        "name": "beta",
+                        "path": harness.native_home.join("skills/beta/SKILL.md")
+                    }),
+                    json!({
+                        "type": "skill",
+                        "name": "alpha",
+                        "path": harness.native_home.join("skills/alpha/SKILL.md")
+                    }),
+                ]
+            );
+            assert!(input.iter().any(|item| {
+                item["type"] == "text"
+                    && item["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("$beta $alpha"))
+            }));
+        } else {
+            let input = native_turn.input.as_array().unwrap();
+            assert!(input.iter().all(|item| item["type"] != "skill"));
+            assert!(input.iter().any(|item| {
+                item["type"] == "text"
+                    && item["text"].as_str().is_some_and(|text| {
+                        text.contains("native Skill tool") && text.contains("beta, alpha")
+                    })
+            }));
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix() {
+    for runtime_kind in [CLIAgentRuntimeKind::Codex, CLIAgentRuntimeKind::Claude] {
+        let harness = setup_cli_runtime_skill_preflight_harness(runtime_kind, false).await;
+        let source = write_test_skill(&harness.user_root, "lifecycle", "", "# first\n");
+        std::fs::create_dir_all(source.join("references")).unwrap();
+        std::fs::write(source.join("references/guide.txt"), b"guide-v1\n").unwrap();
+        let receipt_path = harness
+            .runtime_home
+            .join(pioneer_skills::EXTERNAL_RUNTIME_RECEIPT_FILE_NAME);
+        let destination = harness.native_home.join("skills/lifecycle");
+        let mut first_receipt_snapshot = None;
+        let mut first_destination_snapshot = None;
+
+        for (index, expected_turn_count) in [(1, 1), (2, 2)] {
+            let thread_id = format!("thread_full_turn_{runtime_kind:?}_{index}").to_lowercase();
+            let turn_id = format!("turn_full_turn_{runtime_kind:?}_{index}").to_lowercase();
+            seed_cli_runtime_skill_preflight_thread(&harness, &thread_id).await;
+            let request_id =
+                generate_test_request_id("p51full", format!("{runtime_kind:?}{index}").as_str());
+            let request = cli_runtime_turn_start_request_with_capabilities(
+                &request_id,
+                &thread_id,
+                &turn_id,
+                &harness.runtime_id,
+                runtime_kind,
+                vec![cli_runtime_skill_capability("tests/lifecycle", "user")],
+            );
+            harness
+                .processor
+                .process_request(harness.connection_id, &request)
+                .await;
+            wait_for_recorded_cli_runtime_turn_count(&harness.cli_session, expected_turn_count)
+                .await;
+            let bindings = harness
+                .crud_store
+                .find_turn_skill_bindings(&turn_id)
+                .await
+                .expect("must read persisted CLI runtime turn skill bindings");
+            assert_eq!(bindings.len(), 1);
+            assert_eq!(bindings[0].skill_slug, "tests/lifecycle");
+            assert_eq!(bindings[0].source_kind, "user");
+            assert_eq!(bindings[0].resolved_reason, "explicit_composer_capability");
+            assert!(!bindings[0].fingerprint.is_empty());
+            let receipt_snapshot = std::fs::read(&receipt_path).unwrap();
+            let destination_snapshot = std::fs::read(destination.join("SKILL.md")).unwrap();
+            if index == 1 {
+                first_receipt_snapshot = Some(receipt_snapshot);
+                first_destination_snapshot = Some(destination_snapshot);
+            } else {
+                assert_eq!(Some(receipt_snapshot), first_receipt_snapshot);
+                assert_eq!(Some(destination_snapshot), first_destination_snapshot);
+            }
+        }
+
+        let first_receipt_bytes = first_receipt_snapshot.unwrap();
+        let first_receipt = pioneer_skills::read_external_runtime_receipt(&receipt_path).unwrap();
+        assert_eq!(first_receipt.entries.len(), 1);
+        assert_eq!(first_receipt.entries[0].install_name, "lifecycle");
+        assert_eq!(
+            first_receipt.entries[0].native_skills_root,
+            harness
+                .native_home
+                .join("skills")
+                .to_string_lossy()
+                .into_owned()
+        );
+        assert_eq!(
+            std::fs::read(destination.join("SKILL.md")).unwrap(),
+            std::fs::read(source.join("SKILL.md")).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(destination.join("references/guide.txt")).unwrap(),
+            b"guide-v1\n"
+        );
+        assert_eq!(std::fs::read(&receipt_path).unwrap(), first_receipt_bytes);
+
+        sleep(Duration::from_millis(2)).await;
+        std::fs::write(
+            source.join("SKILL.md"),
+            b"---\nname: lifecycle\nslug: lifecycle\ndescription: updated\n---\n# updated\n",
+        )
+        .unwrap();
+        std::fs::write(source.join("references/guide.txt"), b"guide-v2\n").unwrap();
+        let update_thread = format!("thread_full_turn_{runtime_kind:?}_3").to_lowercase();
+        let update_turn = format!("turn_full_turn_{runtime_kind:?}_3").to_lowercase();
+        seed_cli_runtime_skill_preflight_thread(&harness, &update_thread).await;
+        let update_request_id = generate_test_request_id("p51full", "update");
+        let update_request = cli_runtime_turn_start_request_with_capabilities(
+            &update_request_id,
+            &update_thread,
+            &update_turn,
+            &harness.runtime_id,
+            runtime_kind,
+            vec![cli_runtime_skill_capability("tests/lifecycle", "user")],
+        );
+        harness
+            .processor
+            .process_request(harness.connection_id, &update_request)
+            .await;
+        wait_for_recorded_cli_runtime_turn_count(&harness.cli_session, 3).await;
+        let updated_bindings = harness
+            .crud_store
+            .find_turn_skill_bindings(&update_turn)
+            .await
+            .expect("must read updated CLI runtime turn skill bindings");
+        assert_eq!(updated_bindings.len(), 1);
+        assert_eq!(updated_bindings[0].skill_slug, "tests/lifecycle");
+
+        let updated_receipt = pioneer_skills::read_external_runtime_receipt(&receipt_path).unwrap();
+        assert_ne!(
+            updated_receipt.entries[0].source_folder_hash,
+            first_receipt.entries[0].source_folder_hash
+        );
+        assert_eq!(
+            std::fs::read(destination.join("SKILL.md")).unwrap(),
+            std::fs::read(source.join("SKILL.md")).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(destination.join("references/guide.txt")).unwrap(),
+            b"guide-v2\n"
+        );
+
+        let receipt_after_update = std::fs::read(&receipt_path).unwrap();
+        let destination_after_update = std::fs::read(destination.join("SKILL.md")).unwrap();
+        let zero_thread = format!("thread_full_turn_{runtime_kind:?}_zero").to_lowercase();
+        let zero_turn = format!("turn_full_turn_{runtime_kind:?}_zero").to_lowercase();
+        seed_cli_runtime_skill_preflight_thread(&harness, &zero_thread).await;
+        let zero_request_id = generate_test_request_id("p51full", "zero");
+        let zero_request = cli_runtime_turn_start_request_with_capabilities(
+            &zero_request_id,
+            &zero_thread,
+            &zero_turn,
+            &harness.runtime_id,
+            runtime_kind,
+            Vec::new(),
+        );
+        harness
+            .processor
+            .process_request(harness.connection_id, &zero_request)
+            .await;
+        wait_for_recorded_cli_runtime_turn_count(&harness.cli_session, 4).await;
+        assert!(
+            harness
+                .crud_store
+                .find_turn_skill_bindings(&zero_turn)
+                .await
+                .expect("must read zero-skill CLI runtime turn bindings")
+                .is_empty()
+        );
+        assert_eq!(std::fs::read(&receipt_path).unwrap(), receipt_after_update);
+        assert_eq!(
+            std::fs::read(destination.join("SKILL.md")).unwrap(),
+            destination_after_update
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_system_skill_rejected_before_write_or_materialization() {
+    let mut harness =
+        setup_cli_runtime_skill_preflight_harness(CLIAgentRuntimeKind::Codex, false).await;
+    write_test_skill(&harness.system_root, "memory-like", "", "# system\n");
+    let thread_id = "thread_system_preflight";
+    let turn_id = "turn_system_preflight";
+    seed_cli_runtime_skill_preflight_thread(&harness, thread_id).await;
+    let request_id = generate_test_request_id("p51system", "reject");
+    let request = cli_runtime_turn_start_request_with_capabilities(
+        &request_id,
+        thread_id,
+        turn_id,
+        &harness.runtime_id,
+        harness.runtime_kind,
+        vec![cli_runtime_skill_capability("tests/memory-like", "system")],
+    );
+    harness
+        .processor
+        .process_request(harness.connection_id, &request)
+        .await;
+    let error = recv_error_by_id(&mut harness.rx, &request_id).await;
+    assert!(
+        error
+            .error
+            .message
+            .contains(crate::cli_runtime::skills::CLI_RUNTIME_SYSTEM_SKILL_NOT_EXPORTABLE)
+    );
+    assert!(!harness.native_home.join("skills").exists());
+    assert!(
+        !harness
+            .runtime_home
+            .join(pioneer_skills::EXTERNAL_RUNTIME_RECEIPT_FILE_NAME)
+            .exists()
+    );
+    assert!(harness.cli_session.thread_starts.lock().await.is_empty());
+    assert!(harness.cli_session.turn_starts.lock().await.is_empty());
+    assert!(harness.event_log.lock().await.is_empty());
+    assert!(
+        harness
+            .crud_store
+            .get_turn(thread_id, turn_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_skill_native_agent_control_keeps_system_skill_in_pioneer_flow() {
+    let mut harness =
+        setup_cli_runtime_skill_preflight_harness(CLIAgentRuntimeKind::Codex, false).await;
+    write_test_skill(&harness.system_root, "memory-like", "", "# system\n");
+    let thread_id = "thread_native_system_control";
+    let turn_id = "turn_native_system_control";
+    seed_cli_runtime_skill_preflight_thread(&harness, thread_id).await;
+    let request_id = generate_test_request_id("p51native", "system");
+    let mut request: JsonValue = serde_json::from_str(&cli_runtime_turn_start_request(
+        &request_id,
+        thread_id,
+        turn_id,
+        serde_json::to_value(AgentExecutionBackend::ApiProvider {
+            provider: "openai".to_owned(),
+        })
+        .unwrap(),
+        "full_access",
+        "use selected system skill",
+        None,
+    ))
+    .unwrap();
+    request["params"]["capabilities"] = JsonValue::Array(vec![cli_runtime_skill_capability(
+        "tests/memory-like",
+        "system",
+    )]);
+
+    harness
+        .processor
+        .process_request(harness.connection_id, request.to_string().as_str())
+        .await;
+    let _ = recv_response_by_id(&mut harness.rx, &request_id).await;
+
+    assert!(
+        harness
+            .crud_store
+            .get_turn(thread_id, turn_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(harness.cli_session.thread_starts.lock().await.is_empty());
+    assert!(harness.cli_session.turn_starts.lock().await.is_empty());
+    assert!(!harness.native_home.join("skills").exists());
+    assert!(
+        !harness
+            .runtime_home
+            .join(pioneer_skills::EXTERNAL_RUNTIME_RECEIPT_FILE_NAME)
+            .exists()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_cli_runtime_new_skill_closes_one_cached_session_before_restart() {
+    let harness =
+        setup_cli_runtime_skill_preflight_harness(CLIAgentRuntimeKind::Codex, false).await;
+    write_test_skill(&harness.user_root, "refresh", "", "# refresh\n");
+    let thread_id = "thread_codex_skill_refresh";
+    seed_cli_runtime_skill_preflight_thread(&harness, thread_id).await;
+    let session_key = CLIAgentRuntimeSessionKey::new(
+        harness.workspace_id.clone(),
+        harness.runtime_id.clone(),
+        thread_id,
+    )
+    .unwrap();
+    harness.cli_manager.get_or_start(session_key).await.unwrap();
+    sleep(Duration::from_millis(2)).await;
+
+    let request_id = generate_test_request_id("p51refresh", "codex");
+    let request = cli_runtime_turn_start_request_with_capabilities(
+        &request_id,
+        thread_id,
+        "turn_codex_skill_refresh",
+        &harness.runtime_id,
+        harness.runtime_kind,
+        vec![cli_runtime_skill_capability("tests/refresh", "user")],
+    );
+    harness
+        .processor
+        .process_request(harness.connection_id, &request)
+        .await;
+    wait_for_recorded_cli_runtime_turn_start(&harness.cli_session).await;
+    assert_eq!(harness.cli_session.closes.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_cli_runtime_new_skill_closes_one_cached_session_before_restart() {
+    let harness =
+        setup_cli_runtime_skill_preflight_harness(CLIAgentRuntimeKind::Claude, false).await;
+    write_test_skill(&harness.user_root, "refresh", "", "# refresh\n");
+    let thread_id = "thread_claude_skill_refresh";
+    seed_cli_runtime_skill_preflight_thread(&harness, thread_id).await;
+    let session_key = CLIAgentRuntimeSessionKey::new(
+        harness.workspace_id.clone(),
+        harness.runtime_id.clone(),
+        thread_id,
+    )
+    .unwrap();
+    harness.cli_manager.get_or_start(session_key).await.unwrap();
+    sleep(Duration::from_millis(2)).await;
+
+    let request_id = generate_test_request_id("p51refresh", "claude");
+    let request = cli_runtime_turn_start_request_with_capabilities(
+        &request_id,
+        thread_id,
+        "turn_claude_skill_refresh",
+        &harness.runtime_id,
+        harness.runtime_kind,
+        vec![cli_runtime_skill_capability("tests/refresh", "user")],
+    );
+    harness
+        .processor
+        .process_request(harness.connection_id, &request)
+        .await;
+    let native = wait_for_recorded_cli_runtime_turn_start(&harness.cli_session).await;
+    assert_eq!(harness.cli_session.closes.load(Ordering::SeqCst), 1);
+    assert!(native.input.as_array().unwrap().iter().any(|item| {
+        item["type"] == "text"
+            && item["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("native Skill tool"))
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_skill_not_model_invocable_rejects_before_write_and_native() {
+    let mut harness =
+        setup_cli_runtime_skill_preflight_harness(CLIAgentRuntimeKind::Claude, false).await;
+    write_test_skill(
+        &harness.user_root,
+        "manual-only",
+        "disable-model-invocation: true",
+        "# manual only\n",
+    );
+    let thread_id = "thread_claude_manual_skill";
+    let turn_id = "turn_claude_manual_skill";
+    seed_cli_runtime_skill_preflight_thread(&harness, thread_id).await;
+    let request_id = generate_test_request_id("p51claude", "blocked");
+    let request = cli_runtime_turn_start_request_with_capabilities(
+        &request_id,
+        thread_id,
+        turn_id,
+        &harness.runtime_id,
+        harness.runtime_kind,
+        vec![cli_runtime_skill_capability("tests/manual-only", "user")],
+    );
+    harness
+        .processor
+        .process_request(harness.connection_id, &request)
+        .await;
+    let error = recv_error_by_id(&mut harness.rx, &request_id).await;
+    assert!(
+        error
+            .error
+            .message
+            .contains(crate::cli_runtime::skills::CLI_RUNTIME_CLAUDE_SKILL_NOT_MODEL_INVOCABLE)
+    );
+    assert!(!harness.native_home.join("skills").exists());
+    assert!(
+        !harness
+            .runtime_home
+            .join(pioneer_skills::EXTERNAL_RUNTIME_RECEIPT_FILE_NAME)
+            .exists()
+    );
+    assert!(harness.cli_session.thread_starts.lock().await.is_empty());
+    assert!(harness.event_log.lock().await.is_empty());
+    assert!(
+        harness
+            .crud_store
+            .get_turn(thread_id, turn_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_skill_preflight_collision_and_copy_failure_do_not_start_turn() {
+    let mut collision =
+        setup_cli_runtime_skill_preflight_harness(CLIAgentRuntimeKind::Codex, false).await;
+    write_test_skill_with_declared_name(&collision.user_root, "first", "same skill");
+    write_test_skill_with_declared_name(&collision.registry_root, "second", "same@skill");
+    seed_cli_runtime_skill_preflight_thread(&collision, "thread_collision_preflight").await;
+    let collision_request_id = generate_test_request_id("p51collision", "fail");
+    let request = cli_runtime_turn_start_request_with_capabilities(
+        &collision_request_id,
+        "thread_collision_preflight",
+        "turn_collision_preflight",
+        &collision.runtime_id,
+        collision.runtime_kind,
+        vec![
+            cli_runtime_skill_capability("tests/first", "user"),
+            cli_runtime_skill_capability("tests/second", "registry"),
+        ],
+    );
+    collision
+        .processor
+        .process_request(collision.connection_id, &request)
+        .await;
+    let error = recv_error_by_id(&mut collision.rx, &collision_request_id).await;
+    assert!(
+        error
+            .error
+            .message
+            .contains("cli_runtime.skill_destination_collision")
+    );
+    assert!(!collision.native_home.join("skills").exists());
+    assert!(collision.cli_session.thread_starts.lock().await.is_empty());
+    assert!(
+        collision
+            .crud_store
+            .get_turn("thread_collision_preflight", "turn_collision_preflight")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let mut copy_failure =
+        setup_cli_runtime_skill_preflight_harness(CLIAgentRuntimeKind::Codex, true).await;
+    write_test_skill(
+        &copy_failure.user_root,
+        "copy-failure",
+        "",
+        "# copy failure\n",
+    );
+    seed_cli_runtime_skill_preflight_thread(&copy_failure, "thread_copy_failure_preflight").await;
+    let copy_request_id = generate_test_request_id("p51copy", "failure");
+    let request = cli_runtime_turn_start_request_with_capabilities(
+        &copy_request_id,
+        "thread_copy_failure_preflight",
+        "turn_copy_failure_preflight",
+        &copy_failure.runtime_id,
+        copy_failure.runtime_kind,
+        vec![cli_runtime_skill_capability("tests/copy-failure", "user")],
+    );
+    copy_failure
+        .processor
+        .process_request(copy_failure.connection_id, &request)
+        .await;
+    let error = recv_error_by_id(&mut copy_failure.rx, &copy_request_id).await;
+    assert!(
+        error
+            .error
+            .message
+            .contains("failed to prepare CLI runtime skill")
+    );
+    assert!(
+        copy_failure
+            .cli_session
+            .thread_starts
+            .lock()
+            .await
+            .is_empty()
+    );
+    assert!(copy_failure.event_log.lock().await.is_empty());
+    assert!(
+        copy_failure
+            .crud_store
+            .get_turn(
+                "thread_copy_failure_preflight",
+                "turn_copy_failure_preflight"
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_skill_preflight_mcp_and_resolver_failures_have_zero_side_effects() {
+    for (suffix, capabilities, expected) in [
+        (
+            "mcp",
+            vec![
+                serde_json::to_value(pioneer_protocol::TurnCapability {
+                    id: "mcp:server".to_owned(),
+                    kind: pioneer_protocol::TurnCapabilityKind::McpServer {
+                        name: "server".to_owned(),
+                        scope_kind: McpScopeKind::Workspace,
+                    },
+                    label: None,
+                })
+                .unwrap(),
+            ],
+            "do not support skills, MCP capabilities",
+        ),
+        (
+            "missing",
+            vec![cli_runtime_skill_capability("tests/missing", "user")],
+            "cli_runtime.skill_resolve_failed",
+        ),
+    ] {
+        let mut harness =
+            setup_cli_runtime_skill_preflight_harness(CLIAgentRuntimeKind::Codex, false).await;
+        let thread_id = format!("thread_{suffix}_preflight");
+        let turn_id = format!("turn_{suffix}_preflight");
+        let request_id = generate_test_request_id("p51failure", suffix);
+        seed_cli_runtime_skill_preflight_thread(&harness, &thread_id).await;
+        let request = cli_runtime_turn_start_request_with_capabilities(
+            &request_id,
+            &thread_id,
+            &turn_id,
+            &harness.runtime_id,
+            harness.runtime_kind,
+            capabilities,
+        );
+        harness
+            .processor
+            .process_request(harness.connection_id, &request)
+            .await;
+        let error = recv_error_by_id(&mut harness.rx, &request_id).await;
+        assert!(
+            error.error.message.contains(expected),
+            "unexpected {suffix} preflight error: {}",
+            error.error.message
+        );
+        assert!(harness.cli_session.thread_starts.lock().await.is_empty());
+        assert!(harness.cli_session.turn_starts.lock().await.is_empty());
+        assert!(harness.event_log.lock().await.is_empty());
+        assert!(!harness.native_home.join("skills").exists());
+        assert!(
+            !harness
+                .runtime_home
+                .join(pioneer_skills::EXTERNAL_RUNTIME_RECEIPT_FILE_NAME)
+                .exists()
+        );
+        assert!(
+            harness
+                .crud_store
+                .get_turn(&thread_id, &turn_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
 async fn seed_cli_runtime_security_thread(
     harness: &CliRuntimeSecurityHarness,
     thread_id: &str,
@@ -558,6 +1469,22 @@ async fn wait_for_recorded_cli_runtime_turn_start(
     })
     .await
     .expect("CLI runtime turn/start should be recorded")
+}
+
+async fn wait_for_recorded_cli_runtime_turn_count(
+    cli_session: &RecordingCliRuntimeSession,
+    expected: usize,
+) {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if cli_session.turn_starts.lock().await.len() >= expected {
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("expected {expected} recorded CLI runtime turn starts"));
 }
 
 async fn load_persisted_security_snapshot(

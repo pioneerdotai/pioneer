@@ -240,6 +240,13 @@ impl PioneerDesktop {
                 capability,
             );
         }
+        let filtered = self.effective_composer_capabilities();
+        let removed = filtered.len() != self.composer_capabilities.len();
+        self.composer_capabilities = filtered;
+        if removed {
+            self.composer_upload_error =
+                Some(t!("chat.composer.capabilities_removed_for_provider").to_string());
+        }
     }
 
     pub(super) fn submit_composer_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -269,7 +276,6 @@ impl PioneerDesktop {
                     return;
                 }
             };
-        let cli_runtime_selected = selected_cli_runtime_backend.is_some();
         let turn_model_provider = if selected_cli_runtime_backend.is_some() {
             None
         } else {
@@ -280,16 +286,9 @@ impl PioneerDesktop {
         };
 
         let composer_text = composer_state.read(cx).value().trim().to_owned();
-        if cli_runtime_selected {
-            self.composer_capabilities.clear();
-            self.composer_upload_error = None;
-        }
         let composer_attachments = self.composer_attachments.clone();
-        let composer_capabilities = if cli_runtime_selected {
-            Vec::new()
-        } else {
-            self.composer_capabilities.clone()
-        };
+        let composer_capabilities = self.effective_composer_capabilities();
+        self.composer_capabilities = composer_capabilities.clone();
         if !composer_turn_prepare::composer_has_sendable_content(
             composer_text.as_str(),
             !composer_attachments.is_empty(),
