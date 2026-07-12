@@ -955,19 +955,31 @@ impl MessageProcessor {
                     return;
                 }
             };
-            if let Err(error) = message_future(
-                self.crud_store
-                    .materialize_turn_start_with_reasoning_effort_and_permission_audit(
-                        &outcome.materialization.thread,
-                        outcome.materialization.sandbox_mode,
-                        &outcome.materialization.turn,
-                        &outcome.materialization.input,
-                        effective_cli_runtime_effort.as_deref(),
-                        profile_selected_audit,
-                    ),
-            )
-            .await
-            {
+            let materialization_result = {
+                let crud_store = self.crud_store.clone();
+                let materialization = outcome.materialization.clone();
+                let effective_reasoning_effort = effective_cli_runtime_effort.clone();
+                let workflow = message_future(async move {
+                    crud_store
+                        .materialize_turn_start_with_reasoning_effort_and_permission_audit(
+                            &materialization.thread,
+                            materialization.sandbox_mode,
+                            &materialization.turn,
+                            &materialization.input,
+                            effective_reasoning_effort.as_deref(),
+                            profile_selected_audit,
+                        )
+                        .await
+                });
+                message_fresh_task(workflow).await
+            };
+            let materialization_result = match materialization_result {
+                Ok(result) => result,
+                Err(error) => Err(anyhow::anyhow!(
+                    "CLI runtime turn/start materialization task failed: {error}"
+                )),
+            };
+            if let Err(error) = materialization_result {
                 self.thread_manager
                     .rollback_turn_start(outcome.rollback_context.clone())
                     .await;
