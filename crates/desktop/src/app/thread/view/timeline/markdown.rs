@@ -294,13 +294,13 @@ impl PioneerDesktop {
             .child(
                 div()
                     .text_xs()
-                    .opacity(0.65)
+                    .opacity(0.6)
                     .line_height(relative(1.1))
                     .when_some(language_label, |this, language| this.child(language)),
             )
             .child(
                 div()
-                    .opacity(0.65)
+                    .opacity(0.6)
                     .child(Clipboard::new(clipboard_id).value(text.to_owned())),
             );
         let mut body = v_flex().w_full().gap_2().child(header);
