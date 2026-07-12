@@ -15,6 +15,51 @@ fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/external-runtime-installer")
 }
 
+#[cfg(unix)]
+fn copy_fixture_tree(source: &Path, destination: &Path) {
+    use std::os::unix::fs::symlink;
+
+    fs::create_dir_all(destination).unwrap();
+    for entry in fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let file_type = entry.file_type().unwrap();
+        if file_type.is_symlink() {
+            symlink(fs::read_link(source_path).unwrap(), destination_path).unwrap();
+        } else if file_type.is_dir() {
+            copy_fixture_tree(&source_path, &destination_path);
+        } else {
+            fs::copy(source_path, destination_path).unwrap();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn materialize_fixture_source(root: &Path, manifest: &Value, scratch: &Path) -> PathBuf {
+    use std::os::unix::fs::symlink;
+
+    let source = scratch.join("source");
+    copy_fixture_tree(&root.join("source"), &source);
+    for generated in manifest["fixture_materialization"]["generated_symlinks"]
+        .as_array()
+        .unwrap()
+    {
+        let relative = Path::new(generated["path"].as_str().unwrap());
+        assert!(
+            relative.is_relative()
+                && relative
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_))),
+            "generated fixture symlink path must be a contained relative path"
+        );
+        let link = source.join(relative);
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        symlink(generated["target"].as_str().unwrap(), link).unwrap();
+    }
+    source
+}
+
 fn file_hashes(root: &Path, current: &Path, out: &mut BTreeMap<String, String>) {
     for entry in fs::read_dir(current).unwrap() {
         let entry = entry.unwrap();
@@ -66,13 +111,20 @@ fn external_runtime_installer_compat_manifest_is_pinned_and_self_consistent() {
         "node_modules"
     );
     assert_eq!(manifest["hash_selection"]["includes_metadata_json"], true);
+    assert_eq!(
+        manifest["fixture_materialization"]["generated_symlinks"][0]["path"],
+        "symlink-exclusions/.git"
+    );
 }
 
+#[cfg(unix)]
 #[test]
 fn external_runtime_installer_compat_public_api_matches_oracle() {
     let root = fixture_root();
     let manifest: Value =
         serde_json::from_slice(&fs::read(root.join("manifest.json")).unwrap()).unwrap();
+    let source_temp = tempfile::tempdir().unwrap();
+    let source = materialize_fixture_source(&root, &manifest, source_temp.path());
     for case in manifest["sanitize"].as_array().unwrap() {
         assert_eq!(
             sanitize_name(case["input"].as_str().unwrap()),
@@ -80,18 +132,18 @@ fn external_runtime_installer_compat_public_api_matches_oracle() {
         );
     }
     assert_eq!(
-        compute_skill_folder_hash(&root.join("source")).unwrap(),
+        compute_skill_folder_hash(&source).unwrap(),
         manifest["folder_hash"]
     );
     let temp = tempfile::tempdir().unwrap();
     let codex = temp.path().join("codex/skills/oracle-skill");
     let claude = temp.path().join("claude/skills/oracle-skill");
     assert_eq!(
-        replace_external_runtime_skill(&root.join("source"), &codex).unwrap(),
+        replace_external_runtime_skill(&source, &codex).unwrap(),
         ExternalRuntimeCopyResult::Changed
     );
     assert_eq!(
-        replace_external_runtime_skill(&root.join("source"), &claude).unwrap(),
+        replace_external_runtime_skill(&source, &claude).unwrap(),
         ExternalRuntimeCopyResult::Changed
     );
     assert_eq!(

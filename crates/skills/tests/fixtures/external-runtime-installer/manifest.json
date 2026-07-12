@@ -15,6 +15,12 @@
   ],
   "folder_hash": "f8e26339fec945e49a6485c444661fd1f2c883cd99521d4c38ab4947bddc3e4f",
   "hash_order": ["__pycache__/cache.pyc", "__pypackages__/3.12/lib/pkg.py", ".hidden", "assets/blob.bin", "metadata.json", "order/_under.txt", "order/a.txt", "order/éclair.txt", "order/Z.txt", "order/日本語.txt", "references/guide.md", "references/metadata.json", "scripts/run.sh", "SKILL.md"],
+  "fixture_materialization": {
+    "generated_symlinks": [
+      { "path": "symlink-exclusions/.git", "target": "../references" }
+    ],
+    "reason": "Git does not track entries whose path contains a .git component"
+  },
   "copy_file_hashes": {
     ".hidden": "e83e0ca964304979aba0d46a9ce6d38222d3623931b0e8a53afa9df7c8411bbd",
     "assets/blob.bin": "d44e31ff775b3674c54c7e5a3c488e0f496ed285197d5e57a7ee62942fb9b123",
