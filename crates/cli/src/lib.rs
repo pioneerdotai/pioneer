@@ -8,7 +8,7 @@ use pioneer_config::InstallManagedBy;
 use serde_json::json;
 use std::env;
 use std::fmt;
-use tracing::error;
+use tracing::warn;
 
 pub fn main_entry() {
     let sentry_guard =
@@ -18,9 +18,14 @@ pub fn main_entry() {
     if let Err(error) = run() {
         if is_usage_error(&error) {
             eprintln!("{error:#}");
+        } else if installer::is_transient_download_error(&error) {
+            warn!(
+                error = %format!("{error:#}"),
+                "pioneer command failed after transient installer network failure"
+            );
         } else {
+            warn!(error = %format!("{error:#}"), "pioneer command failed");
             pioneer_observability::capture_anyhow(&error);
-            error!(error = %format!("{error:#}"), "pioneer command failed");
         }
         drop(sentry_guard);
         std::process::exit(1);
@@ -371,6 +376,9 @@ fn print_install_failure_json(
 }
 
 fn install_error_code(command: installer::InstallCommand, error_text: &str) -> &'static str {
+    if error_text.contains("transient network failure") {
+        return "download_transient_network_failure";
+    }
     if error_text.contains("checksum mismatch") {
         return "checksum_mismatch";
     }
@@ -559,5 +567,16 @@ mod tests {
         let error = run_with_args(args(&["task-invariants", "--json"]))
             .expect_err("missing task-invariants db should fail");
         assert!(is_usage_error(&error));
+    }
+
+    #[test]
+    fn transient_installer_network_failure_has_stable_error_code() {
+        assert_eq!(
+            install_error_code(
+                installer::InstallCommand::Update,
+                "download failed due to a transient network failure",
+            ),
+            "download_transient_network_failure"
+        );
     }
 }

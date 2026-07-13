@@ -1,10 +1,12 @@
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
 use pioneer_config::{AppConfig, InstallManagedBy, InstallState, save_install_state};
-use reqwest::blocking::Client;
+use reqwest::{StatusCode, blocking::Client, header::RETRY_AFTER};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::error::Error;
 use std::ffi::OsStr;
+use std::fmt;
 use std::fs::{self, File};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
@@ -12,6 +14,12 @@ use std::process::{Command, Output};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
+
+const INSTALLER_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const INSTALLER_HTTP_IO_TIMEOUT: Duration = Duration::from_secs(120);
+const INSTALLER_DOWNLOAD_MAX_ATTEMPTS: u32 = 4;
+const INSTALLER_DOWNLOAD_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
+const INSTALLER_DOWNLOAD_RETRY_MAX_DELAY: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallCommand {
@@ -140,6 +148,67 @@ struct ResolvedInstallSource {
     asset_path: PathBuf,
     checksums_path: PathBuf,
     _temp_dir: Option<TempDir>,
+}
+
+#[derive(Debug)]
+pub(crate) struct InstallerTransientDownloadError {
+    url: String,
+    attempts: u32,
+    last_error: String,
+}
+
+impl fmt::Display for InstallerTransientDownloadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "download of `{}` failed after {} attempts due to a transient network failure: {}; check network access and retry the command",
+            self.url, self.attempts, self.last_error
+        )
+    }
+}
+
+impl Error for InstallerTransientDownloadError {}
+
+pub(crate) fn is_transient_download_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<InstallerTransientDownloadError>()
+        .is_some()
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DownloadRetryPolicy {
+    max_attempts: u32,
+    base_delay: Duration,
+    max_delay: Duration,
+}
+
+impl DownloadRetryPolicy {
+    const fn installer_default() -> Self {
+        Self {
+            max_attempts: INSTALLER_DOWNLOAD_MAX_ATTEMPTS,
+            base_delay: INSTALLER_DOWNLOAD_RETRY_BASE_DELAY,
+            max_delay: INSTALLER_DOWNLOAD_RETRY_MAX_DELAY,
+        }
+    }
+
+    fn delay_after_attempt(self, attempt: u32, retry_after: Option<Duration>) -> Duration {
+        if let Some(delay) = retry_after {
+            return delay.min(self.max_delay);
+        }
+
+        let exponent = attempt.saturating_sub(1).min(10);
+        self.base_delay
+            .saturating_mul(1_u32 << exponent)
+            .min(self.max_delay)
+    }
+}
+
+enum DownloadAttemptFailure {
+    Retryable {
+        message: String,
+        retry_after: Option<Duration>,
+    },
+    Fatal(anyhow::Error),
 }
 
 pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
@@ -408,6 +477,8 @@ fn resolve_release_install_source(
 
     let client = Client::builder()
         .user_agent("pioneer-installer/1.0")
+        .connect_timeout(INSTALLER_HTTP_CONNECT_TIMEOUT)
+        .timeout(INSTALLER_HTTP_IO_TIMEOUT)
         .build()
         .context("failed to initialize HTTP client")?;
 
@@ -497,22 +568,170 @@ fn normalize_version_tag(raw: &str) -> String {
 }
 
 fn download_release_asset(client: &Client, url: &str, destination: &Path) -> Result<()> {
-    let mut response = client
-        .get(url)
-        .send()
-        .with_context(|| format!("failed to download `{url}`"))?
-        .error_for_status()
-        .with_context(|| format!("release asset request failed for `{url}`"))?;
+    download_release_asset_with_policy(
+        client,
+        url,
+        destination,
+        DownloadRetryPolicy::installer_default(),
+    )
+}
 
-    let mut file = File::create(destination)
-        .with_context(|| format!("failed to create `{}`", destination.display()))?;
-    response.copy_to(&mut file).with_context(|| {
-        format!(
-            "failed to write downloaded payload into `{}`",
+fn download_release_asset_with_policy(
+    client: &Client,
+    url: &str,
+    destination: &Path,
+    policy: DownloadRetryPolicy,
+) -> Result<()> {
+    let partial_path = download_partial_path(destination);
+    let max_attempts = policy.max_attempts.max(1);
+
+    for attempt in 1..=max_attempts {
+        match download_release_asset_once(client, url, destination, partial_path.as_path()) {
+            Ok(()) => return Ok(()),
+            Err(DownloadAttemptFailure::Fatal(error)) => {
+                let _ = fs::remove_file(partial_path.as_path());
+                return Err(error);
+            }
+            Err(DownloadAttemptFailure::Retryable {
+                message,
+                retry_after,
+            }) if attempt < max_attempts => {
+                let _ = fs::remove_file(partial_path.as_path());
+                let delay = policy.delay_after_attempt(attempt, retry_after);
+                tracing::warn!(
+                    url,
+                    attempt,
+                    max_attempts,
+                    retry_delay_ms = delay.as_millis(),
+                    error = message,
+                    "release asset download attempt failed; retrying"
+                );
+                thread::sleep(delay);
+            }
+            Err(DownloadAttemptFailure::Retryable { message, .. }) => {
+                let _ = fs::remove_file(partial_path.as_path());
+                return Err(InstallerTransientDownloadError {
+                    url: url.to_owned(),
+                    attempts: max_attempts,
+                    last_error: message,
+                }
+                .into());
+            }
+        }
+    }
+
+    unreachable!("download retry loop always returns")
+}
+
+fn download_release_asset_once(
+    client: &Client,
+    url: &str,
+    destination: &Path,
+    partial_path: &Path,
+) -> std::result::Result<(), DownloadAttemptFailure> {
+    let mut response = match client.get(url).send() {
+        Ok(response) => response,
+        Err(error) if is_retryable_reqwest_error(&error) => {
+            return Err(DownloadAttemptFailure::Retryable {
+                message: error.to_string(),
+                retry_after: None,
+            });
+        }
+        Err(error) => {
+            return Err(DownloadAttemptFailure::Fatal(
+                anyhow::Error::new(error).context(format!("failed to download `{url}`")),
+            ));
+        }
+    };
+
+    let status = response.status();
+    if !status.is_success() {
+        let retry_after = retry_after_delay(&response);
+        let error = response
+            .error_for_status()
+            .expect_err("non-success response must fail status validation");
+        if is_retryable_download_status(status) {
+            return Err(DownloadAttemptFailure::Retryable {
+                message: error.to_string(),
+                retry_after,
+            });
+        }
+        return Err(DownloadAttemptFailure::Fatal(
+            anyhow::Error::new(error).context(format!("release asset request failed for `{url}`")),
+        ));
+    }
+
+    let mut file = File::create(partial_path).map_err(|error| {
+        DownloadAttemptFailure::Fatal(anyhow::Error::new(error).context(format!(
+            "failed to create partial download `{}`",
+            partial_path.display()
+        )))
+    })?;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read =
+            response
+                .read(&mut buffer)
+                .map_err(|error| DownloadAttemptFailure::Retryable {
+                    message: format!("failed to read response body from `{url}`: {error}"),
+                    retry_after: None,
+                })?;
+        if read == 0 {
+            break;
+        }
+        file.write_all(&buffer[..read]).map_err(|error| {
+            DownloadAttemptFailure::Fatal(anyhow::Error::new(error).context(format!(
+                "failed to write downloaded payload into `{}`",
+                partial_path.display()
+            )))
+        })?;
+    }
+    file.flush().map_err(|error| {
+        DownloadAttemptFailure::Fatal(anyhow::Error::new(error).context(format!(
+            "failed to flush downloaded payload `{}`",
+            partial_path.display()
+        )))
+    })?;
+    drop(file);
+
+    if destination.exists() {
+        fs::remove_file(destination).map_err(|error| {
+            DownloadAttemptFailure::Fatal(anyhow::Error::new(error).context(format!(
+                "failed to remove previous download `{}`",
+                destination.display()
+            )))
+        })?;
+    }
+    fs::rename(partial_path, destination).map_err(|error| {
+        DownloadAttemptFailure::Fatal(anyhow::Error::new(error).context(format!(
+            "failed to finalize download `{}`",
             destination.display()
-        )
+        )))
     })?;
     Ok(())
+}
+
+fn download_partial_path(destination: &Path) -> PathBuf {
+    let mut path = destination.as_os_str().to_os_string();
+    path.push(".part");
+    PathBuf::from(path)
+}
+
+fn is_retryable_reqwest_error(error: &reqwest::Error) -> bool {
+    error.is_timeout() || error.is_connect() || error.is_request() || error.is_body()
+}
+
+fn is_retryable_download_status(status: StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 425 | 429 | 500 | 502 | 503 | 504)
+}
+
+fn retry_after_delay(response: &reqwest::blocking::Response) -> Option<Duration> {
+    response
+        .headers()
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
 }
 
 fn gateway_asset_file_name() -> Result<String> {
@@ -1534,17 +1753,23 @@ fn unix_timestamp_secs() -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
+        DownloadRetryPolicy, download_partial_path, download_release_asset_with_policy,
         ensure_unix_user_path_configured, expected_checksum_for_asset, force_path_update_warning,
-        parse_start_warnings,
+        is_transient_download_error, parse_start_warnings,
     };
+    use anyhow::Context as _;
+    use reqwest::blocking::Client;
     use std::fs;
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
     #[cfg(not(windows))]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     #[cfg(not(windows))]
     use std::sync::{Mutex, OnceLock};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::thread::{self, JoinHandle};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn parses_prefixed_checksum_line() {
@@ -1614,6 +1839,94 @@ mod tests {
                 "pioneer-gateway-{expected_os}-{expected_arch}{expected_variant}.{expected_ext}"
             )
         );
+    }
+
+    #[test]
+    fn release_asset_download_retries_transient_status_and_finalizes_atomically() {
+        let body = b"gateway-asset";
+        let (url, server) = spawn_http_responses(vec![
+            http_response(503, "Service Unavailable", b""),
+            http_response(200, "OK", body),
+        ]);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let destination = temp_dir.path().join("gateway.gz");
+
+        download_release_asset_with_policy(
+            &test_http_client(),
+            url.as_str(),
+            destination.as_path(),
+            immediate_retry_policy(2),
+        )
+        .expect("transient response should be retried");
+        server.join().expect("HTTP server should finish");
+
+        assert_eq!(fs::read(&destination).expect("downloaded asset"), body);
+        assert!(!download_partial_path(&destination).exists());
+    }
+
+    #[test]
+    fn release_asset_download_retries_request_timeout() {
+        let body = b"gateway-asset-after-timeout";
+        let (url, server) = spawn_timeout_then_success(body);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let destination = temp_dir.path().join("gateway.gz");
+
+        download_release_asset_with_policy(
+            &test_http_client_with_timeout(Duration::from_millis(50)),
+            url.as_str(),
+            destination.as_path(),
+            immediate_retry_policy(2),
+        )
+        .expect("timed out request should be retried");
+        server.join().expect("HTTP server should finish");
+
+        assert_eq!(fs::read(&destination).expect("downloaded asset"), body);
+        assert!(!download_partial_path(&destination).exists());
+    }
+
+    #[test]
+    fn exhausted_transient_download_remains_classified_through_context() {
+        let (url, server) = spawn_http_responses(vec![
+            http_response(503, "Service Unavailable", b""),
+            http_response(503, "Service Unavailable", b""),
+        ]);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let destination = temp_dir.path().join("gateway.gz");
+
+        let error = download_release_asset_with_policy(
+            &test_http_client(),
+            url.as_str(),
+            destination.as_path(),
+            immediate_retry_policy(2),
+        )
+        .context("failed to download gateway asset from release `v-test`")
+        .expect_err("exhausted transient responses should fail");
+        server.join().expect("HTTP server should finish");
+
+        assert!(is_transient_download_error(&error));
+        assert!(format!("{error:#}").contains("failed after 2 attempts"));
+        assert!(!destination.exists());
+        assert!(!download_partial_path(&destination).exists());
+    }
+
+    #[test]
+    fn release_asset_download_does_not_retry_permanent_status() {
+        let (url, server) = spawn_http_responses(vec![http_response(404, "Not Found", b"missing")]);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let destination = temp_dir.path().join("gateway.gz");
+
+        let error = download_release_asset_with_policy(
+            &test_http_client(),
+            url.as_str(),
+            destination.as_path(),
+            immediate_retry_policy(4),
+        )
+        .expect_err("permanent response should fail immediately");
+        server.join().expect("HTTP server should finish");
+
+        assert!(!is_transient_download_error(&error));
+        assert!(format!("{error:#}").contains("404 Not Found"));
+        assert!(!destination.exists());
     }
 
     #[test]
@@ -1914,5 +2227,85 @@ fi
             .as_nanos();
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("{prefix}-{nanos}-{id}.txt"))
+    }
+
+    fn immediate_retry_policy(max_attempts: u32) -> DownloadRetryPolicy {
+        DownloadRetryPolicy {
+            max_attempts,
+            base_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+        }
+    }
+
+    fn test_http_client() -> Client {
+        test_http_client_with_timeout(Duration::from_secs(2))
+    }
+
+    fn test_http_client_with_timeout(timeout: Duration) -> Client {
+        Client::builder()
+            .connect_timeout(Duration::from_secs(1))
+            .timeout(timeout)
+            .build()
+            .expect("test HTTP client")
+    }
+
+    fn spawn_timeout_then_success(body: &'static [u8]) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test HTTP server");
+        let address = listener.local_addr().expect("test HTTP server address");
+        let delayed_response = http_response(200, "OK", b"late");
+        let success_response = http_response(200, "OK", body);
+        let server = thread::spawn(move || {
+            let (mut first_stream, _) = listener.accept().expect("accept first HTTP request");
+            read_http_request(&mut first_stream);
+            let delayed_writer = thread::spawn(move || {
+                thread::sleep(Duration::from_millis(200));
+                let _ = first_stream.write_all(&delayed_response);
+            });
+
+            let (mut second_stream, _) = listener.accept().expect("accept retry HTTP request");
+            read_http_request(&mut second_stream);
+            second_stream
+                .write_all(&success_response)
+                .expect("write successful retry response");
+            delayed_writer.join().expect("delayed response writer");
+        });
+        (format!("http://{address}/asset"), server)
+    }
+
+    fn spawn_http_responses(responses: Vec<Vec<u8>>) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test HTTP server");
+        let address = listener.local_addr().expect("test HTTP server address");
+        let server = thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().expect("accept HTTP request");
+                read_http_request(&mut stream);
+                stream.write_all(&response).expect("write HTTP response");
+            }
+        });
+        (format!("http://{address}/asset"), server)
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set request read timeout");
+        let mut request = [0_u8; 4096];
+        let read = stream.read(&mut request).expect("read HTTP request");
+        assert!(
+            request[..read]
+                .windows(4)
+                .any(|window| window == b"\r\n\r\n"),
+            "request headers should be complete"
+        );
+    }
+
+    fn http_response(status: u16, reason: &str, body: &[u8]) -> Vec<u8> {
+        let mut response = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
     }
 }
