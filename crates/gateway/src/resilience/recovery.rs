@@ -568,6 +568,7 @@ pub enum RecoveryCoordinatorEvent {
         item_type: TurnItemType,
         attempt_number: u32,
     },
+    CliRuntimeRetryAttemptRequested(Box<CliRuntimeRecoveryAttemptRequest>),
     RecoverySucceeded {
         job_id: String,
         turn_id: String,
@@ -581,6 +582,19 @@ pub enum RecoveryCoordinatorEvent {
         reason: String,
     },
     RecoveryExhausted(RecoveryTerminalOutcome),
+}
+
+#[derive(Debug, Clone)]
+pub struct CliRuntimeRecoveryAttemptRequest {
+    pub job_id: String,
+    pub recovery_attempt_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub item_type: TurnItemType,
+    pub attempt_number: u32,
+    pub execution_window_index: u32,
+    pub previous_failure_reason: String,
+    pub binding: pioneer_crud::CliRuntimeTurnBindingRecord,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -864,6 +878,32 @@ impl RecoveryCoordinator {
             recovery_attempt_id,
             failure.message,
             failure.retry_after_ms,
+            now_unix,
+        )
+        .await
+    }
+
+    pub async fn record_cli_runtime_attempt_failure(
+        &self,
+        recovery_job_id: &str,
+        recovery_attempt_id: &str,
+        failure_message: String,
+        now_unix: i64,
+    ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+        let Some(job) = self.crud_store.get_recovery_job(recovery_job_id).await? else {
+            return Ok(Vec::new());
+        };
+        if job.status != RecoveryJobStatus::Active
+            || job.active_attempt_id.as_deref() != Some(recovery_attempt_id)
+        {
+            return Ok(Vec::new());
+        }
+
+        self.record_active_recovery_failure(
+            job,
+            recovery_attempt_id,
+            Some(failure_message),
+            None,
             now_unix,
         )
         .await
@@ -1763,6 +1803,13 @@ impl RecoveryCoordinator {
             return Ok(events);
         }
 
+        let cli_runtime_binding = if job.action == RecoveryAction::RestartTurn {
+            self.crud_store
+                .get_cli_runtime_turn_binding(job.turn_id.as_str())
+                .await?
+        } else {
+            None
+        };
         let active_attempt_id = generate_id(RECOVERY_ATTEMPT_ID_LEN);
         match self
             .crud_store
@@ -1789,6 +1836,50 @@ impl RecoveryCoordinator {
                 return Ok(events);
             }
             ClaimedRecoveryActivation::ClaimNotFound => return Ok(events),
+        }
+
+        if let Some(binding) = cli_runtime_binding {
+            let execution_window_index = match self
+                .next_recovery_execution_window_index(
+                    job.turn_id.as_str(),
+                    now_unix,
+                    "cli_runtime_recovery",
+                    "native CLI turn was replaced by a recovery attempt",
+                )
+                .await
+            {
+                Ok(index) => index,
+                Err(error) => {
+                    return self
+                        .record_active_recovery_failure(
+                            job,
+                            active_attempt_id.as_str(),
+                            Some(format!(
+                                "failed to prepare CLI runtime recovery execution window: {error:#}"
+                            )),
+                            None,
+                            now_unix,
+                        )
+                        .await;
+                }
+            };
+            events.push(RecoveryCoordinatorEvent::CliRuntimeRetryAttemptRequested(
+                Box::new(CliRuntimeRecoveryAttemptRequest {
+                    job_id: job.id,
+                    recovery_attempt_id: active_attempt_id,
+                    turn_id: job.turn_id,
+                    item_id: job.item_id,
+                    item_type: job.item_type,
+                    attempt_number,
+                    execution_window_index,
+                    previous_failure_reason: job
+                        .last_error
+                        .or(job.reason)
+                        .unwrap_or_else(|| "native CLI turn was interrupted".to_owned()),
+                    binding,
+                }),
+            ));
+            return Ok(events);
         }
 
         let retained_llm_context = self
@@ -2149,16 +2240,23 @@ impl RecoveryCoordinator {
                 }
             };
         let execution_window_index = self
-            .next_restored_execution_window_index(turn_id, now_unix)
+            .next_recovery_execution_window_index(
+                turn_id,
+                now_unix,
+                "startup_recovery",
+                "agent loop was restored after process loss",
+            )
             .await?;
         request.execution_window_index = execution_window_index;
         Ok(RestoredRecoveryTurnRequestLookup::Available(request))
     }
 
-    async fn next_restored_execution_window_index(
+    async fn next_recovery_execution_window_index(
         &self,
         turn_id: &str,
         now_unix: i64,
+        interrupted_by: &str,
+        terminal_reason: &str,
     ) -> Result<u32> {
         let Some(window) = self
             .crud_store
@@ -2181,19 +2279,17 @@ impl RecoveryCoordinator {
                 Some(metadata) => {
                     metadata.insert(
                         "interruptedBy".to_owned(),
-                        serde_json::Value::String("startup_recovery".to_owned()),
+                        serde_json::Value::String(interrupted_by.to_owned()),
                     );
                     metadata.insert(
                         "terminalReason".to_owned(),
-                        serde_json::Value::String(
-                            "agent loop was restored after process loss".to_owned(),
-                        ),
+                        serde_json::Value::String(terminal_reason.to_owned()),
                     );
                 }
                 None => {
                     metadata_json = serde_json::json!({
-                        "interruptedBy": "startup_recovery",
-                        "terminalReason": "agent loop was restored after process loss",
+                        "interruptedBy": interrupted_by,
+                        "terminalReason": terminal_reason,
                     });
                 }
             }
@@ -2784,7 +2880,7 @@ fn deterministic_jitter_secs(seed: &str, base_delay_secs: u64) -> u64 {
 mod tests {
     use super::{
         ProviderFailureCandidate, RecoveryCoordinator, RecoveryCoordinatorEvent,
-        RecoveryJobEnqueueOutcome, RecoveryPolicyRegistry,
+        RecoveryJobEnqueueOutcome, RecoveryPolicyRegistry, RuntimeFailureCandidate,
     };
     use migration::{Migrator, MigratorTrait};
     use pioneer_agent::{
@@ -2793,9 +2889,10 @@ mod tests {
         SkillsSecurityLoopConfig, SkillsValidationLoopConfig, ToolLoopConfig, WorkspaceSkillPolicy,
     };
     use pioneer_crud::{
-        ClaimedRecoveryActivation, CrudStore, NewTurnExecutionCheckpointRecord,
-        NewTurnExecutionWindowRecord, NewTurnRuntimeSnapshot, RecoveryJobRecord, TimeoutCandidate,
-        TurnExecutionCheckpointKind, TurnExecutionWindowStatsRecord,
+        ClaimedRecoveryActivation, CrudStore, NewCliRuntimeTurnBinding,
+        NewTurnExecutionCheckpointRecord, NewTurnExecutionWindowRecord, NewTurnRuntimeSnapshot,
+        RecoveryJobRecord, TimeoutCandidate, TurnExecutionCheckpointKind,
+        TurnExecutionWindowStatsRecord,
     };
     use pioneer_protocol::{
         AgentMessagePhase, ExecutionWindowExhaustionReason, ExecutionWindowStatus,
@@ -3309,6 +3406,156 @@ mod tests {
             security_snapshot.sandbox.mode,
             TurnSandboxMode::WorkspaceWrite
         );
+    }
+
+    #[tokio::test]
+    async fn cli_runtime_recovery_routes_through_native_attempt_without_runtime_snapshot() {
+        let (crud_store, coordinator) = setup_coordinator().await;
+        let workspace_id = "ws_cli_native_recovery";
+        let thread_id = "thr_cli_native_recovery";
+        let turn_id = "turn_cli_native_recovery";
+        materialize_turn_with_tool_item(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            "tool_cli_native_recovery",
+            None,
+        )
+        .await;
+        let timestamp = chrono::Utc::now().fixed_offset();
+        crud_store
+            .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+                turn_id: turn_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                workspace_id: workspace_id.to_owned(),
+                runtime_id: "codex".to_owned(),
+                runtime_kind: "codex".to_owned(),
+                native_thread_id: "native-thread-cli-recovery".to_owned(),
+                native_turn_id: Some("native-turn-cli-recovery-1".to_owned()),
+                request_id: None,
+                status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING
+                    .to_owned(),
+                model: Some("gpt-5".to_owned()),
+                cwd: Some("/tmp/project".to_owned()),
+                sandbox_json: None,
+                approval_policy: Some("on-request".to_owned()),
+                input_mapping_json: "{}".to_owned(),
+                created_at: timestamp,
+                updated_at: timestamp,
+            })
+            .await
+            .expect("CLI runtime binding should persist");
+        let first_window = crud_store
+            .create_turn_execution_window(
+                NewTurnExecutionWindowRecord {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    window_index: 1,
+                    status: ExecutionWindowStatus::Running,
+                    exhaustion_reason: None,
+                    agent_round_count: 1,
+                    tool_call_count: 1,
+                    provider_token_count: 0,
+                    metadata_json: serde_json::json!({"runtimeWindowId": "cli_window_1"}),
+                    started_at: timestamp,
+                },
+                timestamp,
+                timestamp,
+            )
+            .await
+            .expect("initial CLI execution window should persist");
+        assert!(
+            crud_store
+                .get_turn_runtime_snapshot(turn_id)
+                .await
+                .expect("runtime snapshot lookup should succeed")
+                .is_none(),
+            "CLI-backed turns must not require an API-agent runtime snapshot"
+        );
+        let job = coordinator
+            .enqueue_runtime_failure_job(
+                &RuntimeFailureCandidate {
+                    turn_id: turn_id.to_owned(),
+                    item_id: "runtime:runtime_failure".to_owned(),
+                    item_type: TurnItemType::SystemEvent,
+                    trigger: RecoveryTrigger::RuntimeFailure,
+                    action: RecoveryAction::RestartTurn,
+                    reason: "native CLI turn interrupted".to_owned(),
+                    base_backoff_secs: 0,
+                    max_attempts: 3,
+                    max_wall_clock_secs: 180,
+                    no_progress_limit: 3,
+                    metadata: pioneer_protocol::ToolMetadata::default(),
+                },
+                1_700_000_010,
+            )
+            .await
+            .expect("CLI runtime recovery job should enqueue")
+            .into_job();
+
+        let events = coordinator
+            .run_ready_jobs(1_700_000_011, 1)
+            .await
+            .expect("CLI runtime recovery job should run");
+        let [RecoveryCoordinatorEvent::CliRuntimeRetryAttemptRequested(request)] =
+            events.as_slice()
+        else {
+            panic!("expected one CLI runtime recovery request, got {events:?}");
+        };
+        assert_eq!(request.job_id, job.id);
+        assert_eq!(request.turn_id, turn_id);
+        assert_eq!(request.attempt_number, 1);
+        assert_eq!(request.execution_window_index, 2);
+        assert_eq!(
+            request.binding.native_thread_id,
+            "native-thread-cli-recovery"
+        );
+        let active_job = crud_store
+            .get_recovery_job(job.id.as_str())
+            .await
+            .expect("active recovery job should load")
+            .expect("active recovery job should exist");
+        assert_eq!(active_job.status, RecoveryJobStatus::Active);
+        assert_eq!(
+            active_job.active_attempt_id.as_deref(),
+            Some(request.recovery_attempt_id.as_str())
+        );
+        let interrupted = crud_store
+            .get_turn_execution_window(first_window.id.as_str())
+            .await
+            .expect("first execution window should load")
+            .expect("first execution window should exist");
+        assert_eq!(interrupted.status, ExecutionWindowStatus::Interrupted);
+        assert_eq!(
+            interrupted
+                .metadata_json
+                .get("interruptedBy")
+                .and_then(serde_json::Value::as_str),
+            Some("cli_runtime_recovery")
+        );
+
+        let failure_events = coordinator
+            .record_cli_runtime_attempt_failure(
+                request.job_id.as_str(),
+                request.recovery_attempt_id.as_str(),
+                "replacement native turn disconnected".to_owned(),
+                1_700_000_012,
+            )
+            .await
+            .expect("native CLI recovery failure should return to coordinator policy");
+        assert!(matches!(
+            failure_events.as_slice(),
+            [RecoveryCoordinatorEvent::RetryScheduled { .. }]
+        ));
+        let pending_job = crud_store
+            .get_recovery_job(request.job_id.as_str())
+            .await
+            .expect("retrying recovery job should load")
+            .expect("retrying recovery job should exist");
+        assert_eq!(pending_job.status, RecoveryJobStatus::Pending);
+        assert_eq!(pending_job.run_count, 1);
     }
 
     #[tokio::test]

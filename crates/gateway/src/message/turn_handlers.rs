@@ -1313,6 +1313,11 @@ impl MessageProcessor {
         {
             Ok(native_turn) => native_turn,
             Err(error) => {
+                self.fail_initial_cli_runtime_turn_attempt(
+                    outcome.started_notification.turn.id.as_str(),
+                    format!("failed to start native CLI runtime turn: {error:#}"),
+                )
+                .await;
                 self.mark_turn_blocked(
                     outcome.started_notification.thread_id.clone(),
                     outcome.started_notification.turn.id.clone(),
@@ -1323,7 +1328,7 @@ impl MessageProcessor {
             }
         };
         let native_turn_id = native_turn.native_turn_id.clone();
-        if let Err(error) =
+        let turn_binding = match
             crate::cli_runtime::turn_binding::persist_cli_runtime_turn_binding_after_native_start(
                 self.crud_store.as_ref(),
                 crate::cli_runtime::turn_binding::CLIAgentRuntimeNativeTurnStarted {
@@ -1335,12 +1340,83 @@ impl MessageProcessor {
             )
             .await
         {
+            Ok(binding) => binding,
+            Err(error) => {
+                self.fail_initial_cli_runtime_turn_attempt(
+                    outcome.started_notification.turn.id.as_str(),
+                    format!("failed to persist native CLI runtime owner: {error:#}"),
+                )
+                .await;
+                self.mark_turn_blocked(
+                    outcome.started_notification.thread_id.clone(),
+                    outcome.started_notification.turn.id.clone(),
+                    format!("failed to persist CLI runtime native turn id: {error:#}"),
+                )
+                .await;
+                let _ = cli_session
+                    .interrupt_turn(Some(native_thread_id.as_str()), Some(native_turn_id.as_str()))
+                    .await;
+                return;
+            }
+        };
+        let attempt = match self
+            .crud_store
+            .latest_cli_runtime_turn_attempt(outcome.started_notification.turn.id.as_str())
+            .await
+        {
+            Ok(Some(attempt)) => attempt,
+            Ok(None) => {
+                self.mark_turn_blocked(
+                    outcome.started_notification.thread_id.clone(),
+                    outcome.started_notification.turn.id.clone(),
+                    "CLI runtime native turn started without a durable attempt".to_owned(),
+                )
+                .await;
+                let _ = cli_session
+                    .interrupt_turn(
+                        Some(native_thread_id.as_str()),
+                        Some(native_turn_id.as_str()),
+                    )
+                    .await;
+                return;
+            }
+            Err(error) => {
+                self.mark_turn_blocked(
+                    outcome.started_notification.thread_id.clone(),
+                    outcome.started_notification.turn.id.clone(),
+                    format!("failed to load CLI runtime attempt after native start: {error:#}"),
+                )
+                .await;
+                let _ = cli_session
+                    .interrupt_turn(
+                        Some(native_thread_id.as_str()),
+                        Some(native_turn_id.as_str()),
+                    )
+                    .await;
+                return;
+            }
+        };
+        if let Err(error) = self
+            .publish_cli_runtime_attempt_window_started(&session_key, &turn_binding, &attempt)
+            .await
+        {
+            self.fail_cli_runtime_turn_attempt(
+                attempt.id.as_str(),
+                format!("failed to open CLI runtime execution window: {error:#}"),
+            )
+            .await;
             self.mark_turn_blocked(
                 outcome.started_notification.thread_id.clone(),
                 outcome.started_notification.turn.id.clone(),
-                format!("failed to persist CLI runtime native turn id: {error:#}"),
+                format!("failed to open CLI runtime execution window: {error:#}"),
             )
             .await;
+            let _ = cli_session
+                .interrupt_turn(
+                    Some(native_thread_id.as_str()),
+                    Some(native_turn_id.as_str()),
+                )
+                .await;
             return;
         }
         self.flush_cli_runtime_events_for_native_turn(
@@ -1349,6 +1425,387 @@ impl MessageProcessor {
             native_turn_id.as_str(),
         )
         .await;
+    }
+
+    async fn publish_cli_runtime_attempt_window_started(
+        &self,
+        session_key: &crate::cli_runtime::manager::CLIAgentRuntimeSessionKey,
+        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+        attempt: &pioneer_crud::CliRuntimeTurnAttemptRecord,
+    ) -> anyhow::Result<()> {
+        let window_index = attempt
+            .execution_window_index
+            .context("CLI runtime attempt has no execution window index")?;
+        if let Some(latest) = self
+            .crud_store
+            .latest_turn_execution_window(binding.turn_id.as_str())
+            .await?
+        {
+            if latest.window_index == window_index {
+                let owns_window = latest.status == pioneer_protocol::ExecutionWindowStatus::Running
+                    && latest
+                        .metadata_json
+                        .get("runtimeWindowId")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(attempt.id.as_str());
+                if owns_window {
+                    return Ok(());
+                }
+                anyhow::bail!(
+                    "CLI runtime attempt window {window_index} is already owned by another execution"
+                );
+            }
+            if latest.window_index >= window_index {
+                anyhow::bail!(
+                    "CLI runtime attempt window {window_index} is behind stored window {}",
+                    latest.window_index
+                );
+            }
+        }
+        let started_at = attempt
+            .started_at
+            .unwrap_or(attempt.created_at)
+            .timestamp_millis();
+        let event_hub = self
+            .ensure_cli_runtime_execution_event_hub(session_key)
+            .await;
+        event_hub
+            .publish_durable_and_wait(AgentDurableEvent::TurnExecutionWindowStarted {
+                notification: pioneer_protocol::TurnExecutionWindowStartedNotification {
+                    workspace_id: binding.workspace_id.clone(),
+                    thread_id: binding.thread_id.clone(),
+                    turn_id: binding.turn_id.clone(),
+                    window_id: attempt.id.clone(),
+                    window_index,
+                    status: pioneer_protocol::ExecutionWindowStatus::Running,
+                    started_at_unix_ms: started_at,
+                },
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("failed to commit execution window: {error}"))
+    }
+
+    async fn fail_initial_cli_runtime_turn_attempt(&self, turn_id: &str, reason: String) {
+        match self
+            .crud_store
+            .latest_cli_runtime_turn_attempt(turn_id)
+            .await
+        {
+            Ok(Some(attempt))
+                if attempt.status.is_active() && attempt.recovery_attempt_id.is_none() =>
+            {
+                self.fail_cli_runtime_turn_attempt(attempt.id.as_str(), reason)
+                    .await;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to load CLI runtime attempt while recording start failure"
+                );
+            }
+        }
+    }
+
+    async fn fail_cli_runtime_turn_attempt(&self, attempt_id: &str, reason: String) {
+        match self
+            .crud_store
+            .mark_cli_runtime_turn_attempt_terminal(
+                attempt_id,
+                pioneer_crud::CliRuntimeTurnAttemptStatus::Failed,
+                Some(reason),
+                chrono::Utc::now().fixed_offset(),
+            )
+            .await
+        {
+            Ok(true) | Ok(false) => {}
+            Err(error) => {
+                warn!(
+                    attempt_id,
+                    error = %format!("{error:#}"),
+                    "failed to terminalize CLI runtime attempt after start failure"
+                );
+            }
+        }
+    }
+
+    pub(super) async fn start_cli_runtime_recovery_attempt(
+        &self,
+        request: crate::resilience::CliRuntimeRecoveryAttemptRequest,
+    ) -> anyhow::Result<bool> {
+        let requested_binding = request.binding.clone();
+        let binding = self
+            .crud_store
+            .get_cli_runtime_turn_binding(request.turn_id.as_str())
+            .await?
+            .context("CLI runtime turn binding for recovery is missing")?;
+        if binding.thread_id != requested_binding.thread_id
+            || binding.workspace_id != requested_binding.workspace_id
+            || binding.runtime_id != requested_binding.runtime_id
+            || binding.runtime_kind != requested_binding.runtime_kind
+            || binding.native_thread_id != requested_binding.native_thread_id
+        {
+            anyhow::bail!(
+                "CLI runtime turn binding `{}` changed owners after recovery was claimed",
+                request.turn_id
+            );
+        }
+        let Some((_workspace_id, turn)) = self
+            .crud_store
+            .get_turn(binding.thread_id.as_str(), binding.turn_id.as_str())
+            .await?
+        else {
+            anyhow::bail!("Pioneer turn `{}` is missing", binding.turn_id);
+        };
+        if turn.status != TurnStatus::InProgress {
+            anyhow::bail!(
+                "Pioneer turn `{}` is `{}` and cannot start CLI recovery",
+                binding.turn_id,
+                format!("{:?}", turn.status).to_ascii_lowercase()
+            );
+        }
+        if let Some(existing) = self
+            .crud_store
+            .get_cli_runtime_turn_attempt_by_recovery_attempt(request.recovery_attempt_id.as_str())
+            .await?
+        {
+            if existing.turn_id != request.turn_id
+                || existing.recovery_job_id.as_deref() != Some(request.job_id.as_str())
+                || existing.execution_window_index != Some(request.execution_window_index)
+                || existing.runtime_id != binding.runtime_id
+                || existing.runtime_kind != binding.runtime_kind
+                || existing.native_thread_id != binding.native_thread_id
+            {
+                anyhow::bail!(
+                    "recovery attempt `{}` is owned by a different CLI runtime recovery",
+                    request.recovery_attempt_id
+                );
+            }
+            match existing.status {
+                pioneer_crud::CliRuntimeTurnAttemptStatus::Running
+                    if existing.native_turn_id.is_some()
+                        && existing.native_turn_id == binding.native_turn_id
+                        && binding.status
+                            == crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING =>
+                {
+                    return Ok(false);
+                }
+                pioneer_crud::CliRuntimeTurnAttemptStatus::Starting => {}
+                status => {
+                    anyhow::bail!(
+                        "CLI runtime recovery attempt `{}` is `{}` and cannot start",
+                        existing.id,
+                        status.as_str()
+                    );
+                }
+            }
+        }
+        let runtime_kind = match binding.runtime_kind.as_str() {
+            "codex" => CLIAgentRuntimeKind::Codex,
+            "claude" => CLIAgentRuntimeKind::Claude,
+            other => anyhow::bail!("unsupported CLI runtime kind `{other}`"),
+        };
+        let runtime = self
+            .load_cli_runtime_instances()?
+            .into_iter()
+            .find(|runtime| runtime.id == binding.runtime_id)
+            .context("configured CLI runtime for recovery is missing")?;
+        if !runtime.enabled {
+            anyhow::bail!("CLI runtime `{}` is disabled", runtime.id);
+        }
+        if !cli_runtime_kind_matches_config(runtime_kind, runtime.kind) {
+            anyhow::bail!(
+                "CLI runtime `{}` kind no longer matches stored turn binding",
+                runtime.id
+            );
+        }
+        let manager = self
+            .cli_runtime_manager
+            .as_ref()
+            .context("CLI runtime manager is unavailable")?;
+        let session_key = crate::cli_runtime::manager::CLIAgentRuntimeSessionKey::new(
+            binding.workspace_id.as_str(),
+            binding.runtime_id.as_str(),
+            binding.thread_id.as_str(),
+        )?;
+        let proxy_url = self
+            .prepare_cli_runtime_proxy_url(
+                binding.workspace_id.as_str(),
+                binding.runtime_id.as_str(),
+            )
+            .await?;
+        let native_cwd = binding
+            .cwd
+            .clone()
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|path| path.display().to_string())
+            })
+            .context("CLI runtime recovery has no working directory")?;
+        let session_handle = manager
+            .get_or_start_with_options(
+                session_key.clone(),
+                crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
+                    cwd: Some(std::path::PathBuf::from(native_cwd.as_str())),
+                    approval_policy: binding.approval_policy.clone(),
+                    env: crate::cli_runtime::config::proxy_env(proxy_url.as_deref()),
+                    enable_user_skills: matches!(runtime_kind, CLIAgentRuntimeKind::Claude),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let cli_session = session_handle.session();
+        self.ensure_cli_runtime_session_event_pumps(
+            &session_key,
+            cli_session.clone(),
+            runtime.debug_native_events,
+        )
+        .await;
+
+        let sandbox = binding
+            .sandbox_json
+            .as_deref()
+            .map(pioneer_crud::deserialize_cli_runtime_json)
+            .transpose()?;
+        let security_snapshot = self
+            .crud_store
+            .get_turn_execution_security_snapshot(binding.turn_id.as_str())
+            .await?
+            .map(|record| record.snapshot);
+        let permissions = if matches!(runtime_kind, CLIAgentRuntimeKind::Codex) {
+            security_snapshot.as_ref().map(|snapshot| {
+                crate::cli_runtime::permissions::codex_permissions_profile_for_security_snapshot(
+                    snapshot,
+                )
+                .to_owned()
+            })
+        } else {
+            None
+        };
+        let resumed = cli_session
+            .resume_thread(
+                binding.native_thread_id.as_str(),
+                crate::cli_runtime::manager::CLIAgentRuntimeThreadOpenParams {
+                    cwd: native_cwd.clone(),
+                    model: binding.model.clone(),
+                    approval_policy: binding.approval_policy.clone(),
+                    sandbox: sandbox.clone(),
+                    permissions: permissions.clone(),
+                    service_tier: None,
+                },
+                std::time::Duration::from_millis(runtime.request_timeout_ms),
+            )
+            .await?;
+        if resumed.native_thread_id != binding.native_thread_id {
+            anyhow::bail!(
+                "CLI runtime resumed native thread `{}` instead of `{}`",
+                resumed.native_thread_id,
+                binding.native_thread_id
+            );
+        }
+
+        let prepared_at = chrono::Utc::now().fixed_offset();
+        let (prepared_binding, attempt) = self
+            .crud_store
+            .prepare_cli_runtime_recovery_turn_attempt(
+                binding.turn_id.as_str(),
+                pioneer_protocol::generate_id(21),
+                request.job_id.clone(),
+                request.recovery_attempt_id.clone(),
+                request.execution_window_index,
+                request.previous_failure_reason.clone(),
+                prepared_at,
+            )
+            .await?;
+        match attempt.status {
+            pioneer_crud::CliRuntimeTurnAttemptStatus::Running
+                if attempt.native_turn_id.is_some() =>
+            {
+                return Ok(false);
+            }
+            pioneer_crud::CliRuntimeTurnAttemptStatus::Starting => {}
+            status => {
+                anyhow::bail!(
+                    "CLI runtime recovery attempt `{}` is `{}` and cannot start",
+                    attempt.id,
+                    status.as_str()
+                );
+            }
+        }
+        if let Err(error) = self
+            .publish_cli_runtime_attempt_window_started(&session_key, &prepared_binding, &attempt)
+            .await
+        {
+            self.fail_cli_runtime_turn_attempt(
+                attempt.id.as_str(),
+                format!("failed to open CLI runtime recovery execution window: {error:#}"),
+            )
+            .await;
+            return Err(error);
+        }
+
+        let native_turn = match cli_session
+            .start_turn(
+                crate::cli_runtime::manager::CLIAgentRuntimeTurnStartParams {
+                    native_thread_id: prepared_binding.native_thread_id.clone(),
+                    input: crate::cli_runtime::turn_recovery::cli_runtime_recovery_turn_input(),
+                    cwd: Some(native_cwd),
+                    model: prepared_binding.model.clone(),
+                    approval_policy: prepared_binding.approval_policy.clone(),
+                    sandbox,
+                    permissions,
+                    effort: None,
+                    personality: None,
+                    summary: None,
+                },
+                std::time::Duration::from_millis(runtime.request_timeout_ms),
+            )
+            .await
+        {
+            Ok(native_turn) => native_turn,
+            Err(error) => {
+                self.fail_cli_runtime_turn_attempt(
+                    attempt.id.as_str(),
+                    format!("failed to start native CLI recovery turn: {error:#}"),
+                )
+                .await;
+                return Err(error);
+            }
+        };
+        let native_turn_id = native_turn.native_turn_id.clone();
+        if let Err(error) = self
+            .crud_store
+            .activate_cli_runtime_turn_attempt(
+                prepared_binding.turn_id.as_str(),
+                attempt.id.as_str(),
+                native_turn_id.as_str(),
+                None,
+                chrono::Utc::now().fixed_offset(),
+            )
+            .await
+        {
+            let _ = cli_session
+                .interrupt_turn(
+                    Some(prepared_binding.native_thread_id.as_str()),
+                    Some(native_turn_id.as_str()),
+                )
+                .await;
+            self.fail_cli_runtime_turn_attempt(
+                attempt.id.as_str(),
+                format!("failed to persist native recovery owner: {error:#}"),
+            )
+            .await;
+            return Err(error);
+        }
+        self.flush_cli_runtime_events_for_native_turn(
+            &session_key,
+            prepared_binding.native_thread_id.as_str(),
+            native_turn_id.as_str(),
+        )
+        .await;
+        Ok(true)
     }
 
     async fn validate_cli_runtime_turn_start_backend(

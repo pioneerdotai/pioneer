@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use pioneer_entity::{
     cli_runtime_native_event, cli_runtime_pending_request, thread_cli_runtime_binding,
-    turn_cli_runtime_binding,
+    turn_cli_runtime_attempt, turn_cli_runtime_binding,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::OnConflict;
@@ -114,6 +114,82 @@ pub struct NewCliRuntimeTurnBinding {
     pub sandbox_json: Option<String>,
     pub approval_policy: Option<String>,
     pub input_mapping_json: String,
+    pub created_at: DateTimeWithTimeZone,
+    pub updated_at: DateTimeWithTimeZone,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliRuntimeTurnAttemptStatus {
+    Starting,
+    Running,
+    Completed,
+    Failed,
+    Interrupted,
+}
+
+impl CliRuntimeTurnAttemptStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
+    pub const fn is_active(self) -> bool {
+        matches!(self, Self::Starting | Self::Running)
+    }
+
+    fn from_db(value: &str) -> Result<Self> {
+        match value {
+            "starting" => Ok(Self::Starting),
+            "running" => Ok(Self::Running),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            "interrupted" => Ok(Self::Interrupted),
+            other => Err(anyhow!("unknown CLI runtime turn attempt status `{other}`")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliRuntimeTurnAttemptRecord {
+    pub id: String,
+    pub turn_id: String,
+    pub attempt_index: u32,
+    pub runtime_id: String,
+    pub runtime_kind: String,
+    pub native_thread_id: String,
+    pub native_turn_id: Option<String>,
+    pub recovery_job_id: Option<String>,
+    pub recovery_attempt_id: Option<String>,
+    pub execution_window_index: Option<u32>,
+    pub status: CliRuntimeTurnAttemptStatus,
+    pub failure_reason: Option<String>,
+    pub started_at: Option<DateTimeWithTimeZone>,
+    pub completed_at: Option<DateTimeWithTimeZone>,
+    pub created_at: DateTimeWithTimeZone,
+    pub updated_at: DateTimeWithTimeZone,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewCliRuntimeTurnAttempt {
+    pub id: String,
+    pub turn_id: String,
+    pub attempt_index: u32,
+    pub runtime_id: String,
+    pub runtime_kind: String,
+    pub native_thread_id: String,
+    pub native_turn_id: Option<String>,
+    pub recovery_job_id: Option<String>,
+    pub recovery_attempt_id: Option<String>,
+    pub execution_window_index: Option<u32>,
+    pub status: CliRuntimeTurnAttemptStatus,
+    pub failure_reason: Option<String>,
+    pub started_at: Option<DateTimeWithTimeZone>,
+    pub completed_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
 }
@@ -434,6 +510,153 @@ pub async fn list_turn_bindings<C: ConnectionTrait>(
         .collect()
 }
 
+pub async fn create_turn_attempt<C: ConnectionTrait>(
+    db: &C,
+    attempt: NewCliRuntimeTurnAttempt,
+) -> Result<CliRuntimeTurnAttemptRecord> {
+    validate_new_turn_attempt(&attempt)?;
+    let id = attempt.id.clone();
+    turn_cli_runtime_attempt::Entity::insert(active_turn_attempt_from_new(attempt))
+        .exec(db)
+        .await
+        .context("failed to insert CLI runtime turn attempt")?;
+
+    find_turn_attempt(db, id.as_str())
+        .await?
+        .context("inserted CLI runtime turn attempt is missing")
+}
+
+pub async fn find_turn_attempt<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+) -> Result<Option<CliRuntimeTurnAttemptRecord>> {
+    turn_cli_runtime_attempt::Entity::find_by_id(id.to_owned())
+        .one(db)
+        .await
+        .context("failed to query CLI runtime turn attempt")?
+        .map(turn_attempt_record_from_model)
+        .transpose()
+}
+
+pub async fn find_turn_attempt_by_native_turn<C: ConnectionTrait>(
+    db: &C,
+    runtime_id: &str,
+    native_turn_id: &str,
+) -> Result<Option<CliRuntimeTurnAttemptRecord>> {
+    turn_cli_runtime_attempt::Entity::find()
+        .filter(turn_cli_runtime_attempt::Column::RuntimeId.eq(runtime_id.to_owned()))
+        .filter(turn_cli_runtime_attempt::Column::NativeTurnId.eq(native_turn_id.to_owned()))
+        .one(db)
+        .await
+        .context("failed to query CLI runtime turn attempt by native turn")?
+        .map(turn_attempt_record_from_model)
+        .transpose()
+}
+
+pub async fn find_turn_attempt_by_recovery_attempt<C: ConnectionTrait>(
+    db: &C,
+    recovery_attempt_id: &str,
+) -> Result<Option<CliRuntimeTurnAttemptRecord>> {
+    turn_cli_runtime_attempt::Entity::find()
+        .filter(
+            turn_cli_runtime_attempt::Column::RecoveryAttemptId.eq(recovery_attempt_id.to_owned()),
+        )
+        .one(db)
+        .await
+        .context("failed to query CLI runtime turn attempt by recovery attempt")?
+        .map(turn_attempt_record_from_model)
+        .transpose()
+}
+
+pub async fn latest_turn_attempt<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+) -> Result<Option<CliRuntimeTurnAttemptRecord>> {
+    turn_cli_runtime_attempt::Entity::find()
+        .filter(turn_cli_runtime_attempt::Column::TurnId.eq(turn_id.to_owned()))
+        .order_by_desc(turn_cli_runtime_attempt::Column::AttemptIndex)
+        .one(db)
+        .await
+        .context("failed to query latest CLI runtime turn attempt")?
+        .map(turn_attempt_record_from_model)
+        .transpose()
+}
+
+pub async fn mark_turn_attempt_running<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+    native_turn_id: &str,
+    started_at: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let result = turn_cli_runtime_attempt::Entity::update_many()
+        .col_expr(
+            turn_cli_runtime_attempt::Column::NativeTurnId,
+            sea_orm::sea_query::Expr::value(Some(native_turn_id.to_owned())),
+        )
+        .col_expr(
+            turn_cli_runtime_attempt::Column::Status,
+            sea_orm::sea_query::Expr::value(CliRuntimeTurnAttemptStatus::Running.as_str()),
+        )
+        .col_expr(
+            turn_cli_runtime_attempt::Column::StartedAt,
+            sea_orm::sea_query::Expr::value(Some(started_at)),
+        )
+        .col_expr(
+            turn_cli_runtime_attempt::Column::UpdatedAt,
+            sea_orm::sea_query::Expr::value(started_at),
+        )
+        .filter(turn_cli_runtime_attempt::Column::Id.eq(id.to_owned()))
+        .filter(
+            turn_cli_runtime_attempt::Column::Status
+                .eq(CliRuntimeTurnAttemptStatus::Starting.as_str()),
+        )
+        .exec(db)
+        .await
+        .context("failed to mark CLI runtime turn attempt running")?;
+    Ok(result.rows_affected == 1)
+}
+
+pub async fn mark_turn_attempt_terminal<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+    status: CliRuntimeTurnAttemptStatus,
+    failure_reason: Option<String>,
+    completed_at: DateTimeWithTimeZone,
+) -> Result<bool> {
+    if status.is_active() {
+        return Err(anyhow!(
+            "CLI runtime terminal attempt status cannot be `{}`",
+            status.as_str()
+        ));
+    }
+    let result = turn_cli_runtime_attempt::Entity::update_many()
+        .col_expr(
+            turn_cli_runtime_attempt::Column::Status,
+            sea_orm::sea_query::Expr::value(status.as_str()),
+        )
+        .col_expr(
+            turn_cli_runtime_attempt::Column::FailureReason,
+            sea_orm::sea_query::Expr::value(failure_reason),
+        )
+        .col_expr(
+            turn_cli_runtime_attempt::Column::CompletedAt,
+            sea_orm::sea_query::Expr::value(Some(completed_at)),
+        )
+        .col_expr(
+            turn_cli_runtime_attempt::Column::UpdatedAt,
+            sea_orm::sea_query::Expr::value(completed_at),
+        )
+        .filter(turn_cli_runtime_attempt::Column::Id.eq(id.to_owned()))
+        .filter(turn_cli_runtime_attempt::Column::Status.is_in([
+            CliRuntimeTurnAttemptStatus::Starting.as_str(),
+            CliRuntimeTurnAttemptStatus::Running.as_str(),
+        ]))
+        .exec(db)
+        .await
+        .context("failed to mark CLI runtime turn attempt terminal")?;
+    Ok(result.rows_affected == 1)
+}
+
 pub async fn create_pending_request<C: ConnectionTrait>(
     db: &C,
     request: NewCliRuntimePendingRequest,
@@ -737,6 +960,58 @@ fn active_turn_binding_from_new(
     }
 }
 
+fn active_turn_attempt_from_new(
+    attempt: NewCliRuntimeTurnAttempt,
+) -> turn_cli_runtime_attempt::ActiveModel {
+    turn_cli_runtime_attempt::ActiveModel {
+        id: Set(attempt.id),
+        turn_id: Set(attempt.turn_id),
+        attempt_index: Set(i64::from(attempt.attempt_index)),
+        runtime_id: Set(attempt.runtime_id),
+        runtime_kind: Set(attempt.runtime_kind),
+        native_thread_id: Set(attempt.native_thread_id),
+        native_turn_id: Set(attempt.native_turn_id),
+        recovery_job_id: Set(attempt.recovery_job_id),
+        recovery_attempt_id: Set(attempt.recovery_attempt_id),
+        execution_window_index: Set(attempt.execution_window_index.map(i64::from)),
+        status: Set(attempt.status.as_str().to_owned()),
+        failure_reason: Set(attempt.failure_reason),
+        started_at: Set(attempt.started_at),
+        completed_at: Set(attempt.completed_at),
+        created_at: Set(attempt.created_at),
+        updated_at: Set(attempt.updated_at),
+    }
+}
+
+fn validate_new_turn_attempt(attempt: &NewCliRuntimeTurnAttempt) -> Result<()> {
+    if attempt.attempt_index == 0 {
+        return Err(anyhow!("CLI runtime turn attempt index must be positive"));
+    }
+    if attempt.execution_window_index == Some(0) {
+        return Err(anyhow!(
+            "CLI runtime turn attempt execution window index must be positive"
+        ));
+    }
+    if attempt.recovery_job_id.is_some() != attempt.recovery_attempt_id.is_some() {
+        return Err(anyhow!(
+            "CLI runtime turn attempt recovery job and attempt ids must both be present or absent"
+        ));
+    }
+    if attempt.status == CliRuntimeTurnAttemptStatus::Running
+        && attempt.native_turn_id.as_deref().is_none_or(str::is_empty)
+    {
+        return Err(anyhow!(
+            "running CLI runtime turn attempt must have a native turn id"
+        ));
+    }
+    if attempt.status == CliRuntimeTurnAttemptStatus::Starting && attempt.native_turn_id.is_some() {
+        return Err(anyhow!(
+            "starting CLI runtime turn attempt cannot have a native turn id"
+        ));
+    }
+    Ok(())
+}
+
 fn active_pending_request_from_new(
     request: NewCliRuntimePendingRequest,
 ) -> cli_runtime_pending_request::ActiveModel {
@@ -817,6 +1092,34 @@ fn turn_binding_record_from_model(
         sandbox_json: model.sandbox_json,
         approval_policy: model.approval_policy,
         input_mapping_json: model.input_mapping_json,
+        created_at: model.created_at,
+        updated_at: model.updated_at,
+    })
+}
+
+fn turn_attempt_record_from_model(
+    model: turn_cli_runtime_attempt::Model,
+) -> Result<CliRuntimeTurnAttemptRecord> {
+    Ok(CliRuntimeTurnAttemptRecord {
+        id: model.id,
+        turn_id: model.turn_id,
+        attempt_index: u32::try_from(model.attempt_index)
+            .context("CLI runtime turn attempt index is outside u32")?,
+        runtime_id: model.runtime_id,
+        runtime_kind: model.runtime_kind,
+        native_thread_id: model.native_thread_id,
+        native_turn_id: model.native_turn_id,
+        recovery_job_id: model.recovery_job_id,
+        recovery_attempt_id: model.recovery_attempt_id,
+        execution_window_index: model
+            .execution_window_index
+            .map(u32::try_from)
+            .transpose()
+            .context("CLI runtime execution window index is outside u32")?,
+        status: CliRuntimeTurnAttemptStatus::from_db(model.status.as_str())?,
+        failure_reason: model.failure_reason,
+        started_at: model.started_at,
+        completed_at: model.completed_at,
         created_at: model.created_at,
         updated_at: model.updated_at,
     })

@@ -12,7 +12,7 @@ mod timeline_projection_model;
 mod turn_item_terminal;
 mod util;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use pioneer_protocol::{
     ArtifactBindingSummary, ArtifactProjectionKind, ArtifactProjectionStatus, ArtifactStatus,
     ArtifactSummary, MemoryCandidateDecision, MemoryCandidateStatus, MemoryScope, MemoryScopeKind,
@@ -72,6 +72,7 @@ use crate::convention::{
 };
 use crate::events::{TurnEventPayload, TurnStartedEventPayload};
 use crate::projector::TurnProjector;
+use crate::repositories::cli_runtime_binding::NewCliRuntimeTurnAttempt;
 
 #[derive(Debug)]
 pub struct TurnEventProjectionAfterAppendError {
@@ -329,10 +330,11 @@ pub use crate::repositories::artifact::{
 pub use crate::repositories::cli_runtime_binding::{
     CliRuntimeNativeEventListFilter, CliRuntimeNativeEventRecord,
     CliRuntimePendingRequestListFilter, CliRuntimePendingRequestRecord,
-    CliRuntimePendingRequestStatus, CliRuntimeThreadBindingRecord, CliRuntimeTurnBindingListFilter,
-    CliRuntimeTurnBindingRecord, NewCliRuntimeNativeEvent, NewCliRuntimePendingRequest,
-    NewCliRuntimeThreadBinding, NewCliRuntimeTurnBinding, ResolveCliRuntimePendingRequest,
-    deserialize_cli_runtime_json, serialize_cli_runtime_json,
+    CliRuntimePendingRequestStatus, CliRuntimeThreadBindingRecord, CliRuntimeTurnAttemptRecord,
+    CliRuntimeTurnAttemptStatus, CliRuntimeTurnBindingListFilter, CliRuntimeTurnBindingRecord,
+    NewCliRuntimeNativeEvent, NewCliRuntimePendingRequest, NewCliRuntimeThreadBinding,
+    NewCliRuntimeTurnBinding, ResolveCliRuntimePendingRequest, deserialize_cli_runtime_json,
+    serialize_cli_runtime_json,
 };
 pub use crate::repositories::thread_agents_doc::{
     ResolvedThreadAgentsDocRecord, ThreadAgentsDocError, ThreadAgentsDocRecord,
@@ -1017,6 +1019,541 @@ impl CrudStore {
         filter: CliRuntimeTurnBindingListFilter,
     ) -> Result<Vec<CliRuntimeTurnBindingRecord>> {
         cli_runtime_binding::list_turn_bindings(&self.connection, filter).await
+    }
+
+    pub async fn get_cli_runtime_turn_attempt(
+        &self,
+        id: &str,
+    ) -> Result<Option<CliRuntimeTurnAttemptRecord>> {
+        cli_runtime_binding::find_turn_attempt(&self.connection, id).await
+    }
+
+    pub async fn get_cli_runtime_turn_attempt_by_native_turn(
+        &self,
+        runtime_id: &str,
+        native_turn_id: &str,
+    ) -> Result<Option<CliRuntimeTurnAttemptRecord>> {
+        cli_runtime_binding::find_turn_attempt_by_native_turn(
+            &self.connection,
+            runtime_id,
+            native_turn_id,
+        )
+        .await
+    }
+
+    pub async fn get_cli_runtime_turn_attempt_by_recovery_attempt(
+        &self,
+        recovery_attempt_id: &str,
+    ) -> Result<Option<CliRuntimeTurnAttemptRecord>> {
+        cli_runtime_binding::find_turn_attempt_by_recovery_attempt(
+            &self.connection,
+            recovery_attempt_id,
+        )
+        .await
+    }
+
+    pub async fn latest_cli_runtime_turn_attempt(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<CliRuntimeTurnAttemptRecord>> {
+        cli_runtime_binding::latest_turn_attempt(&self.connection, turn_id).await
+    }
+
+    pub async fn mark_cli_runtime_turn_attempt_terminal(
+        &self,
+        id: &str,
+        status: CliRuntimeTurnAttemptStatus,
+        failure_reason: Option<String>,
+        completed_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+    ) -> Result<bool> {
+        self.run_serialized_write(|| async {
+            cli_runtime_binding::mark_turn_attempt_terminal(
+                &self.connection,
+                id,
+                status,
+                failure_reason.clone(),
+                completed_at,
+            )
+            .await
+        })
+        .await
+    }
+
+    pub async fn prepare_cli_runtime_initial_turn_attempt(
+        &self,
+        binding: NewCliRuntimeTurnBinding,
+        attempt_id: String,
+        execution_window_index: u32,
+    ) -> Result<(CliRuntimeTurnBindingRecord, CliRuntimeTurnAttemptRecord)> {
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin CLI runtime initial attempt transaction")?;
+            let existing_binding =
+                cli_runtime_binding::find_turn_binding(&transaction, binding.turn_id.as_str())
+                    .await?;
+            let attempt = match cli_runtime_binding::latest_turn_attempt(
+                &transaction,
+                binding.turn_id.as_str(),
+            )
+            .await?
+            {
+                Some(existing)
+                    if existing.recovery_attempt_id.is_none() && existing.status.is_active() =>
+                {
+                    let Some(stored_binding) = existing_binding else {
+                        transaction.rollback().await.ok();
+                        bail!(
+                            "active CLI runtime attempt for turn `{}` has no turn binding",
+                            binding.turn_id
+                        );
+                    };
+                    if stored_binding.thread_id != binding.thread_id
+                        || stored_binding.workspace_id != binding.workspace_id
+                        || stored_binding.runtime_id != binding.runtime_id
+                        || stored_binding.runtime_kind != binding.runtime_kind
+                        || stored_binding.native_thread_id != binding.native_thread_id
+                    {
+                        transaction.rollback().await.ok();
+                        bail!(
+                            "turn `{}` already has a different active CLI runtime owner",
+                            binding.turn_id
+                        );
+                    }
+                    transaction
+                        .commit()
+                        .await
+                        .context("failed to commit idempotent CLI runtime initial attempt")?;
+                    return Ok((stored_binding, existing));
+                }
+                Some(existing) => {
+                    transaction.rollback().await.ok();
+                    bail!(
+                        "turn `{}` already has CLI runtime attempt {} in status `{}`",
+                        binding.turn_id,
+                        existing.attempt_index,
+                        existing.status.as_str()
+                    );
+                }
+                None => {
+                    if existing_binding.is_some() {
+                        transaction.rollback().await.ok();
+                        bail!(
+                            "turn `{}` already has a CLI runtime binding without a durable attempt",
+                            binding.turn_id
+                        );
+                    }
+                    let stored_binding =
+                        cli_runtime_binding::upsert_turn_binding(&transaction, binding.clone())
+                            .await?;
+                    cli_runtime_binding::create_turn_attempt(
+                        &transaction,
+                        NewCliRuntimeTurnAttempt {
+                            id: attempt_id.clone(),
+                            turn_id: stored_binding.turn_id.clone(),
+                            attempt_index: 1,
+                            runtime_id: stored_binding.runtime_id.clone(),
+                            runtime_kind: stored_binding.runtime_kind.clone(),
+                            native_thread_id: stored_binding.native_thread_id.clone(),
+                            native_turn_id: None,
+                            recovery_job_id: None,
+                            recovery_attempt_id: None,
+                            execution_window_index: Some(execution_window_index),
+                            status: CliRuntimeTurnAttemptStatus::Starting,
+                            failure_reason: None,
+                            started_at: None,
+                            completed_at: None,
+                            created_at: stored_binding.updated_at,
+                            updated_at: stored_binding.updated_at,
+                        },
+                    )
+                    .await?
+                }
+            };
+            let stored_binding =
+                cli_runtime_binding::find_turn_binding(&transaction, binding.turn_id.as_str())
+                    .await?
+                    .context("initial CLI runtime turn binding is missing")?;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit CLI runtime initial attempt transaction")?;
+            Ok((stored_binding, attempt))
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn prepare_cli_runtime_recovery_turn_attempt(
+        &self,
+        turn_id: &str,
+        attempt_id: String,
+        recovery_job_id: String,
+        recovery_attempt_id: String,
+        execution_window_index: u32,
+        previous_failure_reason: String,
+        prepared_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+    ) -> Result<(CliRuntimeTurnBindingRecord, CliRuntimeTurnAttemptRecord)> {
+        if execution_window_index == 0 {
+            bail!("CLI runtime recovery execution window index must be positive");
+        }
+        let turn_id = turn_id.to_owned();
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin CLI runtime recovery attempt transaction")?;
+            let Some(mut binding) =
+                cli_runtime_binding::find_turn_binding(&transaction, turn_id.as_str()).await?
+            else {
+                transaction.rollback().await.ok();
+                bail!("CLI runtime turn binding `{turn_id}` is missing");
+            };
+
+            if let Some(existing) = cli_runtime_binding::find_turn_attempt_by_recovery_attempt(
+                &transaction,
+                recovery_attempt_id.as_str(),
+            )
+            .await?
+            {
+                let latest = cli_runtime_binding::latest_turn_attempt(
+                    &transaction,
+                    turn_id.as_str(),
+                )
+                .await?;
+                if existing.turn_id != turn_id
+                    || existing.recovery_job_id.as_deref() != Some(recovery_job_id.as_str())
+                    || existing.execution_window_index != Some(execution_window_index)
+                    || existing.runtime_id != binding.runtime_id
+                    || existing.runtime_kind != binding.runtime_kind
+                    || existing.native_thread_id != binding.native_thread_id
+                    || latest.as_ref().map(|attempt| attempt.id.as_str())
+                        != Some(existing.id.as_str())
+                {
+                    transaction.rollback().await.ok();
+                    bail!(
+                        "recovery attempt `{recovery_attempt_id}` is already bound to a different CLI runtime recovery"
+                    );
+                }
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit idempotent CLI runtime recovery attempt")?;
+                return Ok((binding, existing));
+            }
+
+            let mut latest =
+                cli_runtime_binding::latest_turn_attempt(&transaction, turn_id.as_str()).await?;
+            if latest.is_none()
+                && let Some(native_turn_id) = binding.native_turn_id.clone()
+            {
+                latest = Some(
+                    cli_runtime_binding::create_turn_attempt(
+                        &transaction,
+                        NewCliRuntimeTurnAttempt {
+                            id: pioneer_protocol::generate_id(DB_ID_LEN),
+                            turn_id: turn_id.clone(),
+                            attempt_index: 1,
+                            runtime_id: binding.runtime_id.clone(),
+                            runtime_kind: binding.runtime_kind.clone(),
+                            native_thread_id: binding.native_thread_id.clone(),
+                            native_turn_id: Some(native_turn_id),
+                            recovery_job_id: None,
+                            recovery_attempt_id: None,
+                            execution_window_index: execution_window_index
+                                .checked_sub(1)
+                                .filter(|index| *index > 0),
+                            status: CliRuntimeTurnAttemptStatus::Failed,
+                            failure_reason: Some(previous_failure_reason.clone()),
+                            started_at: Some(binding.updated_at),
+                            completed_at: Some(prepared_at),
+                            created_at: binding.created_at,
+                            updated_at: prepared_at,
+                        },
+                    )
+                    .await?,
+                );
+            }
+            if let Some(active) = latest.as_ref().filter(|attempt| attempt.status.is_active())
+                && !cli_runtime_binding::mark_turn_attempt_terminal(
+                    &transaction,
+                    active.id.as_str(),
+                    CliRuntimeTurnAttemptStatus::Failed,
+                    Some(previous_failure_reason.clone()),
+                    prepared_at,
+                )
+                .await?
+            {
+                transaction.rollback().await.ok();
+                bail!(
+                    "CLI runtime turn attempt `{}` changed while recovery was being prepared",
+                    active.id
+                );
+            }
+            let attempt_index = latest
+                .as_ref()
+                .map(|attempt| {
+                    attempt
+                        .attempt_index
+                        .checked_add(1)
+                        .context("CLI runtime turn attempt index overflow")
+                })
+                .transpose()?
+                .unwrap_or(1);
+            let attempt = cli_runtime_binding::create_turn_attempt(
+                &transaction,
+                NewCliRuntimeTurnAttempt {
+                    id: attempt_id.clone(),
+                    turn_id: turn_id.clone(),
+                    attempt_index,
+                    runtime_id: binding.runtime_id.clone(),
+                    runtime_kind: binding.runtime_kind.clone(),
+                    native_thread_id: binding.native_thread_id.clone(),
+                    native_turn_id: None,
+                    recovery_job_id: Some(recovery_job_id.clone()),
+                    recovery_attempt_id: Some(recovery_attempt_id.clone()),
+                    execution_window_index: Some(execution_window_index),
+                    status: CliRuntimeTurnAttemptStatus::Starting,
+                    failure_reason: None,
+                    started_at: None,
+                    completed_at: None,
+                    created_at: prepared_at,
+                    updated_at: prepared_at,
+                },
+            )
+            .await?;
+
+            binding.native_turn_id = None;
+            binding.status = "starting".to_owned();
+            binding.updated_at = prepared_at;
+            let stored_binding = cli_runtime_binding::upsert_turn_binding(
+                &transaction,
+                NewCliRuntimeTurnBinding {
+                    turn_id: binding.turn_id,
+                    thread_id: binding.thread_id,
+                    workspace_id: binding.workspace_id,
+                    runtime_id: binding.runtime_id,
+                    runtime_kind: binding.runtime_kind,
+                    native_thread_id: binding.native_thread_id,
+                    native_turn_id: binding.native_turn_id,
+                    request_id: binding.request_id,
+                    status: binding.status,
+                    model: binding.model,
+                    cwd: binding.cwd,
+                    sandbox_json: binding.sandbox_json,
+                    approval_policy: binding.approval_policy,
+                    input_mapping_json: binding.input_mapping_json,
+                    created_at: binding.created_at,
+                    updated_at: binding.updated_at,
+                },
+            )
+            .await?;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit CLI runtime recovery attempt transaction")?;
+            Ok((stored_binding, attempt))
+        })
+        .await
+    }
+
+    pub async fn activate_cli_runtime_turn_attempt(
+        &self,
+        turn_id: &str,
+        attempt_id: &str,
+        native_turn_id: &str,
+        request_id: Option<String>,
+        started_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+    ) -> Result<(CliRuntimeTurnBindingRecord, CliRuntimeTurnAttemptRecord)> {
+        let turn_id = turn_id.to_owned();
+        let attempt_id = attempt_id.to_owned();
+        let native_turn_id = native_turn_id.to_owned();
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin CLI runtime attempt activation transaction")?;
+            let Some(binding) =
+                cli_runtime_binding::find_turn_binding(&transaction, turn_id.as_str()).await?
+            else {
+                transaction.rollback().await.ok();
+                bail!("CLI runtime turn binding `{turn_id}` is missing");
+            };
+            let Some(attempt) =
+                cli_runtime_binding::find_turn_attempt(&transaction, attempt_id.as_str()).await?
+            else {
+                transaction.rollback().await.ok();
+                bail!("CLI runtime turn attempt `{attempt_id}` is missing");
+            };
+            if attempt.turn_id != turn_id || !attempt.status.is_active() {
+                transaction.rollback().await.ok();
+                bail!(
+                    "CLI runtime turn attempt `{attempt_id}` cannot own native turn for `{turn_id}`"
+                );
+            }
+            if attempt.runtime_id != binding.runtime_id
+                || attempt.runtime_kind != binding.runtime_kind
+                || attempt.native_thread_id != binding.native_thread_id
+            {
+                transaction.rollback().await.ok();
+                bail!("CLI runtime turn attempt `{attempt_id}` does not match its turn binding");
+            }
+            let latest = cli_runtime_binding::latest_turn_attempt(&transaction, turn_id.as_str())
+                .await?
+                .context("CLI runtime turn has no latest attempt during activation")?;
+            if latest.id != attempt.id {
+                transaction.rollback().await.ok();
+                bail!(
+                    "CLI runtime turn attempt `{attempt_id}` is not the latest attempt for `{turn_id}`"
+                );
+            }
+            if attempt.status == CliRuntimeTurnAttemptStatus::Running {
+                if attempt.native_turn_id.as_deref() == Some(native_turn_id.as_str())
+                    && binding.native_turn_id.as_deref() == Some(native_turn_id.as_str())
+                    && binding.status == "running"
+                {
+                    transaction
+                        .commit()
+                        .await
+                        .context("failed to commit idempotent CLI runtime attempt activation")?;
+                    return Ok((binding, attempt));
+                }
+                transaction.rollback().await.ok();
+                bail!(
+                    "CLI runtime turn attempt `{attempt_id}` is already running with a different native owner"
+                );
+            }
+            if binding.status != "starting" || binding.native_turn_id.is_some() {
+                transaction.rollback().await.ok();
+                bail!(
+                    "CLI runtime turn binding `{turn_id}` is not ready to activate attempt `{attempt_id}`"
+                );
+            }
+            if !cli_runtime_binding::mark_turn_attempt_running(
+                &transaction,
+                attempt_id.as_str(),
+                native_turn_id.as_str(),
+                started_at,
+            )
+            .await?
+            {
+                transaction.rollback().await.ok();
+                bail!("CLI runtime turn attempt `{attempt_id}` is no longer starting");
+            }
+            let stored_binding = cli_runtime_binding::upsert_turn_binding(
+                &transaction,
+                NewCliRuntimeTurnBinding {
+                    turn_id: binding.turn_id,
+                    thread_id: binding.thread_id,
+                    workspace_id: binding.workspace_id,
+                    runtime_id: binding.runtime_id,
+                    runtime_kind: binding.runtime_kind,
+                    native_thread_id: binding.native_thread_id,
+                    native_turn_id: Some(native_turn_id.clone()),
+                    request_id: request_id.clone().or(binding.request_id),
+                    status: "running".to_owned(),
+                    model: binding.model,
+                    cwd: binding.cwd,
+                    sandbox_json: binding.sandbox_json,
+                    approval_policy: binding.approval_policy,
+                    input_mapping_json: binding.input_mapping_json,
+                    created_at: binding.created_at,
+                    updated_at: started_at,
+                },
+            )
+            .await?;
+            let stored_attempt =
+                cli_runtime_binding::find_turn_attempt(&transaction, attempt_id.as_str())
+                    .await?
+                    .context("activated CLI runtime turn attempt is missing")?;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit CLI runtime attempt activation transaction")?;
+            Ok((stored_binding, stored_attempt))
+        })
+        .await
+    }
+
+    pub async fn terminalize_cli_runtime_turn_binding(
+        &self,
+        turn_id: &str,
+        binding_status: &str,
+        attempt_status: CliRuntimeTurnAttemptStatus,
+        failure_reason: Option<String>,
+        completed_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+    ) -> Result<Option<CliRuntimeTurnBindingRecord>> {
+        if attempt_status.is_active() {
+            bail!(
+                "CLI runtime terminal binding cannot use active attempt status `{}`",
+                attempt_status.as_str()
+            );
+        }
+        let turn_id = turn_id.to_owned();
+        let binding_status = binding_status.to_owned();
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin CLI runtime terminal binding transaction")?;
+            let Some(binding) =
+                cli_runtime_binding::find_turn_binding(&transaction, turn_id.as_str()).await?
+            else {
+                transaction.rollback().await.ok();
+                return Ok(None);
+            };
+            if let Some(attempt) =
+                cli_runtime_binding::latest_turn_attempt(&transaction, turn_id.as_str()).await?
+                && attempt.status.is_active()
+                && !cli_runtime_binding::mark_turn_attempt_terminal(
+                    &transaction,
+                    attempt.id.as_str(),
+                    attempt_status,
+                    failure_reason.clone(),
+                    completed_at,
+                )
+                .await?
+            {
+                transaction.rollback().await.ok();
+                bail!(
+                    "CLI runtime turn attempt `{}` changed while its binding was terminalized",
+                    attempt.id
+                );
+            }
+            let stored_binding = cli_runtime_binding::upsert_turn_binding(
+                &transaction,
+                NewCliRuntimeTurnBinding {
+                    turn_id: binding.turn_id,
+                    thread_id: binding.thread_id,
+                    workspace_id: binding.workspace_id,
+                    runtime_id: binding.runtime_id,
+                    runtime_kind: binding.runtime_kind,
+                    native_thread_id: binding.native_thread_id,
+                    native_turn_id: binding.native_turn_id,
+                    request_id: binding.request_id,
+                    status: binding_status.clone(),
+                    model: binding.model,
+                    cwd: binding.cwd,
+                    sandbox_json: binding.sandbox_json,
+                    approval_policy: binding.approval_policy,
+                    input_mapping_json: binding.input_mapping_json,
+                    created_at: binding.created_at,
+                    updated_at: completed_at,
+                },
+            )
+            .await?;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit CLI runtime terminal binding transaction")?;
+            Ok(Some(stored_binding))
+        })
+        .await
     }
 
     pub async fn create_cli_runtime_pending_request(

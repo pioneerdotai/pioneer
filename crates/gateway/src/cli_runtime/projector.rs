@@ -23,6 +23,7 @@ pub(crate) struct CLIRuntimeProjectorContext {
     pub workspace_id: String,
     pub thread_id: String,
     pub turn_id: String,
+    pub recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -80,7 +81,7 @@ pub(crate) fn project_cli_runtime_event(
             CLIRuntimeProjectedEvents::durable(AgentDurableEvent::TurnCompleted {
                 thread_id: context.thread_id.clone(),
                 turn_id: context.turn_id.clone(),
-                recovery: None,
+                recovery: context.recovery.clone(),
             })
         }
         RuntimeEvent::TurnFailed(failed) => {
@@ -88,7 +89,7 @@ pub(crate) fn project_cli_runtime_event(
                 thread_id: context.thread_id.clone(),
                 turn_id: context.turn_id.clone(),
                 error: failed.message.clone(),
-                recovery: None,
+                recovery: context.recovery.clone(),
             })
         }
         RuntimeEvent::TurnInterrupted(interrupted) => {
@@ -96,7 +97,7 @@ pub(crate) fn project_cli_runtime_event(
                 thread_id: context.thread_id.clone(),
                 turn_id: context.turn_id.clone(),
                 reason: interrupted.reason.clone(),
-                recovery: None,
+                recovery: context.recovery.clone(),
             })
         }
         RuntimeEvent::TurnRetrying(_) => CLIRuntimeProjectedEvents::ignored("turn_retrying"),
@@ -136,7 +137,7 @@ fn project_runtime_error(
         thread_id: context.thread_id.clone(),
         turn_id: context.turn_id.clone(),
         error: error.message.clone(),
-        recovery: None,
+        recovery: context.recovery.clone(),
     })
 }
 
@@ -1287,6 +1288,7 @@ mod tests {
             workspace_id: "workspace_1".to_owned(),
             thread_id: "thread_1".to_owned(),
             turn_id: "turn_1".to_owned(),
+            recovery: None,
         }
     }
 

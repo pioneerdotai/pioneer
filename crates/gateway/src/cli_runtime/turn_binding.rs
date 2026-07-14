@@ -5,6 +5,7 @@ use anyhow::{Context, Result, bail};
 use pioneer_crud::{
     CliRuntimeTurnBindingRecord, CrudStore, NewCliRuntimeTurnBinding, serialize_cli_runtime_json,
 };
+use pioneer_protocol::generate_id;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -88,32 +89,39 @@ pub(crate) async fn persist_cli_runtime_turn_binding_before_native_start(
         validate_existing_turn_binding(existing, &request)?;
     }
 
-    store
-        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
-            turn_id: request.turn_id,
-            thread_id: request.thread_id,
-            workspace_id: request.workspace_id,
-            runtime_id: request.runtime_id,
-            runtime_kind: request.runtime_kind,
-            native_thread_id: request.native_thread_id,
-            native_turn_id: existing
-                .as_ref()
-                .and_then(|binding| binding.native_turn_id.clone()),
-            request_id: request.request_id,
-            status: CLI_RUNTIME_TURN_STATUS_STARTING.to_owned(),
-            model: request.model,
-            cwd: request.cwd,
-            sandbox_json: request.sandbox_json,
-            approval_policy: request.approval_policy,
-            input_mapping_json: request.input_mapping_json,
-            created_at: existing
-                .as_ref()
-                .map(|binding| binding.created_at)
-                .unwrap_or(request.created_at),
-            updated_at: request.created_at,
-        })
+    let (binding, _attempt) = store
+        .prepare_cli_runtime_initial_turn_attempt(
+            NewCliRuntimeTurnBinding {
+                turn_id: request.turn_id,
+                thread_id: request.thread_id,
+                workspace_id: request.workspace_id,
+                runtime_id: request.runtime_id,
+                runtime_kind: request.runtime_kind,
+                native_thread_id: request.native_thread_id,
+                native_turn_id: existing
+                    .as_ref()
+                    .and_then(|binding| binding.native_turn_id.clone()),
+                request_id: request.request_id,
+                status: CLI_RUNTIME_TURN_STATUS_STARTING.to_owned(),
+                model: request.model,
+                cwd: request.cwd,
+                sandbox_json: request.sandbox_json,
+                approval_policy: request.approval_policy,
+                input_mapping_json: request.input_mapping_json,
+                created_at: existing
+                    .as_ref()
+                    .map(|binding| binding.created_at)
+                    .unwrap_or(request.created_at),
+                updated_at: request.created_at,
+            },
+            generate_id(21),
+            1,
+        )
         .await
-        .context("failed to persist CLI runtime turn binding before native start")
+        .context(
+            "failed to persist CLI runtime turn binding and initial attempt before native start",
+        )?;
+    Ok(binding)
 }
 
 pub(crate) async fn persist_cli_runtime_turn_binding_after_native_start(
@@ -121,7 +129,7 @@ pub(crate) async fn persist_cli_runtime_turn_binding_after_native_start(
     native_turn: CLIAgentRuntimeNativeTurnStarted,
 ) -> Result<CliRuntimeTurnBindingRecord> {
     validate_native_turn_started(&native_turn)?;
-    let Some(existing) = store
+    let Some(_existing) = store
         .get_cli_runtime_turn_binding(native_turn.turn_id.as_str())
         .await
         .with_context(|| {
@@ -137,66 +145,56 @@ pub(crate) async fn persist_cli_runtime_turn_binding_after_native_start(
         );
     };
 
-    store
-        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
-            turn_id: existing.turn_id,
-            thread_id: existing.thread_id,
-            workspace_id: existing.workspace_id,
-            runtime_id: existing.runtime_id,
-            runtime_kind: existing.runtime_kind,
-            native_thread_id: existing.native_thread_id,
-            native_turn_id: Some(native_turn.native_turn_id),
-            request_id: native_turn.request_id.or(existing.request_id),
-            status: CLI_RUNTIME_TURN_STATUS_RUNNING.to_owned(),
-            model: existing.model,
-            cwd: existing.cwd,
-            sandbox_json: existing.sandbox_json,
-            approval_policy: existing.approval_policy,
-            input_mapping_json: existing.input_mapping_json,
-            created_at: existing.created_at,
-            updated_at: native_turn.started_at,
-        })
+    let Some(attempt) = store
+        .latest_cli_runtime_turn_attempt(native_turn.turn_id.as_str())
         .await
-        .context("failed to persist CLI runtime turn binding after native start")
+        .context("failed to load initial CLI runtime turn attempt after native start")?
+    else {
+        bail!(
+            "cannot persist native turn id for CLI runtime turn `{}` without a durable attempt",
+            native_turn.turn_id
+        );
+    };
+    if attempt.recovery_attempt_id.is_some() {
+        bail!(
+            "initial native turn for CLI runtime turn `{}` arrived after recovery ownership changed",
+            native_turn.turn_id
+        );
+    }
+    let (binding, _attempt) = store
+        .activate_cli_runtime_turn_attempt(
+            native_turn.turn_id.as_str(),
+            attempt.id.as_str(),
+            native_turn.native_turn_id.as_str(),
+            native_turn.request_id,
+            native_turn.started_at,
+        )
+        .await
+        .context("failed to activate CLI runtime turn binding and attempt after native start")?;
+    Ok(binding)
 }
 
 pub(crate) async fn update_cli_runtime_turn_binding_status(
     store: &CrudStore,
     turn_id: &str,
     status: &str,
+    reason: Option<String>,
     updated_at: DateTimeWithTimeZone,
 ) -> Result<Option<CliRuntimeTurnBindingRecord>> {
     validate_terminal_status(status)?;
-    let Some(existing) = store
-        .get_cli_runtime_turn_binding(turn_id)
-        .await
-        .with_context(|| format!("failed to read CLI runtime turn binding `{turn_id}`"))?
-    else {
-        return Ok(None);
+    let attempt_status = match status {
+        CLI_RUNTIME_TURN_STATUS_COMPLETED => pioneer_crud::CliRuntimeTurnAttemptStatus::Completed,
+        CLI_RUNTIME_TURN_STATUS_FAILED => pioneer_crud::CliRuntimeTurnAttemptStatus::Failed,
+        CLI_RUNTIME_TURN_STATUS_INTERRUPTED | CLI_RUNTIME_TURN_STATUS_BLOCKED => {
+            pioneer_crud::CliRuntimeTurnAttemptStatus::Interrupted
+        }
+        _ => unreachable!("terminal status was validated above"),
     };
 
     store
-        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
-            turn_id: existing.turn_id,
-            thread_id: existing.thread_id,
-            workspace_id: existing.workspace_id,
-            runtime_id: existing.runtime_id,
-            runtime_kind: existing.runtime_kind,
-            native_thread_id: existing.native_thread_id,
-            native_turn_id: existing.native_turn_id,
-            request_id: existing.request_id,
-            status: status.to_owned(),
-            model: existing.model,
-            cwd: existing.cwd,
-            sandbox_json: existing.sandbox_json,
-            approval_policy: existing.approval_policy,
-            input_mapping_json: existing.input_mapping_json,
-            created_at: existing.created_at,
-            updated_at,
-        })
+        .terminalize_cli_runtime_turn_binding(turn_id, status, attempt_status, reason, updated_at)
         .await
-        .map(Some)
-        .context("failed to update CLI runtime turn binding status")
+        .context("failed to terminalize CLI runtime turn binding and active attempt")
 }
 
 pub(crate) fn cli_runtime_turn_input_mapping_json<T: Serialize>(value: &T) -> Result<String> {
@@ -289,7 +287,7 @@ mod tests {
     };
     use chrono::{FixedOffset, TimeZone};
     use migration::{Migrator, MigratorTrait};
-    use pioneer_crud::CrudStore;
+    use pioneer_crud::{CliRuntimeTurnAttemptStatus, CrudStore};
     use sea_orm::Database;
     use sea_orm::entity::prelude::DateTimeWithTimeZone;
     use serde_json::json;
@@ -347,6 +345,18 @@ mod tests {
         assert_eq!(starting.status, CLI_RUNTIME_TURN_STATUS_STARTING);
         assert_eq!(starting.native_turn_id, None);
         assert_eq!(starting.request_id.as_deref(), Some("rpc-turn-start-1"));
+        let starting_attempt = store
+            .latest_cli_runtime_turn_attempt("turn_cli_turn")
+            .await
+            .expect("initial attempt should load")
+            .expect("initial attempt should exist");
+        assert_eq!(starting_attempt.attempt_index, 1);
+        assert_eq!(
+            starting_attempt.status,
+            CliRuntimeTurnAttemptStatus::Starting
+        );
+        assert_eq!(starting_attempt.execution_window_index, Some(1));
+        assert!(starting_attempt.recovery_attempt_id.is_none());
 
         let running = persist_cli_runtime_turn_binding_after_native_start(
             &store,
@@ -365,6 +375,155 @@ mod tests {
         assert_eq!(running.request_id.as_deref(), Some("rpc-turn-start-1"));
         assert_eq!(running.created_at, created_at);
         assert_eq!(running.updated_at, timestamp(1_700_020_010));
+        let running_attempt = store
+            .latest_cli_runtime_turn_attempt("turn_cli_turn")
+            .await
+            .expect("running attempt should load")
+            .expect("running attempt should exist");
+        assert_eq!(running_attempt.id, starting_attempt.id);
+        assert_eq!(running_attempt.status, CliRuntimeTurnAttemptStatus::Running);
+        assert_eq!(
+            running_attempt.native_turn_id.as_deref(),
+            Some("codex-turn-1")
+        );
+
+        let repeated = persist_cli_runtime_turn_binding_before_native_start(
+            &store,
+            start_request(timestamp(1_700_020_020)),
+        )
+        .await
+        .expect("repeated initial preparation should be idempotent");
+        assert_eq!(repeated.status, CLI_RUNTIME_TURN_STATUS_RUNNING);
+        assert_eq!(repeated.native_turn_id.as_deref(), Some("codex-turn-1"));
+        let repeated_attempt = store
+            .latest_cli_runtime_turn_attempt("turn_cli_turn")
+            .await
+            .expect("repeated attempt should load")
+            .expect("repeated attempt should exist");
+        assert_eq!(repeated_attempt.id, running_attempt.id);
+    }
+
+    #[tokio::test]
+    async fn cli_runtime_recovery_attempt_atomically_replaces_native_owner() {
+        let store = test_store().await;
+        let created_at = timestamp(1_700_020_000);
+        persist_cli_runtime_turn_binding_before_native_start(&store, start_request(created_at))
+            .await
+            .expect("pre-start binding should persist");
+        persist_cli_runtime_turn_binding_after_native_start(
+            &store,
+            CLIAgentRuntimeNativeTurnStarted {
+                turn_id: "turn_cli_turn".to_owned(),
+                native_turn_id: "codex-turn-1".to_owned(),
+                request_id: None,
+                started_at: timestamp(1_700_020_010),
+            },
+        )
+        .await
+        .expect("initial native owner should activate");
+        let initial_attempt = store
+            .latest_cli_runtime_turn_attempt("turn_cli_turn")
+            .await
+            .expect("initial attempt should load")
+            .expect("initial attempt should exist");
+
+        let (starting_binding, recovery_attempt) = store
+            .prepare_cli_runtime_recovery_turn_attempt(
+                "turn_cli_turn",
+                "cli_recovery_attempt_1".to_owned(),
+                "recovery_job_1".to_owned(),
+                "recovery_attempt_1".to_owned(),
+                2,
+                "native turn interrupted".to_owned(),
+                timestamp(1_700_020_020),
+            )
+            .await
+            .expect("recovery attempt should prepare");
+        assert_eq!(starting_binding.status, CLI_RUNTIME_TURN_STATUS_STARTING);
+        assert!(starting_binding.native_turn_id.is_none());
+        assert_eq!(recovery_attempt.attempt_index, 2);
+        assert_eq!(
+            recovery_attempt.status,
+            CliRuntimeTurnAttemptStatus::Starting
+        );
+        assert_eq!(recovery_attempt.execution_window_index, Some(2));
+        assert_eq!(
+            recovery_attempt.recovery_attempt_id.as_deref(),
+            Some("recovery_attempt_1")
+        );
+        let closed_initial = store
+            .get_cli_runtime_turn_attempt(initial_attempt.id.as_str())
+            .await
+            .expect("initial attempt should load")
+            .expect("initial attempt should exist");
+        assert_eq!(closed_initial.status, CliRuntimeTurnAttemptStatus::Failed);
+
+        let late_initial = persist_cli_runtime_turn_binding_after_native_start(
+            &store,
+            CLIAgentRuntimeNativeTurnStarted {
+                turn_id: "turn_cli_turn".to_owned(),
+                native_turn_id: "codex-turn-late-initial".to_owned(),
+                request_id: None,
+                started_at: timestamp(1_700_020_025),
+            },
+        )
+        .await
+        .expect_err("late initial native owner must not capture a recovery attempt");
+        assert!(
+            late_initial
+                .to_string()
+                .contains("recovery ownership changed")
+        );
+
+        let (_, duplicate) = store
+            .prepare_cli_runtime_recovery_turn_attempt(
+                "turn_cli_turn",
+                "unused_attempt_id".to_owned(),
+                "recovery_job_1".to_owned(),
+                "recovery_attempt_1".to_owned(),
+                2,
+                "native turn interrupted".to_owned(),
+                timestamp(1_700_020_021),
+            )
+            .await
+            .expect("repeated recovery preparation should be idempotent");
+        assert_eq!(duplicate.id, recovery_attempt.id);
+
+        let (running_binding, running_attempt) = store
+            .activate_cli_runtime_turn_attempt(
+                "turn_cli_turn",
+                recovery_attempt.id.as_str(),
+                "codex-turn-2",
+                None,
+                timestamp(1_700_020_030),
+            )
+            .await
+            .expect("recovery native owner should activate");
+        assert_eq!(running_binding.status, CLI_RUNTIME_TURN_STATUS_RUNNING);
+        assert_eq!(
+            running_binding.native_turn_id.as_deref(),
+            Some("codex-turn-2")
+        );
+        assert_eq!(running_attempt.status, CliRuntimeTurnAttemptStatus::Running);
+        assert_eq!(
+            running_attempt.native_turn_id.as_deref(),
+            Some("codex-turn-2")
+        );
+        let (repeated_binding, repeated_attempt) = store
+            .activate_cli_runtime_turn_attempt(
+                "turn_cli_turn",
+                recovery_attempt.id.as_str(),
+                "codex-turn-2",
+                None,
+                timestamp(1_700_020_031),
+            )
+            .await
+            .expect("repeated native activation should be idempotent");
+        assert_eq!(
+            repeated_binding.native_turn_id,
+            running_binding.native_turn_id
+        );
+        assert_eq!(repeated_attempt.id, running_attempt.id);
     }
 
     #[tokio::test]

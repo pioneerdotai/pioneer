@@ -2288,6 +2288,40 @@ impl MessageProcessor {
         }
     }
 
+    pub(super) async fn handle_cli_runtime_recovery_native_failure(
+        &self,
+        turn_id: String,
+        recovery: pioneer_protocol::RecoveryAttemptContext,
+        failure_message: String,
+    ) {
+        let now_unix = now_timestamp_secs();
+        match self
+            .recovery_coordinator
+            .record_cli_runtime_attempt_failure(
+                recovery.job_id.as_str(),
+                recovery.attempt_id.as_str(),
+                failure_message,
+                now_unix,
+            )
+            .await
+        {
+            Ok(events) => {
+                for event in events {
+                    self.handle_recovery_event(event, now_unix).await;
+                }
+            }
+            Err(error) => {
+                warn!(
+                    turn_id,
+                    recovery_job_id = recovery.job_id,
+                    recovery_attempt_id = recovery.attempt_id,
+                    error = %format!("{error:#}"),
+                    "failed to record native CLI recovery attempt failure"
+                );
+            }
+        }
+    }
+
     pub(super) async fn report_turn_failure(
         &self,
         thread_id: String,
@@ -2389,7 +2423,7 @@ impl MessageProcessor {
                 next_attempt_number,
             }
         };
-        message_future(self.handle_recovery_event(event, now_unix)).await;
+        self.handle_recovery_event(event, now_unix).await;
         true
     }
 
@@ -2947,22 +2981,14 @@ impl MessageProcessor {
         }
     }
 
-    pub(super) async fn handle_recovery_event(
-        &self,
+    pub(super) fn handle_recovery_event<'a>(
+        &'a self,
         event: crate::resilience::RecoveryCoordinatorEvent,
         event_timestamp: i64,
-    ) {
-        match event {
-            crate::resilience::RecoveryCoordinatorEvent::RecoveryOpened {
-                job_id,
-                turn_id,
-                item_id,
-                item_type,
-                trigger,
-                action,
-                attempt_number,
-            } => {
-                message_future(self.handle_recovery_opened_event(
+    ) -> MessageFuture<'a, ()> {
+        message_future(async move {
+            match event {
+                crate::resilience::RecoveryCoordinatorEvent::RecoveryOpened {
                     job_id,
                     turn_id,
                     item_id,
@@ -2970,23 +2996,20 @@ impl MessageProcessor {
                     trigger,
                     action,
                     attempt_number,
-                    event_timestamp,
-                ))
-                .await;
-            }
-            crate::resilience::RecoveryCoordinatorEvent::RecoveryAttached {
-                job_id,
-                turn_id,
-                item_id,
-                item_type,
-                recovery_item_id,
-                recovery_item_type,
-                trigger,
-                action,
-                existing_status,
-                next_attempt_number,
-            } => {
-                message_future(self.handle_recovery_attached_event(
+                } => {
+                    message_future(self.handle_recovery_opened_event(
+                        job_id,
+                        turn_id,
+                        item_id,
+                        item_type,
+                        trigger,
+                        action,
+                        attempt_number,
+                        event_timestamp,
+                    ))
+                    .await;
+                }
+                crate::resilience::RecoveryCoordinatorEvent::RecoveryAttached {
                     job_id,
                     turn_id,
                     item_id,
@@ -2997,20 +3020,23 @@ impl MessageProcessor {
                     action,
                     existing_status,
                     next_attempt_number,
-                    event_timestamp,
-                ))
-                .await;
-            }
-            crate::resilience::RecoveryCoordinatorEvent::RetryScheduled {
-                job_id,
-                turn_id,
-                item_id,
-                item_type,
-                attempt_number,
-                next_run_at_unix,
-                reason,
-            } => {
-                message_future(self.handle_retry_scheduled_event(
+                } => {
+                    message_future(self.handle_recovery_attached_event(
+                        job_id,
+                        turn_id,
+                        item_id,
+                        item_type,
+                        recovery_item_id,
+                        recovery_item_type,
+                        trigger,
+                        action,
+                        existing_status,
+                        next_attempt_number,
+                        event_timestamp,
+                    ))
+                    .await;
+                }
+                crate::resilience::RecoveryCoordinatorEvent::RetryScheduled {
                     job_id,
                     turn_id,
                     item_id,
@@ -3018,54 +3044,142 @@ impl MessageProcessor {
                     attempt_number,
                     next_run_at_unix,
                     reason,
-                    event_timestamp,
-                ))
-                .await;
-            }
-            crate::resilience::RecoveryCoordinatorEvent::RetryAttemptStarted {
-                job_id,
-                turn_id,
-                item_id,
-                item_type,
-                attempt_number,
-            } => {
-                message_future(self.handle_retry_attempt_started_event(
-                    job_id,
-                    turn_id,
-                    item_id,
-                    item_type,
-                    attempt_number,
-                    event_timestamp,
-                ))
-                .await;
-            }
-            crate::resilience::RecoveryCoordinatorEvent::RecoverySucceeded {
-                job_id,
-                turn_id,
-                item_id,
-                item_type,
-                attempt_number,
-            } => {
-                message_future(self.handle_recovery_succeeded_event(
-                    job_id,
-                    turn_id,
-                    item_id,
-                    item_type,
-                    attempt_number,
-                    event_timestamp,
-                ))
-                .await;
-            }
-            crate::resilience::RecoveryCoordinatorEvent::RecoveryBlocked {
-                job_id,
-                turn_id,
-                reason,
-            } => {
-                message_future(self.handle_recovery_blocked_event(job_id, turn_id, reason)).await;
-            }
-            crate::resilience::RecoveryCoordinatorEvent::RecoveryExhausted(outcome) => {
-                message_future(self.handle_recovery_exhausted_event(outcome, event_timestamp))
+                } => {
+                    message_future(self.handle_retry_scheduled_event(
+                        job_id,
+                        turn_id,
+                        item_id,
+                        item_type,
+                        attempt_number,
+                        next_run_at_unix,
+                        reason,
+                        event_timestamp,
+                    ))
                     .await;
+                }
+                crate::resilience::RecoveryCoordinatorEvent::RetryAttemptStarted {
+                    job_id,
+                    turn_id,
+                    item_id,
+                    item_type,
+                    attempt_number,
+                } => {
+                    message_future(self.handle_retry_attempt_started_event(
+                        job_id,
+                        turn_id,
+                        item_id,
+                        item_type,
+                        attempt_number,
+                        event_timestamp,
+                    ))
+                    .await;
+                }
+                crate::resilience::RecoveryCoordinatorEvent::CliRuntimeRetryAttemptRequested(
+                    request,
+                ) => {
+                    message_future(
+                        self.handle_cli_runtime_recovery_attempt_requested(
+                            *request,
+                            event_timestamp,
+                        ),
+                    )
+                    .await;
+                }
+                crate::resilience::RecoveryCoordinatorEvent::RecoverySucceeded {
+                    job_id,
+                    turn_id,
+                    item_id,
+                    item_type,
+                    attempt_number,
+                } => {
+                    message_future(self.handle_recovery_succeeded_event(
+                        job_id,
+                        turn_id,
+                        item_id,
+                        item_type,
+                        attempt_number,
+                        event_timestamp,
+                    ))
+                    .await;
+                }
+                crate::resilience::RecoveryCoordinatorEvent::RecoveryBlocked {
+                    job_id,
+                    turn_id,
+                    reason,
+                } => {
+                    message_future(self.handle_recovery_blocked_event(job_id, turn_id, reason))
+                        .await;
+                }
+                crate::resilience::RecoveryCoordinatorEvent::RecoveryExhausted(outcome) => {
+                    message_future(self.handle_recovery_exhausted_event(outcome, event_timestamp))
+                        .await;
+                }
+            }
+        })
+    }
+
+    async fn handle_cli_runtime_recovery_attempt_requested(
+        &self,
+        request: crate::resilience::CliRuntimeRecoveryAttemptRequest,
+        event_timestamp: i64,
+    ) {
+        let started = (
+            request.job_id.clone(),
+            request.turn_id.clone(),
+            request.item_id.clone(),
+            request.item_type,
+            request.attempt_number,
+        );
+        match self
+            .start_cli_runtime_recovery_attempt(request.clone())
+            .await
+        {
+            Ok(true) => {
+                self.handle_retry_attempt_started_event(
+                    started.0,
+                    started.1,
+                    started.2,
+                    started.3,
+                    started.4,
+                    event_timestamp,
+                )
+                .await;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                let failure = format!("failed to start CLI runtime recovery attempt: {error:#}");
+                warn!(
+                    turn_id = request.turn_id,
+                    recovery_job_id = request.job_id,
+                    recovery_attempt_id = request.recovery_attempt_id,
+                    error = %format!("{error:#}"),
+                    "CLI runtime recovery attempt start failed"
+                );
+                match self
+                    .recovery_coordinator
+                    .record_cli_runtime_attempt_failure(
+                        request.job_id.as_str(),
+                        request.recovery_attempt_id.as_str(),
+                        failure,
+                        event_timestamp,
+                    )
+                    .await
+                {
+                    Ok(events) => {
+                        for event in events {
+                            self.handle_recovery_event(event, event_timestamp).await;
+                        }
+                    }
+                    Err(coordinator_error) => {
+                        warn!(
+                            turn_id = request.turn_id,
+                            recovery_job_id = request.job_id,
+                            recovery_attempt_id = request.recovery_attempt_id,
+                            error = %format!("{coordinator_error:#}"),
+                            "failed to record CLI runtime recovery start failure"
+                        );
+                    }
+                }
             }
         }
     }

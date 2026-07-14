@@ -1,12 +1,22 @@
 #![allow(dead_code)]
-// Startup recovery classifier skeleton until runtime-specific native turn hydration is wired.
+// Runtime readiness classification and continuation input for CLI-backed turn recovery.
 
 use anyhow::Result;
+use pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem;
 use pioneer_crud::{CliRuntimeTurnBindingListFilter, CliRuntimeTurnBindingRecord, CrudStore};
 use pioneer_protocol::{
     CLIAgentRuntimeKind, RuntimeStatus, RuntimeSummary, TurnBlockedResumeMetadata, TurnStatus,
 };
 use std::collections::HashMap;
+
+const CLI_RUNTIME_RECOVERY_CONTINUATION_PROMPT: &str = "Continue the interrupted task from the existing thread context.\n\nRecovery contract:\n- The original user request and prior conversation are authoritative.\n- Treat the current workspace and external systems as the source of truth.\n- Inspect and reconcile current state before making further changes.\n- Do not repeat actions or tool calls that already completed.\n- Continue from the first unfinished step.\n- If safe continuation cannot be established, stop and explain what must be resolved.";
+
+pub(crate) fn cli_runtime_recovery_turn_input() -> serde_json::Value {
+    serde_json::to_value(vec![CLIRuntimeTurnInputItem::Text {
+        text: CLI_RUNTIME_RECOVERY_CONTINUATION_PROMPT.to_owned(),
+    }])
+    .expect("CLI runtime recovery text input must serialize")
+}
 
 use crate::cli_runtime::turn_binding::{
     CLI_RUNTIME_TURN_STATUS_RUNNING, CLI_RUNTIME_TURN_STATUS_STARTING,
@@ -179,14 +189,14 @@ fn classify_cli_runtime_turn_recovery_outcome(
     match &runtime.status {
         RuntimeStatus::Ready => CLIAgentRuntimeTurnRecoveryOutcome::Recoverable {
             reason: format!(
-                "CLI runtime `{}` is ready; native turn hydration is deferred to runtime-specific recovery.",
+                "CLI runtime `{}` is ready for native turn recovery.",
                 runtime.runtime_id
             ),
         },
         RuntimeStatus::Initializing | RuntimeStatus::Degraded { .. } => {
             CLIAgentRuntimeTurnRecoveryOutcome::Recoverable {
                 reason: format!(
-                    "CLI runtime `{}` is available enough for restart recovery; native hydration is deferred.",
+                    "CLI runtime `{}` is available for native turn recovery.",
                     runtime.runtime_id
                 ),
             }
@@ -513,7 +523,7 @@ mod tests {
         assert!(matches!(
             &plans[0].outcome,
             CLIAgentRuntimeTurnRecoveryOutcome::Recoverable { reason }
-                if reason.contains("native turn hydration is deferred")
+                if reason.contains("ready for native turn recovery")
         ));
     }
 
