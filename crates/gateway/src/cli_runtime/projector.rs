@@ -99,6 +99,7 @@ pub(crate) fn project_cli_runtime_event(
                 recovery: None,
             })
         }
+        RuntimeEvent::TurnRetrying(_) => CLIRuntimeProjectedEvents::ignored("turn_retrying"),
         RuntimeEvent::Error(error) => project_runtime_error(context, error),
         RuntimeEvent::ReviewModeChanged(review) => project_review_mode_changed(context, review),
         RuntimeEvent::ItemStarted(started) => project_item_started(context, started),
@@ -124,6 +125,9 @@ fn project_runtime_error(
     context: &CLIRuntimeProjectorContext,
     error: &RuntimeErrorEvent,
 ) -> CLIRuntimeProjectedEvents {
+    if error.retryable {
+        return CLIRuntimeProjectedEvents::ignored("retryable runtime error");
+    }
     if error.native_turn_id.is_none() {
         return CLIRuntimeProjectedEvents::ignored("runtime error without turn id");
     }
@@ -1246,6 +1250,7 @@ fn event_kind_name(event: &RuntimeEvent) -> &'static str {
         RuntimeEvent::TurnCompleted(_) => "turn_completed",
         RuntimeEvent::TurnFailed(_) => "turn_failed",
         RuntimeEvent::TurnInterrupted(_) => "turn_interrupted",
+        RuntimeEvent::TurnRetrying(_) => "turn_retrying",
         RuntimeEvent::ItemStarted(_) => "item_started",
         RuntimeEvent::ItemDelta(_) => "item_delta",
         RuntimeEvent::ItemCompleted(_) => "item_completed",
@@ -2506,6 +2511,26 @@ mod tests {
                 recovery: None
             }]
         );
+    }
+
+    #[test]
+    fn codex_retrying_turn_does_not_project_terminal_or_timeline_events() {
+        let retrying = project_codex_notification(
+            "error",
+            json!({
+                "threadId": "native_thread_1",
+                "turnId": "native_turn_1",
+                "error": {
+                    "message": "Reconnecting... 2/5",
+                    "code": "stream_disconnected"
+                },
+                "willRetry": true
+            }),
+        );
+
+        assert!(retrying.progress.is_empty());
+        assert!(retrying.durable.is_empty());
+        assert_eq!(retrying.ignored, vec!["turn_retrying"]);
     }
 
     #[test]

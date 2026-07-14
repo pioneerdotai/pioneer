@@ -34,7 +34,7 @@ use pioneer_cli_agent_runtime::driver::JsonlRpcId;
 use pioneer_cli_agent_runtime::event::{
     RuntimeAgentMessagePhase, RuntimeEvent, RuntimeEventMappingOptions, RuntimeItemCompleted,
     RuntimeRequestOpened, RuntimeRequestResolved, RuntimeThreadStateChanged, RuntimeTurnCompleted,
-    map_codex_server_request_event,
+    RuntimeTurnRetrying, map_codex_server_request_event,
 };
 use pioneer_config::{GatewayHookRecoveryConfig, GatewayMemoryConfig, GatewayWebToolsConfig};
 use pioneer_crud::{
@@ -16947,6 +16947,43 @@ async fn cli_runtime_failure_keeps_binding_active_while_pioneer_recovery_is_pend
         .expect("turn binding should upsert");
     let key = CLIAgentRuntimeSessionKey::new(workspace_id, "codex", thread_id)
         .expect("session key should build");
+
+    processor
+        .handle_cli_runtime_timeline_event(
+            &key,
+            RuntimeEvent::TurnRetrying(RuntimeTurnRetrying {
+                native_thread_id: Some(native_thread_id.to_owned()),
+                native_turn_id: Some(native_turn_id.to_owned()),
+                message: "Reconnecting... 2/5".to_owned(),
+                code: Some("stream_disconnected".to_owned()),
+                native: None,
+            }),
+        )
+        .await;
+
+    let (_, retrying_turn) = crud_store
+        .get_turn(thread_id, turn_id)
+        .await
+        .expect("turn lookup should succeed")
+        .expect("turn should exist");
+    assert_eq!(retrying_turn.status, TurnStatus::InProgress);
+    assert!(retrying_turn.error.is_none());
+    let retrying_binding = crud_store
+        .get_cli_runtime_turn_binding(turn_id)
+        .await
+        .expect("binding lookup should succeed")
+        .expect("binding should exist");
+    assert_eq!(
+        retrying_binding.status,
+        crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING
+    );
+    assert!(
+        crud_store
+            .find_recovery_jobs_by_turn_and_status(turn_id, RecoveryJobStatus::Pending)
+            .await
+            .expect("pending recovery jobs should load")
+            .is_empty()
+    );
 
     processor
         .handle_cli_runtime_timeline_event(

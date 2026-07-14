@@ -19,6 +19,7 @@ pub enum RuntimeEvent {
     TurnCompleted(RuntimeTurnCompleted),
     TurnFailed(RuntimeTurnFailed),
     TurnInterrupted(RuntimeTurnInterrupted),
+    TurnRetrying(RuntimeTurnRetrying),
     ItemStarted(RuntimeItemStarted),
     ItemDelta(RuntimeItemDelta),
     ItemCompleted(RuntimeItemCompleted),
@@ -32,6 +33,27 @@ pub enum RuntimeEvent {
     ReviewModeChanged(RuntimeReviewModeChanged),
     Error(RuntimeErrorEvent),
     Raw(RuntimeRawEvent),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeTurnTerminalKind {
+    Completed,
+    Failed,
+    Interrupted,
+}
+
+impl RuntimeEvent {
+    pub const fn turn_terminal_kind(&self) -> Option<RuntimeTurnTerminalKind> {
+        match self {
+            Self::TurnCompleted(_) => Some(RuntimeTurnTerminalKind::Completed),
+            Self::TurnFailed(_) => Some(RuntimeTurnTerminalKind::Failed),
+            Self::TurnInterrupted(_) => Some(RuntimeTurnTerminalKind::Interrupted),
+            Self::Error(error) if !error.retryable && error.native_turn_id.is_some() => {
+                Some(RuntimeTurnTerminalKind::Failed)
+            }
+            _ => None,
+        }
+    }
 }
 
 const RUNTIME_EVENT_MAX_COALESCED_DELTA_BYTES: usize = 64 * 1024;
@@ -170,6 +192,22 @@ pub struct RuntimeTurnInterrupted {
     pub native_thread_id: Option<String>,
     pub native_turn_id: String,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<RuntimeNativeEvent>,
+}
+
+/// A transient provider failure that the runtime is already retrying.
+///
+/// This event is diagnostic and never transfers turn ownership to recovery.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeTurnRetrying {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_turn_id: Option<String>,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native: Option<RuntimeNativeEvent>,
 }
@@ -577,15 +615,31 @@ fn map_codex_error(
     let Some(params) = notification.params.as_ref() else {
         return raw_notification(notification, options, "error missing params");
     };
+    let native_thread_id = string_path(params, &["threadId"]);
+    let native_turn_id = string_path(params, &["turnId"]);
+    let message = string_path(params, &["error", "message"])
+        .or_else(|| string_path(params, &["message"]))
+        .unwrap_or_else(|| "Codex runtime error".to_owned());
+    let code = string_path(params, &["error", "code"]).or_else(|| string_path(params, &["code"]));
+    let native = native_notification(notification, options);
+
+    if bool_path(params, &["willRetry"]).unwrap_or(false) {
+        return RuntimeEvent::TurnRetrying(RuntimeTurnRetrying {
+            native_thread_id,
+            native_turn_id,
+            message,
+            code,
+            native,
+        });
+    }
+
     RuntimeEvent::Error(RuntimeErrorEvent {
-        native_thread_id: string_path(params, &["threadId"]),
-        native_turn_id: string_path(params, &["turnId"]),
-        message: string_path(params, &["error", "message"])
-            .or_else(|| string_path(params, &["message"]))
-            .unwrap_or_else(|| "Codex runtime error".to_owned()),
-        code: string_path(params, &["error", "code"]).or_else(|| string_path(params, &["code"])),
-        retryable: bool_path(params, &["willRetry"]).unwrap_or(false),
-        native: native_notification(notification, options),
+        native_thread_id,
+        native_turn_id,
+        message,
+        code,
+        retryable: false,
+        native,
     })
 }
 
@@ -1352,7 +1406,7 @@ fn is_secret_key(key: &str) -> bool {
 mod tests {
     use super::{
         RuntimeAgentMessagePhase, RuntimeEvent, RuntimeEventMappingOptions, RuntimeItemDeltaKind,
-        map_codex_notification_event, map_codex_server_request_event,
+        RuntimeTurnTerminalKind, map_codex_notification_event, map_codex_server_request_event,
     };
     use crate::codex::{CodexJsonlRpcNotificationEvent, CodexJsonlRpcServerRequest};
     use crate::driver::JsonlRpcId;
@@ -1556,6 +1610,81 @@ mod tests {
         assert_eq!(turn.native_turn_id.as_deref(), Some("native_turn_1"));
         assert_eq!(turn.message, "boom");
         assert_eq!(turn.code.as_deref(), Some("failed"));
+    }
+
+    #[test]
+    fn event_codex_retryable_error_maps_to_turn_retrying() {
+        let event = map_codex_notification_event(
+            &CodexJsonlRpcNotificationEvent {
+                method: "error".to_owned(),
+                params: Some(json!({
+                    "threadId": "native_thread_1",
+                    "turnId": "native_turn_1",
+                    "error": {
+                        "message": "Reconnecting... 2/5",
+                        "code": "stream_disconnected"
+                    },
+                    "willRetry": true
+                })),
+                raw: json!({"method": "error"}),
+            },
+            RuntimeEventMappingOptions::default(),
+        );
+
+        let RuntimeEvent::TurnRetrying(retrying) = event else {
+            panic!("expected turn retrying");
+        };
+        assert_eq!(
+            retrying.native_thread_id.as_deref(),
+            Some("native_thread_1")
+        );
+        assert_eq!(retrying.native_turn_id.as_deref(), Some("native_turn_1"));
+        assert_eq!(retrying.message, "Reconnecting... 2/5");
+        assert_eq!(retrying.code.as_deref(), Some("stream_disconnected"));
+    }
+
+    #[test]
+    fn event_codex_non_retryable_error_remains_terminal_runtime_error() {
+        let event = map_codex_notification_event(
+            &CodexJsonlRpcNotificationEvent {
+                method: "error".to_owned(),
+                params: Some(json!({
+                    "threadId": "native_thread_1",
+                    "turnId": "native_turn_1",
+                    "error": {"message": "request failed"},
+                    "willRetry": false
+                })),
+                raw: json!({"method": "error"}),
+            },
+            RuntimeEventMappingOptions::default(),
+        );
+
+        assert_eq!(
+            event.turn_terminal_kind(),
+            Some(RuntimeTurnTerminalKind::Failed)
+        );
+        let RuntimeEvent::Error(error) = event else {
+            panic!("expected runtime error");
+        };
+        assert!(!error.retryable);
+        assert_eq!(error.message, "request failed");
+    }
+
+    #[test]
+    fn event_codex_unscoped_error_is_not_turn_terminal() {
+        let event = map_codex_notification_event(
+            &CodexJsonlRpcNotificationEvent {
+                method: "error".to_owned(),
+                params: Some(json!({
+                    "error": {"message": "session diagnostic"},
+                    "willRetry": false
+                })),
+                raw: json!({"method": "error"}),
+            },
+            RuntimeEventMappingOptions::default(),
+        );
+
+        assert_eq!(event.turn_terminal_kind(), None);
     }
 
     #[test]

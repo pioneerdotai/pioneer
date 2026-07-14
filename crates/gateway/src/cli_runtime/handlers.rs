@@ -26,8 +26,8 @@ use pioneer_cli_agent_runtime::codex::{
     decode_codex_user_input_request,
 };
 use pioneer_cli_agent_runtime::event::{
-    RuntimeEvent, RuntimeEventMappingOptions, RuntimeRequestResolved, map_codex_notification_event,
-    map_codex_server_request_event,
+    RuntimeEvent, RuntimeEventMappingOptions, RuntimeRequestResolved, RuntimeTurnTerminalKind,
+    map_codex_notification_event, map_codex_server_request_event,
 };
 use pioneer_config::{
     EffectiveGatewayCliAgentRuntimeInstanceConfig, GatewayCliAgentRuntimeKindConfig,
@@ -7010,6 +7010,7 @@ fn cli_runtime_event_log_label(event: &RuntimeEvent) -> String {
         RuntimeEvent::TurnCompleted(_) => "turn_completed".to_owned(),
         RuntimeEvent::TurnFailed(_) => "turn_failed".to_owned(),
         RuntimeEvent::TurnInterrupted(_) => "turn_interrupted".to_owned(),
+        RuntimeEvent::TurnRetrying(_) => "turn_retrying".to_owned(),
         RuntimeEvent::ItemStarted(_) => "item_started".to_owned(),
         RuntimeEvent::ItemDelta(_) => "item_delta".to_owned(),
         RuntimeEvent::ItemCompleted(_) => "item_completed".to_owned(),
@@ -7031,6 +7032,7 @@ fn cli_runtime_native_turn_id_for_event(event: &RuntimeEvent) -> Option<&str> {
         RuntimeEvent::TurnCompleted(event) => Some(event.native_turn_id.as_str()),
         RuntimeEvent::TurnFailed(event) => event.native_turn_id.as_deref(),
         RuntimeEvent::TurnInterrupted(event) => Some(event.native_turn_id.as_str()),
+        RuntimeEvent::TurnRetrying(event) => event.native_turn_id.as_deref(),
         RuntimeEvent::ItemStarted(event) => Some(event.native_turn_id.as_str()),
         RuntimeEvent::ItemDelta(event) => Some(event.native_turn_id.as_str()),
         RuntimeEvent::ItemCompleted(event) => Some(event.native_turn_id.as_str()),
@@ -7068,6 +7070,7 @@ fn cli_runtime_native_thread_id_for_event(event: &RuntimeEvent) -> Option<&str> 
         RuntimeEvent::TurnCompleted(event) => event.native_thread_id.as_deref(),
         RuntimeEvent::TurnFailed(event) => event.native_thread_id.as_deref(),
         RuntimeEvent::TurnInterrupted(event) => event.native_thread_id.as_deref(),
+        RuntimeEvent::TurnRetrying(event) => event.native_thread_id.as_deref(),
         RuntimeEvent::ItemStarted(event) => event.native_thread_id.as_deref(),
         RuntimeEvent::ItemDelta(event) => event.native_thread_id.as_deref(),
         RuntimeEvent::ItemCompleted(event) => event.native_thread_id.as_deref(),
@@ -7086,12 +7089,11 @@ fn cli_runtime_native_thread_id_for_event(event: &RuntimeEvent) -> Option<&str> 
 }
 
 fn cli_runtime_turn_status_for_terminal_event(event: &RuntimeEvent) -> Option<TurnStatus> {
-    match event {
-        RuntimeEvent::TurnCompleted(_) => Some(TurnStatus::Completed),
-        RuntimeEvent::TurnFailed(_) | RuntimeEvent::Error(_) => Some(TurnStatus::Failed),
-        RuntimeEvent::TurnInterrupted(_) => Some(TurnStatus::Interrupted),
-        _ => None,
-    }
+    event.turn_terminal_kind().map(|kind| match kind {
+        RuntimeTurnTerminalKind::Completed => TurnStatus::Completed,
+        RuntimeTurnTerminalKind::Failed => TurnStatus::Failed,
+        RuntimeTurnTerminalKind::Interrupted => TurnStatus::Interrupted,
+    })
 }
 
 fn cli_runtime_event_requires_native_journal(event: &RuntimeEvent) -> bool {

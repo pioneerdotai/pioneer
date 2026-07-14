@@ -102,10 +102,7 @@ impl CliRuntimeCommandHeartbeatTracker {
                 )
                 .await;
             }
-            RuntimeEvent::TurnCompleted(_)
-            | RuntimeEvent::TurnFailed(_)
-            | RuntimeEvent::TurnInterrupted(_)
-            | RuntimeEvent::Error(_) => {
+            _ if event.turn_terminal_kind().is_some() => {
                 self.remove_turn(turn_binding.turn_id.as_str()).await;
             }
             _ => {}
@@ -232,6 +229,7 @@ pub(crate) fn is_command_execution_kind(kind: &str) -> bool {
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
+    use pioneer_cli_agent_runtime::event::{RuntimeErrorEvent, RuntimeTurnRetrying};
 
     fn timestamp() -> sea_orm::entity::prelude::DateTimeWithTimeZone {
         Utc.timestamp_opt(1, 0)
@@ -313,5 +311,54 @@ mod tests {
 
         assert!(tracker.due_items(190).await.is_empty());
         assert_eq!(tracker.due_items(220).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn retrying_turn_keeps_command_heartbeat_active() {
+        let tracker = CliRuntimeCommandHeartbeatTracker::new(60);
+        let key = session_key();
+        let binding = turn_binding(CLI_RUNTIME_TURN_STATUS_RUNNING);
+        tracker
+            .register(
+                &key,
+                &binding,
+                "item",
+                Some("native-thread".to_owned()),
+                "native-turn".to_owned(),
+                100,
+            )
+            .await;
+
+        tracker
+            .update_from_runtime_event(
+                &key,
+                &binding,
+                &RuntimeEvent::TurnRetrying(RuntimeTurnRetrying {
+                    native_thread_id: Some("native-thread".to_owned()),
+                    native_turn_id: Some("native-turn".to_owned()),
+                    message: "Reconnecting... 2/5".to_owned(),
+                    code: Some("stream_disconnected".to_owned()),
+                    native: None,
+                }),
+                120,
+            )
+            .await;
+        tracker
+            .update_from_runtime_event(
+                &key,
+                &binding,
+                &RuntimeEvent::Error(RuntimeErrorEvent {
+                    native_thread_id: Some("native-thread".to_owned()),
+                    native_turn_id: Some("native-turn".to_owned()),
+                    message: "legacy retryable error".to_owned(),
+                    code: None,
+                    retryable: true,
+                    native: None,
+                }),
+                130,
+            )
+            .await;
+
+        assert_eq!(tracker.due_items(160).await.len(), 1);
     }
 }
