@@ -1255,10 +1255,14 @@ impl MessageProcessor {
                                     )
                                     .await;
                             }
-                        } else if summary.projected > 0 || summary.failed > 0 {
+                        } else if summary.projected > 0
+                            || summary.deferred > 0
+                            || summary.failed > 0
+                        {
                             info!(
                                 claimed = summary.claimed,
                                 projected = summary.projected,
+                                deferred = summary.deferred,
                                 failed = summary.failed,
                                 "turn event projection replay completed"
                             );

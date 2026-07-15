@@ -43,6 +43,7 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::future::Future;
 use std::time::Duration;
+use tracing::{debug, warn};
 
 use crate::convention::{
     ATTEMPT_STATUS_CANCELLED, ATTEMPT_STATUS_COMPLETED, ATTEMPT_STATUS_EXHAUSTED,
@@ -578,6 +579,7 @@ pub struct TurnItemAttemptDeadlines {
 pub struct TurnProjectionReplaySummary {
     pub claimed: usize,
     pub projected: usize,
+    pub deferred: usize,
     pub failed: usize,
     pub exhausted: usize,
     pub missing_events: usize,
@@ -596,6 +598,12 @@ pub struct TurnProjectionReplayExhaustedRecord {
 struct TurnEventProjectionContext {
     #[serde(default)]
     item_started_deadlines: Option<TurnItemAttemptDeadlines>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnEventProjectionOutcome {
+    Projected,
+    DeferredByPredecessor,
 }
 
 #[derive(Debug, Clone)]
@@ -850,6 +858,21 @@ impl CrudStore {
 
     pub fn database_connection(&self) -> DatabaseConnection {
         self.connection.clone()
+    }
+
+    pub async fn try_run_low_priority_write<T, F, Fut>(&self, operation: F) -> Result<Option<T>>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        match self
+            .write_coordinator
+            .try_run_serialized_with_retry(operation, is_anyhow_sqlite_lock)
+            .await
+        {
+            Some(result) => result.map(Some),
+            None => Ok(None),
+        }
     }
 
     pub async fn insert_turn_llm_context(
@@ -11254,7 +11277,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             )
             .await?;
 
-        if let Err(error) = retry_with_backoff(
+        let projection = retry_with_backoff(
             || {
                 self.project_claimed_turn_event_once(
                     appended_event.clone(),
@@ -11267,43 +11290,82 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             DEFAULT_LOCK_RETRY_ATTEMPTS,
             Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
         )
-        .await
-        {
-            let error_message = format!("{error:#}");
-            if let Err(mark_error) = retry_with_backoff(
-                || {
-                    self.mark_turn_event_projection_failure_once(
-                        appended_event.id.clone(),
-                        claim_token.clone(),
-                        0,
-                        error_message.clone(),
-                        event_timestamp_secs,
-                        false,
+        .await;
+        match projection {
+            Ok(TurnEventProjectionOutcome::Projected) => {}
+            Ok(TurnEventProjectionOutcome::DeferredByPredecessor) => {
+                let pending_record = retry_with_backoff(
+                    || {
+                        self.mark_turn_event_projection_pending_once(
+                            appended_event.id.clone(),
+                            claim_token.clone(),
+                            event_timestamp_secs,
+                        )
+                    },
+                    is_anyhow_sqlite_lock,
+                    DEFAULT_LOCK_RETRY_ATTEMPTS,
+                    Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
+                )
+                .await;
+                match pending_record {
+                    Ok(true) => debug!(
+                        event_id = appended_event.id,
+                        turn_id = appended_event.turn_id,
+                        sequence = appended_event.sequence,
+                        "turn event projection deferred until its predecessor is projected"
+                    ),
+                    Ok(false) => warn!(
+                        event_id = appended_event.id,
+                        turn_id = appended_event.turn_id,
+                        sequence = appended_event.sequence,
+                        "deferred turn event projection claim was no longer owned"
+                    ),
+                    Err(error) => warn!(
+                        event_id = appended_event.id,
+                        turn_id = appended_event.turn_id,
+                        sequence = appended_event.sequence,
+                        error = %format!("{error:#}"),
+                        "failed to release deferred turn event projection claim; lease expiry will retry it"
+                    ),
+                }
+            }
+            Err(error) => {
+                let error_message = format!("{error:#}");
+                if let Err(mark_error) = retry_with_backoff(
+                    || {
+                        self.mark_turn_event_projection_failure_once(
+                            appended_event.id.clone(),
+                            claim_token.clone(),
+                            0,
+                            error_message.clone(),
+                            event_timestamp_secs,
+                            false,
+                        )
+                    },
+                    is_anyhow_sqlite_lock,
+                    DEFAULT_LOCK_RETRY_ATTEMPTS,
+                    Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
+                )
+                .await
+                {
+                    return Err(TurnEventProjectionAfterAppendError::new(
+                        appended_event.id,
+                        appended_event.turn_id,
+                        appended_event.sequence,
+                        error_message,
+                        Some(format!("{mark_error:#}")),
                     )
-                },
-                is_anyhow_sqlite_lock,
-                DEFAULT_LOCK_RETRY_ATTEMPTS,
-                Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
-            )
-            .await
-            {
+                    .into());
+                }
                 return Err(TurnEventProjectionAfterAppendError::new(
                     appended_event.id,
                     appended_event.turn_id,
                     appended_event.sequence,
                     error_message,
-                    Some(format!("{mark_error:#}")),
+                    None,
                 )
                 .into());
             }
-            return Err(TurnEventProjectionAfterAppendError::new(
-                appended_event.id,
-                appended_event.turn_id,
-                appended_event.sequence,
-                error_message,
-                None,
-            )
-            .into());
         }
 
         Ok(())
@@ -11545,7 +11607,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         projection_context: TurnEventProjectionContext,
         claim_token: String,
         projected_at: DateTimeWithTimeZone,
-    ) -> Result<()> {
+    ) -> Result<TurnEventProjectionOutcome> {
         let transaction = self
             .connection
             .begin()
@@ -11568,11 +11630,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             };
         if has_unprojected_predecessor {
             let _ = transaction.rollback().await;
-            anyhow::bail!(
-                "turn event projection `{}` is waiting for an earlier event in turn `{}`",
-                appended_event.id,
-                appended_event.turn_id
-            );
+            return Ok(TurnEventProjectionOutcome::DeferredByPredecessor);
         }
 
         if let Err(error) = self
@@ -11649,7 +11707,46 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             .await
             .context("failed to commit turn event projection transaction")?;
 
-        Ok(())
+        Ok(TurnEventProjectionOutcome::Projected)
+    }
+
+    async fn mark_turn_event_projection_pending_once(
+        &self,
+        event_id: String,
+        claim_token: String,
+        deferred_at_unix: i64,
+    ) -> Result<bool> {
+        let transaction = self
+            .connection
+            .begin()
+            .await
+            .context("failed to begin deferred turn event projection transaction")?;
+        let deferred_at = unix_to_datetime(deferred_at_unix);
+        let next_run_at = unix_to_datetime(
+            deferred_at_unix.saturating_add(turn_event_projection_retry_delay_secs(0)),
+        );
+        let released = match turn_event_projection_state::release_claim_as_pending(
+            &transaction,
+            event_id.as_str(),
+            claim_token.as_str(),
+            next_run_at,
+            deferred_at,
+        )
+        .await
+        {
+            Ok(released) => released,
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+        };
+
+        transaction
+            .commit()
+            .await
+            .context("failed to commit deferred turn event projection transaction")?;
+
+        Ok(released)
     }
 
     async fn mark_turn_event_projection_failure_once(
@@ -11822,8 +11919,22 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                 .await;
 
             match projected {
-                Ok(()) => {
+                Ok(TurnEventProjectionOutcome::Projected) => {
                     summary.projected += 1;
+                }
+                Ok(TurnEventProjectionOutcome::DeferredByPredecessor) => {
+                    let released = self
+                        .run_serialized_write(|| {
+                            self.mark_turn_event_projection_pending_once(
+                                event_id.clone(),
+                                claim_token.clone(),
+                                now_unix,
+                            )
+                        })
+                        .await?;
+                    if released {
+                        summary.deferred += 1;
+                    }
                 }
                 Err(error) => {
                     let error_message = format!("{error:#}");
@@ -17208,7 +17319,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn turn_event_projection_failure_keeps_raw_event_and_replays_in_order() {
+    async fn turn_event_projection_deferral_keeps_raw_event_and_replays_in_order() {
         let store = test_store_with_workspace("ws_projection_replay").await;
         let timestamp = 1_700_000_000;
         let workspace_id = "ws_projection_replay";
@@ -17240,7 +17351,7 @@ mod tests {
             )
             .col_expr(
                 pioneer_entity::turn_event_projection_state::Column::NextRunAt,
-                sea_orm::sea_query::Expr::value(unix_to_datetime(timestamp + 2)),
+                sea_orm::sea_query::Expr::value(unix_to_datetime(timestamp + 20)),
             )
             .col_expr(
                 pioneer_entity::turn_event_projection_state::Column::ClaimToken,
@@ -17267,7 +17378,7 @@ mod tests {
             hard_deadline_at_unix: Some(timestamp + 301),
         };
 
-        let projection_error = store
+        store
             .materialize_item_started_with_attempt_deadlines(
                 ItemStartedNotification {
                     workspace_id: workspace_id.to_owned(),
@@ -17279,15 +17390,7 @@ mod tests {
                 deadlines,
             )
             .await
-            .expect_err("item projection should wait for earlier turn event");
-        assert!(
-            format!("{projection_error:#}").contains("waiting for an earlier event"),
-            "projection should fail because an earlier event is not projected"
-        );
-        assert!(
-            crate::turn_event_was_appended_before_error(&projection_error),
-            "projection failure should report that the raw turn event was already appended"
-        );
+            .expect("durably appended item should be accepted for ordered projection replay");
 
         let events = pioneer_entity::turn_event::Entity::find()
             .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn_id))
@@ -17309,17 +17412,63 @@ mod tests {
                 .expect("item projection state should exist");
         assert_eq!(
             item_state.status,
-            crate::repositories::turn_event_projection_state::PROJECTION_STATUS_FAILED
+            crate::repositories::turn_event_projection_state::PROJECTION_STATUS_PENDING
+        );
+        assert_eq!(item_state.attempt_count, 0);
+        assert!(item_state.last_error.is_none());
+
+        let item_before_replay = pioneer_entity::turn_item::Entity::find()
+            .filter(pioneer_entity::turn_item::Column::TurnId.eq(turn_id))
+            .filter(pioneer_entity::turn_item::Column::ItemId.eq(item_id))
+            .one(&store.connection)
+            .await
+            .expect("turn item lookup before replay should succeed");
+        assert!(
+            item_before_replay.is_none(),
+            "deferred event must wait for its predecessor before projection"
         );
 
-        let replay = store
+        let deferred_replay = store
             .replay_due_turn_event_projections(timestamp + 10, 10)
             .await
             .expect("projection replay should succeed");
+        assert_eq!(deferred_replay.claimed, 1);
+        assert_eq!(deferred_replay.projected, 0);
+        assert_eq!(deferred_replay.deferred, 1);
+        assert_eq!(deferred_replay.failed, 0);
+        assert_eq!(deferred_replay.exhausted, 0);
+
+        let deferred_state =
+            pioneer_entity::turn_event_projection_state::Entity::find_by_id(events[1].id.clone())
+                .one(&store.connection)
+                .await
+                .expect("deferred projection state lookup should succeed")
+                .expect("deferred projection state should exist");
+        assert_eq!(
+            deferred_state.status,
+            crate::repositories::turn_event_projection_state::PROJECTION_STATUS_PENDING
+        );
+        assert_eq!(deferred_state.attempt_count, 0);
+
+        let replay = store
+            .replay_due_turn_event_projections(timestamp + 30, 10)
+            .await
+            .expect("ordered projection replay should succeed");
         assert_eq!(replay.claimed, 2);
-        assert_eq!(replay.projected, 2);
+        assert_eq!(replay.projected, 1);
+        assert_eq!(replay.deferred, 1);
         assert_eq!(replay.failed, 0);
         assert_eq!(replay.exhausted, 0);
+
+        let final_replay = store
+            .replay_due_turn_event_projections(timestamp + 40, 10)
+            .await
+            .expect("dependent projection replay should succeed");
+        assert_eq!(final_replay.claimed, 1);
+        assert_eq!(final_replay.projected, 1);
+        assert_eq!(final_replay.deferred, 0);
+        assert_eq!(final_replay.failed, 0);
+        assert_eq!(final_replay.exhausted, 0);
 
         let states = pioneer_entity::turn_event_projection_state::Entity::find()
             .filter(pioneer_entity::turn_event_projection_state::Column::TurnId.eq(turn_id))

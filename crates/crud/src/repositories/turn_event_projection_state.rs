@@ -228,6 +228,52 @@ pub async fn mark_projected_claimed<C: ConnectionTrait>(
     Ok(affected)
 }
 
+pub async fn release_claim_as_pending<C: ConnectionTrait>(
+    db: &C,
+    event_id: &str,
+    claim_token: &str,
+    next_run_at: DateTimeWithTimeZone,
+    updated_at: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let affected = turn_event_projection_state::Entity::update_many()
+        .col_expr(
+            turn_event_projection_state::Column::Status,
+            sea_orm::sea_query::Expr::value(PROJECTION_STATUS_PENDING.to_owned()),
+        )
+        .col_expr(
+            turn_event_projection_state::Column::LastError,
+            sea_orm::sea_query::Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            turn_event_projection_state::Column::NextRunAt,
+            sea_orm::sea_query::Expr::value(next_run_at),
+        )
+        .col_expr(
+            turn_event_projection_state::Column::ClaimToken,
+            sea_orm::sea_query::Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            turn_event_projection_state::Column::ClaimExpiresAt,
+            sea_orm::sea_query::Expr::value(Option::<DateTimeWithTimeZone>::None),
+        )
+        .col_expr(
+            turn_event_projection_state::Column::UpdatedAt,
+            sea_orm::sea_query::Expr::value(updated_at),
+        )
+        .filter(turn_event_projection_state::Column::EventId.eq(event_id.to_owned()))
+        .filter(turn_event_projection_state::Column::Status.eq(PROJECTION_STATUS_PROJECTING))
+        .filter(turn_event_projection_state::Column::ClaimToken.eq(claim_token.to_owned()))
+        .exec(db)
+        .await
+        .with_context(|| {
+            format!("failed to release turn event projection `{event_id}` as pending")
+        })?
+        .rows_affected
+        > 0;
+
+    Ok(affected)
+}
+
 pub async fn mark_failed_claimed<C: ConnectionTrait>(
     db: &C,
     event_id: &str,

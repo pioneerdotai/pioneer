@@ -45,8 +45,8 @@ use pioneer_crud::{
     global_agent_memory_scope_key,
 };
 use pioneer_entity::{
-    thread, thread_sandox_policy, thread_timeline_block, turn, turn_input, turn_item,
-    turn_status_history, turn_work_item_projection, turn_work_projection,
+    thread, thread_sandox_policy, thread_timeline_block, turn, turn_event_projection_state,
+    turn_input, turn_item, turn_status_history, turn_work_item_projection, turn_work_projection,
 };
 use pioneer_hooks::{
     HookAwaitPolicy, HookCapabilities, HookCapability, HookContribution, HookDiagnosticCode,
@@ -132,8 +132,8 @@ use pioneer_tools::{
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, Query};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, Database, DatabaseTransaction, EntityTrait, QueryFilter, Set,
-    TransactionTrait,
+    ColumnTrait, ConnectionTrait, Database, DatabaseTransaction, EntityTrait, QueryFilter,
+    QueryOrder, Set, TransactionTrait,
 };
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
@@ -16887,6 +16887,166 @@ async fn cli_runtime_reconciliation_uses_full_terminal_lifecycle_for_unloaded_th
     assert_eq!(
         binding.status,
         crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_COMPLETED
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_projection_backlog_does_not_start_agent_recovery() {
+    let (tx, mut rx) = mpsc::channel(64);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+    let thread_id = "thread_cli_projection_backlog";
+    let turn_id = "turn_cli_projection_backlog";
+    let native_thread_id = "native_thread_cli_projection_backlog";
+    let native_turn_id = "native_turn_cli_projection_backlog";
+    start_loaded_thread_and_turn_for_cli_runtime_test(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+    )
+    .await;
+    let now = chrono::Utc::now().fixed_offset();
+    crud_store
+        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+            turn_id: turn_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            workspace_id: workspace_id.clone(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            native_thread_id: native_thread_id.to_owned(),
+            native_turn_id: Some(native_turn_id.to_owned()),
+            request_id: None,
+            status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING.to_owned(),
+            model: Some("gpt-5".to_owned()),
+            cwd: Some("/tmp/project".to_owned()),
+            sandbox_json: None,
+            approval_policy: None,
+            input_mapping_json: "{}".to_owned(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("turn binding should upsert");
+
+    let db = crud_store.database_connection();
+    let predecessor = turn_event_projection_state::Entity::find()
+        .filter(turn_event_projection_state::Column::TurnId.eq(turn_id))
+        .order_by_desc(turn_event_projection_state::Column::Sequence)
+        .one(&db)
+        .await
+        .expect("predecessor projection state should load")
+        .expect("predecessor projection state should exist");
+    turn_event_projection_state::Entity::update_many()
+        .col_expr(
+            turn_event_projection_state::Column::Status,
+            Expr::value("failed"),
+        )
+        .col_expr(
+            turn_event_projection_state::Column::NextRunAt,
+            Expr::value(now),
+        )
+        .col_expr(
+            turn_event_projection_state::Column::ClaimToken,
+            Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            turn_event_projection_state::Column::ClaimExpiresAt,
+            Expr::value(Option::<DateTimeWithTimeZone>::None),
+        )
+        .filter(turn_event_projection_state::Column::EventId.eq(predecessor.event_id))
+        .exec(&db)
+        .await
+        .expect("predecessor should be queued for replay");
+
+    let key = CLIAgentRuntimeSessionKey::new(workspace_id, "codex", thread_id)
+        .expect("session key should build");
+    processor
+        .handle_cli_runtime_timeline_event(
+            &key,
+            RuntimeEvent::ItemStarted(RuntimeItemStarted {
+                native_thread_id: Some(native_thread_id.to_owned()),
+                native_turn_id: native_turn_id.to_owned(),
+                native_item_id: "deferred_reasoning_item".to_owned(),
+                item_kind: "reasoning".to_owned(),
+                title: None,
+                phase: RuntimeAgentMessagePhase::FinalAnswer,
+                metadata: None,
+                native_item_redacted: None,
+                native: None,
+            }),
+        )
+        .await;
+
+    let (_, running_turn) = crud_store
+        .get_turn(thread_id, turn_id)
+        .await
+        .expect("turn should load")
+        .expect("turn should exist");
+    assert_eq!(running_turn.status, TurnStatus::InProgress);
+    assert!(
+        crud_store
+            .find_recovery_jobs_by_turn_and_status(turn_id, RecoveryJobStatus::Pending)
+            .await
+            .expect("pending recovery jobs should load")
+            .is_empty(),
+        "ordered projection backlog must not start agent recovery"
+    );
+    assert!(
+        crud_store
+            .get_turn_item(turn_id, "deferred_reasoning_item")
+            .await
+            .expect("deferred item lookup should succeed")
+            .is_none(),
+        "deferred event must not project ahead of its predecessor"
+    );
+    let deferred_projection = timeout(Duration::from_secs(2), async {
+        loop {
+            let projection = turn_event_projection_state::Entity::find()
+                .filter(turn_event_projection_state::Column::TurnId.eq(turn_id))
+                .order_by_desc(turn_event_projection_state::Column::Sequence)
+                .one(&db)
+                .await
+                .expect("deferred projection state should load")
+                .expect("deferred projection state should exist");
+            if projection.status == "pending" {
+                return projection;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("deferred projection should return to pending state");
+    assert_eq!(deferred_projection.attempt_count, 0);
+
+    let replay = crud_store
+        .replay_due_turn_event_projections(now.timestamp().saturating_add(10), 64)
+        .await
+        .expect("ordered projection replay should succeed");
+    assert!(replay.projected >= 2);
+    assert_eq!(replay.failed, 0);
+    assert!(
+        crud_store
+            .get_turn_item(turn_id, "deferred_reasoning_item")
+            .await
+            .expect("replayed item lookup should succeed")
+            .is_some(),
+        "replay should project the deferred native event"
     );
 }
 

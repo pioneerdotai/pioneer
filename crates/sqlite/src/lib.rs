@@ -57,6 +57,30 @@ impl SqliteWriteCoordinator {
         )
         .await
     }
+
+    pub async fn try_run_serialized_with_retry<T, E, F, Fut, P>(
+        &self,
+        operation: F,
+        is_retryable: P,
+    ) -> Option<Result<T, E>>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+        P: Fn(&E) -> bool,
+    {
+        let Ok(_write_guard) = self.lock.try_lock() else {
+            return None;
+        };
+        Some(
+            retry_with_backoff(
+                operation,
+                is_retryable,
+                self.retry_attempts,
+                self.retry_base_delay,
+            )
+            .await,
+        )
+    }
 }
 
 pub async fn retry_with_backoff<T, E, F, Fut, P>(
@@ -198,8 +222,11 @@ fn is_disallowed_component(component: Component<'_>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_sqlite_lock_message, is_sqlite_pool_timeout_message, is_sqlite_transient_open_message,
+        SqliteWriteCoordinator, is_sqlite_lock_message, is_sqlite_pool_timeout_message,
+        is_sqlite_transient_open_message,
     };
+    use std::sync::Arc;
+    use tokio::sync::Notify;
 
     #[test]
     fn detects_sqlite_transient_open_errors() {
@@ -228,5 +255,46 @@ mod tests {
         assert!(!is_sqlite_lock_message(
             "Failed to acquire connection from pool: Connection pool timed out"
         ));
+    }
+
+    #[tokio::test]
+    async fn low_priority_write_skips_while_foreground_write_is_active() {
+        let coordinator = SqliteWriteCoordinator::default();
+        let foreground_coordinator = coordinator.clone();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let foreground = tokio::spawn({
+            let entered = entered.clone();
+            let release = release.clone();
+            async move {
+                foreground_coordinator
+                    .run_serialized_with_retry(
+                        || async {
+                            entered.notify_one();
+                            release.notified().await;
+                            Ok::<_, ()>(())
+                        },
+                        |_| false,
+                    )
+                    .await
+            }
+        });
+
+        entered.notified().await;
+        let skipped = coordinator
+            .try_run_serialized_with_retry(|| async { Ok::<_, ()>(()) }, |_| false)
+            .await;
+        assert!(skipped.is_none());
+
+        release.notify_one();
+        foreground
+            .await
+            .expect("foreground task should join")
+            .expect("foreground write should succeed");
+
+        let completed = coordinator
+            .try_run_serialized_with_retry(|| async { Ok::<_, ()>(42) }, |_| false)
+            .await;
+        assert_eq!(completed, Some(Ok(42)));
     }
 }

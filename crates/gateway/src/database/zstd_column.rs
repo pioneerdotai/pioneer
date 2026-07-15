@@ -8,11 +8,13 @@ use sea_orm::{
     ConnectionTrait, DatabaseConnection, Statement, entity::prelude::DateTimeWithTimeZone,
 };
 use serde_json::json;
+use std::time::{Duration, Instant};
 
 pub(crate) const STARTUP_MAINTENANCE_SECONDS: f64 = 60.0;
 pub(crate) const STARTUP_TARGET_DB_LOAD: f64 = 1.0;
 pub(crate) const PERIODIC_MAINTENANCE_INTERVAL_SECONDS: u64 = 300;
 pub(crate) const PERIODIC_MAINTENANCE_SECONDS: f64 = 10.0;
+pub(crate) const PERIODIC_MAINTENANCE_SLICE_SECONDS: f64 = 0.25;
 pub(crate) const PERIODIC_TARGET_DB_LOAD: f64 = 0.25;
 
 #[derive(Debug, Clone, Copy)]
@@ -77,6 +79,18 @@ pub(crate) struct ZstdColumnCompressionSummary {
     pub(crate) maintenance_more_pending: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ZstdPeriodicMaintenanceOutcome {
+    pub(crate) summaries: Vec<ZstdColumnCompressionSummary>,
+    pub(crate) deferred: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CooperativeMaintenanceOutcome {
+    more_pending: bool,
+    deferred: bool,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct EnsureCompressionResult {
     total_rows: u64,
@@ -122,24 +136,40 @@ pub(crate) async fn run_periodic_maintenance_once(
     configs: &[ZstdColumnConfig],
     maintenance_seconds: Option<f64>,
     target_db_load: f64,
-) -> Result<Vec<ZstdColumnCompressionSummary>> {
+) -> Result<ZstdPeriodicMaintenanceOutcome> {
     let db = crud_store.database_connection();
     verify_sqlite_zstd_registered(&db).await?;
 
-    let mut before = Vec::with_capacity(configs.len());
-    for config in configs {
-        let ensure = ensure_compression_enabled(&db, *config).await?;
-        let pending_before = pending_uncompressed_rows(&db, *config).await?;
-        before.push((*config, ensure, pending_before));
-    }
+    let configs = configs.to_vec();
+    let Some(before) = crud_store
+        .try_run_low_priority_write(|| {
+            let db = db.clone();
+            let configs = configs.clone();
+            async move {
+                let mut before = Vec::with_capacity(configs.len());
+                for config in configs {
+                    let ensure = ensure_compression_enabled(&db, config).await?;
+                    let pending_before = pending_uncompressed_rows(&db, config).await?;
+                    before.push((config, ensure, pending_before));
+                }
+                Ok(before)
+            }
+        })
+        .await?
+    else {
+        return Ok(ZstdPeriodicMaintenanceOutcome {
+            summaries: Vec::new(),
+            deferred: true,
+        });
+    };
 
     let should_run_maintenance = before
         .iter()
         .any(|(_, ensure, _)| ensure.was_enabled || ensure.enabled_now);
-    let maintenance_more_pending = if should_run_maintenance {
-        run_maintenance(&db, maintenance_seconds, target_db_load).await?
+    let maintenance = if should_run_maintenance {
+        run_cooperative_maintenance(crud_store, &db, maintenance_seconds, target_db_load).await?
     } else {
-        false
+        CooperativeMaintenanceOutcome::default()
     };
 
     let mut summaries = Vec::with_capacity(before.len());
@@ -154,11 +184,72 @@ pub(crate) async fn run_periodic_maintenance_once(
             total_rows: ensure.total_rows,
             pending_before,
             pending_after,
-            maintenance_more_pending,
+            maintenance_more_pending: maintenance.more_pending,
         });
     }
 
-    Ok(summaries)
+    Ok(ZstdPeriodicMaintenanceOutcome {
+        summaries,
+        deferred: maintenance.deferred,
+    })
+}
+
+async fn run_cooperative_maintenance(
+    crud_store: &CrudStore,
+    db: &DatabaseConnection,
+    maintenance_seconds: Option<f64>,
+    target_db_load: f64,
+) -> Result<CooperativeMaintenanceOutcome> {
+    let Some(total_seconds) = maintenance_seconds else {
+        let result = crud_store
+            .try_run_low_priority_write(|| {
+                let db = db.clone();
+                async move { run_maintenance(&db, None, target_db_load).await }
+            })
+            .await?;
+        return Ok(match result {
+            Some(more_pending) => CooperativeMaintenanceOutcome {
+                more_pending,
+                deferred: false,
+            },
+            None => CooperativeMaintenanceOutcome {
+                more_pending: true,
+                deferred: true,
+            },
+        });
+    };
+
+    let budget = Duration::from_secs_f64(total_seconds.max(0.0));
+    let deadline = Instant::now() + budget;
+    let mut more_pending = true;
+    while more_pending {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let slice_seconds = remaining
+            .as_secs_f64()
+            .min(PERIODIC_MAINTENANCE_SLICE_SECONDS);
+        let result = crud_store
+            .try_run_low_priority_write(|| {
+                let db = db.clone();
+                async move { run_maintenance(&db, Some(slice_seconds), target_db_load).await }
+            })
+            .await?;
+        let Some(slice_more_pending) = result else {
+            return Ok(CooperativeMaintenanceOutcome {
+                more_pending: true,
+                deferred: true,
+            });
+        };
+        more_pending = slice_more_pending;
+        tokio::task::yield_now().await;
+    }
+
+    Ok(CooperativeMaintenanceOutcome {
+        more_pending,
+        deferred: false,
+    })
 }
 
 async fn ensure_compression_enabled(
@@ -457,13 +548,15 @@ fn now_datetime() -> DateTimeWithTimeZone {
 #[cfg(test)]
 mod tests {
     use super::{
-        TURN_EVENT_PAYLOAD, TURN_ITEM_PAYLOAD, ZSTD_PAYLOAD_COLUMNS, run_periodic_maintenance_once,
-        run_startup_once,
+        PERIODIC_MAINTENANCE_SLICE_SECONDS, TURN_EVENT_PAYLOAD, TURN_ITEM_PAYLOAD,
+        ZSTD_PAYLOAD_COLUMNS, run_periodic_maintenance_once, run_startup_once,
     };
     use migration::{Migrator, MigratorTrait};
     use pioneer_crud::{CrudStore, find_projection_meta};
     use pioneer_protocol::{AgentMessagePhase, TurnItem};
     use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement};
+    use std::sync::Arc;
+    use tokio::sync::Notify;
 
     #[tokio::test]
     async fn startup_compression_converts_turn_event_payload_to_zstd_view_and_preserves_reads() {
@@ -884,9 +977,11 @@ mod tests {
         insert_turn_events(&connection, 120).await;
         insert_turn_items(&connection, 120).await;
 
-        let summaries = run_periodic_maintenance_once(&store, ZSTD_PAYLOAD_COLUMNS, None, 1.0)
+        let outcome = run_periodic_maintenance_once(&store, ZSTD_PAYLOAD_COLUMNS, None, 1.0)
             .await
             .expect("periodic maintenance should enable compression without restart");
+        assert!(!outcome.deferred);
+        let summaries = outcome.summaries;
         assert_eq!(summaries.len(), 2);
         for summary in summaries {
             assert!(summary.enabled_now);
@@ -915,6 +1010,58 @@ mod tests {
         assert_eq!(turn_item_view, 1);
         assert_eq!(turn_event_rows, 120);
         assert_eq!(turn_item_rows, 120);
+    }
+
+    #[tokio::test]
+    async fn periodic_maintenance_defers_while_foreground_write_is_active() {
+        pioneer_sqlite::zstd::register_auto_extension_once()
+            .expect("sqlite-zstd auto-extension should register");
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect sqlite memory");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+        insert_turn_events(&connection, 3).await;
+
+        let store = CrudStore::new(connection);
+        let foreground_store = store.clone();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let foreground = tokio::spawn({
+            let entered = entered.clone();
+            let release = release.clone();
+            async move {
+                foreground_store
+                    .try_run_low_priority_write(|| async {
+                        entered.notify_one();
+                        release.notified().await;
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+
+        entered.notified().await;
+        let outcome = run_periodic_maintenance_once(
+            &store,
+            ZSTD_PAYLOAD_COLUMNS,
+            Some(PERIODIC_MAINTENANCE_SLICE_SECONDS),
+            1.0,
+        )
+        .await
+        .expect("busy foreground writer should defer periodic maintenance");
+        assert!(outcome.deferred);
+        assert!(outcome.summaries.is_empty());
+
+        release.notify_one();
+        assert_eq!(
+            foreground
+                .await
+                .expect("foreground task should join")
+                .expect("foreground write should succeed"),
+            Some(())
+        );
     }
 
     #[tokio::test]

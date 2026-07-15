@@ -1,7 +1,7 @@
 use pioneer_crud::CrudStore;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::database::zstd_column::{
     PERIODIC_MAINTENANCE_INTERVAL_SECONDS, PERIODIC_MAINTENANCE_SECONDS, PERIODIC_TARGET_DB_LOAD,
@@ -21,8 +21,14 @@ pub(super) fn spawn(crud_store: Arc<CrudStore>) {
             )
             .await
             {
-                Ok(summaries) => {
-                    for summary in summaries
+                Ok(outcome) => {
+                    if outcome.deferred {
+                        debug!(
+                            "sqlite-zstd periodic payload maintenance deferred for foreground writes"
+                        );
+                    }
+                    for summary in outcome
+                        .summaries
                         .into_iter()
                         .filter(|summary| summary.pending_before != 0 || summary.pending_after != 0)
                     {
