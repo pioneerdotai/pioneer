@@ -72,6 +72,7 @@ pub use super::turn_item_attempt::Entity as TurnItemAttempt;
 pub use super::turn_liveness::Entity as TurnLiveness;
 pub use super::turn_llm_context::Entity as TurnLlmContext;
 pub use super::turn_mcp_binding::Entity as TurnMcpBinding;
+pub use super::turn_mcp_projection::Entity as TurnMcpProjection;
 pub use super::turn_runtime_snapshot::Entity as TurnRuntimeSnapshot;
 pub use super::turn_skill_binding::Entity as TurnSkillBinding;
 pub use super::turn_status_history::Entity as TurnStatusHistory;

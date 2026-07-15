@@ -74,6 +74,7 @@ pub mod turn_item_attempt;
 pub mod turn_liveness;
 pub mod turn_llm_context;
 pub mod turn_mcp_binding;
+pub mod turn_mcp_projection;
 pub mod turn_runtime_snapshot;
 pub mod turn_skill_binding;
 pub mod turn_status_history;

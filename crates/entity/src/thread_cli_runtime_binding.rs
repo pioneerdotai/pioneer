@@ -27,6 +27,22 @@ pub struct Model {
     pub status: String,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub mcp_adapter_kind: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub mcp_manifest_hash: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub mcp_projection_fingerprint: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub mcp_provider_contract_fingerprint: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub mcp_isolation_contract_fingerprint: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub provider_session_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub provider_session_lifecycle_state: Option<String>,
+    pub mcp_session_generation: Option<i64>,
+    pub provider_session_last_verified_process_generation: Option<i64>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

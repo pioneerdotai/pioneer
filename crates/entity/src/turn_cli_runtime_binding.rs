@@ -31,6 +31,18 @@ pub struct Model {
     pub input_mapping_json: String,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub mcp_adapter_kind: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub mcp_manifest_hash: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub mcp_projection_fingerprint: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub mcp_provider_contract_fingerprint: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub mcp_isolation_contract_fingerprint: Option<String>,
+    pub mcp_session_generation: Option<i64>,
+    pub mcp_projection_activation_generation: Option<i64>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

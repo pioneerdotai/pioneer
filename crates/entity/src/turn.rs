@@ -33,6 +33,8 @@ pub struct Model {
     pub execution_security_snapshot_version: Option<i64>,
     #[sea_orm(column_type = "Text", nullable)]
     pub execution_security_snapshot_json: Option<String>,
+    #[sea_orm(has_one)]
+    pub turn_mcp_projection: HasOne<super::turn_mcp_projection::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

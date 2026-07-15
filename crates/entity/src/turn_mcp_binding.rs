@@ -21,6 +21,16 @@ pub struct Model {
     pub created_at: DateTimeWithTimeZone,
     pub selection_reason: String,
     pub capability_id: Option<String>,
+    pub canonical_callable_name: String,
+    pub provider_callable_name: String,
+    pub canonical_schema_fingerprint: String,
+    pub provider_schema_fingerprint: String,
+    #[sea_orm(column_type = "Text")]
+    pub annotations_json: String,
+    pub annotations_digest: String,
+    pub effective_timeout_ms: i64,
+    pub runtime_generation: i64,
+    pub projection_activation_generation: i64,
 }
 
 impl ActiveModelBehavior for ActiveModel {}
