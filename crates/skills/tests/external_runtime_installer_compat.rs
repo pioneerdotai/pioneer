@@ -41,6 +41,22 @@ fn materialize_fixture_source(root: &Path, manifest: &Value, scratch: &Path) -> 
 
     let source = scratch.join("source");
     copy_fixture_tree(&root.join("source"), &source);
+    for generated in manifest["fixture_materialization"]["generated_files"]
+        .as_array()
+        .unwrap()
+    {
+        let relative = Path::new(generated["path"].as_str().unwrap());
+        assert!(
+            relative.is_relative()
+                && relative
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_))),
+            "generated fixture file path must be a contained relative path"
+        );
+        let file = source.join(relative);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, generated["contents"].as_str().unwrap()).unwrap();
+    }
     for generated in manifest["fixture_materialization"]["generated_symlinks"]
         .as_array()
         .unwrap()
@@ -111,6 +127,10 @@ fn external_runtime_installer_compat_manifest_is_pinned_and_self_consistent() {
         "node_modules"
     );
     assert_eq!(manifest["hash_selection"]["includes_metadata_json"], true);
+    assert_eq!(
+        manifest["fixture_materialization"]["generated_files"][0]["path"],
+        "__pycache__/cache.pyc"
+    );
     assert_eq!(
         manifest["fixture_materialization"]["generated_symlinks"][0]["path"],
         "symlink-exclusions/.git"
