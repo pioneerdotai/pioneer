@@ -49,6 +49,15 @@ const CLI_RUNTIME_PENDING_UNBOUND_EVENT_TTL_MS: i64 = 30_000;
 const CLI_RUNTIME_HUMAN_RESPONSE_TIMEOUT_MS: i64 = 24 * 60 * 60 * 1_000;
 const CLI_RUNTIME_TERMINAL_NATIVE_EVENT_CLEANUP_BATCH_SIZE: u64 = 16_384;
 
+enum CLIRuntimeAttemptRecoveryState {
+    Normal,
+    Active(pioneer_protocol::RecoveryAttemptContext),
+    Inactive {
+        job_id: String,
+        status: pioneer_protocol::RecoveryJobStatus,
+    },
+}
+
 impl MessageProcessor {
     pub(super) async fn cli_runtime_list(
         &self,
@@ -2771,6 +2780,8 @@ impl MessageProcessor {
             );
             return;
         }
+        let recovery_binding = turn_binding.clone();
+        let recovery_native_turn_id = request.native_turn_id.clone();
         let payload = cli_runtime_pending_request_from_runtime_event(&request, request_kind);
         let payload_json = match pioneer_crud::serialize_cli_runtime_json(&payload) {
             Ok(payload_json) => payload_json,
@@ -2813,6 +2824,267 @@ impl MessageProcessor {
                 error = %format!("{error:#}"),
                 "failed to open CLI runtime pending request"
             );
+            return;
+        }
+        if let Some(native_turn_id) = recovery_native_turn_id.as_deref() {
+            self.confirm_cli_runtime_recovery_for_native_progress(
+                key,
+                &recovery_binding,
+                native_turn_id,
+                "request_opened",
+            )
+            .await;
+        }
+    }
+
+    async fn cli_runtime_attempt_recovery_state(
+        &self,
+        attempt: &pioneer_crud::CliRuntimeTurnAttemptRecord,
+    ) -> anyhow::Result<CLIRuntimeAttemptRecoveryState> {
+        let (job_id, recovery_attempt_id) = match (
+            attempt.recovery_job_id.as_deref(),
+            attempt.recovery_attempt_id.as_deref(),
+        ) {
+            (Some(job_id), Some(recovery_attempt_id)) => (job_id, recovery_attempt_id),
+            (None, None) if attempt.recovery_confirmed_at.is_none() => {
+                return Ok(CLIRuntimeAttemptRecoveryState::Normal);
+            }
+            _ => {
+                anyhow::bail!(
+                    "CLI runtime attempt `{}` has incomplete recovery ownership",
+                    attempt.id
+                );
+            }
+        };
+
+        if attempt.recovery_confirmed_at.is_some() {
+            return Ok(CLIRuntimeAttemptRecoveryState::Normal);
+        }
+
+        let job = self
+            .crud_store
+            .get_recovery_job(job_id)
+            .await?
+            .with_context(|| {
+                format!(
+                    "recovery job `{job_id}` for CLI runtime attempt `{}` is missing",
+                    attempt.id
+                )
+            })?;
+        if job.turn_id != attempt.turn_id {
+            anyhow::bail!(
+                "recovery job `{job_id}` belongs to turn `{}` instead of `{}`",
+                job.turn_id,
+                attempt.turn_id
+            );
+        }
+
+        if job.status == pioneer_protocol::RecoveryJobStatus::Succeeded {
+            if let Err(error) = self
+                .persist_cli_runtime_recovery_confirmation(
+                    attempt,
+                    recovery_attempt_id,
+                    chrono::Utc::now().fixed_offset(),
+                )
+                .await
+            {
+                warn!(
+                    turn_id = attempt.turn_id.as_str(),
+                    cli_runtime_attempt_id = attempt.id.as_str(),
+                    recovery_job_id = job_id,
+                    recovery_attempt_id,
+                    error = %format!("{error:#}"),
+                    "failed to repair CLI runtime recovery confirmation marker"
+                );
+            }
+            return Ok(CLIRuntimeAttemptRecoveryState::Normal);
+        }
+
+        if job.status == pioneer_protocol::RecoveryJobStatus::Active
+            && job.active_attempt_id.as_deref() == Some(recovery_attempt_id)
+        {
+            return Ok(CLIRuntimeAttemptRecoveryState::Active(
+                pioneer_protocol::RecoveryAttemptContext {
+                    job_id: job_id.to_owned(),
+                    attempt_id: recovery_attempt_id.to_owned(),
+                },
+            ));
+        }
+
+        Ok(CLIRuntimeAttemptRecoveryState::Inactive {
+            job_id: job_id.to_owned(),
+            status: job.status,
+        })
+    }
+
+    async fn persist_cli_runtime_recovery_confirmation(
+        &self,
+        attempt: &pioneer_crud::CliRuntimeTurnAttemptRecord,
+        recovery_attempt_id: &str,
+        confirmed_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+    ) -> anyhow::Result<()> {
+        if attempt.recovery_confirmed_at.is_some() {
+            return Ok(());
+        }
+        if self
+            .crud_store
+            .mark_cli_runtime_turn_attempt_recovery_confirmed(
+                attempt.id.as_str(),
+                recovery_attempt_id,
+                confirmed_at,
+            )
+            .await?
+        {
+            return Ok(());
+        }
+
+        let current = self
+            .crud_store
+            .get_cli_runtime_turn_attempt(attempt.id.as_str())
+            .await?
+            .with_context(|| format!("CLI runtime attempt `{}` is missing", attempt.id))?;
+        if current.recovery_attempt_id.as_deref() == Some(recovery_attempt_id)
+            && current.recovery_confirmed_at.is_some()
+        {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "CLI runtime attempt `{}` changed before recovery confirmation was persisted",
+            attempt.id
+        )
+    }
+
+    async fn confirm_cli_runtime_recovery_progress(
+        &self,
+        attempt: &pioneer_crud::CliRuntimeTurnAttemptRecord,
+        recovery: &pioneer_protocol::RecoveryAttemptContext,
+        progress_event: &str,
+    ) {
+        let now_unix = now_timestamp_secs();
+        let events = match self
+            .recovery_coordinator
+            .succeed_active_recovery_attempt(attempt.turn_id.as_str(), recovery, now_unix)
+            .await
+        {
+            Ok(events) => events,
+            Err(error) => {
+                warn!(
+                    turn_id = attempt.turn_id.as_str(),
+                    cli_runtime_attempt_id = attempt.id.as_str(),
+                    recovery_job_id = recovery.job_id.as_str(),
+                    recovery_attempt_id = recovery.attempt_id.as_str(),
+                    progress_event,
+                    error = %format!("{error:#}"),
+                    "failed to confirm CLI runtime recovery progress"
+                );
+                return;
+            }
+        };
+
+        let emitted_success = events.iter().any(|event| {
+            matches!(
+                event,
+                crate::resilience::RecoveryCoordinatorEvent::RecoverySucceeded {
+                    job_id,
+                    ..
+                } if job_id == &recovery.job_id
+            )
+        });
+        let recovery_succeeded = if emitted_success {
+            true
+        } else {
+            match self
+                .crud_store
+                .get_recovery_job(recovery.job_id.as_str())
+                .await
+            {
+                Ok(Some(job)) => {
+                    job.turn_id == attempt.turn_id
+                        && job.status == pioneer_protocol::RecoveryJobStatus::Succeeded
+                }
+                Ok(None) => false,
+                Err(error) => {
+                    warn!(
+                        turn_id = attempt.turn_id.as_str(),
+                        recovery_job_id = recovery.job_id.as_str(),
+                        error = %format!("{error:#}"),
+                        "failed to verify CLI runtime recovery success"
+                    );
+                    false
+                }
+            }
+        };
+
+        if recovery_succeeded
+            && let Err(error) = self
+                .persist_cli_runtime_recovery_confirmation(
+                    attempt,
+                    recovery.attempt_id.as_str(),
+                    chrono::Utc::now().fixed_offset(),
+                )
+                .await
+        {
+            warn!(
+                turn_id = attempt.turn_id.as_str(),
+                cli_runtime_attempt_id = attempt.id.as_str(),
+                recovery_job_id = recovery.job_id.as_str(),
+                recovery_attempt_id = recovery.attempt_id.as_str(),
+                error = %format!("{error:#}"),
+                "recovery job succeeded but CLI runtime confirmation marker was not persisted"
+            );
+        }
+
+        for event in events {
+            self.handle_recovery_event(event, now_unix).await;
+        }
+    }
+
+    async fn confirm_cli_runtime_recovery_for_native_progress(
+        &self,
+        key: &CLIAgentRuntimeSessionKey,
+        turn_binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+        native_turn_id: &str,
+        progress_event: &str,
+    ) {
+        let attempt = match self
+            .crud_store
+            .get_cli_runtime_turn_attempt_by_native_turn(key.runtime_id.as_str(), native_turn_id)
+            .await
+        {
+            Ok(Some(attempt))
+                if attempt.status.is_active()
+                    && attempt.turn_id == turn_binding.turn_id
+                    && attempt.native_thread_id == turn_binding.native_thread_id =>
+            {
+                attempt
+            }
+            Ok(_) => return,
+            Err(error) => {
+                warn!(
+                    turn_id = turn_binding.turn_id.as_str(),
+                    native_turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to load CLI runtime attempt for recovery progress"
+                );
+                return;
+            }
+        };
+
+        match self.cli_runtime_attempt_recovery_state(&attempt).await {
+            Ok(CLIRuntimeAttemptRecoveryState::Active(recovery)) => {
+                self.confirm_cli_runtime_recovery_progress(&attempt, &recovery, progress_event)
+                    .await;
+            }
+            Ok(CLIRuntimeAttemptRecoveryState::Normal)
+            | Ok(CLIRuntimeAttemptRecoveryState::Inactive { .. }) => {}
+            Err(error) => {
+                warn!(
+                    turn_id = turn_binding.turn_id.as_str(),
+                    native_turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to resolve CLI runtime recovery progress owner"
+                );
+            }
         }
     }
 
@@ -2873,28 +3145,6 @@ impl MessageProcessor {
         } else {
             None
         };
-        let recovery = match turn_attempt.as_ref().map(|attempt| {
-            (
-                attempt.recovery_job_id.as_ref(),
-                attempt.recovery_attempt_id.as_ref(),
-            )
-        }) {
-            Some((Some(job_id), Some(attempt_id))) => {
-                Some(pioneer_protocol::RecoveryAttemptContext {
-                    job_id: job_id.clone(),
-                    attempt_id: attempt_id.clone(),
-                })
-            }
-            Some((None, None)) | None => None,
-            Some(_) => {
-                warn!(
-                    turn_id = turn_binding.turn_id.as_str(),
-                    native_turn_id = native_turn_id_label,
-                    "rejected CLI runtime event for attempt with incomplete recovery ownership"
-                );
-                return false;
-            }
-        };
         if !self
             .cli_runtime_turn_binding_accepts_native_activity(
                 key,
@@ -2916,6 +3166,33 @@ impl MessageProcessor {
             );
             return false;
         }
+        let recovery = if let Some(attempt) = turn_attempt.as_ref() {
+            match self.cli_runtime_attempt_recovery_state(attempt).await {
+                Ok(CLIRuntimeAttemptRecoveryState::Normal) => None,
+                Ok(CLIRuntimeAttemptRecoveryState::Active(recovery)) => Some(recovery),
+                Ok(CLIRuntimeAttemptRecoveryState::Inactive { job_id, status }) => {
+                    debug!(
+                        turn_id = turn_binding.turn_id.as_str(),
+                        native_turn_id = native_turn_id_label,
+                        recovery_job_id = job_id,
+                        recovery_status = ?status,
+                        "ignored CLI runtime event from an inactive recovery attempt"
+                    );
+                    return false;
+                }
+                Err(error) => {
+                    warn!(
+                        turn_id = turn_binding.turn_id.as_str(),
+                        native_turn_id = native_turn_id_label,
+                        error = %format!("{error:#}"),
+                        "failed to resolve CLI runtime recovery ownership"
+                    );
+                    return false;
+                }
+            }
+        } else {
+            None
+        };
         if terminal_status.is_some()
             && let Some(native_turn_id) = native_turn_id
         {
@@ -3038,7 +3315,7 @@ impl MessageProcessor {
             workspace_id: key.workspace_id.clone(),
             thread_id: key.thread_id.clone(),
             turn_id: turn_binding.turn_id.clone(),
-            recovery,
+            recovery: recovery.clone(),
         };
         let event_hub = self.ensure_cli_runtime_execution_event_hub(key).await;
         let projected = crate::cli_runtime::projector::project_cli_runtime_event(&context, &event);
@@ -3091,6 +3368,12 @@ impl MessageProcessor {
         }
         self.update_cli_runtime_command_item_registry(key, &turn_binding, &event)
             .await;
+        if cli_runtime_event_confirms_recovery(&event)
+            && let (Some(attempt), Some(recovery)) = (turn_attempt.as_ref(), recovery.as_ref())
+        {
+            self.confirm_cli_runtime_recovery_progress(attempt, recovery, event_label.as_str())
+                .await;
+        }
         if terminal_status.is_some() {
             if let Some(attempt) = turn_attempt.as_ref() {
                 let attempt_status = match &event {
@@ -3695,6 +3978,7 @@ impl MessageProcessor {
                     binding.turn_id
                 );
             }
+            let recovery_state = self.cli_runtime_attempt_recovery_state(attempt).await?;
             if attempt.status.is_active() {
                 let _ = self
                     .crud_store
@@ -3706,29 +3990,20 @@ impl MessageProcessor {
                     )
                     .await?;
             }
-            match (
-                attempt.recovery_job_id.as_ref(),
-                attempt.recovery_attempt_id.as_ref(),
-            ) {
-                (Some(job_id), Some(attempt_id)) => {
+            match recovery_state {
+                CLIRuntimeAttemptRecoveryState::Active(recovery) => {
                     self.handle_cli_runtime_recovery_native_failure(
                         binding.turn_id.clone(),
-                        pioneer_protocol::RecoveryAttemptContext {
-                            job_id: job_id.clone(),
-                            attempt_id: attempt_id.clone(),
-                        },
+                        recovery,
                         message,
                     )
                     .await;
                     return Ok(());
                 }
-                (None, None) => {}
-                _ => {
-                    anyhow::bail!(
-                        "stale CLI runtime attempt `{}` has incomplete recovery ownership",
-                        attempt.id
-                    );
+                CLIRuntimeAttemptRecoveryState::Inactive { .. } => {
+                    return Ok(());
                 }
+                CLIRuntimeAttemptRecoveryState::Normal => {}
             }
         }
         let _ = self
@@ -4171,7 +4446,7 @@ impl MessageProcessor {
                         key.runtime_id.as_str(),
                         "codex",
                         key.thread_id.as_str(),
-                        Some(turn_binding.turn_id),
+                        Some(turn_binding.turn_id.clone()),
                         decoded.clone(),
                     )
                     .await
@@ -4188,6 +4463,14 @@ impl MessageProcessor {
                         key,
                         &decoded,
                         "failed to open Pioneer pending request",
+                    )
+                    .await;
+                } else if let Some(native_turn_id) = decoded.native_turn_id.as_deref() {
+                    self.confirm_cli_runtime_recovery_for_native_progress(
+                        key,
+                        &turn_binding,
+                        native_turn_id,
+                        request.method.as_str(),
                     )
                     .await;
                 }
@@ -4245,7 +4528,7 @@ impl MessageProcessor {
                         key.runtime_id.as_str(),
                         "codex",
                         key.thread_id.as_str(),
-                        Some(turn_binding.turn_id),
+                        Some(turn_binding.turn_id.clone()),
                         decoded.clone(),
                     )
                     .await
@@ -4262,6 +4545,14 @@ impl MessageProcessor {
                         key,
                         &decoded,
                         "failed to open Pioneer pending request",
+                    )
+                    .await;
+                } else if let Some(native_turn_id) = decoded.native_turn_id.as_deref() {
+                    self.confirm_cli_runtime_recovery_for_native_progress(
+                        key,
+                        &turn_binding,
+                        native_turn_id,
+                        request.method.as_str(),
                     )
                     .await;
                 }
@@ -4315,7 +4606,7 @@ impl MessageProcessor {
                         key.runtime_id.as_str(),
                         "codex",
                         key.thread_id.as_str(),
-                        Some(turn_binding.turn_id),
+                        Some(turn_binding.turn_id.clone()),
                         decoded.clone(),
                     )
                     .await
@@ -4332,6 +4623,14 @@ impl MessageProcessor {
                         key,
                         &decoded,
                         "failed to open Pioneer pending request",
+                    )
+                    .await;
+                } else if let Some(native_turn_id) = decoded.native_turn_id.as_deref() {
+                    self.confirm_cli_runtime_recovery_for_native_progress(
+                        key,
+                        &turn_binding,
+                        native_turn_id,
+                        request.method.as_str(),
                     )
                     .await;
                 }
@@ -7500,6 +7799,48 @@ fn cli_runtime_event_requires_native_journal(event: &RuntimeEvent) -> bool {
     }
 }
 
+fn cli_runtime_event_confirms_recovery(event: &RuntimeEvent) -> bool {
+    match event {
+        RuntimeEvent::TurnCompleted(_)
+        | RuntimeEvent::PlanUpdated(_)
+        | RuntimeEvent::DiffUpdated(_)
+        | RuntimeEvent::RequestOpened(_)
+        | RuntimeEvent::ReviewModeChanged(_) => true,
+        RuntimeEvent::ItemStarted(item) => {
+            !cli_runtime_item_is_native_user_message(item.item_kind.as_str())
+        }
+        RuntimeEvent::ItemDelta(item) => {
+            !cli_runtime_item_is_native_user_message(item.item_kind.as_str())
+        }
+        RuntimeEvent::ItemCompleted(item) => {
+            !cli_runtime_item_is_native_user_message(item.item_kind.as_str())
+        }
+        RuntimeEvent::ItemUpdated(item) => {
+            !cli_runtime_item_is_native_user_message(item.item_kind.as_str())
+        }
+        RuntimeEvent::SessionStateChanged(_)
+        | RuntimeEvent::ThreadStateChanged(_)
+        | RuntimeEvent::TurnStarted(_)
+        | RuntimeEvent::TurnFailed(_)
+        | RuntimeEvent::TurnInterrupted(_)
+        | RuntimeEvent::TurnRetrying(_)
+        | RuntimeEvent::RequestResolved(_)
+        | RuntimeEvent::AccountUpdated(_)
+        | RuntimeEvent::AppListUpdated(_)
+        | RuntimeEvent::Error(_)
+        | RuntimeEvent::Raw(_) => false,
+    }
+}
+
+fn cli_runtime_item_is_native_user_message(item_kind: &str) -> bool {
+    let normalized = item_kind
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .map(|character| character.to_ascii_lowercase())
+        .collect::<String>();
+    matches!(normalized.as_str(), "usermessage" | "user")
+}
+
 fn cli_runtime_turn_binding_status_is_active(status: &str) -> bool {
     matches!(
         status,
@@ -7571,6 +7912,10 @@ fn current_unix_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pioneer_cli_agent_runtime::event::{
+        RuntimeErrorEvent, RuntimeItemStarted, RuntimeRequestOpened, RuntimeTurnRetrying,
+        RuntimeTurnStarted,
+    };
     use pioneer_protocol::RUNTIME_DIAGNOSTIC_MAX_LINES;
     use serde_json::json;
 
@@ -7595,6 +7940,78 @@ mod tests {
             stderr_ring_lines: 200,
             debug_native_events: false,
         }
+    }
+
+    #[test]
+    fn recovery_confirmation_requires_authoritative_native_progress() {
+        let native_thread_id = Some("native_thread".to_owned());
+        let native_turn_id = "native_turn".to_owned();
+
+        assert!(!cli_runtime_event_confirms_recovery(
+            &RuntimeEvent::TurnStarted(RuntimeTurnStarted {
+                native_thread_id: native_thread_id.clone(),
+                native_turn_id: native_turn_id.clone(),
+                native: None,
+            })
+        ));
+        assert!(!cli_runtime_event_confirms_recovery(
+            &RuntimeEvent::TurnRetrying(RuntimeTurnRetrying {
+                native_thread_id: native_thread_id.clone(),
+                native_turn_id: Some(native_turn_id.clone()),
+                message: "provider retry".to_owned(),
+                code: None,
+                native: None,
+            })
+        ));
+        assert!(!cli_runtime_event_confirms_recovery(&RuntimeEvent::Error(
+            RuntimeErrorEvent {
+                native_thread_id: native_thread_id.clone(),
+                native_turn_id: Some(native_turn_id.clone()),
+                message: "provider retry".to_owned(),
+                code: None,
+                retryable: true,
+                native: None,
+            }
+        )));
+        assert!(!cli_runtime_event_confirms_recovery(
+            &RuntimeEvent::ItemStarted(RuntimeItemStarted {
+                native_thread_id: native_thread_id.clone(),
+                native_turn_id: native_turn_id.clone(),
+                native_item_id: "user_echo".to_owned(),
+                item_kind: "userMessage".to_owned(),
+                title: None,
+                phase: Default::default(),
+                metadata: None,
+                native_item_redacted: None,
+                native: None,
+            })
+        ));
+
+        assert!(cli_runtime_event_confirms_recovery(
+            &RuntimeEvent::ItemStarted(RuntimeItemStarted {
+                native_thread_id: native_thread_id.clone(),
+                native_turn_id: native_turn_id.clone(),
+                native_item_id: "reasoning".to_owned(),
+                item_kind: "reasoning".to_owned(),
+                title: None,
+                phase: Default::default(),
+                metadata: None,
+                native_item_redacted: None,
+                native: None,
+            })
+        ));
+        assert!(cli_runtime_event_confirms_recovery(
+            &RuntimeEvent::RequestOpened(RuntimeRequestOpened {
+                native_request_id: "request".to_owned(),
+                native_request_id_json: None,
+                request_kind: "command_approval".to_owned(),
+                native_thread_id,
+                native_turn_id: Some(native_turn_id),
+                native_item_id: Some("command".to_owned()),
+                payload_redacted: None,
+                native: None,
+            })
+        ));
     }
 
     fn cli_runtime_summaries_from_instances(

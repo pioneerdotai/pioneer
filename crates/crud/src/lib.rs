@@ -1079,6 +1079,24 @@ impl CrudStore {
         .await
     }
 
+    pub async fn mark_cli_runtime_turn_attempt_recovery_confirmed(
+        &self,
+        id: &str,
+        recovery_attempt_id: &str,
+        confirmed_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+    ) -> Result<bool> {
+        self.run_serialized_write(|| async {
+            cli_runtime_binding::mark_turn_attempt_recovery_confirmed(
+                &self.connection,
+                id,
+                recovery_attempt_id,
+                confirmed_at,
+            )
+            .await
+        })
+        .await
+    }
+
     pub async fn prepare_cli_runtime_initial_turn_attempt(
         &self,
         binding: NewCliRuntimeTurnBinding,

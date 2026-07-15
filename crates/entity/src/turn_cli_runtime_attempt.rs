@@ -35,6 +35,7 @@ pub struct Model {
     pub completed_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    pub recovery_confirmed_at: Option<DateTimeWithTimeZone>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

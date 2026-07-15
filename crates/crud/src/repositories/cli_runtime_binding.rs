@@ -165,6 +165,7 @@ pub struct CliRuntimeTurnAttemptRecord {
     pub native_turn_id: Option<String>,
     pub recovery_job_id: Option<String>,
     pub recovery_attempt_id: Option<String>,
+    pub recovery_confirmed_at: Option<DateTimeWithTimeZone>,
     pub execution_window_index: Option<u32>,
     pub status: CliRuntimeTurnAttemptStatus,
     pub failure_reason: Option<String>,
@@ -657,6 +658,32 @@ pub async fn mark_turn_attempt_terminal<C: ConnectionTrait>(
     Ok(result.rows_affected == 1)
 }
 
+pub async fn mark_turn_attempt_recovery_confirmed<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+    recovery_attempt_id: &str,
+    confirmed_at: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let result = turn_cli_runtime_attempt::Entity::update_many()
+        .col_expr(
+            turn_cli_runtime_attempt::Column::RecoveryConfirmedAt,
+            sea_orm::sea_query::Expr::value(Some(confirmed_at)),
+        )
+        .col_expr(
+            turn_cli_runtime_attempt::Column::UpdatedAt,
+            sea_orm::sea_query::Expr::value(confirmed_at),
+        )
+        .filter(turn_cli_runtime_attempt::Column::Id.eq(id.to_owned()))
+        .filter(
+            turn_cli_runtime_attempt::Column::RecoveryAttemptId.eq(recovery_attempt_id.to_owned()),
+        )
+        .filter(turn_cli_runtime_attempt::Column::RecoveryConfirmedAt.is_null())
+        .exec(db)
+        .await
+        .context("failed to mark CLI runtime recovery confirmed")?;
+    Ok(result.rows_affected == 1)
+}
+
 pub async fn create_pending_request<C: ConnectionTrait>(
     db: &C,
     request: NewCliRuntimePendingRequest,
@@ -973,6 +1000,7 @@ fn active_turn_attempt_from_new(
         native_turn_id: Set(attempt.native_turn_id),
         recovery_job_id: Set(attempt.recovery_job_id),
         recovery_attempt_id: Set(attempt.recovery_attempt_id),
+        recovery_confirmed_at: Set(None),
         execution_window_index: Set(attempt.execution_window_index.map(i64::from)),
         status: Set(attempt.status.as_str().to_owned()),
         failure_reason: Set(attempt.failure_reason),
@@ -1111,6 +1139,7 @@ fn turn_attempt_record_from_model(
         native_turn_id: model.native_turn_id,
         recovery_job_id: model.recovery_job_id,
         recovery_attempt_id: model.recovery_attempt_id,
+        recovery_confirmed_at: model.recovery_confirmed_at,
         execution_window_index: model
             .execution_window_index
             .map(u32::try_from)

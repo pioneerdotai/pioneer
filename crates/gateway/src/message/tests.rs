@@ -33,8 +33,9 @@ use pioneer_cli_agent_runtime::codex::{
 use pioneer_cli_agent_runtime::driver::JsonlRpcId;
 use pioneer_cli_agent_runtime::event::{
     RuntimeAgentMessagePhase, RuntimeEvent, RuntimeEventMappingOptions, RuntimeItemCompleted,
-    RuntimeRequestOpened, RuntimeRequestResolved, RuntimeThreadStateChanged, RuntimeTurnCompleted,
-    RuntimeTurnInterrupted, RuntimeTurnRetrying, map_codex_server_request_event,
+    RuntimeItemStarted, RuntimeRequestOpened, RuntimeRequestResolved, RuntimeThreadStateChanged,
+    RuntimeTurnCompleted, RuntimeTurnFailed, RuntimeTurnInterrupted, RuntimeTurnRetrying,
+    map_codex_server_request_event,
 };
 use pioneer_config::{GatewayHookRecoveryConfig, GatewayMemoryConfig, GatewayWebToolsConfig};
 use pioneer_crud::{
@@ -17125,16 +17126,31 @@ async fn cli_runtime_terminal_attempt_fences_late_native_events() {
 
 #[tokio::test]
 async fn interrupted_cli_runtime_turn_recovers_in_same_native_thread_and_new_window() {
-    message_future(run_interrupted_cli_runtime_turn_recovery_scenario(false)).await;
+    message_future(run_interrupted_cli_runtime_turn_recovery_scenario(
+        false, false,
+    ))
+    .await;
 }
 
 #[tokio::test]
 async fn reconciled_cli_runtime_interruption_uses_same_recovery_lifecycle() {
-    message_future(run_interrupted_cli_runtime_turn_recovery_scenario(true)).await;
+    message_future(run_interrupted_cli_runtime_turn_recovery_scenario(
+        true, false,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn confirmed_cli_runtime_recovery_failure_starts_new_recovery_job() {
+    message_future(run_interrupted_cli_runtime_turn_recovery_scenario(
+        false, true,
+    ))
+    .await;
 }
 
 async fn run_interrupted_cli_runtime_turn_recovery_scenario(
     reconcile_from_runtime_observation: bool,
+    fail_after_confirmation: bool,
 ) {
     let (tx, _rx) = mpsc::channel(64);
     let session_manager = Arc::new(SessionManager::new());
@@ -17391,6 +17407,13 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
         Some("native_turn_default")
     );
     assert!(recovery_attempt.recovery_attempt_id.is_some());
+    assert!(recovery_attempt.recovery_confirmed_at.is_none());
+    let active_job = crud_store
+        .get_recovery_job(pending_jobs[0].id.as_str())
+        .await
+        .expect("active CLI recovery job should load")
+        .expect("active CLI recovery job should exist");
+    assert_eq!(active_job.status, RecoveryJobStatus::Active);
     let binding = crud_store
         .get_cli_runtime_turn_binding(turn_id)
         .await
@@ -17408,6 +17431,140 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
         .expect("recovery execution window should exist");
     assert_eq!(latest_window.window_index, 2);
     assert_eq!(latest_window.status, ExecutionWindowStatus::Running);
+
+    processor
+        .handle_cli_runtime_timeline_event(
+            &key,
+            RuntimeEvent::ItemStarted(RuntimeItemStarted {
+                native_thread_id: Some(native_thread_id.to_owned()),
+                native_turn_id: "native_turn_default".to_owned(),
+                native_item_id: "recovery_user_echo".to_owned(),
+                item_kind: "userMessage".to_owned(),
+                title: None,
+                phase: RuntimeAgentMessagePhase::FinalAnswer,
+                metadata: None,
+                native_item_redacted: None,
+                native: None,
+            }),
+        )
+        .await;
+    let still_active_job = crud_store
+        .get_recovery_job(pending_jobs[0].id.as_str())
+        .await
+        .expect("CLI recovery job should load after user echo")
+        .expect("CLI recovery job should exist after user echo");
+    assert_eq!(still_active_job.status, RecoveryJobStatus::Active);
+
+    if reconcile_from_runtime_observation {
+        let recovery = pioneer_protocol::RecoveryAttemptContext {
+            job_id: recovery_attempt
+                .recovery_job_id
+                .clone()
+                .expect("recovery job id should exist"),
+            attempt_id: recovery_attempt
+                .recovery_attempt_id
+                .clone()
+                .expect("recovery attempt id should exist"),
+        };
+        let crash_gap_events = processor
+            .recovery_coordinator
+            .succeed_active_recovery_attempt(turn_id, &recovery, chrono::Utc::now().timestamp())
+            .await
+            .expect("recovery job should succeed before simulated crash");
+        assert_eq!(crash_gap_events.len(), 1);
+        let marker_before_repair = crud_store
+            .latest_cli_runtime_turn_attempt(turn_id)
+            .await
+            .expect("recovery attempt should load before marker repair")
+            .expect("recovery attempt should exist before marker repair");
+        assert!(marker_before_repair.recovery_confirmed_at.is_none());
+    }
+
+    processor
+        .handle_cli_runtime_timeline_event(
+            &key,
+            RuntimeEvent::ItemStarted(RuntimeItemStarted {
+                native_thread_id: Some(native_thread_id.to_owned()),
+                native_turn_id: "native_turn_default".to_owned(),
+                native_item_id: "recovery_reasoning".to_owned(),
+                item_kind: "reasoning".to_owned(),
+                title: None,
+                phase: RuntimeAgentMessagePhase::FinalAnswer,
+                metadata: None,
+                native_item_redacted: None,
+                native: None,
+            }),
+        )
+        .await;
+
+    let confirmed_attempt = crud_store
+        .latest_cli_runtime_turn_attempt(turn_id)
+        .await
+        .expect("confirmed recovery attempt should load")
+        .expect("confirmed recovery attempt should exist");
+    assert!(confirmed_attempt.recovery_confirmed_at.is_some());
+    let succeeded_before_completion = crud_store
+        .get_recovery_job(pending_jobs[0].id.as_str())
+        .await
+        .expect("confirmed CLI recovery job should load")
+        .expect("confirmed CLI recovery job should exist");
+    assert_eq!(
+        succeeded_before_completion.status,
+        RecoveryJobStatus::Succeeded
+    );
+    let watchdog_events = processor
+        .recovery_coordinator
+        .run_ready_jobs(pending_jobs[0].scheduled_at_unix.saturating_add(181), 16)
+        .await
+        .expect("recovery watchdog should run after the original wall-clock budget");
+    assert!(watchdog_events.is_empty());
+    let (_, running_turn) = crud_store
+        .get_turn(thread_id, turn_id)
+        .await
+        .expect("recovered turn should load after the recovery budget")
+        .expect("recovered turn should exist after the recovery budget");
+    assert_eq!(running_turn.status, TurnStatus::InProgress);
+    let running_window = crud_store
+        .latest_turn_execution_window(turn_id)
+        .await
+        .expect("running recovery execution window should load")
+        .expect("running recovery execution window should exist");
+    assert_eq!(running_window.status, ExecutionWindowStatus::Running);
+
+    if fail_after_confirmation {
+        processor
+            .handle_cli_runtime_timeline_event(
+                &key,
+                RuntimeEvent::TurnFailed(RuntimeTurnFailed {
+                    native_thread_id: Some(native_thread_id.to_owned()),
+                    native_turn_id: Some("native_turn_default".to_owned()),
+                    message: "recovered native turn failed later".to_owned(),
+                    code: Some("runtime_failure".to_owned()),
+                    native: None,
+                }),
+            )
+            .await;
+
+        let (_, retrying_turn) = crud_store
+            .get_turn(thread_id, turn_id)
+            .await
+            .expect("later failed turn should load")
+            .expect("later failed turn should exist");
+        assert_eq!(retrying_turn.status, TurnStatus::InProgress);
+        let next_jobs = crud_store
+            .find_recovery_jobs_by_turn_and_status(turn_id, RecoveryJobStatus::Pending)
+            .await
+            .expect("next recovery job should load");
+        assert_eq!(next_jobs.len(), 1);
+        assert_ne!(next_jobs[0].id, pending_jobs[0].id);
+        let prior_job = crud_store
+            .get_recovery_job(pending_jobs[0].id.as_str())
+            .await
+            .expect("prior recovery job should load")
+            .expect("prior recovery job should exist");
+        assert_eq!(prior_job.status, RecoveryJobStatus::Succeeded);
+        return;
+    }
 
     processor
         .handle_cli_runtime_timeline_event(
