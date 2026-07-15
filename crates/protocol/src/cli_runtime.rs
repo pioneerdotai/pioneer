@@ -66,6 +66,8 @@ pub enum RuntimeStatus {
 pub struct RuntimeCapabilities {
     #[serde(default)]
     pub supports_skills: bool,
+    #[serde(default)]
+    pub supports_mcp_tools: bool,
     pub supports_threads: bool,
     pub supports_resume: bool,
     pub supports_fork: bool,
@@ -85,6 +87,40 @@ pub struct RuntimeCapabilities {
     pub supports_thread_archive: bool,
     pub supports_auth_management: bool,
     pub supports_generated_schema_probe: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CliMcpInjectionKind {
+    CodexManagedStdioMcp,
+    ClaudeStrictStdioMcp,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CliMcpProjectionUpdateKind {
+    CodexRestartAppServerResumeThread,
+    ClaudeRestartProcessResumeSession,
+}
+
+/// Provider-specific MCP readiness evidence retained inside the Gateway.
+/// RuntimeSummary exposes only `supports_mcp_tools` plus the safe diagnostics;
+/// executable and adapter-contract fingerprints are not treated as UI
+/// capability toggles.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct CliMcpAdapterReadiness {
+    pub supported: bool,
+    pub injection: CliMcpInjectionKind,
+    pub projection_update: CliMcpProjectionUpdateKind,
+    pub strict_isolation: bool,
+    pub contract_fingerprint: String,
+    pub local_executable_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_version: Option<String>,
+    pub max_tools: usize,
+    pub max_schema_bytes: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -815,6 +851,64 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn cli_runtime_mcp_adapter_readiness_round_trips_as_typed_internal_evidence() {
+        let readiness = CliMcpAdapterReadiness {
+            supported: true,
+            injection: CliMcpInjectionKind::CodexManagedStdioMcp,
+            projection_update: CliMcpProjectionUpdateKind::CodexRestartAppServerResumeThread,
+            strict_isolation: true,
+            contract_fingerprint: "a".repeat(64),
+            local_executable_fingerprint: "b".repeat(64),
+            provider_version: Some("0.144.1".to_owned()),
+            max_tools: 128,
+            max_schema_bytes: 1_048_576,
+            diagnostics: vec![RuntimeDiagnostic {
+                level: RuntimeDiagnosticLevel::Info,
+                code: "cli_runtime.mcp.ready".to_owned(),
+                message: "MCP tools are ready".to_owned(),
+            }],
+        };
+        let encoded = serde_json::to_value(&readiness).expect("readiness serializes");
+        assert_eq!(encoded["injection"], "codex_managed_stdio_mcp");
+        assert_eq!(
+            encoded["projection_update"],
+            "codex_restart_app_server_resume_thread"
+        );
+        let decoded: CliMcpAdapterReadiness =
+            serde_json::from_value(encoded).expect("readiness deserializes");
+        assert_eq!(decoded, readiness);
+    }
+
+    #[test]
+    fn cli_runtime_claude_mcp_readiness_round_trips_provider_contract() {
+        let readiness = CliMcpAdapterReadiness {
+            supported: false,
+            injection: CliMcpInjectionKind::ClaudeStrictStdioMcp,
+            projection_update: CliMcpProjectionUpdateKind::ClaudeRestartProcessResumeSession,
+            strict_isolation: true,
+            contract_fingerprint: "d".repeat(64),
+            local_executable_fingerprint: "e".repeat(64),
+            provider_version: Some("2.1.197".to_owned()),
+            max_tools: 128,
+            max_schema_bytes: 1_048_576,
+            diagnostics: vec![RuntimeDiagnostic {
+                level: RuntimeDiagnosticLevel::Warning,
+                code: "cli_runtime.mcp.provider_probe_failed".to_owned(),
+                message: "This Claude adapter contract failed its local probe".to_owned(),
+            }],
+        };
+        let encoded = serde_json::to_value(&readiness).expect("Claude readiness serializes");
+        assert_eq!(encoded["injection"], "claude_strict_stdio_mcp");
+        assert_eq!(
+            encoded["projection_update"],
+            "claude_restart_process_resume_session"
+        );
+        let decoded: CliMcpAdapterReadiness =
+            serde_json::from_value(encoded).expect("Claude readiness deserializes");
+        assert_eq!(decoded, readiness);
+    }
+
+    #[test]
     fn runtime_status_snapshot_serializes_codex_ready_catalog() {
         let summary = RuntimeSummary {
             runtime_id: "codex_personal".to_owned(),
@@ -824,6 +918,7 @@ mod tests {
             status: RuntimeStatus::Ready,
             capabilities: RuntimeCapabilities {
                 supports_skills: true,
+                supports_mcp_tools: false,
                 supports_threads: true,
                 supports_resume: true,
                 supports_fork: true,
@@ -873,6 +968,7 @@ mod tests {
         assert_eq!(encoded["kind"], "codex");
         assert_eq!(encoded["status"], json!({ "state": "ready" }));
         assert_eq!(encoded["capabilities"]["supports_skills"], true);
+        assert_eq!(encoded["capabilities"]["supports_mcp_tools"], false);
         assert_eq!(encoded["account"]["email"], "user@example.com");
         assert_eq!(encoded["debug_native_events_enabled"], true);
         assert_eq!(encoded["recent_stderr"][0], "app-server ready");
@@ -883,8 +979,9 @@ mod tests {
     }
 
     #[test]
-    fn runtime_capabilities_default_and_legacy_payload_do_not_enable_skills() {
+    fn runtime_capabilities_default_and_legacy_payload_do_not_enable_skills_or_mcp() {
         assert!(!RuntimeCapabilities::default().supports_skills);
+        assert!(!RuntimeCapabilities::default().supports_mcp_tools);
 
         let legacy = json!({
             "supports_threads": true,
@@ -911,6 +1008,7 @@ mod tests {
         let decoded: RuntimeCapabilities =
             serde_json::from_value(legacy).expect("legacy capabilities should deserialize");
         assert!(!decoded.supports_skills);
+        assert!(!decoded.supports_mcp_tools);
     }
 
     #[test]

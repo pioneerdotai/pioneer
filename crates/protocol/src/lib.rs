@@ -68,6 +68,7 @@ pub use cli_runtime::{
     CLIRuntimeThreadBindingGetParams, CLIRuntimeThreadBindingGetResponse,
     CLIRuntimeThreadCompactParams, CLIRuntimeThreadCompactResponse, CLIRuntimeThreadForkParams,
     CLIRuntimeThreadForkResponse, CLIRuntimeTurnSteerParams, CLIRuntimeTurnSteerResponse,
+    CliMcpAdapterReadiness, CliMcpInjectionKind, CliMcpProjectionUpdateKind,
     RUNTIME_DIAGNOSTIC_LINE_MAX_CHARS, RUNTIME_DIAGNOSTIC_MAX_LINES, RuntimeAccountSnapshot,
     RuntimeAppInfo, RuntimeCapabilities, RuntimeDiagnostic, RuntimeDiagnosticLevel,
     RuntimeModelInfo, RuntimeStatus, RuntimeSummary, sanitize_runtime_diagnostic_line,
