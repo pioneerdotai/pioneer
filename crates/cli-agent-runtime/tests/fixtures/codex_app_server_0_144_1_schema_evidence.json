@@ -1,0 +1,8 @@
+{
+  "codexVersion": "0.144.1",
+  "generator": "codex app-server generate-json-schema --out <directory>",
+  "stableBundleSha256": "b8dc0c41d7f786ee6a17c084df30a921dba27ada7e5f403bd3a4cc642e415bd0",
+  "v2BundleSha256": "c9c2a0378b5eb598691fa76b04933865984ea1d3ea12f0441a675bae6b96dc67",
+  "dynamicToolSpecInputSchema": true,
+  "mcpToolInputSchema": true
+}

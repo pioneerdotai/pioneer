@@ -1,0 +1,8 @@
+personality = "pragmatic"
+
+[features]
+apps = false
+enable_mcp_apps = false
+plugins = false
+remote_plugin = false
+skill_mcp_dependency_install = false

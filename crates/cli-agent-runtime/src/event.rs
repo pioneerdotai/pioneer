@@ -500,6 +500,12 @@ pub fn map_codex_notification_event(
             "fileChange",
             RuntimeItemDeltaKind::FileChange,
         ),
+        "item/mcpToolCall/progress" => map_codex_item_delta(
+            notification,
+            options,
+            "mcpToolCall",
+            RuntimeItemDeltaKind::ToolProgress,
+        ),
         "serverRequest/resolved" => map_codex_request_resolved(notification, options),
         "account/updated" | "account/login/completed" => {
             RuntimeEvent::AccountUpdated(RuntimeAccountUpdated {
@@ -527,6 +533,7 @@ pub fn map_codex_server_request_event(
     let request_kind = match request.method.as_str() {
         "item/commandExecution/requestApproval" => "command_approval",
         "item/fileChange/requestApproval" => "file_change_approval",
+        "item/permissions/requestApproval" => "permission_approval",
         "item/tool/requestUserInput" | "tool/requestUserInput" | "userInput/request" => {
             "user_input"
         }
@@ -734,6 +741,7 @@ fn map_codex_item_delta(
         delta: string_path(params, &["delta"])
             .or_else(|| string_path(params, &["output"]))
             .or_else(|| string_path(params, &["text"]))
+            .or_else(|| string_path(params, &["message"]))
             .unwrap_or_default(),
         metadata: codex_delta_projection_metadata(params),
         native: native_notification(notification, options),
@@ -1799,5 +1807,125 @@ mod tests {
         assert_eq!(request.native_request_id_json, Some(json!(7)));
         assert_eq!(request.request_kind, "command_approval");
         assert_eq!(request.native_item_id.as_deref(), Some("native_item_1"));
+    }
+
+    #[test]
+    fn codex_mcp_event_maps_native_lifecycle_progress_and_permission_callback() {
+        let started = map_codex_notification_event(
+            &CodexJsonlRpcNotificationEvent {
+                method: "item/started".to_owned(),
+                params: Some(json!({
+                    "threadId": "native_thread_1",
+                    "turnId": "native_turn_1",
+                    "item": {
+                        "id": "native_mcp_1",
+                        "type": "mcpToolCall",
+                        "server": "pioneer",
+                        "tool": "mcp__server__tool",
+                        "arguments": {"value": 7},
+                        "status": "inProgress"
+                    }
+                })),
+                raw: json!({"method": "item/started"}),
+            },
+            RuntimeEventMappingOptions::default(),
+        );
+        let progress = map_codex_notification_event(
+            &CodexJsonlRpcNotificationEvent {
+                method: "item/mcpToolCall/progress".to_owned(),
+                params: Some(json!({
+                    "threadId": "native_thread_1",
+                    "turnId": "native_turn_1",
+                    "itemId": "native_mcp_1",
+                    "message": "working"
+                })),
+                raw: json!({"method": "item/mcpToolCall/progress"}),
+            },
+            RuntimeEventMappingOptions::default(),
+        );
+        let completed = map_codex_notification_event(
+            &CodexJsonlRpcNotificationEvent {
+                method: "item/completed".to_owned(),
+                params: Some(json!({
+                    "threadId": "native_thread_1",
+                    "turnId": "native_turn_1",
+                    "item": {
+                        "id": "native_mcp_1",
+                        "type": "mcpToolCall",
+                        "server": "pioneer",
+                        "tool": "mcp__server__tool",
+                        "arguments": {"value": 7},
+                        "status": "failed",
+                        "error": {"message": "upstream failed"}
+                    }
+                })),
+                raw: json!({"method": "item/completed"}),
+            },
+            RuntimeEventMappingOptions::default(),
+        );
+        let permission = map_codex_server_request_event(
+            &CodexJsonlRpcServerRequest {
+                id: JsonlRpcId::Number(11),
+                method: "item/permissions/requestApproval".to_owned(),
+                params: Some(json!({
+                    "threadId": "native_thread_1",
+                    "turnId": "native_turn_1",
+                    "itemId": "native_mcp_1",
+                    "permissions": {"network": ["example.com"]},
+                    "cwd": "/workspace",
+                    "startedAtMs": 1
+                })),
+                raw: json!({"id": 11, "method": "item/permissions/requestApproval"}),
+            },
+            RuntimeEventMappingOptions::default(),
+        );
+
+        let RuntimeEvent::ItemStarted(started) = started else {
+            panic!("expected MCP item start");
+        };
+        assert_eq!(started.item_kind, "mcpToolCall");
+        assert_eq!(started.native_item_id, "native_mcp_1");
+        assert_eq!(
+            started
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("server")),
+            Some(&json!("pioneer"))
+        );
+        assert_eq!(
+            started
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("arguments")),
+            Some(&json!({"value": 7}))
+        );
+
+        let RuntimeEvent::ItemDelta(progress) = progress else {
+            panic!("expected MCP progress delta");
+        };
+        assert_eq!(progress.item_kind, "mcpToolCall");
+        assert_eq!(progress.delta_kind, RuntimeItemDeltaKind::ToolProgress);
+        assert_eq!(progress.native_item_id, "native_mcp_1");
+        assert_eq!(progress.delta, "working");
+
+        let RuntimeEvent::ItemCompleted(completed) = completed else {
+            panic!("expected MCP item completion");
+        };
+        assert_eq!(completed.item_kind, "mcpToolCall");
+        assert_eq!(completed.native_item_id, "native_mcp_1");
+        assert_eq!(
+            completed
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("status")),
+            Some(&json!("failed"))
+        );
+
+        let RuntimeEvent::RequestOpened(permission) = permission else {
+            panic!("expected MCP permission request");
+        };
+        assert_eq!(permission.request_kind, "permission_approval");
+        assert_eq!(permission.native_item_id.as_deref(), Some("native_mcp_1"));
+        assert_eq!(permission.native_request_id_json, Some(json!(11)));
     }
 }

@@ -12,12 +12,15 @@ pub mod approval;
 pub mod capabilities;
 pub mod claude;
 pub mod codex;
+pub mod codex_attestation;
 pub mod config;
 pub mod driver;
 pub mod event;
 pub mod input;
+pub mod mcp;
 pub mod process;
 pub mod registry;
+pub mod reserved_args;
 pub mod session;
 
 pub const CLI_AGENT_RUNTIME_BOUNDARY: &str = "cli-agent-runtime";

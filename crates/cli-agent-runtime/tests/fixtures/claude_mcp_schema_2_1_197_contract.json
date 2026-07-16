@@ -1,0 +1,23 @@
+{
+  "claudeVersion": "2.1.197",
+  "transformerId": "claude-code.mcp-schema",
+  "contractVersion": 2,
+  "qualifiedToolPrefix": "mcp__pioneer__",
+  "strictMcpConfig": true,
+  "exactAllowedTools": true,
+  "conservativeSchemaSubset": [
+    "$defs",
+    "$ref",
+    "$schema",
+    "additionalProperties",
+    "anyOf",
+    "const",
+    "enum",
+    "items",
+    "nullable",
+    "properties",
+    "propertyNames",
+    "required",
+    "type"
+  ]
+}

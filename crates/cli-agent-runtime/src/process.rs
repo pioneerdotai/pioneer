@@ -7,6 +7,7 @@ use process_wrap::tokio::JobObject;
 use process_wrap::tokio::ProcessGroup;
 use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop};
 use std::collections::{BTreeMap, VecDeque};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
@@ -15,8 +16,119 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 const DEFAULT_STDERR_RING_LINES: usize = 200;
+const REDACTED_SECRET: &str = "[REDACTED]";
+
+#[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn expose_secret(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl fmt::Debug for SecretString {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(REDACTED_SECRET)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum EnvironmentValue {
+    Plain(String),
+    Secret(SecretString),
+}
+
+impl EnvironmentValue {
+    fn expose(&self) -> &str {
+        match self {
+            Self::Plain(value) => value.as_str(),
+            Self::Secret(value) => value.expose_secret(),
+        }
+    }
+}
+
+impl fmt::Debug for EnvironmentValue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Plain(value) => value.fmt(formatter),
+            Self::Secret(value) => value.fmt(formatter),
+        }
+    }
+}
+
+/// Environment values carried across the CLI process boundary.
+///
+/// The type intentionally does not implement serde. Secret insertion is a
+/// separate operation, and both this type and its containing process configs
+/// redact those values from `Debug` output.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct SensitiveEnvironment(BTreeMap<String, EnvironmentValue>);
+
+impl SensitiveEnvironment {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn insert_plain(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.0
+            .insert(key.into(), EnvironmentValue::Plain(value.into()));
+    }
+
+    pub fn insert_secret(&mut self, key: impl Into<String>, value: SecretString) {
+        self.0.insert(key.into(), EnvironmentValue::Secret(value));
+    }
+
+    pub fn expose(&self, key: &str) -> Option<&str> {
+        self.0.get(key).map(EnvironmentValue::expose)
+    }
+
+    pub fn expose_iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.0
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.expose()))
+    }
+
+    pub fn extend_from(&mut self, other: &Self) {
+        self.0.extend(other.0.clone());
+    }
+
+    pub fn redact_text(&self, value: impl Into<String>) -> String {
+        redact_exact_values(value.into(), self.secret_values().as_slice())
+    }
+
+    fn remove(&mut self, key: &str) {
+        self.0.remove(key);
+    }
+
+    fn secret_values(&self) -> Vec<SecretString> {
+        self.0
+            .values()
+            .filter_map(|value| match value {
+                EnvironmentValue::Plain(_) => None,
+                EnvironmentValue::Secret(value) if value.expose_secret().is_empty() => None,
+                EnvironmentValue::Secret(value) => Some(value.clone()),
+            })
+            .collect()
+    }
+}
+
+impl fmt::Debug for SensitiveEnvironment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_map().entries(self.0.iter()).finish()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CLIAgentProcessSpawnConfig {
@@ -25,10 +137,11 @@ pub struct CLIAgentProcessSpawnConfig {
     pub cwd: Option<PathBuf>,
     pub home_path: Option<String>,
     pub home_dir: Option<PathBuf>,
-    pub env: BTreeMap<String, String>,
+    pub env: SensitiveEnvironment,
     pub env_remove: Vec<String>,
     pub stderr_ring_lines: usize,
     pub process_group: bool,
+    pub process_generation: Option<u64>,
 }
 
 impl CLIAgentProcessSpawnConfig {
@@ -39,10 +152,11 @@ impl CLIAgentProcessSpawnConfig {
             cwd: None,
             home_path: Some(home_path.into()),
             home_dir: None,
-            env: BTreeMap::new(),
+            env: SensitiveEnvironment::new(),
             env_remove: Vec::new(),
             stderr_ring_lines: DEFAULT_STDERR_RING_LINES,
             process_group: true,
+            process_generation: None,
         }
     }
 
@@ -57,7 +171,17 @@ impl CLIAgentProcessSpawnConfig {
     }
 
     pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.env.insert(key.into(), value.into());
+        self.env.insert_plain(key, value);
+        self
+    }
+
+    pub fn with_sensitive_env(mut self, key: impl Into<String>, value: SecretString) -> Self {
+        self.env.insert_secret(key, value);
+        self
+    }
+
+    pub fn with_environment(mut self, env: &SensitiveEnvironment) -> Self {
+        self.env.extend_from(env);
         self
     }
 
@@ -76,31 +200,42 @@ impl CLIAgentProcessSpawnConfig {
         self
     }
 
+    pub fn with_process_generation(mut self, generation: u64) -> Result<Self> {
+        if generation == 0 {
+            bail!("CLI process generation must be greater than zero");
+        }
+        self.process_generation = Some(generation);
+        Ok(self)
+    }
+
     pub fn prepare(&self) -> Result<PreparedCLIAgentCommand> {
         if self.executable.trim().is_empty() {
             bail!("CLI executable must not be empty");
         }
 
-        let mut env = BTreeMap::new();
-        for (key, value) in &self.env {
+        let mut env = self.env.clone();
+        for (key, value) in self.env.expose_iter() {
             validate_env_key(key)?;
             validate_env_value(value)?;
-            env.insert(key.clone(), value.clone());
         }
-        let mut env_remove = Vec::new();
+        let mut env_remove = inherited_sensitive_environment_names();
         for key in &self.env_remove {
             validate_env_key(key)?;
             env.remove(key);
-            env_remove.push(key.clone());
+            if !env_remove.contains(key) {
+                env_remove.push(key.clone());
+            }
         }
 
         if let Some(home_path) = self.home_path.as_deref() {
             let expanded = expand_home_path(home_path, self.home_dir.as_deref())?;
-            env.insert(
+            env.insert_plain(
                 "CODEX_HOME".to_owned(),
                 expanded.to_string_lossy().into_owned(),
             );
         }
+
+        let stderr_redactions = env.secret_values();
 
         Ok(PreparedCLIAgentCommand {
             executable: self.executable.clone(),
@@ -108,8 +243,10 @@ impl CLIAgentProcessSpawnConfig {
             cwd: self.cwd.clone(),
             env,
             env_remove,
+            stderr_redactions,
             stderr_ring_lines: self.stderr_ring_lines.max(1),
             process_group: self.process_group,
+            process_generation: self.process_generation,
         })
     }
 }
@@ -119,10 +256,12 @@ pub struct PreparedCLIAgentCommand {
     pub executable: String,
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
-    pub env: BTreeMap<String, String>,
+    pub env: SensitiveEnvironment,
     pub env_remove: Vec<String>,
+    stderr_redactions: Vec<SecretString>,
     pub stderr_ring_lines: usize,
     pub process_group: bool,
+    pub process_generation: Option<u64>,
 }
 
 pub struct CLIAgentProcess {
@@ -200,17 +339,40 @@ impl Drop for CLIAgentProcess {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct StderrRing {
     inner: Arc<Mutex<VecDeque<String>>>,
     max_lines: usize,
+    exact_redactions: Arc<Vec<SecretString>>,
+    process_generation: Option<u64>,
+}
+
+impl fmt::Debug for StderrRing {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StderrRing")
+            .field("max_lines", &self.max_lines)
+            .field("exact_redactions", &REDACTED_SECRET)
+            .field("process_generation", &self.process_generation)
+            .finish_non_exhaustive()
+    }
 }
 
 impl StderrRing {
     pub fn new(max_lines: usize) -> Self {
+        Self::new_with_redactions(max_lines, Vec::new(), None)
+    }
+
+    fn new_with_redactions(
+        max_lines: usize,
+        exact_redactions: Vec<SecretString>,
+        process_generation: Option<u64>,
+    ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(VecDeque::new())),
             max_lines: max_lines.max(1),
+            exact_redactions: Arc::new(exact_redactions),
+            process_generation,
         }
     }
 
@@ -249,7 +411,12 @@ impl StderrRing {
         self.lines().await.join("\n")
     }
 
+    pub const fn process_generation(&self) -> Option<u64> {
+        self.process_generation
+    }
+
     async fn push_line(&self, line: String) {
+        let line = redact_exact_values(line, self.exact_redactions.as_slice());
         let mut guard = self.inner.lock().await;
         guard.push_back(line);
         while guard.len() > self.max_lines {
@@ -267,6 +434,7 @@ pub fn spawn_prepared_cli_agent_process(
     prepared: &PreparedCLIAgentCommand,
 ) -> Result<CLIAgentProcess> {
     let mut command = Command::new(prepared.executable.as_str());
+    scrub_inherited_cli_environment(&mut command);
     command.args(prepared.args.iter().map(String::as_str));
     command.stdin(Stdio::piped());
     command.stdout(Stdio::piped());
@@ -277,12 +445,7 @@ pub fn spawn_prepared_cli_agent_process(
     for key in &prepared.env_remove {
         command.env_remove(key);
     }
-    command.envs(
-        prepared
-            .env
-            .iter()
-            .map(|(key, value)| (key.as_str(), value.as_str())),
-    );
+    command.envs(prepared.env.expose_iter());
 
     let mut wrapped = CommandWrap::from(command);
     wrapped.wrap(KillOnDrop);
@@ -300,7 +463,11 @@ pub fn spawn_prepared_cli_agent_process(
         .with_context(|| format!("failed to spawn CLI process `{}`", prepared.executable))?;
     let stdin = child.stdin().take();
     let stdout = child.stdout().take();
-    let stderr = StderrRing::new(prepared.stderr_ring_lines);
+    let stderr = StderrRing::new_with_redactions(
+        prepared.stderr_ring_lines,
+        prepared.stderr_redactions.clone(),
+        prepared.process_generation,
+    );
     if let Some(stderr_pipe) = child.stderr().take() {
         stderr.spawn_reader(stderr_pipe);
     }
@@ -311,6 +478,12 @@ pub fn spawn_prepared_cli_agent_process(
         stdout,
         stderr,
     })
+}
+
+pub fn scrub_inherited_cli_environment(command: &mut Command) {
+    for key in inherited_sensitive_environment_names() {
+        command.env_remove(key);
+    }
 }
 
 pub fn expand_home_path(raw: &str, home_dir: Option<&Path>) -> Result<PathBuf> {
@@ -356,6 +529,41 @@ fn validate_env_value(value: &str) -> Result<()> {
     Ok(())
 }
 
+fn inherited_sensitive_environment_names() -> Vec<String> {
+    std::env::vars_os()
+        .filter_map(|(key, _)| key.into_string().ok())
+        .filter(|key| inherited_environment_name_is_sensitive(key))
+        .collect()
+}
+
+fn inherited_environment_name_is_sensitive(key: &str) -> bool {
+    let normalized = key.to_ascii_uppercase();
+    [
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "CREDENTIAL",
+        "PRIVATE_KEY",
+        "ACCESS_KEY",
+        "SESSION_KEY",
+        "MCP_GRANT",
+        "MCP_BOOTSTRAP",
+    ]
+    .iter()
+    .any(|pattern| normalized.contains(pattern))
+}
+
+fn redact_exact_values(mut line: String, redactions: &[SecretString]) -> String {
+    for secret in redactions {
+        let secret = secret.expose_secret();
+        if !secret.is_empty() && line.contains(secret) {
+            line = line.replace(secret, REDACTED_SECRET);
+        }
+    }
+    line
+}
+
 fn normalize_stderr_line(line: &str) -> String {
     line.trim_end_matches('\n')
         .trim_end_matches('\r')
@@ -389,13 +597,43 @@ mod tests {
         assert_eq!(prepared.executable, "codex");
         assert_eq!(prepared.args, vec!["app-server"]);
         assert_eq!(
-            prepared.env.get("CODEX_HOME").map(String::as_str),
+            prepared.env.expose("CODEX_HOME"),
             Some("/tmp/pioneer-home/.codex_work")
         );
-        assert_ne!(
-            prepared.env.get("CODEX_HOME").map(String::as_str),
-            Some("~/.codex_work")
-        );
+        assert_ne!(prepared.env.expose("CODEX_HOME"), Some("~/.codex_work"));
+    }
+
+    #[test]
+    fn sensitive_environment_redacts_debug_and_constructed_serde_output() {
+        let canary = "proposal53-sensitive-environment-canary";
+        let config = CLIAgentProcessSpawnConfig::codex_app_server("codex", "/tmp/codex-home")
+            .with_env("SAFE_OPTION", "visible")
+            .with_sensitive_env("PIONEER_CLI_MCP_GRANT", SecretString::new(canary));
+        let prepared = config.prepare().expect("config should prepare");
+
+        assert_eq!(prepared.env.expose("PIONEER_CLI_MCP_GRANT"), Some(canary));
+        assert!(format!("{config:?}").contains("visible"));
+        assert!(!format!("{config:?}").contains(canary));
+        assert!(!format!("{prepared:?}").contains(canary));
+        let serialized_log_field = serde_json::to_string(&format!("{prepared:?}"))
+            .expect("debug log field should serialize");
+        assert!(!serialized_log_field.contains(canary));
+    }
+
+    #[test]
+    fn inherited_secret_environment_names_are_scrubbed_by_default() {
+        for key in [
+            "OPENAI_API_TOKEN",
+            "SERVICE_SECRET",
+            "DATABASE_PASSWORD",
+            "AWS_ACCESS_KEY_ID",
+            "PIONEER_CLI_MCP_GRANT",
+        ] {
+            assert!(inherited_environment_name_is_sensitive(key), "{key}");
+        }
+        for key in ["PATH", "HOME", "LANG", "HTTPS_PROXY", "NO_PROXY"] {
+            assert!(!inherited_environment_name_is_sensitive(key), "{key}");
+        }
     }
 
     #[tokio::test]
@@ -448,6 +686,36 @@ echo err-three >&2
 
         let stderr = process.stderr().lines().await;
         assert_eq!(stderr, vec!["err-two".to_owned(), "err-three".to_owned()]);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn sensitive_environment_values_are_redacted_from_child_stderr() {
+        let root = unique_temp_dir("redacted-stderr");
+        let script = root.join("echo-secret");
+        let canary = "proposal53-child-stderr-secret-canary";
+        write_unix_script(
+            script.as_path(),
+            r#"#!/bin/sh
+echo "grant=$PIONEER_CLI_MCP_GRANT" >&2
+"#,
+        );
+
+        let mut process = spawn_cli_agent_process(
+            &CLIAgentProcessSpawnConfig::codex_app_server(
+                script.to_string_lossy().into_owned(),
+                root.join("home").to_string_lossy(),
+            )
+            .with_sensitive_env("PIONEER_CLI_MCP_GRANT", SecretString::new(canary))
+            .with_process_generation(42)
+            .expect("generation should be valid"),
+        )
+        .expect("process should spawn");
+        assert_eq!(process.stderr().process_generation(), Some(42));
+        assert!(process.wait().await.expect("process should exit").success());
+        let stderr = process.stderr().joined().await;
+        assert!(!stderr.contains(canary));
+        assert!(stderr.contains(REDACTED_SECRET));
     }
 
     #[tokio::test]

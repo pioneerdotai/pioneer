@@ -1,12 +1,29 @@
 //! Codex app-server runtime implementation boundary.
 
+#[path = "codex_schema.rs"]
+mod schema;
+pub use schema::{
+    CODEX_MCP_SCHEMA_TRANSFORM_CONTRACT_VERSION, CodexMcpSchemaTransformer,
+    CodexMcpSchemaTransformerError,
+};
+
+#[path = "codex_mcp_config.rs"]
+mod mcp_config;
+pub use mcp_config::{
+    CodexManagedMcpConfigArtifact, CodexManagedMcpConfigError, CodexManagedMcpConfigInput,
+    CodexManagedMcpSemanticInput, CodexManagedMcpToolIdentity, codex_config_value_fingerprint,
+    codex_managed_mcp_semantic_restart_fingerprint, serialize_codex_managed_mcp_config,
+};
+
 use crate::driver::{
     JsonlRpcDecodeError, JsonlRpcError, JsonlRpcId, JsonlRpcIncomingMessage, JsonlRpcNotification,
     JsonlRpcRequest, JsonlRpcResponse, read_jsonl_rpc_message, write_jsonl_rpc_message,
     write_jsonl_rpc_request,
 };
 use crate::input::CLIRuntimeTurnInputItem;
-use crate::process::{CLIAgentProcessSpawnConfig, expand_home_path, spawn_cli_agent_process};
+use crate::process::{
+    CLIAgentProcessSpawnConfig, SensitiveEnvironment, expand_home_path, spawn_cli_agent_process,
+};
 use pioneer_protocol::normalize_metadata_reasoning_effort;
 use pioneer_runtime_events::{
     OrderedEventIngress, OrderedIngressClass, OrderedIngressConfig, OrderedIngressEvent,
@@ -15,34 +32,47 @@ use pioneer_runtime_events::{
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
-use std::fs;
-use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::fs::{self, File, OpenOptions};
+use std::io::{ErrorKind, Read, Write};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufRead, AsyncWrite, BufReader};
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 
 const DEFAULT_COMMAND_QUEUE_CAPACITY: usize = 64;
 const DEFAULT_INCOMING_QUEUE_CAPACITY: usize = 256;
+const DEFAULT_SERVER_REQUEST_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+const CODEX_SERVER_REQUEST_HANDLER_UNAVAILABLE_CODE: i64 = -32000;
+const CODEX_SERVER_REQUEST_TIMEOUT_CODE: i64 = -32001;
+const CODEX_SERVER_REQUEST_DUPLICATE_ID_CODE: i64 = -32600;
 const LOGIN_SESSION_TIMEOUT: Duration = Duration::from_secs(600);
-const CODEX_SHARED_HOME_ENTRY_NAMES: &[&str] = &[
+const CODEX_HOME_OVERLAY_POLICY_VERSION: u32 = 1;
+const CODEX_SHARED_HOME_ENTRY_NAMES_V1: &[&str] = &[
     "sessions",
     "archived_sessions",
     "sqlite",
     "shell_snapshots",
-    "worktrees",
-    "plugins",
-    "cache",
-    "logs",
+    "skills",
 ];
 const CODEX_PRIVATE_HOME_ENTRY_NAMES: &[&str] = &["auth.json", "models_cache.json"];
-const CODEX_SHADOW_LOCAL_ENTRY_NAMES: &[&str] = &["log", "memories", "tmp"];
+const CODEX_GENERATION_LOCAL_ENTRY_NAMES_V1: &[&str] = &["bootstrap", "log", "cache", "tmp"];
+const CODEX_GENERATION_OVERLAY_MARKER: &str = ".pioneer-codex-overlay.json";
+const CODEX_PHASE_00_CONTROLLED_CONFIG_V1: &[u8] = br#"[features]
+apps = false
+enable_mcp_apps = false
+plugins = false
+remote_plugin = false
+skill_mcp_dependency_install = false
+"#;
+static CODEX_GENERATION_OVERLAY_NONCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 pub struct CodexJsonlRpcClient {
@@ -79,10 +109,38 @@ impl CodexJsonlRpcClient {
         R: AsyncBufRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
     {
+        Self::new_with_server_request_policy(
+            reader,
+            writer,
+            notification_capacity,
+            server_request_capacity,
+            diagnostic_capacity,
+            DEFAULT_SERVER_REQUEST_TIMEOUT,
+        )
+    }
+
+    fn new_with_server_request_policy<R, W>(
+        reader: R,
+        writer: W,
+        notification_capacity: usize,
+        server_request_capacity: usize,
+        diagnostic_capacity: usize,
+        server_request_timeout: Duration,
+    ) -> Self
+    where
+        R: AsyncBufRead + Send + Unpin + 'static,
+        W: AsyncWrite + Send + Unpin + 'static,
+    {
+        let server_request_capacity = server_request_capacity.max(1);
+        let server_request_timeout = if server_request_timeout.is_zero() {
+            Duration::from_millis(1)
+        } else {
+            server_request_timeout
+        };
         let (command_tx, command_rx) = mpsc::channel(DEFAULT_COMMAND_QUEUE_CAPACITY);
         let (incoming_tx, incoming_rx) = mpsc::channel(DEFAULT_INCOMING_QUEUE_CAPACITY);
         let (notification_tx, notification_rx) = mpsc::channel(notification_capacity.max(1));
-        let (server_request_tx, server_request_rx) = mpsc::channel(server_request_capacity.max(1));
+        let (server_request_tx, server_request_rx) = mpsc::channel(server_request_capacity);
         let (diagnostic_tx, diagnostic_rx) = mpsc::channel(diagnostic_capacity.max(1));
         let notification_ingress = OrderedEventIngress::spawn(
             notification_tx,
@@ -103,6 +161,8 @@ impl CodexJsonlRpcClient {
                 server_request_tx,
                 diagnostic_tx,
             },
+            server_request_capacity,
+            server_request_timeout,
         ));
 
         Self {
@@ -422,6 +482,33 @@ impl CodexAppServerClient {
             .await
     }
 
+    /// Reads merged configuration without touching MCP status or starting a
+    /// native thread. The snapshot retains only bounded isolation evidence.
+    pub async fn config_read(
+        &self,
+        cwd: &str,
+        timeout: Duration,
+    ) -> Result<CodexConfigReadSnapshot, CodexJsonlRpcClientError> {
+        if cwd.trim().is_empty() {
+            return Err(CodexJsonlRpcClientError::Encode {
+                method: "config/read".to_owned(),
+                message: "config/read cwd must not be empty".to_owned(),
+            });
+        }
+        let params = CodexConfigReadParams {
+            cwd: cwd.to_owned(),
+            include_layers: true,
+        };
+        let response: CodexConfigReadWireResponse =
+            self.rpc.request("config/read", &params, timeout).await?;
+        decode_codex_config_read_response(response).map_err(|message| {
+            CodexJsonlRpcClientError::Decode {
+                method: "config/read".to_owned(),
+                message,
+            }
+        })
+    }
+
     pub async fn list_models_page(
         &self,
         cursor: Option<String>,
@@ -482,6 +569,37 @@ impl CodexAppServerClient {
                 timeout,
             )
             .await
+    }
+
+    pub async fn thread_read_metadata(
+        &self,
+        thread_id: &str,
+        timeout: Duration,
+    ) -> Result<CodexThreadMetadataSnapshot, CodexJsonlRpcClientError> {
+        let raw = self.thread_read_raw(thread_id, false, timeout).await?;
+        let response: CodexThreadReadMetadataResponse =
+            serde_json::from_value(raw).map_err(|error| CodexJsonlRpcClientError::Decode {
+                method: "thread/read".to_owned(),
+                message: error.to_string(),
+            })?;
+        if response.thread.id != thread_id {
+            return Err(CodexJsonlRpcClientError::Decode {
+                method: "thread/read".to_owned(),
+                message: "thread/read returned a different native thread id".to_owned(),
+            });
+        }
+        if response.thread.cwd.trim().is_empty()
+            || !Path::new(response.thread.cwd.as_str()).is_absolute()
+        {
+            return Err(CodexJsonlRpcClientError::Decode {
+                method: "thread/read".to_owned(),
+                message: "thread/read returned an invalid persisted cwd".to_owned(),
+            });
+        }
+        Ok(CodexThreadMetadataSnapshot {
+            native_thread_id: response.thread.id,
+            cwd: response.thread.cwd,
+        })
     }
 
     pub async fn thread_start(
@@ -787,6 +905,382 @@ pub struct CodexInitializeSnapshot {
     pub raw: JsonValue,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexConfigReadParams {
+    pub cwd: String,
+    pub include_layers: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexConfigReadSnapshot {
+    pub effective: CodexConfigIsolationEvidence,
+    pub layers: Vec<CodexConfigLayerIsolationEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexConfigIsolationEvidence {
+    pub mcp_server_names: Vec<String>,
+    pub mcp_servers_fingerprint: String,
+    pub plugin_names: Vec<String>,
+    pub marketplace_names: Vec<String>,
+    pub app_names: Vec<String>,
+    pub trusted_project_names: Vec<String>,
+    pub isolation_features: CodexConfigIsolationFeatures,
+}
+
+impl CodexConfigIsolationEvidence {
+    pub fn has_forbidden_extension_entries(&self) -> bool {
+        !self.plugin_names.is_empty()
+            || !self.marketplace_names.is_empty()
+            || !self.app_names.is_empty()
+            || !self.trusted_project_names.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodexConfigIsolationFeatures {
+    pub apps: bool,
+    pub enable_mcp_apps: bool,
+    pub plugins: bool,
+    pub remote_plugin: bool,
+    pub skill_mcp_dependency_install: bool,
+}
+
+impl CodexConfigIsolationFeatures {
+    pub fn all_disabled(self) -> bool {
+        !self.apps
+            && !self.enable_mcp_apps
+            && !self.plugins
+            && !self.remote_plugin
+            && !self.skill_mcp_dependency_install
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexConfigLayerIsolationEvidence {
+    pub source: CodexConfigLayerSourceKind,
+    pub source_fingerprint: String,
+    pub version: String,
+    pub mcp_server_names: Vec<String>,
+    pub mcp_servers_fingerprint: String,
+    pub plugin_names: Vec<String>,
+    pub marketplace_names: Vec<String>,
+    pub app_names: Vec<String>,
+    pub trusted_project_names: Vec<String>,
+}
+
+impl CodexConfigLayerIsolationEvidence {
+    pub fn has_forbidden_entries(&self) -> bool {
+        !self.mcp_server_names.is_empty()
+            || !self.plugin_names.is_empty()
+            || !self.marketplace_names.is_empty()
+            || !self.app_names.is_empty()
+            || !self.trusted_project_names.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CodexConfigLayerSourceKind {
+    Mdm,
+    System,
+    EnterpriseManaged,
+    User,
+    Project,
+    SessionFlags,
+    LegacyManagedConfigTomlFromFile,
+    LegacyManagedConfigTomlFromMdm,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexConfigReadWireResponse {
+    config: JsonValue,
+    layers: Option<Vec<CodexConfigLayerWire>>,
+    origins: BTreeMap<String, CodexConfigLayerMetadataWire>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexConfigLayerWire {
+    config: JsonValue,
+    name: JsonValue,
+    version: String,
+    #[serde(default)]
+    disabled_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexConfigLayerMetadataWire {
+    name: JsonValue,
+    version: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexThreadReadMetadataResponse {
+    thread: CodexThreadReadMetadataWire,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexThreadReadMetadataWire {
+    id: String,
+    cwd: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexThreadMetadataSnapshot {
+    pub native_thread_id: String,
+    pub cwd: String,
+}
+
+fn decode_codex_config_read_response(
+    response: CodexConfigReadWireResponse,
+) -> Result<CodexConfigReadSnapshot, String> {
+    const MAX_LAYERS: usize = 128;
+    const MAX_ORIGINS: usize = 512;
+    let layers = response
+        .layers
+        .ok_or_else(|| "config/read omitted requested layer evidence".to_owned())?;
+    if layers.len() > MAX_LAYERS {
+        return Err("config/read returned too many config layers".to_owned());
+    }
+    if response.origins.len() > MAX_ORIGINS {
+        return Err("config/read returned too many config origins".to_owned());
+    }
+    for (key, metadata) in response.origins {
+        validate_codex_config_evidence_text("origin key", key.as_str())?;
+        validate_codex_config_evidence_text("origin version", metadata.version.as_str())?;
+        let _ = decode_codex_config_layer_source(metadata.name)?;
+    }
+
+    let effective = decode_codex_config_isolation_evidence(&response.config, true)?;
+    let mut decoded_layers = Vec::with_capacity(layers.len());
+    let mut source_fingerprints = HashSet::with_capacity(layers.len());
+    for layer in layers {
+        validate_codex_config_evidence_text("layer version", layer.version.as_str())?;
+        if let Some(disabled_reason) = layer.disabled_reason.as_deref() {
+            validate_codex_config_evidence_text("layer disabled reason", disabled_reason)?;
+        }
+        let source = decode_codex_config_layer_source(layer.name.clone())?;
+        let source_fingerprint = codex_safe_json_fingerprint(&layer.name)?;
+        if !source_fingerprints.insert(source_fingerprint.clone()) {
+            return Err("config/read returned duplicate config layer identities".to_owned());
+        }
+        let evidence = decode_codex_config_isolation_evidence(&layer.config, false)?;
+        decoded_layers.push(CodexConfigLayerIsolationEvidence {
+            source,
+            source_fingerprint,
+            version: layer.version,
+            mcp_server_names: evidence.mcp_server_names,
+            mcp_servers_fingerprint: evidence.mcp_servers_fingerprint,
+            plugin_names: evidence.plugin_names,
+            marketplace_names: evidence.marketplace_names,
+            app_names: evidence.app_names,
+            trusted_project_names: evidence.trusted_project_names,
+        });
+    }
+    Ok(CodexConfigReadSnapshot {
+        effective,
+        layers: decoded_layers,
+    })
+}
+
+fn decode_codex_config_isolation_evidence(
+    config: &JsonValue,
+    require_effective_fields: bool,
+) -> Result<CodexConfigIsolationEvidence, String> {
+    let config = config
+        .as_object()
+        .ok_or_else(|| "config/read config evidence is not an object".to_owned())?;
+    let mcp_server_names = decode_codex_named_config_entries(
+        config.get("mcp_servers"),
+        "mcp_servers",
+        require_effective_fields,
+        false,
+    )?;
+    let mcp_servers_fingerprint = codex_config_value_fingerprint(
+        config
+            .get("mcp_servers")
+            .unwrap_or(&JsonValue::Object(serde_json::Map::new())),
+    )
+    .map_err(|error| format!("config/read MCP evidence fingerprint failed: {error}"))?;
+    let plugin_names = decode_codex_named_config_entries(
+        config.get("plugins"),
+        "plugins",
+        require_effective_fields,
+        false,
+    )?;
+    let marketplace_names = decode_codex_named_config_entries(
+        config.get("marketplaces"),
+        "marketplaces",
+        require_effective_fields,
+        false,
+    )?;
+    let app_names = decode_codex_named_config_entries(
+        config.get("apps"),
+        "apps",
+        require_effective_fields,
+        true,
+    )?;
+    let trusted_project_names = decode_codex_named_config_entries(
+        config.get("projects"),
+        "projects",
+        require_effective_fields,
+        true,
+    )?;
+    let isolation_features = if require_effective_fields {
+        let features = config
+            .get("features")
+            .and_then(JsonValue::as_object)
+            .ok_or_else(|| "config/read omitted effective feature evidence".to_owned())?;
+        CodexConfigIsolationFeatures {
+            apps: decode_codex_required_bool(features, "apps")?,
+            enable_mcp_apps: decode_codex_required_bool(features, "enable_mcp_apps")?,
+            plugins: decode_codex_required_bool(features, "plugins")?,
+            remote_plugin: decode_codex_required_bool(features, "remote_plugin")?,
+            skill_mcp_dependency_install: decode_codex_required_bool(
+                features,
+                "skill_mcp_dependency_install",
+            )?,
+        }
+    } else {
+        CodexConfigIsolationFeatures {
+            apps: false,
+            enable_mcp_apps: false,
+            plugins: false,
+            remote_plugin: false,
+            skill_mcp_dependency_install: false,
+        }
+    };
+    Ok(CodexConfigIsolationEvidence {
+        mcp_server_names,
+        mcp_servers_fingerprint,
+        plugin_names,
+        marketplace_names,
+        app_names,
+        trusted_project_names,
+        isolation_features,
+    })
+}
+
+fn decode_codex_named_config_entries(
+    value: Option<&JsonValue>,
+    field: &str,
+    required: bool,
+    allow_null: bool,
+) -> Result<Vec<String>, String> {
+    const MAX_ENTRIES: usize = 256;
+    let Some(value) = value else {
+        return required
+            .then(|| Err(format!("config/read omitted effective `{field}` evidence")))
+            .unwrap_or_else(|| Ok(Vec::new()));
+    };
+    if allow_null && value.is_null() {
+        return Ok(Vec::new());
+    }
+    let entries = value
+        .as_object()
+        .ok_or_else(|| format!("config/read `{field}` evidence is not an object"))?;
+    if entries.len() > MAX_ENTRIES {
+        return Err(format!(
+            "config/read `{field}` evidence has too many entries"
+        ));
+    }
+    let mut names = entries.keys().cloned().collect::<Vec<_>>();
+    for name in &names {
+        validate_codex_config_evidence_text(field, name.as_str())?;
+    }
+    names.sort();
+    Ok(names)
+}
+
+fn decode_codex_required_bool(
+    values: &serde_json::Map<String, JsonValue>,
+    field: &str,
+) -> Result<bool, String> {
+    values
+        .get(field)
+        .and_then(JsonValue::as_bool)
+        .ok_or_else(|| format!("config/read omitted boolean feature `{field}` evidence"))
+}
+
+fn decode_codex_config_layer_source(
+    value: JsonValue,
+) -> Result<CodexConfigLayerSourceKind, String> {
+    let source = value
+        .as_object()
+        .ok_or_else(|| "config/read layer source is not an object".to_owned())?;
+    let source_type = source
+        .get("type")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| "config/read layer source has no string type".to_owned())?;
+    let required_string = |field: &str| -> Result<(), String> {
+        let value = source
+            .get(field)
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| format!("config/read layer source `{source_type}` omitted `{field}`"))?;
+        validate_codex_config_evidence_text("layer source", value)
+    };
+    match source_type {
+        "mdm" => {
+            required_string("domain")?;
+            required_string("key")?;
+            Ok(CodexConfigLayerSourceKind::Mdm)
+        }
+        "system" => {
+            required_string("file")?;
+            Ok(CodexConfigLayerSourceKind::System)
+        }
+        "enterpriseManaged" => {
+            required_string("id")?;
+            required_string("name")?;
+            Ok(CodexConfigLayerSourceKind::EnterpriseManaged)
+        }
+        "user" => {
+            required_string("file")?;
+            if let Some(profile) = source.get("profile").filter(|value| !value.is_null()) {
+                let profile = profile
+                    .as_str()
+                    .ok_or_else(|| "config/read user layer profile is not a string".to_owned())?;
+                validate_codex_config_evidence_text("layer profile", profile)?;
+            }
+            Ok(CodexConfigLayerSourceKind::User)
+        }
+        "project" => {
+            required_string("dotCodexFolder")?;
+            Ok(CodexConfigLayerSourceKind::Project)
+        }
+        "sessionFlags" => Ok(CodexConfigLayerSourceKind::SessionFlags),
+        "legacyManagedConfigTomlFromFile" => {
+            required_string("file")?;
+            Ok(CodexConfigLayerSourceKind::LegacyManagedConfigTomlFromFile)
+        }
+        "legacyManagedConfigTomlFromMdm" => {
+            Ok(CodexConfigLayerSourceKind::LegacyManagedConfigTomlFromMdm)
+        }
+        _ => Err("config/read returned an unsupported config layer source".to_owned()),
+    }
+}
+
+fn validate_codex_config_evidence_text(label: &str, value: &str) -> Result<(), String> {
+    const MAX_TEXT_BYTES: usize = 1024;
+    if value.is_empty() || value.len() > MAX_TEXT_BYTES || value.contains('\0') {
+        return Err(format!("config/read returned invalid {label} evidence"));
+    }
+    Ok(())
+}
+
+fn codex_safe_json_fingerprint(value: &JsonValue) -> Result<String, String> {
+    let serialized = serde_json::to_vec(value)
+        .map_err(|_| "config/read layer source could not be fingerprinted".to_owned())?;
+    Ok(codex_overlay_identity_component(
+        "sha256",
+        String::from_utf8_lossy(&serialized).as_ref(),
+    ))
+}
+
 #[derive(Debug, Clone)]
 pub struct CodexAccountProbeConfig {
     pub executable: String,
@@ -794,7 +1288,7 @@ pub struct CodexAccountProbeConfig {
     pub shadow_home_path: Option<String>,
     pub cwd: Option<PathBuf>,
     pub home_dir: Option<PathBuf>,
-    pub env: BTreeMap<String, String>,
+    pub env: SensitiveEnvironment,
     pub initialize_timeout: Duration,
     pub request_timeout: Duration,
     pub shutdown_grace: Duration,
@@ -858,6 +1352,116 @@ pub struct CodexHomeLayout {
     pub shared_home_path: PathBuf,
     pub effective_home_path: PathBuf,
     pub continuation_key: String,
+}
+
+/// Versioned, default-deny policy for state projected into a managed Codex
+/// process home. New Codex root entries remain private unless a later policy
+/// version names them explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodexHomeOverlayPolicy {
+    pub version: u32,
+    pub shared_directory_names: &'static [&'static str],
+    pub account_file_names: &'static [&'static str],
+    pub local_directory_names: &'static [&'static str],
+}
+
+impl CodexHomeOverlayPolicy {
+    pub const fn v1() -> Self {
+        Self {
+            version: CODEX_HOME_OVERLAY_POLICY_VERSION,
+            shared_directory_names: CODEX_SHARED_HOME_ENTRY_NAMES_V1,
+            account_file_names: CODEX_PRIVATE_HOME_ENTRY_NAMES,
+            local_directory_names: CODEX_GENERATION_LOCAL_ENTRY_NAMES_V1,
+        }
+    }
+}
+
+/// Stable identity of one managed Codex home overlay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexGenerationOverlayIdentity {
+    pub workspace_id: String,
+    pub runtime_id: String,
+    pub logical_thread_id: String,
+    pub gateway_boot_id: String,
+    pub process_generation: u64,
+}
+
+impl CodexGenerationOverlayIdentity {
+    pub fn new(
+        workspace_id: impl Into<String>,
+        runtime_id: impl Into<String>,
+        logical_thread_id: impl Into<String>,
+        gateway_boot_id: impl Into<String>,
+        process_generation: u64,
+    ) -> Result<Self, CodexShadowHomeError> {
+        let identity = Self {
+            workspace_id: workspace_id.into(),
+            runtime_id: runtime_id.into(),
+            logical_thread_id: logical_thread_id.into(),
+            gateway_boot_id: gateway_boot_id.into(),
+            process_generation,
+        };
+        for (field, value) in [
+            ("workspace_id", identity.workspace_id.as_str()),
+            ("runtime_id", identity.runtime_id.as_str()),
+            ("logical_thread_id", identity.logical_thread_id.as_str()),
+            ("gateway_boot_id", identity.gateway_boot_id.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(CodexShadowHomeError::new(format!(
+                    "Codex generation overlay {field} must not be empty"
+                )));
+            }
+        }
+        if process_generation == 0 {
+            return Err(CodexShadowHomeError::new(
+                "Codex generation overlay process_generation must be greater than zero",
+            ));
+        }
+        Ok(identity)
+    }
+}
+
+/// Filesystem contract for one materialized generation-scoped Codex home.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexGenerationOverlayDescriptor {
+    pub identity: CodexGenerationOverlayIdentity,
+    pub policy_version: u32,
+    pub managed_root_path: PathBuf,
+    pub effective_home_path: PathBuf,
+    pub shared_home_path: PathBuf,
+    pub continuation_key: String,
+    pub mcp_artifact: Option<CodexGenerationMcpArtifactDescriptor>,
+    materialization_nonce: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexGenerationMcpArtifactDescriptor {
+    pub config_path: PathBuf,
+    pub config_artifact_digest: String,
+    pub effective_mcp_servers_fingerprint: String,
+    pub semantic_restart_fingerprint: String,
+    pub bootstrap_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CodexGenerationOverlayMarker {
+    policy_version: u32,
+    identity: CodexGenerationOverlayIdentity,
+    materialization_nonce: String,
+    #[serde(default)]
+    mcp_artifact: Option<CodexGenerationMcpArtifactMarker>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CodexGenerationMcpArtifactMarker {
+    config_artifact_digest: String,
+    effective_mcp_servers_fingerprint: String,
+    semantic_restart_fingerprint: String,
+    bootstrap_relative_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -934,51 +1538,22 @@ fn materialize_codex_shadow_home(layout: &CodexHomeLayout) -> Result<(), CodexSh
         ));
     }
 
-    create_dir_all_for_codex_home(layout.shared_home_path.as_path())?;
-    create_dir_all_for_codex_home(layout.effective_home_path.as_path())?;
-    for entry_name in CODEX_SHARED_HOME_ENTRY_NAMES {
+    ensure_codex_directory_no_follow(layout.shared_home_path.as_path(), false)?;
+    ensure_codex_directory_no_follow(layout.effective_home_path.as_path(), true)?;
+    let policy = CodexHomeOverlayPolicy::v1();
+    for entry_name in policy.shared_directory_names {
         create_dir_all_for_codex_home(layout.shared_home_path.join(entry_name).as_path())?;
     }
 
-    let mut entries = CODEX_SHARED_HOME_ENTRY_NAMES
-        .iter()
-        .map(|entry| (*entry).to_owned())
-        .collect::<HashSet<_>>();
-    let shared_entries = fs::read_dir(layout.shared_home_path.as_path()).map_err(|error| {
-        CodexShadowHomeError::with_context(
-            "read Codex shared home",
-            layout.shared_home_path.as_path(),
-            error,
-        )
-    })?;
-    for entry in shared_entries {
-        let entry = entry.map_err(|error| {
-            CodexShadowHomeError::with_context(
-                "read Codex shared home entry",
-                layout.shared_home_path.as_path(),
-                error,
-            )
-        })?;
-        let entry_name = entry.file_name().to_string_lossy().into_owned();
-        if !CODEX_PRIVATE_HOME_ENTRY_NAMES.contains(&entry_name.as_str())
-            && !CODEX_SHADOW_LOCAL_ENTRY_NAMES.contains(&entry_name.as_str())
-        {
-            entries.insert(entry_name);
-        }
-    }
-
-    for entry_name in CODEX_PRIVATE_HOME_ENTRY_NAMES {
+    for entry_name in policy.account_file_names {
         ensure_codex_private_shadow_entry(layout.effective_home_path.as_path(), entry_name)?;
     }
 
-    for entry_name in entries {
-        if CODEX_PRIVATE_HOME_ENTRY_NAMES.contains(&entry_name.as_str()) {
-            continue;
-        }
+    for entry_name in policy.shared_directory_names {
         ensure_codex_shadow_symlink(
             layout.shared_home_path.as_path(),
             layout.effective_home_path.as_path(),
-            entry_name.as_str(),
+            entry_name,
         )?;
     }
 
@@ -1006,10 +1581,477 @@ pub fn codex_app_server_process_config(
     if let Some(home_dir) = config.home_dir.as_ref() {
         process_config = process_config.with_home_dir(home_dir);
     }
-    for (key, value) in &config.env {
-        process_config = process_config.with_env(key, value);
-    }
+    process_config = process_config.with_environment(&config.env);
     Ok(process_config)
+}
+
+/// Builds the app-server command for a managed, generation-scoped Codex home.
+///
+/// `fallback_managed_root` is used when the runtime has no configured auth
+/// shadow home. A configured shadow home remains an account-material source;
+/// its other entries are never projected into the generation overlay.
+pub fn codex_generation_app_server_process_config(
+    config: &CodexAccountProbeConfig,
+    fallback_managed_root: &Path,
+    identity: CodexGenerationOverlayIdentity,
+) -> Result<(CLIAgentProcessSpawnConfig, CodexGenerationOverlayDescriptor), CodexShadowHomeError> {
+    let shared_home_path =
+        resolve_codex_home_path(config.home_path.as_str(), config.home_dir.as_deref())?;
+    let configured_account_home = config
+        .shadow_home_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(|path| resolve_codex_home_path(path, config.home_dir.as_deref()))
+        .transpose()?;
+    let account_home_path = configured_account_home
+        .clone()
+        .unwrap_or_else(|| shared_home_path.clone());
+    let managed_root_path = match configured_account_home {
+        Some(path) => path.join("pioneer-generation-overlays"),
+        None => resolve_absolute_codex_path(fallback_managed_root)?,
+    };
+
+    let descriptor = materialize_codex_generation_overlay(
+        shared_home_path,
+        account_home_path,
+        managed_root_path,
+        identity,
+    )?;
+    let mut process_config = CLIAgentProcessSpawnConfig::codex_app_server(
+        &config.executable,
+        descriptor
+            .effective_home_path
+            .to_string_lossy()
+            .into_owned(),
+    )
+    .with_env(
+        "CODEX_SQLITE_HOME",
+        descriptor.shared_home_path.to_string_lossy().into_owned(),
+    )
+    .with_stderr_ring_lines(config.stderr_ring_lines);
+    if let Some(cwd) = config.cwd.as_ref() {
+        process_config = process_config.with_cwd(cwd);
+    }
+    if let Some(home_dir) = config.home_dir.as_ref() {
+        process_config = process_config.with_home_dir(home_dir);
+    }
+    process_config = process_config.with_environment(&config.env);
+    Ok((process_config, descriptor))
+}
+
+pub fn cleanup_codex_generation_overlay(
+    descriptor: &CodexGenerationOverlayDescriptor,
+) -> Result<(), CodexShadowHomeError> {
+    let managed_root = normalize_absolute_codex_path(descriptor.managed_root_path.as_path())?;
+    let overlay_path = normalize_absolute_codex_path(descriptor.effective_home_path.as_path())?;
+    if overlay_path == managed_root || !overlay_path.starts_with(managed_root.as_path()) {
+        return Err(CodexShadowHomeError::new(
+            "Codex generation overlay cleanup path escapes the managed root",
+        ));
+    }
+    validate_existing_codex_directory_chain_no_follow(managed_root.as_path())?;
+    validate_existing_codex_directory_chain_no_follow(
+        overlay_path
+            .parent()
+            .ok_or_else(|| CodexShadowHomeError::new("Codex overlay has no parent directory"))?,
+    )?;
+    match fs::symlink_metadata(overlay_path.as_path()) {
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(CodexShadowHomeError::with_context(
+                "inspect Codex generation overlay for cleanup",
+                overlay_path.as_path(),
+                error,
+            ));
+        }
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(CodexShadowHomeError::new(format!(
+                "Codex generation overlay cleanup target `{}` is not a real directory",
+                overlay_path.display()
+            )));
+        }
+        Ok(_) => {}
+    }
+    let marker = read_codex_generation_overlay_marker(
+        overlay_path.join(CODEX_GENERATION_OVERLAY_MARKER).as_path(),
+    )?;
+    if marker.policy_version != descriptor.policy_version
+        || marker.identity != descriptor.identity
+        || marker.materialization_nonce != descriptor.materialization_nonce
+    {
+        return Err(CodexShadowHomeError::new(
+            "Codex generation overlay cleanup refused a replacement path",
+        ));
+    }
+    fs::remove_dir_all(overlay_path.as_path()).map_err(|error| {
+        CodexShadowHomeError::with_context(
+            "remove Codex generation overlay",
+            overlay_path.as_path(),
+            error,
+        )
+    })
+}
+
+/// Fence and stage one exact managed MCP config in an already-created,
+/// generation-scoped overlay. The provider process must not be spawned until
+/// this function returns successfully.
+pub fn stage_codex_generation_mcp_config(
+    descriptor: &mut CodexGenerationOverlayDescriptor,
+    artifact: &CodexManagedMcpConfigArtifact,
+    bootstrap_path: Option<&Path>,
+) -> Result<CodexGenerationMcpArtifactDescriptor, CodexShadowHomeError> {
+    validate_sha256_identity(
+        artifact.artifact_digest.as_str(),
+        "Codex MCP config artifact digest",
+    )?;
+    validate_sha256_identity(
+        artifact.semantic_restart_fingerprint.as_str(),
+        "Codex MCP semantic restart fingerprint",
+    )?;
+    if sha256_hex_bytes(artifact.config_toml.as_bytes()) != artifact.artifact_digest {
+        return Err(CodexShadowHomeError::new(
+            "Codex MCP config artifact digest does not match its contents",
+        ));
+    }
+    let overlay_path = normalize_absolute_codex_path(descriptor.effective_home_path.as_path())?;
+    let managed_root = normalize_absolute_codex_path(descriptor.managed_root_path.as_path())?;
+    if overlay_path == managed_root || !overlay_path.starts_with(managed_root.as_path()) {
+        return Err(CodexShadowHomeError::new(
+            "Codex MCP config staging path escapes the managed root",
+        ));
+    }
+    validate_existing_codex_directory_chain_no_follow(overlay_path.as_path())?;
+
+    let bootstrap_path = match (artifact.enabled_tools.is_empty(), bootstrap_path) {
+        (true, None) => None,
+        (true, Some(_)) => {
+            return Err(CodexShadowHomeError::new(
+                "empty Codex MCP projection must not retain a bootstrap artifact",
+            ));
+        }
+        (false, None) => {
+            return Err(CodexShadowHomeError::new(
+                "non-empty Codex MCP projection requires a bootstrap artifact",
+            ));
+        }
+        (false, Some(path)) => {
+            let path = normalize_absolute_codex_path(path)?;
+            let bootstrap_root = overlay_path.join("bootstrap");
+            if path == bootstrap_root || !path.starts_with(bootstrap_root.as_path()) {
+                return Err(CodexShadowHomeError::new(
+                    "Codex MCP bootstrap artifact is outside its generation overlay",
+                ));
+            }
+            let parent = path.parent().ok_or_else(|| {
+                CodexShadowHomeError::new("Codex MCP bootstrap artifact has no parent")
+            })?;
+            validate_existing_codex_directory_chain_no_follow(parent)?;
+            let metadata = fs::symlink_metadata(path.as_path()).map_err(|error| {
+                CodexShadowHomeError::with_context(
+                    "inspect Codex MCP bootstrap artifact",
+                    path.as_path(),
+                    error,
+                )
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(CodexShadowHomeError::new(
+                    "Codex MCP bootstrap artifact must be a real file",
+                ));
+            }
+            Some(path)
+        }
+    };
+    let bootstrap_relative_path = bootstrap_path
+        .as_deref()
+        .map(|path| {
+            path.strip_prefix(overlay_path.as_path())
+                .map(Path::to_path_buf)
+                .map_err(|_| {
+                    CodexShadowHomeError::new(
+                        "Codex MCP bootstrap artifact escaped its generation overlay",
+                    )
+                })
+        })
+        .transpose()?;
+    let staged_marker = CodexGenerationMcpArtifactMarker {
+        config_artifact_digest: artifact.artifact_digest.clone(),
+        effective_mcp_servers_fingerprint: artifact.effective_mcp_servers_fingerprint.clone(),
+        semantic_restart_fingerprint: artifact.semantic_restart_fingerprint.clone(),
+        bootstrap_relative_path,
+    };
+
+    let marker_path = overlay_path.join(CODEX_GENERATION_OVERLAY_MARKER);
+    let mut marker = read_codex_generation_overlay_marker(marker_path.as_path())?;
+    if marker.policy_version != descriptor.policy_version
+        || marker.identity != descriptor.identity
+        || marker.materialization_nonce != descriptor.materialization_nonce
+    {
+        return Err(CodexShadowHomeError::new(
+            "Codex MCP config staging refused a stale generation overlay",
+        ));
+    }
+    let config_path = overlay_path.join("config.toml");
+    match marker.mcp_artifact.as_ref() {
+        Some(existing) if existing != &staged_marker => {
+            return Err(CodexShadowHomeError::new(
+                "Codex MCP generation overlay already contains a different projection",
+            ));
+        }
+        Some(_) => {
+            if digest_codex_private_file(config_path.as_path())? != artifact.artifact_digest {
+                return Err(CodexShadowHomeError::new(
+                    "Codex MCP staged config was replaced after materialization",
+                ));
+            }
+        }
+        None => {
+            overwrite_codex_private_file(config_path.as_path(), artifact.config_toml.as_bytes())?;
+            marker.mcp_artifact = Some(staged_marker.clone());
+            let serialized = serde_json::to_vec(&marker).map_err(|error| {
+                CodexShadowHomeError::new(format!(
+                    "serialize staged Codex generation marker failed: {error}"
+                ))
+            })?;
+            overwrite_codex_private_file(marker_path.as_path(), serialized.as_slice())?;
+        }
+    }
+
+    let staged = CodexGenerationMcpArtifactDescriptor {
+        config_path,
+        config_artifact_digest: artifact.artifact_digest.clone(),
+        effective_mcp_servers_fingerprint: artifact.effective_mcp_servers_fingerprint.clone(),
+        semantic_restart_fingerprint: artifact.semantic_restart_fingerprint.clone(),
+        bootstrap_path,
+    };
+    descriptor.mcp_artifact = Some(staged.clone());
+    Ok(staged)
+}
+
+/// Re-check the exact staged generation artifact immediately before a
+/// pre-thread config attestation. This never follows a replacement overlay or
+/// accepts a marker/config mismatch.
+pub fn verify_codex_generation_mcp_config(
+    descriptor: &CodexGenerationOverlayDescriptor,
+) -> Result<CodexGenerationMcpArtifactDescriptor, CodexShadowHomeError> {
+    let expected = descriptor.mcp_artifact.as_ref().ok_or_else(|| {
+        CodexShadowHomeError::new("Codex generation overlay has no staged MCP artifact")
+    })?;
+    let overlay_path = normalize_absolute_codex_path(descriptor.effective_home_path.as_path())?;
+    let managed_root = normalize_absolute_codex_path(descriptor.managed_root_path.as_path())?;
+    if overlay_path == managed_root || !overlay_path.starts_with(managed_root.as_path()) {
+        return Err(CodexShadowHomeError::new(
+            "Codex MCP artifact verification path escapes the managed root",
+        ));
+    }
+    validate_existing_codex_directory_chain_no_follow(overlay_path.as_path())?;
+    let marker = read_codex_generation_overlay_marker(
+        overlay_path.join(CODEX_GENERATION_OVERLAY_MARKER).as_path(),
+    )?;
+    if marker.policy_version != descriptor.policy_version
+        || marker.identity != descriptor.identity
+        || marker.materialization_nonce != descriptor.materialization_nonce
+    {
+        return Err(CodexShadowHomeError::new(
+            "Codex MCP artifact verification refused a stale generation overlay",
+        ));
+    }
+    let staged = marker.mcp_artifact.ok_or_else(|| {
+        CodexShadowHomeError::new("Codex generation marker has no staged MCP artifact")
+    })?;
+    let bootstrap_path = staged
+        .bootstrap_relative_path
+        .as_deref()
+        .map(|relative| overlay_path.join(relative));
+    if staged.config_artifact_digest != expected.config_artifact_digest
+        || staged.effective_mcp_servers_fingerprint != expected.effective_mcp_servers_fingerprint
+        || staged.semantic_restart_fingerprint != expected.semantic_restart_fingerprint
+        || bootstrap_path != expected.bootstrap_path
+    {
+        return Err(CodexShadowHomeError::new(
+            "Codex MCP generation marker does not match the staged descriptor",
+        ));
+    }
+    let config_path = overlay_path.join("config.toml");
+    if config_path != expected.config_path
+        || digest_codex_private_file(config_path.as_path())? != expected.config_artifact_digest
+    {
+        return Err(CodexShadowHomeError::new(
+            "Codex MCP staged config failed pre-thread digest verification",
+        ));
+    }
+    Ok(expected.clone())
+}
+
+fn materialize_codex_generation_overlay(
+    shared_home_path: PathBuf,
+    account_home_path: PathBuf,
+    managed_root_path: PathBuf,
+    identity: CodexGenerationOverlayIdentity,
+) -> Result<CodexGenerationOverlayDescriptor, CodexShadowHomeError> {
+    let shared_home_path = normalize_absolute_codex_path(shared_home_path.as_path())?;
+    let account_home_path = normalize_absolute_codex_path(account_home_path.as_path())?;
+    let managed_root_path = normalize_absolute_codex_path(managed_root_path.as_path())?;
+    if managed_root_path.starts_with(shared_home_path.as_path()) {
+        return Err(CodexShadowHomeError::new(
+            "Codex generation overlay root must not be inside the shared state home",
+        ));
+    }
+
+    ensure_codex_directory_no_follow(shared_home_path.as_path(), false)?;
+    ensure_codex_directory_no_follow(account_home_path.as_path(), true)?;
+    ensure_codex_directory_no_follow(managed_root_path.as_path(), true)?;
+
+    let policy = CodexHomeOverlayPolicy::v1();
+    let overlay_path = managed_root_path
+        .join(format!("policy-v{}", policy.version))
+        .join(codex_overlay_identity_component(
+            "workspace",
+            identity.workspace_id.as_str(),
+        ))
+        .join(codex_overlay_identity_component(
+            "runtime",
+            identity.runtime_id.as_str(),
+        ))
+        .join(codex_overlay_identity_component(
+            "thread",
+            identity.logical_thread_id.as_str(),
+        ))
+        .join(codex_overlay_identity_component(
+            "boot",
+            identity.gateway_boot_id.as_str(),
+        ))
+        .join(format!("generation-{:020}", identity.process_generation));
+    let overlay_existed = match fs::symlink_metadata(overlay_path.as_path()) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(CodexShadowHomeError::new(format!(
+                "Codex generation overlay path `{}` is not a real directory",
+                overlay_path.display()
+            )));
+        }
+        Ok(_) => true,
+        Err(error) if error.kind() == ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(CodexShadowHomeError::with_context(
+                "inspect Codex generation overlay",
+                overlay_path.as_path(),
+                error,
+            ));
+        }
+    };
+    ensure_codex_directory_no_follow(overlay_path.as_path(), true)?;
+
+    let marker_path = overlay_path.join(CODEX_GENERATION_OVERLAY_MARKER);
+    let marker = if overlay_existed {
+        let marker =
+            read_codex_generation_overlay_marker(marker_path.as_path()).map_err(|error| {
+                CodexShadowHomeError::new(format!(
+                    "stale or unmanaged Codex generation overlay `{}`: {error}",
+                    overlay_path.display()
+                ))
+            })?;
+        if marker.policy_version != policy.version || marker.identity != identity {
+            return Err(CodexShadowHomeError::new(format!(
+                "stale Codex generation overlay identity at `{}`",
+                overlay_path.display()
+            )));
+        }
+        marker
+    } else {
+        let marker = CodexGenerationOverlayMarker {
+            policy_version: policy.version,
+            identity: identity.clone(),
+            materialization_nonce: codex_generation_overlay_nonce(&identity),
+            mcp_artifact: None,
+        };
+        let serialized = serde_json::to_vec(&marker).map_err(|error| {
+            CodexShadowHomeError::new(format!(
+                "serialize Codex generation overlay marker failed: {error}"
+            ))
+        })?;
+        write_new_codex_private_file(marker_path.as_path(), serialized.as_slice())?;
+        marker
+    };
+
+    ensure_codex_private_file(
+        overlay_path.join("config.toml").as_path(),
+        CODEX_PHASE_00_CONTROLLED_CONFIG_V1,
+    )?;
+    for entry_name in policy.local_directory_names {
+        ensure_codex_directory_no_follow(overlay_path.join(entry_name).as_path(), true)?;
+    }
+    for entry_name in policy.shared_directory_names {
+        let source = shared_home_path.join(entry_name);
+        ensure_codex_directory_no_follow(source.as_path(), false)?;
+        ensure_codex_shadow_symlink(
+            shared_home_path.as_path(),
+            overlay_path.as_path(),
+            entry_name,
+        )?;
+    }
+    for entry_name in policy.account_file_names {
+        materialize_codex_account_file(
+            account_home_path.join(entry_name).as_path(),
+            overlay_path.join(entry_name).as_path(),
+        )?;
+    }
+
+    let mcp_artifact =
+        marker
+            .mcp_artifact
+            .as_ref()
+            .map(|artifact| CodexGenerationMcpArtifactDescriptor {
+                config_path: overlay_path.join("config.toml"),
+                config_artifact_digest: artifact.config_artifact_digest.clone(),
+                effective_mcp_servers_fingerprint: artifact
+                    .effective_mcp_servers_fingerprint
+                    .clone(),
+                semantic_restart_fingerprint: artifact.semantic_restart_fingerprint.clone(),
+                bootstrap_path: artifact
+                    .bootstrap_relative_path
+                    .as_deref()
+                    .map(|path| overlay_path.join(path)),
+            });
+    Ok(CodexGenerationOverlayDescriptor {
+        identity,
+        policy_version: policy.version,
+        managed_root_path,
+        effective_home_path: overlay_path,
+        continuation_key: format!("codex:home:{}", shared_home_path.display()),
+        shared_home_path,
+        mcp_artifact,
+        materialization_nonce: marker.materialization_nonce,
+    })
+}
+
+fn codex_overlay_identity_component(label: &str, value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    let mut encoded = String::with_capacity(label.len() + 1 + digest.len() * 2);
+    encoded.push_str(label);
+    encoded.push('-');
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+fn codex_generation_overlay_nonce(identity: &CodexGenerationOverlayIdentity) -> String {
+    let counter = CODEX_GENERATION_OVERLAY_NONCE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let input = format!(
+        "{}:{}:{}:{}:{}:{nanos}:{}:{counter}",
+        identity.workspace_id,
+        identity.runtime_id,
+        identity.logical_thread_id,
+        identity.gateway_boot_id,
+        identity.process_generation,
+        std::process::id()
+    );
+    codex_overlay_identity_component("materialization", input.as_str())
 }
 
 fn resolve_codex_home_path(
@@ -1029,10 +2071,420 @@ fn resolve_codex_home_path(
         })
 }
 
-fn create_dir_all_for_codex_home(path: &Path) -> Result<(), CodexShadowHomeError> {
-    fs::create_dir_all(path).map_err(|error| {
-        CodexShadowHomeError::with_context("create Codex home directory", path, error)
+fn resolve_absolute_codex_path(path: &Path) -> Result<PathBuf, CodexShadowHomeError> {
+    if path.is_absolute() {
+        return normalize_absolute_codex_path(path);
+    }
+    let current_dir = std::env::current_dir().map_err(|error| {
+        CodexShadowHomeError::new(format!("resolve current directory failed: {error}"))
+    })?;
+    normalize_absolute_codex_path(current_dir.join(path).as_path())
+}
+
+fn normalize_absolute_codex_path(path: &Path) -> Result<PathBuf, CodexShadowHomeError> {
+    if !path.is_absolute() {
+        return Err(CodexShadowHomeError::new(format!(
+            "Codex managed path `{}` must be absolute",
+            path.display()
+        )));
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::Normal(part) => normalized.push(part),
+            Component::ParentDir => {
+                return Err(CodexShadowHomeError::new(format!(
+                    "Codex managed path `{}` contains a parent traversal",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+fn ensure_codex_directory_no_follow(
+    path: &Path,
+    owner_only: bool,
+) -> Result<bool, CodexShadowHomeError> {
+    let path = resolve_absolute_codex_path(path)?;
+    let mut current = PathBuf::new();
+    let mut created_leaf = false;
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => {
+                current.push(component.as_os_str());
+                continue;
+            }
+            Component::CurDir => continue,
+            Component::ParentDir => unreachable!("path was normalized above"),
+            Component::Normal(part) => current.push(part),
+        }
+        loop {
+            match fs::symlink_metadata(current.as_path()) {
+                Ok(metadata)
+                    if metadata.file_type().is_symlink()
+                        && !codex_trusted_platform_root_symlink(current.as_path()) =>
+                {
+                    return Err(CodexShadowHomeError::new(format!(
+                        "Codex managed directory `{}` must not traverse a symlink",
+                        current.display()
+                    )));
+                }
+                Ok(metadata)
+                    if metadata.file_type().is_symlink()
+                        && codex_trusted_platform_root_symlink(current.as_path()) =>
+                {
+                    break;
+                }
+                Ok(metadata) if metadata.is_dir() => break,
+                Ok(_) => {
+                    return Err(CodexShadowHomeError::new(format!(
+                        "Codex managed directory component `{}` is not a directory",
+                        current.display()
+                    )));
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    match fs::create_dir(current.as_path()) {
+                        Ok(()) => {
+                            if current == path {
+                                created_leaf = true;
+                            }
+                            break;
+                        }
+                        Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                        Err(error) => {
+                            return Err(CodexShadowHomeError::with_context(
+                                "create Codex managed directory",
+                                current.as_path(),
+                                error,
+                            ));
+                        }
+                    }
+                }
+                Err(error) => {
+                    return Err(CodexShadowHomeError::with_context(
+                        "inspect Codex managed directory",
+                        current.as_path(),
+                        error,
+                    ));
+                }
+            }
+        }
+    }
+    if owner_only {
+        set_codex_owner_only_directory_permissions(path.as_path())?;
+    }
+    Ok(created_leaf)
+}
+
+fn validate_existing_codex_directory_chain_no_follow(
+    path: &Path,
+) -> Result<(), CodexShadowHomeError> {
+    let path = resolve_absolute_codex_path(path)?;
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => {
+                current.push(component.as_os_str());
+                continue;
+            }
+            Component::CurDir => continue,
+            Component::ParentDir => unreachable!("path was normalized above"),
+            Component::Normal(part) => current.push(part),
+        }
+        let metadata = fs::symlink_metadata(current.as_path()).map_err(|error| {
+            CodexShadowHomeError::with_context(
+                "validate Codex managed directory chain",
+                current.as_path(),
+                error,
+            )
+        })?;
+        if (metadata.file_type().is_symlink()
+            && !codex_trusted_platform_root_symlink(current.as_path()))
+            || (!metadata.file_type().is_symlink() && !metadata.is_dir())
+        {
+            return Err(CodexShadowHomeError::new(format!(
+                "Codex managed directory chain `{}` is not a real directory",
+                current.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// macOS exposes a small set of immutable system roots as compatibility
+/// symlinks (for example `/var -> /private/var`). These precede every
+/// application-owned component and are not part of the managed Pioneer tree.
+/// All other symlinks, including a configured managed root, remain rejected.
+fn codex_trusted_platform_root_symlink(path: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        if !matches!(path.to_str(), Some("/var" | "/tmp" | "/etc")) {
+            return false;
+        }
+        return fs::canonicalize(path)
+            .ok()
+            .and_then(|resolved| fs::metadata(resolved).ok())
+            .is_some_and(|metadata| metadata.is_dir());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+fn ensure_codex_private_file(
+    path: &Path,
+    initial_contents: &[u8],
+) -> Result<(), CodexShadowHomeError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(CodexShadowHomeError::new(format!(
+                "Codex private file `{}` must be a real file",
+                path.display()
+            )));
+        }
+        Ok(_) => set_codex_owner_only_file_permissions(path),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            write_new_codex_private_file(path, initial_contents)
+        }
+        Err(error) => Err(CodexShadowHomeError::with_context(
+            "inspect Codex private file",
+            path,
+            error,
+        )),
+    }
+}
+
+fn overwrite_codex_private_file(path: &Path, contents: &[u8]) -> Result<(), CodexShadowHomeError> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        CodexShadowHomeError::with_context("inspect Codex private file for staging", path, error)
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(CodexShadowHomeError::new(format!(
+            "Codex private file `{}` must be a real file",
+            path.display()
+        )));
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path).map_err(|error| {
+        CodexShadowHomeError::with_context("open Codex private file for staging", path, error)
+    })?;
+    file.write_all(contents).map_err(|error| {
+        CodexShadowHomeError::with_context("write Codex private file for staging", path, error)
+    })?;
+    file.sync_all().map_err(|error| {
+        CodexShadowHomeError::with_context("sync Codex private file for staging", path, error)
+    })?;
+    set_codex_owner_only_file_permissions(path)
+}
+
+fn digest_codex_private_file(path: &Path) -> Result<String, CodexShadowHomeError> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        CodexShadowHomeError::with_context("inspect staged Codex private file", path, error)
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 1024 * 1024 {
+        return Err(CodexShadowHomeError::new(format!(
+            "staged Codex private file `{}` is invalid",
+            path.display()
+        )));
+    }
+    let mut contents = Vec::with_capacity(metadata.len() as usize);
+    open_codex_file_no_follow(path)?
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut contents)
+        .map_err(|error| {
+            CodexShadowHomeError::with_context("read staged Codex private file", path, error)
+        })?;
+    Ok(sha256_hex_bytes(contents.as_slice()))
+}
+
+fn validate_sha256_identity(value: &str, label: &str) -> Result<(), CodexShadowHomeError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(CodexShadowHomeError::new(format!("invalid {label}")));
+    }
+    Ok(())
+}
+
+fn sha256_hex_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+fn write_new_codex_private_file(path: &Path, contents: &[u8]) -> Result<(), CodexShadowHomeError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path).map_err(|error| {
+        CodexShadowHomeError::with_context("create Codex private file", path, error)
+    })?;
+    file.write_all(contents).map_err(|error| {
+        CodexShadowHomeError::with_context("write Codex private file", path, error)
+    })?;
+    file.sync_all().map_err(|error| {
+        CodexShadowHomeError::with_context("sync Codex private file", path, error)
+    })?;
+    set_codex_owner_only_file_permissions(path)
+}
+
+fn open_codex_file_no_follow(path: &Path) -> Result<File, CodexShadowHomeError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options
+        .open(path)
+        .map_err(|error| CodexShadowHomeError::with_context("open Codex managed file", path, error))
+}
+
+fn read_codex_generation_overlay_marker(
+    path: &Path,
+) -> Result<CodexGenerationOverlayMarker, CodexShadowHomeError> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        CodexShadowHomeError::with_context("inspect Codex generation overlay marker", path, error)
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(CodexShadowHomeError::new(format!(
+            "Codex generation overlay marker `{}` must be a real file",
+            path.display()
+        )));
+    }
+    let mut serialized = Vec::new();
+    open_codex_file_no_follow(path)?
+        .take(64 * 1024)
+        .read_to_end(&mut serialized)
+        .map_err(|error| {
+            CodexShadowHomeError::with_context("read Codex generation overlay marker", path, error)
+        })?;
+    serde_json::from_slice(serialized.as_slice()).map_err(|error| {
+        CodexShadowHomeError::new(format!(
+            "decode Codex generation overlay marker `{}` failed: {error}",
+            path.display()
+        ))
     })
+}
+
+fn materialize_codex_account_file(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), CodexShadowHomeError> {
+    match fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(CodexShadowHomeError::new(format!(
+                "Codex account file destination `{}` must be a real file",
+                destination.display()
+            )));
+        }
+        Ok(_) => return set_codex_owner_only_file_permissions(destination),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(CodexShadowHomeError::with_context(
+                "inspect Codex account file destination",
+                destination,
+                error,
+            ));
+        }
+    }
+    let source_metadata = match fs::symlink_metadata(source) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(CodexShadowHomeError::with_context(
+                "inspect Codex account file source",
+                source,
+                error,
+            ));
+        }
+    };
+    if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
+        return Err(CodexShadowHomeError::new(format!(
+            "Codex account file source `{}` must be a real file",
+            source.display()
+        )));
+    }
+    let mut source_file = open_codex_file_no_follow(source)?;
+    let mut destination_options = OpenOptions::new();
+    destination_options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        destination_options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut destination_file = destination_options.open(destination).map_err(|error| {
+        CodexShadowHomeError::with_context(
+            "create Codex account materialization",
+            destination,
+            error,
+        )
+    })?;
+    std::io::copy(&mut source_file, &mut destination_file).map_err(|error| {
+        CodexShadowHomeError::with_context("materialize Codex account file", destination, error)
+    })?;
+    destination_file.sync_all().map_err(|error| {
+        CodexShadowHomeError::with_context("sync Codex account file", destination, error)
+    })?;
+    set_codex_owner_only_file_permissions(destination)
+}
+
+#[cfg(unix)]
+fn set_codex_owner_only_directory_permissions(path: &Path) -> Result<(), CodexShadowHomeError> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|error| {
+        CodexShadowHomeError::with_context("set Codex directory permissions", path, error)
+    })
+}
+
+#[cfg(not(unix))]
+fn set_codex_owner_only_directory_permissions(_path: &Path) -> Result<(), CodexShadowHomeError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_codex_owner_only_file_permissions(path: &Path) -> Result<(), CodexShadowHomeError> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
+        CodexShadowHomeError::with_context("set Codex file permissions", path, error)
+    })
+}
+
+#[cfg(not(unix))]
+fn set_codex_owner_only_file_permissions(_path: &Path) -> Result<(), CodexShadowHomeError> {
+    Ok(())
+}
+
+fn create_dir_all_for_codex_home(path: &Path) -> Result<(), CodexShadowHomeError> {
+    ensure_codex_directory_no_follow(path, false).map(|_| ())
 }
 
 fn ensure_codex_private_shadow_entry(
@@ -1059,6 +2511,19 @@ fn ensure_codex_shadow_symlink(
 ) -> Result<(), CodexShadowHomeError> {
     let target = shared_home_path.join(entry_name);
     let link = shadow_home_path.join(entry_name);
+    let target_metadata = fs::symlink_metadata(target.as_path()).map_err(|error| {
+        CodexShadowHomeError::with_context(
+            "inspect Codex shared home allowlist target",
+            target.as_path(),
+            error,
+        )
+    })?;
+    if target_metadata.file_type().is_symlink() || !target_metadata.is_dir() {
+        return Err(CodexShadowHomeError::new(format!(
+            "Codex shared home allowlist target `{}` must be a real directory",
+            target.display()
+        )));
+    }
     match read_codex_shadow_link_state(link.as_path())? {
         CodexShadowLinkState::Missing => {
             create_codex_shadow_symlink(target.as_path(), link.as_path())
@@ -1080,14 +2545,10 @@ fn ensure_codex_shadow_symlink(
             if resolved_existing == target {
                 return Ok(());
             }
-            fs::remove_file(link.as_path()).map_err(|error| {
-                CodexShadowHomeError::with_context(
-                    "replace Codex shadow home symlink",
-                    link.as_path(),
-                    error,
-                )
-            })?;
-            create_codex_shadow_symlink(target.as_path(), link.as_path())
+            Err(CodexShadowHomeError::new(format!(
+                "Cannot create Codex shadow home because `{}` points outside the allowlisted target",
+                link.display()
+            )))
         }
     }
 }
@@ -1586,6 +3047,8 @@ pub struct CodexAccountReadResponse {
 pub struct CodexThreadStartParams {
     pub cwd: String,
     pub approval_policy: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ephemeral: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2815,6 +4278,20 @@ struct PendingCodexJsonlRpcRequest {
     response_tx: oneshot::Sender<Result<JsonValue, CodexJsonlRpcClientError>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexServerRequestTerminalState {
+    DuplicateId,
+    Evicted,
+    IngressClosed,
+    TimedOut,
+    Shutdown,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingCodexServerRequest {
+    deadline: Instant,
+}
+
 struct CodexJsonlRpcEventSinks {
     notification_ingress: OrderedEventIngress<CodexJsonlRpcNotificationEvent>,
     server_request_tx: mpsc::Sender<CodexJsonlRpcServerRequest>,
@@ -3013,12 +4490,18 @@ async fn run_codex_jsonl_rpc_worker<W>(
     mut command_rx: mpsc::Receiver<CodexJsonlRpcCommand>,
     mut incoming_rx: mpsc::Receiver<CodexJsonlRpcIncoming>,
     event_sinks: CodexJsonlRpcEventSinks,
+    max_pending_server_requests: usize,
+    server_request_timeout: Duration,
 ) where
     W: AsyncWrite + Send + Unpin + 'static,
 {
     let mut pending = PendingCodexJsonlRpcRequests::default();
-    let mut pending_server_requests = HashMap::<JsonlRpcId, ()>::new();
+    let mut pending_server_requests = HashMap::<JsonlRpcId, PendingCodexServerRequest>::new();
     let close_error = loop {
+        let next_server_request_deadline = pending_server_requests
+            .values()
+            .map(|pending| pending.deadline)
+            .min();
         tokio::select! {
             command = command_rx.recv() => {
                 match command {
@@ -3072,11 +4555,21 @@ async fn run_codex_jsonl_rpc_worker<W>(
                         let _ = pending.remove(&id);
                     }
                     Some(CodexJsonlRpcCommand::Shutdown) => {
+                        complete_all_codex_server_requests(
+                            &mut writer,
+                            &mut pending_server_requests,
+                            CodexServerRequestTerminalState::Shutdown,
+                        ).await;
                         break CodexJsonlRpcClientError::TransportClosed {
                             message: "codex jsonl-rpc client shut down".to_owned(),
                         };
                     }
                     None => {
+                        complete_all_codex_server_requests(
+                            &mut writer,
+                            &mut pending_server_requests,
+                            CodexServerRequestTerminalState::Shutdown,
+                        ).await;
                         break CodexJsonlRpcClientError::TransportClosed {
                             message: "codex jsonl-rpc command channel closed".to_owned(),
                         };
@@ -3091,24 +4584,49 @@ async fn run_codex_jsonl_rpc_worker<W>(
                             &mut pending,
                             &mut pending_server_requests,
                             &event_sinks,
+                            max_pending_server_requests,
+                            server_request_timeout,
+                            &mut writer,
                         ).await;
                     }
                     Some(CodexJsonlRpcIncoming::DecodeError(error)) => {
+                        complete_all_codex_server_requests(
+                            &mut writer,
+                            &mut pending_server_requests,
+                            CodexServerRequestTerminalState::Shutdown,
+                        ).await;
                         break CodexJsonlRpcClientError::TransportClosed {
                             message: format!("failed to decode codex jsonl-rpc message: {error}"),
                         };
                     }
                     Some(CodexJsonlRpcIncoming::Closed) => {
+                        complete_all_codex_server_requests(
+                            &mut writer,
+                            &mut pending_server_requests,
+                            CodexServerRequestTerminalState::Shutdown,
+                        ).await;
                         break CodexJsonlRpcClientError::TransportClosed {
                             message: "codex jsonl-rpc stdout closed".to_owned(),
                         };
                     }
                     None => {
+                        complete_all_codex_server_requests(
+                            &mut writer,
+                            &mut pending_server_requests,
+                            CodexServerRequestTerminalState::Shutdown,
+                        ).await;
                         break CodexJsonlRpcClientError::TransportClosed {
                             message: "codex jsonl-rpc reader closed".to_owned(),
                         };
                     }
                 }
+            }
+            _ = wait_for_codex_server_request_deadline(next_server_request_deadline), if next_server_request_deadline.is_some() => {
+                complete_expired_codex_server_requests(
+                    &mut writer,
+                    &mut pending_server_requests,
+                    Instant::now(),
+                ).await;
             }
         }
     };
@@ -3122,8 +4640,11 @@ async fn run_codex_jsonl_rpc_worker<W>(
 async fn handle_codex_jsonl_rpc_incoming(
     message: JsonlRpcIncomingMessage,
     pending: &mut PendingCodexJsonlRpcRequests,
-    pending_server_requests: &mut HashMap<JsonlRpcId, ()>,
+    pending_server_requests: &mut HashMap<JsonlRpcId, PendingCodexServerRequest>,
     event_sinks: &CodexJsonlRpcEventSinks,
+    max_pending_server_requests: usize,
+    server_request_timeout: Duration,
+    writer: &mut (impl AsyncWrite + Send + Unpin),
 ) {
     match message {
         JsonlRpcIncomingMessage::Response(response) => {
@@ -3155,7 +4676,15 @@ async fn handle_codex_jsonl_rpc_incoming(
             dispatch_notification(notification.into(), event_sinks).await;
         }
         JsonlRpcIncomingMessage::ServerRequest(request) => {
-            dispatch_server_request(request.into(), pending_server_requests, event_sinks).await;
+            dispatch_server_request(
+                request.into(),
+                pending_server_requests,
+                event_sinks,
+                max_pending_server_requests,
+                server_request_timeout,
+                writer,
+            )
+            .await;
         }
     }
 }
@@ -3191,8 +4720,11 @@ async fn dispatch_notification(
 
 async fn dispatch_server_request(
     request: CodexJsonlRpcServerRequest,
-    pending_server_requests: &mut HashMap<JsonlRpcId, ()>,
+    pending_server_requests: &mut HashMap<JsonlRpcId, PendingCodexServerRequest>,
     event_sinks: &CodexJsonlRpcEventSinks,
+    max_pending_server_requests: usize,
+    server_request_timeout: Duration,
+    writer: &mut (impl AsyncWrite + Send + Unpin),
 ) {
     if pending_server_requests.contains_key(&request.id) {
         emit_diagnostic(
@@ -3200,17 +4732,48 @@ async fn dispatch_server_request(
             CodexJsonlRpcClientDiagnostic {
                 kind: CodexJsonlRpcClientDiagnosticKind::DuplicateServerRequestId,
                 message: format!(
-                    "duplicate codex jsonl-rpc server request id `{}`; request dropped",
+                    "duplicate codex jsonl-rpc server request id `{}`; request rejected",
                     request.id
                 ),
-                method: Some(request.method),
-                raw: Some(request.raw),
+                method: Some(request.method.clone()),
+                raw: Some(request.raw.clone()),
             },
         );
+        pending_server_requests.remove(&request.id);
+        let _ = write_codex_server_request_terminal_error(
+            writer,
+            request.id,
+            CodexServerRequestTerminalState::DuplicateId,
+        )
+        .await;
         return;
     }
 
-    pending_server_requests.insert(request.id.clone(), ());
+    if pending_server_requests.len() >= max_pending_server_requests {
+        emit_diagnostic(
+            event_sinks,
+            CodexJsonlRpcClientDiagnostic {
+                kind: CodexJsonlRpcClientDiagnosticKind::ServerRequestChannelFull,
+                message: "codex jsonl-rpc pending server request limit reached".to_owned(),
+                method: Some(request.method.clone()),
+                raw: Some(request.raw.clone()),
+            },
+        );
+        let _ = write_codex_server_request_terminal_error(
+            writer,
+            request.id,
+            CodexServerRequestTerminalState::Evicted,
+        )
+        .await;
+        return;
+    }
+
+    pending_server_requests.insert(
+        request.id.clone(),
+        PendingCodexServerRequest {
+            deadline: Instant::now() + server_request_timeout,
+        },
+    );
     if let Err(error) = event_sinks.server_request_tx.send(request).await {
         let request = error.0;
         pending_server_requests.remove(&request.id);
@@ -3223,7 +4786,92 @@ async fn dispatch_server_request(
                 raw: Some(request.raw),
             },
         );
+        let _ = write_codex_server_request_terminal_error(
+            writer,
+            request.id,
+            CodexServerRequestTerminalState::IngressClosed,
+        )
+        .await;
     }
+}
+
+async fn wait_for_codex_server_request_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+async fn complete_expired_codex_server_requests(
+    writer: &mut (impl AsyncWrite + Send + Unpin),
+    pending: &mut HashMap<JsonlRpcId, PendingCodexServerRequest>,
+    now: Instant,
+) {
+    let expired = pending
+        .iter()
+        .filter_map(|(id, request)| (request.deadline <= now).then_some(id.clone()))
+        .collect::<Vec<_>>();
+    for id in expired {
+        pending.remove(&id);
+        let _ = write_codex_server_request_terminal_error(
+            writer,
+            id,
+            CodexServerRequestTerminalState::TimedOut,
+        )
+        .await;
+    }
+}
+
+async fn complete_all_codex_server_requests(
+    writer: &mut (impl AsyncWrite + Send + Unpin),
+    pending: &mut HashMap<JsonlRpcId, PendingCodexServerRequest>,
+    terminal: CodexServerRequestTerminalState,
+) {
+    let ids = pending.drain().map(|(id, _)| id).collect::<Vec<_>>();
+    for id in ids {
+        let _ = write_codex_server_request_terminal_error(writer, id, terminal).await;
+    }
+}
+
+async fn write_codex_server_request_terminal_error(
+    writer: &mut (impl AsyncWrite + Send + Unpin),
+    id: JsonlRpcId,
+    terminal: CodexServerRequestTerminalState,
+) -> serde_json::Result<()> {
+    let (code, message) = match terminal {
+        CodexServerRequestTerminalState::DuplicateId => (
+            CODEX_SERVER_REQUEST_DUPLICATE_ID_CODE,
+            "duplicate server request id",
+        ),
+        CodexServerRequestTerminalState::Evicted => (
+            CODEX_SERVER_REQUEST_HANDLER_UNAVAILABLE_CODE,
+            "server request capacity exhausted",
+        ),
+        CodexServerRequestTerminalState::IngressClosed => (
+            CODEX_SERVER_REQUEST_HANDLER_UNAVAILABLE_CODE,
+            "server request handler unavailable",
+        ),
+        CodexServerRequestTerminalState::TimedOut => (
+            CODEX_SERVER_REQUEST_TIMEOUT_CODE,
+            "server request timed out",
+        ),
+        CodexServerRequestTerminalState::Shutdown => (
+            CODEX_SERVER_REQUEST_HANDLER_UNAVAILABLE_CODE,
+            "server request cancelled during shutdown",
+        ),
+    };
+    write_jsonl_rpc_message(
+        writer,
+        &server_request_answer_to_response(
+            id,
+            CodexJsonlRpcServerRequestAnswer::Error {
+                code,
+                message: message.to_owned(),
+                data: None,
+            },
+        ),
+    )
+    .await
 }
 
 fn emit_diagnostic(
@@ -3306,6 +4954,27 @@ mod tests {
             notification_capacity,
             server_request_capacity,
             diagnostic_capacity,
+        );
+        (client, BufReader::new(server_read), server_write)
+    }
+
+    fn client_pair_with_server_request_timeout(
+        timeout: Duration,
+    ) -> (
+        CodexJsonlRpcClient,
+        BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+        tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    ) {
+        let (client_stream, server_stream) = tokio::io::duplex(8192);
+        let (client_read, client_write) = split(client_stream);
+        let (server_read, server_write) = split(server_stream);
+        let client = CodexJsonlRpcClient::new_with_server_request_policy(
+            BufReader::new(client_read),
+            client_write,
+            DEFAULT_INCOMING_QUEUE_CAPACITY,
+            DEFAULT_INCOMING_QUEUE_CAPACITY,
+            DEFAULT_COMMAND_QUEUE_CAPACITY,
+            timeout,
         );
         (client, BufReader::new(server_read), server_write)
     }
@@ -4338,6 +6007,105 @@ while read line; do :; done
         );
     }
 
+    #[tokio::test]
+    async fn codex_server_request_timeout_writes_one_bounded_error() {
+        let (client, mut server_reader, mut server_writer) =
+            client_pair_with_server_request_timeout(Duration::from_millis(20));
+        let mut server_requests = client
+            .take_server_request_receiver()
+            .expect("server request receiver should be available");
+        server_writer
+            .write_all(b"{\"method\":\"future/request\",\"id\":91,\"params\":{}}\n")
+            .await
+            .expect("write server request");
+        let request = server_requests.recv().await.expect("server request");
+        let response =
+            tokio::time::timeout(Duration::from_secs(1), read_server_line(&mut server_reader))
+                .await
+                .expect("timeout response should be bounded");
+        assert_eq!(response["id"], json!(91));
+        assert_eq!(
+            response["error"]["code"],
+            json!(CODEX_SERVER_REQUEST_TIMEOUT_CODE)
+        );
+        assert!(matches!(
+            client
+                .respond_to_server_request(request.id, json!({"late": true}))
+                .await,
+            Err(CodexJsonlRpcClientError::ServerRequestNotPending { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn codex_server_request_shutdown_drains_pending_with_error() {
+        let (client, mut server_reader, mut server_writer) = client_pair();
+        let mut server_requests = client
+            .take_server_request_receiver()
+            .expect("server request receiver should be available");
+        server_writer
+            .write_all(b"{\"method\":\"future/request\",\"id\":92,\"params\":{}}\n")
+            .await
+            .expect("write server request");
+        let _request = server_requests.recv().await.expect("server request");
+        client
+            .shutdown()
+            .await
+            .expect("shutdown command should enqueue");
+        let response = read_server_line(&mut server_reader).await;
+        assert_eq!(response["id"], json!(92));
+        assert_eq!(
+            response["error"]["code"],
+            json!(CODEX_SERVER_REQUEST_HANDLER_UNAVAILABLE_CODE)
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_server_request_closed_ingress_receives_error() {
+        let (client, mut server_reader, mut server_writer) = client_pair();
+        drop(
+            client
+                .take_server_request_receiver()
+                .expect("server request receiver should be available"),
+        );
+        server_writer
+            .write_all(b"{\"method\":\"future/request\",\"id\":93,\"params\":{}}\n")
+            .await
+            .expect("write server request");
+        let response = read_server_line(&mut server_reader).await;
+        assert_eq!(response["id"], json!(93));
+        assert_eq!(
+            response["error"]["code"],
+            json!(CODEX_SERVER_REQUEST_HANDLER_UNAVAILABLE_CODE)
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_server_request_duplicate_id_terminalizes_original_lane() {
+        let (client, mut server_reader, mut server_writer) = client_pair();
+        let mut server_requests = client
+            .take_server_request_receiver()
+            .expect("server request receiver should be available");
+        server_writer
+            .write_all(
+                b"{\"method\":\"future/one\",\"id\":94,\"params\":{}}\n{\"method\":\"future/two\",\"id\":94,\"params\":{}}\n",
+            )
+            .await
+            .expect("write duplicate requests");
+        let original = server_requests.recv().await.expect("original request");
+        let response = read_server_line(&mut server_reader).await;
+        assert_eq!(response["id"], json!(94));
+        assert_eq!(
+            response["error"]["code"],
+            json!(CODEX_SERVER_REQUEST_DUPLICATE_ID_CODE)
+        );
+        assert!(matches!(
+            client
+                .respond_to_server_request(original.id, json!({"late": true}))
+                .await,
+            Err(CodexJsonlRpcClientError::ServerRequestNotPending { .. })
+        ));
+    }
+
     struct FakeCodexAppServer {
         client: CodexAppServerClient,
         server_reader: BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
@@ -4392,6 +6160,179 @@ while read line; do :; done
                 .await
                 .expect("fake server should write notification");
         }
+    }
+
+    fn empty_codex_config_read_result() -> JsonValue {
+        json!({
+            "config": {
+                "mcp_servers": {},
+                "plugins": {},
+                "marketplaces": {},
+                "apps": null,
+                "projects": null,
+                "features": {
+                    "apps": false,
+                    "enable_mcp_apps": false,
+                    "plugins": false,
+                    "remote_plugin": false,
+                    "skill_mcp_dependency_install": false
+                }
+            },
+            "origins": {},
+            "layers": [
+                {
+                    "name": { "type": "user", "file": "/managed/config.toml", "profile": null },
+                    "version": "sha256:user",
+                    "config": {
+                        "features": {
+                            "apps": false,
+                            "enable_mcp_apps": false,
+                            "plugins": false,
+                            "remote_plugin": false,
+                            "skill_mcp_dependency_install": false
+                        }
+                    }
+                },
+                {
+                    "name": { "type": "project", "dotCodexFolder": "/workspace/.codex" },
+                    "version": "sha256:project",
+                    "config": {}
+                }
+            ]
+        })
+    }
+
+    #[tokio::test]
+    async fn codex_config_read_sends_exact_read_only_request_and_decodes_safe_evidence() {
+        let mut fake = FakeCodexAppServer::new();
+        let client = fake.client.clone();
+        let read = tokio::spawn(async move {
+            client
+                .config_read("/workspace", Duration::from_secs(2))
+                .await
+        });
+
+        let request = fake.read_message().await;
+        assert_eq!(request["method"], json!("config/read"));
+        assert_eq!(
+            request["params"],
+            json!({ "cwd": "/workspace", "includeLayers": true })
+        );
+        fake.write_result_response(request["id"].clone(), empty_codex_config_read_result())
+            .await;
+
+        let snapshot = read
+            .await
+            .expect("config/read task should join")
+            .expect("config/read should decode");
+        assert!(snapshot.effective.mcp_server_names.is_empty());
+        assert!(snapshot.effective.isolation_features.all_disabled());
+        assert_eq!(snapshot.layers.len(), 2);
+        assert_eq!(snapshot.layers[0].source, CodexConfigLayerSourceKind::User);
+        assert_eq!(
+            snapshot.layers[1].source,
+            CodexConfigLayerSourceKind::Project
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_config_read_rejects_malformed_or_missing_security_evidence() {
+        for malformed in [
+            json!({ "config": {}, "origins": {}, "layers": [] }),
+            json!({
+                "config": {
+                    "mcp_servers": [],
+                    "plugins": {},
+                    "marketplaces": {},
+                    "apps": null,
+                    "projects": null,
+                    "features": {}
+                },
+                "origins": {},
+                "layers": []
+            }),
+            json!({
+                "config": {
+                    "mcp_servers": {},
+                    "plugins": {},
+                    "marketplaces": {},
+                    "apps": null,
+                    "projects": null,
+                    "features": {
+                        "apps": false,
+                        "enable_mcp_apps": false,
+                        "plugins": false,
+                        "remote_plugin": false,
+                        "skill_mcp_dependency_install": false
+                    }
+                },
+                "origins": {}
+            }),
+        ] {
+            let mut fake = FakeCodexAppServer::new();
+            let client = fake.client.clone();
+            let read = tokio::spawn(async move {
+                client
+                    .config_read("/workspace", Duration::from_secs(2))
+                    .await
+            });
+            let request = fake.read_message().await;
+            fake.write_result_response(request["id"].clone(), malformed)
+                .await;
+            let error = read
+                .await
+                .expect("config/read task should join")
+                .expect_err("malformed config evidence must fail closed");
+            assert!(matches!(error, CodexJsonlRpcClientError::Decode { .. }));
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_config_read_timeout_is_bounded() {
+        let mut fake = FakeCodexAppServer::new();
+        let client = fake.client.clone();
+        let read = tokio::spawn(async move {
+            client
+                .config_read("/workspace", Duration::from_millis(20))
+                .await
+        });
+        let request = fake.read_message().await;
+        assert_eq!(request["method"], json!("config/read"));
+        let error = read
+            .await
+            .expect("config/read task should join")
+            .expect_err("missing config/read response must time out");
+        assert!(matches!(
+            error,
+            CodexJsonlRpcClientError::RequestTimeout { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn codex_config_read_thread_metadata_uses_persisted_cwd() {
+        let mut fake = FakeCodexAppServer::new();
+        let client = fake.client.clone();
+        let read = tokio::spawn(async move {
+            client
+                .thread_read_metadata("native-thread", Duration::from_secs(2))
+                .await
+        });
+        let request = fake.read_message().await;
+        assert_eq!(request["method"], json!("thread/read"));
+        assert_eq!(
+            request["params"],
+            json!({ "threadId": "native-thread", "includeTurns": false })
+        );
+        fake.write_result_response(
+            request["id"].clone(),
+            json!({ "thread": { "id": "native-thread", "cwd": "/persisted/workspace" } }),
+        )
+        .await;
+        let metadata = read
+            .await
+            .expect("thread/read task should join")
+            .expect("thread metadata should decode");
+        assert_eq!(metadata.cwd, "/persisted/workspace");
     }
 
     #[tokio::test]
@@ -4521,6 +6462,7 @@ while read line; do :; done
                     CodexThreadStartParams {
                         cwd: "/tmp/project".to_owned(),
                         approval_policy: "on-request".to_owned(),
+                        ephemeral: false,
                         sandbox: Some("workspace-write".to_owned()),
                         permissions: None,
                         model: Some("gpt-5".to_owned()),
@@ -4655,6 +6597,7 @@ while read line; do :; done
                     CodexThreadStartParams {
                         cwd: "/tmp/project".to_owned(),
                         approval_policy: "never".to_owned(),
+                        ephemeral: false,
                         sandbox: Some("danger-full-access".to_owned()),
                         permissions: None,
                         model: None,
@@ -5095,6 +7038,7 @@ while read line; do :; done
                     CodexThreadStartParams {
                         cwd: "/tmp/project".to_owned(),
                         approval_policy: "never".to_owned(),
+                        ephemeral: false,
                         sandbox: Some("danger-full-access".to_owned()),
                         permissions: None,
                         model: None,
@@ -5142,12 +7086,48 @@ while read line; do :; done
             shadow_home_path: None,
             cwd: Some(root.to_path_buf()),
             home_dir: None,
-            env: BTreeMap::new(),
+            env: SensitiveEnvironment::new(),
             initialize_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(5),
             shutdown_grace: Duration::from_millis(100),
             stderr_ring_lines: 16,
         }
+    }
+
+    fn codex_overlay_identity(thread_id: &str, generation: u64) -> CodexGenerationOverlayIdentity {
+        CodexGenerationOverlayIdentity::new(
+            "workspace-a",
+            "codex-personal",
+            thread_id,
+            "gateway-boot-a",
+            generation,
+        )
+        .expect("overlay identity should be valid")
+    }
+
+    fn codex_overlay_mcp_artifact(
+        bootstrap_path: &Path,
+        manifest_byte: char,
+    ) -> CodexManagedMcpConfigArtifact {
+        let hash = manifest_byte.to_string().repeat(64);
+        serialize_codex_managed_mcp_config(CodexManagedMcpConfigInput {
+            semantic: CodexManagedMcpSemanticInput {
+                canonical_manifest_hash: hash.clone(),
+                provider_manifest_hash: hash.clone(),
+                provider_contract_fingerprint: "f".repeat(64),
+                overlay_policy_version: CodexHomeOverlayPolicy::v1().version,
+                tools: vec![CodexManagedMcpToolIdentity {
+                    canonical_callable_name: "mcp__server__tool".to_owned(),
+                    canonical_schema_fingerprint: "1".repeat(64),
+                    transformed_schema_fingerprint: "2".repeat(64),
+                    transform_contract_fingerprint: "3".repeat(64),
+                    transformed_fingerprint: "4".repeat(64),
+                }],
+            },
+            helper_path: Some(PathBuf::from("/opt/pioneer/pioneer")),
+            bootstrap_path: Some(bootstrap_path.to_path_buf()),
+        })
+        .expect("managed overlay MCP artifact")
     }
 
     #[cfg(unix)]
@@ -5208,13 +7188,15 @@ while read line; do :; done
 
     #[test]
     #[cfg(unix)]
-    fn codex_home_auth_overlay_materializes_shared_symlinks_and_private_auth() {
+    fn codex_home_auth_overlay_projects_only_v1_allowlist_and_private_auth() {
         let root = unique_temp_dir("codex-home-auth-overlay");
         let shared = root.join("shared");
         let shadow = root.join("shadow");
         fs::create_dir_all(shared.as_path()).expect("create shared home");
         fs::create_dir_all(shadow.as_path()).expect("create shadow home");
         fs::write(shared.join("config.toml"), "shared-config").expect("write shared config");
+        fs::create_dir_all(shared.join("plugins")).expect("create user plugins");
+        fs::create_dir_all(shared.join("cache")).expect("create user cache");
         fs::write(shared.join("auth.json"), "shared-auth").expect("write shared auth");
         fs::write(shared.join("models_cache.json"), "shared-models")
             .expect("write shared models cache");
@@ -5236,13 +7218,12 @@ while read line; do :; done
             shared.join("sessions").as_path(),
         );
         assert_symlink_target(
-            shadow.join("cache").as_path(),
-            shared.join("cache").as_path(),
+            shadow.join("skills").as_path(),
+            shared.join("skills").as_path(),
         );
-        assert_symlink_target(
-            shadow.join("config.toml").as_path(),
-            shared.join("config.toml").as_path(),
-        );
+        assert!(!shadow.join("cache").exists());
+        assert!(!shadow.join("plugins").exists());
+        assert!(!shadow.join("config.toml").exists());
         assert!(
             !fs::symlink_metadata(shadow.join("auth.json"))
                 .expect("shadow auth metadata")
@@ -5311,6 +7292,397 @@ while read line; do :; done
             .expect_err("private auth symlink should block materialization");
 
         assert!(error.to_string().contains("must be a real file"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn codex_overlay_policy_is_versioned_owner_only_and_default_deny() {
+        let root = unique_temp_dir("codex-overlay-policy");
+        let shared = root.join("shared");
+        let account = root.join("account");
+        let managed = root.join("managed");
+        fs::create_dir_all(shared.join("plugins")).expect("create plugins");
+        fs::create_dir_all(shared.join("marketplaces")).expect("create marketplaces");
+        fs::create_dir_all(shared.join("worktrees")).expect("create worktrees");
+        fs::write(shared.join("config.toml"), "[mcp_servers.host]").expect("write host config");
+        fs::create_dir_all(account.as_path()).expect("create account home");
+        fs::write(account.join("auth.json"), "account-secret").expect("write account auth");
+        fs::write(account.join("models_cache.json"), "models").expect("write account models");
+        let mut config = codex_account_probe_config(root.as_path(), Path::new("codex"));
+        config.home_path = shared.to_string_lossy().into_owned();
+        config.shadow_home_path = Some(account.to_string_lossy().into_owned());
+
+        let (process, descriptor) = codex_generation_app_server_process_config(
+            &config,
+            managed.as_path(),
+            codex_overlay_identity("thread-a", 1),
+        )
+        .expect("generation overlay should materialize");
+        let overlay = descriptor.effective_home_path.as_path();
+
+        assert_eq!(descriptor.policy_version, 1);
+        assert_eq!(CodexHomeOverlayPolicy::v1().version, 1);
+        assert_eq!(
+            process.env.expose("CODEX_SQLITE_HOME"),
+            Some(shared.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            process.home_path.as_deref(),
+            Some(overlay.to_string_lossy().as_ref())
+        );
+        for entry_name in CODEX_SHARED_HOME_ENTRY_NAMES_V1 {
+            assert_symlink_target(
+                overlay.join(entry_name).as_path(),
+                shared.join(entry_name).as_path(),
+            );
+        }
+        for denied in ["plugins", "marketplaces", "worktrees", "host-unknown"] {
+            assert!(
+                !overlay.join(denied).exists(),
+                "denied host entry `{denied}` was projected"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(overlay.join("config.toml")).expect("read generated config"),
+            std::str::from_utf8(CODEX_PHASE_00_CONTROLLED_CONFIG_V1)
+                .expect("controlled config is UTF-8")
+        );
+        assert_eq!(
+            fs::read_to_string(overlay.join("auth.json")).expect("read account material"),
+            "account-secret"
+        );
+        assert_eq!(
+            fs::metadata(overlay)
+                .expect("overlay metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(overlay.join("config.toml"))
+                .expect("config metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        cleanup_codex_generation_overlay(&descriptor).expect("clean overlay");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn codex_overlay_concurrent_threads_and_generations_are_disjoint_and_idempotent() {
+        let root = unique_temp_dir("codex-overlay-concurrency");
+        let shared = root.join("shared");
+        let managed = root.join("managed");
+        fs::create_dir_all(shared.as_path()).expect("create shared home");
+        let mut config = codex_account_probe_config(root.as_path(), Path::new("codex"));
+        config.home_path = shared.to_string_lossy().into_owned();
+
+        let (_, first) = codex_generation_app_server_process_config(
+            &config,
+            managed.as_path(),
+            codex_overlay_identity("thread-a", 1),
+        )
+        .expect("first overlay");
+        let (_, first_again) = codex_generation_app_server_process_config(
+            &config,
+            managed.as_path(),
+            codex_overlay_identity("thread-a", 1),
+        )
+        .expect("idempotent overlay");
+        let (_, second_thread) = codex_generation_app_server_process_config(
+            &config,
+            managed.as_path(),
+            codex_overlay_identity("thread-b", 2),
+        )
+        .expect("second-thread overlay");
+        let (_, second_generation) = codex_generation_app_server_process_config(
+            &config,
+            managed.as_path(),
+            codex_overlay_identity("thread-a", 3),
+        )
+        .expect("second-generation overlay");
+
+        assert_eq!(first, first_again);
+        assert_ne!(first.effective_home_path, second_thread.effective_home_path);
+        assert_ne!(
+            first.effective_home_path,
+            second_generation.effective_home_path
+        );
+        for descriptor in [&first, &second_thread, &second_generation] {
+            assert_symlink_target(
+                descriptor.effective_home_path.join("sessions").as_path(),
+                shared.join("sessions").as_path(),
+            );
+        }
+
+        cleanup_codex_generation_overlay(&first).expect("clean first overlay");
+        cleanup_codex_generation_overlay(&first_again).expect("idempotent cleanup");
+        cleanup_codex_generation_overlay(&second_thread).expect("clean second thread");
+        cleanup_codex_generation_overlay(&second_generation).expect("clean second generation");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn codex_overlay_mcp_artifacts_are_disjoint_with_shared_resume_continuity() {
+        let root = unique_temp_dir("codex-overlay-mcp-concurrency");
+        let shared = root.join("shared");
+        let managed = root.join("managed");
+        fs::create_dir_all(shared.as_path()).expect("create shared home");
+        let mut config = codex_account_probe_config(root.as_path(), Path::new("codex"));
+        config.home_path = shared.to_string_lossy().into_owned();
+
+        let (_, mut thread_a) = codex_generation_app_server_process_config(
+            &config,
+            managed.as_path(),
+            codex_overlay_identity("thread-a", 1),
+        )
+        .expect("thread A overlay");
+        let (_, mut thread_b) = codex_generation_app_server_process_config(
+            &config,
+            managed.as_path(),
+            codex_overlay_identity("thread-b", 1),
+        )
+        .expect("thread B overlay");
+        let bootstrap_a = thread_a
+            .effective_home_path
+            .join("bootstrap/session-a/bootstrap.json");
+        let bootstrap_b = thread_b
+            .effective_home_path
+            .join("bootstrap/session-b/bootstrap.json");
+        fs::create_dir_all(bootstrap_a.parent().expect("bootstrap A parent"))
+            .expect("create bootstrap A parent");
+        fs::create_dir_all(bootstrap_b.parent().expect("bootstrap B parent"))
+            .expect("create bootstrap B parent");
+        fs::write(bootstrap_a.as_path(), "bootstrap-a").expect("write bootstrap A");
+        fs::write(bootstrap_b.as_path(), "bootstrap-b").expect("write bootstrap B");
+
+        let artifact_a = codex_overlay_mcp_artifact(bootstrap_a.as_path(), 'a');
+        let artifact_b = codex_overlay_mcp_artifact(bootstrap_b.as_path(), 'a');
+        let staged_a = stage_codex_generation_mcp_config(
+            &mut thread_a,
+            &artifact_a,
+            Some(bootstrap_a.as_path()),
+        )
+        .expect("stage thread A MCP artifact");
+        let staged_b = stage_codex_generation_mcp_config(
+            &mut thread_b,
+            &artifact_b,
+            Some(bootstrap_b.as_path()),
+        )
+        .expect("stage thread B MCP artifact");
+        let staged_a_again = stage_codex_generation_mcp_config(
+            &mut thread_a,
+            &artifact_a,
+            Some(bootstrap_a.as_path()),
+        )
+        .expect("identical staging is idempotent");
+
+        assert_eq!(staged_a, staged_a_again);
+        assert_ne!(staged_a.config_path, staged_b.config_path);
+        assert_ne!(staged_a.bootstrap_path, staged_b.bootstrap_path);
+        assert_eq!(
+            staged_a.semantic_restart_fingerprint, staged_b.semantic_restart_fingerprint,
+            "generation-local paths must not affect semantic session equality"
+        );
+        assert_ne!(
+            staged_a.config_artifact_digest, staged_b.config_artifact_digest,
+            "generation-local paths remain part of the staged artifact identity"
+        );
+        let config_a = fs::read_to_string(staged_a.config_path.as_path()).expect("read config A");
+        let config_b = fs::read_to_string(staged_b.config_path.as_path()).expect("read config B");
+        assert!(config_a.contains(bootstrap_a.to_string_lossy().as_ref()));
+        assert!(!config_a.contains(bootstrap_b.to_string_lossy().as_ref()));
+        assert!(config_b.contains(bootstrap_b.to_string_lossy().as_ref()));
+        assert!(!config_b.contains(bootstrap_a.to_string_lossy().as_ref()));
+        for descriptor in [&thread_a, &thread_b] {
+            for shared_entry in ["sessions", "archived_sessions", "sqlite"] {
+                assert_symlink_target(
+                    descriptor.effective_home_path.join(shared_entry).as_path(),
+                    shared.join(shared_entry).as_path(),
+                );
+            }
+            for forbidden in ["plugins", "marketplaces", "worktrees", "host-config"] {
+                assert!(!descriptor.effective_home_path.join(forbidden).exists());
+            }
+        }
+
+        cleanup_codex_generation_overlay(&thread_a).expect("clean thread A");
+        cleanup_codex_generation_overlay(&thread_b).expect("clean thread B");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn codex_overlay_mcp_collision_and_external_bootstrap_fail_closed() {
+        let root = unique_temp_dir("codex-overlay-mcp-collision");
+        let shared = root.join("shared");
+        let managed = root.join("managed");
+        fs::create_dir_all(shared.as_path()).expect("create shared home");
+        let mut config = codex_account_probe_config(root.as_path(), Path::new("codex"));
+        config.home_path = shared.to_string_lossy().into_owned();
+        let (_, mut descriptor) = codex_generation_app_server_process_config(
+            &config,
+            managed.as_path(),
+            codex_overlay_identity("thread-a", 1),
+        )
+        .expect("generation overlay");
+        let bootstrap = descriptor
+            .effective_home_path
+            .join("bootstrap/session/bootstrap.json");
+        fs::create_dir_all(bootstrap.parent().expect("bootstrap parent"))
+            .expect("create bootstrap parent");
+        fs::write(bootstrap.as_path(), "bootstrap").expect("write bootstrap");
+        let first = codex_overlay_mcp_artifact(bootstrap.as_path(), 'a');
+        stage_codex_generation_mcp_config(&mut descriptor, &first, Some(bootstrap.as_path()))
+            .expect("stage first artifact");
+
+        let replacement = codex_overlay_mcp_artifact(bootstrap.as_path(), 'b');
+        let collision = stage_codex_generation_mcp_config(
+            &mut descriptor,
+            &replacement,
+            Some(bootstrap.as_path()),
+        )
+        .expect_err("same generation cannot accept another projection");
+        assert!(collision.to_string().contains("different projection"));
+
+        let (_, mut external_descriptor) = codex_generation_app_server_process_config(
+            &config,
+            managed.as_path(),
+            codex_overlay_identity("thread-b", 1),
+        )
+        .expect("external-bootstrap overlay");
+        let external_bootstrap = root.join("outside-bootstrap.json");
+        fs::write(external_bootstrap.as_path(), "outside").expect("write outside bootstrap");
+        let external_artifact = codex_overlay_mcp_artifact(external_bootstrap.as_path(), 'a');
+        let outside = stage_codex_generation_mcp_config(
+            &mut external_descriptor,
+            &external_artifact,
+            Some(external_bootstrap.as_path()),
+        )
+        .expect_err("bootstrap outside the generation overlay must fail");
+        assert!(
+            outside
+                .to_string()
+                .contains("outside its generation overlay")
+        );
+
+        cleanup_codex_generation_overlay(&descriptor).expect("clean first overlay");
+        cleanup_codex_generation_overlay(&external_descriptor)
+            .expect("clean external-bootstrap overlay");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn codex_overlay_mcp_attestation_rejects_config_drift_before_thread_start() {
+        let root = unique_temp_dir("codex-overlay-mcp-attestation");
+        let shared = root.join("shared");
+        let managed = root.join("managed");
+        fs::create_dir_all(shared.as_path()).expect("create shared home");
+        let mut config = codex_account_probe_config(root.as_path(), Path::new("codex"));
+        config.home_path = shared.to_string_lossy().into_owned();
+        let (_, mut descriptor) = codex_generation_app_server_process_config(
+            &config,
+            managed.as_path(),
+            codex_overlay_identity("thread-a", 1),
+        )
+        .expect("generation overlay");
+        let bootstrap = descriptor
+            .effective_home_path
+            .join("bootstrap/session/bootstrap.json");
+        fs::create_dir_all(bootstrap.parent().expect("bootstrap parent"))
+            .expect("create bootstrap parent");
+        fs::write(bootstrap.as_path(), "bootstrap").expect("write bootstrap");
+        let artifact = codex_overlay_mcp_artifact(bootstrap.as_path(), 'a');
+        stage_codex_generation_mcp_config(&mut descriptor, &artifact, Some(bootstrap.as_path()))
+            .expect("stage artifact");
+        verify_codex_generation_mcp_config(&descriptor).expect("exact artifact verifies");
+
+        fs::write(
+            descriptor.effective_home_path.join("config.toml"),
+            "[mcp_servers.malicious]\ncommand = '/sentinel'\n",
+        )
+        .expect("replace staged config");
+        let error = verify_codex_generation_mcp_config(&descriptor)
+            .expect_err("staged config drift must fail before config/read");
+        assert!(error.to_string().contains("digest verification"));
+
+        cleanup_codex_generation_overlay(&descriptor).expect("clean overlay");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn codex_overlay_stale_cleanup_cannot_delete_replacement_path() {
+        let root = unique_temp_dir("codex-overlay-replacement");
+        let shared = root.join("shared");
+        let managed = root.join("managed");
+        fs::create_dir_all(shared.as_path()).expect("create shared home");
+        let mut config = codex_account_probe_config(root.as_path(), Path::new("codex"));
+        config.home_path = shared.to_string_lossy().into_owned();
+        let identity = codex_overlay_identity("thread-a", 1);
+
+        let (_, stale_descriptor) = codex_generation_app_server_process_config(
+            &config,
+            managed.as_path(),
+            identity.clone(),
+        )
+        .expect("first materialization");
+        cleanup_codex_generation_overlay(&stale_descriptor).expect("clean first materialization");
+        let (_, replacement_descriptor) =
+            codex_generation_app_server_process_config(&config, managed.as_path(), identity)
+                .expect("replacement materialization");
+
+        let error = cleanup_codex_generation_overlay(&stale_descriptor)
+            .expect_err("stale cleanup must not remove replacement");
+        assert!(error.to_string().contains("replacement path"));
+        assert!(replacement_descriptor.effective_home_path.exists());
+        cleanup_codex_generation_overlay(&replacement_descriptor).expect("clean replacement");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn codex_overlay_rejects_stale_directory_and_symlinked_managed_root() {
+        let root = unique_temp_dir("codex-overlay-stale");
+        let shared = root.join("shared");
+        let managed = root.join("managed");
+        fs::create_dir_all(shared.as_path()).expect("create shared home");
+        let mut config = codex_account_probe_config(root.as_path(), Path::new("codex"));
+        config.home_path = shared.to_string_lossy().into_owned();
+        let identity = codex_overlay_identity("thread-a", 1);
+        let (_, descriptor) = codex_generation_app_server_process_config(
+            &config,
+            managed.as_path(),
+            identity.clone(),
+        )
+        .expect("initial materialization");
+        cleanup_codex_generation_overlay(&descriptor).expect("clean initial overlay");
+        fs::create_dir_all(descriptor.effective_home_path.as_path())
+            .expect("create stale unmarked directory");
+        let error =
+            codex_generation_app_server_process_config(&config, managed.as_path(), identity)
+                .expect_err("stale unmarked directory must fail closed");
+        assert!(error.to_string().contains("stale or unmanaged"));
+        fs::remove_dir_all(managed.as_path()).expect("remove stale managed root");
+
+        let outside = root.join("outside");
+        fs::create_dir_all(outside.as_path()).expect("create outside directory");
+        std::os::unix::fs::symlink(outside.as_path(), managed.as_path())
+            .expect("create managed-root symlink");
+        let error = codex_generation_app_server_process_config(
+            &config,
+            managed.as_path(),
+            codex_overlay_identity("thread-b", 2),
+        )
+        .expect_err("symlinked managed root must fail closed");
+        assert!(error.to_string().contains("must not traverse a symlink"));
         let _ = fs::remove_dir_all(root);
     }
 

@@ -13,5 +13,8 @@ pioneer-protocol.workspace = true
 pioneer-runtime-events.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 toml.workspace = true
+uuid.workspace = true
+zeroize = { version = "1", features = ["derive"] }

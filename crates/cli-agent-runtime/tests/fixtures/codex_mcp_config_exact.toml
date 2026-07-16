@@ -1,0 +1,20 @@
+personality = "pragmatic"
+
+[features]
+apps = false
+enable_mcp_apps = false
+plugins = false
+remote_plugin = false
+skill_mcp_dependency_install = false
+
+[mcp_servers.pioneer]
+command = "/opt/pioneer/pioneer"
+args = ["__cli-mcp-stdio", "--bootstrap-file", "/private/pioneer/session/bootstrap"]
+required = true
+enabled_tools = ["mcp_alpha", "mcp_beta"]
+
+[mcp_servers.pioneer.tools.mcp_alpha]
+approval_mode = "approve"
+
+[mcp_servers.pioneer.tools.mcp_beta]
+approval_mode = "approve"

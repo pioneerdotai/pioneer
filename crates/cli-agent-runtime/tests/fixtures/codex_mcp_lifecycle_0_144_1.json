@@ -1,0 +1,64 @@
+{
+  "contractVersion": 1,
+  "codexVersion": "0.144.1",
+  "notifications": [
+    {
+      "method": "item/started",
+      "params": {
+        "threadId": "thread-1",
+        "turnId": "turn-1",
+        "item": {
+          "type": "mcpToolCall",
+          "id": "item-1",
+          "server": "pioneer",
+          "tool": "mcp__fixture__read",
+          "arguments": {},
+          "status": "inProgress"
+        }
+      },
+      "expectedEvent": "item_started"
+    },
+    {
+      "method": "item/mcpToolCall/progress",
+      "params": {
+        "threadId": "thread-1",
+        "turnId": "turn-1",
+        "itemId": "item-1",
+        "message": "working"
+      },
+      "expectedEvent": "item_delta"
+    },
+    {
+      "method": "item/completed",
+      "params": {
+        "threadId": "thread-1",
+        "turnId": "turn-1",
+        "item": {
+          "type": "mcpToolCall",
+          "id": "item-1",
+          "server": "pioneer",
+          "tool": "mcp__fixture__read",
+          "arguments": {},
+          "status": "completed",
+          "result": {"content": [{"type": "text", "text": "ok"}]}
+        }
+      },
+      "expectedEvent": "item_completed"
+    }
+  ],
+  "requests": [
+    {
+      "id": 7,
+      "method": "item/permissions/requestApproval",
+      "params": {
+        "threadId": "thread-1",
+        "turnId": "turn-1",
+        "itemId": "item-1",
+        "cwd": "/workspace",
+        "permissions": {"network": ["example.com"]},
+        "startedAtMs": 1
+      },
+      "expectedRequestKind": "permission_approval"
+    }
+  ]
+}
