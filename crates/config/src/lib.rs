@@ -3238,9 +3238,9 @@ service_name = "com.pioneer.gateway.env"
         let config = GatewayCliAgentRuntimeConfig::default();
 
         assert!(!config.enabled);
-        assert_eq!(config.mcp_tools.max_tools, 128);
-        assert_eq!(config.mcp_tools.max_total_schema_bytes, 1_048_576);
-        assert_eq!(config.mcp_tools.max_concurrent_calls_per_turn, 8);
+        assert_eq!(config.mcp_tools.max_tools, 512);
+        assert_eq!(config.mcp_tools.max_total_schema_bytes, 3_145_728);
+        assert_eq!(config.mcp_tools.max_concurrent_calls_per_turn, 16);
         assert_eq!(config.idle_session_ttl_secs, 1_800);
         assert_eq!(config.startup_timeout_ms, 30_000);
         assert_eq!(config.request_timeout_ms, 120_000);
@@ -3333,10 +3333,10 @@ kind = "claude"
     }
 
     #[test]
-    fn gateway_cli_agent_runtime_cli_mcp_legacy_and_zero_values_stay_bounded() {
-        let legacy = toml::from_str::<GatewayCliAgentRuntimeConfig>("enabled = true")
-            .expect("legacy CLI runtime config should deserialize");
-        assert_eq!(legacy.mcp_tools.max_tools, 128);
+    fn gateway_cli_agent_runtime_cli_mcp_omitted_and_zero_values_use_current_defaults() {
+        let omitted = toml::from_str::<GatewayCliAgentRuntimeConfig>("enabled = true")
+            .expect("CLI runtime config with omitted MCP limits should deserialize");
+        assert_eq!(omitted.mcp_tools.max_tools, 512);
 
         let normalized = toml::from_str::<GatewayCliAgentRuntimeConfig>(
             r#"
@@ -3349,9 +3349,9 @@ max_concurrent_calls_per_turn = 0
 "#,
         )
         .expect("CLI MCP limits should deserialize");
-        assert_eq!(normalized.mcp_tools.max_tools, 128);
-        assert_eq!(normalized.mcp_tools.max_total_schema_bytes, 1_048_576);
-        assert_eq!(normalized.mcp_tools.max_concurrent_calls_per_turn, 8);
+        assert_eq!(normalized.mcp_tools.max_tools, 512);
+        assert_eq!(normalized.mcp_tools.max_total_schema_bytes, 3_145_728);
+        assert_eq!(normalized.mcp_tools.max_concurrent_calls_per_turn, 16);
     }
 
     #[test]

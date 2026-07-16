@@ -3,7 +3,10 @@ use super::coordinator::{
     CliMcpProjectionFingerprint, CliMcpProjectionGeneration, CliMcpProjectionReadiness,
 };
 use super::grants::CliMcpBoundGrant;
-use super::limits::{CliMcpFacadeLimits, CliMcpLimitConfigurationError};
+use super::limits::{
+    CliMcpFacadeLimits, CliMcpFacadeProjectionLimits, CliMcpLimitConfigurationError,
+    RESPONSE_ENVELOPE_RESERVE_BYTES,
+};
 use crate::turn_mcp::invoker::{
     TurnMcpInvocation, TurnMcpInvocationError, TurnMcpInvocationErrorCode, TurnMcpInvocationOrigin,
     TurnMcpInvoker,
@@ -45,21 +48,6 @@ const FACADE_CALL_FAILED: i64 = -32005;
 const FACADE_BUSY: i64 = -32006;
 const FACADE_LIMIT_EXCEEDED: i64 = -32007;
 const FACADE_SHUTTING_DOWN: i64 = -32008;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CliMcpFacadeProjectionLimits {
-    pub(crate) max_tools: usize,
-    pub(crate) max_list_result_bytes: usize,
-}
-
-impl Default for CliMcpFacadeProjectionLimits {
-    fn default() -> Self {
-        Self {
-            max_tools: 128,
-            max_list_result_bytes: 1024 * 1024,
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CliMcpFacadeTool {
@@ -596,7 +584,10 @@ impl CliMcpToolFacade {
         let list_result_bytes = serde_json::to_vec(&projection.list_result)
             .map_err(|_| CliMcpFacadeConfigurationError::ProjectionSerialization)?
             .len();
-        if list_result_bytes > limits.max_result_bytes {
+        if list_result_bytes
+            .checked_add(RESPONSE_ENVELOPE_RESERVE_BYTES)
+            .is_none_or(|bytes| bytes > limits.max_frame_bytes)
+        {
             return Err(CliMcpFacadeConfigurationError::ProjectionTooLarge);
         }
         Ok(Arc::new(Self {

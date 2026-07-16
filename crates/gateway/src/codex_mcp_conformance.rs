@@ -80,9 +80,11 @@ pub async fn run_codex_mcp_deterministic_conformance() -> Result<CodexMcpDetermi
     let empty_launch =
         build_codex_mcp_session_launch_projection(empty_projection, provider_contract)?;
 
-    let facade_a = launch_a.facade_projection()?;
-    let facade_b = launch_b.facade_projection()?;
-    let empty_facade = empty_launch.facade_projection()?;
+    let facade_limits =
+        crate::cli_runtime::mcp::limits::CliMcpFacadeProjectionLimits::transport_bounded(1);
+    let facade_a = launch_a.facade_projection(facade_limits)?;
+    let facade_b = launch_b.facade_projection(facade_limits)?;
+    let empty_facade = empty_launch.facade_projection(facade_limits)?;
     ensure!(
         facade_a.tools().len() == 1 && facade_a.contains_tool(callable_a.as_str()),
         "Codex A projection must expose exactly A"
@@ -102,8 +104,9 @@ pub async fn run_codex_mcp_deterministic_conformance() -> Result<CodexMcpDetermi
 
     let temporary = tempfile::tempdir().context("create Codex conformance root")?;
     let bootstrap_path = temporary.path().join("bootstrap.json");
-    let managed_a = build_codex_managed_mcp_config(&launch_a.preflight, Some(&bootstrap_path))?;
-    let managed_empty = build_codex_managed_mcp_config(&empty_launch.preflight, None)?;
+    let managed_a =
+        build_codex_managed_mcp_config(&launch_a.preflight, Some(&bootstrap_path), 512)?;
+    let managed_empty = build_codex_managed_mcp_config(&empty_launch.preflight, None, 512)?;
     let exact_managed_config_isolated = managed_a.enabled_tools == [callable_a.as_str()]
         && managed_a.config_toml.contains("[mcp_servers.pioneer]")
         && managed_a.config_toml.contains("required = true")

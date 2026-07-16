@@ -308,10 +308,11 @@ mod tests {
     use super::*;
     use crate::cli_runtime::manager::CLIAgentRuntimeSessionKey;
     use crate::cli_runtime::mcp::coordinator::CliMcpProjectionFingerprint;
-    use crate::cli_runtime::mcp::facade::{CliMcpFacadeProjectionLimits, CliMcpFacadeTool};
+    use crate::cli_runtime::mcp::facade::CliMcpFacadeTool;
     use crate::cli_runtime::mcp::grants::{
         CliMcpConnectionId, CliMcpGrantError, CliMcpGrantScope, CliMcpManifestHash,
     };
+    use crate::cli_runtime::mcp::limits::CliMcpFacadeProjectionLimits;
     use crate::cli_runtime::session_instance::CliSessionInstanceId;
     use crate::turn_mcp::invoker::{
         TurnMcpInvocation, TurnMcpInvocationError, TurnMcpInvocationErrorCode,

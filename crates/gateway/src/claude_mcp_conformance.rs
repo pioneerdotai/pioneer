@@ -105,9 +105,11 @@ pub async fn run_claude_mcp_deterministic_conformance() -> Result<ClaudeMcpDeter
         "Claude exact preallow names drifted"
     );
 
-    let facade_a = launch_a.facade_projection()?;
-    let facade_b = launch_b.facade_projection()?;
-    let empty_facade = empty_launch.facade_projection()?;
+    let facade_limits =
+        crate::cli_runtime::mcp::limits::CliMcpFacadeProjectionLimits::transport_bounded(1);
+    let facade_a = launch_a.facade_projection(facade_limits)?;
+    let facade_b = launch_b.facade_projection(facade_limits)?;
+    let empty_facade = empty_launch.facade_projection(facade_limits)?;
     ensure!(
         facade_a.tools().len() == 1 && facade_a.contains_tool(callable_a.as_str()),
         "Claude A projection must expose exactly A"

@@ -11,8 +11,9 @@ pub use schema::{
 mod mcp_config;
 pub use mcp_config::{
     CodexManagedMcpConfigArtifact, CodexManagedMcpConfigError, CodexManagedMcpConfigInput,
-    CodexManagedMcpSemanticInput, CodexManagedMcpToolIdentity, codex_config_value_fingerprint,
-    codex_managed_mcp_semantic_restart_fingerprint, serialize_codex_managed_mcp_config,
+    CodexManagedMcpConfigLimits, CodexManagedMcpSemanticInput, CodexManagedMcpToolIdentity,
+    codex_config_value_fingerprint, codex_managed_mcp_semantic_restart_fingerprint,
+    serialize_codex_managed_mcp_config,
 };
 
 use crate::driver::{
@@ -7231,6 +7232,7 @@ while read line; do :; done
                     transformed_fingerprint: "4".repeat(64),
                 }],
             },
+            limits: CodexManagedMcpConfigLimits { max_tools: 512 },
             helper_path: Some(PathBuf::from("/opt/pioneer/pioneer")),
             bootstrap_path: Some(bootstrap_path.to_path_buf()),
         })

@@ -22,7 +22,7 @@ use crate::cli_runtime::mcp::coordinator::{
 };
 use crate::cli_runtime::mcp::facade::CliMcpFacadeProjection;
 use crate::cli_runtime::mcp::grants::{CliMcpGrantScope, CliMcpManifestHash};
-use crate::cli_runtime::mcp::limits::CliMcpFacadeLimits;
+use crate::cli_runtime::mcp::limits::{CliMcpFacadeLimits, CliMcpRuntimeLimits};
 use crate::cli_runtime::mcp::server::{CliMcpBridgeFacadeHandle, CliMcpBridgeFacadeServer};
 use crate::cli_runtime::mcp::supervisor::{CliMcpBridgeLaunch, CliMcpBridgeSupervisor};
 use crate::cli_runtime::permissions::{
@@ -123,6 +123,7 @@ struct ClaudeRequiredMcpBridge {
     provider_contract_fingerprint: String,
     isolation_contract_fingerprint: String,
     invoker: Arc<dyn TurnMcpInvoker>,
+    facade_limits: CliMcpFacadeLimits,
     native_items: Arc<ClaudeNativeMcpCorrelationLedger>,
     state: Mutex<ClaudeRequiredMcpBridgeState>,
 }
@@ -369,7 +370,7 @@ impl ClaudeRequiredMcpBridge {
                         }),
                         self.projection_generation,
                         self.projection.clone(),
-                        CliMcpFacadeLimits::default(),
+                        self.facade_limits.clone(),
                     )
                     .map_err(|error| anyhow!("Claude MCP facade build failed: {error}"))?;
                     let server = tokio::spawn(server.run());
@@ -607,6 +608,7 @@ impl ClaudeMcpPermissionAuthorizer for ClaudeRequiredMcpBridge {
 pub(crate) struct ClaudeCLIAgentRuntimeSessionFactory {
     runtime_home: PathBuf,
     bridge_supervisor: Option<Arc<CliMcpBridgeSupervisor>>,
+    mcp_limits: CliMcpRuntimeLimits,
     turn_mcp_invoker: Option<Arc<dyn TurnMcpInvoker>>,
     crud_store: Arc<CrudStore>,
 }
@@ -615,12 +617,14 @@ impl ClaudeCLIAgentRuntimeSessionFactory {
     pub(crate) fn new_with_bridge(
         runtime_home: PathBuf,
         bridge_supervisor: Arc<CliMcpBridgeSupervisor>,
+        mcp_limits: CliMcpRuntimeLimits,
         turn_mcp_invoker: Arc<dyn TurnMcpInvoker>,
         crud_store: Arc<CrudStore>,
     ) -> Self {
         Self {
             runtime_home,
             bridge_supervisor: Some(bridge_supervisor),
+            mcp_limits,
             turn_mcp_invoker: Some(turn_mcp_invoker),
             crud_store,
         }
@@ -741,9 +745,11 @@ impl CLIAgentRuntimeSessionFactory for ClaudeCLIAgentRuntimeSessionFactory {
                     .bridge_supervisor
                     .as_ref()
                     .ok_or_else(|| anyhow!("Claude MCP launch requires the bridge supervisor"))?;
-                let projection = launch_projection.facade_projection().map_err(|error| {
-                    anyhow!("failed to build Claude facade projection: {error}")
-                })?;
+                let projection = launch_projection
+                    .facade_projection(self.mcp_limits.facade_projection_limits())
+                    .map_err(|error| {
+                        anyhow!("failed to build Claude facade projection: {error}")
+                    })?;
                 let manifest_hash = CliMcpManifestHash::new(
                     launch_projection.preflight.canonical_manifest_hash.clone(),
                 )
@@ -866,6 +872,7 @@ impl CLIAgentRuntimeSessionFactory for ClaudeCLIAgentRuntimeSessionFactory {
                 provider_contract_fingerprint: prepared.provider_contract_fingerprint,
                 isolation_contract_fingerprint: prepared.isolation_contract_fingerprint,
                 invoker,
+                facade_limits: self.mcp_limits.facade_limits(),
                 native_items: mcp_native_items
                     .as_ref()
                     .expect("prepared Claude bridge requires native item ledger")
@@ -1185,7 +1192,9 @@ pub(crate) async fn run_claude_mcp_local_provider_probe(
         )
         .context("failed to transform Claude readiness projection")?;
     let facade_projection = launch_projection
-        .facade_projection()
+        .facade_projection(
+            crate::cli_runtime::mcp::limits::CliMcpFacadeProjectionLimits::transport_bounded(1),
+        )
         .context("failed to build Claude readiness facade projection")?;
 
     let process_instance =
@@ -1227,6 +1236,7 @@ pub(crate) async fn run_claude_mcp_local_provider_probe(
             .clone(),
         isolation_contract_fingerprint: launch_projection.semantic_restart_fingerprint().to_owned(),
         invoker: Arc::new(ClaudeReadinessNeverInvoke),
+        facade_limits: CliMcpFacadeLimits::default(),
         native_items: native_items.clone(),
         state: Mutex::new(ClaudeRequiredMcpBridgeState::Pending),
     });
@@ -3731,7 +3741,7 @@ mod tests {
                 )
                 .expect("tool"),
             ],
-            crate::cli_runtime::mcp::facade::CliMcpFacadeProjectionLimits::default(),
+            crate::cli_runtime::mcp::limits::CliMcpFacadeProjectionLimits::default(),
         )
         .expect("projection");
         let scope = CliMcpGrantScope::new(
@@ -3763,6 +3773,7 @@ mod tests {
             provider_contract_fingerprint: "b".repeat(64),
             isolation_contract_fingerprint: "c".repeat(64),
             invoker: Arc::new(NeverInvoke),
+            facade_limits: CliMcpFacadeLimits::default(),
             native_items: Arc::new(ClaudeNativeMcpCorrelationLedger::default()),
             state: Mutex::new(ClaudeRequiredMcpBridgeState::Pending),
         });
@@ -3849,7 +3860,7 @@ mod tests {
                 )
                 .expect("tool"),
             ],
-            crate::cli_runtime::mcp::facade::CliMcpFacadeProjectionLimits::default(),
+            crate::cli_runtime::mcp::limits::CliMcpFacadeProjectionLimits::default(),
         )
         .expect("projection");
         let scope = CliMcpGrantScope::new(
@@ -3882,6 +3893,7 @@ mod tests {
             provider_contract_fingerprint: "b".repeat(64),
             isolation_contract_fingerprint: "c".repeat(64),
             invoker: Arc::new(NeverInvoke),
+            facade_limits: CliMcpFacadeLimits::default(),
             native_items: native_items.clone(),
             state: Mutex::new(ClaudeRequiredMcpBridgeState::Pending),
         });

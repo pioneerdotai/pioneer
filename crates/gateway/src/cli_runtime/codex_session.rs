@@ -23,11 +23,11 @@ use crate::cli_runtime::manager::{
 use crate::cli_runtime::mcp::coordinator::{
     CliMcpProjectionFingerprint, CliMcpProjectionGeneration,
 };
-use crate::cli_runtime::mcp::facade::{
-    CliMcpFacadeProjection, CliMcpFacadeProjectionLimits, CliMcpFacadeTool,
-};
+use crate::cli_runtime::mcp::facade::{CliMcpFacadeProjection, CliMcpFacadeTool};
 use crate::cli_runtime::mcp::grants::{CliMcpGrantScope, CliMcpManifestHash};
-use crate::cli_runtime::mcp::limits::CliMcpFacadeLimits;
+use crate::cli_runtime::mcp::limits::{
+    CliMcpFacadeLimits, CliMcpFacadeProjectionLimits, CliMcpRuntimeLimits,
+};
 use crate::cli_runtime::mcp::server::{CliMcpBridgeFacadeHandle, CliMcpBridgeFacadeServer};
 use crate::cli_runtime::mcp::supervisor::{CliMcpBridgeLaunch, CliMcpBridgeSupervisor};
 use crate::cli_runtime::session_instance::{CliSessionGenerationAllocator, CliSessionInstanceId};
@@ -41,12 +41,12 @@ use pioneer_cli_agent_runtime::codex::{
     CodexAppServerClient, CodexCollaborationMode, CodexConfigReadSnapshot,
     CodexGenerationOverlayDescriptor, CodexGenerationOverlayIdentity, CodexHomeOverlayPolicy,
     CodexJsonlRpcClient, CodexJsonlRpcNotificationEvent, CodexManagedMcpConfigInput,
-    CodexManagedMcpSemanticInput, CodexManagedMcpToolIdentity, CodexThreadForkParams,
-    CodexThreadNameSetParams, CodexThreadOpenSnapshot, CodexThreadStartParams,
-    CodexTurnStartParams, CodexTurnSteerParams, cleanup_codex_generation_overlay,
-    codex_config_value_fingerprint, codex_generation_app_server_process_config,
-    serialize_codex_managed_mcp_config, stage_codex_generation_mcp_config,
-    verify_codex_generation_mcp_config,
+    CodexManagedMcpConfigLimits, CodexManagedMcpSemanticInput, CodexManagedMcpToolIdentity,
+    CodexThreadForkParams, CodexThreadNameSetParams, CodexThreadOpenSnapshot,
+    CodexThreadStartParams, CodexTurnStartParams, CodexTurnSteerParams,
+    cleanup_codex_generation_overlay, codex_config_value_fingerprint,
+    codex_generation_app_server_process_config, serialize_codex_managed_mcp_config,
+    stage_codex_generation_mcp_config, verify_codex_generation_mcp_config,
 };
 use pioneer_cli_agent_runtime::codex_attestation::sha256_json;
 use pioneer_cli_agent_runtime::driver::JsonlRpcId;
@@ -103,6 +103,7 @@ impl TurnMcpInvoker for CodexReadinessNeverInvoke {
 pub(crate) fn cli_runtime_manager(
     runtime_home: PathBuf,
     idle_session_ttl: Duration,
+    mcp_limits: CliMcpRuntimeLimits,
     turn_mcp_invoker: Arc<dyn TurnMcpInvoker>,
     crud_store: Arc<pioneer_crud::CrudStore>,
 ) -> Result<Arc<CLIAgentRuntimeManager>> {
@@ -111,6 +112,7 @@ pub(crate) fn cli_runtime_manager(
     let factory = Arc::new(DispatchingCLIAgentRuntimeSessionFactory {
         runtime_home,
         bridge_supervisor: bridge_supervisor.clone(),
+        mcp_limits,
         turn_mcp_invoker,
         crud_store,
     });
@@ -184,7 +186,7 @@ pub(crate) async fn run_codex_mcp_local_provider_probe(
             serde_json::json!({"type": "object", "additionalProperties": false}),
             serde_json::json!({"readOnlyHint": true}),
         )?],
-        CliMcpFacadeProjectionLimits::default(),
+        CliMcpFacadeProjectionLimits::transport_bounded(1),
     )?;
     let projection_fingerprint = projection.fingerprint().as_str().to_owned();
     let supervisor = CliMcpBridgeSupervisor::new(
@@ -246,6 +248,7 @@ pub(crate) async fn run_codex_mcp_local_provider_probe(
                 transformed_fingerprint: tool_fingerprint,
             }],
         },
+        limits: CodexManagedMcpConfigLimits { max_tools: 1 },
         helper_path: Some(helper_path),
         bootstrap_path: Some(launch.bootstrap_path().to_path_buf()),
     })?;
@@ -461,6 +464,7 @@ fn bounded_codex_readiness_diagnostic(value: &str) -> String {
 struct DispatchingCLIAgentRuntimeSessionFactory {
     runtime_home: PathBuf,
     bridge_supervisor: Arc<CliMcpBridgeSupervisor>,
+    mcp_limits: CliMcpRuntimeLimits,
     turn_mcp_invoker: Arc<dyn TurnMcpInvoker>,
     crud_store: Arc<pioneer_crud::CrudStore>,
 }
@@ -493,6 +497,7 @@ impl CLIAgentRuntimeSessionFactory for DispatchingCLIAgentRuntimeSessionFactory 
                 CodexCLIAgentRuntimeSessionFactory {
                     runtime_home: self.runtime_home.clone(),
                     bridge_supervisor: self.bridge_supervisor.clone(),
+                    mcp_limits: self.mcp_limits,
                     turn_mcp_invoker: self.turn_mcp_invoker.clone(),
                 }
                 .start_session_with_options(process_instance, options)
@@ -502,6 +507,7 @@ impl CLIAgentRuntimeSessionFactory for DispatchingCLIAgentRuntimeSessionFactory 
                 crate::cli_runtime::claude_session::ClaudeCLIAgentRuntimeSessionFactory::new_with_bridge(
                     self.runtime_home.clone(),
                     self.bridge_supervisor.clone(),
+                    self.mcp_limits,
                     self.turn_mcp_invoker.clone(),
                     self.crud_store.clone(),
                 )
@@ -526,6 +532,7 @@ impl CLIAgentRuntimeSessionFactory for DispatchingCLIAgentRuntimeSessionFactory 
                 CodexCLIAgentRuntimeSessionFactory {
                     runtime_home: self.runtime_home.clone(),
                     bridge_supervisor: self.bridge_supervisor.clone(),
+                    mcp_limits: self.mcp_limits,
                     turn_mcp_invoker: self.turn_mcp_invoker.clone(),
                 }
                 .start_session_with_launch_spec(process_instance, launch_spec)
@@ -535,6 +542,7 @@ impl CLIAgentRuntimeSessionFactory for DispatchingCLIAgentRuntimeSessionFactory 
                 crate::cli_runtime::claude_session::ClaudeCLIAgentRuntimeSessionFactory::new_with_bridge(
                     self.runtime_home.clone(),
                     self.bridge_supervisor.clone(),
+                    self.mcp_limits,
                     self.turn_mcp_invoker.clone(),
                     self.crud_store.clone(),
                 )
@@ -548,6 +556,7 @@ impl CLIAgentRuntimeSessionFactory for DispatchingCLIAgentRuntimeSessionFactory 
 struct CodexCLIAgentRuntimeSessionFactory {
     runtime_home: PathBuf,
     bridge_supervisor: Arc<CliMcpBridgeSupervisor>,
+    mcp_limits: CliMcpRuntimeLimits,
     turn_mcp_invoker: Arc<dyn TurnMcpInvoker>,
 }
 
@@ -571,6 +580,7 @@ struct CodexRequiredMcpBridge {
     provider_contract_fingerprint: String,
     isolation_contract_fingerprint: String,
     invoker: Arc<dyn TurnMcpInvoker>,
+    facade_limits: CliMcpFacadeLimits,
     native_items: Arc<CodexNativeMcpCorrelationLedger>,
     state: tokio::sync::Mutex<CodexRequiredMcpBridgeState>,
 }
@@ -824,7 +834,7 @@ impl CodexRequiredMcpBridge {
                         }),
                         self.projection_generation,
                         self.projection.clone(),
-                        CliMcpFacadeLimits::default(),
+                        self.facade_limits.clone(),
                     )
                     .map_err(|error| anyhow!("Codex MCP facade build failed: {error}"))?;
                     let server = tokio::spawn(server.run());
@@ -1157,9 +1167,11 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
                 let prepared = if launch_projection.preflight.tools.is_empty() {
                     None
                 } else {
-                    let projection = launch_projection.facade_projection().map_err(|error| {
-                        anyhow!("failed to build Codex facade projection: {error}")
-                    })?;
+                    let projection = launch_projection
+                        .facade_projection(self.mcp_limits.facade_projection_limits())
+                        .map_err(|error| {
+                            anyhow!("failed to build Codex facade projection: {error}")
+                        })?;
                     let manifest_hash = CliMcpManifestHash::new(
                         launch_projection.preflight.canonical_manifest_hash.clone(),
                     )
@@ -1209,6 +1221,7 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
                 let artifact = build_codex_managed_mcp_config(
                     &launch_projection.preflight,
                     bootstrap_path.as_deref(),
+                    self.mcp_limits.max_tools(),
                 )
                 .map_err(|error| anyhow!("failed to build managed Codex MCP config: {error}"))?;
                 if artifact.semantic_restart_fingerprint
@@ -1297,6 +1310,7 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
                 provider_contract_fingerprint: prepared.provider_contract_fingerprint,
                 isolation_contract_fingerprint: prepared.isolation_contract_fingerprint,
                 invoker: self.turn_mcp_invoker.clone(),
+                facade_limits: self.mcp_limits.facade_limits(),
                 native_items: Arc::new(CodexNativeMcpCorrelationLedger::default()),
                 state: tokio::sync::Mutex::new(CodexRequiredMcpBridgeState::Pending),
             }))
@@ -2309,7 +2323,8 @@ impl Drop for CodexGenerationOverlayStartupGuard {
 mod tests {
     use super::*;
     use crate::cli_runtime::manager::CLIAgentRuntimeSessionKey;
-    use crate::cli_runtime::mcp::facade::{CliMcpFacadeProjectionLimits, CliMcpFacadeTool};
+    use crate::cli_runtime::mcp::facade::CliMcpFacadeTool;
+    use crate::cli_runtime::mcp::limits::CliMcpFacadeProjectionLimits;
     use crate::cli_runtime::session_instance::CliSessionGenerationAllocator;
     use crate::turn_mcp::invoker::{
         TurnMcpInvocation, TurnMcpInvocationError, TurnMcpInvocationErrorCode,
@@ -2827,6 +2842,7 @@ mod tests {
             provider_contract_fingerprint: "b".repeat(64),
             isolation_contract_fingerprint: "c".repeat(64),
             invoker: Arc::new(NeverCalledInvoker),
+            facade_limits: CliMcpFacadeLimits::default(),
             native_items: Arc::new(CodexNativeMcpCorrelationLedger::default()),
             state: tokio::sync::Mutex::new(CodexRequiredMcpBridgeState::Pending),
         });
@@ -3051,6 +3067,7 @@ mod tests {
             provider_contract_fingerprint: "b".repeat(64),
             isolation_contract_fingerprint: "c".repeat(64),
             invoker: Arc::new(NeverCalledInvoker),
+            facade_limits: CliMcpFacadeLimits::default(),
             native_items: Arc::new(CodexNativeMcpCorrelationLedger::default()),
             state: tokio::sync::Mutex::new(CodexRequiredMcpBridgeState::Pending),
         };

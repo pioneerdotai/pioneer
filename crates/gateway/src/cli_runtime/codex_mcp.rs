@@ -1,11 +1,12 @@
 use crate::cli_runtime::mcp::facade::{
-    CliMcpFacadeBuildError, CliMcpFacadeProjection, CliMcpFacadeProjectionLimits, CliMcpFacadeTool,
+    CliMcpFacadeBuildError, CliMcpFacadeProjection, CliMcpFacadeTool,
 };
+use crate::cli_runtime::mcp::limits::CliMcpFacadeProjectionLimits;
 use crate::turn_mcp::projection::{ResolvedMcpTurnProjection, ResolvedMcpTurnTool};
 use pioneer_cli_agent_runtime::codex::{
     CodexHomeOverlayPolicy, CodexManagedMcpConfigArtifact, CodexManagedMcpConfigError,
-    CodexManagedMcpConfigInput, CodexManagedMcpSemanticInput, CodexManagedMcpToolIdentity,
-    CodexMcpSchemaTransformer, CodexMcpSchemaTransformerError,
+    CodexManagedMcpConfigInput, CodexManagedMcpConfigLimits, CodexManagedMcpSemanticInput,
+    CodexManagedMcpToolIdentity, CodexMcpSchemaTransformer, CodexMcpSchemaTransformerError,
     codex_managed_mcp_semantic_restart_fingerprint, serialize_codex_managed_mcp_config,
 };
 use pioneer_cli_agent_runtime::event::RuntimeEvent;
@@ -82,6 +83,7 @@ impl CodexMcpSessionLaunchProjection {
 
     pub(crate) fn facade_projection(
         &self,
+        limits: CliMcpFacadeProjectionLimits,
     ) -> Result<CliMcpFacadeProjection, CliMcpFacadeBuildError> {
         let tools = self
             .preflight
@@ -105,7 +107,7 @@ impl CodexMcpSessionLaunchProjection {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        CliMcpFacadeProjection::new(tools, CliMcpFacadeProjectionLimits::default())
+        CliMcpFacadeProjection::new(tools, limits)
     }
 
     pub(crate) fn enrich_native_event(
@@ -519,6 +521,7 @@ pub(crate) fn build_codex_mcp_session_launch_projection(
 pub(crate) fn build_codex_managed_mcp_config(
     preflight: &CodexMcpSchemaPreflight,
     bootstrap_path: Option<&Path>,
+    max_tools: usize,
 ) -> Result<CodexManagedMcpConfigArtifact, CodexManagedMcpProjectionError> {
     let helper_path = if preflight.tools.is_empty() {
         None
@@ -532,6 +535,7 @@ pub(crate) fn build_codex_managed_mcp_config(
         preflight,
         helper_path,
         bootstrap_path.map(Path::to_path_buf),
+        max_tools,
     )
 }
 
@@ -539,11 +543,13 @@ fn build_codex_managed_mcp_config_with_helper(
     preflight: &CodexMcpSchemaPreflight,
     helper_path: Option<PathBuf>,
     bootstrap_path: Option<PathBuf>,
+    max_tools: usize,
 ) -> Result<CodexManagedMcpConfigArtifact, CodexManagedMcpProjectionError> {
     let semantic = codex_managed_mcp_semantic_input(preflight);
     Ok(serialize_codex_managed_mcp_config(
         CodexManagedMcpConfigInput {
             semantic,
+            limits: CodexManagedMcpConfigLimits { max_tools },
             helper_path,
             bootstrap_path,
         },
@@ -648,6 +654,37 @@ mod tests {
         projection
             .finalize_identity(McpProjectionLimits::default())
             .expect("empty canonical projection");
+        projection
+    }
+
+    fn projection_with_tool_count(tool_count: usize) -> ResolvedMcpTurnProjection {
+        let mut projection = ResolvedMcpTurnProjection::empty("workspace", "large-turn");
+        projection.tools = (0..tool_count)
+            .map(|index| ResolvedMcpTurnTool {
+                canonical_callable_name: String::new(),
+                workspace_id: "workspace".to_owned(),
+                server_installation_id: "large-installation".to_owned(),
+                server_name: "server".to_owned(),
+                raw_tool_name: format!("tool_{index:03}"),
+                description: Some("fixture".to_owned()),
+                input_schema: serde_json::json!({"type": "object"}),
+                annotations: None,
+                timeout_ms: 20_000,
+                catalog_version: "catalog".to_owned(),
+                installation_fingerprint: "installation-fingerprint".to_owned(),
+                schema_fingerprint: String::new(),
+                runtime_generation: 1,
+                selection_reason: McpSelectionReason::ExplicitTool,
+                capability_id: Some(format!("capability-{index}")),
+            })
+            .collect();
+        projection
+            .finalize_identity(McpProjectionLimits {
+                max_tools: 512,
+                max_total_schema_bytes: 3_145_728,
+                ..McpProjectionLimits::default()
+            })
+            .expect("large canonical projection");
         projection
     }
 
@@ -756,7 +793,7 @@ mod tests {
     fn codex_mcp_config_empty_projection_has_no_stale_server_or_paths() {
         let preflight = preflight_codex_mcp_schemas(&empty_projection(), "a".repeat(64))
             .expect("empty preflight");
-        let artifact = build_codex_managed_mcp_config_with_helper(&preflight, None, None)
+        let artifact = build_codex_managed_mcp_config_with_helper(&preflight, None, None, 512)
             .expect("empty managed config");
         assert!(artifact.enabled_tools.is_empty());
         assert!(!artifact.config_toml.contains("mcp_servers"));
@@ -774,6 +811,7 @@ mod tests {
             &preflight,
             Some(PathBuf::from("/opt/pioneer/pioneer")),
             Some(PathBuf::from("/private/pioneer/session/bootstrap")),
+            512,
         )
         .expect("managed config");
         assert_eq!(artifact.enabled_tools.len(), 1);
@@ -782,6 +820,32 @@ mod tests {
         assert!(artifact.config_toml.contains("approval_mode = \"approve\""));
         assert!(!artifact.config_toml.contains("default_tools_approval_mode"));
         assert!(!artifact.config_toml.contains("disabled_tools"));
+    }
+
+    #[test]
+    fn configured_512_tool_limit_reaches_codex_config_and_facade() {
+        let runtime_limits =
+            crate::cli_runtime::mcp::limits::CliMcpRuntimeLimits::new(512, 3_145_728, 16)
+                .expect("runtime limits");
+        let launch = build_codex_mcp_session_launch_projection(
+            projection_with_tool_count(306),
+            "a".repeat(64),
+        )
+        .expect("large Codex launch projection");
+
+        let facade = launch
+            .facade_projection(runtime_limits.facade_projection_limits())
+            .expect("306 tools must fit the configured facade limit");
+        assert_eq!(facade.tools().len(), 306);
+
+        let artifact = build_codex_managed_mcp_config_with_helper(
+            &launch.preflight,
+            Some(PathBuf::from("/opt/pioneer/pioneer")),
+            Some(PathBuf::from("/private/pioneer/session/bootstrap")),
+            runtime_limits.max_tools(),
+        )
+        .expect("306 tools must fit the configured Codex config limit");
+        assert_eq!(artifact.enabled_tools.len(), 306);
     }
 
     #[test]
@@ -807,6 +871,7 @@ mod tests {
             &preflight,
             Some(PathBuf::from("/opt/pioneer/pioneer")),
             Some(PathBuf::from("/private/pioneer/session/bootstrap")),
+            512,
         )
         .expect("managed config");
         assert!(!artifact.config_toml.contains(canary));

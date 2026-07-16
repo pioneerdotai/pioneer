@@ -1,8 +1,9 @@
 //! Hermetic production bridge contract used by the provider conformance gates.
 
-use super::facade::{CliMcpFacadeProjection, CliMcpFacadeProjectionLimits, CliMcpFacadeTool};
+use super::facade::{CliMcpFacadeProjection, CliMcpFacadeTool};
 use super::grants::{CliMcpGrantScope, CliMcpManifestHash};
 use super::limits::CliMcpFacadeLimits;
+use super::limits::CliMcpFacadeProjectionLimits;
 use super::server::CliMcpBridgeFacadeServer;
 use super::supervisor::CliMcpBridgeSupervisor;
 use crate::cli_runtime::manager::CLIAgentRuntimeSessionKey;
@@ -188,7 +189,7 @@ async fn run_single_bridge_conformance(
     );
     let projection = CliMcpFacadeProjection::new(
         vec![tool(callable_name)?, tool(wait_callable)?],
-        CliMcpFacadeProjectionLimits::default(),
+        CliMcpFacadeProjectionLimits::transport_bounded(2),
     )
     .map_err(|error| anyhow::anyhow!("build facade projection: {error}"))?;
     let projection_fingerprint = projection.fingerprint().clone();

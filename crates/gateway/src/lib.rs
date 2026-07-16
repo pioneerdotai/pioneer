@@ -472,6 +472,20 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
     let thread_episodic_workspace_vector_search_configs =
         gateway_settings.workspace_thread_episodic_vector_search_configs();
     let cli_runtime_crud_store = crud_store.clone();
+    let cli_mcp_limits = crate::cli_runtime::mcp::limits::CliMcpRuntimeLimits::new(
+        config.gateway.cli_agent_runtime.mcp_tools.max_tools,
+        config
+            .gateway
+            .cli_agent_runtime
+            .mcp_tools
+            .max_total_schema_bytes,
+        config
+            .gateway
+            .cli_agent_runtime
+            .mcp_tools
+            .max_concurrent_calls_per_turn,
+    )
+    .context("invalid Gateway CLI MCP runtime limits")?;
 
     let mut message_processor = MessageProcessor::new_with_memory_runtime_and_task_config(
         thread_manager,
@@ -495,17 +509,11 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
             cli_runtime_command_heartbeat: config.gateway.cli_agent_runtime.command_heartbeat,
         },
     )
-    .with_mcp_projection_limits(
-        config.gateway.cli_agent_runtime.mcp_tools.max_tools,
-        config
-            .gateway
-            .cli_agent_runtime
-            .mcp_tools
-            .max_total_schema_bytes,
-    );
+    .with_cli_mcp_limits(cli_mcp_limits);
     let cli_runtime_manager = build_cli_runtime_manager(
         &runtime_home,
         &config,
+        cli_mcp_limits,
         message_processor.cli_turn_mcp_invoker(),
         cli_runtime_crud_store,
     )?;
@@ -669,12 +677,14 @@ fn remote_access_desired_state(
 fn build_cli_runtime_manager(
     runtime_home: &Path,
     config: &AppConfig,
+    mcp_limits: crate::cli_runtime::mcp::limits::CliMcpRuntimeLimits,
     turn_mcp_invoker: Arc<dyn crate::turn_mcp::invoker::TurnMcpInvoker>,
     crud_store: Arc<CrudStore>,
 ) -> Result<Option<Arc<crate::cli_runtime::manager::CLIAgentRuntimeManager>>> {
     crate::cli_runtime::codex_session::cli_runtime_manager(
         runtime_home.to_path_buf(),
         Duration::from_secs(config.gateway.cli_agent_runtime.idle_session_ttl_secs),
+        mcp_limits,
         turn_mcp_invoker,
         crud_store,
     )

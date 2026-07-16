@@ -876,13 +876,12 @@ impl MessageProcessor {
         Arc::new(self.mcp_service.turn_mcp_invoker())
     }
 
-    pub(crate) fn with_mcp_projection_limits(
+    pub(crate) fn with_cli_mcp_limits(
         self,
-        max_tools: usize,
-        max_total_schema_bytes: usize,
+        limits: crate::cli_runtime::mcp::limits::CliMcpRuntimeLimits,
     ) -> Self {
         self.mcp_service
-            .configure_projection_limits(max_tools, max_total_schema_bytes);
+            .configure_projection_limits(limits.max_tools(), limits.max_total_schema_bytes());
         self
     }
 

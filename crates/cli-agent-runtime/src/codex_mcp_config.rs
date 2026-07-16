@@ -12,7 +12,6 @@ const HELPER_SUBCOMMAND: &str = "__cli-mcp-stdio";
 const HELPER_BOOTSTRAP_OPTION: &str = "--bootstrap-file";
 const APPROVAL_MODE_APPROVE: &str = "approve";
 const CODEX_DEFAULT_PERSONALITY: &str = "pragmatic";
-const MAX_TOOLS: usize = 128;
 const MAX_CALLABLE_NAME_BYTES: usize = 64;
 const MAX_MANAGED_PATH_BYTES: usize = 4_096;
 const MAX_CONFIG_BYTES: usize = 1024 * 1024;
@@ -49,12 +48,18 @@ pub struct CodexManagedMcpSemanticInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexManagedMcpConfigInput {
     pub semantic: CodexManagedMcpSemanticInput,
+    pub limits: CodexManagedMcpConfigLimits,
     /// Required only for a non-empty projection. The production caller must
     /// resolve this from the signed, running Pioneer `current_exe()`.
     pub helper_path: Option<PathBuf>,
     /// Required only for a non-empty projection and scoped to one bridge
     /// process generation.
     pub bootstrap_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodexManagedMcpConfigLimits {
+    pub max_tools: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +76,7 @@ pub struct CodexManagedMcpConfigArtifact {
 pub enum CodexManagedMcpConfigError {
     InvalidHash { field: &'static str },
     InvalidOverlayPolicyVersion,
+    InvalidMaxTools,
     TooManyTools { actual: usize, maximum: usize },
     InvalidCallableName { name: String },
     DuplicateCallableName { name: String },
@@ -88,6 +94,9 @@ impl fmt::Display for CodexManagedMcpConfigError {
             Self::InvalidHash { field } => write!(formatter, "invalid Codex MCP {field}"),
             Self::InvalidOverlayPolicyVersion => {
                 formatter.write_str("Codex MCP overlay policy version must be greater than zero")
+            }
+            Self::InvalidMaxTools => {
+                formatter.write_str("Codex MCP maximum tool count must be greater than zero")
             }
             Self::TooManyTools { actual, maximum } => write!(
                 formatter,
@@ -177,6 +186,15 @@ pub fn serialize_codex_managed_mcp_config(
     mut input: CodexManagedMcpConfigInput,
 ) -> Result<CodexManagedMcpConfigArtifact, CodexManagedMcpConfigError> {
     validate_semantic_input(&mut input.semantic)?;
+    if input.limits.max_tools == 0 {
+        return Err(CodexManagedMcpConfigError::InvalidMaxTools);
+    }
+    if input.semantic.tools.len() > input.limits.max_tools {
+        return Err(CodexManagedMcpConfigError::TooManyTools {
+            actual: input.semantic.tools.len(),
+            maximum: input.limits.max_tools,
+        });
+    }
 
     let non_empty = !input.semantic.tools.is_empty();
     let helper_path =
@@ -344,13 +362,6 @@ fn validate_semantic_input(
     if input.overlay_policy_version == 0 {
         return Err(CodexManagedMcpConfigError::InvalidOverlayPolicyVersion);
     }
-    if input.tools.len() > MAX_TOOLS {
-        return Err(CodexManagedMcpConfigError::TooManyTools {
-            actual: input.tools.len(),
-            maximum: MAX_TOOLS,
-        });
-    }
-
     input.tools.sort_by(|left, right| {
         left.canonical_callable_name
             .cmp(&right.canonical_callable_name)
@@ -606,6 +617,7 @@ mod tests {
                 overlay_policy_version: 1,
                 tools,
             },
+            limits: CodexManagedMcpConfigLimits { max_tools: 512 },
             helper_path: non_empty.then(|| PathBuf::from("/opt/pioneer/pioneer")),
             bootstrap_path: non_empty.then(|| PathBuf::from("/private/pioneer/session/bootstrap")),
         }
@@ -681,5 +693,32 @@ mod tests {
             serialize_codex_managed_mcp_config(invalid),
             Err(CodexManagedMcpConfigError::InvalidCallableName { .. })
         ));
+    }
+
+    #[test]
+    fn codex_mcp_config_uses_the_supplied_tool_limit() {
+        let tools = (0..306)
+            .map(|index| tool(format!("mcp_tool_{index:03}").as_str(), index))
+            .collect::<Vec<_>>();
+        let accepted = serialize_codex_managed_mcp_config(input(tools.clone()))
+            .expect("306 tools must fit the configured 512-tool limit");
+        assert_eq!(accepted.enabled_tools.len(), 306);
+
+        let mut rejected = input(tools);
+        rejected.limits.max_tools = 305;
+        assert!(matches!(
+            serialize_codex_managed_mcp_config(rejected),
+            Err(CodexManagedMcpConfigError::TooManyTools {
+                actual: 306,
+                maximum: 305,
+            })
+        ));
+
+        let mut invalid = input(Vec::new());
+        invalid.limits.max_tools = 0;
+        assert_eq!(
+            serialize_codex_managed_mcp_config(invalid),
+            Err(CodexManagedMcpConfigError::InvalidMaxTools)
+        );
     }
 }

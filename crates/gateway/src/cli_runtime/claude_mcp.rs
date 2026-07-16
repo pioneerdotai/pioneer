@@ -2,8 +2,9 @@
 
 use crate::cli_runtime::config::resolve_current_pioneer_cli_mcp_helper;
 use crate::cli_runtime::mcp::facade::{
-    CliMcpFacadeBuildError, CliMcpFacadeProjection, CliMcpFacadeProjectionLimits, CliMcpFacadeTool,
+    CliMcpFacadeBuildError, CliMcpFacadeProjection, CliMcpFacadeTool,
 };
+use crate::cli_runtime::mcp::limits::CliMcpFacadeProjectionLimits;
 use crate::turn_mcp::projection::ResolvedMcpTurnProjection;
 use anyhow::{Context, Result};
 use pioneer_cli_agent_runtime::claude::{
@@ -88,6 +89,7 @@ impl ClaudeMcpSessionLaunchProjection {
 
     pub(crate) fn facade_projection(
         &self,
+        limits: CliMcpFacadeProjectionLimits,
     ) -> Result<CliMcpFacadeProjection, CliMcpFacadeBuildError> {
         let tools = self
             .preflight
@@ -111,7 +113,7 @@ impl ClaudeMcpSessionLaunchProjection {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        CliMcpFacadeProjection::new(tools, CliMcpFacadeProjectionLimits::default())
+        CliMcpFacadeProjection::new(tools, limits)
     }
 
     pub(crate) fn bind_native_tool_use(
@@ -790,6 +792,37 @@ mod tests {
         projection
     }
 
+    fn projection_with_tool_count(tool_count: usize) -> ResolvedMcpTurnProjection {
+        let mut projection = ResolvedMcpTurnProjection::empty("workspace", "large-turn");
+        projection.tools = (0..tool_count)
+            .map(|index| ResolvedMcpTurnTool {
+                canonical_callable_name: String::new(),
+                workspace_id: "workspace".to_owned(),
+                server_installation_id: "large-installation".to_owned(),
+                server_name: "server".to_owned(),
+                raw_tool_name: format!("tool_{index:03}"),
+                description: Some("fixture".to_owned()),
+                input_schema: serde_json::json!({"type": "object"}),
+                annotations: None,
+                timeout_ms: 20_000,
+                catalog_version: "catalog".to_owned(),
+                installation_fingerprint: "installation-fingerprint".to_owned(),
+                schema_fingerprint: String::new(),
+                runtime_generation: 1,
+                selection_reason: McpSelectionReason::ExplicitTool,
+                capability_id: Some(format!("capability-{index}")),
+            })
+            .collect();
+        projection
+            .finalize_identity(McpProjectionLimits {
+                max_tools: 512,
+                max_total_schema_bytes: 3_145_728,
+                ..McpProjectionLimits::default()
+            })
+            .expect("large canonical projection");
+        projection
+    }
+
     #[test]
     fn claude_mcp_permission_callback_fixture_is_typed_and_strict() {
         let fixture: JsonValue = serde_json::from_str(include_str!(
@@ -949,6 +982,22 @@ mod tests {
             preflight.tools[0].canonical_schema_fingerprint,
             preflight.tools[0].transformed_schema_fingerprint
         );
+    }
+
+    #[test]
+    fn configured_512_tool_limit_reaches_claude_facade() {
+        let runtime_limits =
+            crate::cli_runtime::mcp::limits::CliMcpRuntimeLimits::new(512, 3_145_728, 16)
+                .expect("runtime limits");
+        let launch = build_claude_mcp_session_launch_projection(
+            projection_with_tool_count(306),
+            "a".repeat(64),
+        )
+        .expect("large Claude launch projection");
+        let facade = launch
+            .facade_projection(runtime_limits.facade_projection_limits())
+            .expect("306 tools must fit the configured Claude facade limit");
+        assert_eq!(facade.tools().len(), 306);
     }
 
     #[test]
