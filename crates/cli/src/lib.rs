@@ -7,10 +7,21 @@ use anyhow::Result;
 use pioneer_config::InstallManagedBy;
 use serde_json::json;
 use std::env;
+use std::ffi::OsString;
 use std::fmt;
 use tracing::warn;
 
 pub fn main_entry() {
+    // This must remain the first dispatch in the signed binary. The hidden
+    // stdio helper cannot initialize tracing, Sentry, Gateway, or ordinary CLI
+    // parsing because stdout is exclusively the provider MCP transport.
+    if let Some(exit_code) = dispatch_hidden_cli_mcp_stdio(env::args_os().skip(1)) {
+        if exit_code != 0 {
+            std::process::exit(exit_code);
+        }
+        return;
+    }
+
     let sentry_guard =
         pioneer_observability::init_sentry(pioneer_observability::SentryTarget::Shared);
     pioneer_observability::init_tracing(sentry_guard.is_some());
@@ -29,6 +40,42 @@ pub fn main_entry() {
         }
         drop(sentry_guard);
         std::process::exit(1);
+    }
+}
+
+fn dispatch_hidden_cli_mcp_stdio(args: impl Iterator<Item = OsString>) -> Option<i32> {
+    let bootstrap_path = match pioneer_cli_mcp_bridge::helper::parse_hidden_helper_args(args) {
+        Ok(None) => return None,
+        Ok(Some(path)) => path,
+        Err(error) => {
+            eprintln!(
+                "{}",
+                pioneer_cli_mcp_bridge::helper::bounded_diagnostic(&error)
+            );
+            return Some(2);
+        }
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            eprintln!("CLI MCP helper runtime initialization failed");
+            return Some(1);
+        }
+    };
+    match runtime.block_on(pioneer_cli_mcp_bridge::helper::run_hidden_helper(
+        &bootstrap_path,
+    )) {
+        Ok(()) => Some(0),
+        Err(error) => {
+            eprintln!(
+                "{}",
+                pioneer_cli_mcp_bridge::helper::bounded_diagnostic(&error)
+            );
+            Some(1)
+        }
     }
 }
 
@@ -525,6 +572,27 @@ mod tests {
 
     fn args<'a>(values: &'a [&'a str]) -> impl Iterator<Item = String> + 'a {
         values.iter().map(|value| (*value).to_owned())
+    }
+
+    #[test]
+    fn hidden_cli_mcp_stdio_is_classified_before_ordinary_cli() {
+        let parsed = pioneer_cli_mcp_bridge::helper::parse_hidden_helper_args(
+            [
+                OsString::from("__cli-mcp-stdio"),
+                OsString::from("--bootstrap-file"),
+                OsString::from("/private/bootstrap"),
+            ]
+            .into_iter(),
+        )
+        .expect("hidden helper args");
+        assert_eq!(parsed, Some(std::path::PathBuf::from("/private/bootstrap")));
+        assert!(
+            pioneer_cli_mcp_bridge::helper::parse_hidden_helper_args(
+                [OsString::from("status")].into_iter()
+            )
+            .expect("ordinary args")
+            .is_none()
+        );
     }
 
     #[test]
