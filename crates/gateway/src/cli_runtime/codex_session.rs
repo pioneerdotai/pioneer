@@ -38,14 +38,15 @@ use crate::turn_mcp::result::CanonicalMcpToolResult;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use pioneer_cli_agent_runtime::codex::{
-    CodexAppServerClient, CodexConfigReadSnapshot, CodexGenerationOverlayDescriptor,
-    CodexGenerationOverlayIdentity, CodexHomeOverlayPolicy, CodexJsonlRpcClient,
-    CodexJsonlRpcNotificationEvent, CodexManagedMcpConfigInput, CodexManagedMcpSemanticInput,
-    CodexManagedMcpToolIdentity, CodexThreadForkParams, CodexThreadNameSetParams,
-    CodexThreadOpenSnapshot, CodexThreadStartParams, CodexTurnStartParams, CodexTurnSteerParams,
-    cleanup_codex_generation_overlay, codex_config_value_fingerprint,
-    codex_generation_app_server_process_config, serialize_codex_managed_mcp_config,
-    stage_codex_generation_mcp_config, verify_codex_generation_mcp_config,
+    CodexAppServerClient, CodexCollaborationMode, CodexConfigReadSnapshot,
+    CodexGenerationOverlayDescriptor, CodexGenerationOverlayIdentity, CodexHomeOverlayPolicy,
+    CodexJsonlRpcClient, CodexJsonlRpcNotificationEvent, CodexManagedMcpConfigInput,
+    CodexManagedMcpSemanticInput, CodexManagedMcpToolIdentity, CodexThreadForkParams,
+    CodexThreadNameSetParams, CodexThreadOpenSnapshot, CodexThreadStartParams,
+    CodexTurnStartParams, CodexTurnSteerParams, cleanup_codex_generation_overlay,
+    codex_config_value_fingerprint, codex_generation_app_server_process_config,
+    serialize_codex_managed_mcp_config, stage_codex_generation_mcp_config,
+    verify_codex_generation_mcp_config,
 };
 use pioneer_cli_agent_runtime::codex_attestation::sha256_json;
 use pioneer_cli_agent_runtime::driver::JsonlRpcId;
@@ -370,7 +371,6 @@ pub(crate) async fn run_codex_mcp_local_provider_probe(
             CodexThreadStartParams {
                 cwd,
                 approval_policy: "never".to_owned(),
-                developer_instructions: None,
                 ephemeral: true,
                 sandbox: Some("read-only".to_owned()),
                 permissions: None,
@@ -1097,6 +1097,11 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
         launch_spec: &CliSessionLaunchSpec,
     ) -> Result<Arc<dyn CLIAgentRuntimeSession>> {
         let options = &launch_spec.options;
+        if options.elevated_instructions.is_some() {
+            bail!(
+                "Codex elevated instructions are turn-local and must be delivered through turn/start collaborationMode"
+            );
+        }
         let expected_native_thread_id = match &launch_spec.continuation {
             CliProviderContinuation::CodexRpcThread { native_thread_id } => {
                 native_thread_id.clone()
@@ -1695,15 +1700,29 @@ fn codex_read_only_thread_open_params(
         approval_policy: params
             .approval_policy
             .unwrap_or_else(|| "default".to_owned()),
-        developer_instructions: params
-            .elevated_instructions
-            .map(|instructions| instructions.text().to_owned()),
         ephemeral: false,
         sandbox: Some("read-only".to_owned()),
         permissions: None,
         model: params.model,
         service_tier: params.service_tier,
     }
+}
+
+fn codex_turn_collaboration_mode(
+    params: &CLIAgentRuntimeTurnStartParams,
+) -> Result<CodexCollaborationMode> {
+    let instructions = &params.elevated_instructions;
+    let model = params
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .context("Codex turn/start cannot deliver elevated instructions without a model")?;
+    Ok(CodexCollaborationMode::default_with_developer_instructions(
+        model.to_owned(),
+        params.effort.clone(),
+        instructions.text().to_owned(),
+    ))
 }
 
 fn normalize_codex_turn_sandbox_policy(value: Option<JsonValue>) -> Result<Option<JsonValue>> {
@@ -1922,6 +1941,7 @@ impl CLIAgentRuntimeSession for CodexCLIAgentRuntimeSession {
                 .await
                 .context("Codex turn/start blocked by required MCP readiness")?;
         }
+        let collaboration_mode = codex_turn_collaboration_mode(&params)?;
         let input = serde_json::from_value(params.input)
             .context("failed to decode generic CLI runtime input for Codex")?;
         let sandbox_policy = if params.permissions.is_none() {
@@ -1943,6 +1963,7 @@ impl CLIAgentRuntimeSession for CodexCLIAgentRuntimeSession {
                     effort: params.effort,
                     personality: params.personality,
                     summary: params.summary,
+                    collaboration_mode: Some(collaboration_mode),
                 },
                 timeout,
             )
@@ -2459,26 +2480,80 @@ mod tests {
             sandbox: Some(json!("danger-full-access")),
             permissions: Some("full-access".to_owned()),
             service_tier: None,
-            elevated_instructions: None,
         }
     }
 
     #[test]
-    fn codex_thread_open_maps_elevated_prompt_to_developer_instructions() {
+    fn codex_turn_maps_elevated_prompt_to_collaboration_mode() {
         let text = "Pioneer elevated instructions for Codex";
         let fingerprint = Sha256::digest(text.as_bytes())
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        let mut params = thread_open_params("/workspace");
-        params.elevated_instructions = Some(
-            CLIRuntimeElevatedInstructions::try_new(text, fingerprint)
+        let params = CLIAgentRuntimeTurnStartParams {
+            native_thread_id: "native-thread".to_owned(),
+            input: json!([]),
+            cwd: Some("/workspace".to_owned()),
+            model: Some("gpt-5".to_owned()),
+            approval_policy: Some("never".to_owned()),
+            sandbox: None,
+            permissions: Some(":read-only".to_owned()),
+            effort: Some("high".to_owned()),
+            personality: None,
+            summary: None,
+            elevated_instructions: CLIRuntimeElevatedInstructions::try_new(text, fingerprint)
                 .expect("valid elevated instructions"),
+        };
+
+        let mapped = codex_turn_collaboration_mode(&params)
+            .expect("elevated instructions should produce a collaboration mode");
+        assert_eq!(
+            serde_json::to_value(mapped).expect("serialize collaboration mode"),
+            json!({
+                "mode": "default",
+                "settings": {
+                    "model": "gpt-5",
+                    "reasoning_effort": "high",
+                    "developer_instructions": text
+                }
+            })
         );
 
-        let mapped = codex_read_only_thread_open_params(params, "/workspace".to_owned());
-        assert_eq!(mapped.developer_instructions.as_deref(), Some(text));
-        assert_eq!(mapped.sandbox.as_deref(), Some("read-only"));
+        let opened = codex_read_only_thread_open_params(
+            thread_open_params("/workspace"),
+            "/workspace".to_owned(),
+        );
+        assert_eq!(opened.sandbox.as_deref(), Some("read-only"));
+    }
+
+    #[test]
+    fn codex_turn_rejects_elevated_prompt_without_model() {
+        let text = "Pioneer elevated instructions for Codex";
+        let fingerprint = Sha256::digest(text.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let params = CLIAgentRuntimeTurnStartParams {
+            native_thread_id: "native-thread".to_owned(),
+            input: json!([]),
+            cwd: Some("/workspace".to_owned()),
+            model: None,
+            approval_policy: Some("never".to_owned()),
+            sandbox: None,
+            permissions: Some(":read-only".to_owned()),
+            effort: None,
+            personality: None,
+            summary: None,
+            elevated_instructions: CLIRuntimeElevatedInstructions::try_new(text, fingerprint)
+                .expect("valid elevated instructions"),
+        };
+
+        let error = codex_turn_collaboration_mode(&params)
+            .expect_err("elevated instructions without a model must fail closed");
+        assert_eq!(
+            error.to_string(),
+            "Codex turn/start cannot deliver elevated instructions without a model"
+        );
     }
 
     #[test]

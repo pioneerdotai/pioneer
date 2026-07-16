@@ -238,27 +238,28 @@ mod tests {
     }
 
     #[test]
-    fn elevated_instruction_identity_controls_process_reuse() {
+    fn claude_elevated_instruction_identity_controls_process_reuse() {
         let mut first_options = CLIAgentRuntimeSessionStartOptions::default();
         first_options.elevated_instructions = Some(elevated("first governing prompt"));
         let same_options = first_options.clone();
         let mut changed_options = first_options.clone();
         changed_options.elevated_instructions = Some(elevated("changed governing prompt"));
+        let provider_session_id = Uuid::new_v4();
 
-        let first = CliSessionLaunchSpec::codex(
+        let first = CliSessionLaunchSpec::claude_resume(
             first_options,
             CliMcpSessionLaunch::Disabled,
-            Some("native-thread".to_owned()),
+            provider_session_id,
         );
-        let same = CliSessionLaunchSpec::codex(
+        let same = CliSessionLaunchSpec::claude_resume(
             same_options,
             CliMcpSessionLaunch::Disabled,
-            Some("native-thread".to_owned()),
+            provider_session_id,
         );
-        let changed = CliSessionLaunchSpec::codex(
+        let changed = CliSessionLaunchSpec::claude_resume(
             changed_options,
             CliMcpSessionLaunch::Disabled,
-            Some("native-thread".to_owned()),
+            provider_session_id,
         );
 
         assert!(!requires_restart(&first, &same));

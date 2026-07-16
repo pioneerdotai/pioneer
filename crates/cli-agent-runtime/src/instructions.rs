@@ -63,21 +63,21 @@ impl fmt::Debug for CLIRuntimeElevatedInstructions {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CLIRuntimeElevatedInstructionTransport {
-    CodexDeveloperInstructions,
+    CodexTurnCollaborationMode,
     ClaudeAppendSystemPromptFile,
 }
 
 impl CLIRuntimeElevatedInstructionTransport {
     pub fn for_runtime(kind: CLIAgentRuntimeKind) -> Self {
         match kind {
-            CLIAgentRuntimeKind::Codex => Self::CodexDeveloperInstructions,
+            CLIAgentRuntimeKind::Codex => Self::CodexTurnCollaborationMode,
             CLIAgentRuntimeKind::Claude => Self::ClaudeAppendSystemPromptFile,
         }
     }
 
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::CodexDeveloperInstructions => "codex_developer_instructions",
+            Self::CodexTurnCollaborationMode => "codex_turn_collaboration_mode",
             Self::ClaudeAppendSystemPromptFile => "claude_append_system_prompt_file",
         }
     }
@@ -124,7 +124,7 @@ mod tests {
     fn runtime_transport_mapping_is_explicit() {
         assert_eq!(
             CLIRuntimeElevatedInstructionTransport::for_runtime(CLIAgentRuntimeKind::Codex),
-            CLIRuntimeElevatedInstructionTransport::CodexDeveloperInstructions
+            CLIRuntimeElevatedInstructionTransport::CodexTurnCollaborationMode
         );
         assert_eq!(
             CLIRuntimeElevatedInstructionTransport::for_runtime(CLIAgentRuntimeKind::Claude),

@@ -14307,7 +14307,7 @@ mod tests {
         let projection = NewCliRuntimeInstructionProjection {
             turn_id: turn_id.to_owned(),
             runtime_kind: "codex".to_owned(),
-            transport_kind: "codex_developer_instructions".to_owned(),
+            transport_kind: "codex_turn_collaboration_mode".to_owned(),
             instruction_text: governing_text.to_owned(),
             instruction_fingerprint: "a".repeat(64),
             section_ids_json: r#"["pioneer_cli_runtime_instructions"]"#.to_owned(),

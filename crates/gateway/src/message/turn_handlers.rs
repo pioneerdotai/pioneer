@@ -1506,7 +1506,8 @@ impl MessageProcessor {
                 env: proxy_env,
                 enable_user_skills: matches!(runtime_kind, CLIAgentRuntimeKind::Claude)
                     && !installed_skills.is_empty(),
-                elevated_instructions: Some(elevated_instructions.clone()),
+                elevated_instructions: matches!(runtime_kind, CLIAgentRuntimeKind::Claude)
+                    .then_some(elevated_instructions.clone()),
                 ..Default::default()
             };
             let session_result = if runtime_kind == CLIAgentRuntimeKind::Codex {
@@ -1671,7 +1672,6 @@ impl MessageProcessor {
                         sandbox: thread_sandbox_label,
                         permissions: provider_permissions_id.clone(),
                         service_tier: None,
-                        elevated_instructions: Some(elevated_instructions),
                         resume_existing: cli_runtime_supports_durable_thread_resume(runtime_kind),
                         request_timeout: std::time::Duration::from_millis(
                             runtime_config.request_timeout_ms,
@@ -1780,6 +1780,7 @@ impl MessageProcessor {
                     effort: effective_cli_runtime_effort,
                     personality: cli_runtime_personality,
                     summary: cli_runtime_summary,
+                    elevated_instructions,
                 };
             let native_turn_start = PreparedCliRuntimeNativeTurnStart {
                 outcome,
@@ -2312,7 +2313,8 @@ impl MessageProcessor {
                     approval_policy: binding.approval_policy.clone(),
                     env: crate::cli_runtime::config::proxy_env(proxy_url.as_deref()),
                     enable_user_skills: matches!(runtime_kind, CLIAgentRuntimeKind::Claude),
-                    elevated_instructions: Some(elevated_instructions.clone()),
+                    elevated_instructions: matches!(runtime_kind, CLIAgentRuntimeKind::Claude)
+                        .then_some(elevated_instructions.clone()),
                     ..Default::default()
                 },
             )
@@ -2355,7 +2357,6 @@ impl MessageProcessor {
                     sandbox: sandbox.clone(),
                     permissions: permissions.clone(),
                     service_tier: None,
-                    elevated_instructions: Some(elevated_instructions),
                 },
                 std::time::Duration::from_millis(runtime.request_timeout_ms),
             )
@@ -2425,6 +2426,7 @@ impl MessageProcessor {
                     effort: None,
                     personality: None,
                     summary: None,
+                    elevated_instructions,
                 },
                 std::time::Duration::from_millis(runtime.request_timeout_ms),
             )

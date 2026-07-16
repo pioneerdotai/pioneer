@@ -99,8 +99,6 @@ pub(crate) struct CLIAgentRuntimeThreadBindingOpenRequest {
     pub sandbox: Option<serde_json::Value>,
     pub permissions: Option<String>,
     pub service_tier: Option<String>,
-    pub elevated_instructions:
-        Option<pioneer_cli_agent_runtime::instructions::CLIRuntimeElevatedInstructions>,
     pub resume_existing: bool,
     pub request_timeout: Duration,
     pub opened_at: DateTimeWithTimeZone,
@@ -115,7 +113,6 @@ impl CLIAgentRuntimeThreadBindingOpenRequest {
             sandbox: self.sandbox.clone(),
             permissions: self.permissions.clone(),
             service_tier: self.service_tier.clone(),
-            elevated_instructions: self.elevated_instructions.clone(),
         }
     }
 }
@@ -429,7 +426,6 @@ mod tests {
             sandbox: Some(json!("workspace-write")),
             permissions: None,
             service_tier: None,
-            elevated_instructions: None,
             resume_existing: true,
             request_timeout: Duration::from_secs(5),
             opened_at: unix_to_datetime(opened_at),

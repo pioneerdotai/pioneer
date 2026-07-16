@@ -40,12 +40,13 @@ use pioneer_cli_agent_runtime::event::{
     RuntimeTurnCompleted, RuntimeTurnFailed, RuntimeTurnInterrupted, RuntimeTurnRetrying,
     map_codex_server_request_event,
 };
+use pioneer_cli_agent_runtime::instructions::CLIRuntimeElevatedInstructionTransport;
 use pioneer_config::{GatewayHookRecoveryConfig, GatewayMemoryConfig, GatewayWebToolsConfig};
 use pioneer_crud::{
     AgentMemoryListFilter, CliRuntimeTurnAttemptStatus, CrudStore, MemoryActorRecord,
-    NewAgentMemoryCandidate, NewCliRuntimePendingRequest, NewCliRuntimeThreadBinding,
-    NewCliRuntimeTurnBinding, ThreadAgentsDocSaveReason, TurnItemAttemptDeadlines,
-    global_agent_memory_scope_key,
+    NewAgentMemoryCandidate, NewCliRuntimeInstructionProjection, NewCliRuntimePendingRequest,
+    NewCliRuntimeThreadBinding, NewCliRuntimeTurnBinding, ThreadAgentsDocSaveReason,
+    TurnItemAttemptDeadlines, global_agent_memory_scope_key,
 };
 use pioneer_entity::{
     thread, thread_sandox_policy, thread_timeline_block, turn, turn_event_projection_state,
@@ -15315,6 +15316,12 @@ async fn codex_cli_runtime_full_access_sets_danger_full_access_permissions_profi
         turn_start.permissions.as_deref(),
         Some(":danger-full-access")
     );
+    assert!(
+        turn_start
+            .elevated_instructions
+            .text()
+            .contains("## Pioneer CLI Runtime Instructions")
+    );
 
     let persisted =
         load_persisted_security_snapshot_record(&harness.crud_store, "turn_codex_full_access")
@@ -15396,6 +15403,12 @@ async fn codex_cli_runtime_supervised_sets_read_only_permissions_profile_impl() 
     assert_eq!(turn_start.approval_policy.as_deref(), Some("on-request"));
     assert_eq!(turn_start.sandbox.as_ref(), None);
     assert_eq!(turn_start.permissions.as_deref(), Some(":read-only"));
+    assert!(
+        turn_start
+            .elevated_instructions
+            .text()
+            .contains("## Pioneer CLI Runtime Instructions")
+    );
 
     assert_eq!(
         persisted.snapshot.sandbox.mode,
@@ -17607,6 +17620,30 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
         .await
         .expect("CLI recovery turn should materialize");
 
+    let recovery_instruction_text =
+        "## Pioneer CLI Runtime Instructions\n\nContinue the interrupted Pioneer turn.";
+    let recovery_instruction_fingerprint = Sha256::digest(recovery_instruction_text.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let projection_time = chrono::Utc::now().fixed_offset();
+    crud_store
+        .insert_cli_runtime_instruction_projection_if_absent(NewCliRuntimeInstructionProjection {
+            turn_id: turn_id.to_owned(),
+            runtime_kind: "codex".to_owned(),
+            transport_kind: CLIRuntimeElevatedInstructionTransport::CodexTurnCollaborationMode
+                .as_str()
+                .to_owned(),
+            instruction_text: recovery_instruction_text.to_owned(),
+            instruction_fingerprint: recovery_instruction_fingerprint,
+            section_ids_json: r#"["pioneer_cli_runtime_instructions"]"#.to_owned(),
+            compiler_version: "recovery-test".to_owned(),
+            created_at: projection_time,
+            updated_at: projection_time,
+        })
+        .await
+        .expect("CLI recovery instruction projection should persist");
+
     let now = chrono::Utc::now().fixed_offset();
     let (_, initial_attempt) = crud_store
         .prepare_cli_runtime_initial_turn_attempt(
@@ -17738,6 +17775,12 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
     let starts = cli_session.turn_starts.lock().await.clone();
     assert_eq!(starts.len(), 1);
     assert_eq!(starts[0].native_thread_id, native_thread_id);
+    assert!(
+        starts[0]
+            .elevated_instructions
+            .text()
+            .contains("## Pioneer CLI Runtime Instructions")
+    );
     assert!(
         starts[0]
             .input

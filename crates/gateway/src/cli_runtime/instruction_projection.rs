@@ -134,7 +134,7 @@ mod tests {
         CliRuntimeInstructionProjectionRecord {
             turn_id: "turn_1".to_owned(),
             runtime_kind: "codex".to_owned(),
-            transport_kind: CLIRuntimeElevatedInstructionTransport::CodexDeveloperInstructions
+            transport_kind: CLIRuntimeElevatedInstructionTransport::CodexTurnCollaborationMode
                 .as_str()
                 .to_owned(),
             instruction_text: text.to_owned(),

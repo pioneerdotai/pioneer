@@ -124,7 +124,6 @@ pub(crate) struct CLIAgentRuntimeThreadOpenParams {
     pub sandbox: Option<JsonValue>,
     pub permissions: Option<String>,
     pub service_tier: Option<String>,
-    pub elevated_instructions: Option<CLIRuntimeElevatedInstructions>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -147,6 +146,7 @@ pub(crate) struct CLIAgentRuntimeTurnStartParams {
     pub effort: Option<String>,
     pub personality: Option<String>,
     pub summary: Option<String>,
+    pub elevated_instructions: CLIRuntimeElevatedInstructions,
 }
 
 #[derive(Debug, Clone, PartialEq)]

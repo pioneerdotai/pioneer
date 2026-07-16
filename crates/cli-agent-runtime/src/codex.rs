@@ -3047,8 +3047,6 @@ pub struct CodexAccountReadResponse {
 pub struct CodexThreadStartParams {
     pub cwd: String,
     pub approval_policy: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub developer_instructions: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ephemeral: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3067,10 +3065,6 @@ impl fmt::Debug for CodexThreadStartParams {
             .debug_struct("CodexThreadStartParams")
             .field("cwd", &self.cwd)
             .field("approval_policy", &self.approval_policy)
-            .field(
-                "developer_instructions",
-                &self.developer_instructions.as_ref().map(|_| "[REDACTED]"),
-            )
             .field("ephemeral", &self.ephemeral)
             .field("sandbox", &self.sandbox)
             .field("permissions", &self.permissions)
@@ -3139,6 +3133,57 @@ pub struct CodexTurnStartParams {
     pub personality: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collaboration_mode: Option<CodexCollaborationMode>,
+}
+
+#[derive(Clone, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub struct CodexCollaborationMode {
+    mode: CodexCollaborationModeKind,
+    settings: CodexCollaborationModeSettings,
+}
+
+impl CodexCollaborationMode {
+    pub fn default_with_developer_instructions(
+        model: String,
+        reasoning_effort: Option<String>,
+        developer_instructions: String,
+    ) -> Self {
+        Self {
+            mode: CodexCollaborationModeKind::Default,
+            settings: CodexCollaborationModeSettings {
+                model,
+                reasoning_effort,
+                developer_instructions,
+            },
+        }
+    }
+}
+
+impl fmt::Debug for CodexCollaborationMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CodexCollaborationMode")
+            .field("mode", &self.mode)
+            .field("model", &self.settings.model)
+            .field("reasoning_effort", &self.settings.reasoning_effort)
+            .field("developer_instructions", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum CodexCollaborationModeKind {
+    Default,
+}
+
+#[derive(Clone, PartialEq, Serialize)]
+struct CodexCollaborationModeSettings {
+    model: String,
+    reasoning_effort: Option<String>,
+    developer_instructions: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -6493,7 +6538,6 @@ while read line; do :; done
                     CodexThreadStartParams {
                         cwd: "/tmp/project".to_owned(),
                         approval_policy: "on-request".to_owned(),
-                        developer_instructions: Some("Pioneer elevated instructions".to_owned()),
                         ephemeral: false,
                         sandbox: Some("workspace-write".to_owned()),
                         permissions: None,
@@ -6512,7 +6556,6 @@ while read line; do :; done
             json!({
                 "cwd": "/tmp/project",
                 "approvalPolicy": "on-request",
-                "developerInstructions": "Pioneer elevated instructions",
                 "sandbox": "workspace-write",
                 "model": "gpt-5",
                 "serviceTier": "priority"
@@ -6540,18 +6583,13 @@ while read line; do :; done
     }
 
     #[test]
-    fn codex_thread_start_debug_redacts_developer_instructions() {
+    fn codex_turn_collaboration_mode_debug_redacts_developer_instructions() {
         let canary = "codex-developer-instruction-canary";
-        let params = CodexThreadStartParams {
-            cwd: "/tmp/project".to_owned(),
-            approval_policy: "on-request".to_owned(),
-            developer_instructions: Some(canary.to_owned()),
-            ephemeral: false,
-            sandbox: Some("workspace-write".to_owned()),
-            permissions: None,
-            model: Some("gpt-5".to_owned()),
-            service_tier: None,
-        };
+        let params = CodexCollaborationMode::default_with_developer_instructions(
+            "gpt-5".to_owned(),
+            Some("high".to_owned()),
+            canary.to_owned(),
+        );
 
         let debug = format!("{params:?}");
         assert!(!debug.contains(canary));
@@ -6588,6 +6626,13 @@ while read line; do :; done
                         effort: Some("ultra".to_owned()),
                         personality: None,
                         summary: Some("concise".to_owned()),
+                        collaboration_mode: Some(
+                            CodexCollaborationMode::default_with_developer_instructions(
+                                "gpt-5".to_owned(),
+                                Some("ultra".to_owned()),
+                                "Pioneer elevated instructions".to_owned(),
+                            ),
+                        ),
                     },
                     Duration::from_secs(2),
                 )
@@ -6617,7 +6662,15 @@ while read line; do :; done
                 },
                 "model": "gpt-5",
                 "effort": "ultra",
-                "summary": "concise"
+                "summary": "concise",
+                "collaborationMode": {
+                    "mode": "default",
+                    "settings": {
+                        "model": "gpt-5",
+                        "reasoning_effort": "ultra",
+                        "developer_instructions": "Pioneer elevated instructions"
+                    }
+                }
             })
         );
         fake.write_result_response(
@@ -6649,7 +6702,6 @@ while read line; do :; done
                     CodexThreadStartParams {
                         cwd: "/tmp/project".to_owned(),
                         approval_policy: "never".to_owned(),
-                        developer_instructions: None,
                         ephemeral: false,
                         sandbox: Some("danger-full-access".to_owned()),
                         permissions: None,
@@ -6703,6 +6755,7 @@ while read line; do :; done
                         effort: None,
                         personality: None,
                         summary: None,
+                        collaboration_mode: None,
                     },
                     Duration::from_secs(2),
                 )
@@ -6746,6 +6799,7 @@ while read line; do :; done
                         effort: None,
                         personality: None,
                         summary: None,
+                        collaboration_mode: None,
                     },
                     Duration::from_secs(2),
                 )
@@ -7091,7 +7145,6 @@ while read line; do :; done
                     CodexThreadStartParams {
                         cwd: "/tmp/project".to_owned(),
                         approval_policy: "never".to_owned(),
-                        developer_instructions: Some("Pioneer resumed instructions".to_owned()),
                         ephemeral: false,
                         sandbox: Some("danger-full-access".to_owned()),
                         permissions: None,
@@ -7111,7 +7164,6 @@ while read line; do :; done
                 "threadId": "codex-thread-existing",
                 "cwd": "/tmp/project",
                 "approvalPolicy": "never",
-                "developerInstructions": "Pioneer resumed instructions",
                 "sandbox": "danger-full-access"
             })
         );
