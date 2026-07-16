@@ -30,12 +30,14 @@ use crate::hooks::{
 };
 use crate::{
     AgentEventHub, AgentEventHubError, AgentMcpAvailability, AgentMcpMaterialization,
-    AgentMcpMaterializationRequest, AgentMcpServerRef, AgentMcpToolProvider, AgentMcpToolRef,
-    AgentTurnHookRuntimeContext, ExecutionCheckpointContext, ExecutionWindowContinuation,
-    ResolvedArtifactInput, RetainedToolLlmContext, ReviewRequiredTaskObservation,
-    TaskToolMaterialization, TaskToolProvider, TaskTurnContext, TerminalTaskObservation,
-    ToolLoopConfig, TurnExecutionControl, TurnFinalizationContext, TurnFinalizationDecision,
-    TurnFinalizationProvider, TurnToolContext, TurnToolMaterialization, TurnToolProvider,
+    AgentMcpMaterializationError, AgentMcpMaterializationFailureReason,
+    AgentMcpMaterializationRequest, AgentMcpResolutionDiagnostic, AgentMcpServerRef,
+    AgentMcpToolProvider, AgentMcpToolRef, AgentTurnHookRuntimeContext, ExecutionCheckpointContext,
+    ExecutionWindowContinuation, ResolvedArtifactInput, RetainedToolLlmContext,
+    ReviewRequiredTaskObservation, TaskToolMaterialization, TaskToolProvider, TaskTurnContext,
+    TerminalTaskObservation, ToolLoopConfig, TurnExecutionControl, TurnFinalizationContext,
+    TurnFinalizationDecision, TurnFinalizationProvider, TurnToolContext, TurnToolMaterialization,
+    TurnToolProvider,
 };
 use chrono::Local;
 use futures_util::{StreamExt, stream};
@@ -1246,6 +1248,39 @@ fn unsupported_mcp_capability_summary(
     summary
 }
 
+fn unavailable_mcp_provider_summary(
+    server_refs: &[AgentMcpServerRef],
+    tool_refs: &[AgentMcpToolRef],
+) -> TurnCapabilityResolutionSummary {
+    let mut summary = TurnCapabilityResolutionSummary::default();
+    for reference in server_refs {
+        summary.rejected.push(TurnRejectedCapability {
+            id: reference.capability_id.clone(),
+            label: reference.label.clone(),
+            kind: TurnCapabilityKind::McpServer {
+                name: reference.name.clone(),
+                scope_kind: reference.scope_kind,
+            },
+            reason: TurnCapabilityRejectedReason::Unavailable,
+            message: "MCP resolution is unavailable for this turn.".to_owned(),
+        });
+    }
+    for reference in tool_refs {
+        summary.rejected.push(TurnRejectedCapability {
+            id: reference.capability_id.clone(),
+            label: reference.label.clone(),
+            kind: TurnCapabilityKind::McpTool {
+                server_name: reference.server_name.clone(),
+                raw_tool_name: reference.raw_tool_name.clone(),
+                scope_kind: reference.scope_kind,
+            },
+            reason: TurnCapabilityRejectedReason::Unavailable,
+            message: "MCP resolution is unavailable for this turn.".to_owned(),
+        });
+    }
+    summary
+}
+
 fn capability_display_label(rejected: &TurnRejectedCapability) -> String {
     if let Some(label) = rejected.label.as_deref()
         && !label.trim().is_empty()
@@ -1362,6 +1397,36 @@ async fn emit_capability_resolution_events(
         .await?;
     }
 
+    Ok(())
+}
+
+async fn emit_mcp_resolution_diagnostics(
+    event_tx: &AgentEventHub,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    diagnostics: &[AgentMcpResolutionDiagnostic],
+) -> Result<(), ChatTurnError> {
+    for diagnostic in diagnostics {
+        emit_durable_event(
+            event_tx,
+            AgentDurableEvent::ItemCompleted {
+                notification: ItemCompletedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: TurnItem::SystemEvent {
+                        id: generate_id(TURN_ITEM_ID_LEN),
+                        level: pioneer_protocol::SystemEventLevel::Warning,
+                        message: diagnostic.message.clone(),
+                        code: Some(diagnostic.code.clone()),
+                        details: None,
+                    },
+                },
+            },
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -2386,41 +2451,30 @@ async fn execute_standard_provider_response(
     }
 }
 
-async fn load_mcp_availability(
-    provider: Option<&Arc<dyn AgentMcpToolProvider>>,
-    workspace_id: &str,
-    thread_id: &str,
-    turn_id: &str,
-) -> AgentMcpAvailability {
-    let Some(provider) = provider else {
-        return AgentMcpAvailability::default();
-    };
-    match provider.mcp_availability(workspace_id).await {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            warn!(
-                thread_id,
-                turn_id,
-                error = error.as_str(),
-                "failed to load MCP availability for skill dependencies"
-            );
-            AgentMcpAvailability::default()
-        }
-    }
-}
-
 async fn materialize_mcp_tooling(
     provider: Option<&Arc<dyn AgentMcpToolProvider>>,
     workspace_id: &str,
     turn_id: &str,
-    thread_id: &str,
     explicit_servers: &[AgentMcpServerRef],
     explicit_tools: &[AgentMcpToolRef],
-) -> AgentMcpMaterialization {
+) -> Result<AgentMcpMaterialization, AgentMcpMaterializationError> {
     let Some(provider) = provider else {
-        return AgentMcpMaterialization::default();
+        if explicit_servers.is_empty() && explicit_tools.is_empty() {
+            return Ok(AgentMcpMaterialization::default());
+        }
+        let summary = unavailable_mcp_provider_summary(explicit_servers, explicit_tools);
+        return Err(AgentMcpMaterializationError {
+            reason: AgentMcpMaterializationFailureReason::ProviderUnavailable,
+            message: "explicit MCP capabilities cannot be resolved for this turn".to_owned(),
+            diagnostics: vec![AgentMcpResolutionDiagnostic {
+                code: "mcp.resolution.provider_unavailable".to_owned(),
+                message: "MCP resolution is unavailable for this turn.".to_owned(),
+            }],
+            accepted_capabilities: Vec::new(),
+            rejected_capabilities: summary.rejected,
+        });
     };
-    match provider
+    provider
         .materialize_mcp_tools(AgentMcpMaterializationRequest {
             workspace_id: workspace_id.to_owned(),
             turn_id: turn_id.to_owned(),
@@ -2428,18 +2482,6 @@ async fn materialize_mcp_tooling(
             explicit_tools: explicit_tools.to_vec(),
         })
         .await
-    {
-        Ok(materialization) => materialization,
-        Err(error) => {
-            warn!(
-                thread_id,
-                turn_id,
-                error = error.as_str(),
-                "failed to materialize MCP dynamic tools"
-            );
-            AgentMcpMaterialization::default()
-        }
-    }
 }
 
 async fn materialize_task_tooling(
@@ -2894,10 +2936,70 @@ async fn execute_agent_provider_response(
     )
     .await;
 
-    let mcp_availability =
-        load_mcp_availability(mcp_tool_provider.as_ref(), workspace_id, thread_id, turn_id).await;
-
     let normalized_capabilities = normalize_turn_capabilities(capabilities);
+
+    let mcp_materialization = if provider_tool_calling {
+        match materialize_mcp_tooling(
+            mcp_tool_provider.as_ref(),
+            workspace_id,
+            turn_id,
+            normalized_capabilities.mcp_server_refs.as_slice(),
+            normalized_capabilities.mcp_tool_refs.as_slice(),
+        )
+        .await
+        {
+            Ok(materialization) => materialization,
+            Err(failure) => {
+                for diagnostic in &failure.diagnostics {
+                    warn!(
+                        thread_id,
+                        turn_id,
+                        reason = ?failure.reason,
+                        code = diagnostic.code.as_str(),
+                        diagnostic = diagnostic.message.as_str(),
+                        "MCP turn projection preflight failed"
+                    );
+                }
+                let accepted_capabilities = failure.accepted_capabilities.clone();
+                let mut rejected_capabilities = normalized_capabilities.rejected.clone();
+                rejected_capabilities.extend(failure.rejected_capabilities.clone());
+                emit_capability_resolution_events(
+                    event_tx.as_ref(),
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    accepted_capabilities.as_slice(),
+                    rejected_capabilities.as_slice(),
+                    &[],
+                )
+                .await?;
+                emit_mcp_resolution_diagnostics(
+                    event_tx.as_ref(),
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    failure.diagnostics.as_slice(),
+                )
+                .await?;
+                return Err(ChatTurnError::Blocked(failure.message));
+            }
+        }
+    } else {
+        AgentMcpMaterialization::default()
+    };
+    for diagnostic in &mcp_materialization.diagnostics {
+        warn!(
+            thread_id,
+            turn_id,
+            code = diagnostic.code.as_str(),
+            diagnostic = diagnostic.message.as_str(),
+            "MCP dynamic tool materialization reported diagnostic"
+        );
+    }
+    let projected_mcp_availability = AgentMcpAvailability {
+        available_mcp: mcp_materialization.available_mcp.clone(),
+        blocked_mcp: mcp_materialization.blocked_mcp.clone(),
+    };
 
     let skills_resolution = match skills::resolve_turn_skills_with_explicit_refs(
         workdir.as_path(),
@@ -2906,7 +3008,7 @@ async fn execute_agent_provider_response(
         normalized_capabilities.skill_refs.as_slice(),
         &tool_loop_config.skills,
         workspace_skill_policies,
-        &mcp_availability,
+        &projected_mcp_availability,
     ) {
         Ok(resolution) => resolution,
         Err(error) => {
@@ -2914,21 +3016,32 @@ async fn execute_agent_provider_response(
                 thread_id,
                 turn_id,
                 error = %format!("{error:#}"),
-                "failed to resolve turn skills"
+                "combined MCP and skill preflight failed while resolving skills"
             );
-            skills::TurnSkillResolution {
-                prompt: String::new(),
-                result: pioneer_skills::SkillResolutionResult {
-                    active: Vec::new(),
-                    excluded: Vec::new(),
-                },
-                runtime_plan: pioneer_skills::SkillRuntimePlan {
-                    tools: Vec::new(),
-                    read_skill_index: HashMap::new(),
-                    excluded_tools: Vec::new(),
-                },
-                audit_events: Vec::new(),
-            }
+            let accepted_capabilities = mcp_materialization.accepted_capabilities.clone();
+            let mut rejected_capabilities = normalized_capabilities.rejected.clone();
+            rejected_capabilities.extend(mcp_materialization.rejected_capabilities.clone());
+            emit_capability_resolution_events(
+                event_tx.as_ref(),
+                workspace_id,
+                thread_id,
+                turn_id,
+                accepted_capabilities.as_slice(),
+                rejected_capabilities.as_slice(),
+                &[],
+            )
+            .await?;
+            emit_mcp_resolution_diagnostics(
+                event_tx.as_ref(),
+                workspace_id,
+                thread_id,
+                turn_id,
+                mcp_materialization.diagnostics.as_slice(),
+            )
+            .await?;
+            return Err(ChatTurnError::Blocked(format!(
+                "combined MCP and skill preflight failed: {error:#}"
+            )));
         }
     };
 
@@ -2936,6 +3049,78 @@ async fn execute_agent_provider_response(
         normalized_capabilities.skill_refs.as_slice(),
         &skills_resolution,
     );
+
+    let unsupported_mcp_summary = if provider_tool_calling {
+        TurnCapabilityResolutionSummary::default()
+    } else {
+        unsupported_mcp_capability_summary(
+            normalized_capabilities.mcp_server_refs.as_slice(),
+            normalized_capabilities.mcp_tool_refs.as_slice(),
+        )
+    };
+    let mut accepted_capabilities = skill_capability_summary.accepted.clone();
+    accepted_capabilities.extend(mcp_materialization.accepted_capabilities.clone());
+    let mut rejected_capabilities = normalized_capabilities.rejected.clone();
+    rejected_capabilities.extend(skill_capability_summary.rejected.clone());
+    rejected_capabilities.extend(mcp_materialization.rejected_capabilities.clone());
+    rejected_capabilities.extend(unsupported_mcp_summary.rejected);
+    if !rejected_capabilities.is_empty() {
+        emit_capability_resolution_events(
+            event_tx.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            accepted_capabilities.as_slice(),
+            rejected_capabilities.as_slice(),
+            &[],
+        )
+        .await?;
+        emit_mcp_resolution_diagnostics(
+            event_tx.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            mcp_materialization.diagnostics.as_slice(),
+        )
+        .await?;
+        return Err(ChatTurnError::Blocked(
+            "combined MCP and skill preflight rejected one or more explicit capabilities"
+                .to_owned(),
+        ));
+    }
+
+    if let Some(persistence_request) = mcp_materialization.persistence.clone() {
+        let Some(mcp_tool_provider) = mcp_tool_provider.as_ref() else {
+            return Err(ChatTurnError::Blocked(
+                "resolved MCP projection has no persistence owner".to_owned(),
+            ));
+        };
+        let expected_manifest_hash = persistence_request.manifest_hash.clone();
+        let expected_tool_count = persistence_request.bindings.len();
+        let persisted = mcp_tool_provider
+            .persist_mcp_projection(persistence_request)
+            .await
+            .map_err(|error| {
+                warn!(
+                    thread_id,
+                    turn_id,
+                    error = %error,
+                    "turn MCP projection persistence failed before provider start"
+                );
+                ChatTurnError::Blocked(format!(
+                    "failed to persist resolved MCP projection: {error}"
+                ))
+            })?;
+        if persisted.turn_id != turn_id
+            || persisted.manifest_hash != expected_manifest_hash
+            || persisted.tool_count != expected_tool_count
+        {
+            return Err(ChatTurnError::Blocked(
+                "persisted MCP projection acknowledgement did not match the resolved projection"
+                    .to_owned(),
+            ));
+        }
+    }
 
     let bindings = skills::to_turn_skill_bindings(skills_resolution.result.active.as_slice());
 
@@ -2965,6 +3150,26 @@ async fn execute_agent_provider_response(
         )
         .await?;
     }
+
+    emit_capability_resolution_events(
+        event_tx.as_ref(),
+        workspace_id,
+        thread_id,
+        turn_id,
+        accepted_capabilities.as_slice(),
+        rejected_capabilities.as_slice(),
+        mcp_materialization.mcp_bindings.as_slice(),
+    )
+    .await?;
+    emit_mcp_resolution_diagnostics(
+        event_tx.as_ref(),
+        workspace_id,
+        thread_id,
+        turn_id,
+        mcp_materialization.diagnostics.as_slice(),
+    )
+    .await?;
+    let capability_diagnostics = capability_manifest_diagnostics(rejected_capabilities.as_slice());
 
     let skills_prompt = normalize_optional_prompt(Some(skills_resolution.prompt.clone()));
 
@@ -3010,27 +3215,6 @@ async fn execute_agent_provider_response(
     }
 
     if !provider_tool_calling {
-        let unsupported_mcp_summary = unsupported_mcp_capability_summary(
-            normalized_capabilities.mcp_server_refs.as_slice(),
-            normalized_capabilities.mcp_tool_refs.as_slice(),
-        );
-        let accepted_capabilities = skill_capability_summary.accepted.clone();
-        let mut rejected_capabilities = normalized_capabilities.rejected.clone();
-        rejected_capabilities.extend(skill_capability_summary.rejected.clone());
-        rejected_capabilities.extend(unsupported_mcp_summary.rejected);
-        emit_capability_resolution_events(
-            event_tx.as_ref(),
-            workspace_id,
-            thread_id,
-            turn_id,
-            accepted_capabilities.as_slice(),
-            rejected_capabilities.as_slice(),
-            &[],
-        )
-        .await?;
-        let capability_diagnostics =
-            capability_manifest_diagnostics(rejected_capabilities.as_slice());
-
         let _effective_tool_bundle_set = run_agent_turn_tool_materialization_hook_phase(
             hook_runtime.as_ref(),
             &hook_context,
@@ -3218,40 +3402,6 @@ async fn execute_agent_provider_response(
             }
         }
     }
-
-    let mcp_materialization = materialize_mcp_tooling(
-        mcp_tool_provider.as_ref(),
-        workspace_id,
-        turn_id,
-        thread_id,
-        normalized_capabilities.mcp_server_refs.as_slice(),
-        normalized_capabilities.mcp_tool_refs.as_slice(),
-    )
-    .await;
-    for diagnostic in &mcp_materialization.diagnostics {
-        warn!(
-            thread_id,
-            turn_id,
-            diagnostic = diagnostic.as_str(),
-            "MCP dynamic tool materialization reported diagnostic"
-        );
-    }
-    let mut accepted_capabilities = skill_capability_summary.accepted.clone();
-    accepted_capabilities.extend(mcp_materialization.accepted_capabilities.clone());
-    let mut rejected_capabilities = normalized_capabilities.rejected.clone();
-    rejected_capabilities.extend(skill_capability_summary.rejected.clone());
-    rejected_capabilities.extend(mcp_materialization.rejected_capabilities.clone());
-    emit_capability_resolution_events(
-        event_tx.as_ref(),
-        workspace_id,
-        thread_id,
-        turn_id,
-        accepted_capabilities.as_slice(),
-        rejected_capabilities.as_slice(),
-        mcp_materialization.mcp_bindings.as_slice(),
-    )
-    .await?;
-    let capability_diagnostics = capability_manifest_diagnostics(rejected_capabilities.as_slice());
 
     let skill_tool_materialization = skill_tools::materialize_skill_tooling(
         &skills_resolution.runtime_plan,
@@ -5415,15 +5565,18 @@ mod tests {
         ExecutedToolResult, TaskMutationFinalizationGuard, append_recovered_tool_llm_context,
         apply_request_tools_results_to_visible_tools, apply_request_tools_visibility_expansion,
         apply_review_required_tools_to_visible_tools, build_user_message,
-        compile_agent_prompt_bundle_with_prompt_root, normalize_turn_capabilities,
-        resolve_skill_capability_summary, retain_agent_attachment_messages,
-        retain_agent_attachment_messages_with_budget, retain_chat_mode_attachment_messages,
-        review_required_observation_payload, review_required_observation_signature,
-        runtime_sections_with_artifact_reference_policy,
+        compile_agent_prompt_bundle_with_prompt_root, materialize_mcp_tooling,
+        normalize_turn_capabilities, resolve_skill_capability_summary,
+        retain_agent_attachment_messages, retain_agent_attachment_messages_with_budget,
+        retain_chat_mode_attachment_messages, review_required_observation_payload,
+        review_required_observation_signature, runtime_sections_with_artifact_reference_policy,
         runtime_sections_with_execution_continuation_context,
         sync_review_action_tools_to_observations, workdir_from_execution_security_snapshot,
     };
     use crate::{
+        AgentMcpAvailability, AgentMcpMaterialization, AgentMcpMaterializationError,
+        AgentMcpMaterializationFailureReason, AgentMcpMaterializationRequest,
+        AgentMcpResolutionDiagnostic, AgentMcpServerRef, AgentMcpToolProvider,
         ExecutionCheckpointContext, ResolvedArtifactInput, RetainedToolLlmContext,
         ReviewRequiredTaskObservation,
     };
@@ -5470,6 +5623,97 @@ mod tests {
         ) -> Result<Box<dyn ToolOutput>, ToolError> {
             Ok(Box::new(FunctionToolOutput::new("ok", true)))
         }
+    }
+
+    struct FailingMcpMaterializationProvider;
+
+    #[async_trait::async_trait]
+    impl AgentMcpToolProvider for FailingMcpMaterializationProvider {
+        async fn mcp_availability(
+            &self,
+            _workspace_id: &str,
+        ) -> Result<AgentMcpAvailability, String> {
+            Ok(AgentMcpAvailability::default())
+        }
+
+        async fn materialize_mcp_tools(
+            &self,
+            _request: AgentMcpMaterializationRequest,
+        ) -> Result<AgentMcpMaterialization, AgentMcpMaterializationError> {
+            Err(AgentMcpMaterializationError {
+                reason: AgentMcpMaterializationFailureReason::ResolutionUncertain,
+                message: "storage unavailable".to_owned(),
+                diagnostics: vec![AgentMcpResolutionDiagnostic {
+                    code: "mcp.resolution.uncertain".to_owned(),
+                    message: "storage unavailable".to_owned(),
+                }],
+                accepted_capabilities: Vec::new(),
+                rejected_capabilities: Vec::new(),
+            })
+        }
+
+        async fn persist_mcp_projection(
+            &self,
+            _request: crate::AgentMcpProjectionPersistenceRequest,
+        ) -> Result<crate::AgentMcpPersistedProjection, crate::AgentMcpProjectionPersistenceError>
+        {
+            Err(crate::AgentMcpProjectionPersistenceError {
+                message: "materialization failed before persistence".to_owned(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_materialization_explicit_capability_without_provider_is_not_empty_fallback() {
+        let failure = match materialize_mcp_tooling(
+            None,
+            "workspace",
+            "turn",
+            &[AgentMcpServerRef {
+                capability_id: "mcp-server:workspace:resend".to_owned(),
+                label: Some("resend".to_owned()),
+                name: "resend".to_owned(),
+                scope_kind: McpScopeKind::Workspace,
+            }],
+            &[],
+        )
+        .await
+        {
+            Ok(_) => panic!("explicit MCP without a provider must fail"),
+            Err(failure) => failure,
+        };
+
+        assert_eq!(
+            failure.reason,
+            AgentMcpMaterializationFailureReason::ProviderUnavailable
+        );
+        assert_eq!(failure.rejected_capabilities.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn mcp_materialization_provider_uncertainty_is_not_empty_fallback() {
+        let provider: std::sync::Arc<dyn AgentMcpToolProvider> =
+            std::sync::Arc::new(FailingMcpMaterializationProvider);
+        let failure =
+            match materialize_mcp_tooling(Some(&provider), "workspace", "turn", &[], &[]).await {
+                Ok(_) => panic!("resolver uncertainty must fail before provider request"),
+                Err(failure) => failure,
+            };
+
+        assert_eq!(
+            failure.reason,
+            AgentMcpMaterializationFailureReason::ResolutionUncertain
+        );
+        assert_eq!(failure.message, "storage unavailable");
+    }
+
+    #[tokio::test]
+    async fn mcp_materialization_empty_valid_turn_without_provider_remains_valid() {
+        let materialization = materialize_mcp_tooling(None, "workspace", "turn", &[], &[])
+            .await
+            .expect("empty valid MCP projection should remain successful");
+        assert!(materialization.bundles.is_empty());
+        assert!(materialization.rejected_capabilities.is_empty());
     }
 
     #[test]

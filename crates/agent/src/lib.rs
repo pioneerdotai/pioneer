@@ -251,11 +251,95 @@ pub struct AgentMcpMaterialization {
     pub bundles: Vec<pioneer_tools::ToolExtensionBundle>,
     pub available_mcp: Vec<String>,
     pub blocked_mcp: Vec<String>,
-    pub diagnostics: Vec<String>,
+    pub diagnostics: Vec<AgentMcpResolutionDiagnostic>,
     pub accepted_capabilities: Vec<pioneer_protocol::TurnAcceptedCapability>,
     pub rejected_capabilities: Vec<pioneer_protocol::TurnRejectedCapability>,
     pub mcp_bindings: Vec<pioneer_protocol::McpTurnBindingSummary>,
+    pub persistence: Option<AgentMcpProjectionPersistenceRequest>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentMcpProjectionPersistenceRequest {
+    pub workspace_id: String,
+    pub turn_id: String,
+    pub projection_version: u32,
+    pub manifest_hash: String,
+    pub resolution_status: String,
+    pub bindings: Vec<AgentMcpProjectionBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentMcpProjectionBinding {
+    pub server_installation_id: String,
+    pub server_name: String,
+    pub raw_tool_name: String,
+    pub callable_name: String,
+    pub canonical_callable_name: String,
+    pub provider_callable_name: String,
+    pub catalog_version: String,
+    pub installation_fingerprint: String,
+    pub canonical_schema_fingerprint: String,
+    pub provider_schema_fingerprint: String,
+    pub annotations_json: String,
+    pub annotations_digest: String,
+    pub effective_timeout_ms: u64,
+    pub runtime_generation: u64,
+    pub projection_activation_generation: u64,
+    pub selection_reason: String,
+    pub capability_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentMcpPersistedProjection {
+    pub turn_id: String,
+    pub manifest_hash: String,
+    pub tool_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentMcpProjectionPersistenceError {
+    pub message: String,
+}
+
+impl std::fmt::Display for AgentMcpProjectionPersistenceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message.as_str())
+    }
+}
+
+impl std::error::Error for AgentMcpProjectionPersistenceError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentMcpResolutionDiagnostic {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentMcpMaterializationFailureReason {
+    ExplicitCapabilityRejected,
+    RequiredInstallationUnavailable,
+    ResolutionUncertain,
+    ProjectionInvalid,
+    ProviderUnavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentMcpMaterializationError {
+    pub reason: AgentMcpMaterializationFailureReason,
+    pub message: String,
+    pub diagnostics: Vec<AgentMcpResolutionDiagnostic>,
+    pub accepted_capabilities: Vec<pioneer_protocol::TurnAcceptedCapability>,
+    pub rejected_capabilities: Vec<pioneer_protocol::TurnRejectedCapability>,
+}
+
+impl std::fmt::Display for AgentMcpMaterializationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message.as_str())
+    }
+}
+
+impl std::error::Error for AgentMcpMaterializationError {}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentMcpMaterializationRequest {
@@ -289,7 +373,12 @@ pub trait AgentMcpToolProvider: Send + Sync {
     async fn materialize_mcp_tools(
         &self,
         request: AgentMcpMaterializationRequest,
-    ) -> Result<AgentMcpMaterialization, String>;
+    ) -> Result<AgentMcpMaterialization, AgentMcpMaterializationError>;
+
+    async fn persist_mcp_projection(
+        &self,
+        request: AgentMcpProjectionPersistenceRequest,
+    ) -> Result<AgentMcpPersistedProjection, AgentMcpProjectionPersistenceError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

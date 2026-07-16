@@ -1,6 +1,8 @@
 use super::{
     AgentCommand, AgentEvent, AgentManager, AgentMcpAvailability, AgentMcpMaterialization,
-    AgentMcpMaterializationRequest, AgentMcpToolProvider, AgentMemoryProvider,
+    AgentMcpMaterializationError, AgentMcpMaterializationRequest, AgentMcpPersistedProjection,
+    AgentMcpProjectionBinding, AgentMcpProjectionPersistenceError,
+    AgentMcpProjectionPersistenceRequest, AgentMcpToolProvider, AgentMemoryProvider,
     AgentMemoryTurnPolicyProvider, AgentPostTurnHookDispatchPolicy, AgentStartError,
     AgentTurnHookRuntimeContext, DurableEventReceiver, ExecutionTurnStatus, MemoryExtractionPolicy,
     MemoryRecallItem, MemoryRecallRequest, MemoryRecallSnapshot, MemoryToolMaterialization,
@@ -56,6 +58,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::task::yield_now;
 use tokio::time::{Duration, Instant, advance, sleep, timeout};
+use tokio_util::sync::CancellationToken;
 
 fn test_tool_loop_config() -> ToolLoopConfig {
     ToolLoopConfig {
@@ -535,6 +538,8 @@ impl TextOnlyAgentProvider {
 struct TestMcpToolProvider {
     materialization: AgentMcpMaterialization,
     requests: std::sync::Mutex<Vec<AgentMcpMaterializationRequest>>,
+    persisted: std::sync::Mutex<Vec<AgentMcpProjectionPersistenceRequest>>,
+    persist_failure: Option<String>,
 }
 
 impl TestMcpToolProvider {
@@ -542,7 +547,14 @@ impl TestMcpToolProvider {
         Self {
             materialization,
             requests: std::sync::Mutex::new(Vec::new()),
+            persisted: std::sync::Mutex::new(Vec::new()),
+            persist_failure: None,
         }
+    }
+
+    fn with_persistence_failure(mut self, message: &str) -> Self {
+        self.persist_failure = Some(message.to_owned());
+        self
     }
 
     fn snapshot_requests(&self) -> Vec<AgentMcpMaterializationRequest> {
@@ -551,13 +563,24 @@ impl TestMcpToolProvider {
             .expect("MCP provider requests lock poisoned")
             .clone()
     }
+
+    fn snapshot_persisted(&self) -> Vec<AgentMcpProjectionPersistenceRequest> {
+        self.persisted
+            .lock()
+            .expect("MCP persisted projections lock poisoned")
+            .clone()
+    }
 }
 
 #[async_trait::async_trait]
 impl AgentMcpToolProvider for TestMcpToolProvider {
     async fn mcp_availability(&self, _workspace_id: &str) -> Result<AgentMcpAvailability, String> {
         Ok(AgentMcpAvailability {
-            available_mcp: vec!["resend".to_owned(), "resend/send".to_owned()],
+            available_mcp: vec![
+                "resend".to_owned(),
+                "resend/domains".to_owned(),
+                "resend/send".to_owned(),
+            ],
             blocked_mcp: Vec::new(),
         })
     }
@@ -565,12 +588,38 @@ impl AgentMcpToolProvider for TestMcpToolProvider {
     async fn materialize_mcp_tools(
         &self,
         request: AgentMcpMaterializationRequest,
-    ) -> Result<AgentMcpMaterialization, String> {
+    ) -> Result<AgentMcpMaterialization, AgentMcpMaterializationError> {
+        let mut materialization = self.materialization.clone();
+        if let Some(persistence) = materialization.persistence.as_mut() {
+            persistence.workspace_id = request.workspace_id.clone();
+            persistence.turn_id = request.turn_id.clone();
+        }
         self.requests
             .lock()
             .expect("MCP provider requests lock poisoned")
             .push(request);
-        Ok(self.materialization.clone())
+        Ok(materialization)
+    }
+
+    async fn persist_mcp_projection(
+        &self,
+        request: AgentMcpProjectionPersistenceRequest,
+    ) -> Result<AgentMcpPersistedProjection, AgentMcpProjectionPersistenceError> {
+        let persisted = AgentMcpPersistedProjection {
+            turn_id: request.turn_id.clone(),
+            manifest_hash: request.manifest_hash.clone(),
+            tool_count: request.bindings.len(),
+        };
+        self.persisted
+            .lock()
+            .expect("MCP persisted projections lock poisoned")
+            .push(request);
+        if let Some(message) = self.persist_failure.as_ref() {
+            return Err(AgentMcpProjectionPersistenceError {
+                message: message.clone(),
+            });
+        }
+        Ok(persisted)
     }
 }
 
@@ -582,6 +631,7 @@ impl pioneer_tools::McpToolExecutor for NoopMcpToolExecutor {
         &self,
         _request: pioneer_tools::McpToolCallRequest,
         _trace: ToolEventTrace,
+        _cancellation: CancellationToken,
     ) -> Result<pioneer_tools::McpToolCallOutput, ToolError> {
         Ok(pioneer_tools::McpToolCallOutput {
             content: json!([{"type":"text","text":"ok"}]),
@@ -653,6 +703,32 @@ fn explicit_mcp_tool_materialization(
                 capability_id: binding.capability_id,
             })
             .collect(),
+        persistence: Some(AgentMcpProjectionPersistenceRequest {
+            workspace_id: workspace_id.to_owned(),
+            turn_id: "turn_mcp_materialized".to_owned(),
+            projection_version: 1,
+            manifest_hash: "manifest-mcp-resend-send".to_owned(),
+            resolution_status: "resolved".to_owned(),
+            bindings: vec![AgentMcpProjectionBinding {
+                server_installation_id: "mcp_server_resend_001".to_owned(),
+                server_name: "resend".to_owned(),
+                raw_tool_name: "send".to_owned(),
+                callable_name: "mcp_resend_send".to_owned(),
+                canonical_callable_name: "mcp_resend_send".to_owned(),
+                provider_callable_name: "mcp_resend_send".to_owned(),
+                catalog_version: "catalog-v1".to_owned(),
+                installation_fingerprint: "fingerprint-resend".to_owned(),
+                canonical_schema_fingerprint: "schema-resend-send".to_owned(),
+                provider_schema_fingerprint: "schema-resend-send".to_owned(),
+                annotations_json: "{}".to_owned(),
+                annotations_digest: "annotations-empty".to_owned(),
+                effective_timeout_ms: 5_000,
+                runtime_generation: 1,
+                projection_activation_generation: 0,
+                selection_reason: "explicit_composer_capability".to_owned(),
+                capability_id: Some(capability_id.to_owned()),
+            }],
+        }),
     }
 }
 
@@ -11314,6 +11390,10 @@ async fn explicit_mcp_tool_contributes_dynamic_tool_definition_without_prompt_se
         materialization_requests[0].explicit_tools[0].capability_id,
         capability_id
     );
+    let persisted = mcp_provider.snapshot_persisted();
+    assert_eq!(persisted.len(), 1);
+    assert_eq!(persisted[0].turn_id, turn_id);
+    assert_eq!(persisted[0].bindings.len(), 1);
 
     let requests = provider.snapshot_requests();
     assert!(!requests.is_empty());
@@ -11376,13 +11456,77 @@ async fn explicit_mcp_tool_contributes_dynamic_tool_definition_without_prompt_se
 }
 
 #[tokio::test]
-async fn text_file_skill_and_mcp_capabilities_survive_single_turn_prompt_gate() {
+async fn capability_persistence_order_failure_starts_no_api_provider_request() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let workspace_id = "ws_000000000000000129";
+    let capability_id = "mcp-tool:workspace:resend:send";
+    let mcp_provider = Arc::new(
+        TestMcpToolProvider::new(explicit_mcp_tool_materialization(
+            capability_id,
+            workspace_id,
+        ))
+        .with_persistence_failure("injected projection transaction failure"),
+    );
+    let manager = AgentManager::new_with_mcp(
+        registry,
+        test_tool_loop_config(),
+        Some(mcp_provider.clone()),
+    );
+    let thread_id = "thr_000000000000000129";
+    let turn_id = "turn_000000000000000129";
+    manager
+        .ensure_thread(thread_id, workspace_id)
+        .await
+        .expect("thread should be created");
+    let mut events = subscribe_agent_events(&manager, thread_id).await;
+
+    manager
+        .start_test_turn_with_default_profile_and_capabilities(
+            thread_id,
+            turn_id,
+            ThreadMode::Agent,
+            "test-model",
+            "capture",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "use resend".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            vec![mcp_tool_capability("resend", "send")],
+            Vec::new(),
+        )
+        .await
+        .expect("turn should start and reach projection persistence");
+
+    let observed = recv_events_until_terminal(&mut events).await;
+    assert_turn_blocked(
+        &observed,
+        "failed to persist resolved MCP projection: injected projection transaction failure",
+    );
+    assert_eq!(mcp_provider.snapshot_requests().len(), 1);
+    assert_eq!(mcp_provider.snapshot_persisted().len(), 1);
+    assert!(
+        provider.snapshot_requests().is_empty(),
+        "API provider must not receive a request when projection persistence fails"
+    );
+    assert!(
+        observed.iter().all(|event| !matches!(
+            event,
+            AgentEvent::TurnCapabilitiesResolved { mcp_bindings, .. } if !mcp_bindings.is_empty()
+        )),
+        "successful durable capability result must not be emitted after persistence failure"
+    );
+}
+
+#[tokio::test]
+async fn mixed_skill_mcp_text_file_capabilities_use_exact_projected_dependency() {
     let skill_root = unique_temp_dir("phase-6-combined-skill");
     let skill_dir = skill_root.join("tests").join("my-skill");
     fs::create_dir_all(&skill_dir).expect("failed to create skill dir");
     fs::write(
         skill_dir.join("SKILL.md"),
-        "---\nname: My Skill\nslug: my-skill\ndescription: Test skill description\n---\nFollow the skill.",
+        "---\nname: My Skill\nslug: my-skill\ndescription: Test skill description\ndependencies:\n  mcp:\n    - resend/send\n---\nFollow the skill.",
     )
     .expect("failed to write SKILL.md");
 
@@ -11543,6 +11687,93 @@ async fn text_file_skill_and_mcp_capabilities_survive_single_turn_prompt_gate() 
 
     let _ = fs::remove_dir_all(skill_root);
     let _ = fs::remove_dir_all(file_root);
+}
+
+#[tokio::test]
+async fn mixed_skill_mcp_unprojected_workspace_dependency_blocks_before_provider_request() {
+    let skill_root = unique_temp_dir("mixed-skill-unprojected-mcp");
+    let skill_dir = skill_root.join("tests").join("my-skill");
+    fs::create_dir_all(&skill_dir).expect("failed to create skill dir");
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: My Skill\nslug: my-skill\ndescription: Test skill description\ndependencies:\n  mcp:\n    - resend/domains\n---\nFollow the skill.",
+    )
+    .expect("failed to write SKILL.md");
+
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let workspace_id = "ws_000000000000000127";
+    let capability_id = "mcp-tool:workspace:resend:send";
+    let mcp_provider = Arc::new(TestMcpToolProvider::new(explicit_mcp_tool_materialization(
+        capability_id,
+        workspace_id,
+    )));
+
+    let mut tool_loop_config = test_tool_loop_config();
+    tool_loop_config.skills.system_roots = Vec::new();
+    tool_loop_config.skills.user_roots = vec![skill_root.display().to_string()];
+    tool_loop_config.skills.registry_roots = Vec::new();
+    let manager =
+        AgentManager::new_with_mcp(registry, tool_loop_config, Some(mcp_provider.clone()));
+    let thread_id = "thr_000000000000000127";
+    let turn_id = "turn_000000000000000127";
+    manager
+        .ensure_thread(thread_id, workspace_id)
+        .await
+        .expect("thread should be created");
+    let mut events = subscribe_agent_events(&manager, thread_id).await;
+
+    manager
+        .start_test_turn_with_default_profile_and_capabilities(
+            thread_id,
+            turn_id,
+            ThreadMode::Agent,
+            "test-model",
+            "capture",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "use the unavailable projected dependency".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            vec![
+                skill_capability("my-skill"),
+                mcp_tool_capability("resend", "send"),
+            ],
+            Vec::new(),
+        )
+        .await
+        .expect("turn should start and reach combined preflight");
+
+    let observed = recv_events_until_terminal(&mut events).await;
+    assert_turn_blocked(
+        &observed,
+        "combined MCP and skill preflight rejected one or more explicit capabilities",
+    );
+    assert_eq!(mcp_provider.snapshot_requests().len(), 1);
+    assert!(
+        provider.snapshot_requests().is_empty(),
+        "provider must not receive a request when skill dependency is outside the projection"
+    );
+
+    let capability_event = observed.iter().find_map(|event| match event {
+        AgentEvent::TurnCapabilitiesResolved {
+            accepted,
+            rejected,
+            mcp_bindings,
+            ..
+        } => Some((accepted, rejected, mcp_bindings)),
+        _ => None,
+    });
+    let (accepted, rejected, mcp_bindings) =
+        capability_event.expect("combined rejection must remain visible as one capability event");
+    assert!(accepted.iter().any(|item| item.id == capability_id));
+    assert!(rejected.iter().any(|item| item.id == "skill:user:my-skill"));
+    assert!(
+        mcp_bindings.is_empty(),
+        "failed combined preflight must not commit MCP bindings"
+    );
+
+    let _ = fs::remove_dir_all(skill_root);
 }
 
 #[tokio::test]
