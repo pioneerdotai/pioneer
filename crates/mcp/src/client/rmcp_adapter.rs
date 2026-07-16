@@ -8,12 +8,17 @@ use crate::runtime::{
     McpSecretResolver, McpSessionEvent, McpToolCallResult, materialize_transport,
 };
 use async_trait::async_trait;
-use rmcp::model::{CallToolRequestParams, ErrorCode, JsonObject};
-use rmcp::service::{NotificationContext, RunningService, ServiceError};
+use rmcp::model::{
+    CallToolRequest, CallToolRequestParams, CancelledNotificationParam, ClientRequest, ErrorCode,
+    JsonObject, ServerResult,
+};
+use rmcp::service::{NotificationContext, PeerRequestOptions, RunningService, ServiceError};
 use rmcp::{ClientHandler, RoleClient, ServiceExt};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+
+const MCP_CANCELLATION_NOTIFICATION_GRACE: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Default)]
 pub struct RmcpRuntimeConnector;
@@ -79,6 +84,7 @@ impl McpRuntimeConnector for RmcpRuntimeConnector {
                         };
                         let _ = client.close_with_timeout(Duration::from_secs(3)).await;
                         return Err(McpRuntimeError {
+                            kind: error.kind,
                             state: error.state,
                             message,
                         });
@@ -235,10 +241,17 @@ impl McpRuntimeSession for RmcpRuntimeSession {
         &mut self,
         raw_tool_name: &str,
         arguments: serde_json::Value,
+        timeout: Duration,
+        cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<McpToolCallResult, McpRuntimeError> {
         let Some(client) = self.client.as_ref() else {
             return Err(McpRuntimeError::failed("MCP session is closed"));
         };
+        if cancellation.is_cancelled() {
+            return Err(McpRuntimeError::cancelled(
+                "MCP tools/call cancelled before transport dispatch",
+            ));
+        }
         let arguments = match arguments {
             serde_json::Value::Object(map) => map,
             serde_json::Value::Null => JsonObject::new(),
@@ -250,16 +263,58 @@ impl McpRuntimeSession for RmcpRuntimeSession {
         };
 
         let started = Instant::now();
-        let result = tokio::time::timeout(
-            self.tool_timeout,
-            client.peer().call_tool(
-                CallToolRequestParams::new(raw_tool_name.to_owned()).with_arguments(arguments),
-            ),
-        )
-        .await
-        .map_err(|_| {
-            McpRuntimeError::failed(format!("MCP tools/call `{raw_tool_name}` timed out"))
-        })?
+        let effective_timeout = self.tool_timeout.min(timeout).max(Duration::from_millis(1));
+        let peer = client.peer();
+        let handle = peer
+            .send_cancellable_request(
+                ClientRequest::CallToolRequest(CallToolRequest::new(
+                    CallToolRequestParams::new(raw_tool_name.to_owned()).with_arguments(arguments),
+                )),
+                PeerRequestOptions::no_options(),
+            )
+            .await
+            .map_err(|error| {
+                classify_runtime_error(
+                    format!("MCP tools/call `{raw_tool_name}` dispatch failed").as_str(),
+                    &error,
+                    self.secrets.as_slice(),
+                )
+            })?;
+        let request_id = handle.id.clone();
+        let response = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                let notification = peer.notify_cancelled(CancelledNotificationParam::new(
+                        Some(request_id),
+                        Some("Pioneer MCP invocation cancelled".to_owned()),
+                    ));
+                if !matches!(
+                    tokio::time::timeout(MCP_CANCELLATION_NOTIFICATION_GRACE, notification).await,
+                    Ok(Ok(()))
+                ) {
+                    client.cancellation_token().cancel();
+                }
+                return Err(McpRuntimeError::cancelled(
+                    "MCP tools/call cancelled while awaiting the server",
+                ));
+            }
+            _ = tokio::time::sleep(effective_timeout) => {
+                let notification = peer.notify_cancelled(CancelledNotificationParam::new(
+                    Some(request_id),
+                    Some("Pioneer MCP invocation timed out".to_owned()),
+                ));
+                if !matches!(
+                    tokio::time::timeout(MCP_CANCELLATION_NOTIFICATION_GRACE, notification).await,
+                    Ok(Ok(()))
+                ) {
+                    client.cancellation_token().cancel();
+                }
+                return Err(McpRuntimeError::timed_out(format!(
+                    "MCP tools/call `{raw_tool_name}` timed out"
+                )));
+            }
+            response = handle.await_response() => response,
+        }
         .map_err(|error| {
             classify_runtime_error(
                 format!("MCP tools/call `{raw_tool_name}` failed").as_str(),
@@ -267,6 +322,14 @@ impl McpRuntimeSession for RmcpRuntimeSession {
                 self.secrets.as_slice(),
             )
         })?;
+        let result = match response {
+            ServerResult::CallToolResult(result) => result,
+            _ => {
+                return Err(McpRuntimeError::failed(format!(
+                    "MCP tools/call `{raw_tool_name}` returned an unexpected response"
+                )));
+            }
+        };
 
         let content = serde_json::to_value(result.content).map_err(|error| {
             McpRuntimeError::failed(format!("failed to encode MCP tool content: {error}"))

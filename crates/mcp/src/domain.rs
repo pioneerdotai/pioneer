@@ -111,6 +111,17 @@ impl McpTransportConfig {
             Self::StreamableHttp { .. } => "streamable_http",
         }
     }
+
+    pub fn tool_timeout_ms(&self) -> u64 {
+        match self {
+            Self::Stdio {
+                tool_timeout_ms, ..
+            }
+            | Self::StreamableHttp {
+                tool_timeout_ms, ..
+            } => (*tool_timeout_ms).max(1),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord)]
@@ -232,6 +243,8 @@ pub struct McpServerRuntimeSnapshot {
     pub scope_kind: McpScopeKind,
     pub scope_key: String,
     pub fingerprint: String,
+    #[serde(default)]
+    pub runtime_generation: u64,
     pub state: McpRuntimeState,
     pub live: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]

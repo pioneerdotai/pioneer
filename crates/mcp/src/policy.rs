@@ -71,7 +71,7 @@ pub fn classify_mcp_tool_policy(hints: McpToolSafetyHints) -> McpToolPolicyClass
     McpToolPolicyClassification {
         side_effect_class,
         permission_class,
-        requires_network: hints.open_world_hint == Some(true),
+        requires_network: hints.open_world_hint.unwrap_or(true),
     }
 }
 
@@ -148,6 +148,6 @@ mod tests {
             classification.permission_class,
             McpToolPermissionClass::WriteOrUnknown
         );
-        assert!(!classification.requires_network);
+        assert!(classification.requires_network);
     }
 }

@@ -26,7 +26,7 @@ pub use policy::{
 };
 pub use redaction::{REDACTED_VALUE, bounded_text, redact_text};
 pub use runtime::{
-    McpRetryPolicy, McpRuntimeConnector, McpRuntimeError, McpRuntimeSession, McpSecretResolver,
-    McpSessionEvent, McpToolCallResult,
+    McpRetryPolicy, McpRuntimeConnector, McpRuntimeError, McpRuntimeErrorKind, McpRuntimeSession,
+    McpSecretResolver, McpSessionEvent, McpToolCallResult, effective_secret_material_fingerprint,
 };
 pub use secrets::McpSecretMaterialization;
