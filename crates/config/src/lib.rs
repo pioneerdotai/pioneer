@@ -2128,15 +2128,15 @@ const fn default_cli_agent_runtime_command_heartbeat_interval_secs() -> u64 {
 }
 
 const fn default_cli_agent_runtime_mcp_max_tools() -> usize {
-    128
+    512
 }
 
 const fn default_cli_agent_runtime_mcp_max_total_schema_bytes() -> usize {
-    1_048_576
+    3_145_728
 }
 
 const fn default_cli_agent_runtime_mcp_max_concurrent_calls_per_turn() -> usize {
-    8
+    16
 }
 
 const fn default_command_execution_lease_timeout_secs() -> u64 {
@@ -3195,14 +3195,14 @@ service_name = "com.pioneer.gateway.env"
         assert_eq!(config.gateway.tasks.review.default_max_revision_rounds, 5);
         assert_eq!(config.gateway.tasks.review.auto_accept_after_seconds, 300);
         assert!(!config.gateway.cli_agent_runtime.enabled);
-        assert_eq!(config.gateway.cli_agent_runtime.mcp_tools.max_tools, 128);
+        assert_eq!(config.gateway.cli_agent_runtime.mcp_tools.max_tools, 512);
         assert_eq!(
             config
                 .gateway
                 .cli_agent_runtime
                 .mcp_tools
                 .max_total_schema_bytes,
-            1_048_576
+            3_145_728
         );
         assert_eq!(
             config
@@ -3210,7 +3210,7 @@ service_name = "com.pioneer.gateway.env"
                 .cli_agent_runtime
                 .mcp_tools
                 .max_concurrent_calls_per_turn,
-            8
+            16
         );
         assert_eq!(
             config.gateway.cli_agent_runtime.idle_session_ttl_secs,

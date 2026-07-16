@@ -190,9 +190,9 @@ stderr_ring_lines = 200
 debug_native_events = false
 
 [gateway.cli_agent_runtime.mcp_tools]
-max_tools = 128
-max_total_schema_bytes = 1048576
-max_concurrent_calls_per_turn = 8
+max_tools = 512
+max_total_schema_bytes = 3145728
+max_concurrent_calls_per_turn = 16
 
 [gateway.cli_agent_runtime.command_heartbeat]
 interval_secs = 60
