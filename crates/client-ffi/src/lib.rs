@@ -93,8 +93,9 @@ use pioneer_client::{
 };
 use pioneer_protocol::{
     CLIRuntimeListModelsParams, CLIRuntimeListModelsResponse, CLIRuntimeListParams,
-    CLIRuntimeListResponse, CLIRuntimeRequestRespondParams, CLIRuntimeRequestRespondResponse,
-    CLIRuntimeReviewStartParams, CLIRuntimeReviewStartResponse, CLIRuntimeThreadBindingGetParams,
+    CLIRuntimeListResponse, CLIRuntimeRefreshParams, CLIRuntimeRefreshResponse,
+    CLIRuntimeRequestRespondParams, CLIRuntimeRequestRespondResponse, CLIRuntimeReviewStartParams,
+    CLIRuntimeReviewStartResponse, CLIRuntimeThreadBindingGetParams,
     CLIRuntimeThreadBindingGetResponse, CLIRuntimeThreadCompactParams,
     CLIRuntimeThreadCompactResponse, CLIRuntimeTurnSteerParams, CLIRuntimeTurnSteerResponse,
     ProviderListModelsParams, ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
@@ -429,6 +430,16 @@ impl ClientFfiRuntime {
         self.client_runtime
             .ws_command_sender()
             .cli_runtime_list(params)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn cli_runtime_refresh(&self, input_json: &str) -> Result<CLIRuntimeRefreshResponse, String> {
+        let params = serde_json::from_str::<CLIRuntimeRefreshParams>(input_json)
+            .map_err(|error| format!("invalid CLI runtime refresh params: {error}"))?;
+
+        self.client_runtime
+            .ws_command_sender()
+            .cli_runtime_refresh(params)
             .map_err(|error| format!("{error:#}"))
     }
 
@@ -1246,6 +1257,7 @@ ffi_client_json_method!(pioneer_client_ffi_workspace_create, workspace_create);
 ffi_client_json_method!(pioneer_client_ffi_workspace_rename, workspace_rename);
 ffi_client_json_method!(pioneer_client_ffi_provider_list, provider_list);
 ffi_client_json_method!(pioneer_client_ffi_cli_runtime_list, cli_runtime_list);
+ffi_client_json_method!(pioneer_client_ffi_cli_runtime_refresh, cli_runtime_refresh);
 ffi_client_json_method!(
     pioneer_client_ffi_cli_runtime_list_models,
     cli_runtime_list_models
@@ -1742,6 +1754,16 @@ mod tests {
             .expect_err("zero timeout should fail");
 
         assert!(error.contains("timeout must be positive"));
+    }
+
+    #[test]
+    fn cli_runtime_refresh_validates_bridge_input() {
+        let runtime = ClientFfiRuntime::default();
+        let error = runtime
+            .cli_runtime_refresh(r#"{"workspace_id":42}"#)
+            .expect_err("non-string workspace id should fail");
+
+        assert!(error.contains("invalid CLI runtime refresh params"));
     }
 
     #[test]
