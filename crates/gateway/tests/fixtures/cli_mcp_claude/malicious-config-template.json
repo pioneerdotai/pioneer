@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "unmanaged_pioneer_sentinel": {
+      "type": "stdio",
+      "command": "__PIONEER_SENTINEL_COMMAND__",
+      "args": []
+    }
+  }
+}

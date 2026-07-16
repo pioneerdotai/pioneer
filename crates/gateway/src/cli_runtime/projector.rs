@@ -465,6 +465,9 @@ fn started_turn_item(
     if is_web_search_kind(kind) {
         return web_search_item(item_id, metadata, ToolCallStatus::InProgress);
     }
+    if is_mcp_tool_kind(kind) {
+        return mcp_tool_item(item_id, metadata, ToolCallStatus::InProgress);
+    }
     if is_dynamic_tool_kind(kind) {
         return dynamic_tool_item(item_id, metadata, ToolCallStatus::InProgress);
     }
@@ -538,6 +541,13 @@ fn completed_turn_item(completed: &RuntimeItemCompleted) -> TurnItem {
     }
     if is_web_search_kind(completed.item_kind.as_str()) {
         return web_search_item(
+            completed.native_item_id.as_str(),
+            completed.metadata.as_ref(),
+            terminal_tool_status(completed.metadata.as_ref()),
+        );
+    }
+    if is_mcp_tool_kind(completed.item_kind.as_str()) {
+        return mcp_tool_item(
             completed.native_item_id.as_str(),
             completed.metadata.as_ref(),
             terminal_tool_status(completed.metadata.as_ref()),
@@ -821,6 +831,58 @@ fn dynamic_tool_item(
         storage,
         recovery: None,
         success: metadata_success(metadata),
+        outcome: None,
+        observation: None,
+    }
+}
+
+fn mcp_tool_item(item_id: &str, metadata: Option<&JsonValue>, status: ToolCallStatus) -> TurnItem {
+    let metadata_json = metadata.cloned().unwrap_or_else(|| json!({}));
+    let tool_name = metadata_string(metadata, "canonicalCallableName")
+        .unwrap_or_else(|| "mcp_tool_call".to_owned());
+    let server_name = metadata_string(metadata, "serverName").unwrap_or_else(|| "MCP".to_owned());
+    let raw_tool_name =
+        metadata_string(metadata, "rawToolName").unwrap_or_else(|| tool_name.clone());
+    let arguments = metadata_json
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let mut lines = Vec::new();
+    if let Some(message) = metadata_string(metadata, "message") {
+        lines.push(message);
+    }
+    if let Some(error) = metadata_json
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(JsonValue::as_str)
+    {
+        lines.push(error.to_owned());
+    }
+    let summary = tool_summary(
+        format!("MCP: {server_name} / {raw_tool_name}"),
+        lines,
+        metadata_json.clone(),
+    );
+    let output_policy =
+        ToolOutputPolicySnapshot::for_external_runtime_tool_name(tool_name.as_str());
+    let (display, storage) = summary_payloads_for_policy(&output_policy, &summary);
+    let success = metadata_success(metadata).or_else(|| match status {
+        ToolCallStatus::Completed => Some(true),
+        ToolCallStatus::Failed => Some(false),
+        _ => None,
+    });
+
+    TurnItem::DynamicToolCall {
+        id: item_id.to_owned(),
+        tool_name: tool_name.clone(),
+        arguments: tool_arguments(item_id, arguments),
+        status,
+        recovery_policy: None,
+        output_policy,
+        display,
+        storage,
+        recovery: None,
+        success,
         outcome: None,
         observation: None,
     }
@@ -1110,6 +1172,10 @@ fn is_dynamic_tool_kind(kind: &str) -> bool {
     )
 }
 
+fn is_mcp_tool_kind(kind: &str) -> bool {
+    normalize_kind(kind) == "mcptoolcall"
+}
+
 fn is_collab_tool_kind(kind: &str) -> bool {
     matches!(
         normalize_kind(kind).as_str(),
@@ -1273,8 +1339,9 @@ mod tests {
     use super::{CLIRuntimeProjectorContext, project_cli_runtime_event};
     use pioneer_cli_agent_runtime::codex::CodexJsonlRpcNotificationEvent;
     use pioneer_cli_agent_runtime::event::{
-        RuntimeEvent, RuntimeEventMappingOptions, RuntimeItemDelta, RuntimeItemDeltaKind,
-        RuntimeRawEvent, RuntimeTurnCompleted, map_codex_notification_event,
+        RuntimeAgentMessagePhase, RuntimeEvent, RuntimeEventMappingOptions, RuntimeItemCompleted,
+        RuntimeItemDelta, RuntimeItemDeltaKind, RuntimeItemStarted, RuntimeRawEvent,
+        RuntimeTurnCompleted, map_codex_notification_event,
     };
     use pioneer_protocol::{
         AgentDurableEvent, AgentMessagePhase, AgentProgressEvent, ItemDeltaStream,
@@ -2284,6 +2351,111 @@ mod tests {
         assert!(matches!(display, ToolDisplayPayload::Summary(_)));
         assert!(matches!(storage, ToolStoragePayload::Metadata { .. }));
         assert_eq!(*success, Some(true));
+    }
+
+    #[test]
+    fn codex_mcp_timeline_uses_one_enriched_native_item_for_start_terminal_and_replay() {
+        let metadata = json!({
+            "server": "pioneer",
+            "tool": "mcp__server__tool",
+            "canonicalCallableName": "mcp__server__tool",
+            "serverInstallationId": "installation-real",
+            "serverName": "Real Server",
+            "rawToolName": "real_tool",
+            "capabilityId": "capability-1",
+            "selectionReason": "explicit_tool",
+            "manifestHash": "a".repeat(64),
+            "providerManifestHash": "b".repeat(64),
+            "providerCallId": "native_mcp_1",
+            "invocationCorrelationId": "correlation-1",
+            "sessionGeneration": 7,
+            "arguments": {"value": 7},
+            "status": "inProgress"
+        });
+        let started_event = RuntimeEvent::ItemStarted(RuntimeItemStarted {
+            native_thread_id: Some("native_thread_1".to_owned()),
+            native_turn_id: "native_turn_1".to_owned(),
+            native_item_id: "native_mcp_1".to_owned(),
+            item_kind: "mcpToolCall".to_owned(),
+            title: None,
+            phase: RuntimeAgentMessagePhase::FinalAnswer,
+            metadata: Some(metadata.clone()),
+            native_item_redacted: None,
+            native: None,
+        });
+        let completed_event = RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+            native_thread_id: Some("native_thread_1".to_owned()),
+            native_turn_id: "native_turn_1".to_owned(),
+            native_item_id: "native_mcp_1".to_owned(),
+            item_kind: "mcpToolCall".to_owned(),
+            text: None,
+            summary: Vec::new(),
+            content: Vec::new(),
+            phase: RuntimeAgentMessagePhase::FinalAnswer,
+            metadata: Some({
+                let mut terminal = metadata;
+                terminal["status"] = json!("failed");
+                terminal["error"] = json!({"message": "upstream failed"});
+                terminal
+            }),
+            native_item_redacted: None,
+            native: None,
+        });
+
+        let started = project_cli_runtime_event(&context(), &started_event);
+        let replayed = project_cli_runtime_event(&context(), &started_event);
+        let completed = project_cli_runtime_event(&context(), &completed_event);
+        assert_eq!(started, replayed, "replay must upsert the same identity");
+        assert_eq!(started.durable.len(), 1);
+        assert_eq!(completed.durable.len(), 1);
+
+        let AgentDurableEvent::ItemStarted { notification } = &started.durable[0] else {
+            panic!("expected MCP item start");
+        };
+        let TurnItem::DynamicToolCall {
+            id,
+            tool_name,
+            arguments,
+            status,
+            display,
+            success,
+            ..
+        } = &notification.item
+        else {
+            panic!("expected canonical MCP tool item");
+        };
+        assert_eq!(id, "native_mcp_1");
+        assert_eq!(tool_name, "mcp__server__tool");
+        assert_eq!(arguments.get("value"), Some(&json!(7)));
+        assert_eq!(*status, pioneer_protocol::ToolCallStatus::InProgress);
+        let ToolDisplayPayload::Summary(summary) = display else {
+            panic!("expected MCP summary");
+        };
+        assert_eq!(summary.title, "MCP: Real Server / real_tool");
+        assert_eq!(*success, None);
+
+        let AgentDurableEvent::ItemCompleted { notification } = &completed.durable[0] else {
+            panic!("expected MCP item terminal");
+        };
+        let TurnItem::DynamicToolCall {
+            id,
+            tool_name,
+            status,
+            success,
+            display,
+            ..
+        } = &notification.item
+        else {
+            panic!("expected terminal canonical MCP tool item");
+        };
+        assert_eq!(id, "native_mcp_1");
+        assert_eq!(tool_name, "mcp__server__tool");
+        assert_eq!(*status, pioneer_protocol::ToolCallStatus::Failed);
+        assert_eq!(*success, Some(false));
+        let ToolDisplayPayload::Summary(summary) = display else {
+            panic!("expected terminal MCP summary");
+        };
+        assert_eq!(summary.lines, vec!["upstream failed".to_owned()]);
     }
 
     #[test]

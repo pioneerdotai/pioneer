@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 // Persists Pioneer thread to native CLI runtime thread bindings.
 
+use crate::cli_runtime::continuation::CliProviderContinuation;
 use crate::cli_runtime::manager::{
     CLIAgentRuntimeSession, CLIAgentRuntimeThreadOpenParams, CLIAgentRuntimeThreadOpenSnapshot,
 };
@@ -8,10 +9,83 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use pioneer_crud::{
     CliRuntimeThreadBindingRecord, CrudStore, NewCliRuntimeThreadBinding,
+    PrepareClaudeProviderSessionBinding, PreparedClaudeProviderSessionMode,
     serialize_cli_runtime_json,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use std::time::Duration;
+use uuid::Uuid;
+
+#[derive(Debug, Clone)]
+pub(crate) struct ClaudeProviderSessionPrepareRequest {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub runtime_id: String,
+    pub cwd: String,
+    pub model: Option<String>,
+    pub prepared_at: DateTimeWithTimeZone,
+}
+
+/// Create or load the real Claude UUID before process allocation. This is the
+/// only place where a fresh provider session identity is minted for a Pioneer
+/// thread; a reload always reuses the durable value.
+pub(crate) async fn prepare_claude_provider_session(
+    store: &CrudStore,
+    request: ClaudeProviderSessionPrepareRequest,
+) -> Result<CliProviderContinuation> {
+    for (label, value) in [
+        ("workspace_id", request.workspace_id.as_str()),
+        ("thread_id", request.thread_id.as_str()),
+        ("runtime_id", request.runtime_id.as_str()),
+        ("cwd", request.cwd.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            bail!("Claude provider session request `{label}` cannot be empty");
+        }
+    }
+    let proposed_provider_session_id = Uuid::new_v4();
+    let prepared = store
+        .prepare_claude_provider_session_binding(PrepareClaudeProviderSessionBinding {
+            thread_binding: NewCliRuntimeThreadBinding {
+                thread_id: request.thread_id,
+                workspace_id: request.workspace_id,
+                runtime_id: request.runtime_id,
+                runtime_kind: "claude".to_owned(),
+                native_thread_id: proposed_provider_session_id.to_string(),
+                native_session_id: Some(proposed_provider_session_id.to_string()),
+                native_root_thread_id: None,
+                native_cwd: Some(request.cwd),
+                native_model: request.model,
+                resume_cursor_json: serialize_cli_runtime_json(&serde_json::json!({
+                    "provider": "claude",
+                    "providerSessionId": "<redacted>"
+                }))?,
+                status: "active".to_owned(),
+                created_at: request.prepared_at,
+                updated_at: request.prepared_at,
+            },
+            proposed_provider_session_id: proposed_provider_session_id.to_string(),
+        })
+        .await
+        .context("failed to prepare durable Claude provider session binding")?;
+    let provider = prepared
+        .binding
+        .provider_session
+        .context("prepared Claude binding is missing provider session metadata")?;
+    let provider_session_id = Uuid::parse_str(provider.provider_session_id.as_str())
+        .context("durable Claude provider session identity is not a UUID")?;
+    if provider_session_id.is_nil() {
+        bail!("durable Claude provider session identity cannot be nil");
+    }
+    Ok(match prepared.mode {
+        PreparedClaudeProviderSessionMode::New => CliProviderContinuation::ClaudeNew {
+            provider_session_id,
+        },
+        PreparedClaudeProviderSessionMode::Resume => CliProviderContinuation::ClaudeResume {
+            provider_session_id,
+        },
+    })
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct CLIAgentRuntimeThreadBindingOpenRequest {
@@ -184,9 +258,13 @@ fn generic_thread_binding_from_opened(
         runtime_id: request.runtime_id.clone(),
         runtime_kind: request.runtime_kind.clone(),
         native_thread_id: opened.native_thread_id.clone(),
-        native_session_id: preserve_native_metadata
-            .then(|| existing.and_then(|binding| binding.native_session_id.clone()))
-            .flatten(),
+        native_session_id: if request.runtime_kind == "claude" {
+            Some(opened.native_thread_id.clone())
+        } else {
+            preserve_native_metadata
+                .then(|| existing.and_then(|binding| binding.native_session_id.clone()))
+                .flatten()
+        },
         native_root_thread_id: preserve_native_metadata
             .then(|| existing.and_then(|binding| binding.native_root_thread_id.clone()))
             .flatten(),
@@ -513,7 +591,10 @@ mod tests {
 
         assert_eq!(result.mode, CLIAgentRuntimeThreadBindingOpenMode::Started);
         assert_eq!(result.binding.native_thread_id, "cli-thread-started");
-        assert_eq!(result.binding.native_session_id, None);
+        assert_eq!(
+            result.binding.native_session_id.as_deref(),
+            Some("cli-thread-started")
+        );
         assert_eq!(result.binding.native_root_thread_id, None);
         assert_eq!(result.binding.created_at, opened_at);
         assert_eq!(result.binding.updated_at, unix_to_datetime(200));

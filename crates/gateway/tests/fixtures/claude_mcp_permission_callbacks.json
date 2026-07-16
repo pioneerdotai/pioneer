@@ -1,0 +1,42 @@
+{
+  "providerVersion": "2.1.197",
+  "exactDestructive": {
+    "type": "control_request",
+    "request_id": "permission-exact",
+    "request": {
+      "subtype": "can_use_tool",
+      "tool_name": "mcp__pioneer__mcp_server_tool_a",
+      "tool_use_id": "call-exact",
+      "input": {"command": "rm -rf ./generated", "value": 1}
+    }
+  },
+  "unknown": {
+    "type": "control_request",
+    "request_id": "permission-unknown",
+    "request": {
+      "subtype": "can_use_tool",
+      "tool_name": "mcp__pioneer__mcp_server_unknown",
+      "tool_use_id": "call-unknown",
+      "input": {"value": 2}
+    }
+  },
+  "wildcard": {
+    "type": "control_request",
+    "request_id": "permission-wildcard",
+    "request": {
+      "subtype": "can_use_tool",
+      "tool_name": "mcp__pioneer__*",
+      "tool_use_id": "call-wildcard",
+      "input": {"value": 3}
+    }
+  },
+  "malformed": {
+    "type": "control_request",
+    "request_id": "permission-malformed",
+    "request": {
+      "subtype": "can_use_tool",
+      "tool_name": "mcp__pioneer__mcp_server_tool_a",
+      "input": {"value": 4}
+    }
+  }
+}

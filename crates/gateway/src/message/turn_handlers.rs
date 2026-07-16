@@ -24,7 +24,7 @@ pub(super) struct PreparedApiProviderTurnStart {
 
 struct PreparedCliRuntimeNativeTurnStart {
     outcome: crate::thread::TurnStartOutcome,
-    session_key: crate::cli_runtime::manager::CLIAgentRuntimeSessionKey,
+    session_instance: crate::cli_runtime::session_instance::CliSessionInstanceId,
     cli_session: std::sync::Arc<dyn crate::cli_runtime::manager::CLIAgentRuntimeSession>,
     native_thread_id: String,
     turn_start_params: crate::cli_runtime::manager::CLIAgentRuntimeTurnStartParams,
@@ -515,6 +515,7 @@ impl MessageProcessor {
     ) -> MessageFuture<'a, ()> {
         message_future(async move {
             let response_turn_id = params.turn_id.clone();
+            let submitted_model_provider = params.model_provider.clone();
             macro_rules! send_turn_start_failure {
                 ($message:expr) => {{
                     self.send_cli_runtime_turn_start_failure(
@@ -543,16 +544,40 @@ impl MessageProcessor {
             };
             params.model_provider = Some(cli_runtime_provider_key(runtime_id.as_str()));
 
-            let skill_capabilities =
-                match crate::cli_runtime::skills::partition_cli_runtime_skill_capabilities(
+            let capability_partition =
+                crate::cli_runtime::skills::partition_cli_runtime_capabilities(
                     &params.capabilities,
-                ) {
-                    Ok(partition) => partition,
-                    Err(message) => {
-                        send_turn_start_failure!(message);
-                        return;
-                    }
-                };
+                );
+            let requested_mcp = capability_partition.has_mcp();
+            let provider_claim_matches = submitted_model_provider
+                .as_deref()
+                .map(str::trim)
+                .filter(|provider| !provider.is_empty())
+                .is_none_or(|provider| provider == cli_runtime_provider_key(runtime_id.as_str()));
+            if let Err(rejection) =
+                crate::cli_mcp_client_validation::validate_cli_mcp_client_request_durably(
+                    &self.crud_store,
+                    crate::cli_mcp_client_validation::CliMcpClientValidationAuditContext {
+                        workspace_id: None,
+                        thread_id: params.thread_id.as_str(),
+                        turn_id: params.turn_id.as_str(),
+                        runtime_id: runtime_id.as_str(),
+                    },
+                    crate::cli_mcp_client_validation::CliMcpClientValidationEvidence {
+                        target: cli_mcp_client_target(runtime_kind),
+                        has_mcp_projection: requested_mcp,
+                        provider_claim_matches,
+                        runtime_snapshot_current: true,
+                        runtime_supports_mcp_tools: true,
+                        projection_workspace_matches: true,
+                        explicit_capabilities_resolved: true,
+                    },
+                )
+                .await
+            {
+                send_turn_start_failure!(rejection.to_string());
+                return;
+            }
             if let Some(input_kind) = params
                 .input
                 .iter()
@@ -608,192 +633,332 @@ impl MessageProcessor {
                     return;
                 }
             }
-            let (installed_skills, resolved_skill_bindings) = match skill_capabilities {
-                crate::cli_runtime::skills::CliRuntimeSkillCapabilityPartition::NoSkills => {
-                    (Vec::new(), Vec::new())
-                }
-                crate::cli_runtime::skills::CliRuntimeSkillCapabilityPartition::Skills(
-                    attachments,
-                ) => {
-                    let preflight_started = std::time::Instant::now();
-                    let resolved = match self
-                        .resolve_cli_runtime_skill_attachments(
-                            thread.workspace_id.as_str(),
-                            &attachments,
-                        )
-                        .await
-                    {
-                        Ok(resolved) => resolved,
-                        Err(error) => {
-                            let failure_reason =
-                                format!("failed to resolve CLI runtime skills: {error:#}");
-                            for attachment in &attachments {
-                                warn!(
-                                    event = "cli_runtime_skill_preflight",
-                                    runtime_id = runtime_id.as_str(),
-                                    runtime_kind = ?runtime_kind,
-                                    skill_slug = attachment.slug.as_str(),
-                                    source_kind = attachment.claimed_source_kind.as_str(),
-                                    result = "failed",
-                                    failure_reason = failure_reason.as_str(),
-                                    elapsed_ms = preflight_started.elapsed().as_millis(),
-                                    "CLI runtime skill preflight failed"
-                                );
-                            }
-                            send_turn_start_failure!(failure_reason);
-                            return;
+            let mcp_projection = match self
+                .mcp_service
+                .resolve_mcp_turn_projection(&pioneer_agent::AgentMcpMaterializationRequest {
+                    workspace_id: thread.workspace_id.clone(),
+                    turn_id: params.turn_id.clone(),
+                    explicit_servers: capability_partition.mcp_servers.clone(),
+                    explicit_tools: capability_partition.mcp_tools.clone(),
+                })
+                .await
+            {
+                Ok(projection) => Some(projection),
+                Err(error) => {
+                    let code = match error.reason {
+                        pioneer_agent::AgentMcpMaterializationFailureReason::ExplicitCapabilityRejected => {
+                            crate::cli_mcp_client_validation::CliMcpClientValidationRejectionCode::ExplicitCapabilityUnresolved.as_str()
+                        }
+                        pioneer_agent::AgentMcpMaterializationFailureReason::RequiredInstallationUnavailable => {
+                            "cli_runtime.mcp.required_installation_unavailable"
+                        }
+                        pioneer_agent::AgentMcpMaterializationFailureReason::ResolutionUncertain => {
+                            "cli_runtime.mcp.resolution_uncertain"
+                        }
+                        pioneer_agent::AgentMcpMaterializationFailureReason::ProjectionInvalid => {
+                            "cli_runtime.mcp.projection_invalid"
+                        }
+                        pioneer_agent::AgentMcpMaterializationFailureReason::ProviderUnavailable => {
+                            "cli_runtime.mcp.provider_unavailable"
                         }
                     };
-                    if let Err(error) =
-                        crate::cli_runtime::skills::ensure_cli_runtime_skills_exportable(&resolved)
+                    crate::cli_mcp_client_validation::persist_cli_mcp_materialization_rejections(
+                        &self.crud_store,
+                        crate::cli_mcp_client_validation::CliMcpClientValidationAuditContext {
+                            workspace_id: Some(thread.workspace_id.as_str()),
+                            thread_id: thread.id.as_str(),
+                            turn_id: params.turn_id.as_str(),
+                            runtime_id: runtime_id.as_str(),
+                        },
+                        cli_mcp_client_target(runtime_kind),
+                        code,
+                        error.rejected_capabilities.as_slice(),
+                    )
+                    .await;
+                    send_turn_start_failure!(format!(
+                        "{code}: combined MCP and skill preflight failed: {error}"
+                    ));
+                    return;
+                }
+            };
+            let combined_preflight_input =
+                crate::cli_runtime::skills::CliRuntimeCombinedPreflightInput {
+                    capabilities: capability_partition,
+                    mcp_projection,
+                };
+            let projected_mcp_availability = combined_preflight_input.exact_mcp_availability();
+            let attachments = combined_preflight_input.capabilities.skills.as_slice();
+            let (skill_install_plans, resolved_skill_bindings) = if attachments.is_empty() {
+                (Vec::new(), Vec::new())
+            } else {
+                let preflight_started = std::time::Instant::now();
+                let resolved = match self
+                    .resolve_cli_runtime_skill_attachments(
+                        thread.workspace_id.as_str(),
+                        attachments,
+                        &projected_mcp_availability,
+                    )
+                    .await
+                {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        let failure_reason =
+                            format!("failed to resolve CLI runtime skills: {error:#}");
+                        for attachment in attachments {
+                            warn!(
+                                event = "cli_runtime_skill_preflight",
+                                runtime_id = runtime_id.as_str(),
+                                runtime_kind = ?runtime_kind,
+                                skill_slug = attachment.slug.as_str(),
+                                source_kind = attachment.claimed_source_kind.as_str(),
+                                result = "failed",
+                                failure_reason = failure_reason.as_str(),
+                                elapsed_ms = preflight_started.elapsed().as_millis(),
+                                "CLI runtime skill preflight failed"
+                            );
+                        }
+                        send_turn_start_failure!(failure_reason);
+                        return;
+                    }
+                };
+                if let Err(error) =
+                    crate::cli_runtime::skills::ensure_cli_runtime_skills_exportable(&resolved)
+                {
+                    warn!(
+                        event = "cli_runtime_skill_preflight",
+                        runtime_id = runtime_id.as_str(),
+                        runtime_kind = ?runtime_kind,
+                        skill_slug = error.skill_slug.as_str(),
+                        source_kind = "system",
+                        result = "failed",
+                        failure_reason = crate::cli_runtime::skills::CLI_RUNTIME_SYSTEM_SKILL_NOT_EXPORTABLE,
+                        elapsed_ms = preflight_started.elapsed().as_millis(),
+                        "CLI runtime skill preflight rejected Pioneer-only system skill"
+                    );
+                    send_turn_start_failure!(error.to_string());
+                    return;
+                }
+                if let Err(error) =
+                    crate::cli_runtime::skills::ensure_cli_runtime_skill_invocation_eligible(
+                        runtime_kind,
+                        &runtime_config.display_name,
+                        &resolved,
+                    )
+                {
+                    if let Some(skill) = resolved
+                        .iter()
+                        .find(|skill| skill.definition.runtime.disable_model_invocation)
                     {
                         warn!(
                             event = "cli_runtime_skill_preflight",
                             runtime_id = runtime_id.as_str(),
                             runtime_kind = ?runtime_kind,
-                            skill_slug = error.skill_slug.as_str(),
-                            source_kind = "system",
+                            skill_slug = skill.slug.as_str(),
+                            source_kind = skill.definition.identity.source_kind.as_db_value(),
                             result = "failed",
-                            failure_reason = crate::cli_runtime::skills::CLI_RUNTIME_SYSTEM_SKILL_NOT_EXPORTABLE,
+                            failure_reason = crate::cli_runtime::skills::CLI_RUNTIME_CLAUDE_SKILL_NOT_MODEL_INVOCABLE,
                             elapsed_ms = preflight_started.elapsed().as_millis(),
-                            "CLI runtime skill preflight rejected Pioneer-only system skill"
+                            "CLI runtime skill preflight rejected unsupported native invocation"
                         );
-                        send_turn_start_failure!(error.to_string());
-                        return;
                     }
-                    if let Err(error) =
-                        crate::cli_runtime::skills::ensure_cli_runtime_skill_invocation_eligible(
-                            runtime_kind,
-                            &runtime_config.display_name,
-                            &resolved,
-                        )
-                    {
-                        if let Some(skill) = resolved
-                            .iter()
-                            .find(|skill| skill.definition.runtime.disable_model_invocation)
-                        {
+                    send_turn_start_failure!(error.to_string());
+                    return;
+                }
+                let resolved_skill_bindings =
+                    crate::cli_runtime::skills::cli_runtime_turn_skill_bindings(&resolved);
+                let receipt_path = self
+                    .artifact_runtime_home
+                    .join(pioneer_skills::EXTERNAL_RUNTIME_RECEIPT_FILE_NAME);
+                let plans = match crate::cli_runtime::skills::build_cli_runtime_skill_install_plans(
+                    &runtime_config,
+                    runtime_kind,
+                    &resolved,
+                    &receipt_path,
+                ) {
+                    Ok(plans) => plans,
+                    Err(error) => {
+                        let failure_reason =
+                            format!("failed to plan CLI runtime skills: {error:#}");
+                        for skill in &resolved {
                             warn!(
                                 event = "cli_runtime_skill_preflight",
                                 runtime_id = runtime_id.as_str(),
                                 runtime_kind = ?runtime_kind,
                                 skill_slug = skill.slug.as_str(),
                                 source_kind = skill.definition.identity.source_kind.as_db_value(),
+                                install_name = pioneer_skills::sanitize_name(
+                                    &skill.definition.identity.name
+                                ),
                                 result = "failed",
-                                failure_reason = crate::cli_runtime::skills::CLI_RUNTIME_CLAUDE_SKILL_NOT_MODEL_INVOCABLE,
+                                failure_reason = failure_reason.as_str(),
                                 elapsed_ms = preflight_started.elapsed().as_millis(),
-                                "CLI runtime skill preflight rejected unsupported native invocation"
+                                "CLI runtime skill preflight planning failed"
                             );
                         }
-                        send_turn_start_failure!(error.to_string());
+                        send_turn_start_failure!(failure_reason);
                         return;
                     }
-                    let resolved_skill_bindings =
-                        crate::cli_runtime::skills::cli_runtime_turn_skill_bindings(&resolved);
-                    let receipt_path = self
-                        .artifact_runtime_home
-                        .join(pioneer_skills::EXTERNAL_RUNTIME_RECEIPT_FILE_NAME);
-                    let plans =
-                        match crate::cli_runtime::skills::build_cli_runtime_skill_install_plans(
-                            &runtime_config,
-                            runtime_kind,
-                            &resolved,
-                            &receipt_path,
-                        ) {
-                            Ok(plans) => plans,
-                            Err(error) => {
-                                let failure_reason =
-                                    format!("failed to plan CLI runtime skills: {error:#}");
-                                for skill in &resolved {
-                                    warn!(
-                                        event = "cli_runtime_skill_preflight",
-                                        runtime_id = runtime_id.as_str(),
-                                        runtime_kind = ?runtime_kind,
-                                        skill_slug = skill.slug.as_str(),
-                                        source_kind = skill.definition.identity.source_kind.as_db_value(),
-                                        install_name = pioneer_skills::sanitize_name(
-                                            &skill.definition.identity.name
-                                        ),
-                                        result = "failed",
-                                        failure_reason = failure_reason.as_str(),
-                                        elapsed_ms = preflight_started.elapsed().as_millis(),
-                                        "CLI runtime skill preflight planning failed"
-                                    );
-                                }
-                                send_turn_start_failure!(failure_reason);
-                                return;
-                            }
-                        };
-                    let mut installed = Vec::with_capacity(plans.len());
-                    for plan in &plans {
-                        let install_started = std::time::Instant::now();
-                        match self.install_one_cli_runtime_skill(plan).await {
-                            Ok(result) => {
-                                let result_name = match result.status {
-                                    crate::cli_runtime::skills::CliRuntimeSkillInstallStatus::Current => "current",
-                                    crate::cli_runtime::skills::CliRuntimeSkillInstallStatus::Installed => "installed",
-                                    crate::cli_runtime::skills::CliRuntimeSkillInstallStatus::Updated => "updated",
-                                };
-                                let source_hash_prefix = &result.source_folder_hash
-                                    [..result.source_folder_hash.len().min(12)];
-                                info!(
-                                    event = "cli_runtime_skill_preflight",
-                                    runtime_id = plan.runtime_id.as_str(),
-                                    runtime_kind = plan.runtime_kind.as_str(),
-                                    skill_slug = plan.skill_slug.as_str(),
-                                    source_kind = plan.source_kind.as_str(),
-                                    install_name = plan.install_name.as_str(),
-                                    destination = %plan.destination.display(),
-                                    result = result_name,
-                                    source_hash_prefix,
-                                    elapsed_ms = install_started.elapsed().as_millis(),
-                                    "CLI runtime skill preflight completed"
-                                );
-                                installed.push(result);
-                            }
-                            Err(error) => {
-                                let failure_reason = format!(
-                                    "failed to prepare CLI runtime skill `{}`: {error:#}",
-                                    plan.skill_slug
-                                );
-                                warn!(
-                                    event = "cli_runtime_skill_preflight",
-                                    runtime_id = plan.runtime_id.as_str(),
-                                    runtime_kind = plan.runtime_kind.as_str(),
-                                    skill_slug = plan.skill_slug.as_str(),
-                                    source_kind = plan.source_kind.as_str(),
-                                    install_name = plan.install_name.as_str(),
-                                    destination = %plan.destination.display(),
-                                    result = "failed",
-                                    failure_reason = failure_reason.as_str(),
-                                    elapsed_ms = install_started.elapsed().as_millis(),
-                                    "CLI runtime skill preflight failed"
-                                );
-                                send_turn_start_failure!(failure_reason);
-                                return;
-                            }
-                        }
-                    }
-                    (installed, resolved_skill_bindings)
-                }
+                };
+                (plans, resolved_skill_bindings)
             };
-            #[cfg(test)]
-            self.cli_runtime_skill_preflight_test_events
-                .lock()
-                .await
-                .push("preflight_complete".to_owned());
-            if let Some(cutoff_ms) = installed_skills
-                .iter()
-                .map(|skill| skill.receipt_updated_at_unix_ms)
-                .max()
-                && let Err(error) = manager
-                    .close_session_if_started_at_or_before(&session_key, cutoff_ms)
-                    .await
-            {
-                send_turn_start_failure!(format!(
-                    "failed to refresh CLI runtime session for selected skills: {error:#}"
-                ));
-                return;
+            let combined_preflight = crate::cli_runtime::skills::CliRuntimeCombinedPreflightPlan {
+                mcp_projection: combined_preflight_input.mcp_projection,
+                skill_install_plans,
+                skill_bindings: resolved_skill_bindings,
+            };
+            let mut codex_mcp_launch_projection = None;
+            let mut claude_mcp_launch_projection = None;
+            if let Some(projection) = combined_preflight.mcp_projection.as_ref() {
+                let readiness_summary = self
+                    .cli_runtime_live_summary_from_instance(
+                        thread.workspace_id.as_str(),
+                        runtime_config.clone(),
+                    )
+                    .await;
+                let has_mcp_projection = requested_mcp || !projection.tools.is_empty();
+                let validation =
+                    crate::cli_mcp_client_validation::validate_cli_mcp_client_request_durably(
+                        &self.crud_store,
+                        crate::cli_mcp_client_validation::CliMcpClientValidationAuditContext {
+                            workspace_id: Some(thread.workspace_id.as_str()),
+                            thread_id: thread.id.as_str(),
+                            turn_id: params.turn_id.as_str(),
+                            runtime_id: runtime_id.as_str(),
+                        },
+                        crate::cli_mcp_client_validation::CliMcpClientValidationEvidence {
+                            target: cli_mcp_client_target(runtime_kind),
+                            has_mcp_projection,
+                            provider_claim_matches,
+                            runtime_snapshot_current: matches!(
+                                readiness_summary.status,
+                                RuntimeStatus::Ready | RuntimeStatus::Degraded { .. }
+                            ),
+                            runtime_supports_mcp_tools: readiness_summary
+                                .capabilities
+                                .supports_mcp_tools,
+                            projection_workspace_matches: projection.workspace_id
+                                == thread.workspace_id,
+                            explicit_capabilities_resolved:
+                                cli_mcp_projection_resolves_all_explicit_capabilities(
+                                    &combined_preflight_input.capabilities,
+                                    projection,
+                                ),
+                        },
+                    )
+                    .await;
+                if let Err(rejection) = validation {
+                    let diagnostic = readiness_summary
+                        .diagnostics
+                        .iter()
+                        .find(|diagnostic| diagnostic.code.starts_with("cli_runtime.mcp."));
+                    let code = diagnostic
+                        .map(|diagnostic| diagnostic.code.as_str())
+                        .unwrap_or_else(|| rejection.code.as_str());
+                    let message = diagnostic
+                        .map(|diagnostic| diagnostic.message.as_str())
+                        .unwrap_or(rejection.message);
+                    warn!(
+                        event = "combined_cli_preflight",
+                        runtime_id = runtime_id.as_str(),
+                        runtime_kind = ?runtime_kind,
+                        manifest_hash = projection.manifest_hash.as_str(),
+                        diagnostic_code = code,
+                        rejection_reason = ?rejection.reason,
+                        "combined MCP and skill preflight rejected the client MCP claim"
+                    );
+                    send_turn_start_failure!(format!("{code}: {message}"));
+                    return;
+                }
+                if has_mcp_projection && runtime_kind == CLIAgentRuntimeKind::Codex {
+                    let (max_tools, max_schema_bytes) = self.mcp_service.projection_limit_values();
+                    let readiness =
+                        crate::cli_runtime::mcp::readiness::codex_mcp_readiness_for_instance(
+                            &runtime_config,
+                            self.artifact_runtime_home.as_path(),
+                            matches!(readiness_summary.status, RuntimeStatus::Ready),
+                            readiness_summary.version.as_deref(),
+                            readiness_summary.proxy_url.as_deref(),
+                            max_tools,
+                            max_schema_bytes,
+                        )
+                        .await;
+                    if !readiness.supported {
+                        let diagnostic = readiness
+                            .diagnostics
+                            .iter()
+                            .find(|diagnostic| diagnostic.code.starts_with("cli_runtime.mcp."));
+                        send_turn_start_failure!(format!(
+                            "{}: {}",
+                            diagnostic
+                                .map(|diagnostic| diagnostic.code.as_str())
+                                .unwrap_or("cli_runtime.mcp.readiness_unavailable"),
+                            diagnostic
+                                .map(|diagnostic| diagnostic.message.as_str())
+                                .unwrap_or("MCP tool readiness is not available")
+                        ));
+                        return;
+                    }
+                    codex_mcp_launch_projection = Some(
+                        match crate::cli_runtime::codex_mcp::build_codex_mcp_session_launch_projection(
+                            projection.clone(),
+                            readiness.contract_fingerprint,
+                        ) {
+                            Ok(projection) => projection,
+                            Err(error) => {
+                                send_turn_start_failure!(format!(
+                                    "failed to prepare Codex MCP schema projection: {error}"
+                                ));
+                                return;
+                            }
+                        },
+                    );
+                } else if has_mcp_projection && runtime_kind == CLIAgentRuntimeKind::Claude {
+                    let (max_tools, max_schema_bytes) = self.mcp_service.projection_limit_values();
+                    let readiness =
+                        crate::cli_runtime::mcp::readiness::claude_mcp_readiness_for_instance(
+                            &runtime_config,
+                            self.artifact_runtime_home.as_path(),
+                            matches!(readiness_summary.status, RuntimeStatus::Ready),
+                            readiness_summary.version.as_deref(),
+                            readiness_summary.proxy_url.as_deref(),
+                            max_tools,
+                            max_schema_bytes,
+                        )
+                        .await;
+                    if !readiness.supported {
+                        let diagnostic = readiness
+                            .diagnostics
+                            .iter()
+                            .find(|diagnostic| diagnostic.code.starts_with("cli_runtime.mcp."));
+                        send_turn_start_failure!(format!(
+                            "{}: {}",
+                            diagnostic
+                                .map(|diagnostic| diagnostic.code.as_str())
+                                .unwrap_or("cli_runtime.mcp.readiness_unavailable"),
+                            diagnostic
+                                .map(|diagnostic| diagnostic.message.as_str())
+                                .unwrap_or("MCP tool readiness is not available")
+                        ));
+                        return;
+                    }
+                    claude_mcp_launch_projection = Some(
+                        match crate::cli_runtime::claude_mcp::build_claude_mcp_session_launch_projection(
+                            projection.clone(),
+                            readiness.contract_fingerprint,
+                        ) {
+                            Ok(projection) => projection,
+                            Err(error) => {
+                                send_turn_start_failure!(format!(
+                                    "failed to prepare Claude MCP schema projection: {error}"
+                                ));
+                                return;
+                            }
+                        },
+                    );
+                }
             }
+            let mut installed_skills =
+                Vec::with_capacity(combined_preflight.skill_install_plans.len());
             let proxy_url = match self
                 .prepare_cli_runtime_proxy_url(thread.workspace_id.as_str(), runtime_id.as_str())
                 .await
@@ -853,17 +1018,6 @@ impl MessageProcessor {
                     return;
                 }
             };
-            if matches!(runtime_kind, CLIAgentRuntimeKind::Codex) {
-                crate::cli_runtime::skills::prepend_codex_installed_skill_inputs(
-                    &installed_skills,
-                    &mut input_mapping,
-                );
-            } else {
-                crate::cli_runtime::skills::prepend_claude_installed_skill_directive(
-                    &installed_skills,
-                    &mut input_mapping,
-                );
-            }
             let permission_adapter =
                 crate::cli_runtime::permissions::adapt_cli_runtime_permissions_for_turn(
                     runtime_kind,
@@ -989,22 +1143,6 @@ impl MessageProcessor {
                 ));
                 return;
             }
-            if !resolved_skill_bindings.is_empty() {
-                let event = AgentDurableEvent::TurnSkillsResolved {
-                    thread_id: outcome.started_notification.thread_id.clone(),
-                    turn_id: outcome.started_notification.turn.id.clone(),
-                    bindings: resolved_skill_bindings,
-                };
-                if !self.handle_durable_agent_event(event).await {
-                    self.thread_manager
-                        .rollback_turn_start(outcome.rollback_context.clone())
-                        .await;
-                    send_turn_start_failure!(
-                        "failed to commit CLI runtime turn skill bindings".to_owned()
-                    );
-                    return;
-                }
-            }
             let security_snapshot = match self
                 .persist_turn_execution_security_snapshot(&security_params, &outcome)
                 .await
@@ -1022,6 +1160,243 @@ impl MessageProcessor {
                     return;
                 }
             };
+            if let Some(projection) = combined_preflight.mcp_projection.as_ref() {
+                let provider_bindings = codex_mcp_launch_projection
+                    .as_ref()
+                    .map(|launch| {
+                        launch
+                            .preflight
+                            .tools
+                            .iter()
+                            .map(|tool| {
+                                crate::turn_mcp::persistence::TurnMcpProviderBindingIdentity {
+                                    canonical_callable_name: tool.canonical_callable_name.clone(),
+                                    provider_callable_name: format!(
+                                        "mcp__pioneer__{}",
+                                        tool.canonical_callable_name
+                                    ),
+                                    provider_schema_fingerprint: tool
+                                        .transformed_schema_fingerprint
+                                        .clone(),
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .or_else(|| {
+                        claude_mcp_launch_projection.as_ref().map(|launch| {
+                            launch
+                                .preflight
+                                .tools
+                                .iter()
+                                .map(|tool| {
+                                    crate::turn_mcp::persistence::TurnMcpProviderBindingIdentity {
+                                        canonical_callable_name: tool
+                                            .canonical_callable_name
+                                            .clone(),
+                                        provider_callable_name: format!(
+                                            "mcp__pioneer__{}",
+                                            tool.canonical_callable_name
+                                        ),
+                                        provider_schema_fingerprint: tool
+                                            .transformed_schema_fingerprint
+                                            .clone(),
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .unwrap_or_default();
+                let persisted = match self
+                    .mcp_service
+                    .persist_cli_resolved_mcp_turn_projection(projection, &provider_bindings)
+                    .await
+                {
+                    Ok(persisted) => persisted,
+                    Err(error) => {
+                        self.mark_turn_blocked(
+                            outcome.started_notification.thread_id.clone(),
+                            outcome.started_notification.turn.id.clone(),
+                            format!(
+                                "failed to persist resolved MCP projection before CLI provider start: {error}"
+                            ),
+                        )
+                        .await;
+                        send_turn_start_failure!(format!(
+                            "failed to persist resolved MCP projection: {error}"
+                        ));
+                        return;
+                    }
+                };
+                if persisted.turn_id != outcome.started_notification.turn.id
+                    || persisted.manifest_hash != projection.manifest_hash
+                    || persisted.tool_count != projection.tools.len()
+                {
+                    self.mark_turn_blocked(
+                        outcome.started_notification.thread_id.clone(),
+                        outcome.started_notification.turn.id.clone(),
+                        "persisted MCP projection acknowledgement did not match CLI preflight"
+                            .to_owned(),
+                    )
+                    .await;
+                    send_turn_start_failure!(
+                        "persisted MCP projection acknowledgement did not match CLI preflight"
+                            .to_owned()
+                    );
+                    return;
+                }
+
+                let event = AgentDurableEvent::TurnCapabilitiesResolved {
+                    thread_id: outcome.started_notification.thread_id.clone(),
+                    turn_id: outcome.started_notification.turn.id.clone(),
+                    accepted: projection.accepted_capabilities.clone(),
+                    rejected: projection.rejected_capabilities.clone(),
+                    mcp_bindings: projection
+                        .tools
+                        .iter()
+                        .map(|tool| pioneer_protocol::McpTurnBindingSummary {
+                            server_installation_id: tool.server_installation_id.clone(),
+                            server_name: tool.server_name.clone(),
+                            raw_tool_name: tool.raw_tool_name.clone(),
+                            callable_name: tool.canonical_callable_name.clone(),
+                            catalog_version: tool.catalog_version.clone(),
+                            fingerprint: tool.installation_fingerprint.clone(),
+                            selection_reason: tool
+                                .selection_reason
+                                .legacy_binding_value()
+                                .to_owned(),
+                            capability_id: tool.capability_id.clone(),
+                        })
+                        .collect(),
+                };
+                if !self.handle_durable_agent_event(event).await {
+                    self.mark_turn_blocked(
+                        outcome.started_notification.thread_id.clone(),
+                        outcome.started_notification.turn.id.clone(),
+                        "failed to emit durable CLI MCP capability result".to_owned(),
+                    )
+                    .await;
+                    send_turn_start_failure!(
+                        "failed to emit durable CLI MCP capability result".to_owned()
+                    );
+                    return;
+                }
+            }
+            if !combined_preflight.skill_bindings.is_empty() {
+                let event = AgentDurableEvent::TurnSkillsResolved {
+                    thread_id: outcome.started_notification.thread_id.clone(),
+                    turn_id: outcome.started_notification.turn.id.clone(),
+                    bindings: combined_preflight.skill_bindings.clone(),
+                };
+                if !self.handle_durable_agent_event(event).await {
+                    self.mark_turn_blocked(
+                        outcome.started_notification.thread_id.clone(),
+                        outcome.started_notification.turn.id.clone(),
+                        "failed to commit CLI runtime turn skill bindings".to_owned(),
+                    )
+                    .await;
+                    send_turn_start_failure!(
+                        "failed to commit CLI runtime turn skill bindings".to_owned()
+                    );
+                    return;
+                }
+            }
+
+            for plan in &combined_preflight.skill_install_plans {
+                let install_started = std::time::Instant::now();
+                match self.install_one_cli_runtime_skill(plan).await {
+                    Ok(result) => {
+                        let result_name = match result.status {
+                            crate::cli_runtime::skills::CliRuntimeSkillInstallStatus::Current => {
+                                "current"
+                            }
+                            crate::cli_runtime::skills::CliRuntimeSkillInstallStatus::Installed => {
+                                "installed"
+                            }
+                            crate::cli_runtime::skills::CliRuntimeSkillInstallStatus::Updated => {
+                                "updated"
+                            }
+                        };
+                        let source_hash_prefix =
+                            &result.source_folder_hash[..result.source_folder_hash.len().min(12)];
+                        info!(
+                            event = "cli_runtime_skill_preflight",
+                            runtime_id = plan.runtime_id.as_str(),
+                            runtime_kind = plan.runtime_kind.as_str(),
+                            skill_slug = plan.skill_slug.as_str(),
+                            source_kind = plan.source_kind.as_str(),
+                            install_name = plan.install_name.as_str(),
+                            destination = %plan.destination.display(),
+                            result = result_name,
+                            source_hash_prefix,
+                            elapsed_ms = install_started.elapsed().as_millis(),
+                            "CLI runtime skill preflight completed after MCP projection persistence"
+                        );
+                        installed_skills.push(result);
+                    }
+                    Err(error) => {
+                        let failure_reason = format!(
+                            "failed to prepare CLI runtime skill `{}`: {error:#}",
+                            plan.skill_slug
+                        );
+                        warn!(
+                            event = "cli_runtime_skill_preflight",
+                            runtime_id = plan.runtime_id.as_str(),
+                            runtime_kind = plan.runtime_kind.as_str(),
+                            skill_slug = plan.skill_slug.as_str(),
+                            source_kind = plan.source_kind.as_str(),
+                            install_name = plan.install_name.as_str(),
+                            destination = %plan.destination.display(),
+                            result = "failed",
+                            failure_reason = failure_reason.as_str(),
+                            elapsed_ms = install_started.elapsed().as_millis(),
+                            "CLI runtime skill preflight failed"
+                        );
+                        self.mark_turn_blocked(
+                            outcome.started_notification.thread_id.clone(),
+                            outcome.started_notification.turn.id.clone(),
+                            failure_reason.clone(),
+                        )
+                        .await;
+                        send_turn_start_failure!(failure_reason);
+                        return;
+                    }
+                }
+            }
+            #[cfg(test)]
+            self.cli_runtime_skill_preflight_test_events
+                .lock()
+                .await
+                .push("preflight_complete".to_owned());
+            if let Some(cutoff_ms) = installed_skills
+                .iter()
+                .map(|skill| skill.receipt_updated_at_unix_ms)
+                .max()
+                && let Err(error) = manager
+                    .close_session_if_started_at_or_before(&session_key, cutoff_ms)
+                    .await
+            {
+                self.mark_turn_blocked(
+                    outcome.started_notification.thread_id.clone(),
+                    outcome.started_notification.turn.id.clone(),
+                    format!("failed to refresh CLI runtime session for selected skills: {error:#}"),
+                )
+                .await;
+                send_turn_start_failure!(format!(
+                    "failed to refresh CLI runtime session for selected skills: {error:#}"
+                ));
+                return;
+            }
+            if matches!(runtime_kind, CLIAgentRuntimeKind::Codex) {
+                crate::cli_runtime::skills::prepend_codex_installed_skill_inputs(
+                    &installed_skills,
+                    &mut input_mapping,
+                );
+            } else {
+                crate::cli_runtime::skills::prepend_claude_installed_skill_directive(
+                    &installed_skills,
+                    &mut input_mapping,
+                );
+            }
             if runtime_kind == CLIAgentRuntimeKind::Codex {
                 provider_permissions_id = Some(
                     crate::cli_runtime::permissions::codex_permissions_profile_for_security_snapshot(
@@ -1061,6 +1436,7 @@ impl MessageProcessor {
                     runtime_id.as_str(),
                     runtime_kind,
                     &outcome,
+                    combined_preflight.mcp_projection.as_ref(),
                 )
                 .await
             {
@@ -1085,20 +1461,137 @@ impl MessageProcessor {
             );
             let native_cwd = security_snapshot.sandbox.cwd.clone();
             let proxy_env = crate::cli_runtime::config::proxy_env(proxy_url.as_deref());
-            let session_handle = match manager
-                .get_or_start_with_options(
-                    session_key.clone(),
-                    crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
-                        cwd: Some(std::path::PathBuf::from(native_cwd.as_str())),
-                        approval_policy: Some(effective_approval_policy.clone()),
-                        env: proxy_env,
-                        enable_user_skills: matches!(runtime_kind, CLIAgentRuntimeKind::Claude)
-                            && !installed_skills.is_empty(),
-                        ..Default::default()
-                    },
-                )
-                .await
-            {
+            let session_options = crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
+                cwd: Some(std::path::PathBuf::from(native_cwd.as_str())),
+                approval_policy: Some(effective_approval_policy.clone()),
+                env: proxy_env,
+                enable_user_skills: matches!(runtime_kind, CLIAgentRuntimeKind::Claude)
+                    && !installed_skills.is_empty(),
+                ..Default::default()
+            };
+            let session_result = if runtime_kind == CLIAgentRuntimeKind::Codex {
+                let persisted_binding = match self
+                    .crud_store
+                    .get_cli_runtime_thread_binding(outcome.started_notification.thread_id.as_str())
+                    .await
+                {
+                    Ok(binding) => binding,
+                    Err(error) => {
+                        self.mark_turn_blocked(
+                            outcome.started_notification.thread_id.clone(),
+                            outcome.started_notification.turn.id.clone(),
+                            format!("failed to load Codex continuation binding: {error:#}"),
+                        )
+                        .await;
+                        send_turn_start_failure!(format!(
+                            "failed to load Codex continuation binding: {error:#}"
+                        ));
+                        return;
+                    }
+                };
+                let native_thread_id = match persisted_binding {
+                    Some(binding)
+                        if binding.workspace_id == outcome.started_notification.workspace_id
+                            && binding.runtime_id == runtime_id
+                            && binding.runtime_kind
+                                == cli_runtime_protocol_kind_label(runtime_kind) =>
+                    {
+                        Some(binding.native_thread_id)
+                    }
+                    Some(_) => {
+                        self.mark_turn_blocked(
+                            outcome.started_notification.thread_id.clone(),
+                            outcome.started_notification.turn.id.clone(),
+                            "persisted Codex continuation binding does not match the requested runtime"
+                                .to_owned(),
+                        )
+                        .await;
+                        send_turn_start_failure!(
+                            "persisted Codex continuation binding does not match the requested runtime"
+                                .to_owned()
+                        );
+                        return;
+                    }
+                    None => None,
+                };
+                manager
+                    .get_or_start_with_launch_spec(
+                        session_key.clone(),
+                        crate::cli_runtime::continuation::CliSessionLaunchSpec::codex(
+                            session_options,
+                            codex_mcp_launch_projection
+                                .clone()
+                                .map(crate::cli_runtime::continuation::CliMcpSessionLaunch::Codex)
+                                .unwrap_or(
+                                    crate::cli_runtime::continuation::CliMcpSessionLaunch::Disabled,
+                                ),
+                            native_thread_id,
+                        ),
+                    )
+                    .await
+            } else {
+                let continuation =
+                    match crate::cli_runtime::thread_binding::prepare_claude_provider_session(
+                        self.crud_store.as_ref(),
+                        crate::cli_runtime::thread_binding::ClaudeProviderSessionPrepareRequest {
+                            workspace_id: outcome.started_notification.workspace_id.clone(),
+                            thread_id: outcome.started_notification.thread_id.clone(),
+                            runtime_id: runtime_id.clone(),
+                            cwd: native_cwd.clone(),
+                            model: Some(outcome.materialization.thread.model.clone()),
+                            prepared_at: chrono::Utc::now().fixed_offset(),
+                        },
+                    )
+                    .await
+                    {
+                        Ok(continuation) => continuation,
+                        Err(error) => {
+                            self.mark_turn_blocked(
+                                outcome.started_notification.thread_id.clone(),
+                                outcome.started_notification.turn.id.clone(),
+                                format!("failed to prepare Claude provider session: {error:#}"),
+                            )
+                            .await;
+                            send_turn_start_failure!(format!(
+                                "failed to prepare Claude provider session: {error:#}"
+                            ));
+                            return;
+                        }
+                    };
+                let launch_spec = match continuation {
+                    crate::cli_runtime::continuation::CliProviderContinuation::ClaudeNew {
+                        provider_session_id,
+                    } => crate::cli_runtime::continuation::CliSessionLaunchSpec::claude_new(
+                        session_options,
+                        claude_mcp_launch_projection
+                            .clone()
+                            .map(crate::cli_runtime::continuation::CliMcpSessionLaunch::Claude)
+                            .unwrap_or(
+                                crate::cli_runtime::continuation::CliMcpSessionLaunch::Disabled,
+                            ),
+                        provider_session_id,
+                    ),
+                    crate::cli_runtime::continuation::CliProviderContinuation::ClaudeResume {
+                        provider_session_id,
+                    } => crate::cli_runtime::continuation::CliSessionLaunchSpec::claude_resume(
+                        session_options,
+                        claude_mcp_launch_projection
+                            .clone()
+                            .map(crate::cli_runtime::continuation::CliMcpSessionLaunch::Claude)
+                            .unwrap_or(
+                                crate::cli_runtime::continuation::CliMcpSessionLaunch::Disabled,
+                            ),
+                        provider_session_id,
+                    ),
+                    crate::cli_runtime::continuation::CliProviderContinuation::CodexRpcThread {
+                        ..
+                    } => unreachable!("Claude preparation returned a Codex continuation"),
+                };
+                manager
+                    .get_or_start_with_launch_spec(session_key.clone(), launch_spec)
+                    .await
+            };
+            let session_handle = match session_result {
                 Ok(handle) => handle,
                 Err(error) => {
                     self.mark_turn_blocked(
@@ -1115,7 +1608,7 @@ impl MessageProcessor {
             };
             let cli_session = session_handle.session();
             self.ensure_cli_runtime_session_event_pumps(
-                &session_key,
+                session_handle.instance(),
                 cli_session.clone(),
                 runtime_config.debug_native_events,
             )
@@ -1249,7 +1742,7 @@ impl MessageProcessor {
                 };
             let native_turn_start = PreparedCliRuntimeNativeTurnStart {
                 outcome,
-                session_key,
+                session_instance: session_handle.instance().clone(),
                 cli_session,
                 native_thread_id,
                 turn_start_params: native_turn_start_params,
@@ -1298,12 +1791,85 @@ impl MessageProcessor {
     ) {
         let PreparedCliRuntimeNativeTurnStart {
             outcome,
-            session_key,
+            session_instance,
             cli_session,
             native_thread_id,
             turn_start_params,
             request_timeout_ms,
         } = prepared;
+        let pioneer_turn_id = outcome.started_notification.turn.id.clone();
+        let mcp_metadata = match cli_session.prepare_mcp_turn(pioneer_turn_id.as_str()).await {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                self.mark_turn_blocked(
+                    outcome.started_notification.thread_id.clone(),
+                    pioneer_turn_id,
+                    format!("failed to reserve CLI MCP turn lease: {error:#}"),
+                )
+                .await;
+                return;
+            }
+        };
+        if let Some(metadata) = mcp_metadata {
+            let session_generation = match i64::try_from(metadata.session_generation) {
+                Ok(generation) => generation,
+                Err(_) => {
+                    let _ = cli_session
+                        .terminal_mcp_turn(pioneer_turn_id.as_str())
+                        .await;
+                    self.mark_turn_blocked(
+                        outcome.started_notification.thread_id.clone(),
+                        pioneer_turn_id,
+                        "CLI MCP session generation exceeds durable range".to_owned(),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let projection_activation_generation =
+                match i64::try_from(metadata.projection_activation_generation) {
+                    Ok(generation) => generation,
+                    Err(_) => {
+                        let _ = cli_session
+                            .terminal_mcp_turn(pioneer_turn_id.as_str())
+                            .await;
+                        self.mark_turn_blocked(
+                            outcome.started_notification.thread_id.clone(),
+                            pioneer_turn_id,
+                            "CLI MCP activation generation exceeds durable range".to_owned(),
+                        )
+                        .await;
+                        return;
+                    }
+                };
+            if let Err(error) = self
+                .crud_store
+                .bind_cli_runtime_turn_mcp_activation(
+                    pioneer_turn_id.as_str(),
+                    pioneer_crud::CliRuntimeTurnMcpMetadata {
+                        adapter_kind: metadata.adapter_kind,
+                        manifest_hash: metadata.manifest_hash,
+                        projection_fingerprint: metadata.projection_fingerprint,
+                        provider_contract_fingerprint: metadata.provider_contract_fingerprint,
+                        isolation_contract_fingerprint: metadata.isolation_contract_fingerprint,
+                        session_generation,
+                        projection_activation_generation,
+                    },
+                )
+                .await
+            {
+                let _ = cli_session
+                    .terminal_mcp_turn(pioneer_turn_id.as_str())
+                    .await;
+                self.mark_turn_blocked(
+                    outcome.started_notification.thread_id.clone(),
+                    pioneer_turn_id,
+                    format!("failed to persist CLI MCP turn lease: {error:#}"),
+                )
+                .await;
+                return;
+            }
+        }
         let native_turn = match cli_session
             .start_turn(
                 turn_start_params,
@@ -1313,6 +1879,9 @@ impl MessageProcessor {
         {
             Ok(native_turn) => native_turn,
             Err(error) => {
+                let _ = cli_session
+                    .terminal_mcp_turn(pioneer_turn_id.as_str())
+                    .await;
                 self.fail_initial_cli_runtime_turn_attempt(
                     outcome.started_notification.turn.id.as_str(),
                     format!("failed to start native CLI runtime turn: {error:#}"),
@@ -1320,7 +1889,7 @@ impl MessageProcessor {
                 .await;
                 self.mark_turn_blocked(
                     outcome.started_notification.thread_id.clone(),
-                    outcome.started_notification.turn.id.clone(),
+                    pioneer_turn_id,
                     format!("failed to start CLI runtime turn: {error:#}"),
                 )
                 .await;
@@ -1342,6 +1911,9 @@ impl MessageProcessor {
         {
             Ok(binding) => binding,
             Err(error) => {
+                let _ = cli_session
+                    .terminal_mcp_turn(pioneer_turn_id.as_str())
+                    .await;
                 self.fail_initial_cli_runtime_turn_attempt(
                     outcome.started_notification.turn.id.as_str(),
                     format!("failed to persist native CLI runtime owner: {error:#}"),
@@ -1366,6 +1938,9 @@ impl MessageProcessor {
         {
             Ok(Some(attempt)) => attempt,
             Ok(None) => {
+                let _ = cli_session
+                    .terminal_mcp_turn(pioneer_turn_id.as_str())
+                    .await;
                 self.mark_turn_blocked(
                     outcome.started_notification.thread_id.clone(),
                     outcome.started_notification.turn.id.clone(),
@@ -1381,6 +1956,9 @@ impl MessageProcessor {
                 return;
             }
             Err(error) => {
+                let _ = cli_session
+                    .terminal_mcp_turn(pioneer_turn_id.as_str())
+                    .await;
                 self.mark_turn_blocked(
                     outcome.started_notification.thread_id.clone(),
                     outcome.started_notification.turn.id.clone(),
@@ -1397,9 +1975,12 @@ impl MessageProcessor {
             }
         };
         if let Err(error) = self
-            .publish_cli_runtime_attempt_window_started(&session_key, &turn_binding, &attempt)
+            .publish_cli_runtime_attempt_window_started(&session_instance, &turn_binding, &attempt)
             .await
         {
+            let _ = cli_session
+                .terminal_mcp_turn(pioneer_turn_id.as_str())
+                .await;
             self.fail_cli_runtime_turn_attempt(
                 attempt.id.as_str(),
                 format!("failed to open CLI runtime execution window: {error:#}"),
@@ -1419,8 +2000,38 @@ impl MessageProcessor {
                 .await;
             return;
         }
+        if let Err(error) = cli_session
+            .activate_mcp_turn(
+                pioneer_turn_id.as_str(),
+                native_thread_id.as_str(),
+                native_turn_id.as_str(),
+            )
+            .await
+        {
+            let _ = cli_session
+                .terminal_mcp_turn(pioneer_turn_id.as_str())
+                .await;
+            self.fail_cli_runtime_turn_attempt(
+                attempt.id.as_str(),
+                format!("failed to activate CLI MCP turn lease: {error:#}"),
+            )
+            .await;
+            let _ = cli_session
+                .interrupt_turn(
+                    Some(native_thread_id.as_str()),
+                    Some(native_turn_id.as_str()),
+                )
+                .await;
+            self.mark_turn_blocked(
+                outcome.started_notification.thread_id.clone(),
+                pioneer_turn_id,
+                format!("failed to activate CLI MCP turn lease: {error:#}"),
+            )
+            .await;
+            return;
+        }
         self.flush_cli_runtime_events_for_native_turn(
-            &session_key,
+            &session_instance,
             native_thread_id.as_str(),
             native_turn_id.as_str(),
         )
@@ -1429,7 +2040,7 @@ impl MessageProcessor {
 
     async fn publish_cli_runtime_attempt_window_started(
         &self,
-        session_key: &crate::cli_runtime::manager::CLIAgentRuntimeSessionKey,
+        session_instance: &crate::cli_runtime::session_instance::CliSessionInstanceId,
         binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
         attempt: &pioneer_crud::CliRuntimeTurnAttemptRecord,
     ) -> anyhow::Result<()> {
@@ -1467,7 +2078,7 @@ impl MessageProcessor {
             .unwrap_or(attempt.created_at)
             .timestamp_millis();
         let event_hub = self
-            .ensure_cli_runtime_execution_event_hub(session_key)
+            .ensure_cli_runtime_execution_event_hub(session_instance)
             .await;
         event_hub
             .publish_durable_and_wait(AgentDurableEvent::TurnExecutionWindowStarted {
@@ -1658,7 +2269,7 @@ impl MessageProcessor {
             .await?;
         let cli_session = session_handle.session();
         self.ensure_cli_runtime_session_event_pumps(
-            &session_key,
+            session_handle.instance(),
             cli_session.clone(),
             runtime.debug_native_events,
         )
@@ -1735,7 +2346,11 @@ impl MessageProcessor {
             }
         }
         if let Err(error) = self
-            .publish_cli_runtime_attempt_window_started(&session_key, &prepared_binding, &attempt)
+            .publish_cli_runtime_attempt_window_started(
+                session_handle.instance(),
+                &prepared_binding,
+                &attempt,
+            )
             .await
         {
             self.fail_cli_runtime_turn_attempt(
@@ -1800,7 +2415,7 @@ impl MessageProcessor {
             return Err(error);
         }
         self.flush_cli_runtime_events_for_native_turn(
-            &session_key,
+            session_handle.instance(),
             prepared_binding.native_thread_id.as_str(),
             native_turn_id.as_str(),
         )
@@ -2266,6 +2881,7 @@ impl MessageProcessor {
         runtime_id: &str,
         runtime_kind: CLIAgentRuntimeKind,
         outcome: &crate::thread::TurnStartOutcome,
+        mcp_projection: Option<&crate::turn_mcp::ResolvedMcpTurnProjection>,
     ) -> anyhow::Result<pioneer_promt::CompiledPromptBundle> {
         let native_cwd = self
             .crud_store
@@ -2293,6 +2909,11 @@ impl MessageProcessor {
                 cwd: native_cwd.as_deref(),
                 permission_profile,
                 history: history.as_slice(),
+                selected_capabilities_context:
+                    crate::cli_runtime::context::cli_runtime_mcp_capabilities_context(
+                        runtime_kind,
+                        mcp_projection,
+                    ),
             },
         )
     }
@@ -2573,6 +3194,9 @@ impl MessageProcessor {
             .await;
             return;
         }
+
+        self.mcp_service
+            .cancel_turn_mcp_invocations(turn_id.as_str());
 
         let cli_turn_binding = match self
             .crud_store
@@ -3836,6 +4460,39 @@ fn normalize_cli_runtime_sandbox_label(value: &str) -> String {
 
 fn cli_runtime_provider_key(runtime_id: &str) -> String {
     format!("cli_runtime:{}", runtime_id.trim())
+}
+
+fn cli_mcp_client_target(
+    runtime_kind: CLIAgentRuntimeKind,
+) -> crate::cli_mcp_client_validation::CliMcpClientTarget {
+    match runtime_kind {
+        CLIAgentRuntimeKind::Codex => crate::cli_mcp_client_validation::CliMcpClientTarget::Codex,
+        CLIAgentRuntimeKind::Claude => crate::cli_mcp_client_validation::CliMcpClientTarget::Claude,
+    }
+}
+
+fn cli_mcp_projection_resolves_all_explicit_capabilities(
+    capabilities: &crate::cli_runtime::skills::CliRuntimeCapabilityPartition,
+    projection: &crate::turn_mcp::ResolvedMcpTurnProjection,
+) -> bool {
+    let requested = capabilities
+        .mcp_servers
+        .iter()
+        .map(|capability| capability.capability_id.as_str())
+        .chain(
+            capabilities
+                .mcp_tools
+                .iter()
+                .map(|capability| capability.capability_id.as_str()),
+        )
+        .collect::<std::collections::HashSet<_>>();
+    let accepted = projection
+        .accepted_capabilities
+        .iter()
+        .map(|capability| capability.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+
+    projection.rejected_capabilities.is_empty() && requested == accepted
 }
 
 fn cli_runtime_kind_matches_config(

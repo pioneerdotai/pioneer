@@ -1,14 +1,18 @@
 #![allow(dead_code)]
 // Owns reusable CLI runtime sessions across provider kinds.
 
+use crate::cli_runtime::continuation::{CliSessionLaunchSpec, requires_restart};
+use crate::cli_runtime::session_instance::{CliSessionGenerationAllocator, CliSessionInstanceId};
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use pioneer_cli_agent_runtime::codex::{
     CodexJsonlRpcClientDiagnostic, CodexJsonlRpcNotificationEvent, CodexJsonlRpcServerRequest,
 };
 use pioneer_cli_agent_runtime::event::RuntimeEvent;
+use pioneer_cli_agent_runtime::process::SensitiveEnvironment;
 use serde_json::Value as JsonValue;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -93,17 +97,19 @@ pub(crate) struct CLIAgentRuntimeSessionStartOptions {
     pub cwd: Option<PathBuf>,
     pub approval_policy: Option<String>,
     pub app_server_args: Vec<String>,
-    pub env: BTreeMap<String, String>,
+    pub env: SensitiveEnvironment,
     pub enable_user_skills: bool,
 }
 
 pub(crate) struct CLIAgentRuntimeCodexEventReceivers {
+    pub process_instance: CliSessionInstanceId,
     pub notifications: mpsc::Receiver<CodexJsonlRpcNotificationEvent>,
     pub server_requests: mpsc::Receiver<CodexJsonlRpcServerRequest>,
     pub diagnostics: mpsc::Receiver<CodexJsonlRpcClientDiagnostic>,
 }
 
 pub(crate) struct CLIAgentRuntimeEventReceivers {
+    pub process_instance: CliSessionInstanceId,
     pub runtime_kind: String,
     pub events: mpsc::Receiver<RuntimeEvent>,
 }
@@ -147,6 +153,25 @@ pub(crate) struct CLIAgentRuntimeTurnStartSnapshot {
     pub raw: JsonValue,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CLIAgentRuntimeMcpTurnMetadata {
+    pub adapter_kind: String,
+    pub manifest_hash: String,
+    pub projection_fingerprint: String,
+    pub provider_contract_fingerprint: String,
+    pub isolation_contract_fingerprint: String,
+    pub session_generation: u64,
+    pub projection_activation_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CLIAgentRuntimeNativeMcpApprovalRequest {
+    pub native_thread_id: String,
+    pub native_turn_id: String,
+    pub native_item_id: String,
+    pub requested_permissions: JsonValue,
+}
+
 pub(crate) use pioneer_runtime_events::ExecutionTurnStatus as CLIAgentRuntimeObservedTurnStatus;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -161,6 +186,18 @@ pub(crate) struct CLIAgentRuntimeTurnObservation {
 #[async_trait]
 pub(crate) trait CLIAgentRuntimeSession: Send + Sync {
     async fn close(&self) -> Result<()>;
+
+    /// Provider-specific barrier used only for a launch-contract replacement.
+    /// The cached generation remains published when this fails.
+    async fn prepare_for_replacement(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Confirm the provider continuity checkpoint after the old process has
+    /// closed but before its generation is revoked and a replacement starts.
+    async fn confirm_replacement_checkpoint(&self) -> Result<()> {
+        Ok(())
+    }
 
     fn take_codex_event_receivers(&self) -> Option<CLIAgentRuntimeCodexEventReceivers> {
         None
@@ -202,6 +239,41 @@ pub(crate) trait CLIAgentRuntimeSession: Send + Sync {
         bail!("CLI runtime session does not support turn start");
     }
 
+    async fn prepare_mcp_turn(
+        &self,
+        _pioneer_turn_id: &str,
+    ) -> Result<Option<CLIAgentRuntimeMcpTurnMetadata>> {
+        Ok(None)
+    }
+
+    async fn activate_mcp_turn(
+        &self,
+        _pioneer_turn_id: &str,
+        _native_thread_id: &str,
+        _native_turn_id: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn terminal_mcp_turn(&self, _pioneer_turn_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    async fn native_mcp_approval_response(
+        &self,
+        _request: CLIAgentRuntimeNativeMcpApprovalRequest,
+    ) -> Result<Option<JsonValue>> {
+        Ok(None)
+    }
+
+    async fn mcp_permission_fallback_count(&self) -> Result<usize> {
+        Ok(0)
+    }
+
+    fn enrich_runtime_event(&self, _event: &mut RuntimeEvent) -> Result<()> {
+        Ok(())
+    }
+
     async fn respond_to_request(
         &self,
         native_request_id: JsonValue,
@@ -209,6 +281,17 @@ pub(crate) trait CLIAgentRuntimeSession: Send + Sync {
     ) -> Result<()> {
         let _ = (native_request_id, response);
         bail!("CLI runtime session does not support server request responses");
+    }
+
+    async fn fail_request(
+        &self,
+        native_request_id: JsonValue,
+        code: i64,
+        message: String,
+        data: Option<JsonValue>,
+    ) -> Result<()> {
+        let _ = (native_request_id, code, message, data);
+        bail!("CLI runtime session does not support server request error responses");
     }
 
     async fn interrupt_turn(
@@ -266,28 +349,60 @@ pub(crate) trait CLIAgentRuntimeSession: Send + Sync {
 pub(crate) trait CLIAgentRuntimeSessionFactory: Send + Sync {
     async fn start_session(
         &self,
-        key: &CLIAgentRuntimeSessionKey,
+        instance: &CliSessionInstanceId,
     ) -> Result<Arc<dyn CLIAgentRuntimeSession>>;
 
     async fn start_session_with_options(
         &self,
-        key: &CLIAgentRuntimeSessionKey,
+        instance: &CliSessionInstanceId,
         options: &CLIAgentRuntimeSessionStartOptions,
     ) -> Result<Arc<dyn CLIAgentRuntimeSession>> {
         let _ = options;
-        self.start_session(key).await
+        self.start_session(instance).await
+    }
+
+    async fn start_session_with_launch_spec(
+        &self,
+        instance: &CliSessionInstanceId,
+        launch_spec: &CliSessionLaunchSpec,
+    ) -> Result<Arc<dyn CLIAgentRuntimeSession>> {
+        self.start_session_with_options(instance, &launch_spec.options)
+            .await
     }
 }
 
+/// Exact-generation lifecycle hooks for resources that surround a provider
+/// process (for example the private CLI MCP bridge). Hooks never perform
+/// logical-key lookup and are called outside the manager's session locks.
+#[async_trait]
+pub(crate) trait CLIAgentRuntimeSessionLifecycle: Send + Sync {
+    async fn shutdown_started(&self) {}
+
+    async fn before_session_close(&self, _instance: &CliSessionInstanceId) {}
+
+    async fn after_session_close(&self, _instance: &CliSessionInstanceId) {}
+
+    async fn shutdown_finished(&self) {}
+}
+
+struct NoopCLIAgentRuntimeSessionLifecycle;
+
+#[async_trait]
+impl CLIAgentRuntimeSessionLifecycle for NoopCLIAgentRuntimeSessionLifecycle {}
+
 #[derive(Clone)]
 pub(crate) struct CLIAgentRuntimeSessionHandle {
-    key: CLIAgentRuntimeSessionKey,
+    instance: CliSessionInstanceId,
     session: Arc<dyn CLIAgentRuntimeSession>,
 }
 
 impl CLIAgentRuntimeSessionHandle {
     pub(crate) fn key(&self) -> &CLIAgentRuntimeSessionKey {
-        &self.key
+        self.instance.key()
+    }
+
+    pub(crate) fn instance(&self) -> &CliSessionInstanceId {
+        &self.instance
     }
 
     pub(crate) fn session(&self) -> Arc<dyn CLIAgentRuntimeSession> {
@@ -300,17 +415,82 @@ impl CLIAgentRuntimeSessionHandle {
     }
 }
 
-struct CLIAgentRuntimeCachedSession {
+/// A response route captured from the exact native process that emitted a
+/// machine request. It must never be reconstructed through a logical-key
+/// lookup because that key may already point at a replacement generation.
+#[derive(Clone)]
+pub(crate) struct CLIAgentRuntimeMachineRequestResponder {
+    instance: CliSessionInstanceId,
+    native_request_id: JsonValue,
     session: Arc<dyn CLIAgentRuntimeSession>,
-    start_options: CLIAgentRuntimeSessionStartOptions,
+}
+
+impl std::fmt::Debug for CLIAgentRuntimeMachineRequestResponder {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CLIAgentRuntimeMachineRequestResponder")
+            .field("instance", &self.instance)
+            .field("native_request_id", &self.native_request_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CLIAgentRuntimeMachineRequestResponder {
+    pub(crate) fn new(
+        instance: CliSessionInstanceId,
+        native_request_id: JsonValue,
+        session: Arc<dyn CLIAgentRuntimeSession>,
+    ) -> Self {
+        Self {
+            instance,
+            native_request_id,
+            session,
+        }
+    }
+
+    pub(crate) fn instance(&self) -> &CliSessionInstanceId {
+        &self.instance
+    }
+
+    pub(crate) fn native_request_id(&self) -> &JsonValue {
+        &self.native_request_id
+    }
+
+    pub(crate) fn session(&self) -> Arc<dyn CLIAgentRuntimeSession> {
+        self.session.clone()
+    }
+
+    pub(crate) async fn respond(&self, response: JsonValue) -> Result<()> {
+        self.session
+            .respond_to_request(self.native_request_id.clone(), response)
+            .await
+    }
+
+    pub(crate) async fn fail(
+        &self,
+        code: i64,
+        message: impl Into<String>,
+        data: Option<JsonValue>,
+    ) -> Result<()> {
+        self.session
+            .fail_request(self.native_request_id.clone(), code, message.into(), data)
+            .await
+    }
+}
+
+#[derive(Clone)]
+struct CLIAgentRuntimeCachedSession {
+    instance: CliSessionInstanceId,
+    session: Arc<dyn CLIAgentRuntimeSession>,
+    launch_spec: CliSessionLaunchSpec,
     started_at_ms: u64,
     last_used_at_ms: u64,
 }
 
 impl CLIAgentRuntimeCachedSession {
-    fn handle(&self, key: &CLIAgentRuntimeSessionKey) -> CLIAgentRuntimeSessionHandle {
+    fn handle(&self) -> CLIAgentRuntimeSessionHandle {
         CLIAgentRuntimeSessionHandle {
-            key: key.clone(),
+            instance: self.instance.clone(),
             session: self.session.clone(),
         }
     }
@@ -318,9 +498,11 @@ impl CLIAgentRuntimeCachedSession {
 
 pub(crate) struct CLIAgentRuntimeManager {
     factory: Arc<dyn CLIAgentRuntimeSessionFactory>,
+    lifecycle: Arc<dyn CLIAgentRuntimeSessionLifecycle>,
     idle_session_ttl: Duration,
     sessions: Mutex<HashMap<CLIAgentRuntimeSessionKey, CLIAgentRuntimeCachedSession>>,
     start_locks: Mutex<HashMap<CLIAgentRuntimeSessionKey, Arc<Mutex<()>>>>,
+    generations: CliSessionGenerationAllocator,
 }
 
 impl CLIAgentRuntimeManager {
@@ -328,14 +510,28 @@ impl CLIAgentRuntimeManager {
         factory: Arc<dyn CLIAgentRuntimeSessionFactory>,
         idle_session_ttl: Duration,
     ) -> Result<Self> {
+        Self::new_with_lifecycle(
+            factory,
+            idle_session_ttl,
+            Arc::new(NoopCLIAgentRuntimeSessionLifecycle),
+        )
+    }
+
+    pub(crate) fn new_with_lifecycle(
+        factory: Arc<dyn CLIAgentRuntimeSessionFactory>,
+        idle_session_ttl: Duration,
+        lifecycle: Arc<dyn CLIAgentRuntimeSessionLifecycle>,
+    ) -> Result<Self> {
         if idle_session_ttl.is_zero() {
             bail!("CLI runtime idle session TTL must be greater than zero");
         }
         Ok(Self {
             factory,
+            lifecycle,
             idle_session_ttl,
             sessions: Mutex::new(HashMap::new()),
             start_locks: Mutex::new(HashMap::new()),
+            generations: CliSessionGenerationAllocator::default(),
         })
     }
 
@@ -352,27 +548,84 @@ impl CLIAgentRuntimeManager {
         key: CLIAgentRuntimeSessionKey,
         options: CLIAgentRuntimeSessionStartOptions,
     ) -> Result<CLIAgentRuntimeSessionHandle> {
-        self.get_or_start_at(key, options, current_time_millis())
+        self.get_or_start_with_launch_spec(key, CliSessionLaunchSpec::unmanaged_codex(options))
             .await
     }
 
+    pub(crate) async fn get_or_start_with_launch_spec(
+        &self,
+        key: CLIAgentRuntimeSessionKey,
+        launch_spec: CliSessionLaunchSpec,
+    ) -> Result<CLIAgentRuntimeSessionHandle> {
+        self.get_or_start_with_launch_spec_at(key, launch_spec, current_time_millis())
+            .await
+    }
+
+    #[cfg(test)]
     async fn get_or_start_at(
         &self,
         key: CLIAgentRuntimeSessionKey,
         options: CLIAgentRuntimeSessionStartOptions,
         now_ms: u64,
     ) -> Result<CLIAgentRuntimeSessionHandle> {
+        self.get_or_start_with_launch_spec_at(
+            key,
+            CliSessionLaunchSpec::unmanaged_codex(options),
+            now_ms,
+        )
+        .await
+    }
+
+    async fn get_or_start_with_launch_spec_at(
+        &self,
+        key: CLIAgentRuntimeSessionKey,
+        launch_spec: CliSessionLaunchSpec,
+        now_ms: u64,
+    ) -> Result<CLIAgentRuntimeSessionHandle> {
         let start_lock = self.start_lock_for_key(&key).await;
         let _guard = start_lock.lock().await;
 
-        if let Some(handle) = self.touch_existing_session(&key, &options, now_ms).await {
-            return Ok(handle);
-        }
-        if let Some(stale) = self
-            .remove_session_with_different_options(&key, &options)
+        if let Some(handle) = self
+            .touch_reusable_session(&key, &launch_spec, now_ms)
             .await
         {
-            stale.session.close().await.map_err(|error| {
+            return Ok(handle);
+        }
+        if let Some(stale) = self.session_requiring_restart(&key, &launch_spec).await {
+            validate_replacement_continuation(&stale.launch_spec, &launch_spec)?;
+            stale
+                .session
+                .prepare_for_replacement()
+                .await
+                .map_err(|error| {
+                    anyhow!(
+                        "CLI runtime session `{}/{}/{}` is not safe to replace: {error:#}",
+                        key.workspace_id,
+                        key.runtime_id,
+                        key.thread_id
+                    )
+                })?;
+            let Some(stale) = self.remove_session_instance(&stale.instance).await else {
+                bail!(
+                    "CLI runtime session `{}/{}/{}` changed while preparing replacement",
+                    key.workspace_id,
+                    key.runtime_id,
+                    key.thread_id
+                );
+            };
+            // Replacement has a stronger provider-owned shutdown order than
+            // ordinary eviction: the session has already proved terminal and
+            // must close its process/helper before the lifecycle revokes the
+            // exact generation. Manual/idle shutdown still uses the early
+            // cancellation hook below.
+            let close_result = stale.session.close().await;
+            let checkpoint_result = if close_result.is_ok() {
+                stale.session.confirm_replacement_checkpoint().await
+            } else {
+                Ok(())
+            };
+            self.lifecycle.after_session_close(&stale.instance).await;
+            close_result.map_err(|error| {
                 anyhow!(
                     "failed to close stale CLI runtime session `{}/{}/{}`: {error:#}",
                     key.workspace_id,
@@ -380,26 +633,92 @@ impl CLIAgentRuntimeManager {
                     key.thread_id
                 )
             })?;
+            checkpoint_result.map_err(|error| {
+                anyhow!(
+                    "failed to confirm replacement checkpoint for CLI runtime session `{}/{}/{}`: {error:#}",
+                    key.workspace_id,
+                    key.runtime_id,
+                    key.thread_id
+                )
+            })?;
         }
 
-        let session = self
-            .factory
-            .start_session_with_options(&key, &options)
+        self.start_and_publish_locked(key, launch_spec, now_ms)
             .await
-            .map_err(|error| anyhow!("failed to start CLI runtime session: {error:#}"))?;
+    }
+
+    /// Obtain an existing process for a management operation without ever
+    /// replacing its active turn launch contract. An isolated empty process is
+    /// created only when the logical key has no cached generation.
+    pub(crate) async fn existing_or_start_management(
+        &self,
+        key: CLIAgentRuntimeSessionKey,
+        options: CLIAgentRuntimeSessionStartOptions,
+    ) -> Result<CLIAgentRuntimeSessionHandle> {
+        let start_lock = self.start_lock_for_key(&key).await;
+        let _guard = start_lock.lock().await;
+        let now_ms = current_time_millis();
+        if let Some(handle) = self.touch_any_existing_session(&key, now_ms).await {
+            return Ok(handle);
+        }
+        self.start_and_publish_locked(key, CliSessionLaunchSpec::codex_management(options), now_ms)
+            .await
+    }
+
+    async fn start_and_publish_locked(
+        &self,
+        key: CLIAgentRuntimeSessionKey,
+        launch_spec: CliSessionLaunchSpec,
+        now_ms: u64,
+    ) -> Result<CLIAgentRuntimeSessionHandle> {
+        let instance = self.generations.allocate(key.clone())?;
+        let session = match self
+            .factory
+            .start_session_with_launch_spec(&instance, &launch_spec)
+            .await
+        {
+            Ok(session) => session,
+            Err(error) => {
+                self.lifecycle.after_session_close(&instance).await;
+                return Err(anyhow!("failed to start CLI runtime session: {error:#}"));
+            }
+        };
         let handle = CLIAgentRuntimeSessionHandle {
-            key: key.clone(),
+            instance: instance.clone(),
             session: session.clone(),
         };
-        self.sessions.lock().await.insert(
-            key,
-            CLIAgentRuntimeCachedSession {
-                session,
-                start_options: options,
-                started_at_ms: now_ms,
-                last_used_at_ms: now_ms,
-            },
-        );
+        let published = {
+            let mut sessions = self.sessions.lock().await;
+            match sessions.entry(key.clone()) {
+                Entry::Vacant(entry) => {
+                    entry.insert(CLIAgentRuntimeCachedSession {
+                        instance: instance.clone(),
+                        session: session.clone(),
+                        launch_spec,
+                        started_at_ms: now_ms,
+                        last_used_at_ms: now_ms,
+                    });
+                    true
+                }
+                Entry::Occupied(_) => false,
+            }
+        };
+        if !published {
+            self.lifecycle.before_session_close(&instance).await;
+            let close_result = session.close().await;
+            self.lifecycle.after_session_close(&instance).await;
+            close_result.map_err(|error| {
+                anyhow!(
+                    "failed to close unpublished CLI runtime session generation after CAS conflict: {error:#}"
+                )
+            })?;
+            bail!(
+                "CLI runtime session `{}/{}/{}` changed while publishing a new process generation",
+                key.workspace_id,
+                key.runtime_id,
+                key.thread_id
+            );
+        }
         Ok(handle)
     }
 
@@ -420,7 +739,10 @@ impl CLIAgentRuntimeManager {
         let Some(stale) = stale else {
             return Ok(false);
         };
-        stale.session.close().await.map_err(|error| {
+        self.lifecycle.before_session_close(&stale.instance).await;
+        let close_result = stale.session.close().await;
+        self.lifecycle.after_session_close(&stale.instance).await;
+        close_result.map_err(|error| {
             anyhow!(
                 "failed to close stale CLI runtime session `{}/{}/{}` for receipt cutoff `{cutoff_ms}`: {error:#}",
                 key.workspace_id,
@@ -431,19 +753,34 @@ impl CLIAgentRuntimeManager {
         Ok(true)
     }
 
-    async fn touch_existing_session(
+    async fn touch_reusable_session(
         &self,
         key: &CLIAgentRuntimeSessionKey,
-        options: &CLIAgentRuntimeSessionStartOptions,
+        launch_spec: &CliSessionLaunchSpec,
         now_ms: u64,
     ) -> Option<CLIAgentRuntimeSessionHandle> {
         let mut sessions = self.sessions.lock().await;
         let cached = sessions.get_mut(key)?;
-        if &cached.start_options != options {
+        if requires_restart(&cached.launch_spec, launch_spec) {
             return None;
         }
+        // Continuation is resolved before every acquisition. Retain the newest
+        // typed value so a later manifest-driven replacement resumes the exact
+        // persisted provider identity.
+        cached.launch_spec.continuation = launch_spec.continuation.clone();
         cached.last_used_at_ms = now_ms;
-        Some(cached.handle(key))
+        Some(cached.handle())
+    }
+
+    async fn touch_any_existing_session(
+        &self,
+        key: &CLIAgentRuntimeSessionKey,
+        now_ms: u64,
+    ) -> Option<CLIAgentRuntimeSessionHandle> {
+        let mut sessions = self.sessions.lock().await;
+        let cached = sessions.get_mut(key)?;
+        cached.last_used_at_ms = now_ms;
+        Some(cached.handle())
     }
 
     pub(crate) async fn existing_session(
@@ -454,20 +791,59 @@ impl CLIAgentRuntimeManager {
             .lock()
             .await
             .get(key)
-            .map(|cached| cached.handle(key))
+            .map(CLIAgentRuntimeCachedSession::handle)
     }
 
-    async fn remove_session_with_different_options(
+    pub(crate) async fn is_current_instance(&self, instance: &CliSessionInstanceId) -> bool {
+        self.sessions
+            .lock()
+            .await
+            .get(instance.key())
+            .is_some_and(|cached| cached.instance == *instance)
+    }
+
+    pub(crate) async fn remove_if_generation(&self, instance: &CliSessionInstanceId) -> bool {
+        let removed = {
+            let mut sessions = self.sessions.lock().await;
+            let is_current = sessions
+                .get(instance.key())
+                .is_some_and(|cached| cached.instance == *instance);
+            is_current
+                .then(|| sessions.remove(instance.key()))
+                .flatten()
+        };
+        if removed.is_some() {
+            // Event-pump EOF means the provider side has already terminated.
+            self.lifecycle.after_session_close(instance).await;
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn session_requiring_restart(
         &self,
         key: &CLIAgentRuntimeSessionKey,
-        options: &CLIAgentRuntimeSessionStartOptions,
+        launch_spec: &CliSessionLaunchSpec,
     ) -> Option<CLIAgentRuntimeCachedSession> {
-        let mut sessions = self.sessions.lock().await;
+        let sessions = self.sessions.lock().await;
         let cached = sessions.get(key)?;
-        if &cached.start_options == options {
+        if !requires_restart(&cached.launch_spec, launch_spec) {
             return None;
         }
-        sessions.remove(key)
+        Some(cached.clone())
+    }
+
+    async fn remove_session_instance(
+        &self,
+        instance: &CliSessionInstanceId,
+    ) -> Option<CLIAgentRuntimeCachedSession> {
+        let mut sessions = self.sessions.lock().await;
+        let current = sessions.get(instance.key())?;
+        if current.instance != *instance {
+            return None;
+        }
+        sessions.remove(instance.key())
     }
 
     async fn start_lock_for_key(&self, key: &CLIAgentRuntimeSessionKey) -> Arc<Mutex<()>> {
@@ -499,26 +875,37 @@ impl CLIAgentRuntimeManager {
         };
 
         let closed_count = idle_sessions.len();
+        let mut first_error = None;
         for (key, cached) in idle_sessions {
-            cached.session.close().await.map_err(|error| {
-                anyhow!(
+            self.lifecycle.before_session_close(&cached.instance).await;
+            let close_result = cached.session.close().await;
+            self.lifecycle.after_session_close(&cached.instance).await;
+            if let Err(error) = close_result
+                && first_error.is_none()
+            {
+                first_error = Some(anyhow!(
                     "failed to close idle CLI runtime session `{}/{}/{}`: {error:#}",
                     key.workspace_id,
                     key.runtime_id,
                     key.thread_id
-                )
-            })?;
+                ));
+            }
             self.remove_start_lock(&key).await;
         }
-        Ok(closed_count)
+        first_error.map_or(Ok(closed_count), Err)
     }
 
     pub(crate) async fn close_session(&self, key: &CLIAgentRuntimeSessionKey) -> Result<bool> {
+        let start_lock = self.start_lock_for_key(key).await;
+        let _start_guard = start_lock.lock().await;
         let session = self.sessions.lock().await.remove(key);
         let Some(cached) = session else {
             return Ok(false);
         };
-        cached.session.close().await.map_err(|error| {
+        self.lifecycle.before_session_close(&cached.instance).await;
+        let close_result = cached.session.close().await;
+        self.lifecycle.after_session_close(&cached.instance).await;
+        close_result.map_err(|error| {
             anyhow!(
                 "failed to close CLI runtime session `{}/{}/{}`: {error:#}",
                 key.workspace_id,
@@ -530,7 +917,42 @@ impl CLIAgentRuntimeManager {
         Ok(true)
     }
 
+    pub(crate) async fn close_session_instance(
+        &self,
+        instance: &CliSessionInstanceId,
+    ) -> Result<bool> {
+        let start_lock = self.start_lock_for_key(instance.key()).await;
+        let _start_guard = start_lock.lock().await;
+        let cached = {
+            let mut sessions = self.sessions.lock().await;
+            let is_current = sessions
+                .get(instance.key())
+                .is_some_and(|cached| cached.instance == *instance);
+            is_current
+                .then(|| sessions.remove(instance.key()))
+                .flatten()
+        };
+        let Some(cached) = cached else {
+            return Ok(false);
+        };
+        self.lifecycle.before_session_close(&cached.instance).await;
+        let close_result = cached.session.close().await;
+        self.lifecycle.after_session_close(&cached.instance).await;
+        close_result.map_err(|error| {
+            anyhow!(
+                "failed to close CLI runtime session `{}/{}/{}` generation {}: {error:#}",
+                instance.key().workspace_id,
+                instance.key().runtime_id,
+                instance.key().thread_id,
+                instance.generation()
+            )
+        })?;
+        self.remove_start_lock(instance.key()).await;
+        Ok(true)
+    }
+
     pub(crate) async fn close_all(&self) -> Result<usize> {
+        self.lifecycle.shutdown_started().await;
         let sessions = {
             let mut sessions = self.sessions.lock().await;
             sessions.drain().collect::<Vec<_>>()
@@ -538,17 +960,24 @@ impl CLIAgentRuntimeManager {
         self.start_locks.lock().await.clear();
 
         let closed_count = sessions.len();
+        let mut first_error = None;
         for (key, cached) in sessions {
-            cached.session.close().await.map_err(|error| {
-                anyhow!(
+            self.lifecycle.before_session_close(&cached.instance).await;
+            let close_result = cached.session.close().await;
+            self.lifecycle.after_session_close(&cached.instance).await;
+            if let Err(error) = close_result
+                && first_error.is_none()
+            {
+                first_error = Some(anyhow!(
                     "failed to close CLI runtime session `{}/{}/{}`: {error:#}",
                     key.workspace_id,
                     key.runtime_id,
                     key.thread_id
-                )
-            })?;
+                ));
+            }
         }
-        Ok(closed_count)
+        self.lifecycle.shutdown_finished().await;
+        first_error.map_or(Ok(closed_count), Err)
     }
 
     async fn remove_start_lock(&self, key: &CLIAgentRuntimeSessionKey) {
@@ -578,6 +1007,41 @@ fn normalize_key_part(value: String, label: &str) -> Result<String> {
     Ok(trimmed.to_owned())
 }
 
+fn validate_replacement_continuation(
+    old: &CliSessionLaunchSpec,
+    new: &CliSessionLaunchSpec,
+) -> Result<()> {
+    use crate::cli_runtime::continuation::CliProviderContinuation;
+    match (&old.continuation, &new.continuation) {
+        (
+            CliProviderContinuation::ClaudeNew {
+                provider_session_id: old_id,
+            }
+            | CliProviderContinuation::ClaudeResume {
+                provider_session_id: old_id,
+            },
+            CliProviderContinuation::ClaudeResume {
+                provider_session_id: new_id,
+            },
+        ) if old_id == new_id => Ok(()),
+        (
+            CliProviderContinuation::ClaudeNew { .. }
+            | CliProviderContinuation::ClaudeResume { .. },
+            CliProviderContinuation::ClaudeNew { .. },
+        ) => bail!("Claude process replacement requires spawn-time resume of the durable UUID"),
+        (
+            CliProviderContinuation::ClaudeNew { .. }
+            | CliProviderContinuation::ClaudeResume { .. },
+            CliProviderContinuation::ClaudeResume { .. },
+        ) => bail!("Claude process replacement cannot change the durable provider UUID"),
+        (
+            CliProviderContinuation::CodexRpcThread { .. },
+            CliProviderContinuation::CodexRpcThread { .. },
+        ) => Ok(()),
+        _ => bail!("CLI process replacement cannot change provider continuation kind"),
+    }
+}
+
 fn current_time_millis() -> u64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
@@ -588,15 +1052,29 @@ fn current_time_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        CLIAgentRuntimeManager, CLIAgentRuntimeSession, CLIAgentRuntimeSessionFactory,
-        CLIAgentRuntimeSessionKey, CLIAgentRuntimeSessionStartOptions,
+        CLIAgentRuntimeMachineRequestResponder, CLIAgentRuntimeManager, CLIAgentRuntimeSession,
+        CLIAgentRuntimeSessionFactory, CLIAgentRuntimeSessionKey,
+        CLIAgentRuntimeSessionStartOptions,
+    };
+    use crate::cli_runtime::claude_mcp::{
+        ClaudeMcpSessionLaunchProjection, build_claude_mcp_session_launch_projection,
+    };
+    use crate::cli_runtime::codex_mcp::{
+        CodexMcpSessionLaunchProjection, build_codex_mcp_session_launch_projection,
+    };
+    use crate::cli_runtime::continuation::{
+        CliMcpSessionLaunch, CliProviderContinuation, CliSessionLaunchSpec,
+    };
+    use crate::turn_mcp::projection::{
+        McpProjectionLimits, McpSelectionReason, ResolvedMcpTurnProjection, ResolvedMcpTurnTool,
     };
     use anyhow::Result;
     use async_trait::async_trait;
+    use serde_json::{Value as JsonValue, json};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
-    use tokio::sync::Notify;
+    use tokio::sync::{Mutex, Notify};
 
     #[derive(Default)]
     struct FakeFactory {
@@ -605,24 +1083,44 @@ mod tests {
         release: Option<Arc<Notify>>,
         close_started: Option<Arc<Notify>>,
         close_release: Option<Arc<Notify>>,
+        fail_after: Option<usize>,
+        fail_replacement_prepare: bool,
+        launch_specs: Arc<Mutex<Vec<CliSessionLaunchSpec>>>,
+        responses: Arc<Mutex<Vec<(usize, JsonValue, JsonValue)>>>,
+        replacement_events: Arc<Mutex<Vec<(usize, &'static str)>>>,
     }
 
     #[async_trait]
     impl CLIAgentRuntimeSessionFactory for FakeFactory {
         async fn start_session(
             &self,
-            _key: &CLIAgentRuntimeSessionKey,
+            _instance: &crate::cli_runtime::session_instance::CliSessionInstanceId,
         ) -> Result<Arc<dyn CLIAgentRuntimeSession>> {
             let id = self.starts.fetch_add(1, Ordering::SeqCst) + 1;
             if let Some(release) = self.release.as_ref() {
                 release.notified().await;
+            }
+            if self.fail_after.is_some_and(|maximum| id > maximum) {
+                anyhow::bail!("injected CLI session start failure");
             }
             Ok(Arc::new(FakeSession {
                 id,
                 closes: self.closes.clone(),
                 close_started: self.close_started.clone(),
                 close_release: self.close_release.clone(),
+                responses: self.responses.clone(),
+                replacement_events: self.replacement_events.clone(),
+                fail_replacement_prepare: self.fail_replacement_prepare,
             }))
+        }
+
+        async fn start_session_with_launch_spec(
+            &self,
+            instance: &crate::cli_runtime::session_instance::CliSessionInstanceId,
+            launch_spec: &CliSessionLaunchSpec,
+        ) -> Result<Arc<dyn CLIAgentRuntimeSession>> {
+            self.launch_specs.lock().await.push(launch_spec.clone());
+            self.start_session(instance).await
         }
     }
 
@@ -631,12 +1129,19 @@ mod tests {
         closes: Arc<AtomicUsize>,
         close_started: Option<Arc<Notify>>,
         close_release: Option<Arc<Notify>>,
+        responses: Arc<Mutex<Vec<(usize, JsonValue, JsonValue)>>>,
+        replacement_events: Arc<Mutex<Vec<(usize, &'static str)>>>,
+        fail_replacement_prepare: bool,
     }
 
     #[async_trait]
     impl CLIAgentRuntimeSession for FakeSession {
         async fn close(&self) -> Result<()> {
             let _ = self.id;
+            self.replacement_events
+                .lock()
+                .await
+                .push((self.id, "close"));
             self.closes.fetch_add(1, Ordering::SeqCst);
             if let Some(started) = self.close_started.as_ref() {
                 started.notify_one();
@@ -646,10 +1151,135 @@ mod tests {
             }
             Ok(())
         }
+
+        async fn prepare_for_replacement(&self) -> Result<()> {
+            self.replacement_events
+                .lock()
+                .await
+                .push((self.id, "prepare"));
+            if self.fail_replacement_prepare {
+                anyhow::bail!("injected non-terminal or unverified provider session");
+            }
+            Ok(())
+        }
+
+        async fn confirm_replacement_checkpoint(&self) -> Result<()> {
+            self.replacement_events
+                .lock()
+                .await
+                .push((self.id, "confirm"));
+            Ok(())
+        }
+
+        async fn respond_to_request(
+            &self,
+            native_request_id: JsonValue,
+            response: JsonValue,
+        ) -> Result<()> {
+            self.responses
+                .lock()
+                .await
+                .push((self.id, native_request_id, response));
+            Ok(())
+        }
     }
 
     fn key(thread_id: &str) -> CLIAgentRuntimeSessionKey {
         CLIAgentRuntimeSessionKey::new("ws", "codex", thread_id).expect("valid key")
+    }
+
+    fn codex_mcp_launch_projection(
+        turn_id: &str,
+        provider_contract_byte: char,
+    ) -> CodexMcpSessionLaunchProjection {
+        let mut projection = ResolvedMcpTurnProjection::empty("ws", turn_id);
+        projection.tools.push(ResolvedMcpTurnTool {
+            canonical_callable_name: String::new(),
+            workspace_id: "ws".to_owned(),
+            server_installation_id: "installation".to_owned(),
+            server_name: "server".to_owned(),
+            raw_tool_name: "tool".to_owned(),
+            description: Some("fixture".to_owned()),
+            input_schema: json!({"type": "object"}),
+            annotations: None,
+            timeout_ms: 20_000,
+            catalog_version: "catalog".to_owned(),
+            installation_fingerprint: "installation-fingerprint".to_owned(),
+            schema_fingerprint: String::new(),
+            runtime_generation: 1,
+            selection_reason: McpSelectionReason::ExplicitTool,
+            capability_id: Some("capability".to_owned()),
+        });
+        projection
+            .finalize_identity(McpProjectionLimits::default())
+            .expect("canonical projection");
+        build_codex_mcp_session_launch_projection(
+            projection,
+            provider_contract_byte.to_string().repeat(64),
+        )
+        .expect("Codex MCP launch projection")
+    }
+
+    fn codex_empty_mcp_launch_projection(
+        turn_id: &str,
+        provider_contract_byte: char,
+    ) -> CodexMcpSessionLaunchProjection {
+        let mut projection = ResolvedMcpTurnProjection::empty("ws", turn_id);
+        projection
+            .finalize_identity(McpProjectionLimits::default())
+            .expect("canonical empty projection");
+        build_codex_mcp_session_launch_projection(
+            projection,
+            provider_contract_byte.to_string().repeat(64),
+        )
+        .expect("empty Codex MCP launch projection")
+    }
+
+    fn claude_mcp_launch_projection(
+        turn_id: &str,
+        provider_contract_byte: char,
+    ) -> ClaudeMcpSessionLaunchProjection {
+        let mut projection = ResolvedMcpTurnProjection::empty("ws", turn_id);
+        projection.tools.push(ResolvedMcpTurnTool {
+            canonical_callable_name: String::new(),
+            workspace_id: "ws".to_owned(),
+            server_installation_id: "installation".to_owned(),
+            server_name: "server".to_owned(),
+            raw_tool_name: "tool".to_owned(),
+            description: Some("fixture".to_owned()),
+            input_schema: json!({"type": "object"}),
+            annotations: None,
+            timeout_ms: 20_000,
+            catalog_version: "catalog".to_owned(),
+            installation_fingerprint: "installation-fingerprint".to_owned(),
+            schema_fingerprint: String::new(),
+            runtime_generation: 1,
+            selection_reason: McpSelectionReason::ExplicitTool,
+            capability_id: Some("capability".to_owned()),
+        });
+        projection
+            .finalize_identity(McpProjectionLimits::default())
+            .expect("canonical projection");
+        build_claude_mcp_session_launch_projection(
+            projection,
+            provider_contract_byte.to_string().repeat(64),
+        )
+        .expect("Claude MCP launch projection")
+    }
+
+    fn claude_empty_mcp_launch_projection(
+        turn_id: &str,
+        provider_contract_byte: char,
+    ) -> ClaudeMcpSessionLaunchProjection {
+        let mut projection = ResolvedMcpTurnProjection::empty("ws", turn_id);
+        projection
+            .finalize_identity(McpProjectionLimits::default())
+            .expect("canonical empty projection");
+        build_claude_mcp_session_launch_projection(
+            projection,
+            provider_contract_byte.to_string().repeat(64),
+        )
+        .expect("empty Claude MCP launch projection")
     }
 
     fn manager_with_factory(factory: Arc<FakeFactory>) -> CLIAgentRuntimeManager {
@@ -682,6 +1312,8 @@ mod tests {
 
         assert!(first.ptr_eq(&second));
         assert_eq!(first.key(), &key);
+        assert_eq!(first.instance().generation(), 1);
+        assert_eq!(second.instance(), first.instance());
         assert_eq!(factory.starts.load(Ordering::SeqCst), 1);
         assert_eq!(manager.cached_started_at_ms(&key).await, Some(1_000));
         assert_eq!(manager.session_count().await, 1);
@@ -722,9 +1354,527 @@ mod tests {
 
         assert!(first.ptr_eq(&reused));
         assert!(!first.ptr_eq(&restarted));
+        assert!(restarted.instance().generation() > first.instance().generation());
         assert_eq!(factory.starts.load(Ordering::SeqCst), 2);
         assert_eq!(factory.closes.load(Ordering::SeqCst), 1);
         assert_eq!(manager.session_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn codex_mcp_restart_reuses_manifest_and_resumes_changed_manifest() {
+        let factory = Arc::new(FakeFactory::default());
+        let manager = manager_with_factory(factory.clone());
+        let key = key("mcp-semantic-session");
+        let options_a = CliSessionLaunchSpec::codex(
+            CLIAgentRuntimeSessionStartOptions::default(),
+            CliMcpSessionLaunch::Codex(codex_mcp_launch_projection("turn-a", 'a')),
+            None,
+        );
+        let options_b = CliSessionLaunchSpec::codex(
+            CLIAgentRuntimeSessionStartOptions::default(),
+            CliMcpSessionLaunch::Codex(codex_mcp_launch_projection("turn-b", 'a')),
+            Some("native-thread".to_owned()),
+        );
+        let changed_contract = CliSessionLaunchSpec::codex(
+            CLIAgentRuntimeSessionStartOptions::default(),
+            CliMcpSessionLaunch::Codex(codex_mcp_launch_projection("turn-c", 'b')),
+            Some("native-thread".to_owned()),
+        );
+
+        let first = manager
+            .get_or_start_with_launch_spec_at(key.clone(), options_a, 1_000)
+            .await
+            .expect("first semantic projection should start");
+        let reused = manager
+            .get_or_start_with_launch_spec_at(key.clone(), options_b, 1_100)
+            .await
+            .expect("same semantic projection should reuse");
+        let restarted = manager
+            .get_or_start_with_launch_spec_at(key, changed_contract, 1_200)
+            .await
+            .expect("changed semantic projection should restart");
+
+        assert!(first.ptr_eq(&reused));
+        assert!(!first.ptr_eq(&restarted));
+        assert_eq!(factory.starts.load(Ordering::SeqCst), 2);
+        assert_eq!(factory.closes.load(Ordering::SeqCst), 1);
+        let launches = factory.launch_specs.lock().await;
+        assert_eq!(launches.len(), 2);
+        assert!(matches!(
+            &launches[1].continuation,
+            CliProviderContinuation::CodexRpcThread {
+                native_thread_id: Some(native_thread_id)
+            } if native_thread_id == "native-thread"
+        ));
+    }
+
+    #[tokio::test]
+    async fn codex_manifest_transition_empty_nonempty_and_back_restarts() {
+        let factory = Arc::new(FakeFactory::default());
+        let manager = manager_with_factory(factory.clone());
+        let key = key("codex-manifest-transition");
+        let empty = |turn_id: &str| {
+            CliSessionLaunchSpec::codex(
+                CLIAgentRuntimeSessionStartOptions::default(),
+                CliMcpSessionLaunch::Codex(codex_empty_mcp_launch_projection(turn_id, 'a')),
+                Some("native-thread".to_owned()),
+            )
+        };
+        let non_empty = CliSessionLaunchSpec::codex(
+            CLIAgentRuntimeSessionStartOptions::default(),
+            CliMcpSessionLaunch::Codex(codex_mcp_launch_projection("turn-b", 'a')),
+            Some("native-thread".to_owned()),
+        );
+
+        let first = manager
+            .get_or_start_with_launch_spec_at(key.clone(), empty("turn-a"), 1_000)
+            .await
+            .unwrap();
+        let non_empty_handle = manager
+            .get_or_start_with_launch_spec_at(key.clone(), non_empty, 1_100)
+            .await
+            .unwrap();
+        let final_empty = manager
+            .get_or_start_with_launch_spec_at(key, empty("turn-c"), 1_200)
+            .await
+            .unwrap();
+
+        assert!(!first.ptr_eq(&non_empty_handle));
+        assert!(!non_empty_handle.ptr_eq(&final_empty));
+        assert_eq!(factory.starts.load(Ordering::SeqCst), 3);
+        assert_eq!(factory.closes.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn codex_mcp_restart_failure_never_falls_back_to_stale_generation() {
+        let factory = Arc::new(FakeFactory {
+            fail_after: Some(1),
+            ..FakeFactory::default()
+        });
+        let manager = manager_with_factory(factory.clone());
+        let key = key("restart-failure");
+        manager
+            .get_or_start_with_launch_spec(
+                key.clone(),
+                CliSessionLaunchSpec::codex(
+                    CLIAgentRuntimeSessionStartOptions::default(),
+                    CliMcpSessionLaunch::Codex(codex_mcp_launch_projection("turn-a", 'a')),
+                    None,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let failure = manager
+            .get_or_start_with_launch_spec(
+                key.clone(),
+                CliSessionLaunchSpec::codex(
+                    CLIAgentRuntimeSessionStartOptions::default(),
+                    CliMcpSessionLaunch::Codex(codex_mcp_launch_projection("turn-b", 'b')),
+                    Some("native-thread".to_owned()),
+                ),
+            )
+            .await;
+
+        assert!(failure.is_err());
+        assert!(manager.existing_session(&key).await.is_none());
+        assert_eq!(factory.closes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn claude_mcp_restart_reuses_unchanged_and_resumes_changed_manifest_in_order() {
+        let factory = Arc::new(FakeFactory::default());
+        let manager = manager_with_factory(factory.clone());
+        let key =
+            CLIAgentRuntimeSessionKey::new("ws", "claude", "claude-restart").expect("valid key");
+        let provider_session_id = uuid::Uuid::new_v4();
+        let first_spec = CliSessionLaunchSpec::claude_new(
+            CLIAgentRuntimeSessionStartOptions::default(),
+            CliMcpSessionLaunch::Claude(claude_mcp_launch_projection("turn-a", 'a')),
+            provider_session_id,
+        );
+        let unchanged = CliSessionLaunchSpec::claude_resume(
+            CLIAgentRuntimeSessionStartOptions::default(),
+            CliMcpSessionLaunch::Claude(claude_mcp_launch_projection("turn-b", 'a')),
+            provider_session_id,
+        );
+        let changed = CliSessionLaunchSpec::claude_resume(
+            CLIAgentRuntimeSessionStartOptions::default(),
+            CliMcpSessionLaunch::Claude(claude_mcp_launch_projection("turn-c", 'b')),
+            provider_session_id,
+        );
+
+        let first = manager
+            .get_or_start_with_launch_spec(key.clone(), first_spec)
+            .await
+            .expect("fresh Claude process");
+        let reused = manager
+            .get_or_start_with_launch_spec(key.clone(), unchanged)
+            .await
+            .expect("unchanged Claude launch must reuse");
+        let replacement = manager
+            .get_or_start_with_launch_spec(key, changed)
+            .await
+            .expect("changed Claude launch must resume");
+
+        assert!(first.ptr_eq(&reused));
+        assert!(!first.ptr_eq(&replacement));
+        assert_eq!(factory.starts.load(Ordering::SeqCst), 2);
+        assert_eq!(factory.closes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            factory.replacement_events.lock().await.as_slice(),
+            &[(1, "prepare"), (1, "close"), (1, "confirm")]
+        );
+        let launches = factory.launch_specs.lock().await;
+        assert_eq!(launches.len(), 2);
+        assert!(matches!(
+            launches[0].continuation,
+            CliProviderContinuation::ClaudeNew { provider_session_id: id } if id == provider_session_id
+        ));
+        assert!(matches!(
+            launches[1].continuation,
+            CliProviderContinuation::ClaudeResume { provider_session_id: id } if id == provider_session_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn claude_manifest_transition_empty_nonempty_and_back_always_restarts() {
+        let factory = Arc::new(FakeFactory::default());
+        let manager = manager_with_factory(factory.clone());
+        let key = CLIAgentRuntimeSessionKey::new("ws", "claude", "claude-empty-transition")
+            .expect("valid key");
+        let provider_session_id = uuid::Uuid::new_v4();
+        let empty = |turn_id: &str, fresh: bool| {
+            let mcp = CliMcpSessionLaunch::Claude(claude_empty_mcp_launch_projection(turn_id, 'a'));
+            if fresh {
+                CliSessionLaunchSpec::claude_new(
+                    CLIAgentRuntimeSessionStartOptions::default(),
+                    mcp,
+                    provider_session_id,
+                )
+            } else {
+                CliSessionLaunchSpec::claude_resume(
+                    CLIAgentRuntimeSessionStartOptions::default(),
+                    mcp,
+                    provider_session_id,
+                )
+            }
+        };
+        let non_empty = CliSessionLaunchSpec::claude_resume(
+            CLIAgentRuntimeSessionStartOptions::default(),
+            CliMcpSessionLaunch::Claude(claude_mcp_launch_projection("turn-b", 'a')),
+            provider_session_id,
+        );
+
+        let first = manager
+            .get_or_start_with_launch_spec(key.clone(), empty("turn-a", true))
+            .await
+            .unwrap();
+        let second = manager
+            .get_or_start_with_launch_spec(key.clone(), non_empty)
+            .await
+            .unwrap();
+        let third = manager
+            .get_or_start_with_launch_spec(key, empty("turn-c", false))
+            .await
+            .unwrap();
+
+        assert!(!first.ptr_eq(&second));
+        assert!(!second.ptr_eq(&third));
+        assert_eq!(factory.starts.load(Ordering::SeqCst), 3);
+        assert_eq!(factory.closes.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn claude_resume_rejection_never_falls_back_to_old_or_empty_conversation() {
+        let factory = Arc::new(FakeFactory {
+            fail_after: Some(1),
+            ..FakeFactory::default()
+        });
+        let manager = manager_with_factory(factory.clone());
+        let key = CLIAgentRuntimeSessionKey::new("ws", "claude", "claude-resume-rejected")
+            .expect("valid key");
+        let provider_session_id = uuid::Uuid::new_v4();
+        manager
+            .get_or_start_with_launch_spec(
+                key.clone(),
+                CliSessionLaunchSpec::claude_new(
+                    CLIAgentRuntimeSessionStartOptions::default(),
+                    CliMcpSessionLaunch::Claude(claude_mcp_launch_projection("turn-a", 'a')),
+                    provider_session_id,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let failure = manager
+            .get_or_start_with_launch_spec(
+                key.clone(),
+                CliSessionLaunchSpec::claude_resume(
+                    CLIAgentRuntimeSessionStartOptions::default(),
+                    CliMcpSessionLaunch::Claude(claude_mcp_launch_projection("turn-b", 'b')),
+                    provider_session_id,
+                ),
+            )
+            .await;
+
+        assert!(failure.is_err());
+        assert!(manager.existing_session(&key).await.is_none());
+        assert_eq!(factory.starts.load(Ordering::SeqCst), 2);
+        assert_eq!(factory.closes.load(Ordering::SeqCst), 1);
+        let launches = factory.launch_specs.lock().await;
+        assert_eq!(launches.len(), 2, "no untyped fallback launch is allowed");
+        assert!(matches!(
+            launches[1].continuation,
+            CliProviderContinuation::ClaudeResume { provider_session_id: id } if id == provider_session_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn claude_resume_waits_for_terminal_verified_replacement_barrier() {
+        let factory = Arc::new(FakeFactory {
+            fail_replacement_prepare: true,
+            ..FakeFactory::default()
+        });
+        let manager = manager_with_factory(factory.clone());
+        let key =
+            CLIAgentRuntimeSessionKey::new("ws", "claude", "claude-barrier").expect("valid key");
+        let provider_session_id = uuid::Uuid::new_v4();
+        let old = manager
+            .get_or_start_with_launch_spec(
+                key.clone(),
+                CliSessionLaunchSpec::claude_new(
+                    CLIAgentRuntimeSessionStartOptions::default(),
+                    CliMcpSessionLaunch::Claude(claude_mcp_launch_projection("turn-a", 'a')),
+                    provider_session_id,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let failure = manager
+            .get_or_start_with_launch_spec(
+                key.clone(),
+                CliSessionLaunchSpec::claude_resume(
+                    CLIAgentRuntimeSessionStartOptions::default(),
+                    CliMcpSessionLaunch::Claude(claude_mcp_launch_projection("turn-b", 'b')),
+                    provider_session_id,
+                ),
+            )
+            .await;
+
+        assert!(failure.is_err());
+        let still_current = manager.existing_session(&key).await.unwrap();
+        assert!(old.ptr_eq(&still_current));
+        assert_eq!(factory.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(factory.closes.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            factory.replacement_events.lock().await.as_slice(),
+            &[(1, "prepare")]
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_resume_rejects_changed_manifest_without_spawn_time_resume() {
+        let factory = Arc::new(FakeFactory::default());
+        let manager = manager_with_factory(factory.clone());
+        let key = CLIAgentRuntimeSessionKey::new("ws", "claude", "claude-resume-required")
+            .expect("valid key");
+        let provider_session_id = uuid::Uuid::new_v4();
+        let old = manager
+            .get_or_start_with_launch_spec(
+                key.clone(),
+                CliSessionLaunchSpec::claude_new(
+                    CLIAgentRuntimeSessionStartOptions::default(),
+                    CliMcpSessionLaunch::Claude(claude_mcp_launch_projection("turn-a", 'a')),
+                    provider_session_id,
+                ),
+            )
+            .await
+            .unwrap();
+        let rejected = manager
+            .get_or_start_with_launch_spec(
+                key.clone(),
+                CliSessionLaunchSpec::claude_new(
+                    CLIAgentRuntimeSessionStartOptions::default(),
+                    CliMcpSessionLaunch::Claude(claude_mcp_launch_projection("turn-b", 'b')),
+                    provider_session_id,
+                ),
+            )
+            .await;
+
+        assert!(rejected.is_err());
+        assert!(old.ptr_eq(&manager.existing_session(&key).await.unwrap()));
+        assert_eq!(factory.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(factory.closes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn claude_management_acquisition_never_clobbers_active_mcp_launch() {
+        let factory = Arc::new(FakeFactory::default());
+        let manager = manager_with_factory(factory.clone());
+        let key =
+            CLIAgentRuntimeSessionKey::new("ws", "claude", "claude-management").expect("valid key");
+        let provider_session_id = uuid::Uuid::new_v4();
+        let active = manager
+            .get_or_start_with_launch_spec(
+                key.clone(),
+                CliSessionLaunchSpec::claude_new(
+                    CLIAgentRuntimeSessionStartOptions::default(),
+                    CliMcpSessionLaunch::Claude(claude_mcp_launch_projection("turn-a", 'a')),
+                    provider_session_id,
+                ),
+            )
+            .await
+            .unwrap();
+        let management = manager
+            .existing_or_start_management(
+                key,
+                CLIAgentRuntimeSessionStartOptions {
+                    approval_policy: Some("management-defaults-must-not-replace".to_owned()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(active.ptr_eq(&management));
+        assert_eq!(factory.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(factory.closes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn management_and_fork_acquisition_never_clobbers_mcp_session() {
+        let factory = Arc::new(FakeFactory::default());
+        let manager = manager_with_factory(factory.clone());
+        let key = key("management-no-clobber");
+        let active = manager
+            .get_or_start_with_launch_spec(
+                key.clone(),
+                CliSessionLaunchSpec::codex(
+                    CLIAgentRuntimeSessionStartOptions::default(),
+                    CliMcpSessionLaunch::Codex(codex_mcp_launch_projection("turn-a", 'a')),
+                    Some("native-thread".to_owned()),
+                ),
+            )
+            .await
+            .unwrap();
+        let management = manager
+            .existing_or_start_management(
+                key,
+                CLIAgentRuntimeSessionStartOptions {
+                    approval_policy: Some("different-management-policy".to_owned()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(active.ptr_eq(&management));
+        assert_eq!(factory.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(factory.closes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn cli_runtime_generation_compare_and_swap_cannot_remove_replacement() {
+        let factory = Arc::new(FakeFactory::default());
+        let manager = manager_with_factory(factory);
+        let key = key("generation-cas");
+        let first = manager
+            .get_or_start_with_options(key.clone(), CLIAgentRuntimeSessionStartOptions::default())
+            .await
+            .unwrap();
+        let replacement = manager
+            .get_or_start_with_options(
+                key.clone(),
+                CLIAgentRuntimeSessionStartOptions {
+                    approval_policy: Some("never".to_owned()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(!manager.remove_if_generation(first.instance()).await);
+        let current = manager.existing_session(&key).await.unwrap();
+        assert_eq!(current.instance(), replacement.instance());
+        assert!(manager.remove_if_generation(replacement.instance()).await);
+        assert!(manager.existing_session(&key).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn cli_runtime_generation_origin_bound_responder_never_uses_replacement_process() {
+        let factory = Arc::new(FakeFactory::default());
+        let responses = factory.responses.clone();
+        let manager = manager_with_factory(factory);
+        let key = key("origin-responder");
+        let old = manager
+            .get_or_start_with_options(key.clone(), CLIAgentRuntimeSessionStartOptions::default())
+            .await
+            .unwrap();
+        let responder = CLIAgentRuntimeMachineRequestResponder::new(
+            old.instance().clone(),
+            json!(7),
+            old.session(),
+        );
+        let replacement = manager
+            .get_or_start_with_options(
+                key,
+                CLIAgentRuntimeSessionStartOptions {
+                    approval_policy: Some("never".to_owned()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        responder
+            .respond(json!({"decision": "cancel"}))
+            .await
+            .unwrap();
+        let responses = responses.lock().await;
+        assert_eq!(
+            responses.as_slice(),
+            &[(1, json!(7), json!({"decision": "cancel"}))]
+        );
+        assert_ne!(responder.instance(), replacement.instance());
+    }
+
+    #[tokio::test]
+    async fn stale_process_event_is_fenced_after_codex_and_claude_replacement() {
+        for runtime_id in ["codex", "claude"] {
+            let factory = Arc::new(FakeFactory::default());
+            let manager = manager_with_factory(factory);
+            let key = CLIAgentRuntimeSessionKey::new("ws", runtime_id, "replacement-race")
+                .expect("valid key");
+            let old = manager
+                .get_or_start_with_options(
+                    key.clone(),
+                    CLIAgentRuntimeSessionStartOptions::default(),
+                )
+                .await
+                .unwrap();
+            let replacement = manager
+                .get_or_start_with_options(
+                    key,
+                    CLIAgentRuntimeSessionStartOptions {
+                        approval_policy: Some("never".to_owned()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+
+            assert!(!manager.is_current_instance(old.instance()).await);
+            assert!(manager.is_current_instance(replacement.instance()).await);
+            assert!(
+                !manager
+                    .close_session_instance(old.instance())
+                    .await
+                    .unwrap()
+            );
+            assert!(manager.is_current_instance(replacement.instance()).await);
+        }
     }
 
     #[tokio::test]
@@ -751,7 +1901,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cli_runtime_manager_concurrent_same_key_starts_once() {
+    async fn cli_runtime_concurrency_same_key_starts_once() {
         let release = Arc::new(Notify::new());
         let factory = Arc::new(FakeFactory {
             release: Some(release.clone()),

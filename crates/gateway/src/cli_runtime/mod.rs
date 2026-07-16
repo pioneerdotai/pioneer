@@ -1,12 +1,17 @@
+pub(crate) mod claude_mcp;
 pub(crate) mod claude_session;
+pub(crate) mod codex_mcp;
 pub(crate) mod codex_session;
 pub(crate) mod command_heartbeat;
 pub(crate) mod config;
 pub(crate) mod context;
+pub(crate) mod continuation;
 pub(crate) mod input_mapping;
 pub(crate) mod manager;
+pub(crate) mod mcp;
 pub(crate) mod permissions;
 pub(crate) mod projector;
+pub(crate) mod session_instance;
 pub(crate) mod skills;
 pub(crate) mod thread_binding;
 pub(crate) mod turn_binding;

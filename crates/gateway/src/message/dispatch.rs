@@ -43,18 +43,10 @@ impl MessageProcessor {
         connection_id: ConnectionId,
         payload: &'a str,
     ) -> MessageFuture<'a, ()> {
-        self.process_request_inner(connection_id, payload)
-    }
-
-    fn process_request_inner<'a>(
-        &'a self,
-        connection_id: ConnectionId,
-        payload: &'a str,
-    ) -> MessageFuture<'a, ()> {
-        message_future(async move {
-            let request_value = match serde_json::from_str::<JsonValue>(payload) {
-                Ok(value) => value,
-                Err(_) => {
+        let request_value = match serde_json::from_str::<JsonValue>(payload) {
+            Ok(value) => value,
+            Err(_) => {
+                return message_future(async move {
                     self.send_error(
                         connection_id,
                         JsonRpcErrorResponse::new(
@@ -64,15 +56,15 @@ impl MessageProcessor {
                         ),
                     )
                     .await;
-                    return;
-                }
-            };
+                });
+            }
+        };
 
-            let request_id = parse_request_id(&request_value);
-
-            let request = match serde_json::from_value::<JsonRpcRequest>(request_value) {
-                Ok(request) => request,
-                Err(error) => {
+        let request_id = parse_request_id(&request_value);
+        let request = match serde_json::from_value::<JsonRpcRequest>(request_value) {
+            Ok(request) => request,
+            Err(error) => {
+                return message_future(async move {
                     self.send_error(
                         connection_id,
                         JsonRpcErrorResponse::new(
@@ -82,11 +74,12 @@ impl MessageProcessor {
                         ),
                     )
                     .await;
-                    return;
-                }
-            };
+                });
+            }
+        };
 
-            if request.jsonrpc != JSONRPC_VERSION {
+        if request.jsonrpc != JSONRPC_VERSION {
+            return message_future(async move {
                 self.send_error(
                     connection_id,
                     JsonRpcErrorResponse::new(
@@ -96,9 +89,47 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
-                return;
-            }
+            });
+        }
 
+        // Keep turn/start outside the monolithic async dispatcher. Polling the CLI runtime
+        // turn-start future from inside that dispatcher nests both state machines on one Tokio
+        // worker stack and can exceed the runtime's default stack before the turn is persisted.
+        if request.method == methods::TURN_START {
+            return self.dispatch_turn_start(connection_id, request);
+        }
+
+        self.process_request_inner(connection_id, request)
+    }
+
+    fn dispatch_turn_start<'a>(
+        &'a self,
+        connection_id: ConnectionId,
+        request: JsonRpcRequest,
+    ) -> MessageFuture<'a, ()> {
+        let params_value = request.params.unwrap_or_else(empty_object_value);
+        match serde_json::from_value::<TurnStartParams>(params_value) {
+            Ok(params) => self.turn_start(connection_id, request.id, params),
+            Err(error) => message_future(async move {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request.id),
+                        INVALID_PARAMS_CODE,
+                        format!("invalid params for `{}`: {error}", methods::TURN_START),
+                    ),
+                )
+                .await;
+            }),
+        }
+    }
+
+    fn process_request_inner<'a>(
+        &'a self,
+        connection_id: ConnectionId,
+        request: JsonRpcRequest,
+    ) -> MessageFuture<'a, ()> {
+        message_future(async move {
             match request.method.as_str() {
                 methods::WORKSPACE_LIST => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
@@ -777,28 +808,6 @@ impl MessageProcessor {
                                     format!(
                                         "invalid params for `{}`: {error}",
                                         methods::TURN_WORK_PAGE
-                                    ),
-                                ),
-                            )
-                            .await;
-                        }
-                    }
-                }
-                methods::TURN_START => {
-                    let params_value = request.params.unwrap_or_else(empty_object_value);
-                    match serde_json::from_value::<TurnStartParams>(params_value) {
-                        Ok(params) => {
-                            self.turn_start(connection_id, request.id, params).await;
-                        }
-                        Err(error) => {
-                            self.send_error(
-                                connection_id,
-                                JsonRpcErrorResponse::new(
-                                    Some(request.id),
-                                    INVALID_PARAMS_CODE,
-                                    format!(
-                                        "invalid params for `{}`: {error}",
-                                        methods::TURN_START
                                     ),
                                 ),
                             )

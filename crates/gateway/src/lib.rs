@@ -8,7 +8,11 @@ mod artifact_prompt_refs;
 mod attachment;
 mod auth;
 mod bootstrap;
+pub mod claude_mcp_conformance;
+#[doc(hidden)]
+pub mod cli_mcp_client_validation;
 mod cli_runtime;
+pub mod codex_mcp_conformance;
 mod database;
 mod helpers;
 mod hook_run_store;
@@ -35,6 +39,7 @@ mod thread_episodic_embedding;
 mod thread_episodic_hooks;
 mod tokenizer;
 mod transport;
+mod turn_mcp;
 mod turn_runtime_snapshot;
 mod turn_security;
 mod voice;
@@ -460,14 +465,13 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
 
     let task_runtime_config = task_runtime_config_from_gateway_tasks_config(&config.gateway.tasks);
 
-    let cli_runtime_manager = build_cli_runtime_manager(&runtime_home, &config)?;
-
     let thread_episodic_storage_root = config
         .gateway
         .memory
         .resolve_capsules_root(runtime_home.as_path())?;
     let thread_episodic_workspace_vector_search_configs =
         gateway_settings.workspace_thread_episodic_vector_search_configs();
+    let cli_runtime_crud_store = crud_store.clone();
 
     let mut message_processor = MessageProcessor::new_with_memory_runtime_and_task_config(
         thread_manager,
@@ -490,7 +494,21 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
             provider_stream_item_timeout: config.gateway.resilience.provider_stream_items,
             cli_runtime_command_heartbeat: config.gateway.cli_agent_runtime.command_heartbeat,
         },
+    )
+    .with_mcp_projection_limits(
+        config.gateway.cli_agent_runtime.mcp_tools.max_tools,
+        config
+            .gateway
+            .cli_agent_runtime
+            .mcp_tools
+            .max_total_schema_bytes,
     );
+    let cli_runtime_manager = build_cli_runtime_manager(
+        &runtime_home,
+        &config,
+        message_processor.cli_turn_mcp_invoker(),
+        cli_runtime_crud_store,
+    )?;
     if let Some(cli_runtime_manager) = cli_runtime_manager {
         message_processor = message_processor.with_cli_runtime_manager(cli_runtime_manager);
     }
@@ -552,6 +570,7 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
     message_processor.shutdown_remote_access_supervisor().await;
     handle.shutdown().await?;
     message_processor.shutdown_cli_runtime_manager().await;
+    message_processor.shutdown_mcp_service().await;
     database
         .close()
         .await
@@ -650,10 +669,14 @@ fn remote_access_desired_state(
 fn build_cli_runtime_manager(
     runtime_home: &Path,
     config: &AppConfig,
+    turn_mcp_invoker: Arc<dyn crate::turn_mcp::invoker::TurnMcpInvoker>,
+    crud_store: Arc<CrudStore>,
 ) -> Result<Option<Arc<crate::cli_runtime::manager::CLIAgentRuntimeManager>>> {
     crate::cli_runtime::codex_session::cli_runtime_manager(
         runtime_home.to_path_buf(),
         Duration::from_secs(config.gateway.cli_agent_runtime.idle_session_ttl_secs),
+        turn_mcp_invoker,
+        crud_store,
     )
     .map(Some)
 }

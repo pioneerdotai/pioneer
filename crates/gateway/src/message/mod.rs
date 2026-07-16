@@ -167,7 +167,7 @@ use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, warn};
 
 use crate::cli_runtime::command_heartbeat::CliRuntimeCommandHeartbeatTracker;
-use crate::cli_runtime::manager::{CLIAgentRuntimeManager, CLIAgentRuntimeSessionKey};
+use crate::cli_runtime::manager::{CLIAgentRuntimeMachineRequestResponder, CLIAgentRuntimeManager};
 use crate::cli_runtime::skills::{
     CliRuntimeSkillDestinationLocks, new_cli_runtime_skill_destination_locks,
 };
@@ -357,10 +357,11 @@ pub struct MessageProcessor {
         Arc<Mutex<HashMap<CLIRuntimePendingTurnEventKey, Vec<CLIRuntimePendingTurnEvent>>>>,
     cli_runtime_pending_turn_server_requests:
         Arc<Mutex<HashMap<CLIRuntimePendingTurnEventKey, Vec<CLIRuntimePendingTurnServerRequest>>>>,
+    cli_runtime_machine_requests: Arc<Mutex<CLIRuntimeMachineRequestRegistry>>,
     cli_runtime_proxy_cache: Arc<Mutex<HashMap<(String, String), Option<String>>>>,
     cli_runtime_pending_turn_activity_sequence: Arc<AtomicU64>,
     cli_runtime_event_hubs:
-        Arc<Mutex<HashMap<CLIAgentRuntimeSessionKey, Arc<ExecutionEventHub>>>>,
+        Arc<Mutex<HashMap<crate::cli_runtime::session_instance::CliSessionInstanceId, Arc<ExecutionEventHub>>>>,
     cli_runtime_turn_binding_cache:
         Arc<Mutex<HashMap<CLIRuntimeNativeTurnKey, pioneer_crud::CliRuntimeTurnBindingRecord>>>,
     cli_runtime_command_heartbeats: CliRuntimeCommandHeartbeatTracker,
@@ -425,6 +426,7 @@ struct CLIRuntimePendingTurnEventKey {
     workspace_id: String,
     runtime_id: String,
     thread_id: String,
+    session_generation: u64,
     native_thread_id: String,
     native_turn_id: String,
 }
@@ -434,6 +436,7 @@ struct CLIRuntimeNativeTurnKey {
     workspace_id: String,
     runtime_id: String,
     thread_id: String,
+    session_generation: u64,
     native_thread_id: String,
     native_turn_id: String,
 }
@@ -448,9 +451,30 @@ struct CLIRuntimePendingTurnEvent {
 #[derive(Clone, Debug)]
 struct CLIRuntimePendingTurnServerRequest {
     request: pioneer_cli_agent_runtime::codex::CodexJsonlRpcServerRequest,
+    responder: CLIAgentRuntimeMachineRequestResponder,
     event: RuntimeEvent,
     received_at_unix_ms: i64,
     received_sequence: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct CLIRuntimeMachineRequestKey {
+    instance: crate::cli_runtime::session_instance::CliSessionInstanceId,
+    provider_request_id_json: String,
+}
+
+#[derive(Clone, Debug)]
+struct CLIRuntimePendingMachineRequest {
+    pioneer_request_id: String,
+    method: String,
+    responder: CLIAgentRuntimeMachineRequestResponder,
+    registered_sequence: u64,
+}
+
+#[derive(Default)]
+struct CLIRuntimeMachineRequestRegistry {
+    by_lane: HashMap<CLIRuntimeMachineRequestKey, CLIRuntimePendingMachineRequest>,
+    by_pioneer_request_id: HashMap<String, CLIRuntimeMachineRequestKey>,
 }
 
 struct PendingNativePermissionApprovalRequest {
@@ -631,6 +655,9 @@ impl MessageProcessor {
             parent_timeline_targets: Arc::new(Mutex::new(HashMap::new())),
             cli_runtime_pending_turn_events: Arc::new(Mutex::new(HashMap::new())),
             cli_runtime_pending_turn_server_requests: Arc::new(Mutex::new(HashMap::new())),
+            cli_runtime_machine_requests: Arc::new(Mutex::new(
+                CLIRuntimeMachineRequestRegistry::default(),
+            )),
             cli_runtime_proxy_cache: Arc::new(Mutex::new(HashMap::new())),
             cli_runtime_pending_turn_activity_sequence: Arc::new(AtomicU64::new(0)),
             cli_runtime_event_hubs: Arc::new(Mutex::new(HashMap::new())),
@@ -830,6 +857,10 @@ impl MessageProcessor {
         }
     }
 
+    pub async fn shutdown_mcp_service(&self) {
+        self.mcp_service.shutdown().await;
+    }
+
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn cli_runtime_manager_enabled(&self) -> bool {
@@ -838,6 +869,20 @@ impl MessageProcessor {
 
     pub(crate) fn with_cli_runtime_manager(mut self, manager: Arc<CLIAgentRuntimeManager>) -> Self {
         self.cli_runtime_manager = Some(manager);
+        self
+    }
+
+    pub(crate) fn cli_turn_mcp_invoker(&self) -> Arc<dyn crate::turn_mcp::invoker::TurnMcpInvoker> {
+        Arc::new(self.mcp_service.turn_mcp_invoker())
+    }
+
+    pub(crate) fn with_mcp_projection_limits(
+        self,
+        max_tools: usize,
+        max_total_schema_bytes: usize,
+    ) -> Self {
+        self.mcp_service
+            .configure_projection_limits(max_tools, max_total_schema_bytes);
         self
     }
 
@@ -930,8 +975,12 @@ impl MessageProcessor {
 
         let (broker, mut request_rx) =
             crate::permissions::GatewayPermissionApprovalBroker::channel();
+        let broker = Arc::new(broker);
         self.agent_manager
-            .set_permission_approval_broker(Arc::new(broker))
+            .set_permission_approval_broker(broker.clone())
+            .await;
+        self.mcp_service
+            .set_permission_approval_broker(broker)
             .await;
 
         let processor = Arc::downgrade(self);
@@ -1312,27 +1361,30 @@ impl MessageProcessor {
 
     async fn update_cli_runtime_command_item_registry(
         &self,
-        key: &CLIAgentRuntimeSessionKey,
+        instance: &crate::cli_runtime::session_instance::CliSessionInstanceId,
         turn_binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
         event: &RuntimeEvent,
     ) {
         self.cli_runtime_command_heartbeats
-            .update_from_runtime_event(key, turn_binding, event, now_timestamp_secs())
+            .update_from_runtime_event(instance, turn_binding, event, now_timestamp_secs())
             .await;
     }
 
     #[cfg(test)]
-    async fn register_cli_runtime_command_item(
+    async fn register_cli_runtime_command_item<
+        O: crate::cli_runtime::session_instance::CliSessionInstanceOrigin + ?Sized,
+    >(
         &self,
-        key: &CLIAgentRuntimeSessionKey,
+        origin: &O,
         turn_binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
         item_id: &str,
         native_thread_id: Option<String>,
         native_turn_id: String,
     ) {
+        let instance = origin.to_session_instance();
         self.cli_runtime_command_heartbeats
             .register(
-                key,
+                &instance,
                 turn_binding,
                 item_id,
                 native_thread_id,
@@ -1342,9 +1394,12 @@ impl MessageProcessor {
             .await;
     }
 
-    async fn remove_cli_runtime_command_items_for_session(&self, key: &CLIAgentRuntimeSessionKey) {
+    async fn remove_cli_runtime_command_items_for_session(
+        &self,
+        instance: &crate::cli_runtime::session_instance::CliSessionInstanceId,
+    ) {
         self.cli_runtime_command_heartbeats
-            .remove_session(key)
+            .remove_session(instance)
             .await;
     }
 
@@ -2214,6 +2269,9 @@ impl MessageProcessor {
             parent_timeline_targets: Arc::new(Mutex::new(HashMap::new())),
             cli_runtime_pending_turn_events: Arc::new(Mutex::new(HashMap::new())),
             cli_runtime_pending_turn_server_requests: Arc::new(Mutex::new(HashMap::new())),
+            cli_runtime_machine_requests: Arc::new(Mutex::new(
+                CLIRuntimeMachineRequestRegistry::default(),
+            )),
             cli_runtime_proxy_cache: Arc::new(Mutex::new(HashMap::new())),
             cli_runtime_pending_turn_activity_sequence: Arc::new(AtomicU64::new(0)),
             cli_runtime_event_hubs: Arc::new(Mutex::new(HashMap::new())),

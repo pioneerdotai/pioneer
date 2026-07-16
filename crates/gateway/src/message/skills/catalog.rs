@@ -111,6 +111,7 @@ mod cli_runtime_resolver_tests {
         catalog: &SkillCatalogSnapshot,
         attachments: &[crate::cli_runtime::skills::CliRuntimeSkillAttachment],
         policy_set: &SkillPolicySet,
+        mcp_availability: &pioneer_agent::AgentMcpAvailability,
     ) -> anyhow::Result<Vec<pioneer_skills::ResolvedSkill>> {
         let refs = attachments
             .iter()
@@ -121,13 +122,18 @@ mod cli_runtime_resolver_tests {
                 source_kind: attachment.claimed_source_kind.clone(),
             })
             .collect::<Vec<_>>();
+        let dependency_input = DependencyCheckInput {
+            available_mcp: mcp_availability.available_mcp.clone(),
+            blocked_mcp: mcp_availability.blocked_mcp.clone(),
+            ..DependencyCheckInput::baseline()
+        };
         let resolution = resolve_skills(SkillResolutionInput {
             explicit_refs: &refs,
             touched_paths: &[],
             catalog,
             policy_set,
             validation_policy: SkillValidationPolicy::default(),
-            dependency_input: &DependencyCheckInput::baseline(),
+            dependency_input: &dependency_input,
         });
         ordered_cli_runtime_explicit_skills(attachments, &refs, catalog, &resolution)
     }
@@ -146,7 +152,13 @@ mod cli_runtime_resolver_tests {
             attachment("z", "zeta", "registry"),
             attachment("a", "alpha", "user"),
         ];
-        let resolved = resolve_for(&catalog, &attachments, &SkillPolicySet::default()).unwrap();
+        let resolved = resolve_for(
+            &catalog,
+            &attachments,
+            &SkillPolicySet::default(),
+            &pioneer_agent::AgentMcpAvailability::default(),
+        )
+        .unwrap();
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0].definition.identity.slug, "zeta");
         assert_eq!(resolved[1].definition.identity.slug, "alpha");
@@ -164,10 +176,15 @@ mod cli_runtime_resolver_tests {
             vec![attachment("missing", "missing", "user")],
         ] {
             assert!(
-                resolve_for(&catalog, &attachments, &SkillPolicySet::default())
-                    .unwrap_err()
-                    .to_string()
-                    .contains("cli_runtime.skill_resolve_failed")
+                resolve_for(
+                    &catalog,
+                    &attachments,
+                    &SkillPolicySet::default(),
+                    &pioneer_agent::AgentMcpAvailability::default(),
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("cli_runtime.skill_resolve_failed")
             );
         }
 
@@ -183,10 +200,56 @@ mod cli_runtime_resolver_tests {
             &catalog,
             &[attachment("disabled", "alpha", "user")],
             &policy_set,
+            &pioneer_agent::AgentMcpAvailability::default(),
         )
         .unwrap_err()
         .to_string();
         assert!(error.contains("disabled_by_policy"));
+    }
+
+    #[test]
+    fn cli_runtime_skill_dependency_uses_exact_projected_mcp_snapshot() {
+        let mut dependent = definition("mcp-dependent", SkillSourceKind::User);
+        dependent.dependencies = pioneer_skills::compile::SkillDependencySet {
+            mcp: vec!["resend/send".to_owned()],
+            ..pioneer_skills::compile::SkillDependencySet::default()
+        };
+        let catalog = SkillCatalogSnapshot {
+            version: 1,
+            generated_at_unix: 1,
+            skills: vec![dependent],
+        };
+        let attachments = [attachment("dependent", "mcp-dependent", "user")];
+
+        let projected = pioneer_agent::AgentMcpAvailability {
+            available_mcp: vec!["resend/send".to_owned()],
+            blocked_mcp: Vec::new(),
+        };
+        let resolved = resolve_for(
+            &catalog,
+            &attachments,
+            &SkillPolicySet::default(),
+            &projected,
+        )
+        .expect("an exact projected tool must satisfy the skill dependency");
+        assert_eq!(resolved.len(), 1);
+
+        let wider_workspace_but_unprojected = pioneer_agent::AgentMcpAvailability {
+            available_mcp: vec!["resend/domains".to_owned()],
+            blocked_mcp: Vec::new(),
+        };
+        let error = resolve_for(
+            &catalog,
+            &attachments,
+            &SkillPolicySet::default(),
+            &wider_workspace_but_unprojected,
+        )
+        .expect_err("a workspace tool outside the projection must not satisfy the dependency")
+        .to_string();
+        assert!(
+            error.contains("dependency_missing"),
+            "unexpected error: {error}"
+        );
     }
 }
 
@@ -195,6 +258,7 @@ impl MessageProcessor {
         &self,
         workspace_id: &str,
         attachments: &[crate::cli_runtime::skills::CliRuntimeSkillAttachment],
+        mcp_availability: &pioneer_agent::AgentMcpAvailability,
     ) -> anyhow::Result<Vec<pioneer_skills::ResolvedSkill>> {
         if attachments.is_empty() {
             return Ok(Vec::new());
@@ -219,13 +283,18 @@ impl MessageProcessor {
                 source_kind: attachment.claimed_source_kind.clone(),
             })
             .collect::<Vec<_>>();
+        let dependency_input = DependencyCheckInput {
+            available_mcp: mcp_availability.available_mcp.clone(),
+            blocked_mcp: mcp_availability.blocked_mcp.clone(),
+            ..DependencyCheckInput::baseline()
+        };
         let resolution = resolve_skills(SkillResolutionInput {
             explicit_refs: explicit_refs.as_slice(),
             touched_paths: &[],
             catalog: &catalog,
             policy_set: &policy_set,
             validation_policy: context.validation_policy,
-            dependency_input: &DependencyCheckInput::baseline(),
+            dependency_input: &dependency_input,
         });
 
         ordered_cli_runtime_explicit_skills(attachments, &explicit_refs, &catalog, &resolution)

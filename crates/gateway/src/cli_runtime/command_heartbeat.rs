@@ -1,4 +1,4 @@
-use crate::cli_runtime::manager::CLIAgentRuntimeSessionKey;
+use crate::cli_runtime::session_instance::CliSessionInstanceId;
 use crate::cli_runtime::turn_binding::{
     CLI_RUNTIME_TURN_STATUS_RUNNING, CLI_RUNTIME_TURN_STATUS_STARTING,
 };
@@ -13,6 +13,7 @@ pub(crate) struct CliRuntimeCommandHeartbeatKey {
     pub(crate) workspace_id: String,
     pub(crate) runtime_id: String,
     pub(crate) thread_id: String,
+    pub(crate) session_generation: u64,
     pub(crate) turn_id: String,
     pub(crate) item_id: String,
 }
@@ -73,7 +74,7 @@ impl CliRuntimeCommandHeartbeatTracker {
 
     pub(crate) async fn update_from_runtime_event(
         &self,
-        key: &CLIAgentRuntimeSessionKey,
+        instance: &CliSessionInstanceId,
         turn_binding: &CliRuntimeTurnBindingRecord,
         event: &RuntimeEvent,
         now_unix: i64,
@@ -83,7 +84,7 @@ impl CliRuntimeCommandHeartbeatTracker {
                 if is_command_execution_kind(started.item_kind.as_str()) =>
             {
                 self.register(
-                    key,
+                    instance,
                     turn_binding,
                     started.native_item_id.as_str(),
                     started.native_thread_id.clone(),
@@ -96,14 +97,15 @@ impl CliRuntimeCommandHeartbeatTracker {
                 if is_command_execution_kind(completed.item_kind.as_str()) =>
             {
                 self.remove_item(
-                    key,
+                    instance,
                     turn_binding.turn_id.as_str(),
                     completed.native_item_id.as_str(),
                 )
                 .await;
             }
             _ if event.turn_terminal_kind().is_some() => {
-                self.remove_turn(turn_binding.turn_id.as_str()).await;
+                self.remove_turn(instance, turn_binding.turn_id.as_str())
+                    .await;
             }
             _ => {}
         }
@@ -111,7 +113,7 @@ impl CliRuntimeCommandHeartbeatTracker {
 
     pub(crate) async fn register(
         &self,
-        key: &CLIAgentRuntimeSessionKey,
+        instance: &CliSessionInstanceId,
         turn_binding: &CliRuntimeTurnBindingRecord,
         item_id: &str,
         native_thread_id: Option<String>,
@@ -120,9 +122,10 @@ impl CliRuntimeCommandHeartbeatTracker {
     ) {
         self.active.lock().await.insert(
             CliRuntimeCommandHeartbeatKey {
-                workspace_id: key.workspace_id.clone(),
-                runtime_id: key.runtime_id.clone(),
-                thread_id: key.thread_id.clone(),
+                workspace_id: instance.key().workspace_id.clone(),
+                runtime_id: instance.key().runtime_id.clone(),
+                thread_id: instance.key().thread_id.clone(),
+                session_generation: instance.generation(),
                 turn_id: turn_binding.turn_id.clone(),
                 item_id: item_id.to_owned(),
             },
@@ -137,7 +140,7 @@ impl CliRuntimeCommandHeartbeatTracker {
 
     pub(crate) async fn remove_item(
         &self,
-        key: &CLIAgentRuntimeSessionKey,
+        instance: &CliSessionInstanceId,
         turn_id: &str,
         item_id: &str,
     ) {
@@ -145,26 +148,31 @@ impl CliRuntimeCommandHeartbeatTracker {
             .lock()
             .await
             .remove(&CliRuntimeCommandHeartbeatKey {
-                workspace_id: key.workspace_id.clone(),
-                runtime_id: key.runtime_id.clone(),
-                thread_id: key.thread_id.clone(),
+                workspace_id: instance.key().workspace_id.clone(),
+                runtime_id: instance.key().runtime_id.clone(),
+                thread_id: instance.key().thread_id.clone(),
+                session_generation: instance.generation(),
                 turn_id: turn_id.to_owned(),
                 item_id: item_id.to_owned(),
             });
     }
 
-    pub(crate) async fn remove_turn(&self, turn_id: &str) {
-        self.active
-            .lock()
-            .await
-            .retain(|key, _| key.turn_id != turn_id);
+    pub(crate) async fn remove_turn(&self, instance: &CliSessionInstanceId, turn_id: &str) {
+        self.active.lock().await.retain(|key, _| {
+            key.turn_id != turn_id
+                || key.workspace_id != instance.key().workspace_id
+                || key.runtime_id != instance.key().runtime_id
+                || key.thread_id != instance.key().thread_id
+                || key.session_generation != instance.generation()
+        });
     }
 
-    pub(crate) async fn remove_session(&self, key: &CLIAgentRuntimeSessionKey) {
+    pub(crate) async fn remove_session(&self, instance: &CliSessionInstanceId) {
         self.active.lock().await.retain(|item_key, _| {
-            item_key.workspace_id != key.workspace_id
-                || item_key.runtime_id != key.runtime_id
-                || item_key.thread_id != key.thread_id
+            item_key.workspace_id != instance.key().workspace_id
+                || item_key.runtime_id != instance.key().runtime_id
+                || item_key.thread_id != instance.key().thread_id
+                || item_key.session_generation != instance.generation()
         });
     }
 
@@ -238,9 +246,17 @@ mod tests {
             .fixed_offset()
     }
 
-    fn session_key() -> CLIAgentRuntimeSessionKey {
-        CLIAgentRuntimeSessionKey::new("workspace", "codex", "thread")
-            .expect("session key should build")
+    fn session_instance() -> CliSessionInstanceId {
+        CliSessionInstanceId::unmanaged_for_test(
+            crate::cli_runtime::manager::CLIAgentRuntimeSessionKey::new(
+                "workspace",
+                "codex",
+                "thread",
+            )
+            .expect("session key should build"),
+            1,
+        )
+        .unwrap()
     }
 
     fn turn_binding(status: &str) -> CliRuntimeTurnBindingRecord {
@@ -259,6 +275,7 @@ mod tests {
             sandbox_json: None,
             approval_policy: None,
             input_mapping_json: "{}".to_owned(),
+            mcp: None,
             created_at: timestamp(),
             updated_at: timestamp(),
         }
@@ -267,11 +284,11 @@ mod tests {
     #[tokio::test]
     async fn due_items_do_not_advance_heartbeat_until_success() {
         let tracker = CliRuntimeCommandHeartbeatTracker::new(60);
-        let key = session_key();
+        let instance = session_instance();
         let binding = turn_binding(CLI_RUNTIME_TURN_STATUS_RUNNING);
         tracker
             .register(
-                &key,
+                &instance,
                 &binding,
                 "item",
                 Some("native-thread".to_owned()),
@@ -292,11 +309,11 @@ mod tests {
     #[tokio::test]
     async fn failed_attempt_delays_retry_without_marking_heartbeat_success() {
         let tracker = CliRuntimeCommandHeartbeatTracker::new(60);
-        let key = session_key();
+        let instance = session_instance();
         let binding = turn_binding(CLI_RUNTIME_TURN_STATUS_RUNNING);
         tracker
             .register(
-                &key,
+                &instance,
                 &binding,
                 "item",
                 Some("native-thread".to_owned()),
@@ -316,11 +333,11 @@ mod tests {
     #[tokio::test]
     async fn retrying_turn_keeps_command_heartbeat_active() {
         let tracker = CliRuntimeCommandHeartbeatTracker::new(60);
-        let key = session_key();
+        let instance = session_instance();
         let binding = turn_binding(CLI_RUNTIME_TURN_STATUS_RUNNING);
         tracker
             .register(
-                &key,
+                &instance,
                 &binding,
                 "item",
                 Some("native-thread".to_owned()),
@@ -331,7 +348,7 @@ mod tests {
 
         tracker
             .update_from_runtime_event(
-                &key,
+                &instance,
                 &binding,
                 &RuntimeEvent::TurnRetrying(RuntimeTurnRetrying {
                     native_thread_id: Some("native-thread".to_owned()),
@@ -345,7 +362,7 @@ mod tests {
             .await;
         tracker
             .update_from_runtime_event(
-                &key,
+                &instance,
                 &binding,
                 &RuntimeEvent::Error(RuntimeErrorEvent {
                     native_thread_id: Some("native-thread".to_owned()),

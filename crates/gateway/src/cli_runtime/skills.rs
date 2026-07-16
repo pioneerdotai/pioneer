@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use pioneer_agent::{AgentMcpServerRef, AgentMcpToolRef};
 use pioneer_protocol::{TurnCapability, TurnCapabilityKind, TurnSkillBinding};
 use pioneer_skills::{
     ExternalRuntimeSkillReceiptEntry, compute_skill_folder_hash, external_runtime_skill_is_current,
@@ -17,8 +18,6 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 pub(crate) type CliRuntimeSkillDestinationLocks = Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>;
 
-const CLI_RUNTIME_UNSUPPORTED_CAPABILITY_MESSAGE: &str =
-    "CLI runtime providers do not support skills, MCP capabilities, or tool attachments";
 pub(crate) const CLI_RUNTIME_SYSTEM_SKILL_NOT_EXPORTABLE: &str =
     "cli_runtime.system_skill_not_exportable";
 pub(crate) const CLI_RUNTIME_CLAUDE_SKILL_NOT_MODEL_INVOCABLE: &str =
@@ -182,35 +181,82 @@ pub(crate) struct CliRuntimeSkillAttachment {
     pub claimed_source_kind: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum CliRuntimeSkillCapabilityPartition {
-    NoSkills,
-    Skills(Vec<CliRuntimeSkillAttachment>),
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CliRuntimeCapabilityPartition {
+    pub(crate) skills: Vec<CliRuntimeSkillAttachment>,
+    pub(crate) mcp_servers: Vec<AgentMcpServerRef>,
+    pub(crate) mcp_tools: Vec<AgentMcpToolRef>,
 }
 
-pub(crate) fn partition_cli_runtime_skill_capabilities(
-    capabilities: &[TurnCapability],
-) -> std::result::Result<CliRuntimeSkillCapabilityPartition, String> {
-    if capabilities.is_empty() {
-        return Ok(CliRuntimeSkillCapabilityPartition::NoSkills);
+impl CliRuntimeCapabilityPartition {
+    pub(crate) fn has_mcp(&self) -> bool {
+        !self.mcp_servers.is_empty() || !self.mcp_tools.is_empty()
     }
-    let mut skills = Vec::with_capacity(capabilities.len());
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CliRuntimeCombinedPreflightInput {
+    pub(crate) capabilities: CliRuntimeCapabilityPartition,
+    pub(crate) mcp_projection: Option<crate::turn_mcp::ResolvedMcpTurnProjection>,
+}
+
+impl CliRuntimeCombinedPreflightInput {
+    pub(crate) fn exact_mcp_availability(&self) -> pioneer_agent::AgentMcpAvailability {
+        self.mcp_projection
+            .as_ref()
+            .map(|projection| pioneer_agent::AgentMcpAvailability {
+                available_mcp: projection.available_mcp.clone(),
+                blocked_mcp: projection.blocked_mcp.clone(),
+            })
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CliRuntimeCombinedPreflightPlan {
+    pub(crate) mcp_projection: Option<crate::turn_mcp::ResolvedMcpTurnProjection>,
+    pub(crate) skill_install_plans: Vec<CliRuntimeSkillInstallPlan>,
+    pub(crate) skill_bindings: Vec<TurnSkillBinding>,
+}
+
+pub(crate) fn partition_cli_runtime_capabilities(
+    capabilities: &[TurnCapability],
+) -> CliRuntimeCapabilityPartition {
+    let mut partition = CliRuntimeCapabilityPartition::default();
     for capability in capabilities {
         match &capability.kind {
             TurnCapabilityKind::Skill { slug, source_kind } => {
-                skills.push(CliRuntimeSkillAttachment {
+                partition.skills.push(CliRuntimeSkillAttachment {
                     capability_id: capability.id.clone(),
                     label: capability.label.clone(),
                     slug: slug.clone(),
                     claimed_source_kind: source_kind.clone(),
                 });
             }
-            TurnCapabilityKind::McpServer { .. } | TurnCapabilityKind::McpTool { .. } => {
-                return Err(CLI_RUNTIME_UNSUPPORTED_CAPABILITY_MESSAGE.to_owned());
+            TurnCapabilityKind::McpServer { name, scope_kind } => {
+                partition.mcp_servers.push(AgentMcpServerRef {
+                    capability_id: capability.id.clone(),
+                    label: capability.label.clone(),
+                    name: name.clone(),
+                    scope_kind: *scope_kind,
+                });
+            }
+            TurnCapabilityKind::McpTool {
+                server_name,
+                raw_tool_name,
+                scope_kind,
+            } => {
+                partition.mcp_tools.push(AgentMcpToolRef {
+                    capability_id: capability.id.clone(),
+                    label: capability.label.clone(),
+                    server_name: server_name.clone(),
+                    raw_tool_name: raw_tool_name.clone(),
+                    scope_kind: *scope_kind,
+                });
             }
         }
     }
-    Ok(CliRuntimeSkillCapabilityPartition::Skills(skills))
+    partition
 }
 
 pub(crate) fn new_cli_runtime_skill_destination_locks() -> CliRuntimeSkillDestinationLocks {
@@ -558,36 +604,39 @@ mod tests {
     }
 
     #[test]
-    fn cli_runtime_capability_partition_preserves_skills_and_empty_fast_path() {
+    fn combined_cli_preflight_partition_preserves_skills_and_empty_fast_path() {
         assert_eq!(
-            partition_cli_runtime_skill_capabilities(&[]).unwrap(),
-            CliRuntimeSkillCapabilityPartition::NoSkills
+            partition_cli_runtime_capabilities(&[]),
+            CliRuntimeCapabilityPartition::default()
         );
         let input = [
             skill_capability("one", "registry/one", "registry"),
             skill_capability("two", "two", "user"),
         ];
         assert_eq!(
-            partition_cli_runtime_skill_capabilities(&input).unwrap(),
-            CliRuntimeSkillCapabilityPartition::Skills(vec![
-                CliRuntimeSkillAttachment {
-                    capability_id: "one".to_owned(),
-                    label: Some("label-one".to_owned()),
-                    slug: "registry/one".to_owned(),
-                    claimed_source_kind: "registry".to_owned(),
-                },
-                CliRuntimeSkillAttachment {
-                    capability_id: "two".to_owned(),
-                    label: Some("label-two".to_owned()),
-                    slug: "two".to_owned(),
-                    claimed_source_kind: "user".to_owned(),
-                },
-            ])
+            partition_cli_runtime_capabilities(&input),
+            CliRuntimeCapabilityPartition {
+                skills: vec![
+                    CliRuntimeSkillAttachment {
+                        capability_id: "one".to_owned(),
+                        label: Some("label-one".to_owned()),
+                        slug: "registry/one".to_owned(),
+                        claimed_source_kind: "registry".to_owned(),
+                    },
+                    CliRuntimeSkillAttachment {
+                        capability_id: "two".to_owned(),
+                        label: Some("label-two".to_owned()),
+                        slug: "two".to_owned(),
+                        claimed_source_kind: "user".to_owned(),
+                    },
+                ],
+                ..CliRuntimeCapabilityPartition::default()
+            }
         );
     }
 
     #[test]
-    fn cli_runtime_capability_partition_rejects_mcp_only_and_mixed() {
+    fn combined_cli_preflight_partition_preserves_mcp_only_and_mixed() {
         use pioneer_protocol::McpScopeKind;
 
         let server = TurnCapability {
@@ -607,16 +656,27 @@ mod tests {
             },
             label: None,
         };
-        for capabilities in [
-            vec![server.clone()],
-            vec![tool],
-            vec![skill_capability("one", "one", "user"), server],
-        ] {
-            assert_eq!(
-                partition_cli_runtime_skill_capabilities(&capabilities).unwrap_err(),
-                CLI_RUNTIME_UNSUPPORTED_CAPABILITY_MESSAGE
-            );
-        }
+        let server_only = partition_cli_runtime_capabilities(std::slice::from_ref(&server));
+        assert!(server_only.skills.is_empty());
+        assert_eq!(server_only.mcp_servers.len(), 1);
+        assert!(server_only.mcp_tools.is_empty());
+        assert!(server_only.has_mcp());
+
+        let tool_only = partition_cli_runtime_capabilities(std::slice::from_ref(&tool));
+        assert!(tool_only.skills.is_empty());
+        assert!(tool_only.mcp_servers.is_empty());
+        assert_eq!(tool_only.mcp_tools.len(), 1);
+        assert!(tool_only.has_mcp());
+
+        let mixed = partition_cli_runtime_capabilities(&[
+            skill_capability("one", "one", "user"),
+            server,
+            tool,
+        ]);
+        assert_eq!(mixed.skills.len(), 1);
+        assert_eq!(mixed.mcp_servers.len(), 1);
+        assert_eq!(mixed.mcp_tools.len(), 1);
+        assert!(mixed.has_mcp());
     }
 
     #[test]
@@ -762,9 +822,9 @@ mod tests {
     }
 
     #[test]
-    fn cli_runtime_skill_destination_plan_expands_tilde_and_rejects_batch_collision() {
+    fn combined_cli_preflight_skill_collision_with_mcp_is_side_effect_free() {
         use pioneer_config::GatewayCliAgentRuntimeKindConfig;
-        use pioneer_protocol::CLIAgentRuntimeKind;
+        use pioneer_protocol::{CLIAgentRuntimeKind, McpScopeKind};
 
         let home = PathBuf::from(std::env::var_os("HOME").expect("HOME"));
         let runtime = runtime_instance(
@@ -790,6 +850,21 @@ mod tests {
         first.definition.identity.name = "Same Skill".to_owned();
         let mut second = resolved_skill("second", SkillSourceKind::Registry);
         second.definition.identity.name = "same@skill".to_owned();
+        let partition = partition_cli_runtime_capabilities(&[
+            skill_capability("first", "first", "user"),
+            skill_capability("second", "second", "registry"),
+            TurnCapability {
+                id: "mcp-tool:workspace:resend:send".to_owned(),
+                kind: TurnCapabilityKind::McpTool {
+                    server_name: "resend".to_owned(),
+                    raw_tool_name: "send".to_owned(),
+                    scope_kind: McpScopeKind::Workspace,
+                },
+                label: Some("resend/send".to_owned()),
+            },
+        ]);
+        assert_eq!(partition.skills.len(), 2);
+        assert_eq!(partition.mcp_tools.len(), 1);
         let temp = tempfile::tempdir().unwrap();
         let collision_home = temp.path().join("collision-home");
         let collision_runtime = runtime_instance(

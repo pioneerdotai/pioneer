@@ -1,4 +1,7 @@
-use super::{MessageProcessor, message_future, record_resilience_worker_poll_error};
+use super::{
+    CLIRuntimeMachineRequestKey, MessageProcessor, message_future,
+    record_resilience_worker_poll_error,
+};
 use crate::bootstrap::bootstrap;
 use crate::cli_runtime::manager::{
     CLIAgentRuntimeManager, CLIAgentRuntimeObservedTurnStatus, CLIAgentRuntimeSession,
@@ -137,7 +140,7 @@ use sea_orm::{
 };
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -194,6 +197,7 @@ struct RecordingCliRuntimeSession {
     thread_resumes: TokioMutex<Vec<(String, CLIAgentRuntimeThreadOpenParams)>>,
     turn_starts: TokioMutex<Vec<CLIAgentRuntimeTurnStartParams>>,
     responses: TokioMutex<Vec<(JsonValue, JsonValue)>>,
+    response_errors: TokioMutex<Vec<(JsonValue, i64, String, Option<JsonValue>)>>,
     interrupts: TokioMutex<Vec<(Option<String>, Option<String>)>>,
     thread_compactions: TokioMutex<Vec<CLIAgentRuntimeThreadCompactRequest>>,
     thread_compact_result: TokioMutex<Option<CLIAgentRuntimeThreadCompactResult>>,
@@ -306,6 +310,20 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
         Ok(())
     }
 
+    async fn fail_request(
+        &self,
+        native_request_id: JsonValue,
+        code: i64,
+        message: String,
+        data: Option<JsonValue>,
+    ) -> anyhow::Result<()> {
+        self.response_errors
+            .lock()
+            .await
+            .push((native_request_id, code, message, data));
+        Ok(())
+    }
+
     async fn interrupt_turn(
         &self,
         native_thread_id: Option<&str>,
@@ -396,7 +414,7 @@ struct StaticCliRuntimeSessionFactory {
 impl CLIAgentRuntimeSessionFactory for StaticCliRuntimeSessionFactory {
     async fn start_session(
         &self,
-        _key: &CLIAgentRuntimeSessionKey,
+        _instance: &crate::cli_runtime::session_instance::CliSessionInstanceId,
     ) -> anyhow::Result<Arc<dyn CLIAgentRuntimeSession>> {
         Ok(self.session.clone())
     }
@@ -661,8 +679,39 @@ async fn seed_cli_runtime_skill_preflight_thread(
         .unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cli_runtime_skill_preflight_ordering_installs_before_materialization_and_native() {
+#[test]
+fn capability_persistence_order_materializes_before_skill_install_and_native_start() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("capability persistence order test runtime should build")
+        .block_on(async {
+            tokio::spawn(capability_persistence_order_impl())
+                .await
+                .expect("capability persistence order test task should finish");
+        });
+}
+
+fn run_large_stack_message_test<F>(name: &'static str, future: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .unwrap_or_else(|error| panic!("{name} runtime should build: {error}"))
+        .block_on(async move {
+            tokio::spawn(future)
+                .await
+                .unwrap_or_else(|error| panic!("{name} task should finish: {error}"));
+        });
+}
+
+async fn capability_persistence_order_impl() {
     for runtime_kind in [CLIAgentRuntimeKind::Codex, CLIAgentRuntimeKind::Claude] {
         let harness = setup_cli_runtime_skill_preflight_harness(runtime_kind, false).await;
         write_test_skill(&harness.user_root, "alpha", "", "# alpha\n");
@@ -709,8 +758,8 @@ async fn cli_runtime_skill_preflight_ordering_installs_before_materialization_an
         assert_eq!(
             harness.event_log.lock().await.as_slice(),
             [
-                "preflight_complete",
                 "thread_manager_turn_start",
+                "preflight_complete",
                 "native_thread_start"
             ]
         );
@@ -759,12 +808,29 @@ async fn cli_runtime_skill_preflight_ordering_installs_before_materialization_an
                 .iter()
                 .all(|binding| !binding.fingerprint.is_empty())
         );
-        let committed = timeout(Duration::from_secs(1), committed_rx.recv())
+        let committed_capabilities = timeout(Duration::from_secs(1), committed_rx.recv())
+            .await
+            .expect("committed empty MCP capability event should arrive")
+            .expect("committed lane should stay open");
+        assert!(matches!(
+            committed_capabilities,
+            AgentDurableEvent::TurnCapabilitiesResolved {
+                turn_id: committed_turn_id,
+                accepted,
+                rejected,
+                mcp_bindings,
+                ..
+            } if committed_turn_id == turn_id
+                && accepted.is_empty()
+                && rejected.is_empty()
+                && mcp_bindings.is_empty()
+        ));
+        let committed_skills = timeout(Duration::from_secs(1), committed_rx.recv())
             .await
             .expect("committed skill binding event should arrive")
             .expect("committed lane should stay open");
         assert!(matches!(
-            committed,
+            committed_skills,
             AgentDurableEvent::TurnSkillsResolved {
                 turn_id: committed_turn_id,
                 bindings,
@@ -812,8 +878,15 @@ async fn cli_runtime_skill_preflight_ordering_installs_before_materialization_an
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix() {
+#[test]
+fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix() {
+    run_large_stack_message_test(
+        "gateway CLI skill full-turn matrix test",
+        gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix_impl(),
+    );
+}
+
+async fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix_impl() {
     for runtime_kind in [CLIAgentRuntimeKind::Codex, CLIAgentRuntimeKind::Claude] {
         let harness = setup_cli_runtime_skill_preflight_harness(runtime_kind, false).await;
         let source = write_test_skill(&harness.user_root, "lifecycle", "", "# first\n");
@@ -970,8 +1043,15 @@ async fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cli_runtime_system_skill_rejected_before_write_or_materialization() {
+#[test]
+fn cli_runtime_system_skill_rejected_before_write_or_materialization() {
+    run_large_stack_message_test(
+        "CLI system skill rejection test",
+        cli_runtime_system_skill_rejected_before_write_or_materialization_impl(),
+    );
+}
+
+async fn cli_runtime_system_skill_rejected_before_write_or_materialization_impl() {
     let mut harness =
         setup_cli_runtime_skill_preflight_harness(CLIAgentRuntimeKind::Codex, false).await;
     write_test_skill(&harness.system_root, "memory-like", "", "# system\n");
@@ -1018,8 +1098,15 @@ async fn cli_runtime_system_skill_rejected_before_write_or_materialization() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cli_runtime_skill_native_agent_control_keeps_system_skill_in_pioneer_flow() {
+#[test]
+fn cli_runtime_skill_native_agent_control_keeps_system_skill_in_pioneer_flow() {
+    run_large_stack_message_test(
+        "native-agent system skill control test",
+        cli_runtime_skill_native_agent_control_keeps_system_skill_in_pioneer_flow_impl(),
+    );
+}
+
+async fn cli_runtime_skill_native_agent_control_keeps_system_skill_in_pioneer_flow_impl() {
     let mut harness =
         setup_cli_runtime_skill_preflight_harness(CLIAgentRuntimeKind::Codex, false).await;
     write_test_skill(&harness.system_root, "memory-like", "", "# system\n");
@@ -1070,8 +1157,15 @@ async fn cli_runtime_skill_native_agent_control_keeps_system_skill_in_pioneer_fl
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn codex_cli_runtime_new_skill_closes_one_cached_session_before_restart() {
+#[test]
+fn codex_cli_runtime_new_skill_closes_one_cached_session_before_restart() {
+    run_large_stack_message_test(
+        "Codex skill restart test",
+        codex_cli_runtime_new_skill_closes_one_cached_session_before_restart_impl(),
+    );
+}
+
+async fn codex_cli_runtime_new_skill_closes_one_cached_session_before_restart_impl() {
     let harness =
         setup_cli_runtime_skill_preflight_harness(CLIAgentRuntimeKind::Codex, false).await;
     write_test_skill(&harness.user_root, "refresh", "", "# refresh\n");
@@ -1103,8 +1197,24 @@ async fn codex_cli_runtime_new_skill_closes_one_cached_session_before_restart() 
     assert_eq!(harness.cli_session.closes.load(Ordering::SeqCst), 1);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn claude_cli_runtime_new_skill_closes_one_cached_session_before_restart() {
+#[test]
+fn claude_cli_runtime_new_skill_closes_one_cached_session_before_restart() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("Claude skill restart test runtime should build")
+        .block_on(async {
+            tokio::spawn(
+                claude_cli_runtime_new_skill_closes_one_cached_session_before_restart_impl(),
+            )
+            .await
+            .expect("Claude skill restart test task should finish");
+        });
+}
+
+async fn claude_cli_runtime_new_skill_closes_one_cached_session_before_restart_impl() {
     let harness =
         setup_cli_runtime_skill_preflight_harness(CLIAgentRuntimeKind::Claude, false).await;
     write_test_skill(&harness.user_root, "refresh", "", "# refresh\n");
@@ -1142,8 +1252,15 @@ async fn claude_cli_runtime_new_skill_closes_one_cached_session_before_restart()
     }));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn claude_skill_not_model_invocable_rejects_before_write_and_native() {
+#[test]
+fn claude_skill_not_model_invocable_rejects_before_write_and_native() {
+    run_large_stack_message_test(
+        "Claude non-invocable skill rejection test",
+        claude_skill_not_model_invocable_rejects_before_write_and_native_impl(),
+    );
+}
+
+async fn claude_skill_not_model_invocable_rejects_before_write_and_native_impl() {
     let mut harness =
         setup_cli_runtime_skill_preflight_harness(CLIAgentRuntimeKind::Claude, false).await;
     write_test_skill(
@@ -1194,8 +1311,15 @@ async fn claude_skill_not_model_invocable_rejects_before_write_and_native() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cli_runtime_skill_preflight_collision_and_copy_failure_do_not_start_turn() {
+#[test]
+fn cli_runtime_skill_preflight_collision_and_copy_failure_do_not_start_turn() {
+    run_large_stack_message_test(
+        "CLI skill preflight failure test",
+        cli_runtime_skill_preflight_collision_and_copy_failure_do_not_start_turn_impl(),
+    );
+}
+
+async fn cli_runtime_skill_preflight_collision_and_copy_failure_do_not_start_turn_impl() {
     let mut collision =
         setup_cli_runtime_skill_preflight_harness(CLIAgentRuntimeKind::Codex, false).await;
     write_test_skill_with_declared_name(&collision.user_root, "first", "same skill");
@@ -1272,22 +1396,37 @@ async fn cli_runtime_skill_preflight_collision_and_copy_failure_do_not_start_tur
             .await
             .is_empty()
     );
-    assert!(copy_failure.event_log.lock().await.is_empty());
+    assert_eq!(
+        copy_failure.event_log.lock().await.as_slice(),
+        ["thread_manager_turn_start"]
+    );
+    let (_workspace_id, blocked_turn) = copy_failure
+        .crud_store
+        .get_turn(
+            "thread_copy_failure_preflight",
+            "turn_copy_failure_preflight",
+        )
+        .await
+        .expect("copy failure turn should load")
+        .expect("copy failure turn should remain durable");
+    assert_eq!(blocked_turn.status, TurnStatus::Blocked);
     assert!(
-        copy_failure
-            .crud_store
-            .get_turn(
-                "thread_copy_failure_preflight",
-                "turn_copy_failure_preflight"
-            )
-            .await
-            .unwrap()
-            .is_none()
+        blocked_turn
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("failed to prepare CLI runtime skill"))
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cli_runtime_skill_preflight_mcp_and_resolver_failures_have_zero_side_effects() {
+#[test]
+fn cli_runtime_skill_preflight_mcp_and_resolver_failures_have_zero_side_effects() {
+    run_large_stack_message_test(
+        "combined CLI preflight failure test",
+        cli_runtime_skill_preflight_mcp_and_resolver_failures_have_zero_side_effects_impl(),
+    );
+}
+
+async fn cli_runtime_skill_preflight_mcp_and_resolver_failures_have_zero_side_effects_impl() {
     for (suffix, capabilities, expected) in [
         (
             "mcp",
@@ -1302,7 +1441,7 @@ async fn cli_runtime_skill_preflight_mcp_and_resolver_failures_have_zero_side_ef
                 })
                 .unwrap(),
             ],
-            "do not support skills, MCP capabilities",
+            "cli_runtime.mcp.explicit_capability_unresolved",
         ),
         (
             "missing",
@@ -12016,7 +12155,7 @@ async fn internal_llm_context_event_persists_without_websocket_notification() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn direct_durable_turn_capabilities_resolved_commits_payload() {
+async fn turn_mcp_persistence_durable_capability_event_is_read_only() {
     let session_manager = Arc::new(SessionManager::new());
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let agent_manager = Arc::new(AgentManager::new(test_provider(), test_tool_loop_config()));
@@ -12081,15 +12220,18 @@ async fn direct_durable_turn_capabilities_resolved_commits_payload() {
     let mcp_bindings = crud_store_for_assert
         .list_turn_mcp_bindings(turn_id)
         .await
-        .expect("turn MCP bindings should load after durable event");
-    assert_eq!(mcp_bindings.len(), 1);
-    assert_eq!(
-        mcp_bindings[0].selection_reason,
-        "explicit_composer_capability"
+        .expect("turn MCP bindings query should succeed after durable event");
+    assert!(
+        mcp_bindings.is_empty(),
+        "durable capability event must not write projection bindings"
     );
-    assert_eq!(
-        mcp_bindings[0].capability_id.as_deref(),
-        Some("mcp-tool:workspace:resend:send")
+    assert!(
+        crud_store_for_assert
+            .get_turn_mcp_projection(turn_id)
+            .await
+            .expect("turn MCP projection query should succeed")
+            .is_none(),
+        "durable capability event must not create a projection header"
     );
 
     let committed = timeout(Duration::from_secs(1), committed_rx.recv())
@@ -15022,7 +15164,11 @@ async fn turn_start_security_audit_events_include_snapshot_reference() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn turn_start_cli_runtime_backend_disabled_errors_before_provider_dispatch() {
+async fn turn_start_cli_runtime_uses_default_stack_and_errors_before_provider_dispatch() {
+    turn_start_cli_runtime_backend_disabled_errors_before_provider_dispatch_impl().await;
+}
+
+async fn turn_start_cli_runtime_backend_disabled_errors_before_provider_dispatch_impl() {
     let (tx, mut rx) = mpsc::channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = session_manager.register_connection(tx).await;
@@ -15111,8 +15257,15 @@ async fn turn_start_cli_runtime_backend_disabled_errors_before_provider_dispatch
     );
 }
 
-#[tokio::test]
-async fn codex_cli_runtime_full_access_sets_danger_full_access_permissions_profile() {
+#[test]
+fn codex_cli_runtime_full_access_sets_danger_full_access_permissions_profile() {
+    run_large_stack_message_test(
+        "Codex full-access security test",
+        codex_cli_runtime_full_access_sets_danger_full_access_permissions_profile_impl(),
+    );
+}
+
+async fn codex_cli_runtime_full_access_sets_danger_full_access_permissions_profile_impl() {
     let mut harness = setup_cli_runtime_security_harness().await;
     seed_cli_runtime_security_thread(
         &harness,
@@ -15185,8 +15338,15 @@ async fn codex_cli_runtime_full_access_sets_danger_full_access_permissions_profi
     );
 }
 
-#[tokio::test]
-async fn codex_cli_runtime_supervised_sets_read_only_permissions_profile() {
+#[test]
+fn codex_cli_runtime_supervised_sets_read_only_permissions_profile() {
+    run_large_stack_message_test(
+        "Codex supervised security test",
+        codex_cli_runtime_supervised_sets_read_only_permissions_profile_impl(),
+    );
+}
+
+async fn codex_cli_runtime_supervised_sets_read_only_permissions_profile_impl() {
     let mut harness = setup_cli_runtime_security_harness().await;
     seed_cli_runtime_security_thread(
         &harness,
@@ -15252,8 +15412,24 @@ async fn codex_cli_runtime_supervised_sets_read_only_permissions_profile() {
     assert_eq!(cli_cwd, persisted.snapshot.sandbox.cwd);
 }
 
-#[tokio::test]
-async fn claude_cli_runtime_supervised_required_sandbox_is_rejected_without_runtime_call() {
+#[test]
+fn claude_cli_runtime_supervised_required_sandbox_is_rejected_without_runtime_call() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("Claude supervised rejection test runtime should build")
+        .block_on(async {
+            tokio::spawn(
+                claude_cli_runtime_supervised_required_sandbox_is_rejected_without_runtime_call_impl(),
+            )
+            .await
+            .expect("Claude supervised rejection test task should finish");
+        });
+}
+
+async fn claude_cli_runtime_supervised_required_sandbox_is_rejected_without_runtime_call_impl() {
     let mut harness = setup_cli_runtime_security_harness().await;
     seed_cli_runtime_security_thread(
         &harness,
@@ -15299,8 +15475,22 @@ async fn claude_cli_runtime_supervised_required_sandbox_is_rejected_without_runt
     );
 }
 
-#[tokio::test]
-async fn claude_cli_runtime_ignores_legacy_provider_sandbox_option() {
+#[test]
+fn claude_cli_runtime_ignores_legacy_provider_sandbox_option() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("Claude legacy sandbox test runtime should build")
+        .block_on(async {
+            tokio::spawn(claude_cli_runtime_ignores_legacy_provider_sandbox_option_impl())
+                .await
+                .expect("Claude legacy sandbox test task should finish");
+        });
+}
+
+async fn claude_cli_runtime_ignores_legacy_provider_sandbox_option_impl() {
     let mut harness = setup_cli_runtime_security_harness().await;
     seed_cli_runtime_security_thread(
         &harness,
@@ -15351,8 +15541,24 @@ async fn claude_cli_runtime_ignores_legacy_provider_sandbox_option() {
     );
 }
 
-#[tokio::test]
-async fn turn_start_security_audit_events_include_unavailable_sandbox_decision() {
+#[test]
+fn turn_start_security_audit_events_include_unavailable_sandbox_decision() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("CLI security audit test runtime should build")
+        .block_on(async {
+            tokio::spawn(
+                turn_start_security_audit_events_include_unavailable_sandbox_decision_impl(),
+            )
+            .await
+            .expect("CLI security audit test task should finish");
+        });
+}
+
+async fn turn_start_security_audit_events_include_unavailable_sandbox_decision_impl() {
     let mut harness = setup_cli_runtime_security_harness().await;
     let thread_id = "thread_security_audit_claude";
     let turn_id = "turn_security_audit_claude";
@@ -16404,6 +16610,7 @@ async fn cli_runtime_turn_start_blocker_rejects_unbound_server_request() {
         .set_connection_workspace(connection_id, Some(workspace_id.clone()))
         .await;
     let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
     let processor = MessageProcessor::new(
         thread_manager,
         test_provider(),
@@ -16415,7 +16622,7 @@ async fn cli_runtime_turn_start_blocker_rejects_unbound_server_request() {
         test_context_budget(),
         test_tool_loop_config(),
     )
-    .with_cli_runtime_manager_for_tests(test_cli_runtime_manager(cli_session));
+    .with_cli_runtime_manager_for_tests(cli_manager.clone());
 
     let thread_id = "thread_cli_busy_unbound_request";
     let turn_id = "turn_cli_busy_unbound_request";
@@ -16446,6 +16653,10 @@ async fn cli_runtime_turn_start_blocker_rejects_unbound_server_request() {
 
     let key = CLIAgentRuntimeSessionKey::new(workspace_id, "codex", thread_id)
         .expect("session key should build");
+    cli_manager
+        .get_or_start(key.clone())
+        .await
+        .expect("originating CLI runtime session should start");
     let request = CodexJsonlRpcServerRequest {
         id: JsonlRpcId::from(63_i64),
         method: "item/commandExecution/requestApproval".to_owned(),
@@ -18286,7 +18497,10 @@ async fn codex_steer_rejects_missing_active_runtime_session() {
 
     let error = recv_error_by_id(&mut rx, "codexsteer00000000004").await;
     assert!(
-        error.error.message.contains("session is not active"),
+        error
+            .error
+            .message
+            .contains("CLI runtime session is not active"),
         "error should mention missing active session: {}",
         error.error.message
     );
@@ -18470,42 +18684,38 @@ async fn cli_runtime_request_respond_resolves_pending_and_broadcasts_notificatio
         .await
         .expect("CLI runtime session should be active for native request response");
 
-    let request_payload = CLIRuntimePendingRequest {
-        kind: CLIRuntimeRequestKind::CommandApproval,
-        title: Some("Run command".to_owned()),
-        message: Some("Codex wants to execute a command".to_owned()),
-        native_request_id: Some("codex-native-request-1".to_owned()),
-        payload: Some(json!({
+    let native_request = CodexJsonlRpcServerRequest {
+        id: JsonlRpcId::from("codex-native-request-1"),
+        method: "item/commandExecution/requestApproval".to_owned(),
+        params: Some(json!({
             "command": "cargo check",
-            "cwd": "/tmp/pioneer"
+            "cwd": "/tmp/pioneer",
+            "threadId": "codex-thread-request",
+            "turnId": "turn_cli_request",
+            "itemId": "item-command-1"
         })),
+        raw: json!({
+            "id": "codex-native-request-1",
+            "method": "item/commandExecution/requestApproval"
+        }),
     };
-    let payload_json = pioneer_crud::serialize_cli_runtime_json(&request_payload)
-        .expect("pending request payload should serialize");
-    processor
-        .open_cli_runtime_pending_request(NewCliRuntimePendingRequest {
-            request_id: "cli-approval-request-1".to_owned(),
-            runtime_id: "codex".to_owned(),
-            runtime_kind: "codex".to_owned(),
-            workspace_id: workspace_id.clone(),
-            thread_id: "thread_cli_request".to_owned(),
-            turn_id: Some("turn_cli_request".to_owned()),
-            native_thread_id: Some("codex-thread-request".to_owned()),
-            native_turn_id: Some("turn_cli_request".to_owned()),
-            native_item_id: Some("item-command-1".to_owned()),
-            request_kind: "command_approval".to_owned(),
-            payload_json,
-            created_at: chrono::Utc::now().fixed_offset(),
-            updated_at: chrono::Utc::now().fixed_offset(),
-        })
+    let opened_record = processor
+        .open_codex_command_approval_request(
+            workspace_id.as_str(),
+            "codex",
+            "codex",
+            "thread_cli_request",
+            decode_codex_command_approval_request(&native_request),
+        )
         .await
-        .expect("pending request should open");
+        .expect("origin-bound pending request should open");
+    let pending_request_id = opened_record.request_id;
 
     let opened = recv_notification_by_method(&mut rx, events::CLI_RUNTIME_REQUEST_OPENED).await;
     let opened_payload: CLIRuntimeRequestOpenedNotification =
         serde_json::from_value(opened.params.expect("request_opened params"))
             .expect("request_opened payload should decode");
-    assert_eq!(opened_payload.request_id, "cli-approval-request-1");
+    assert_eq!(opened_payload.request_id, pending_request_id);
     assert_eq!(
         opened_payload.request.kind,
         CLIRuntimeRequestKind::CommandApproval
@@ -18525,7 +18735,7 @@ async fn cli_runtime_request_respond_resolves_pending_and_broadcasts_notificatio
                 "params": {
                     "workspace_id": workspace_id,
                     "runtime_id": "codex",
-                    "request_id": "cli-approval-request-1",
+                    "request_id": pending_request_id.clone(),
                     "resolution": { "status": "approved" }
                 }
             })
@@ -18541,21 +18751,21 @@ async fn cli_runtime_request_respond_resolves_pending_and_broadcasts_notificatio
     .await;
     let result: CLIRuntimeRequestRespondResponse =
         serde_json::from_value(response.result).expect("respond result should decode");
-    assert_eq!(result.request_id, "cli-approval-request-1");
+    assert_eq!(result.request_id, pending_request_id);
     assert_eq!(result.status, CLIRuntimePendingRequestStatus::Answered);
     assert_eq!(result.resolution, CLIRuntimeRequestResolution::Approved);
 
     let resolved_payload: CLIRuntimeRequestResolvedNotification =
         serde_json::from_value(resolved.params.expect("request_resolved params"))
             .expect("request_resolved payload should decode");
-    assert_eq!(resolved_payload.request_id, "cli-approval-request-1");
+    assert_eq!(resolved_payload.request_id, pending_request_id);
     assert_eq!(
         resolved_payload.resolution,
         CLIRuntimeRequestResolution::Approved
     );
 
     let stored = crud_store
-        .get_cli_runtime_pending_request("cli-approval-request-1")
+        .get_cli_runtime_pending_request(pending_request_id.as_str())
         .await
         .expect("pending request lookup should succeed")
         .expect("pending request should remain durable");
@@ -26403,7 +26613,10 @@ async fn cli_runtime_request_respond_rejects_pending_without_active_runtime_sess
 
     let error = recv_error_by_id(&mut rx, "cliruntimenoactive001").await;
     assert!(
-        error.error.message.contains("session is not active"),
+        error
+            .error
+            .message
+            .contains("originating Codex process is not active"),
         "error should mention missing active session: {}",
         error.error.message
     );
@@ -26631,6 +26844,96 @@ async fn cli_runtime_server_request_without_turn_binding_is_cancelled_without_pe
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_machine_request_unknown_method_receives_exactly_one_error() {
+    let (processor, _connection_id, _rx, workspace_id, crud_store, cli_session) =
+        cli_runtime_approval_processor().await;
+    let key = CLIAgentRuntimeSessionKey::new(workspace_id, "codex", "thread_cli_command_approval")
+        .expect("session key should build");
+    let request = CodexJsonlRpcServerRequest {
+        id: JsonlRpcId::from("unknown-machine-request"),
+        method: "future/unknownMachineRequest".to_owned(),
+        params: Some(json!({"future": true})),
+        raw: json!({
+            "id": "unknown-machine-request",
+            "method": "future/unknownMachineRequest",
+            "params": {"future": true}
+        }),
+    };
+    let event = map_codex_server_request_event(&request, RuntimeEventMappingOptions::default());
+    processor
+        .handle_cli_runtime_codex_server_request(&key, request, event)
+        .await;
+
+    let errors = cli_session.response_errors.lock().await;
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].0, json!("unknown-machine-request"));
+    assert_eq!(errors[0].1, -32601);
+    drop(errors);
+    assert!(
+        crud_store
+            .list_cli_runtime_pending_requests(pioneer_crud::CliRuntimePendingRequestListFilter {
+                thread_id: Some("thread_cli_command_approval".to_owned()),
+                limit: None,
+                ..Default::default()
+            })
+            .await
+            .expect("pending requests should load")
+            .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_machine_request_malformed_known_method_receives_invalid_params_error() {
+    let (processor, _connection_id, _rx, workspace_id, _crud_store, cli_session) =
+        cli_runtime_approval_processor().await;
+    let key = CLIAgentRuntimeSessionKey::new(workspace_id, "codex", "thread_cli_command_approval")
+        .expect("session key should build");
+    let request = CodexJsonlRpcServerRequest {
+        id: JsonlRpcId::from(404_i64),
+        method: "item/commandExecution/requestApproval".to_owned(),
+        params: Some(json!({"threadId": "codex-thread-command"})),
+        raw: json!({
+            "id": 404,
+            "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "codex-thread-command"}
+        }),
+    };
+    let event = map_codex_server_request_event(&request, RuntimeEventMappingOptions::default());
+    processor
+        .handle_cli_runtime_codex_server_request(&key, request, event)
+        .await;
+
+    let errors = cli_session.response_errors.lock().await;
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].0, json!(404));
+    assert_eq!(errors[0].1, -32602);
+}
+
+#[test]
+fn pending_machine_request_lane_includes_process_generation() {
+    let logical = CLIAgentRuntimeSessionKey::new("workspace", "codex", "thread")
+        .expect("logical key should build");
+    let first = crate::cli_runtime::session_instance::CliSessionInstanceId::unmanaged_for_test(
+        logical.clone(),
+        1,
+    )
+    .expect("first instance should build");
+    let second =
+        crate::cli_runtime::session_instance::CliSessionInstanceId::unmanaged_for_test(logical, 2)
+            .expect("second instance should build");
+    let first_lane = CLIRuntimeMachineRequestKey {
+        instance: first,
+        provider_request_id_json: "7".to_owned(),
+    };
+    let second_lane = CLIRuntimeMachineRequestKey {
+        instance: second,
+        provider_request_id_json: "7".to_owned(),
+    };
+    assert_ne!(first_lane, second_lane);
+    assert_eq!(HashSet::from([first_lane, second_lane]).len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_server_request_waits_for_starting_turn_binding_native_id() {
     let (tx, mut rx) = mpsc::channel(16);
     let session_manager = Arc::new(SessionManager::new());
@@ -26697,7 +27000,7 @@ async fn cli_runtime_server_request_waits_for_starting_turn_binding_native_id() 
 
     let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
         .expect("session key should build");
-    cli_manager
+    let session_handle = cli_manager
         .get_or_start(key.clone())
         .await
         .expect("test CLI runtime session should start");
@@ -26749,7 +27052,11 @@ async fn cli_runtime_server_request_waits_for_starting_turn_binding_native_id() 
     .expect("native turn id should persist");
 
     processor
-        .flush_cli_runtime_events_for_native_turn(&key, native_thread_id, native_turn_id)
+        .flush_cli_runtime_events_for_native_turn(
+            session_handle.instance(),
+            native_thread_id,
+            native_turn_id,
+        )
         .await;
 
     let opened = recv_notification_by_method(&mut rx, events::CLI_RUNTIME_REQUEST_OPENED).await;
@@ -26993,7 +27300,7 @@ async fn cli_runtime_server_request_buffered_flush_preserves_order_before_termin
 
     let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
         .expect("session key should build");
-    cli_manager
+    let session_handle = cli_manager
         .get_or_start(key.clone())
         .await
         .expect("test CLI runtime session should start");
@@ -27019,7 +27326,7 @@ async fn cli_runtime_server_request_buffered_flush_preserves_order_before_termin
         .await;
     processor
         .handle_cli_runtime_timeline_event(
-            &key,
+            session_handle.instance(),
             RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
                 native_thread_id: Some(native_thread_id.to_owned()),
                 native_turn_id: native_turn_id.to_owned(),
@@ -27042,7 +27349,11 @@ async fn cli_runtime_server_request_buffered_flush_preserves_order_before_termin
     .expect("native turn id should persist");
 
     processor
-        .flush_cli_runtime_events_for_native_turn(&key, native_thread_id, native_turn_id)
+        .flush_cli_runtime_events_for_native_turn(
+            session_handle.instance(),
+            native_thread_id,
+            native_turn_id,
+        )
         .await;
 
     let pending_after_flush = crud_store
@@ -27285,11 +27596,12 @@ async fn cli_runtime_server_request_without_native_thread_does_not_buffer_on_sta
         "request without native thread id must not be guessed into a starting turn"
     );
 
-    let responses = cli_session.responses.lock().await;
-    assert_eq!(responses.len(), 1);
-    assert_eq!(responses[0].0, json!(58));
-    assert_eq!(responses[0].1, json!({ "decision": "cancel" }));
-    drop(responses);
+    assert!(cli_session.responses.lock().await.is_empty());
+    let errors = cli_session.response_errors.lock().await;
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].0, json!(58));
+    assert_eq!(errors[0].1, -32602);
+    drop(errors);
     assert_eq!(cli_session.closes.load(Ordering::SeqCst), 0);
     assert!(
         cli_manager.existing_session(&key).await.is_some(),
@@ -27396,11 +27708,12 @@ async fn cli_runtime_server_request_without_native_turn_does_not_close_starting_
         "request without native turn id must not be guessed into a starting turn"
     );
 
-    let responses = cli_session.responses.lock().await;
-    assert_eq!(responses.len(), 1);
-    assert_eq!(responses[0].0, json!(61));
-    assert_eq!(responses[0].1, json!({ "decision": "cancel" }));
-    drop(responses);
+    assert!(cli_session.responses.lock().await.is_empty());
+    let errors = cli_session.response_errors.lock().await;
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].0, json!(61));
+    assert_eq!(errors[0].1, -32602);
+    drop(errors);
     assert_eq!(cli_session.closes.load(Ordering::SeqCst), 0);
     assert!(
         cli_manager.existing_session(&key).await.is_some(),
@@ -27575,11 +27888,12 @@ async fn cli_runtime_server_request_with_bound_native_turn_but_missing_native_th
         "missing native thread must not bind by native turn id alone"
     );
 
-    let responses = cli_session.responses.lock().await;
-    assert_eq!(responses.len(), 1);
-    assert_eq!(responses[0].0, json!(60));
-    assert_eq!(responses[0].1, json!({ "decision": "cancel" }));
-    drop(responses);
+    assert!(cli_session.responses.lock().await.is_empty());
+    let errors = cli_session.response_errors.lock().await;
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].0, json!(60));
+    assert_eq!(errors[0].1, -32602);
+    drop(errors);
     assert_eq!(cli_session.closes.load(Ordering::SeqCst), 0);
     assert!(
         cli_manager.existing_session(&key).await.is_some(),
@@ -28608,6 +28922,15 @@ async fn turn_start_materializes_mcp_tool_bindings_and_executes_tool() {
             .any(|configured| configured.spec.name == "mcp_resend_send"),
         "MCP callable should be materialized as a dynamic tool"
     );
+    let persistence = materialization
+        .persistence
+        .as_ref()
+        .expect("MCP materialization should carry a persistence request");
+    assert!(persistence.bindings.iter().any(|binding| {
+        binding.server_name == "resend"
+            && binding.raw_tool_name == "send"
+            && binding.callable_name == "mcp_resend_send"
+    }));
 
     let built_tools = build_tools_with_environment_and_security_snapshot(
         std::env::temp_dir(),
@@ -28635,16 +28958,6 @@ async fn turn_start_materializes_mcp_tool_bindings_and_executes_tool() {
         .expect("MCP tool should execute through runtime");
     assert!(result.success());
     assert!(result.model_visible_text().contains("\"tool\": \"send\""));
-
-    let bindings = crud_store_for_assert
-        .list_turn_mcp_bindings("turn_000000000000000131")
-        .await
-        .expect("turn MCP bindings should load");
-    assert!(bindings.iter().any(|binding| {
-        binding.server_name == "resend"
-            && binding.raw_tool_name == "send"
-            && binding.callable_name == "mcp_resend_send"
-    }));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -30536,6 +30849,8 @@ impl pioneer_mcp::McpRuntimeSession for FakeMcpRuntimeSession {
         &mut self,
         raw_tool_name: &str,
         arguments: serde_json::Value,
+        _timeout: std::time::Duration,
+        _cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<pioneer_mcp::McpToolCallResult, pioneer_mcp::McpRuntimeError> {
         Ok(pioneer_mcp::McpToolCallResult {
             content: json!([{
@@ -31192,8 +31507,17 @@ async fn mcp_details_and_uninstall_return_full_ui_state_and_remove_server() {
                 server_name: "resend".to_owned(),
                 raw_tool_name: "send".to_owned(),
                 callable_name: "mcp_resend_send".to_owned(),
+                canonical_callable_name: "mcp_resend_send".to_owned(),
+                provider_callable_name: "mcp_resend_send".to_owned(),
                 catalog_version: "catalog-v1".to_owned(),
                 fingerprint: installed_server.fingerprint.clone(),
+                canonical_schema_fingerprint: "schema-canonical-v1".to_owned(),
+                provider_schema_fingerprint: "schema-provider-v1".to_owned(),
+                annotations_json: "{}".to_owned(),
+                annotations_digest: "annotations-v1".to_owned(),
+                effective_timeout_ms: 20_000,
+                runtime_generation: 3,
+                projection_activation_generation: 4,
                 selection_reason: "implicit_policy".to_owned(),
                 capability_id: None,
             }],

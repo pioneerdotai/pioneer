@@ -3,6 +3,29 @@ use pioneer_protocol::{
     TurnPermissionProfileSelection, TurnPermissionProfileSnapshot, TurnSandboxMode,
     default_turn_permission_profile_snapshot, resolve_turn_permission_profile,
 };
+use serde_json::{Value as JsonValue, json};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClaudeMcpPermissionFallbackDecision {
+    AllowExact,
+    Deny { reason: String },
+}
+
+pub(crate) fn claude_mcp_permission_fallback_response(
+    decision: ClaudeMcpPermissionFallbackDecision,
+    original_input: &JsonValue,
+) -> JsonValue {
+    match decision {
+        ClaudeMcpPermissionFallbackDecision::AllowExact => json!({
+            "behavior": "allow",
+            "updatedInput": original_input,
+        }),
+        ClaudeMcpPermissionFallbackDecision::Deny { reason } => json!({
+            "behavior": "deny",
+            "message": reason,
+        }),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CLIRuntimePermissionMappingQuality {

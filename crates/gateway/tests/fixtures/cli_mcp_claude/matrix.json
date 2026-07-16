@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "scenarios": [
+    "mixed_skill_whole_server_a",
+    "unchanged_projection_reuse_a",
+    "mixed_skill_individual_tool_b_after_resume",
+    "cancel_active_call",
+    "empty_projection_after_resume",
+    "rejected_resume_before_model"
+  ],
+  "serverSelectionMarker": "PIONEER_SKILL_SERVER_SELECTION_53",
+  "individualToolMarker": "PIONEER_SKILL_INDIVIDUAL_TOOL_53",
+  "continuityFact": "PIONEER-CLAUDE-CONTINUITY-FACT-53"
+}

@@ -5,10 +5,14 @@ use crate::cli_runtime::config::{
     codex_account_probe_config_from_instance_with_proxy,
 };
 use crate::cli_runtime::manager::{
-    CLIAgentRuntimeCodexEventReceivers, CLIAgentRuntimeObservedTurnStatus, CLIAgentRuntimeSession,
-    CLIAgentRuntimeSessionHandle, CLIAgentRuntimeSessionKey, CLIAgentRuntimeThreadForkRequest,
-    CLIAgentRuntimeThreadNameSetRequest, CLIAgentRuntimeTurnSteerRequest,
+    CLIAgentRuntimeCodexEventReceivers, CLIAgentRuntimeMachineRequestResponder,
+    CLIAgentRuntimeNativeMcpApprovalRequest, CLIAgentRuntimeObservedTurnStatus,
+    CLIAgentRuntimeSession, CLIAgentRuntimeSessionHandle, CLIAgentRuntimeSessionKey,
+    CLIAgentRuntimeThreadForkRequest, CLIAgentRuntimeThreadNameSetRequest,
+    CLIAgentRuntimeTurnSteerRequest,
 };
+use crate::cli_runtime::mcp::readiness::CliRuntimeCapabilityPolicy;
+use crate::cli_runtime::session_instance::{CliSessionInstanceId, CliSessionInstanceOrigin};
 use anyhow::Context as AnyhowContext;
 use pioneer_cli_agent_runtime::claude::{
     ClaudeAccountProbeSnapshot, ClaudeAccountProbeStatus, ClaudeAccountSnapshot,
@@ -48,6 +52,12 @@ const CLI_RUNTIME_EVENTED_TURN_STALE_AFTER_MS: i64 = 15 * 60 * 1_000;
 const CLI_RUNTIME_PENDING_UNBOUND_EVENT_TTL_MS: i64 = 30_000;
 const CLI_RUNTIME_HUMAN_RESPONSE_TIMEOUT_MS: i64 = 24 * 60 * 60 * 1_000;
 const CLI_RUNTIME_TERMINAL_NATIVE_EVENT_CLEANUP_BATCH_SIZE: u64 = 16_384;
+const CLI_RUNTIME_MAX_PENDING_MACHINE_REQUESTS: usize = 4096;
+const CLI_RUNTIME_MACHINE_REQUEST_UNAVAILABLE_CODE: i64 = -32000;
+const CLI_RUNTIME_MACHINE_REQUEST_TIMEOUT_CODE: i64 = -32001;
+const CLI_RUNTIME_MACHINE_REQUEST_STALE_CODE: i64 = -32002;
+const CLI_RUNTIME_MACHINE_REQUEST_INVALID_PARAMS_CODE: i64 = -32602;
+const CLI_RUNTIME_MACHINE_REQUEST_UNKNOWN_METHOD_CODE: i64 = -32601;
 
 enum CLIRuntimeAttemptRecoveryState {
     Normal,
@@ -703,7 +713,7 @@ impl MessageProcessor {
                 .cli_runtime_proxy_url(workspace_id.as_str(), params.runtime_id.as_str())
                 .await;
             let handle = match manager
-                .get_or_start_with_options(
+                .existing_or_start_management(
                     key,
                     crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
                         env: crate::cli_runtime::config::proxy_env(proxy_url.as_deref()),
@@ -1891,15 +1901,27 @@ impl MessageProcessor {
         thread_id: &str,
         request: CodexCommandApprovalRequest,
     ) -> anyhow::Result<CliRuntimePendingRequestRecord> {
-        self.open_codex_command_approval_request_for_turn(
+        let native_request_id = request.native_request_id_json.clone();
+        let opened = self
+            .open_codex_command_approval_request_for_turn(
+                workspace_id,
+                runtime_id,
+                runtime_kind,
+                thread_id,
+                request.native_turn_id.as_deref().map(str::to_owned),
+                request,
+            )
+            .await?;
+        self.capture_direct_codex_machine_request(
             workspace_id,
             runtime_id,
-            runtime_kind,
             thread_id,
-            request.native_turn_id.as_deref().map(str::to_owned),
-            request,
+            "item/commandExecution/requestApproval",
+            native_request_id,
+            &opened,
         )
-        .await
+        .await?;
+        Ok(opened)
     }
 
     async fn open_codex_command_approval_request_for_turn(
@@ -1943,15 +1965,27 @@ impl MessageProcessor {
         thread_id: &str,
         request: CodexFileChangeApprovalRequest,
     ) -> anyhow::Result<CliRuntimePendingRequestRecord> {
-        self.open_codex_file_change_approval_request_for_turn(
+        let native_request_id = request.native_request_id_json.clone();
+        let opened = self
+            .open_codex_file_change_approval_request_for_turn(
+                workspace_id,
+                runtime_id,
+                runtime_kind,
+                thread_id,
+                request.native_turn_id.as_deref().map(str::to_owned),
+                request,
+            )
+            .await?;
+        self.capture_direct_codex_machine_request(
             workspace_id,
             runtime_id,
-            runtime_kind,
             thread_id,
-            request.native_turn_id.as_deref().map(str::to_owned),
-            request,
+            "item/fileChange/requestApproval",
+            native_request_id,
+            &opened,
         )
-        .await
+        .await?;
+        Ok(opened)
     }
 
     async fn open_codex_file_change_approval_request_for_turn(
@@ -2007,15 +2041,72 @@ impl MessageProcessor {
         thread_id: &str,
         request: CodexUserInputRequest,
     ) -> anyhow::Result<CliRuntimePendingRequestRecord> {
-        self.open_codex_user_input_request_for_turn(
+        let native_request_id = request.native_request_id_json.clone();
+        let opened = self
+            .open_codex_user_input_request_for_turn(
+                workspace_id,
+                runtime_id,
+                runtime_kind,
+                thread_id,
+                request.native_turn_id.as_deref().map(str::to_owned),
+                request,
+            )
+            .await?;
+        self.capture_direct_codex_machine_request(
             workspace_id,
             runtime_id,
-            runtime_kind,
             thread_id,
-            request.native_turn_id.as_deref().map(str::to_owned),
-            request,
+            "item/tool/requestUserInput",
+            native_request_id,
+            &opened,
         )
-        .await
+        .await?;
+        Ok(opened)
+    }
+
+    async fn capture_direct_codex_machine_request(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        thread_id: &str,
+        method: &str,
+        native_request_id: JsonValue,
+        opened: &CliRuntimePendingRequestRecord,
+    ) -> anyhow::Result<()> {
+        let manager = self
+            .cli_runtime_manager
+            .as_ref()
+            .context("CLI runtime manager is unavailable for Codex request capture")?;
+        let key = CLIAgentRuntimeSessionKey::new(workspace_id, runtime_id, thread_id)?;
+        let handle = manager
+            .existing_session(&key)
+            .await
+            .context("originating Codex session is unavailable for request capture")?;
+        let request = CodexJsonlRpcServerRequest {
+            id: serde_json::from_value(native_request_id.clone())
+                .context("invalid Codex native request id")?,
+            method: method.to_owned(),
+            params: None,
+            raw: json!({"id": native_request_id, "method": method}),
+        };
+        let responder = CLIAgentRuntimeMachineRequestResponder::new(
+            handle.instance().clone(),
+            native_request_id,
+            handle.session(),
+        );
+        self.register_cli_runtime_machine_request(handle.instance(), &request, responder, opened)
+            .await;
+        if self
+            .cli_runtime_machine_request_is_registered(opened.request_id.as_str())
+            .await
+        {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "failed to capture originating Codex response lane for request `{}`",
+                opened.request_id
+            )
+        }
     }
 
     async fn open_codex_user_input_request_for_turn(
@@ -2052,7 +2143,7 @@ impl MessageProcessor {
 
     pub(crate) async fn ensure_cli_runtime_session_event_pumps(
         &self,
-        key: &CLIAgentRuntimeSessionKey,
+        instance: &CliSessionInstanceId,
         session: Arc<dyn CLIAgentRuntimeSession>,
         debug_native_events: bool,
     ) {
@@ -2061,22 +2152,40 @@ impl MessageProcessor {
         if event_receivers.is_none() && codex_receivers.is_none() {
             return;
         }
+        if let Some(receivers) = event_receivers.as_ref()
+            && receivers.process_instance != *instance
+        {
+            self.audit_stale_cli_runtime_process_activity(
+                &receivers.process_instance,
+                "mismatched_event_receiver",
+            );
+            return;
+        }
+        if let Some(receivers) = codex_receivers.as_ref()
+            && receivers.process_instance != *instance
+        {
+            self.audit_stale_cli_runtime_process_activity(
+                &receivers.process_instance,
+                "mismatched_codex_receiver",
+            );
+            return;
+        }
 
-        self.ensure_cli_runtime_execution_event_hub(key).await;
+        self.ensure_cli_runtime_execution_event_hub(instance).await;
         if let Some(receivers) = event_receivers {
-            self.spawn_cli_runtime_event_pump(key.clone(), receivers, debug_native_events);
+            self.spawn_cli_runtime_event_pump(instance.clone(), receivers, debug_native_events);
         }
         if let Some(receivers) = codex_receivers {
-            self.spawn_codex_event_pumps(key.clone(), receivers, debug_native_events);
+            self.spawn_codex_event_pumps(instance.clone(), session, receivers, debug_native_events);
         }
     }
 
     pub(super) async fn ensure_cli_runtime_execution_event_hub(
         &self,
-        key: &CLIAgentRuntimeSessionKey,
+        instance: &CliSessionInstanceId,
     ) -> Arc<ExecutionEventHub> {
         let mut hubs = self.cli_runtime_event_hubs.lock().await;
-        if let Some(hub) = hubs.get(key) {
+        if let Some(hub) = hubs.get(instance) {
             return hub.clone();
         }
 
@@ -2090,11 +2199,11 @@ impl MessageProcessor {
             .await
             .expect("new execution event hub must expose its snapshot receiver");
         let live_receiver = hub.subscribe_live();
-        hubs.insert(key.clone(), hub.clone());
+        hubs.insert(instance.clone(), hub.clone());
         drop(hubs);
 
         self.spawn_cli_runtime_execution_event_listener(
-            key.clone(),
+            instance.clone(),
             durable_receiver,
             snapshot_receiver,
             live_receiver,
@@ -2104,13 +2213,14 @@ impl MessageProcessor {
 
     fn spawn_cli_runtime_execution_event_listener(
         &self,
-        key: CLIAgentRuntimeSessionKey,
+        instance: CliSessionInstanceId,
         mut durable_receiver: pioneer_runtime_events::DurableEventReceiver,
         mut snapshot_receiver: pioneer_runtime_events::SnapshotEventReceiver,
         mut live_receiver: tokio::sync::broadcast::Receiver<AgentProgressEvent>,
     ) {
         let processor = self.clone();
         tokio::spawn(async move {
+            let key = instance.key();
             let mut durable_open = true;
             let mut snapshot_open = true;
             let mut live_open = true;
@@ -2119,13 +2229,31 @@ impl MessageProcessor {
                     biased;
                     snapshot = snapshot_receiver.recv(), if snapshot_open => {
                         match snapshot {
-                            Some(event) => processor.handle_snapshot_agent_event(event).await,
+                            Some(event) => {
+                                if processor.cli_runtime_instance_is_current(&instance).await {
+                                    processor.handle_snapshot_agent_event(event).await;
+                                } else {
+                                    processor.audit_stale_cli_runtime_process_activity(
+                                        &instance,
+                                        "snapshot_projection",
+                                    );
+                                }
+                            }
                             None => snapshot_open = false,
                         }
                     }
                     live = live_receiver.recv(), if live_open => {
                         match live {
-                            Ok(event) => processor.handle_progress_agent_event(event).await,
+                            Ok(event) => {
+                                if processor.cli_runtime_instance_is_current(&instance).await {
+                                    processor.handle_progress_agent_event(event).await;
+                                } else {
+                                    processor.audit_stale_cli_runtime_process_activity(
+                                        &instance,
+                                        "progress_projection",
+                                    );
+                                }
+                            }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                                 warn!(
                                     workspace_id = key.workspace_id.as_str(),
@@ -2143,7 +2271,18 @@ impl MessageProcessor {
                     durable = durable_receiver.recv(), if durable_open => {
                         match durable {
                             Some(event) => {
-                                let committed = processor.handle_durable_agent_event(event).await;
+                                let committed = if processor
+                                    .cli_runtime_instance_is_current(&instance)
+                                    .await
+                                {
+                                    processor.handle_durable_agent_event(event).await
+                                } else {
+                                    processor.audit_stale_cli_runtime_process_activity(
+                                        &instance,
+                                        "durable_projection",
+                                    );
+                                    true
+                                };
                                 durable_receiver.acknowledge_last(if committed {
                                     Ok(())
                                 } else {
@@ -2164,8 +2303,8 @@ impl MessageProcessor {
         });
     }
 
-    async fn close_cli_runtime_execution_event_hub(&self, key: &CLIAgentRuntimeSessionKey) {
-        let hub = self.cli_runtime_event_hubs.lock().await.remove(key);
+    async fn close_cli_runtime_execution_event_hub(&self, instance: &CliSessionInstanceId) {
+        let hub = self.cli_runtime_event_hubs.lock().await.remove(instance);
         if let Some(hub) = hub {
             hub.shutdown_progress().await;
         }
@@ -2173,34 +2312,66 @@ impl MessageProcessor {
             .lock()
             .await
             .retain(|cached, _| {
-                cached.workspace_id != key.workspace_id
-                    || cached.runtime_id != key.runtime_id
-                    || cached.thread_id != key.thread_id
+                cached.workspace_id != instance.key().workspace_id
+                    || cached.runtime_id != instance.key().runtime_id
+                    || cached.thread_id != instance.key().thread_id
+                    || cached.session_generation != instance.generation()
             });
+    }
+
+    async fn cli_runtime_instance_is_current(&self, instance: &CliSessionInstanceId) -> bool {
+        #[cfg(test)]
+        if instance.generation() == u64::MAX {
+            return true;
+        }
+        let Some(manager) = self.cli_runtime_manager.as_ref() else {
+            return true;
+        };
+        manager.is_current_instance(instance).await
+    }
+
+    fn audit_stale_cli_runtime_process_activity(
+        &self,
+        instance: &CliSessionInstanceId,
+        activity: &str,
+    ) {
+        warn!(
+            workspace_id = instance.key().workspace_id.as_str(),
+            runtime_id = instance.key().runtime_id.as_str(),
+            thread_id = instance.key().thread_id.as_str(),
+            session_generation = instance.generation(),
+            activity,
+            "dropped stale CLI runtime process activity"
+        );
     }
 
     fn spawn_cli_runtime_event_pump(
         &self,
-        key: CLIAgentRuntimeSessionKey,
+        instance: CliSessionInstanceId,
         receivers: crate::cli_runtime::manager::CLIAgentRuntimeEventReceivers,
         debug_native_events: bool,
     ) {
         let processor = self.clone();
         tokio::spawn(async move {
+            let key = instance.key();
             let mut events = receivers.events;
             let runtime_kind = receivers.runtime_kind;
             while let Some(event) = events.recv().await {
+                if !processor.cli_runtime_instance_is_current(&instance).await {
+                    processor.audit_stale_cli_runtime_process_activity(&instance, "event");
+                    continue;
+                }
                 if cli_runtime_event_requires_native_journal(&event) {
                     processor
                         .persist_cli_runtime_canonical_event(
-                            &key,
+                            &instance,
                             runtime_kind.as_str(),
                             &event,
                             debug_native_events,
                         )
                         .await;
                 }
-                processor.handle_cli_runtime_event(&key, event).await;
+                processor.handle_cli_runtime_event(&instance, event).await;
             }
             debug!(
                 workspace_id = key.workspace_id.as_str(),
@@ -2208,16 +2379,22 @@ impl MessageProcessor {
                 thread_id = key.thread_id.as_str(),
                 "CLI runtime canonical event pump closed"
             );
-            processor.close_cli_runtime_execution_event_hub(&key).await;
+            if let Some(manager) = processor.cli_runtime_manager.as_ref() {
+                manager.remove_if_generation(&instance).await;
+            }
             processor
-                .remove_cli_runtime_command_items_for_session(&key)
+                .close_cli_runtime_execution_event_hub(&instance)
+                .await;
+            processor
+                .remove_cli_runtime_command_items_for_session(&instance)
                 .await;
         });
     }
 
     fn spawn_codex_event_pumps(
         &self,
-        key: CLIAgentRuntimeSessionKey,
+        instance: CliSessionInstanceId,
+        session: Arc<dyn CLIAgentRuntimeSession>,
         receivers: CLIAgentRuntimeCodexEventReceivers,
         debug_native_events: bool,
     ) {
@@ -2226,15 +2403,38 @@ impl MessageProcessor {
         };
 
         let notification_processor = self.clone();
-        let notification_key = key.clone();
+        let notification_instance = instance.clone();
+        let notification_session = session.clone();
         tokio::spawn(async move {
+            let notification_key = notification_instance.key();
             let mut notifications = receivers.notifications;
             while let Some(notification) = notifications.recv().await {
-                let event = map_codex_notification_event(&notification, options);
+                if !notification_processor
+                    .cli_runtime_instance_is_current(&notification_instance)
+                    .await
+                {
+                    notification_processor.audit_stale_cli_runtime_process_activity(
+                        &notification_instance,
+                        "notification",
+                    );
+                    continue;
+                }
+                let mut event = map_codex_notification_event(&notification, options);
+                if let Err(error) = notification_session.enrich_runtime_event(&mut event) {
+                    warn!(
+                        workspace_id = notification_key.workspace_id.as_str(),
+                        runtime_id = notification_key.runtime_id.as_str(),
+                        thread_id = notification_key.thread_id.as_str(),
+                        method = notification.method.as_str(),
+                        error = %format!("{error:#}"),
+                        "rejected invalid Codex native MCP lifecycle event"
+                    );
+                    continue;
+                }
                 if cli_runtime_event_requires_native_journal(&event) {
                     notification_processor
                         .persist_codex_native_transport_event(
-                            &notification_key,
+                            &notification_instance,
                             "notification",
                             notification.method.as_str(),
                             notification.params.as_ref(),
@@ -2243,7 +2443,7 @@ impl MessageProcessor {
                         .await;
                 }
                 notification_processor
-                    .handle_cli_runtime_timeline_event(&notification_key, event)
+                    .handle_cli_runtime_timeline_event(&notification_instance, event)
                     .await;
             }
             debug!(
@@ -2252,22 +2452,51 @@ impl MessageProcessor {
                 thread_id = notification_key.thread_id.as_str(),
                 "Codex CLI runtime notification pump closed"
             );
+            if let Some(manager) = notification_processor.cli_runtime_manager.as_ref() {
+                manager.remove_if_generation(&notification_instance).await;
+            }
             notification_processor
-                .close_cli_runtime_execution_event_hub(&notification_key)
+                .close_cli_runtime_execution_event_hub(&notification_instance)
                 .await;
             notification_processor
-                .remove_cli_runtime_command_items_for_session(&notification_key)
+                .remove_cli_runtime_command_items_for_session(&notification_instance)
                 .await;
         });
 
         let request_processor = self.clone();
-        let request_key = key.clone();
+        let request_instance = instance.clone();
         tokio::spawn(async move {
+            let request_key = request_instance.key();
             let mut server_requests = receivers.server_requests;
             while let Some(request) = server_requests.recv().await {
+                let native_request_id = serde_json::to_value(&request.id)
+                    .unwrap_or_else(|_| JsonValue::String(request.id.to_string()));
+                let responder = CLIAgentRuntimeMachineRequestResponder::new(
+                    request_instance.clone(),
+                    native_request_id,
+                    session.clone(),
+                );
+                if !request_processor
+                    .cli_runtime_instance_is_current(&request_instance)
+                    .await
+                {
+                    request_processor.audit_stale_cli_runtime_process_activity(
+                        &request_instance,
+                        "server_request",
+                    );
+                    request_processor
+                        .fail_codex_machine_request(
+                            &responder,
+                            CLI_RUNTIME_MACHINE_REQUEST_STALE_CODE,
+                            "server request belongs to a stale process generation",
+                            Some(json!({"method": request.method})),
+                        )
+                        .await;
+                    continue;
+                }
                 request_processor
                     .persist_codex_native_transport_event(
-                        &request_key,
+                        &request_instance,
                         "server_request",
                         request.method.as_str(),
                         request.params.as_ref(),
@@ -2276,7 +2505,12 @@ impl MessageProcessor {
                     .await;
                 let event = map_codex_server_request_event(&request, options);
                 request_processor
-                    .handle_cli_runtime_codex_server_request(&request_key, request, event)
+                    .handle_cli_runtime_codex_server_request_with_responder(
+                        &request_instance,
+                        request,
+                        responder,
+                        event,
+                    )
                     .await;
             }
             debug!(
@@ -2285,12 +2519,31 @@ impl MessageProcessor {
                 thread_id = request_key.thread_id.as_str(),
                 "Codex CLI runtime server request pump closed"
             );
+            request_processor
+                .finalize_cli_runtime_machine_requests_for_instance(
+                    &request_instance,
+                    CLI_RUNTIME_MACHINE_REQUEST_UNAVAILABLE_CODE,
+                    "originating Codex process request pump closed",
+                )
+                .await;
         });
 
-        let diagnostic_key = key;
+        let diagnostic_processor = self.clone();
+        let diagnostic_instance = instance;
         tokio::spawn(async move {
+            let diagnostic_key = diagnostic_instance.key();
             let mut diagnostics = receivers.diagnostics;
             while let Some(diagnostic) = diagnostics.recv().await {
+                if !diagnostic_processor
+                    .cli_runtime_instance_is_current(&diagnostic_instance)
+                    .await
+                {
+                    diagnostic_processor.audit_stale_cli_runtime_process_activity(
+                        &diagnostic_instance,
+                        "diagnostic",
+                    );
+                    continue;
+                }
                 warn!(
                     workspace_id = diagnostic_key.workspace_id.as_str(),
                     runtime_id = diagnostic_key.runtime_id.as_str(),
@@ -2306,12 +2559,17 @@ impl MessageProcessor {
 
     async fn persist_codex_native_transport_event(
         &self,
-        key: &CLIAgentRuntimeSessionKey,
+        instance: &CliSessionInstanceId,
         transport_kind: &str,
         native_method: &str,
         params: Option<&JsonValue>,
         include_payload: bool,
     ) {
+        if !self.cli_runtime_instance_is_current(instance).await {
+            self.audit_stale_cli_runtime_process_activity(instance, "native_journal");
+            return;
+        }
+        let key = instance.key();
         let native_thread_id = params.and_then(|params| {
             json_string_path(params, &["threadId"])
                 .or_else(|| json_string_path(params, &["thread_id"]))
@@ -2328,7 +2586,7 @@ impl MessageProcessor {
         });
         let turn_id = if let Some(native_turn_id) = native_turn_id.as_deref() {
             self.cli_runtime_pioneer_turn_id_for_native_turn(
-                key,
+                instance,
                 native_thread_id.as_deref(),
                 Some(native_turn_id),
             )
@@ -2338,12 +2596,14 @@ impl MessageProcessor {
         };
         let payload = if include_payload {
             json!({
+                "sessionGeneration": instance.generation(),
                 "transportKind": transport_kind,
                 "nativeItemId": native_item_id,
                 "params": params.map(redact_cli_runtime_native_payload),
             })
         } else {
             json!({
+                "sessionGeneration": instance.generation(),
                 "transportKind": transport_kind,
                 "nativeItemId": native_item_id,
             })
@@ -2393,25 +2653,36 @@ impl MessageProcessor {
 
     async fn persist_cli_runtime_canonical_event(
         &self,
-        key: &CLIAgentRuntimeSessionKey,
+        instance: &CliSessionInstanceId,
         runtime_kind: &str,
         event: &RuntimeEvent,
         include_payload: bool,
     ) {
+        if !self.cli_runtime_instance_is_current(instance).await {
+            self.audit_stale_cli_runtime_process_activity(instance, "canonical_journal");
+            return;
+        }
+        let key = instance.key();
         let native_thread_id = cli_runtime_native_thread_id_for_event(event).map(str::to_owned);
         let native_turn_id = cli_runtime_native_turn_id_for_event(event).map(str::to_owned);
         let native_item_id = cli_runtime_native_item_id_for_event(event).map(str::to_owned);
         let turn_id = self
             .cli_runtime_pioneer_turn_id_for_native_turn(
-                key,
+                instance,
                 native_thread_id.as_deref(),
                 native_turn_id.as_deref(),
             )
             .await;
         let payload = if include_payload {
-            serde_json::to_value(event).unwrap_or_else(|_| json!({ "event": "unserializable" }))
+            let mut payload = serde_json::to_value(event)
+                .unwrap_or_else(|_| json!({ "event": "unserializable" }));
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("sessionGeneration".to_owned(), json!(instance.generation()));
+            }
+            payload
         } else {
             json!({
+                "sessionGeneration": instance.generation(),
                 "event": cli_runtime_event_log_label(event),
                 "nativeItemId": native_item_id,
             })
@@ -2457,11 +2728,18 @@ impl MessageProcessor {
         }
     }
 
-    pub(super) async fn handle_cli_runtime_timeline_event(
+    pub(super) async fn handle_cli_runtime_timeline_event<O: CliSessionInstanceOrigin + ?Sized>(
         &self,
-        key: &CLIAgentRuntimeSessionKey,
+        origin: &O,
         event: RuntimeEvent,
     ) {
+        let instance = origin.to_session_instance();
+        let instance = &instance;
+        if !self.cli_runtime_instance_is_current(instance).await {
+            self.audit_stale_cli_runtime_process_activity(instance, "timeline_event");
+            return;
+        }
+        let key = instance.key();
         match &event {
             RuntimeEvent::RequestResolved(_) | RuntimeEvent::RequestOpened(_) => return,
             _ => {}
@@ -2475,7 +2753,7 @@ impl MessageProcessor {
             else {
                 return;
             };
-            self.process_bound_cli_runtime_event(key, turn_binding, event)
+            self.process_bound_cli_runtime_event(instance, turn_binding, event)
                 .await;
             return;
         };
@@ -2493,7 +2771,7 @@ impl MessageProcessor {
         };
         let Some(turn_binding) = self
             .cli_runtime_turn_binding_for_native_turn(
-                key,
+                instance,
                 native_thread_id.as_str(),
                 native_turn_id.as_str(),
             )
@@ -2548,7 +2826,7 @@ impl MessageProcessor {
                 return;
             }
             self.buffer_cli_runtime_event_until_turn_binding(
-                key,
+                instance,
                 native_thread_id.as_str(),
                 native_turn_id.as_str(),
                 event,
@@ -2564,36 +2842,46 @@ impl MessageProcessor {
             return;
         };
 
-        self.process_bound_cli_runtime_event(key, turn_binding, event)
+        self.process_bound_cli_runtime_event(instance, turn_binding, event)
             .await;
     }
 
-    pub(super) async fn handle_cli_runtime_event(
+    pub(super) async fn handle_cli_runtime_event<O: CliSessionInstanceOrigin + ?Sized>(
         &self,
-        key: &CLIAgentRuntimeSessionKey,
+        origin: &O,
         event: RuntimeEvent,
     ) {
+        let instance = origin.to_session_instance();
+        let instance = &instance;
         match event {
             RuntimeEvent::RequestOpened(request) => {
-                self.handle_cli_runtime_request_opened_event(key, request)
+                self.handle_cli_runtime_request_opened_event(instance, request)
                     .await;
             }
             RuntimeEvent::RequestResolved(resolved) => {
-                self.handle_cli_runtime_request_resolved_event(key, resolved)
+                self.handle_cli_runtime_request_resolved_event(instance, resolved)
                     .await;
             }
-            other => self.handle_cli_runtime_timeline_event(key, other).await,
+            other => {
+                self.handle_cli_runtime_timeline_event(instance, other)
+                    .await
+            }
         }
     }
 
     async fn handle_cli_runtime_request_opened_event(
         &self,
-        key: &CLIAgentRuntimeSessionKey,
+        instance: &CliSessionInstanceId,
         request: pioneer_cli_agent_runtime::event::RuntimeRequestOpened,
     ) {
+        if !self.cli_runtime_instance_is_current(instance).await {
+            self.audit_stale_cli_runtime_process_activity(instance, "request_opened");
+            return;
+        }
+        let key = instance.key();
         let Some(turn_binding) = self
             .cli_runtime_turn_binding_for_native_turn_option(
-                key,
+                instance,
                 request.native_thread_id.as_deref(),
                 request.native_turn_id.as_deref(),
             )
@@ -2621,7 +2909,7 @@ impl MessageProcessor {
                     return;
                 }
                 self.buffer_cli_runtime_event_until_turn_binding(
-                    key,
+                    instance,
                     native_thread_id.as_str(),
                     native_turn_id.as_str(),
                     RuntimeEvent::RequestOpened(request),
@@ -2648,15 +2936,20 @@ impl MessageProcessor {
             );
             return;
         };
-        self.open_bound_cli_runtime_request(key, turn_binding, request)
+        self.open_bound_cli_runtime_request(instance, turn_binding, request)
             .await;
     }
 
     async fn handle_cli_runtime_request_resolved_event(
         &self,
-        key: &CLIAgentRuntimeSessionKey,
+        instance: &CliSessionInstanceId,
         resolved: RuntimeRequestResolved,
     ) {
+        if !self.cli_runtime_instance_is_current(instance).await {
+            self.audit_stale_cli_runtime_process_activity(instance, "request_resolved");
+            return;
+        }
+        let key = instance.key();
         let pending_requests = match self
             .crud_store
             .list_cli_runtime_pending_requests(pioneer_crud::CliRuntimePendingRequestListFilter {
@@ -2737,6 +3030,13 @@ impl MessageProcessor {
         };
 
         if let Some(cancelled) = cancelled {
+            if cli_runtime_kind_config_from_stored_kind(cancelled.runtime_kind.as_str())
+                == Some(GatewayCliAgentRuntimeKindConfig::Codex)
+            {
+                let _ = self
+                    .take_cli_runtime_machine_request(cancelled.request_id.as_str())
+                    .await;
+            }
             self.emit_cli_runtime_request_resolved(cancelled.clone(), resolution.clone())
                 .await;
             if cancelled.request_kind
@@ -2753,10 +3053,11 @@ impl MessageProcessor {
 
     async fn open_bound_cli_runtime_request(
         &self,
-        key: &CLIAgentRuntimeSessionKey,
+        instance: &CliSessionInstanceId,
         turn_binding: pioneer_crud::CliRuntimeTurnBindingRecord,
         request: pioneer_cli_agent_runtime::event::RuntimeRequestOpened,
     ) {
+        let key = instance.key();
         if !self
             .cli_runtime_turn_binding_accepts_native_activity(
                 key,
@@ -3090,10 +3391,15 @@ impl MessageProcessor {
 
     async fn process_bound_cli_runtime_event(
         &self,
-        key: &CLIAgentRuntimeSessionKey,
+        instance: &CliSessionInstanceId,
         turn_binding: pioneer_crud::CliRuntimeTurnBindingRecord,
         event: RuntimeEvent,
     ) -> bool {
+        if !self.cli_runtime_instance_is_current(instance).await {
+            self.audit_stale_cli_runtime_process_activity(instance, "bound_event");
+            return false;
+        }
+        let key = instance.key();
         let native_turn_id = cli_runtime_native_turn_id_for_event(&event);
         let native_turn_id_label = native_turn_id.unwrap_or("<none>");
         let native_thread_id = cli_runtime_native_thread_id_for_event(&event);
@@ -3254,7 +3560,7 @@ impl MessageProcessor {
                     }
                 }
             }
-            self.update_cli_runtime_command_item_registry(key, &turn_binding, &event)
+            self.update_cli_runtime_command_item_registry(instance, &turn_binding, &event)
                 .await;
             self.handle_cli_runtime_recovery_native_failure(
                 turn_binding.turn_id.clone(),
@@ -3300,7 +3606,7 @@ impl MessageProcessor {
                     }
                 }
             }
-            self.update_cli_runtime_command_item_registry(key, &turn_binding, &event)
+            self.update_cli_runtime_command_item_registry(instance, &turn_binding, &event)
                 .await;
             return self
                 .report_turn_failure(
@@ -3317,7 +3623,7 @@ impl MessageProcessor {
             turn_id: turn_binding.turn_id.clone(),
             recovery: recovery.clone(),
         };
-        let event_hub = self.ensure_cli_runtime_execution_event_hub(key).await;
+        let event_hub = self.ensure_cli_runtime_execution_event_hub(instance).await;
         let projected = crate::cli_runtime::projector::project_cli_runtime_event(&context, &event);
         for durable in projected.durable {
             if let Err(error) = event_hub.publish_durable_and_wait(durable).await {
@@ -3366,7 +3672,7 @@ impl MessageProcessor {
         for progress in projected.progress {
             event_hub.publish_progress(progress);
         }
-        self.update_cli_runtime_command_item_registry(key, &turn_binding, &event)
+        self.update_cli_runtime_command_item_registry(instance, &turn_binding, &event)
             .await;
         if cli_runtime_event_confirms_recovery(&event)
             && let (Some(attempt), Some(recovery)) = (turn_attempt.as_ref(), recovery.as_ref())
@@ -3510,16 +3816,26 @@ impl MessageProcessor {
         }
     }
 
-    pub(super) async fn flush_cli_runtime_events_for_native_turn(
+    pub(super) async fn flush_cli_runtime_events_for_native_turn<
+        O: CliSessionInstanceOrigin + ?Sized,
+    >(
         &self,
-        key: &CLIAgentRuntimeSessionKey,
+        origin: &O,
         native_thread_id: &str,
         native_turn_id: &str,
     ) {
+        let instance = origin.to_session_instance();
+        let instance = &instance;
+        if !self.cli_runtime_instance_is_current(instance).await {
+            self.audit_stale_cli_runtime_process_activity(instance, "buffer_flush");
+            return;
+        }
+        let key = instance.key();
         let pending_key = CLIRuntimePendingTurnEventKey {
             workspace_id: key.workspace_id.clone(),
             runtime_id: key.runtime_id.clone(),
             thread_id: key.thread_id.clone(),
+            session_generation: instance.generation(),
             native_thread_id: native_thread_id.to_owned(),
             native_turn_id: native_turn_id.to_owned(),
         };
@@ -3540,7 +3856,7 @@ impl MessageProcessor {
         }
 
         let Some(turn_binding) = self
-            .cli_runtime_turn_binding_for_native_turn(key, native_thread_id, native_turn_id)
+            .cli_runtime_turn_binding_for_native_turn(instance, native_thread_id, native_turn_id)
             .await
         else {
             if !pending.is_empty() {
@@ -3600,12 +3916,20 @@ impl MessageProcessor {
                     );
                     match pending_event.event {
                         RuntimeEvent::RequestOpened(request) => {
-                            self.open_bound_cli_runtime_request(key, turn_binding.clone(), request)
-                                .await;
+                            self.open_bound_cli_runtime_request(
+                                instance,
+                                turn_binding.clone(),
+                                request,
+                            )
+                            .await;
                         }
                         event => {
-                            self.process_bound_cli_runtime_event(key, turn_binding.clone(), event)
-                                .await;
+                            self.process_bound_cli_runtime_event(
+                                instance,
+                                turn_binding.clone(),
+                                event,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -3621,9 +3945,10 @@ impl MessageProcessor {
                         received_sequence = pending_request.received_sequence,
                         "flushing buffered CLI runtime server request"
                     );
-                    self.handle_cli_runtime_codex_server_request(
-                        key,
+                    self.handle_cli_runtime_codex_server_request_with_responder(
+                        instance,
                         pending_request.request,
+                        pending_request.responder,
                         pending_request.event,
                     )
                     .await;
@@ -4069,7 +4394,7 @@ impl MessageProcessor {
 
         for event in observation.reconciliation_events.iter().cloned() {
             if !self
-                .process_bound_cli_runtime_event(&key, binding.clone(), event)
+                .process_bound_cli_runtime_event(handle.instance(), binding.clone(), event)
                 .await
             {
                 anyhow::bail!(
@@ -4138,7 +4463,7 @@ impl MessageProcessor {
                 }
                 self.commit_cli_runtime_final_diff_snapshot(&key, binding, native_turn_id)
                     .await;
-                self.ensure_cli_runtime_execution_event_hub(&key)
+                self.ensure_cli_runtime_execution_event_hub(handle.instance())
                     .await
                     .publish_durable_and_wait(AgentDurableEvent::TurnBlocked {
                         thread_id: binding.thread_id.clone(),
@@ -4155,7 +4480,7 @@ impl MessageProcessor {
             CLIAgentRuntimeObservedTurnStatus::InProgress => unreachable!(),
         };
         if !self
-            .process_bound_cli_runtime_event(&key, binding.clone(), terminal_event)
+            .process_bound_cli_runtime_event(handle.instance(), binding.clone(), terminal_event)
             .await
         {
             anyhow::bail!("failed to commit canonical runtime terminal observation");
@@ -4277,22 +4602,17 @@ impl MessageProcessor {
                         key.thread_id.clone(),
                         key.native_thread_id.clone(),
                         key.native_turn_id.clone(),
-                        requests.len(),
+                        requests.clone(),
                     ));
                 }
                 keep
             });
         }
 
-        for (
-            workspace_id,
-            runtime_id,
-            thread_id,
-            native_thread_id,
-            native_turn_id,
-            request_count,
-        ) in removed
+        for (workspace_id, runtime_id, thread_id, native_thread_id, native_turn_id, requests) in
+            removed
         {
+            let request_count = requests.len();
             warn!(
                 workspace_id = workspace_id.as_str(),
                 runtime_id = runtime_id.as_str(),
@@ -4302,20 +4622,31 @@ impl MessageProcessor {
                 request_count,
                 "discarded unbound CLI runtime native turn server requests after TTL"
             );
+            for request in requests {
+                self.fail_codex_machine_request(
+                    &request.responder,
+                    CLI_RUNTIME_MACHINE_REQUEST_TIMEOUT_CODE,
+                    "server request timed out before native turn binding became available",
+                    Some(json!({"method": request.request.method})),
+                )
+                .await;
+            }
         }
     }
 
     async fn buffer_cli_runtime_event_until_turn_binding(
         &self,
-        key: &CLIAgentRuntimeSessionKey,
+        instance: &CliSessionInstanceId,
         native_thread_id: &str,
         native_turn_id: &str,
         event: RuntimeEvent,
     ) {
+        let key = instance.key();
         let pending_key = CLIRuntimePendingTurnEventKey {
             workspace_id: key.workspace_id.clone(),
             runtime_id: key.runtime_id.clone(),
             thread_id: key.thread_id.clone(),
+            session_generation: instance.generation(),
             native_thread_id: native_thread_id.to_owned(),
             native_turn_id: native_turn_id.to_owned(),
         };
@@ -4341,63 +4672,270 @@ impl MessageProcessor {
 
     async fn buffer_cli_runtime_codex_server_request_until_turn_binding(
         &self,
-        key: &CLIAgentRuntimeSessionKey,
+        instance: &CliSessionInstanceId,
         native_thread_id: &str,
         native_turn_id: &str,
         request: CodexJsonlRpcServerRequest,
+        responder: CLIAgentRuntimeMachineRequestResponder,
         event: RuntimeEvent,
     ) {
+        let key = instance.key();
         let pending_key = CLIRuntimePendingTurnEventKey {
             workspace_id: key.workspace_id.clone(),
             runtime_id: key.runtime_id.clone(),
             thread_id: key.thread_id.clone(),
+            session_generation: instance.generation(),
             native_thread_id: native_thread_id.to_owned(),
             native_turn_id: native_turn_id.to_owned(),
         };
+        let mut evicted = Vec::new();
         let mut buffer = self.cli_runtime_pending_turn_server_requests.lock().await;
         if !buffer.contains_key(&pending_key)
             && buffer.len() >= CLI_RUNTIME_PENDING_TURN_EVENT_MAX_KEYS
             && let Some(oldest_key) = buffer.keys().next().cloned()
         {
-            buffer.remove(&oldest_key);
+            evicted.extend(buffer.remove(&oldest_key).unwrap_or_default());
         }
         let requests = buffer.entry(pending_key).or_default();
         if requests.len() >= CLI_RUNTIME_PENDING_TURN_EVENT_MAX_PER_TURN {
-            requests.remove(0);
+            evicted.push(requests.remove(0));
         }
         requests.push(CLIRuntimePendingTurnServerRequest {
             request,
+            responder,
             event,
             received_at_unix_ms: now_timestamp_millis(),
             received_sequence: self
                 .cli_runtime_pending_turn_activity_sequence
                 .fetch_add(1, Ordering::Relaxed),
         });
+        drop(buffer);
+        for request in evicted {
+            self.fail_codex_machine_request(
+                &request.responder,
+                CLI_RUNTIME_MACHINE_REQUEST_UNAVAILABLE_CODE,
+                "server request evicted before native turn binding became available",
+                Some(json!({"method": request.request.method})),
+            )
+            .await;
+        }
     }
 
-    pub(super) async fn handle_cli_runtime_codex_server_request(
+    #[cfg(test)]
+    pub(super) async fn handle_cli_runtime_codex_server_request<
+        O: CliSessionInstanceOrigin + ?Sized,
+    >(
         &self,
-        key: &CLIAgentRuntimeSessionKey,
+        origin: &O,
         request: CodexJsonlRpcServerRequest,
         event: RuntimeEvent,
     ) {
+        let logical = origin.to_session_instance();
+        let Some(manager) = self.cli_runtime_manager.as_ref() else {
+            return;
+        };
+        let Some(handle) = manager.existing_session(logical.key()).await else {
+            return;
+        };
+        let native_request_id = serde_json::to_value(&request.id)
+            .unwrap_or_else(|_| JsonValue::String(request.id.to_string()));
+        let responder = CLIAgentRuntimeMachineRequestResponder::new(
+            handle.instance().clone(),
+            native_request_id,
+            handle.session(),
+        );
+        self.handle_cli_runtime_codex_server_request_with_responder(
+            handle.instance(),
+            request,
+            responder,
+            event,
+        )
+        .await;
+    }
+
+    pub(super) async fn handle_cli_runtime_codex_server_request_with_responder<
+        O: CliSessionInstanceOrigin + ?Sized,
+    >(
+        &self,
+        origin: &O,
+        request: CodexJsonlRpcServerRequest,
+        responder: CLIAgentRuntimeMachineRequestResponder,
+        event: RuntimeEvent,
+    ) {
+        let instance = origin.to_session_instance();
+        let instance = &instance;
+        if !self.cli_runtime_instance_is_current(instance).await {
+            self.audit_stale_cli_runtime_process_activity(instance, "server_request");
+            self.fail_codex_machine_request(
+                &responder,
+                CLI_RUNTIME_MACHINE_REQUEST_STALE_CODE,
+                "server request belongs to a stale process generation",
+                Some(json!({"method": request.method})),
+            )
+            .await;
+            return;
+        }
+        let key = instance.key();
+        if let Err(message) = validate_codex_machine_request_shape(&request) {
+            self.fail_codex_machine_request(
+                &responder,
+                CLI_RUNTIME_MACHINE_REQUEST_INVALID_PARAMS_CODE,
+                message,
+                Some(json!({"method": request.method})),
+            )
+            .await;
+            return;
+        }
         if matches!(event, RuntimeEvent::Raw(_)) {
             debug!(
                 workspace_id = key.workspace_id.as_str(),
                 runtime_id = key.runtime_id.as_str(),
                 thread_id = key.thread_id.as_str(),
                 method = request.method.as_str(),
-                "ignoring unsupported Codex server request"
+                "rejecting unsupported Codex server request"
             );
+            self.fail_codex_machine_request(
+                &responder,
+                CLI_RUNTIME_MACHINE_REQUEST_UNKNOWN_METHOD_CODE,
+                "unsupported Codex server request method",
+                Some(json!({"method": request.method})),
+            )
+            .await;
             return;
         }
 
         match request.method.as_str() {
+            "item/permissions/requestApproval" => {
+                let params = request
+                    .params
+                    .as_ref()
+                    .and_then(JsonValue::as_object)
+                    .expect("validated Codex permission approval params");
+                let native_thread_id = params
+                    .get("threadId")
+                    .and_then(JsonValue::as_str)
+                    .expect("validated Codex permission approval threadId");
+                let native_turn_id = params
+                    .get("turnId")
+                    .and_then(JsonValue::as_str)
+                    .expect("validated Codex permission approval turnId");
+                let native_item_id = params
+                    .get("itemId")
+                    .and_then(JsonValue::as_str)
+                    .expect("validated Codex permission approval itemId");
+                let requested_permissions = params
+                    .get("permissions")
+                    .cloned()
+                    .expect("validated Codex permission approval permissions");
+
+                let Some(turn_binding) = self
+                    .cli_runtime_turn_binding_for_native_turn_option(
+                        instance,
+                        Some(native_thread_id),
+                        Some(native_turn_id),
+                    )
+                    .await
+                else {
+                    if self
+                        .buffer_cli_runtime_codex_server_request_if_turn_binding_pending(
+                            instance,
+                            Some(native_thread_id),
+                            Some(native_turn_id),
+                            &request,
+                            &responder,
+                            &event,
+                        )
+                        .await
+                    {
+                        return;
+                    }
+                    self.fail_codex_machine_request(
+                        &responder,
+                        CLI_RUNTIME_MACHINE_REQUEST_STALE_CODE,
+                        "Codex MCP permission request has no active Pioneer turn binding",
+                        Some(json!({"method": request.method})),
+                    )
+                    .await;
+                    return;
+                };
+                if !self
+                    .cli_runtime_turn_binding_accepts_native_activity(
+                        key,
+                        &turn_binding,
+                        Some(native_thread_id),
+                        request.method.as_str(),
+                    )
+                    .await
+                {
+                    self.fail_codex_machine_request(
+                        &responder,
+                        CLI_RUNTIME_MACHINE_REQUEST_STALE_CODE,
+                        "Codex MCP permission request belongs to a stale or terminal turn",
+                        Some(json!({"method": request.method})),
+                    )
+                    .await;
+                    return;
+                }
+
+                let approval = responder
+                    .session()
+                    .native_mcp_approval_response(CLIAgentRuntimeNativeMcpApprovalRequest {
+                        native_thread_id: native_thread_id.to_owned(),
+                        native_turn_id: native_turn_id.to_owned(),
+                        native_item_id: native_item_id.to_owned(),
+                        requested_permissions,
+                    })
+                    .await;
+                match approval {
+                    Ok(Some(response)) => {
+                        if let Err(error) = responder.respond(response).await {
+                            debug!(
+                                workspace_id = key.workspace_id.as_str(),
+                                runtime_id = key.runtime_id.as_str(),
+                                thread_id = key.thread_id.as_str(),
+                                native_thread_id,
+                                native_turn_id,
+                                native_item_id,
+                                error = %format!("{error:#}"),
+                                "Codex MCP permission approval lane was already closed"
+                            );
+                        }
+                    }
+                    Ok(None) => {
+                        self.fail_codex_machine_request(
+                            &responder,
+                            CLI_RUNTIME_MACHINE_REQUEST_STALE_CODE,
+                            "Codex MCP permission request does not match the active frozen binding",
+                            Some(json!({"method": request.method})),
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        warn!(
+                            workspace_id = key.workspace_id.as_str(),
+                            runtime_id = key.runtime_id.as_str(),
+                            thread_id = key.thread_id.as_str(),
+                            native_thread_id,
+                            native_turn_id,
+                            native_item_id,
+                            error = %format!("{error:#}"),
+                            "failed to authorize Codex MCP permission request"
+                        );
+                        self.fail_codex_machine_request(
+                            &responder,
+                            CLI_RUNTIME_MACHINE_REQUEST_UNAVAILABLE_CODE,
+                            "Codex MCP permission authorization failed closed",
+                            Some(json!({"method": request.method})),
+                        )
+                        .await;
+                    }
+                }
+            }
             "item/commandExecution/requestApproval" => {
                 let decoded = decode_codex_command_approval_request(&request);
                 let Some(turn_binding) = self
                     .cli_runtime_turn_binding_for_native_turn_option(
-                        key,
+                        instance,
                         decoded.native_thread_id.as_deref(),
                         decoded.native_turn_id.as_deref(),
                     )
@@ -4405,10 +4943,11 @@ impl MessageProcessor {
                 else {
                     if self
                         .buffer_cli_runtime_codex_server_request_if_turn_binding_pending(
-                            key,
+                            instance,
                             decoded.native_thread_id.as_deref(),
                             decoded.native_turn_id.as_deref(),
                             &request,
+                            &responder,
                             &event,
                         )
                         .await
@@ -4418,6 +4957,7 @@ impl MessageProcessor {
                     self.cancel_stale_codex_command_approval_request(
                         key,
                         &decoded,
+                        &responder,
                         "missing Pioneer turn binding",
                     )
                     .await;
@@ -4435,12 +4975,13 @@ impl MessageProcessor {
                     self.cancel_stale_codex_command_approval_request(
                         key,
                         &decoded,
+                        &responder,
                         "terminal turn",
                     )
                     .await;
                     return;
                 }
-                if let Err(error) = self
+                match self
                     .open_codex_command_approval_request_for_turn(
                         key.workspace_id.as_str(),
                         key.runtime_id.as_str(),
@@ -4451,35 +4992,48 @@ impl MessageProcessor {
                     )
                     .await
                 {
-                    warn!(
+                    Ok(opened) => {
+                        self.register_cli_runtime_machine_request(
+                            instance,
+                            &request,
+                            responder.clone(),
+                            &opened,
+                        )
+                        .await;
+                        if let Some(native_turn_id) = decoded.native_turn_id.as_deref() {
+                            self.confirm_cli_runtime_recovery_for_native_progress(
+                                key,
+                                &turn_binding,
+                                native_turn_id,
+                                request.method.as_str(),
+                            )
+                            .await;
+                        }
+                    }
+                    Err(error) => {
+                        warn!(
                         workspace_id = key.workspace_id.as_str(),
                         runtime_id = key.runtime_id.as_str(),
                         thread_id = key.thread_id.as_str(),
                         method = request.method.as_str(),
                         error = %format!("{error:#}"),
                         "failed to open Codex CLI runtime command approval request"
-                    );
-                    self.cancel_stale_codex_command_approval_request(
-                        key,
-                        &decoded,
-                        "failed to open Pioneer pending request",
-                    )
-                    .await;
-                } else if let Some(native_turn_id) = decoded.native_turn_id.as_deref() {
-                    self.confirm_cli_runtime_recovery_for_native_progress(
-                        key,
-                        &turn_binding,
-                        native_turn_id,
-                        request.method.as_str(),
-                    )
-                    .await;
+                        );
+                        self.cancel_stale_codex_command_approval_request(
+                            key,
+                            &decoded,
+                            &responder,
+                            "failed to open Pioneer pending request",
+                        )
+                        .await;
+                    }
                 }
             }
             "item/fileChange/requestApproval" => {
                 let decoded = decode_codex_file_change_approval_request(&request);
                 let Some(turn_binding) = self
                     .cli_runtime_turn_binding_for_native_turn_option(
-                        key,
+                        instance,
                         decoded.native_thread_id.as_deref(),
                         decoded.native_turn_id.as_deref(),
                     )
@@ -4487,10 +5041,11 @@ impl MessageProcessor {
                 else {
                     if self
                         .buffer_cli_runtime_codex_server_request_if_turn_binding_pending(
-                            key,
+                            instance,
                             decoded.native_thread_id.as_deref(),
                             decoded.native_turn_id.as_deref(),
                             &request,
+                            &responder,
                             &event,
                         )
                         .await
@@ -4500,6 +5055,7 @@ impl MessageProcessor {
                     self.cancel_stale_codex_file_change_approval_request(
                         key,
                         &decoded,
+                        &responder,
                         "missing Pioneer turn binding",
                     )
                     .await;
@@ -4517,12 +5073,13 @@ impl MessageProcessor {
                     self.cancel_stale_codex_file_change_approval_request(
                         key,
                         &decoded,
+                        &responder,
                         "terminal turn",
                     )
                     .await;
                     return;
                 }
-                if let Err(error) = self
+                match self
                     .open_codex_file_change_approval_request_for_turn(
                         key.workspace_id.as_str(),
                         key.runtime_id.as_str(),
@@ -4533,35 +5090,48 @@ impl MessageProcessor {
                     )
                     .await
                 {
-                    warn!(
+                    Ok(opened) => {
+                        self.register_cli_runtime_machine_request(
+                            instance,
+                            &request,
+                            responder.clone(),
+                            &opened,
+                        )
+                        .await;
+                        if let Some(native_turn_id) = decoded.native_turn_id.as_deref() {
+                            self.confirm_cli_runtime_recovery_for_native_progress(
+                                key,
+                                &turn_binding,
+                                native_turn_id,
+                                request.method.as_str(),
+                            )
+                            .await;
+                        }
+                    }
+                    Err(error) => {
+                        warn!(
                         workspace_id = key.workspace_id.as_str(),
                         runtime_id = key.runtime_id.as_str(),
                         thread_id = key.thread_id.as_str(),
                         method = request.method.as_str(),
                         error = %format!("{error:#}"),
                         "failed to open Codex CLI runtime file change approval request"
-                    );
-                    self.cancel_stale_codex_file_change_approval_request(
-                        key,
-                        &decoded,
-                        "failed to open Pioneer pending request",
-                    )
-                    .await;
-                } else if let Some(native_turn_id) = decoded.native_turn_id.as_deref() {
-                    self.confirm_cli_runtime_recovery_for_native_progress(
-                        key,
-                        &turn_binding,
-                        native_turn_id,
-                        request.method.as_str(),
-                    )
-                    .await;
+                        );
+                        self.cancel_stale_codex_file_change_approval_request(
+                            key,
+                            &decoded,
+                            &responder,
+                            "failed to open Pioneer pending request",
+                        )
+                        .await;
+                    }
                 }
             }
             "item/tool/requestUserInput" | "tool/requestUserInput" | "userInput/request" => {
                 let decoded = decode_codex_user_input_request(&request);
                 let Some(turn_binding) = self
                     .cli_runtime_turn_binding_for_native_turn_option(
-                        key,
+                        instance,
                         decoded.native_thread_id.as_deref(),
                         decoded.native_turn_id.as_deref(),
                     )
@@ -4569,10 +5139,11 @@ impl MessageProcessor {
                 else {
                     if self
                         .buffer_cli_runtime_codex_server_request_if_turn_binding_pending(
-                            key,
+                            instance,
                             decoded.native_thread_id.as_deref(),
                             decoded.native_turn_id.as_deref(),
                             &request,
+                            &responder,
                             &event,
                         )
                         .await
@@ -4582,6 +5153,7 @@ impl MessageProcessor {
                     self.cancel_stale_codex_user_input_request(
                         key,
                         &decoded,
+                        &responder,
                         "missing Pioneer turn binding",
                     )
                     .await;
@@ -4596,11 +5168,16 @@ impl MessageProcessor {
                     )
                     .await
                 {
-                    self.cancel_stale_codex_user_input_request(key, &decoded, "terminal turn")
-                        .await;
+                    self.cancel_stale_codex_user_input_request(
+                        key,
+                        &decoded,
+                        &responder,
+                        "terminal turn",
+                    )
+                    .await;
                     return;
                 }
-                if let Err(error) = self
+                match self
                     .open_codex_user_input_request_for_turn(
                         key.workspace_id.as_str(),
                         key.runtime_id.as_str(),
@@ -4611,54 +5188,77 @@ impl MessageProcessor {
                     )
                     .await
                 {
-                    warn!(
+                    Ok(opened) => {
+                        self.register_cli_runtime_machine_request(
+                            instance,
+                            &request,
+                            responder.clone(),
+                            &opened,
+                        )
+                        .await;
+                        if let Some(native_turn_id) = decoded.native_turn_id.as_deref() {
+                            self.confirm_cli_runtime_recovery_for_native_progress(
+                                key,
+                                &turn_binding,
+                                native_turn_id,
+                                request.method.as_str(),
+                            )
+                            .await;
+                        }
+                    }
+                    Err(error) => {
+                        warn!(
                         workspace_id = key.workspace_id.as_str(),
                         runtime_id = key.runtime_id.as_str(),
                         thread_id = key.thread_id.as_str(),
                         method = request.method.as_str(),
                         error = %format!("{error:#}"),
                         "failed to open Codex CLI runtime user input request"
-                    );
-                    self.cancel_stale_codex_user_input_request(
-                        key,
-                        &decoded,
-                        "failed to open Pioneer pending request",
-                    )
-                    .await;
-                } else if let Some(native_turn_id) = decoded.native_turn_id.as_deref() {
-                    self.confirm_cli_runtime_recovery_for_native_progress(
-                        key,
-                        &turn_binding,
-                        native_turn_id,
-                        request.method.as_str(),
-                    )
-                    .await;
+                        );
+                        self.cancel_stale_codex_user_input_request(
+                            key,
+                            &decoded,
+                            &responder,
+                            "failed to open Pioneer pending request",
+                        )
+                        .await;
+                    }
                 }
             }
-            _ => {}
+            _ => {
+                self.fail_codex_machine_request(
+                    &responder,
+                    CLI_RUNTIME_MACHINE_REQUEST_UNKNOWN_METHOD_CODE,
+                    "unsupported Codex server request method",
+                    Some(json!({"method": request.method})),
+                )
+                .await;
+            }
         }
     }
 
     async fn cli_runtime_turn_binding_for_native_turn_option(
         &self,
-        key: &CLIAgentRuntimeSessionKey,
+        instance: &CliSessionInstanceId,
         native_thread_id: Option<&str>,
         native_turn_id: Option<&str>,
     ) -> Option<pioneer_crud::CliRuntimeTurnBindingRecord> {
         let native_thread_id = native_thread_id?;
         let native_turn_id = native_turn_id?;
-        self.cli_runtime_turn_binding_for_native_turn(key, native_thread_id, native_turn_id)
+        self.cli_runtime_turn_binding_for_native_turn(instance, native_thread_id, native_turn_id)
             .await
     }
 
     async fn buffer_cli_runtime_codex_server_request_if_turn_binding_pending(
         &self,
-        key: &CLIAgentRuntimeSessionKey,
+        instance: &CliSessionInstanceId,
         native_thread_id: Option<&str>,
         native_turn_id: Option<&str>,
         request: &CodexJsonlRpcServerRequest,
+        responder: &CLIAgentRuntimeMachineRequestResponder,
         event: &RuntimeEvent,
     ) -> bool {
+        let key = instance.key();
         let Some(native_turn_id) = native_turn_id else {
             return false;
         };
@@ -4672,10 +5272,11 @@ impl MessageProcessor {
             return false;
         }
         self.buffer_cli_runtime_codex_server_request_until_turn_binding(
-            key,
+            instance,
             native_thread_id,
             native_turn_id,
             request.clone(),
+            responder.clone(),
             event.clone(),
         )
         .await;
@@ -4825,27 +5426,29 @@ impl MessageProcessor {
 
     async fn cli_runtime_pioneer_turn_id_for_native_turn(
         &self,
-        key: &CLIAgentRuntimeSessionKey,
+        instance: &CliSessionInstanceId,
         native_thread_id: Option<&str>,
         native_turn_id: Option<&str>,
     ) -> Option<String> {
         let native_thread_id = native_thread_id?;
         let native_turn_id = native_turn_id?;
-        self.cli_runtime_turn_binding_for_native_turn(key, native_thread_id, native_turn_id)
+        self.cli_runtime_turn_binding_for_native_turn(instance, native_thread_id, native_turn_id)
             .await
             .map(|binding| binding.turn_id)
     }
 
     async fn cli_runtime_turn_binding_for_native_turn(
         &self,
-        key: &CLIAgentRuntimeSessionKey,
+        instance: &CliSessionInstanceId,
         native_thread_id: &str,
         native_turn_id: &str,
     ) -> Option<pioneer_crud::CliRuntimeTurnBindingRecord> {
+        let key = instance.key();
         let cache_key = CLIRuntimeNativeTurnKey {
             workspace_id: key.workspace_id.clone(),
             runtime_id: key.runtime_id.clone(),
             thread_id: key.thread_id.clone(),
+            session_generation: instance.generation(),
             native_thread_id: native_thread_id.to_owned(),
             native_turn_id: native_turn_id.to_owned(),
         };
@@ -4962,12 +5565,12 @@ impl MessageProcessor {
         self.cli_runtime_turn_binding_cache
             .lock()
             .await
-            .remove(&CLIRuntimeNativeTurnKey {
-                workspace_id: binding.workspace_id.clone(),
-                runtime_id: binding.runtime_id.clone(),
-                thread_id: binding.thread_id.clone(),
-                native_thread_id: binding.native_thread_id.clone(),
-                native_turn_id: native_turn_id.to_owned(),
+            .retain(|key, _| {
+                key.workspace_id != binding.workspace_id
+                    || key.runtime_id != binding.runtime_id
+                    || key.thread_id != binding.thread_id
+                    || key.native_thread_id != binding.native_thread_id
+                    || key.native_turn_id != native_turn_id
             });
     }
 
@@ -5363,6 +5966,31 @@ impl MessageProcessor {
         status: TurnStatus,
         reason: &str,
     ) {
+        if status != TurnStatus::InProgress {
+            self.mcp_service
+                .cancel_turn_mcp_invocations(binding.turn_id.as_str());
+            if let Some(manager) = self.cli_runtime_manager.as_ref()
+                && let Ok(key) = CLIAgentRuntimeSessionKey::new(
+                    binding.workspace_id.clone(),
+                    binding.runtime_id.clone(),
+                    binding.thread_id.clone(),
+                )
+                && let Some(handle) = manager.existing_session(&key).await
+                && let Err(error) = handle
+                    .session()
+                    .terminal_mcp_turn(binding.turn_id.as_str())
+                    .await
+            {
+                warn!(
+                    workspace_id = binding.workspace_id.as_str(),
+                    runtime_id = binding.runtime_id.as_str(),
+                    thread_id = binding.thread_id.as_str(),
+                    turn_id = binding.turn_id.as_str(),
+                    error = %format!("{error:#}"),
+                    "failed to terminalize CLI MCP turn lease"
+                );
+            }
+        }
         match status {
             TurnStatus::InProgress => {}
             TurnStatus::Completed => {
@@ -5592,6 +6220,20 @@ impl MessageProcessor {
             )),
         }?;
         if let Some(expired) = expired.as_ref() {
+            if cli_runtime_kind_config_from_stored_kind(expired.runtime_kind.as_str())
+                == Some(GatewayCliAgentRuntimeKindConfig::Codex)
+                && let Some(pending) = self
+                    .take_cli_runtime_machine_request(expired.request_id.as_str())
+                    .await
+            {
+                self.fail_codex_machine_request(
+                    &pending.responder,
+                    CLI_RUNTIME_MACHINE_REQUEST_TIMEOUT_CODE,
+                    "Codex machine request expired before completion",
+                    Some(json!({"method": pending.method})),
+                )
+                .await;
+            }
             self.emit_cli_runtime_request_resolved(expired.clone(), resolution.clone())
                 .await;
             if expired.request_kind
@@ -5693,12 +6335,13 @@ impl MessageProcessor {
         &self,
         key: &CLIAgentRuntimeSessionKey,
         request: &CodexCommandApprovalRequest,
+        responder: &CLIAgentRuntimeMachineRequestResponder,
         reason: &str,
     ) {
         self.cancel_stale_codex_native_request(
             key,
+            responder,
             "item/commandExecution/requestApproval",
-            request.native_request_id_json.clone(),
             codex_command_approval_response(CodexCommandApprovalDecision::Cancel),
             request.native_thread_id.as_deref(),
             request.native_turn_id.as_deref(),
@@ -5707,16 +6350,202 @@ impl MessageProcessor {
         .await;
     }
 
+    async fn register_cli_runtime_machine_request(
+        &self,
+        instance: &CliSessionInstanceId,
+        request: &CodexJsonlRpcServerRequest,
+        responder: CLIAgentRuntimeMachineRequestResponder,
+        opened: &CliRuntimePendingRequestRecord,
+    ) {
+        let provider_request_id_json =
+            serde_json::to_string(&request.id).unwrap_or_else(|_| format!("\"{}\"", request.id));
+        let responder_request_id_json = serde_json::to_string(responder.native_request_id())
+            .unwrap_or_else(|_| responder.native_request_id().to_string());
+        if responder.instance() != instance || responder_request_id_json != provider_request_id_json
+        {
+            self.fail_codex_machine_request(
+                &responder,
+                CLI_RUNTIME_MACHINE_REQUEST_STALE_CODE,
+                "server request responder origin does not match request envelope",
+                Some(json!({"method": request.method})),
+            )
+            .await;
+            let _ = self
+                .expire_cli_runtime_pending_request_as_stale(opened)
+                .await;
+            return;
+        }
+
+        let key = CLIRuntimeMachineRequestKey {
+            instance: instance.clone(),
+            provider_request_id_json,
+        };
+        let pending = CLIRuntimePendingMachineRequest {
+            pioneer_request_id: opened.request_id.clone(),
+            method: request.method.clone(),
+            responder: responder.clone(),
+            registered_sequence: self
+                .cli_runtime_pending_turn_activity_sequence
+                .fetch_add(1, Ordering::Relaxed),
+        };
+        let rejection = {
+            let mut registry = self.cli_runtime_machine_requests.lock().await;
+            if registry.by_lane.contains_key(&key) {
+                Some("duplicate provider request lane")
+            } else if registry
+                .by_pioneer_request_id
+                .contains_key(opened.request_id.as_str())
+            {
+                Some("duplicate Pioneer pending request lane")
+            } else if registry.by_lane.len() >= CLI_RUNTIME_MAX_PENDING_MACHINE_REQUESTS {
+                Some("Gateway pending machine request capacity exhausted")
+            } else {
+                registry
+                    .by_pioneer_request_id
+                    .insert(opened.request_id.clone(), key.clone());
+                registry.by_lane.insert(key, pending);
+                None
+            }
+        };
+        if let Some(reason) = rejection {
+            self.fail_codex_machine_request(
+                &responder,
+                CLI_RUNTIME_MACHINE_REQUEST_UNAVAILABLE_CODE,
+                reason,
+                Some(json!({"method": request.method})),
+            )
+            .await;
+            let _ = self
+                .expire_cli_runtime_pending_request_as_stale(opened)
+                .await;
+        }
+    }
+
+    async fn cli_runtime_machine_request_is_registered(&self, pioneer_request_id: &str) -> bool {
+        self.cli_runtime_machine_requests
+            .lock()
+            .await
+            .by_pioneer_request_id
+            .contains_key(pioneer_request_id)
+    }
+
+    async fn take_cli_runtime_machine_request(
+        &self,
+        pioneer_request_id: &str,
+    ) -> Option<CLIRuntimePendingMachineRequest> {
+        let mut registry = self.cli_runtime_machine_requests.lock().await;
+        let key = registry.by_pioneer_request_id.remove(pioneer_request_id)?;
+        registry.by_lane.remove(&key)
+    }
+
+    async fn finalize_cli_runtime_machine_requests_for_instance(
+        &self,
+        instance: &CliSessionInstanceId,
+        code: i64,
+        message: &str,
+    ) {
+        let pending = {
+            let mut registry = self.cli_runtime_machine_requests.lock().await;
+            let keys = registry
+                .by_lane
+                .keys()
+                .filter(|key| key.instance == *instance)
+                .cloned()
+                .collect::<Vec<_>>();
+            keys.into_iter()
+                .filter_map(|key| {
+                    let pending = registry.by_lane.remove(&key)?;
+                    registry
+                        .by_pioneer_request_id
+                        .remove(pending.pioneer_request_id.as_str());
+                    Some(pending)
+                })
+                .collect::<Vec<_>>()
+        };
+        let buffered = {
+            let key = instance.key();
+            let mut buffer = self.cli_runtime_pending_turn_server_requests.lock().await;
+            let keys = buffer
+                .keys()
+                .filter(|pending_key| {
+                    pending_key.workspace_id == key.workspace_id
+                        && pending_key.runtime_id == key.runtime_id
+                        && pending_key.thread_id == key.thread_id
+                        && pending_key.session_generation == instance.generation()
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            keys.into_iter()
+                .flat_map(|key| buffer.remove(&key).unwrap_or_default())
+                .collect::<Vec<_>>()
+        };
+
+        for pending in pending {
+            self.fail_codex_machine_request(
+                &pending.responder,
+                code,
+                message,
+                Some(json!({
+                    "method": pending.method,
+                    "registeredSequence": pending.registered_sequence,
+                })),
+            )
+            .await;
+            if let Ok(Some(record)) = self
+                .crud_store
+                .get_cli_runtime_pending_request(pending.pioneer_request_id.as_str())
+                .await
+            {
+                let _ = self
+                    .expire_cli_runtime_pending_request_as_stale(&record)
+                    .await;
+            }
+        }
+        for request in buffered {
+            self.fail_codex_machine_request(
+                &request.responder,
+                code,
+                message,
+                Some(json!({"method": request.request.method})),
+            )
+            .await;
+        }
+    }
+
+    async fn fail_codex_machine_request(
+        &self,
+        responder: &CLIAgentRuntimeMachineRequestResponder,
+        code: i64,
+        message: impl Into<String>,
+        data: Option<JsonValue>,
+    ) {
+        let message = message.into();
+        if let Err(error) = responder.fail(code, message.clone(), data).await {
+            let key = responder.instance().key();
+            debug!(
+                workspace_id = key.workspace_id.as_str(),
+                runtime_id = key.runtime_id.as_str(),
+                thread_id = key.thread_id.as_str(),
+                session_generation = responder.instance().generation(),
+                code,
+                message,
+                error = %format!("{error:#}"),
+                "originating Codex machine request lane was already closed"
+            );
+        }
+    }
+
     async fn cancel_stale_codex_file_change_approval_request(
         &self,
         key: &CLIAgentRuntimeSessionKey,
         request: &CodexFileChangeApprovalRequest,
+        responder: &CLIAgentRuntimeMachineRequestResponder,
         reason: &str,
     ) {
         self.cancel_stale_codex_native_request(
             key,
+            responder,
             "item/fileChange/requestApproval",
-            request.native_request_id_json.clone(),
             codex_file_change_approval_response(CodexFileChangeApprovalDecision::Cancel),
             request.native_thread_id.as_deref(),
             request.native_turn_id.as_deref(),
@@ -5729,12 +6558,13 @@ impl MessageProcessor {
         &self,
         key: &CLIAgentRuntimeSessionKey,
         request: &CodexUserInputRequest,
+        responder: &CLIAgentRuntimeMachineRequestResponder,
         reason: &str,
     ) {
         self.cancel_stale_codex_native_request(
             key,
+            responder,
             "item/tool/requestUserInput",
-            request.native_request_id_json.clone(),
             codex_user_input_response(BTreeMap::new()),
             request.native_thread_id.as_deref(),
             request.native_turn_id.as_deref(),
@@ -5746,32 +6576,14 @@ impl MessageProcessor {
     async fn cancel_stale_codex_native_request(
         &self,
         key: &CLIAgentRuntimeSessionKey,
+        responder: &CLIAgentRuntimeMachineRequestResponder,
         method: &str,
-        native_request_id: JsonValue,
         response: JsonValue,
         native_thread_id: Option<&str>,
         native_turn_id: Option<&str>,
         reason: &str,
     ) {
-        let Some(manager) = self.cli_runtime_manager.as_ref() else {
-            return;
-        };
-        let Some(handle) = manager.existing_session(key).await else {
-            debug!(
-                workspace_id = key.workspace_id.as_str(),
-                runtime_id = key.runtime_id.as_str(),
-                thread_id = key.thread_id.as_str(),
-                method,
-                reason,
-                "dropped stale Codex CLI runtime server request because session is already closed"
-            );
-            return;
-        };
-        let session = handle.session();
-        if let Err(error) = session
-            .respond_to_request(native_request_id, response)
-            .await
-        {
+        if let Err(error) = responder.respond(response).await {
             warn!(
                 workspace_id = key.workspace_id.as_str(),
                 runtime_id = key.runtime_id.as_str(),
@@ -5782,6 +6594,7 @@ impl MessageProcessor {
                 "failed to cancel stale Codex CLI runtime server request"
             );
         }
+        let session = responder.session();
         if native_turn_id.is_some()
             && let Err(error) = session
                 .interrupt_turn(native_thread_id, native_turn_id)
@@ -5813,7 +6626,10 @@ impl MessageProcessor {
             );
             return;
         }
-        if let Err(error) = manager.close_session(key).await {
+        let Some(manager) = self.cli_runtime_manager.as_ref() else {
+            return;
+        };
+        if let Err(error) = manager.close_session_instance(responder.instance()).await {
             warn!(
                 workspace_id = key.workspace_id.as_str(),
                 runtime_id = key.runtime_id.as_str(),
@@ -5870,6 +6686,21 @@ impl MessageProcessor {
             == CLIRuntimeRequestKind::Other
         {
             return Ok(None);
+        }
+
+        if cli_runtime_kind_config_from_stored_kind(request.runtime_kind.as_str())
+            == Some(GatewayCliAgentRuntimeKindConfig::Codex)
+        {
+            if self
+                .cli_runtime_machine_request_is_registered(request.request_id.as_str())
+                .await
+            {
+                return Ok(None);
+            }
+            anyhow::bail!(
+                "originating Codex process is not active for request `{}`",
+                request.request_id
+            );
         }
 
         let Some(manager) = self.cli_runtime_manager.as_ref() else {
@@ -5937,18 +6768,49 @@ impl MessageProcessor {
                 }
             };
         let native_request_id = cli_runtime_native_request_id_json_from_record(request)?;
-        let Some(handle) = native_response_session else {
-            anyhow::bail!(
-                "CLI runtime session is not active for request `{}`",
-                request.request_id
-            );
+        let response_session = if request.runtime_kind == "codex" {
+            let Some(pending) = self
+                .take_cli_runtime_machine_request(request.request_id.as_str())
+                .await
+            else {
+                anyhow::bail!(
+                    "originating Codex process response lane is closed for request `{}`",
+                    request.request_id
+                );
+            };
+            if pending.responder.native_request_id() != &native_request_id {
+                self.fail_codex_machine_request(
+                    &pending.responder,
+                    CLI_RUNTIME_MACHINE_REQUEST_STALE_CODE,
+                    "persisted native request id does not match originating response lane",
+                    Some(json!({"method": pending.method})),
+                )
+                .await;
+                anyhow::bail!(
+                    "native request id mismatch for originating Codex request `{}`",
+                    request.request_id
+                );
+            }
+            pending.responder.respond(response).await?;
+            Some(pending.responder.session())
+        } else {
+            let Some(handle) = native_response_session else {
+                anyhow::bail!(
+                    "CLI runtime session is not active for request `{}`",
+                    request.request_id
+                );
+            };
+            let session = handle.session();
+            session
+                .respond_to_request(native_request_id, response)
+                .await?;
+            Some(session)
         };
-        let session = handle.session();
-        session
-            .respond_to_request(native_request_id, response)
-            .await?;
 
-        if should_interrupt && request.native_turn_id.is_some() {
+        if should_interrupt
+            && request.native_turn_id.is_some()
+            && let Some(session) = response_session
+        {
             session
                 .interrupt_turn(
                     request.native_thread_id.as_deref(),
@@ -6192,7 +7054,7 @@ impl MessageProcessor {
         }
     }
 
-    async fn cli_runtime_live_summary_from_instance(
+    pub(crate) async fn cli_runtime_live_summary_from_instance(
         &self,
         workspace_id: &str,
         instance: EffectiveGatewayCliAgentRuntimeInstanceConfig,
@@ -6213,7 +7075,30 @@ impl MessageProcessor {
                         proxy_url.as_deref(),
                     ))
                     .await;
-                apply_codex_account_probe_to_summary(summary, probe)
+                let normal_runtime_ready = probe.status == CodexAccountProbeStatus::Ready;
+                let provider_version = probe.version.clone();
+                let mut summary = apply_codex_account_probe_to_summary(summary, probe);
+                let (max_tools, max_schema_bytes) = self.mcp_service.projection_limit_values();
+                let readiness =
+                    crate::cli_runtime::mcp::readiness::codex_mcp_readiness_for_instance(
+                        &instance,
+                        self.artifact_runtime_home.as_path(),
+                        normal_runtime_ready,
+                        provider_version.as_deref(),
+                        proxy_url.as_deref(),
+                        max_tools,
+                        max_schema_bytes,
+                    )
+                    .await;
+                let policy = CliRuntimeCapabilityPolicy::from_readiness(
+                    true,
+                    normal_runtime_ready,
+                    Some(&readiness),
+                );
+                summary.capabilities =
+                    cli_runtime_capabilities_for_kind_with_policy(instance.kind, policy);
+                summary.diagnostics.extend(readiness.diagnostics);
+                summary
             }
             GatewayCliAgentRuntimeKindConfig::Claude => {
                 let probe = ClaudeProbe::account_read(
@@ -6223,7 +7108,30 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
-                apply_claude_account_probe_to_summary(summary, probe)
+                let normal_runtime_ready = probe.status == ClaudeAccountProbeStatus::Ready;
+                let provider_version = probe.version.clone();
+                let mut summary = apply_claude_account_probe_to_summary(summary, probe);
+                let (max_tools, max_schema_bytes) = self.mcp_service.projection_limit_values();
+                let readiness =
+                    crate::cli_runtime::mcp::readiness::claude_mcp_readiness_for_instance(
+                        &instance,
+                        self.artifact_runtime_home.as_path(),
+                        normal_runtime_ready,
+                        provider_version.as_deref(),
+                        proxy_url.as_deref(),
+                        max_tools,
+                        max_schema_bytes,
+                    )
+                    .await;
+                let policy = CliRuntimeCapabilityPolicy::from_readiness(
+                    true,
+                    normal_runtime_ready,
+                    Some(&readiness),
+                );
+                summary.capabilities =
+                    cli_runtime_capabilities_for_kind_with_policy(instance.kind, policy);
+                summary.diagnostics.extend(readiness.diagnostics);
+                summary
             }
         }
     }
@@ -6536,6 +7444,7 @@ fn cli_runtime_summary_from_instance(
     instance: EffectiveGatewayCliAgentRuntimeInstanceConfig,
     proxy_url: Option<String>,
 ) -> RuntimeSummary {
+    let capability_policy = CliRuntimeCapabilityPolicy::phase_zero(true);
     let status = if instance.enabled {
         RuntimeStatus::Degraded {
             message: "CLI runtime has not been probed yet".to_owned(),
@@ -6544,11 +7453,19 @@ fn cli_runtime_summary_from_instance(
         RuntimeStatus::Disabled
     };
     let diagnostics = if instance.enabled {
-        vec![RuntimeDiagnostic {
-            level: RuntimeDiagnosticLevel::Info,
-            code: "cli_runtime.unprobed".to_owned(),
-            message: "Runtime status will refresh after live probing is enabled".to_owned(),
-        }]
+        let (mcp_code, mcp_message) = capability_policy.mcp_diagnostic();
+        vec![
+            RuntimeDiagnostic {
+                level: RuntimeDiagnosticLevel::Info,
+                code: "cli_runtime.unprobed".to_owned(),
+                message: "Runtime status will refresh after live probing is enabled".to_owned(),
+            },
+            RuntimeDiagnostic {
+                level: RuntimeDiagnosticLevel::Info,
+                code: mcp_code.to_owned(),
+                message: mcp_message.to_owned(),
+            },
+        ]
     } else {
         Vec::new()
     };
@@ -6559,7 +7476,10 @@ fn cli_runtime_summary_from_instance(
         display_name: instance.display_name,
         enabled: instance.enabled,
         status,
-        capabilities: cli_runtime_capabilities_for_kind(instance.kind),
+        capabilities: cli_runtime_capabilities_for_kind_with_policy(
+            instance.kind,
+            capability_policy,
+        ),
         account: None,
         version: None,
         binary_path: Some(instance.binary_path),
@@ -6604,9 +7524,20 @@ fn cli_runtime_kind_config_from_stored_kind(
 fn cli_runtime_capabilities_for_kind(
     kind: GatewayCliAgentRuntimeKindConfig,
 ) -> RuntimeCapabilities {
+    cli_runtime_capabilities_for_kind_with_policy(
+        kind,
+        CliRuntimeCapabilityPolicy::phase_zero(true),
+    )
+}
+
+fn cli_runtime_capabilities_for_kind_with_policy(
+    kind: GatewayCliAgentRuntimeKindConfig,
+    capability_policy: CliRuntimeCapabilityPolicy,
+) -> RuntimeCapabilities {
     match kind {
         GatewayCliAgentRuntimeKindConfig::Codex => RuntimeCapabilities {
-            supports_skills: true,
+            supports_skills: capability_policy.supports_skills(),
+            supports_mcp_tools: capability_policy.supports_mcp_tools(),
             supports_threads: true,
             supports_resume: true,
             supports_fork: true,
@@ -6628,7 +7559,8 @@ fn cli_runtime_capabilities_for_kind(
             supports_generated_schema_probe: true,
         },
         GatewayCliAgentRuntimeKindConfig::Claude => RuntimeCapabilities {
-            supports_skills: true,
+            supports_skills: capability_policy.supports_skills(),
+            supports_mcp_tools: capability_policy.supports_mcp_tools(),
             supports_threads: true,
             supports_resume: false,
             supports_fork: false,
@@ -7272,6 +8204,62 @@ fn cli_runtime_native_request_id_json_from_record(
         "CLI runtime request `{}` does not include a native request id",
         record.request_id
     );
+}
+
+fn validate_codex_machine_request_shape(
+    request: &CodexJsonlRpcServerRequest,
+) -> std::result::Result<(), String> {
+    let is_known = matches!(
+        request.method.as_str(),
+        "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+            | "item/permissions/requestApproval"
+            | "item/tool/requestUserInput"
+            | "tool/requestUserInput"
+            | "userInput/request"
+    );
+    if !is_known {
+        return Ok(());
+    }
+    let params = request
+        .params
+        .as_ref()
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| "known Codex server request requires object params".to_owned())?;
+    for field in ["threadId", "turnId"] {
+        let valid = params
+            .get(field)
+            .and_then(JsonValue::as_str)
+            .is_some_and(|value| !value.trim().is_empty());
+        if !valid {
+            return Err(format!(
+                "known Codex server request requires non-empty `{field}`"
+            ));
+        }
+    }
+    if request.method == "item/permissions/requestApproval" {
+        let item_id_is_valid = params
+            .get("itemId")
+            .and_then(JsonValue::as_str)
+            .is_some_and(|value| !value.trim().is_empty());
+        if !item_id_is_valid {
+            return Err("Codex MCP permission approval requires non-empty `itemId`".to_owned());
+        }
+        if !params.get("permissions").is_some_and(JsonValue::is_object) {
+            return Err("Codex MCP permission approval requires object `permissions`".to_owned());
+        }
+    }
+    if matches!(
+        request.method.as_str(),
+        "item/tool/requestUserInput" | "tool/requestUserInput" | "userInput/request"
+    ) && !params
+        .get("questions")
+        .and_then(JsonValue::as_array)
+        .is_some_and(|questions| !questions.is_empty())
+    {
+        return Err("Codex user input request requires at least one question".to_owned());
+    }
+    Ok(())
 }
 
 fn validate_cli_runtime_native_request_resolution(
@@ -8075,6 +9063,7 @@ mod tests {
     fn cli_runtime_capability_matrix_matches_runtime_contracts() {
         let codex = cli_runtime_capabilities_for_kind(GatewayCliAgentRuntimeKindConfig::Codex);
         assert!(codex.supports_skills);
+        assert!(!codex.supports_mcp_tools);
         assert!(codex.supports_resume);
         assert!(codex.supports_fork);
         assert!(codex.supports_steer);
@@ -8082,6 +9071,7 @@ mod tests {
 
         let claude = cli_runtime_capabilities_for_kind(GatewayCliAgentRuntimeKindConfig::Claude);
         assert!(claude.supports_skills);
+        assert!(!claude.supports_mcp_tools);
         assert!(claude.supports_threads);
         assert!(claude.supports_model_list);
         assert!(claude.supports_interrupt);
