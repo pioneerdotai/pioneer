@@ -478,6 +478,15 @@ login_started = "CLI login started"
 refresh_already_running = "CLI provider refresh is already running."
 refresh_wait = "CLI provider refresh is waiting for the refresh policy."
 
+[providers.cli.mcp]
+runtime_not_ready = "Runtime is not ready"
+unsupported_contract = "Provider MCP contract is unsupported"
+strict_isolation_failed = "MCP isolation check failed"
+helper_self_probe_failed = "MCP helper self-check failed"
+platform_ipc_unavailable = "Secure local IPC is unavailable"
+continuity_unavailable = "Conversation restart/resume is unavailable"
+readiness_unavailable = "MCP readiness is unavailable"
+
 [providers.cli.detail]
 account = "Account"
 version = "Version"

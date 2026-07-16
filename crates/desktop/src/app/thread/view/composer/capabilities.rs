@@ -14,8 +14,8 @@ use gpui_component::{
 };
 use pioneer_client::composer::capabilities as composer_capabilities;
 use pioneer_client::composer::capabilities::{
-    ComposerCapabilityTarget, McpCapabilityUnavailableReason, SelectableMcpCapability,
-    SelectableSkillCapability, SkillCapabilityUnavailableReason,
+    McpCapabilityUnavailableReason, SelectableMcpCapability, SelectableSkillCapability,
+    SkillCapabilityUnavailableReason,
 };
 use pioneer_client::mcp::{details as mcp_details, list as mcp_list};
 use pioneer_client::skills::catalog as skill_catalog;
@@ -211,7 +211,7 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.composer_capability_target() == ComposerCapabilityTarget::UnsupportedCli {
+        if !self.composer_capability_target().policy().supports_skills {
             return;
         }
 
@@ -309,7 +309,11 @@ impl PioneerDesktop {
     }
 
     pub(super) fn open_composer_mcp_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.composer_capability_target() != ComposerCapabilityTarget::Native {
+        if !self
+            .composer_capability_target()
+            .policy()
+            .supports_mcp_tools
+        {
             return;
         }
 
@@ -479,7 +483,14 @@ impl PioneerDesktop {
         &self,
         query: &str,
     ) -> Vec<SelectableMcpCapability> {
-        composer_capabilities::filter_mcp_server_capability_rows(self.mcp_servers.as_slice(), query)
+        let rows = composer_capabilities::filter_mcp_server_capability_rows(
+            self.mcp_servers.as_slice(),
+            query,
+        );
+        composer_capabilities::filter_selectable_mcp_capabilities_for_target(
+            rows.as_slice(),
+            self.composer_capability_target(),
+        )
     }
 
     fn load_composer_skill_picker_rows(

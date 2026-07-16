@@ -1,38 +1,22 @@
 use super::*;
 use pioneer_client::agents_doc::scope as agents_doc_scope;
 use pioneer_client::composer::capabilities::{
-    ComposerCapabilityTarget, filter_composer_capabilities_for_target,
+    ComposerCapabilityTarget,
+    composer_capability_target_for_provider as shared_composer_capability_target_for_provider,
+    filter_composer_capabilities_for_target,
 };
 use pioneer_client::providers::list as provider_list;
 use pioneer_client::state::selectors as client_selectors;
 use pioneer_client::state::snapshot::{ClientSnapshot, ClientSnapshotInput};
 use pioneer_client::threads::tree as thread_tree;
 use pioneer_client::workspaces::selectors as workspace_selectors;
-use pioneer_protocol::{RuntimeStatus, RuntimeSummary};
+use pioneer_protocol::RuntimeSummary;
 
 pub(crate) fn composer_capability_target_for_provider(
     provider: Option<&str>,
     runtimes: &[RuntimeSummary],
 ) -> ComposerCapabilityTarget {
-    let Some(runtime_id) =
-        provider.and_then(provider_list::runtime_id_from_cli_runtime_provider_key)
-    else {
-        return ComposerCapabilityTarget::Native;
-    };
-
-    if runtimes.iter().any(|runtime| {
-        runtime.runtime_id == runtime_id
-            && runtime.enabled
-            && matches!(
-                runtime.status,
-                RuntimeStatus::Ready | RuntimeStatus::Degraded { .. }
-            )
-            && runtime.capabilities.supports_skills
-    }) {
-        ComposerCapabilityTarget::SkillCapableCli
-    } else {
-        ComposerCapabilityTarget::UnsupportedCli
-    }
+    shared_composer_capability_target_for_provider(provider, runtimes)
 }
 
 impl PioneerDesktop {

@@ -115,11 +115,19 @@ impl PioneerDesktop {
         self.composer_selected_model = model;
         self.composer_selected_reasoning_effort = reasoning_effort;
         self.composer_model_selection_manually_selected = manually_selected;
+        self.reconcile_composer_capabilities_with_selected_provider();
+        if self.composer_selected_provider_is_cli_runtime() {
+            self.composer_upload_in_progress = false;
+        }
+    }
+
+    pub(in crate::app) fn reconcile_composer_capabilities_with_selected_provider(&mut self) {
         let filtered = self.effective_composer_capabilities();
         let removed = filtered.len() != self.composer_capabilities.len();
         self.composer_capabilities = filtered;
-        if self.composer_selected_provider_is_cli_runtime() {
-            self.composer_upload_in_progress = false;
+        if let Some(thread_id) = self.active_thread_id.as_ref() {
+            self.thread_draft_capabilities
+                .insert(thread_id.clone(), self.composer_capabilities.clone());
         }
         if removed {
             self.composer_upload_error =

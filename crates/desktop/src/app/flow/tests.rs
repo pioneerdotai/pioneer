@@ -5,11 +5,13 @@ use super::{
 use crate::app::root::composer_capability_target_for_provider;
 use crate::gateway::{GatewayInstallWarning, GatewayRuntime};
 use pioneer_client::composer::capabilities::{
-    ComposerCapability, ComposerCapabilityKind, ComposerCapabilityTarget,
-    filter_composer_capabilities_for_target,
+    COMPOSER_CAPABILITY_MATRIX, ComposerCapability, ComposerCapabilityKind,
+    ComposerCapabilityPolicy, ComposerCapabilityTarget, filter_composer_capabilities_for_target,
 };
 use pioneer_client::gateway::types::{GatewayEndpoint, GatewayEndpointKind};
-use pioneer_protocol::{CLIAgentRuntimeKind, RuntimeCapabilities, RuntimeStatus, RuntimeSummary};
+use pioneer_protocol::{
+    CLIAgentRuntimeKind, McpScopeKind, RuntimeCapabilities, RuntimeStatus, RuntimeSummary,
+};
 use std::time::Duration;
 
 #[test]
@@ -122,6 +124,7 @@ fn desktop_composer_cli_target_and_capability_matrix_match_runtime_summary() {
         status: RuntimeStatus::Ready,
         capabilities: RuntimeCapabilities {
             supports_skills: true,
+            supports_mcp_tools: true,
             ..Default::default()
         },
         account: None,
@@ -152,28 +155,111 @@ fn desktop_composer_cli_target_and_capability_matrix_match_runtime_summary() {
                 source_kind: "system".to_owned(),
             },
         },
+        ComposerCapability {
+            id: "server".to_owned(),
+            label: "Docs".to_owned(),
+            kind: ComposerCapabilityKind::McpServer {
+                name: "docs".to_owned(),
+                scope_kind: McpScopeKind::Workspace,
+            },
+        },
+        ComposerCapability {
+            id: "tool".to_owned(),
+            label: "Issues / search".to_owned(),
+            kind: ComposerCapabilityKind::McpTool {
+                server_name: "issues".to_owned(),
+                raw_tool_name: "search".to_owned(),
+                scope_kind: McpScopeKind::Workspace,
+            },
+        },
     ];
 
     let target = composer_capability_target_for_provider(
         Some("cli_runtime:codex"),
         std::slice::from_ref(&runtime),
     );
-    assert_eq!(target, ComposerCapabilityTarget::SkillCapableCli);
+    assert_eq!(target.policy().supports_skills, true);
+    assert_eq!(target.policy().supports_mcp_tools, true);
     assert_eq!(
         filter_composer_capabilities_for_target(capabilities.as_slice(), target)
             .iter()
             .map(|capability| capability.id.as_str())
             .collect::<Vec<_>>(),
-        vec!["user"]
+        vec!["user", "server", "tool"]
     );
     assert_eq!(
         composer_capability_target_for_provider(Some("cli_runtime:missing"), &[runtime]),
-        ComposerCapabilityTarget::UnsupportedCli
+        ComposerCapabilityTarget::cli(ComposerCapabilityPolicy::unsupported_cli())
     );
     assert_eq!(
         composer_capability_target_for_provider(Some("openai"), &[]),
-        ComposerCapabilityTarget::Native
+        ComposerCapabilityTarget::native()
     );
+}
+
+#[test]
+fn desktop_composer_cli_policy_filters_skills_and_mcp_independently() {
+    assert_eq!(
+        COMPOSER_CAPABILITY_MATRIX
+            .iter()
+            .map(|case| case.id)
+            .collect::<Vec<_>>(),
+        vec![
+            "native",
+            "cli_neither",
+            "cli_skills_only",
+            "cli_mcp_only",
+            "cli_both",
+        ]
+    );
+    let runtime =
+        |runtime_id: &str, supports_skills: bool, supports_mcp_tools: bool| -> RuntimeSummary {
+            RuntimeSummary {
+                runtime_id: runtime_id.to_owned(),
+                kind: CLIAgentRuntimeKind::Codex,
+                display_name: runtime_id.to_owned(),
+                enabled: true,
+                status: RuntimeStatus::Ready,
+                capabilities: RuntimeCapabilities {
+                    supports_skills,
+                    supports_mcp_tools,
+                    ..Default::default()
+                },
+                account: None,
+                version: None,
+                binary_path: None,
+                home_path: None,
+                shadow_home_path: None,
+                proxy_url: None,
+                debug_native_events_enabled: false,
+                models_refreshed_at_unix_ms: None,
+                diagnostics: Vec::new(),
+                recent_stderr: Vec::new(),
+            }
+        };
+    let runtimes = vec![
+        runtime("neither", false, false),
+        runtime("skills", true, false),
+        runtime("mcp", false, true),
+        runtime("both", true, true),
+    ];
+
+    let policy = |runtime_id: &str| {
+        composer_capability_target_for_provider(
+            Some(format!("cli_runtime:{runtime_id}").as_str()),
+            runtimes.as_slice(),
+        )
+        .policy()
+    };
+
+    assert_eq!(policy("neither").supports_skills, false);
+    assert_eq!(policy("neither").supports_mcp_tools, false);
+    assert_eq!(policy("skills").supports_skills, true);
+    assert_eq!(policy("skills").supports_mcp_tools, false);
+    assert_eq!(policy("mcp").supports_skills, false);
+    assert_eq!(policy("mcp").supports_mcp_tools, true);
+    assert_eq!(policy("both").supports_skills, true);
+    assert_eq!(policy("both").supports_mcp_tools, true);
 }
 
 #[test]
@@ -202,6 +288,6 @@ fn desktop_composer_cli_target_fails_closed_for_unavailable_runtime() {
 
     assert_eq!(
         composer_capability_target_for_provider(Some("cli_runtime:codex"), &[runtime]),
-        ComposerCapabilityTarget::UnsupportedCli
+        ComposerCapabilityTarget::cli(ComposerCapabilityPolicy::unsupported_cli())
     );
 }

@@ -160,17 +160,8 @@ impl PioneerDesktop {
         });
         self.composer_permission_mode = draft.permission_mode;
         self.composer_attachments = draft.attachments;
-        let target = self.composer_capability_target();
-        let filtered =
-            pioneer_client::composer::capabilities::filter_composer_capabilities_for_target(
-                draft.capabilities.as_slice(),
-                target,
-            );
-        if filtered.len() != draft.capabilities.len() {
-            self.composer_upload_error =
-                Some(t!("chat.composer.capabilities_removed_for_provider").to_string());
-        }
-        self.composer_capabilities = filtered;
+        self.composer_capabilities = draft.capabilities;
+        self.reconcile_composer_capabilities_with_selected_provider();
     }
 
     pub(in crate::app) fn activate_thread_with_draft_restore(

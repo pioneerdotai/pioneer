@@ -14,6 +14,10 @@ use gpui_component::{
     *,
 };
 use pioneer_client::providers::cli_runtime_settings::CLIRuntimeProviderDraftField;
+use pioneer_client::providers::diagnostics::{
+    CliRuntimeMcpReadinessReason, cli_runtime_mcp_readiness_reason,
+    cli_runtime_mcp_readiness_reason_from_code,
+};
 use pioneer_client::providers::{
     cli_runtime_settings as cli_provider_settings, list as provider_list, selectors,
 };
@@ -508,6 +512,7 @@ impl PioneerDesktop {
         let menu_shadow_home_path = runtime.shadow_home_path.clone();
         let menu_desktop_entity = desktop_entity.clone();
         let summary = cli_runtime_summary_line(runtime);
+        let mcp_readiness = cli_runtime_mcp_readiness_reason(runtime);
 
         v_flex()
             .id(("cli-runtime-card", index))
@@ -690,7 +695,19 @@ impl PioneerDesktop {
                                     .line_height(relative(1.35))
                                     .opacity(0.6)
                                     .child(summary),
-                            ),
+                            )
+                            .when_some(mcp_readiness, |this, reason| {
+                                this.child(
+                                    div()
+                                        .text_xs()
+                                        .line_height(relative(1.35))
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(format!(
+                                            "MCP: {}",
+                                            cli_runtime_mcp_readiness_reason_label(reason)
+                                        )),
+                                )
+                            }),
                     )
                     .child(
                         h_flex()
@@ -1101,7 +1118,8 @@ fn cli_runtime_summary_line(runtime: &RuntimeSummary) -> String {
         }
         RuntimeStatus::Degraded { message } => runtime
             .diagnostics
-            .first()
+            .iter()
+            .find(|diagnostic| !diagnostic.code.starts_with("cli_runtime.mcp."))
             .map(|diagnostic| diagnostic.message.clone())
             .unwrap_or_else(|| {
                 format!("{} - {message}", cli_runtime_status_label(&runtime.status))
@@ -1349,6 +1367,7 @@ fn cli_runtime_has_diagnostics(runtime: &RuntimeSummary) -> bool {
     runtime.debug_native_events_enabled
         || !runtime.diagnostics.is_empty()
         || !runtime.recent_stderr.is_empty()
+        || cli_runtime_mcp_readiness_reason(runtime).is_some()
 }
 
 fn cli_runtime_diagnostics_panel(
@@ -1389,21 +1408,30 @@ fn cli_runtime_diagnostics_panel(
         )
         .when(!runtime.diagnostics.is_empty(), |this| {
             this.child(
-                v_flex()
-                    .gap_1()
-                    .children(runtime.diagnostics.iter().take(6).map(|diagnostic| {
-                        let color = match diagnostic.level {
-                            RuntimeDiagnosticLevel::Error => cx.theme().danger,
-                            RuntimeDiagnosticLevel::Warning => cx.theme().warning,
-                            RuntimeDiagnosticLevel::Info => cx.theme().muted_foreground,
-                        };
-                        div()
-                            .text_xs()
-                            .line_height(relative(1.25))
-                            .whitespace_normal()
-                            .text_color(color)
-                            .child(format!("{}: {}", diagnostic.code, diagnostic.message))
-                    })),
+                v_flex().gap_1().children(
+                    runtime
+                        .diagnostics
+                        .iter()
+                        .filter(|diagnostic| {
+                            cli_runtime_mcp_readiness_reason_from_code(diagnostic.code.as_str())
+                                .is_none()
+                                && !diagnostic.code.starts_with("cli_runtime.mcp.")
+                        })
+                        .take(6)
+                        .map(|diagnostic| {
+                            let color = match diagnostic.level {
+                                RuntimeDiagnosticLevel::Error => cx.theme().danger,
+                                RuntimeDiagnosticLevel::Warning => cx.theme().warning,
+                                RuntimeDiagnosticLevel::Info => cx.theme().muted_foreground,
+                            };
+                            div()
+                                .text_xs()
+                                .line_height(relative(1.25))
+                                .whitespace_normal()
+                                .text_color(color)
+                                .child(format!("{}: {}", diagnostic.code, diagnostic.message))
+                        }),
+                ),
             )
         })
         .when(!stderr_lines.is_empty(), |this| {
@@ -1434,10 +1462,42 @@ fn cli_runtime_diagnostics_panel(
         .into_any_element()
 }
 
+fn cli_runtime_mcp_readiness_reason_label(reason: CliRuntimeMcpReadinessReason) -> String {
+    match reason {
+        CliRuntimeMcpReadinessReason::RuntimeNotReady => {
+            t!("providers.cli.mcp.runtime_not_ready").to_string()
+        }
+        CliRuntimeMcpReadinessReason::UnsupportedContract => {
+            t!("providers.cli.mcp.unsupported_contract").to_string()
+        }
+        CliRuntimeMcpReadinessReason::StrictIsolationFailed => {
+            t!("providers.cli.mcp.strict_isolation_failed").to_string()
+        }
+        CliRuntimeMcpReadinessReason::HelperSelfProbeFailed => {
+            t!("providers.cli.mcp.helper_self_probe_failed").to_string()
+        }
+        CliRuntimeMcpReadinessReason::PlatformIpcUnavailable => {
+            t!("providers.cli.mcp.platform_ipc_unavailable").to_string()
+        }
+        CliRuntimeMcpReadinessReason::ContinuityUnavailable => {
+            t!("providers.cli.mcp.continuity_unavailable").to_string()
+        }
+        CliRuntimeMcpReadinessReason::ReadinessUnavailable => {
+            t!("providers.cli.mcp.readiness_unavailable").to_string()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{cli_runtime_inline_field_key, cli_runtime_inline_field_value};
-    use pioneer_client::providers::cli_runtime_settings::CLIRuntimeProviderDraftField;
+    use super::{
+        cli_runtime_inline_field_key, cli_runtime_inline_field_value,
+        cli_runtime_mcp_readiness_reason_label,
+    };
+    use pioneer_client::providers::{
+        cli_runtime_settings::CLIRuntimeProviderDraftField,
+        diagnostics::CliRuntimeMcpReadinessReason,
+    };
     use pioneer_protocol::{
         CLIAgentRuntimeKind, RuntimeCapabilities, RuntimeStatus, RuntimeSummary,
     };
@@ -1517,5 +1577,27 @@ mod tests {
             "shadow-home-path"
         );
         assert_eq!(cli_runtime_inline_field_key(None), "proxy-url");
+    }
+
+    #[test]
+    fn cli_runtime_mcp_readiness_reasons_render_only_localized_safe_copy() {
+        let reasons = [
+            CliRuntimeMcpReadinessReason::RuntimeNotReady,
+            CliRuntimeMcpReadinessReason::UnsupportedContract,
+            CliRuntimeMcpReadinessReason::StrictIsolationFailed,
+            CliRuntimeMcpReadinessReason::HelperSelfProbeFailed,
+            CliRuntimeMcpReadinessReason::PlatformIpcUnavailable,
+            CliRuntimeMcpReadinessReason::ContinuityUnavailable,
+            CliRuntimeMcpReadinessReason::ReadinessUnavailable,
+        ];
+
+        for reason in reasons {
+            let label = cli_runtime_mcp_readiness_reason_label(reason);
+            assert!(!label.trim().is_empty());
+            assert!(!label.contains("/private/"));
+            assert!(!label.contains("bootstrap="));
+            assert!(!label.contains("grant="));
+            assert!(!label.contains("mcp__pioneer"));
+        }
     }
 }

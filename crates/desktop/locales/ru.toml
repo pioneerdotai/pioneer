@@ -478,6 +478,15 @@ login_started = "Вход CLI запущен"
 refresh_already_running = "Обновление CLI провайдеров уже выполняется."
 refresh_wait = "Обновление CLI провайдеров ожидает согласно политике обновления."
 
+[providers.cli.mcp]
+runtime_not_ready = "Runtime не готов"
+unsupported_contract = "MCP-контракт провайдера не поддерживается"
+strict_isolation_failed = "Проверка изоляции MCP не пройдена"
+helper_self_probe_failed = "Самопроверка MCP helper не пройдена"
+platform_ipc_unavailable = "Безопасный локальный IPC недоступен"
+continuity_unavailable = "Перезапуск с продолжением диалога недоступен"
+readiness_unavailable = "Готовность MCP не определена"
+
 [providers.cli.detail]
 account = "Аккаунт"
 version = "Версия"

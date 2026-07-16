@@ -14,8 +14,6 @@ use gpui_component::{
     theme::ActiveTheme,
     *,
 };
-use pioneer_client::composer::capabilities::ComposerCapabilityTarget;
-
 const COMPOSER_ATTACHMENT_TEXT_FADE_WIDTH: Pixels = px(24.);
 
 impl PioneerDesktop {
@@ -262,6 +260,7 @@ impl PioneerDesktop {
             || self.active_task_thread_navigation().is_some()
             || self.desktop_voice_context_locked();
         let capability_target = self.composer_capability_target();
+        let capability_policy = capability_target.policy();
 
         Button::new("composer-add-attachment")
             .small()
@@ -284,7 +283,7 @@ impl PioneerDesktop {
                     },
                 ));
 
-                let menu = if capability_target != ComposerCapabilityTarget::UnsupportedCli {
+                let menu = if capability_policy.supports_skills {
                     menu.item(Self::composer_add_menu_item(
                         t!("chat.composer.add_menu.skills").to_string().into(),
                         PioneerIconName::Zap,
@@ -302,7 +301,7 @@ impl PioneerDesktop {
                     menu
                 };
 
-                if capability_target == ComposerCapabilityTarget::Native {
+                if capability_policy.supports_mcp_tools {
                     menu.item(Self::composer_add_menu_item(
                         t!("chat.composer.add_menu.mcp").to_string().into(),
                         PioneerIconName::Mcp,
