@@ -837,6 +837,8 @@ impl Default for GatewayProviderConfig {
 pub struct GatewayCliAgentRuntimeConfig {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
+    pub mcp_tools: GatewayCliAgentRuntimeMcpToolsConfig,
     pub idle_session_ttl_secs: u64,
     pub startup_timeout_ms: u64,
     pub request_timeout_ms: u64,
@@ -846,6 +848,57 @@ pub struct GatewayCliAgentRuntimeConfig {
     pub debug_native_events: bool,
     #[serde(default)]
     pub command_heartbeat: GatewayCliAgentRuntimeCommandHeartbeatConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct GatewayCliAgentRuntimeMcpToolsConfig {
+    pub max_tools: usize,
+    pub max_total_schema_bytes: usize,
+    pub max_concurrent_calls_per_turn: usize,
+}
+
+impl Default for GatewayCliAgentRuntimeMcpToolsConfig {
+    fn default() -> Self {
+        Self {
+            max_tools: default_cli_agent_runtime_mcp_max_tools(),
+            max_total_schema_bytes: default_cli_agent_runtime_mcp_max_total_schema_bytes(),
+            max_concurrent_calls_per_turn:
+                default_cli_agent_runtime_mcp_max_concurrent_calls_per_turn(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+struct GatewayCliAgentRuntimeMcpToolsConfigWire {
+    #[serde(default = "default_cli_agent_runtime_mcp_max_tools")]
+    max_tools: usize,
+    #[serde(default = "default_cli_agent_runtime_mcp_max_total_schema_bytes")]
+    max_total_schema_bytes: usize,
+    #[serde(default = "default_cli_agent_runtime_mcp_max_concurrent_calls_per_turn")]
+    max_concurrent_calls_per_turn: usize,
+}
+
+impl<'de> Deserialize<'de> for GatewayCliAgentRuntimeMcpToolsConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = GatewayCliAgentRuntimeMcpToolsConfigWire::deserialize(deserializer)?;
+        Ok(Self {
+            max_tools: non_zero_or_default_usize(
+                wire.max_tools,
+                default_cli_agent_runtime_mcp_max_tools(),
+            ),
+            max_total_schema_bytes: non_zero_or_default_usize(
+                wire.max_total_schema_bytes,
+                default_cli_agent_runtime_mcp_max_total_schema_bytes(),
+            ),
+            max_concurrent_calls_per_turn: non_zero_or_default_usize(
+                wire.max_concurrent_calls_per_turn,
+                default_cli_agent_runtime_mcp_max_concurrent_calls_per_turn(),
+            ),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1057,6 +1110,7 @@ impl Default for GatewayCliAgentRuntimeConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            mcp_tools: GatewayCliAgentRuntimeMcpToolsConfig::default(),
             idle_session_ttl_secs: default_cli_agent_runtime_idle_session_ttl_secs(),
             startup_timeout_ms: default_cli_agent_runtime_startup_timeout_ms(),
             request_timeout_ms: default_cli_agent_runtime_request_timeout_ms(),
@@ -1072,6 +1126,8 @@ impl Default for GatewayCliAgentRuntimeConfig {
 struct GatewayCliAgentRuntimeConfigWire {
     #[serde(default)]
     enabled: bool,
+    #[serde(default)]
+    mcp_tools: GatewayCliAgentRuntimeMcpToolsConfig,
     #[serde(default = "default_cli_agent_runtime_idle_session_ttl_secs")]
     idle_session_ttl_secs: u64,
     #[serde(default = "default_cli_agent_runtime_startup_timeout_ms")]
@@ -1096,6 +1152,7 @@ impl<'de> Deserialize<'de> for GatewayCliAgentRuntimeConfig {
         let wire = GatewayCliAgentRuntimeConfigWire::deserialize(deserializer)?;
         Ok(Self {
             enabled: wire.enabled,
+            mcp_tools: wire.mcp_tools,
             idle_session_ttl_secs: non_zero_or_default(
                 wire.idle_session_ttl_secs,
                 default_cli_agent_runtime_idle_session_ttl_secs(),
@@ -2068,6 +2125,18 @@ const fn default_cli_agent_runtime_stderr_ring_lines() -> usize {
 
 const fn default_cli_agent_runtime_command_heartbeat_interval_secs() -> u64 {
     60
+}
+
+const fn default_cli_agent_runtime_mcp_max_tools() -> usize {
+    128
+}
+
+const fn default_cli_agent_runtime_mcp_max_total_schema_bytes() -> usize {
+    1_048_576
+}
+
+const fn default_cli_agent_runtime_mcp_max_concurrent_calls_per_turn() -> usize {
+    8
 }
 
 const fn default_command_execution_lease_timeout_secs() -> u64 {
@@ -3126,6 +3195,23 @@ service_name = "com.pioneer.gateway.env"
         assert_eq!(config.gateway.tasks.review.default_max_revision_rounds, 5);
         assert_eq!(config.gateway.tasks.review.auto_accept_after_seconds, 300);
         assert!(!config.gateway.cli_agent_runtime.enabled);
+        assert_eq!(config.gateway.cli_agent_runtime.mcp_tools.max_tools, 128);
+        assert_eq!(
+            config
+                .gateway
+                .cli_agent_runtime
+                .mcp_tools
+                .max_total_schema_bytes,
+            1_048_576
+        );
+        assert_eq!(
+            config
+                .gateway
+                .cli_agent_runtime
+                .mcp_tools
+                .max_concurrent_calls_per_turn,
+            8
+        );
         assert_eq!(
             config.gateway.cli_agent_runtime.idle_session_ttl_secs,
             1_800
@@ -3148,10 +3234,13 @@ service_name = "com.pioneer.gateway.env"
     }
 
     #[test]
-    fn gateway_cli_agent_runtime_config_defaults_are_disabled_and_bounded() {
+    fn gateway_cli_agent_runtime_config_defaults_are_runtime_disabled_and_mcp_bounded() {
         let config = GatewayCliAgentRuntimeConfig::default();
 
         assert!(!config.enabled);
+        assert_eq!(config.mcp_tools.max_tools, 128);
+        assert_eq!(config.mcp_tools.max_total_schema_bytes, 1_048_576);
+        assert_eq!(config.mcp_tools.max_concurrent_calls_per_turn, 8);
         assert_eq!(config.idle_session_ttl_secs, 1_800);
         assert_eq!(config.startup_timeout_ms, 30_000);
         assert_eq!(config.request_timeout_ms, 120_000);
@@ -3193,7 +3282,80 @@ debug_native_events = true
     }
 
     #[test]
-    fn gateway_cli_agent_runtime_default_instances_load_when_feature_enabled() {
+    fn gateway_cli_agent_runtime_cli_mcp_limits_apply_to_every_runtime() {
+        let workspace_override = unique_temp_file_path("gateway-cli-agent-runtime-mcp-limits");
+        write_file(
+            &workspace_override,
+            r#"
+[gateway.cli_agent_runtime]
+enabled = true
+
+[gateway.cli_agent_runtime.mcp_tools]
+max_tools = 64
+max_total_schema_bytes = 524288
+max_concurrent_calls_per_turn = 4
+
+[gateway.cli_agent_runtimes.codex]
+kind = "codex"
+
+[gateway.cli_agent_runtimes.claude]
+kind = "claude"
+"#,
+        );
+
+        let config =
+            load_config_from_sources(DEFAULT_CONFIG_TOML, vec![workspace_override.clone()])
+                .expect("load config with CLI MCP limits");
+        assert_eq!(config.gateway.cli_agent_runtime.mcp_tools.max_tools, 64);
+        assert_eq!(
+            config
+                .gateway
+                .cli_agent_runtime
+                .mcp_tools
+                .max_total_schema_bytes,
+            524_288
+        );
+        assert_eq!(
+            config
+                .gateway
+                .cli_agent_runtime
+                .mcp_tools
+                .max_concurrent_calls_per_turn,
+            4
+        );
+
+        assert_eq!(
+            config.gateway.effective_cli_agent_runtime_instances().len(),
+            2
+        );
+
+        let _ = fs::remove_file(workspace_override);
+    }
+
+    #[test]
+    fn gateway_cli_agent_runtime_cli_mcp_legacy_and_zero_values_stay_bounded() {
+        let legacy = toml::from_str::<GatewayCliAgentRuntimeConfig>("enabled = true")
+            .expect("legacy CLI runtime config should deserialize");
+        assert_eq!(legacy.mcp_tools.max_tools, 128);
+
+        let normalized = toml::from_str::<GatewayCliAgentRuntimeConfig>(
+            r#"
+enabled = true
+
+[mcp_tools]
+max_tools = 0
+max_total_schema_bytes = 0
+max_concurrent_calls_per_turn = 0
+"#,
+        )
+        .expect("CLI MCP limits should deserialize");
+        assert_eq!(normalized.mcp_tools.max_tools, 128);
+        assert_eq!(normalized.mcp_tools.max_total_schema_bytes, 1_048_576);
+        assert_eq!(normalized.mcp_tools.max_concurrent_calls_per_turn, 8);
+    }
+
+    #[test]
+    fn gateway_cli_agent_runtime_default_instances_load_when_runtime_enabled() {
         let workspace_override = unique_temp_file_path("gateway-cli-agent-runtime-default-codex");
         write_file(
             &workspace_override,
