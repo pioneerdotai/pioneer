@@ -860,20 +860,41 @@ async fn capability_persistence_order_impl() {
                     }),
                 ]
             );
-            assert!(input.iter().any(|item| {
-                item["type"] == "text"
-                    && item["text"]
+            let instructions = native_turn.elevated_instructions.text();
+            assert!(instructions.contains("native Codex skill"));
+            let beta = instructions
+                .find("- $beta")
+                .expect("Codex elevated instructions should include beta");
+            let alpha = instructions
+                .find("- $alpha")
+                .expect("Codex elevated instructions should include alpha");
+            assert!(beta < alpha, "selected Codex skill order must be preserved");
+            assert!(input.iter().all(|item| {
+                item["type"] != "text"
+                    || item["text"]
                         .as_str()
-                        .is_some_and(|text| text.contains("$beta $alpha"))
+                        .is_none_or(|text| !text.contains("native Codex skill"))
             }));
         } else {
             let input = native_turn.input.as_array().unwrap();
             assert!(input.iter().all(|item| item["type"] != "skill"));
-            assert!(input.iter().any(|item| {
-                item["type"] == "text"
-                    && item["text"].as_str().is_some_and(|text| {
-                        text.contains("native Skill tool") && text.contains("beta, alpha")
-                    })
+            let instructions = native_turn.elevated_instructions.text();
+            assert!(instructions.contains("native Skill tool"));
+            let beta = instructions
+                .find("- beta")
+                .expect("Claude elevated instructions should include beta");
+            let alpha = instructions
+                .find("- alpha")
+                .expect("Claude elevated instructions should include alpha");
+            assert!(
+                beta < alpha,
+                "selected Claude skill order must be preserved"
+            );
+            assert!(input.iter().all(|item| {
+                item["type"] != "text"
+                    || item["text"]
+                        .as_str()
+                        .is_none_or(|text| !text.contains("native Skill tool"))
             }));
         }
     }
@@ -1245,11 +1266,18 @@ async fn claude_cli_runtime_new_skill_closes_one_cached_session_before_restart_i
         .await;
     let native = wait_for_recorded_cli_runtime_turn_start(&harness.cli_session).await;
     assert_eq!(harness.cli_session.closes.load(Ordering::SeqCst), 1);
-    assert!(native.input.as_array().unwrap().iter().any(|item| {
-        item["type"] == "text"
-            && item["text"]
+    assert!(
+        native
+            .elevated_instructions
+            .text()
+            .contains("native Skill tool")
+    );
+    assert!(native.elevated_instructions.text().contains("- refresh"));
+    assert!(native.input.as_array().unwrap().iter().all(|item| {
+        item["type"] != "text"
+            || item["text"]
                 .as_str()
-                .is_some_and(|text| text.contains("native Skill tool"))
+                .is_none_or(|text| !text.contains("native Skill tool"))
     }));
 }
 

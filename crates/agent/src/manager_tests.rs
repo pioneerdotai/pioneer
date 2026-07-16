@@ -10982,9 +10982,9 @@ async fn explicit_skill_input_injects_compact_skill_prompt_and_binding() {
 }
 
 #[tokio::test]
-async fn rejected_capability_emits_event_warning_and_manifest_diagnostic() {
+async fn rejected_capability_emits_event_warning_and_blocks_before_prompt_compile() {
     let provider = Arc::new(CaptureAgentProvider::default());
-    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider));
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
     let mut tool_loop_config = test_tool_loop_config();
     tool_loop_config.skills.system_roots = Vec::new();
     tool_loop_config.skills.user_roots = Vec::new();
@@ -11018,7 +11018,14 @@ async fn rejected_capability_emits_event_warning_and_manifest_diagnostic() {
         .expect("turn should start");
 
     let observed = recv_events_until_terminal(&mut events).await;
-    assert_turn_completed(&observed);
+    assert_turn_blocked(
+        &observed,
+        "combined MCP and skill preflight rejected one or more explicit capabilities",
+    );
+    assert!(
+        provider.snapshot_requests().is_empty(),
+        "provider must not run after an explicit capability is rejected"
+    );
 
     let (accepted, rejected) = observed
         .iter()
@@ -11085,26 +11092,12 @@ async fn rejected_capability_emits_event_warning_and_manifest_diagnostic() {
         Some(1)
     );
 
-    let manifest = observed
-        .iter()
-        .find_map(|event| match event {
-            AgentEvent::PromptManifestCompiled { manifest, .. } => Some(manifest),
-            _ => None,
-        })
-        .expect("prompt manifest should be emitted");
-    let diagnostic = manifest
-        .diagnostics
-        .iter()
-        .find(|diagnostic| diagnostic.code == PromptManifestDiagnosticCode::CapabilityRejected)
-        .expect("rejected capability should be included in prompt manifest diagnostics");
-    assert!(diagnostic.message.contains("missing-skill"));
     assert!(
-        diagnostic
-            .message
-            .contains("not installed or not available")
+        observed
+            .iter()
+            .all(|event| !matches!(event, AgentEvent::PromptManifestCompiled { .. })),
+        "blocked preflight must not compile a provider prompt"
     );
-    assert_eq!(diagnostic.section_id, None);
-    assert_eq!(diagnostic.hook_source, None);
 }
 
 #[tokio::test]
@@ -12238,41 +12231,35 @@ async fn skill_resolution_emits_allowed_and_blocked_audit_events() {
         .await
         .expect("turn should start");
 
+    let observed = recv_events_until_terminal(&mut events).await;
+    assert_turn_blocked(
+        &observed,
+        "combined MCP and skill preflight rejected one or more explicit capabilities",
+    );
+
     let mut saw_allowed = false;
     let mut saw_blocked = false;
-    for _ in 0..60 {
-        let event = timeout(Duration::from_secs(2), events.recv())
-            .await
-            .expect("must receive event in time")
-            .expect("broadcast should remain open");
-
-        match event {
-            AgentEvent::SkillAuditEvents { events, .. } => {
-                for item in events {
-                    if item.skill_slug == "tests/good-skill"
-                        && item.action == SkillAuditAction::ResolveAllowed
-                    {
-                        assert_eq!(
-                            item.details
-                                .get("resolved_reason")
-                                .and_then(|value| value.as_str()),
-                            Some("explicit_composer_capability")
-                        );
-                        saw_allowed = true;
-                    }
-                    if item.skill_slug == "tests/bad-skill"
-                        && item.action == SkillAuditAction::ResolveBlocked
-                        && item.reason_code.as_deref() == Some("resolve.dependency_missing")
-                    {
-                        saw_blocked = true;
-                    }
+    for event in &observed {
+        if let AgentEvent::SkillAuditEvents { events, .. } = event {
+            for item in events {
+                if item.skill_slug == "tests/good-skill"
+                    && item.action == SkillAuditAction::ResolveAllowed
+                {
+                    assert_eq!(
+                        item.details
+                            .get("resolved_reason")
+                            .and_then(|value| value.as_str()),
+                        Some("explicit_composer_capability")
+                    );
+                    saw_allowed = true;
+                }
+                if item.skill_slug == "tests/bad-skill"
+                    && item.action == SkillAuditAction::ResolveBlocked
+                    && item.reason_code.as_deref() == Some("resolve.dependency_missing")
+                {
+                    saw_blocked = true;
                 }
             }
-            AgentEvent::TurnCompleted { .. } => break,
-            AgentEvent::TurnFailed { error, .. } => {
-                panic!("turn should not fail: {error}");
-            }
-            _ => {}
         }
     }
 
@@ -12280,6 +12267,10 @@ async fn skill_resolution_emits_allowed_and_blocked_audit_events() {
     assert!(
         saw_blocked,
         "expected resolve_blocked dependency audit event"
+    );
+    assert!(
+        provider.snapshot_requests().is_empty(),
+        "provider must not run when explicit skill preflight is blocked"
     );
 
     let _ = fs::remove_dir_all(skill_root);

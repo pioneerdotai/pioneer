@@ -3053,6 +3053,23 @@ async fn execute_agent_provider_response(
         }
     };
 
+    if !skills_resolution.audit_events.is_empty() {
+        emit_durable_event(
+            event_tx.as_ref(),
+            AgentDurableEvent::SkillAuditEvents {
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                events: skills_resolution
+                    .audit_events
+                    .iter()
+                    .cloned()
+                    .map(protocol_skill_audit_event)
+                    .collect(),
+            },
+        )
+        .await?;
+    }
+
     let skill_capability_summary = resolve_skill_capability_summary(
         normalized_capabilities.skill_refs.as_slice(),
         &skills_resolution,
@@ -3141,23 +3158,6 @@ async fn execute_agent_provider_response(
         },
     )
     .await?;
-
-    if !skills_resolution.audit_events.is_empty() {
-        emit_durable_event(
-            event_tx.as_ref(),
-            AgentDurableEvent::SkillAuditEvents {
-                thread_id: thread_id.to_owned(),
-                turn_id: turn_id.to_owned(),
-                events: skills_resolution
-                    .audit_events
-                    .iter()
-                    .cloned()
-                    .map(protocol_skill_audit_event)
-                    .collect(),
-            },
-        )
-        .await?;
-    }
 
     emit_capability_resolution_events(
         event_tx.as_ref(),
