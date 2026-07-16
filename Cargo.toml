@@ -32,7 +32,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.29.0"
+version = "0.30.0"
 edition = "2024"
 license = "MIT"
 authors = ["Pioneer Contributors"]
@@ -79,11 +79,11 @@ semver = "1"
 toml = "1.1"
 schemars = { version = "1.2", features = ["derive"] }
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
-uuid = "1.23"
+uuid = "1.24"
 
 # Async
 tokio = { version = "1.52", features = ["full"] }
-tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7", features = ["full"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
@@ -123,7 +123,7 @@ scraper = "0.27"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 chrono-tz = "0.10"
 xcap = "0.9"
-xa11y = "0.9"
+xa11y = "0.11"
 tempfile = "3"
 fs4 = "1.1"
 lazy_static = "1.5"
@@ -166,11 +166,11 @@ tar = "0.4"
 windows-sys = "0.61"
 
 # Database
-sea-orm = "2.0.0-rc.42"
-sea-orm-migration = "2.0.0-rc.42"
+sea-orm = "2.0.0-rc.43"
+sea-orm-migration = "2.0.0-rc.43"
 rusqlite = { version = "0.39", default-features = false, features = ["functions", "blob", "bundled", "array"] }
 zstd = { version = "0.13", features = ["experimental"] }
 
 # MCP
-rmcp = { version = "2.1", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
+rmcp = { version = "2.2", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
 process-wrap = { version = "9.1.0", features = ["tokio1"] }
