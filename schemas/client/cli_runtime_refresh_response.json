@@ -101,6 +101,10 @@
         "supports_interrupt": {
           "type": "boolean"
         },
+        "supports_mcp_tools": {
+          "type": "boolean",
+          "default": false
+        },
         "supports_model_list": {
           "type": "boolean"
         },

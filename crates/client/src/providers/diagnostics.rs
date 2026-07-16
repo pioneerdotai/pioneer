@@ -5,6 +5,73 @@ use pioneer_protocol::{
     sanitize_runtime_diagnostic_line, sanitize_runtime_diagnostic_lines,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CliRuntimeMcpReadinessReason {
+    RuntimeNotReady,
+    UnsupportedContract,
+    StrictIsolationFailed,
+    HelperSelfProbeFailed,
+    PlatformIpcUnavailable,
+    ContinuityUnavailable,
+    ReadinessUnavailable,
+}
+
+pub fn cli_runtime_mcp_readiness_reason_from_code(
+    code: &str,
+) -> Option<CliRuntimeMcpReadinessReason> {
+    let reason = match code.trim() {
+        "cli_runtime.mcp.ready" => return None,
+        "cli_runtime.mcp.runtime_not_ready" => CliRuntimeMcpReadinessReason::RuntimeNotReady,
+        "cli_runtime.mcp.strict_isolation_failed"
+        | "cli_runtime.mcp.codex_overlay_isolation_failed"
+        | "cli_runtime.mcp.claude_artifact_hygiene_failed"
+        | "cli_runtime.mcp.claude_safe_mode_contract_failed" => {
+            CliRuntimeMcpReadinessReason::StrictIsolationFailed
+        }
+        "cli_runtime.mcp.codex_required_list_failed"
+        | "cli_runtime.mcp.codex_unknown_request_failed"
+        | "cli_runtime.mcp.codex_decoder_fixture_failed"
+        | "cli_runtime.mcp.claude_decoder_fixture_failed" => {
+            CliRuntimeMcpReadinessReason::HelperSelfProbeFailed
+        }
+        "cli_runtime.mcp.bridge_unavailable" => {
+            CliRuntimeMcpReadinessReason::PlatformIpcUnavailable
+        }
+        "cli_runtime.mcp.codex_continuity_prerequisite_failed"
+        | "cli_runtime.mcp.claude_resume_contract_failed" => {
+            CliRuntimeMcpReadinessReason::ContinuityUnavailable
+        }
+        "cli_runtime.mcp.provider_probe_failed"
+        | "cli_runtime.mcp.codex_raw_tool_filter_failed"
+        | "cli_runtime.mcp.claude_flag_contract_failed" => {
+            CliRuntimeMcpReadinessReason::UnsupportedContract
+        }
+        "cli_runtime.mcp.readiness_unavailable" => {
+            CliRuntimeMcpReadinessReason::ReadinessUnavailable
+        }
+        other if other.starts_with("cli_runtime.mcp.") => {
+            CliRuntimeMcpReadinessReason::ReadinessUnavailable
+        }
+        _ => return None,
+    };
+
+    Some(reason)
+}
+
+pub fn cli_runtime_mcp_readiness_reason(
+    runtime: &RuntimeSummary,
+) -> Option<CliRuntimeMcpReadinessReason> {
+    if runtime.capabilities.supports_mcp_tools {
+        return None;
+    }
+
+    runtime
+        .diagnostics
+        .iter()
+        .find_map(|diagnostic| cli_runtime_mcp_readiness_reason_from_code(&diagnostic.code))
+        .or(Some(CliRuntimeMcpReadinessReason::ReadinessUnavailable))
+}
+
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct CLIRuntimeProviderDiagnosticsBundle {
@@ -146,5 +213,75 @@ mod tests {
 
         assert_eq!(bundle.recent_stderr.len(), RUNTIME_DIAGNOSTIC_MAX_LINES);
         assert_eq!(bundle.recent_stderr[0], "line 3");
+    }
+
+    #[test]
+    fn cli_runtime_mcp_reason_codes_map_to_safe_typed_semantics() {
+        let cases = [
+            (
+                "cli_runtime.mcp.runtime_not_ready",
+                CliRuntimeMcpReadinessReason::RuntimeNotReady,
+            ),
+            (
+                "cli_runtime.mcp.provider_probe_failed",
+                CliRuntimeMcpReadinessReason::UnsupportedContract,
+            ),
+            (
+                "cli_runtime.mcp.strict_isolation_failed",
+                CliRuntimeMcpReadinessReason::StrictIsolationFailed,
+            ),
+            (
+                "cli_runtime.mcp.codex_required_list_failed",
+                CliRuntimeMcpReadinessReason::HelperSelfProbeFailed,
+            ),
+            (
+                "cli_runtime.mcp.bridge_unavailable",
+                CliRuntimeMcpReadinessReason::PlatformIpcUnavailable,
+            ),
+            (
+                "cli_runtime.mcp.claude_resume_contract_failed",
+                CliRuntimeMcpReadinessReason::ContinuityUnavailable,
+            ),
+            (
+                "cli_runtime.mcp.readiness_unavailable",
+                CliRuntimeMcpReadinessReason::ReadinessUnavailable,
+            ),
+        ];
+
+        for (code, expected) in cases {
+            assert_eq!(
+                cli_runtime_mcp_readiness_reason_from_code(code),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn cli_runtime_mcp_reason_does_not_confuse_selected_server_health() {
+        assert_eq!(
+            cli_runtime_mcp_readiness_reason_from_code("mcp.server.runtime_unavailable"),
+            None
+        );
+        assert_eq!(
+            cli_runtime_mcp_readiness_reason_from_code("mcp.server.not_ready"),
+            None
+        );
+    }
+
+    #[test]
+    fn cli_runtime_mcp_reason_never_returns_raw_diagnostic_values() {
+        let mut runtime = runtime_summary();
+        runtime.diagnostics = vec![RuntimeDiagnostic {
+            level: RuntimeDiagnosticLevel::Error,
+            code: "cli_runtime.mcp.future_reason".to_owned(),
+            message: "config=/private/tmp/secret bootstrap=secret grant=secret".to_owned(),
+        }];
+
+        assert_eq!(
+            cli_runtime_mcp_readiness_reason(&runtime),
+            Some(CliRuntimeMcpReadinessReason::ReadinessUnavailable)
+        );
+        runtime.capabilities.supports_mcp_tools = true;
+        assert_eq!(cli_runtime_mcp_readiness_reason(&runtime), None);
     }
 }

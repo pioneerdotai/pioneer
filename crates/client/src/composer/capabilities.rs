@@ -1,10 +1,12 @@
 //! Composer capability selection helpers.
 
+use crate::providers::list::runtime_id_from_cli_runtime_provider_key;
+
 use pioneer_protocol::{
     McpListItem, McpListResponse, McpRuntimeState, McpScopeKind, McpServerDetailsResponse,
-    SkillListItem, SkillListResponse, TurnCapability, TurnCapabilityKind,
-    TurnMcpServerCapabilitySummary, TurnMcpToolCapabilitySummary, TurnSkillCapabilitySummary,
-    UserMessageAttachment,
+    RuntimeCapabilities, RuntimeStatus, RuntimeSummary, SkillListItem, SkillListResponse,
+    TurnCapability, TurnCapabilityKind, TurnMcpServerCapabilitySummary,
+    TurnMcpToolCapabilitySummary, TurnSkillCapabilitySummary, UserMessageAttachment,
 };
 use std::collections::HashSet;
 
@@ -35,10 +37,184 @@ pub enum ComposerCapabilityKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ComposerCapabilityTarget {
+pub struct ComposerCapabilityPolicy {
+    pub supports_skills: bool,
+    pub supports_mcp_tools: bool,
+}
+
+impl ComposerCapabilityPolicy {
+    pub const fn native() -> Self {
+        Self {
+            supports_skills: true,
+            supports_mcp_tools: true,
+        }
+    }
+
+    pub const fn unsupported_cli() -> Self {
+        Self {
+            supports_skills: false,
+            supports_mcp_tools: false,
+        }
+    }
+
+    pub const fn cli(supports_skills: bool, supports_mcp_tools: bool) -> Self {
+        Self {
+            supports_skills,
+            supports_mcp_tools,
+        }
+    }
+
+    pub fn from_cli_runtime_capabilities(capabilities: &RuntimeCapabilities) -> Self {
+        Self::cli(
+            capabilities.supports_skills,
+            capabilities.supports_mcp_tools,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ComposerCapabilityTargetKind {
     Native,
-    UnsupportedCli,
-    SkillCapableCli,
+    Cli,
+}
+
+/// Capability eligibility context.
+///
+/// The target kind exists only because native skills retain their current
+/// source policy while CLI skills must be exportable. Capability support is
+/// represented exclusively by [`ComposerCapabilityPolicy`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComposerCapabilityTarget {
+    kind: ComposerCapabilityTargetKind,
+    policy: ComposerCapabilityPolicy,
+}
+
+impl ComposerCapabilityTarget {
+    pub const fn native() -> Self {
+        Self {
+            kind: ComposerCapabilityTargetKind::Native,
+            policy: ComposerCapabilityPolicy::native(),
+        }
+    }
+
+    pub const fn cli(policy: ComposerCapabilityPolicy) -> Self {
+        Self {
+            kind: ComposerCapabilityTargetKind::Cli,
+            policy,
+        }
+    }
+
+    pub fn from_cli_runtime_capabilities(capabilities: &RuntimeCapabilities) -> Self {
+        Self::cli(ComposerCapabilityPolicy::from_cli_runtime_capabilities(
+            capabilities,
+        ))
+    }
+
+    pub const fn policy(self) -> ComposerCapabilityPolicy {
+        self.policy
+    }
+
+    pub const fn is_native(self) -> bool {
+        matches!(self.kind, ComposerCapabilityTargetKind::Native)
+    }
+
+    pub const fn is_cli(self) -> bool {
+        matches!(self.kind, ComposerCapabilityTargetKind::Cli)
+    }
+}
+
+/// Canonical capability matrix shared by Rust clients and their focused tests.
+///
+/// Stale, disabled, or missing CLI summaries resolve to the `cli_neither`
+/// policy; provider-switch behavior is a reduction from one row to another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComposerCapabilityMatrixCase {
+    pub id: &'static str,
+    pub target: ComposerCapabilityTarget,
+    pub supports_skills: bool,
+    pub supports_mcp_tools: bool,
+}
+
+pub const COMPOSER_CAPABILITY_MATRIX: [ComposerCapabilityMatrixCase; 5] = [
+    ComposerCapabilityMatrixCase {
+        id: "native",
+        target: ComposerCapabilityTarget::native(),
+        supports_skills: true,
+        supports_mcp_tools: true,
+    },
+    ComposerCapabilityMatrixCase {
+        id: "cli_neither",
+        target: ComposerCapabilityTarget::cli(ComposerCapabilityPolicy::cli(false, false)),
+        supports_skills: false,
+        supports_mcp_tools: false,
+    },
+    ComposerCapabilityMatrixCase {
+        id: "cli_skills_only",
+        target: ComposerCapabilityTarget::cli(ComposerCapabilityPolicy::cli(true, false)),
+        supports_skills: true,
+        supports_mcp_tools: false,
+    },
+    ComposerCapabilityMatrixCase {
+        id: "cli_mcp_only",
+        target: ComposerCapabilityTarget::cli(ComposerCapabilityPolicy::cli(false, true)),
+        supports_skills: false,
+        supports_mcp_tools: true,
+    },
+    ComposerCapabilityMatrixCase {
+        id: "cli_both",
+        target: ComposerCapabilityTarget::cli(ComposerCapabilityPolicy::cli(true, true)),
+        supports_skills: true,
+        supports_mcp_tools: true,
+    },
+];
+
+pub fn composer_capability_target_for_provider(
+    provider: Option<&str>,
+    runtimes: &[RuntimeSummary],
+) -> ComposerCapabilityTarget {
+    let Some(runtime_id) = provider
+        .map(str::trim)
+        .filter(|provider| !provider.is_empty())
+        .and_then(runtime_id_from_cli_runtime_provider_key)
+        .map(str::trim)
+        .filter(|runtime_id| !runtime_id.is_empty())
+    else {
+        return ComposerCapabilityTarget::native();
+    };
+
+    let Some(runtime) = runtimes.iter().find(|runtime| {
+        runtime.runtime_id == runtime_id
+            && runtime.enabled
+            && matches!(
+                runtime.status,
+                RuntimeStatus::Ready | RuntimeStatus::Degraded { .. }
+            )
+    }) else {
+        return ComposerCapabilityTarget::cli(ComposerCapabilityPolicy::unsupported_cli());
+    };
+
+    ComposerCapabilityTarget::from_cli_runtime_capabilities(&runtime.capabilities)
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposerCapabilityRemovalReason {
+    SkillsUnsupported,
+    SkillSourceNotExportable,
+    McpToolsUnsupported,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemovedComposerCapability {
+    pub capability: ComposerCapability,
+    pub reason: ComposerCapabilityRemovalReason,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ComposerCapabilityPolicyReduction {
+    pub capabilities: Vec<ComposerCapability>,
+    pub removed: Vec<RemovedComposerCapability>,
 }
 
 fn is_cli_exportable_skill_source(source_kind: &str) -> bool {
@@ -49,26 +225,59 @@ pub fn composer_capability_is_eligible_for_target(
     capability: &ComposerCapability,
     target: ComposerCapabilityTarget,
 ) -> bool {
-    match target {
-        ComposerCapabilityTarget::Native => true,
-        ComposerCapabilityTarget::UnsupportedCli => false,
-        ComposerCapabilityTarget::SkillCapableCli => matches!(
-            &capability.kind,
-            ComposerCapabilityKind::Skill { source_kind, .. }
-                if is_cli_exportable_skill_source(source_kind)
-        ),
+    composer_capability_removal_reason(capability, target).is_none()
+}
+
+pub fn composer_capability_removal_reason(
+    capability: &ComposerCapability,
+    target: ComposerCapabilityTarget,
+) -> Option<ComposerCapabilityRemovalReason> {
+    let policy = target.policy();
+    match &capability.kind {
+        ComposerCapabilityKind::Skill { source_kind, .. } => {
+            if !policy.supports_skills {
+                Some(ComposerCapabilityRemovalReason::SkillsUnsupported)
+            } else if target.is_cli() && !is_cli_exportable_skill_source(source_kind) {
+                Some(ComposerCapabilityRemovalReason::SkillSourceNotExportable)
+            } else {
+                None
+            }
+        }
+        ComposerCapabilityKind::McpServer { .. } | ComposerCapabilityKind::McpTool { .. } => {
+            (!policy.supports_mcp_tools)
+                .then_some(ComposerCapabilityRemovalReason::McpToolsUnsupported)
+        }
     }
+}
+
+pub fn reduce_composer_capabilities_for_target(
+    capabilities: &[ComposerCapability],
+    target: ComposerCapabilityTarget,
+) -> ComposerCapabilityPolicyReduction {
+    let mut reduction = ComposerCapabilityPolicyReduction {
+        capabilities: Vec::with_capacity(capabilities.len()),
+        removed: Vec::new(),
+    };
+
+    for capability in capabilities {
+        if let Some(reason) = composer_capability_removal_reason(capability, target) {
+            reduction.removed.push(RemovedComposerCapability {
+                capability: capability.clone(),
+                reason,
+            });
+        } else {
+            reduction.capabilities.push(capability.clone());
+        }
+    }
+
+    reduction
 }
 
 pub fn filter_composer_capabilities_for_target(
     capabilities: &[ComposerCapability],
     target: ComposerCapabilityTarget,
 ) -> Vec<ComposerCapability> {
-    capabilities
-        .iter()
-        .filter(|capability| composer_capability_is_eligible_for_target(capability, target))
-        .cloned()
-        .collect()
+    reduce_composer_capabilities_for_target(capabilities, target).capabilities
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -87,13 +296,15 @@ pub fn selectable_skill_capability_is_eligible_for_target(
     row: &SelectableSkillCapability,
     target: ComposerCapabilityTarget,
 ) -> bool {
-    match target {
-        ComposerCapabilityTarget::Native => true,
-        ComposerCapabilityTarget::UnsupportedCli => false,
-        ComposerCapabilityTarget::SkillCapableCli => {
-            is_cli_exportable_skill_source(row.source_kind.as_str())
-        }
-    }
+    let capability = ComposerCapability {
+        id: row.key.clone(),
+        label: row.label.clone(),
+        kind: ComposerCapabilityKind::Skill {
+            slug: row.slug.clone(),
+            source_kind: row.source_kind.clone(),
+        },
+    };
+    composer_capability_is_eligible_for_target(&capability, target)
 }
 
 pub fn filter_selectable_skill_capabilities_for_target(
@@ -102,6 +313,41 @@ pub fn filter_selectable_skill_capabilities_for_target(
 ) -> Vec<SelectableSkillCapability> {
     rows.iter()
         .filter(|row| selectable_skill_capability_is_eligible_for_target(row, target))
+        .cloned()
+        .collect()
+}
+
+pub fn selectable_mcp_capability_is_eligible_for_target(
+    row: &SelectableMcpCapability,
+    target: ComposerCapabilityTarget,
+) -> bool {
+    let kind = match &row.raw_tool_name {
+        Some(raw_tool_name) => ComposerCapabilityKind::McpTool {
+            server_name: row.server_name.clone(),
+            raw_tool_name: raw_tool_name.clone(),
+            scope_kind: row.scope_kind,
+        },
+        None => ComposerCapabilityKind::McpServer {
+            name: row.server_name.clone(),
+            scope_kind: row.scope_kind,
+        },
+    };
+    composer_capability_is_eligible_for_target(
+        &ComposerCapability {
+            id: row.key.clone(),
+            label: row.label.clone(),
+            kind,
+        },
+        target,
+    )
+}
+
+pub fn filter_selectable_mcp_capabilities_for_target(
+    rows: &[SelectableMcpCapability],
+    target: ComposerCapabilityTarget,
+) -> Vec<SelectableMcpCapability> {
+    rows.iter()
+        .filter(|row| selectable_mcp_capability_is_eligible_for_target(row, target))
         .cloned()
         .collect()
 }
@@ -888,6 +1134,30 @@ mod tests {
         SkillHealthSummary, SkillInstallState, SkillPolicyState,
     };
 
+    #[test]
+    fn canonical_capability_matrix_covers_every_supported_policy_shape() {
+        assert_eq!(
+            COMPOSER_CAPABILITY_MATRIX
+                .iter()
+                .map(|case| case.id)
+                .collect::<Vec<_>>(),
+            vec![
+                "native",
+                "cli_neither",
+                "cli_skills_only",
+                "cli_mcp_only",
+                "cli_both",
+            ]
+        );
+        for case in COMPOSER_CAPABILITY_MATRIX {
+            assert_eq!(case.target.policy().supports_skills, case.supports_skills);
+            assert_eq!(
+                case.target.policy().supports_mcp_tools,
+                case.supports_mcp_tools
+            );
+        }
+    }
+
     fn skill_capability(slug: &str) -> ComposerCapability {
         skill_capability_from_source(slug, "user")
     }
@@ -1000,7 +1270,7 @@ mod tests {
     }
 
     #[test]
-    fn capability_target_filter_preserves_native_and_exports_only_supported_cli_skills() {
+    fn capability_policy_filters_native_and_all_cli_capability_matrices_independently() {
         let input = vec![
             skill_capability_from_source("user-first", "user"),
             mcp_server_capability("docs"),
@@ -1013,7 +1283,8 @@ mod tests {
 
         let cases = [
             (
-                ComposerCapabilityTarget::Native,
+                "native",
+                ComposerCapabilityTarget::native(),
                 vec![
                     "skill:user:user-first",
                     "mcp-server:workspace:docs",
@@ -1023,25 +1294,117 @@ mod tests {
                     "skill:future:unknown",
                 ],
             ),
-            (ComposerCapabilityTarget::UnsupportedCli, vec![]),
             (
-                ComposerCapabilityTarget::SkillCapableCli,
+                "unsupported CLI",
+                ComposerCapabilityTarget::cli(ComposerCapabilityPolicy::cli(false, false)),
+                vec![],
+            ),
+            (
+                "skills-only CLI",
+                ComposerCapabilityTarget::cli(ComposerCapabilityPolicy::cli(true, false)),
                 vec!["skill:user:user-first", "skill:registry:registry-second"],
+            ),
+            (
+                "MCP-only CLI",
+                ComposerCapabilityTarget::cli(ComposerCapabilityPolicy::cli(false, true)),
+                vec![
+                    "mcp-server:workspace:docs",
+                    "mcp-tool:workspace:docs:search",
+                ],
+            ),
+            (
+                "combined CLI",
+                ComposerCapabilityTarget::cli(ComposerCapabilityPolicy::cli(true, true)),
+                vec![
+                    "skill:user:user-first",
+                    "mcp-server:workspace:docs",
+                    "skill:registry:registry-second",
+                    "mcp-tool:workspace:docs:search",
+                ],
             ),
         ];
 
-        for (target, expected_ids) in cases {
-            let filtered = filter_composer_capabilities_for_target(&input, target);
+        for (case, target, expected_ids) in cases {
+            let reduction = reduce_composer_capabilities_for_target(&input, target);
             assert_eq!(
-                filtered
+                reduction
+                    .capabilities
                     .iter()
                     .map(|capability| capability.id.as_str())
                     .collect::<Vec<_>>(),
-                expected_ids
+                expected_ids,
+                "{case}"
+            );
+            assert_eq!(
+                reduction.capabilities.len() + reduction.removed.len(),
+                input.len(),
+                "{case} must account for every input capability"
             );
         }
 
         assert_eq!(input, original);
+    }
+
+    #[test]
+    fn capability_policy_reports_stable_kind_and_source_removal_reasons() {
+        let input = vec![
+            skill_capability_from_source("user", "user"),
+            skill_capability_from_source("system", "system"),
+            mcp_server_capability("docs"),
+            mcp_tool_capability("docs", "search"),
+        ];
+
+        let unsupported = reduce_composer_capabilities_for_target(
+            &input,
+            ComposerCapabilityTarget::cli(ComposerCapabilityPolicy::unsupported_cli()),
+        );
+        assert_eq!(
+            unsupported
+                .removed
+                .iter()
+                .map(|removed| removed.reason)
+                .collect::<Vec<_>>(),
+            vec![
+                ComposerCapabilityRemovalReason::SkillsUnsupported,
+                ComposerCapabilityRemovalReason::SkillsUnsupported,
+                ComposerCapabilityRemovalReason::McpToolsUnsupported,
+                ComposerCapabilityRemovalReason::McpToolsUnsupported,
+            ]
+        );
+
+        let combined = reduce_composer_capabilities_for_target(
+            &input,
+            ComposerCapabilityTarget::cli(ComposerCapabilityPolicy::cli(true, true)),
+        );
+        assert_eq!(
+            combined
+                .removed
+                .iter()
+                .map(|removed| (removed.capability.id.as_str(), removed.reason))
+                .collect::<Vec<_>>(),
+            vec![(
+                "skill:system:system",
+                ComposerCapabilityRemovalReason::SkillSourceNotExportable,
+            )]
+        );
+    }
+
+    #[test]
+    fn cli_runtime_capabilities_map_directly_to_policy_and_default_mcp_closed() {
+        let missing_or_old = RuntimeCapabilities::default();
+        assert_eq!(
+            ComposerCapabilityPolicy::from_cli_runtime_capabilities(&missing_or_old),
+            ComposerCapabilityPolicy::unsupported_cli()
+        );
+
+        let proven = RuntimeCapabilities {
+            supports_skills: true,
+            supports_mcp_tools: true,
+            ..Default::default()
+        };
+        let target = ComposerCapabilityTarget::from_cli_runtime_capabilities(&proven);
+        assert!(target.is_cli());
+        assert_eq!(target.policy(), ComposerCapabilityPolicy::cli(true, true));
     }
 
     #[test]
@@ -1059,21 +1422,21 @@ mod tests {
         assert_eq!(
             filter_selectable_skill_capabilities_for_target(
                 &rows,
-                ComposerCapabilityTarget::Native
+                ComposerCapabilityTarget::native()
             ),
             rows
         );
         assert!(
             filter_selectable_skill_capabilities_for_target(
                 &rows,
-                ComposerCapabilityTarget::UnsupportedCli
+                ComposerCapabilityTarget::cli(ComposerCapabilityPolicy::unsupported_cli())
             )
             .is_empty()
         );
 
         let cli_rows = filter_selectable_skill_capabilities_for_target(
             &rows,
-            ComposerCapabilityTarget::SkillCapableCli,
+            ComposerCapabilityTarget::cli(ComposerCapabilityPolicy::cli(true, false)),
         );
         assert_eq!(
             cli_rows
@@ -1085,10 +1448,35 @@ mod tests {
         assert!(cli_rows.iter().all(|row| {
             selectable_skill_capability_is_eligible_for_target(
                 row,
-                ComposerCapabilityTarget::SkillCapableCli,
+                ComposerCapabilityTarget::cli(ComposerCapabilityPolicy::cli(true, false)),
             )
         }));
         assert_eq!(rows, original);
+    }
+
+    #[test]
+    fn selectable_mcp_rows_use_the_same_server_and_tool_policy_gate() {
+        let server_row = selectable_mcp_server_from_item(&mcp_server("docs"));
+        let tool_row = filter_mcp_tool_capability_rows(
+            &mcp_details("docs", vec![mcp_tool("search", "Search docs")]),
+            "",
+        )
+        .remove(0);
+        let rows = vec![server_row, tool_row];
+
+        let skills_only = ComposerCapabilityTarget::cli(ComposerCapabilityPolicy::cli(true, false));
+        assert!(filter_selectable_mcp_capabilities_for_target(&rows, skills_only).is_empty());
+
+        for target in [
+            ComposerCapabilityTarget::native(),
+            ComposerCapabilityTarget::cli(ComposerCapabilityPolicy::cli(false, true)),
+            ComposerCapabilityTarget::cli(ComposerCapabilityPolicy::cli(true, true)),
+        ] {
+            assert_eq!(
+                filter_selectable_mcp_capabilities_for_target(&rows, target),
+                rows
+            );
+        }
     }
 
     fn mcp_details(server_name: &str, tools: Vec<McpToolCatalogItem>) -> McpServerDetailsResponse {
