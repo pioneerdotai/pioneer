@@ -1,8 +1,9 @@
 use crate::classifier::{DefaultErrorClassifier, ErrorClassifier};
 use crate::context::ToolOutcome;
-use crate::context::{AnyToolResult, ToolInvocation};
+use crate::context::{AnyToolResult, ToolInvocation, ToolPayload};
 use crate::error::ToolError;
 use crate::events::ToolEventTrace;
+use crate::mcp_policy::enforce_mcp_network_policy;
 use crate::network_policy::{NetworkPolicyChecker, NetworkPolicyDenyReason};
 use crate::permissions::{
     PermissionActionKind, PermissionApprovalBroker, PermissionApprovalResolution,
@@ -13,6 +14,7 @@ use crate::permissions::{
 use crate::registry::ToolRegistry;
 use crate::spec::ToolIdempotencyMode;
 use crate::{FilePolicyChecker, FilePolicyDecision, FilePolicyDenyReason, FilePolicyOperation};
+use pioneer_mcp::{McpToolSafetyHints, classify_mcp_tool_policy};
 use pioneer_protocol::{
     TurnExecutionSecuritySnapshot, TurnFilesystemAccess, TurnFilesystemSandboxEntry,
     TurnFilesystemSandboxKind, TurnFilesystemSandboxPath, TurnNetworkMode,
@@ -255,6 +257,29 @@ impl ToolOrchestrator {
         }
     }
 
+    async fn request_approval_or_cancel(
+        &self,
+        permission_context: &PermissionEvaluationContext,
+        invocation: &ToolInvocation,
+        intent: &PermissionIntent,
+        key: &crate::PermissionRequestKey,
+        reason: PermissionDecisionReason,
+    ) -> PermissionApprovalResolution {
+        tokio::select! {
+            biased;
+            _ = invocation.cancellation.cancelled() => {
+                PermissionApprovalResolution::Cancelled
+            }
+            resolution = self.approval_broker.request_approval(
+                permission_context,
+                invocation,
+                intent,
+                key,
+                reason,
+            ) => resolution,
+        }
+    }
+
     pub fn with_permission_evaluator(
         policy: OrchestratorPolicy,
         post_policy: PostExecutionPolicy,
@@ -316,6 +341,7 @@ impl ToolOrchestrator {
         self.enforce_idempotency_contract(&invocation)?;
 
         invocation.attempt_id = 1;
+        enforce_non_escalatable_mcp_network_policy(&invocation)?;
 
         let permission_grant = self
             .evaluate_permission(&invocation, permission_context, trace)
@@ -605,8 +631,13 @@ impl ToolOrchestrator {
                 );
 
                 let resolution = self
-                    .approval_broker
-                    .request_approval(permission_context, invocation, &intent, &key, reason)
+                    .request_approval_or_cancel(
+                        permission_context,
+                        invocation,
+                        &intent,
+                        &key,
+                        reason,
+                    )
                     .await;
                 match resolution {
                     PermissionApprovalResolution::AllowOnce => {
@@ -753,8 +784,7 @@ impl ToolOrchestrator {
         );
 
         let resolution = self
-            .approval_broker
-            .request_approval(
+            .request_approval_or_cancel(
                 permission_context,
                 invocation,
                 &intent,
@@ -905,8 +935,7 @@ impl ToolOrchestrator {
         );
 
         let resolution = self
-            .approval_broker
-            .request_approval(
+            .request_approval_or_cancel(
                 permission_context,
                 invocation,
                 &intent,
@@ -1278,6 +1307,34 @@ impl ToolOrchestrator {
             }
         }
     }
+}
+
+fn enforce_non_escalatable_mcp_network_policy(
+    invocation: &ToolInvocation,
+) -> Result<(), ToolError> {
+    let ToolPayload::Mcp {
+        server,
+        tool,
+        read_only_hint,
+        destructive_hint,
+        open_world_hint,
+        ..
+    } = &invocation.payload
+    else {
+        return Ok(());
+    };
+
+    let classification = classify_mcp_tool_policy(McpToolSafetyHints {
+        read_only_hint: *read_only_hint,
+        destructive_hint: *destructive_hint,
+        open_world_hint: *open_world_hint,
+    });
+    enforce_mcp_network_policy(
+        invocation.execution_security_snapshot.as_ref(),
+        &classification,
+        server,
+        tool,
+    )
 }
 
 fn filesystem_grant_cache_key(
@@ -2467,7 +2524,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_network_like_approval_enables_network_for_call() {
+    async fn mcp_network_policy_denial_precedes_approval_and_does_not_widen_sandbox() {
         let workspace = temp_path("mcp-network-grant");
         std::fs::create_dir_all(workspace.as_path()).expect("workspace should create");
 
@@ -2475,7 +2532,7 @@ mod tests {
         let handler = Arc::new(NetworkSnapshotAssertHandler {
             calls: handler_calls.clone(),
             required_url: None,
-            expect_enabled: true,
+            expect_enabled: false,
         });
         let registry =
             registry_with_named_handlers([("mcp.example", handler as Arc<dyn ToolHandler>)]);
@@ -2513,13 +2570,20 @@ mod tests {
 
         let trace =
             crate::events::ToolEventBus::default().start_trace("turn", "call_1", "mcp.example");
-        orchestrator
+        let result = orchestrator
             .run_with_context(&registry, invocation, &trace, &context)
-            .await
-            .expect("approved MCP network-like call should receive enabled network grant");
+            .await;
+        let error = match result {
+            Ok(_) => panic!("MCP approval must not widen the frozen network sandbox"),
+            Err(error) => error,
+        };
 
-        assert_eq!(broker_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            matches!(error, ToolError::Rejected(ref message) if message.contains("network is disabled")),
+            "unexpected error: {error}"
+        );
+        assert_eq!(broker_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
         let _ = std::fs::remove_dir_all(workspace);
     }
 

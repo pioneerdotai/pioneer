@@ -14,6 +14,7 @@ use pioneer_mcp::{McpToolSafetyHints, classify_mcp_tool_policy};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 const DEFAULT_MCP_TOOL_TIMEOUT_MS: u64 = 20_000;
 
@@ -110,6 +111,7 @@ pub trait McpToolExecutor: Send + Sync {
         &self,
         request: McpToolCallRequest,
         trace: ToolEventTrace,
+        cancellation: CancellationToken,
     ) -> Result<McpToolCallOutput, ToolError>;
 }
 
@@ -135,14 +137,14 @@ pub fn materialize_mcp_runtime_tools(
             continue;
         }
 
-        let parameters = if descriptor.parameters.is_object() {
-            descriptor.parameters.clone()
-        } else {
-            serde_json::json!({
-                "type": "object",
-                "additionalProperties": true
-            })
-        };
+        if !descriptor.parameters.is_object() {
+            excluded_tools.push(excluded(
+                descriptor,
+                "MCP input schema must be a JSON object",
+            ));
+            continue;
+        }
+        let parameters = descriptor.parameters.clone();
         let recovery = recovery_for_annotations(&descriptor.annotations);
         let spec = ToolSpec::new(
             descriptor.callable_name.clone(),
@@ -317,23 +319,14 @@ impl ToolHandler for McpToolHandler {
         let output = match self
             .executor
             .call_mcp_tool(
-                McpToolCallRequest {
-                    workspace_id: self.descriptor.workspace_id.clone(),
-                    turn_id: trace.turn_id().to_owned(),
-                    call_id: invocation.call_id.clone(),
-                    callable_name: self.descriptor.callable_name.clone(),
-                    server_id: self.descriptor.server_id.clone(),
-                    server_name: self.descriptor.server_name.clone(),
-                    raw_tool_name: self.descriptor.raw_tool_name.clone(),
-                    catalog_version: self.descriptor.catalog_version.clone(),
+                mcp_call_request(
+                    &self.descriptor,
+                    trace.turn_id(),
+                    invocation.call_id.as_str(),
                     arguments,
-                    timeout_ms: self
-                        .descriptor
-                        .timeout_ms
-                        .unwrap_or(DEFAULT_MCP_TOOL_TIMEOUT_MS)
-                        .max(1),
-                },
+                ),
                 trace.clone(),
+                invocation.cancellation.clone(),
             )
             .await
         {
@@ -384,6 +377,29 @@ impl ToolHandler for McpToolHandler {
     }
 }
 
+fn mcp_call_request(
+    descriptor: &McpDynamicToolDescriptor,
+    turn_id: &str,
+    call_id: &str,
+    arguments: JsonValue,
+) -> McpToolCallRequest {
+    McpToolCallRequest {
+        workspace_id: descriptor.workspace_id.clone(),
+        turn_id: turn_id.to_owned(),
+        call_id: call_id.to_owned(),
+        callable_name: descriptor.callable_name.clone(),
+        server_id: descriptor.server_id.clone(),
+        server_name: descriptor.server_name.clone(),
+        raw_tool_name: descriptor.raw_tool_name.clone(),
+        catalog_version: descriptor.catalog_version.clone(),
+        arguments,
+        timeout_ms: descriptor
+            .timeout_ms
+            .unwrap_or(DEFAULT_MCP_TOOL_TIMEOUT_MS)
+            .max(1),
+    }
+}
+
 fn mcp_stage_metadata(descriptor: &McpDynamicToolDescriptor) -> JsonValue {
     let classification = classify_mcp_tool_policy(McpToolSafetyHints {
         read_only_hint: descriptor.annotations.read_only_hint,
@@ -427,4 +443,125 @@ fn render_mcp_tool_text(output: &McpToolCallOutput) -> String {
         return serde_json::to_string_pretty(structured).unwrap_or_else(|_| structured.to_string());
     }
     serde_json::to_string_pretty(&output.content).unwrap_or_else(|_| output.content.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::{ToolIdempotencyMode, ToolPayloadBinding, ToolRetryClass};
+
+    struct NoopExecutor;
+
+    #[async_trait]
+    impl McpToolExecutor for NoopExecutor {
+        async fn call_mcp_tool(
+            &self,
+            _request: McpToolCallRequest,
+            _trace: ToolEventTrace,
+            _cancellation: CancellationToken,
+        ) -> Result<McpToolCallOutput, ToolError> {
+            unreachable!("materialization tests do not execute the handler")
+        }
+    }
+
+    fn descriptor(parameters: JsonValue) -> McpDynamicToolDescriptor {
+        McpDynamicToolDescriptor {
+            callable_name: "mcp_resend_send".to_owned(),
+            workspace_id: "workspace".to_owned(),
+            server_id: "installation".to_owned(),
+            server_name: "resend".to_owned(),
+            raw_tool_name: "send".to_owned(),
+            catalog_version: "catalog-v1".to_owned(),
+            fingerprint: "installation-fingerprint".to_owned(),
+            snapshot_version: 17,
+            description: "Send an email".to_owned(),
+            parameters,
+            annotations: McpDynamicToolAnnotations {
+                title: Some("Send".to_owned()),
+                read_only_hint: Some(false),
+                destructive_hint: Some(true),
+                idempotent_hint: Some(true),
+                open_world_hint: Some(true),
+            },
+            timeout_ms: Some(4_321),
+            selection_reason: "explicit_composer_capability".to_owned(),
+            capability_id: Some("mcp-tool:workspace:resend:send".to_owned()),
+        }
+    }
+
+    #[test]
+    fn mcp_api_materialization_preserves_projection_descriptor_exactly() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"to": {"type": "string"}},
+            "required": ["to"],
+            "additionalProperties": false
+        });
+        let descriptor = descriptor(schema.clone());
+        let materialized = materialize_mcp_runtime_tools(
+            std::slice::from_ref(&descriptor),
+            Arc::new(NoopExecutor),
+        );
+
+        assert!(materialized.excluded_tools.is_empty());
+        assert_eq!(materialized.bundles.len(), 1);
+        let configured = &materialized.bundles[0].specs[0];
+        assert_eq!(configured.spec.name, descriptor.callable_name);
+        assert_eq!(configured.spec.parameters, schema);
+        assert_eq!(
+            configured.spec.recovery.retry_class,
+            ToolRetryClass::Network
+        );
+        assert_eq!(
+            configured.spec.recovery.idempotency_mode,
+            ToolIdempotencyMode::Safe
+        );
+        assert_eq!(
+            configured.payload_binding,
+            ToolPayloadBinding::Mcp {
+                server_id: descriptor.server_id.clone(),
+                server_name: descriptor.server_name.clone(),
+                raw_tool_name: descriptor.raw_tool_name.clone(),
+                catalog_version: descriptor.catalog_version.clone(),
+                snapshot_version: descriptor.snapshot_version,
+                read_only_hint: descriptor.annotations.read_only_hint,
+                destructive_hint: descriptor.annotations.destructive_hint,
+                open_world_hint: descriptor.annotations.open_world_hint,
+            }
+        );
+        assert_eq!(materialized.bindings.len(), 1);
+        assert_eq!(
+            materialized.bindings[0].callable_name,
+            descriptor.callable_name
+        );
+        assert_eq!(
+            materialized.bindings[0].capability_id,
+            descriptor.capability_id
+        );
+
+        let call = mcp_call_request(&descriptor, "turn", "call", serde_json::json!({"to":"a"}));
+        assert_eq!(call.callable_name, descriptor.callable_name);
+        assert_eq!(call.server_id, descriptor.server_id);
+        assert_eq!(call.raw_tool_name, descriptor.raw_tool_name);
+        assert_eq!(call.catalog_version, descriptor.catalog_version);
+        assert_eq!(call.timeout_ms, 4_321);
+    }
+
+    #[test]
+    fn mcp_api_materialization_rejects_schema_drift_instead_of_rewriting_it() {
+        let descriptor = descriptor(serde_json::json!("not-an-object-schema"));
+        let materialized = materialize_mcp_runtime_tools(
+            std::slice::from_ref(&descriptor),
+            Arc::new(NoopExecutor),
+        );
+
+        assert!(materialized.bundles.is_empty());
+        assert!(materialized.bindings.is_empty());
+        assert_eq!(materialized.excluded_tools.len(), 1);
+        assert!(
+            materialized.excluded_tools[0]
+                .reason
+                .contains("schema must be a JSON object")
+        );
+    }
 }

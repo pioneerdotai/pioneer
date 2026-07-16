@@ -173,6 +173,29 @@ pub struct WebToolsConfig {
     pub default_user_agent: String,
 }
 
+impl Default for WebToolsConfig {
+    fn default() -> Self {
+        Self {
+            default_timeout_ms: 20_000,
+            hard_max_timeout_ms: 120_000,
+            default_fetch_max_bytes: 2 * 1024 * 1024,
+            hard_fetch_max_bytes: 8 * 1024 * 1024,
+            default_download_max_bytes: 128 * 1024 * 1024,
+            hard_download_max_bytes: 1024 * 1024 * 1024,
+            default_max_results: 8,
+            hard_max_results: 20,
+            default_snippet_chars: 420,
+            hard_max_snippet_chars: 4096,
+            default_link_count: 40,
+            hard_link_count: 200,
+            default_render_max_chars: 40_000,
+            ddg_html_search_url: "https://duckduckgo.com/html/".to_owned(),
+            ddg_instant_api_url: "https://api.duckduckgo.com/".to_owned(),
+            default_user_agent: "Mozilla/5.0".to_owned(),
+        }
+    }
+}
+
 impl WebToolsConfig {
     pub fn normalized(&self) -> Self {
         let ddg_html_search_url = if self.ddg_html_search_url.trim().is_empty() {

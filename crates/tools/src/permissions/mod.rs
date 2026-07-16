@@ -2198,7 +2198,7 @@ mod tests {
         for (read_only_hint, destructive_hint, open_world_hint, expected_class, requires_network) in [
             (Some(true), Some(true), Some(false), "write_like", "false"),
             (Some(false), Some(false), Some(true), "network_like", "true"),
-            (None, None, None, "unknown", "false"),
+            (None, None, None, "unknown", "true"),
             (Some(false), Some(false), Some(false), "unknown", "false"),
         ] {
             let invocation = invocation_for_tool(
