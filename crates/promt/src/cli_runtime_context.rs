@@ -9,6 +9,7 @@ use std::path::Path;
 const PIONEER_CONTEXT_MAX_CHARS: usize = 4_000;
 const MEMORY_CONTEXT_MAX_CHARS: usize = 6_000;
 const THREAD_CONTEXT_MAX_CHARS: usize = 6_000;
+const SELECTED_CAPABILITIES_CONTEXT_MAX_CHARS: usize = 4_000;
 const CURRENT_PERMISSIONS_CONTEXT_MAX_CHARS: usize = 1_500;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +24,7 @@ pub struct CliRuntimeContextInput {
     pub permission_profile: TurnPermissionProfileSnapshot,
     pub memory_recall_context: Option<CliRuntimeContextText>,
     pub thread_context: Option<CliRuntimeContextText>,
+    pub selected_capabilities_context: Option<CliRuntimeContextText>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +76,15 @@ fn cli_runtime_context_sections(input: &CliRuntimeContextInput) -> Vec<PromptRun
             Some(THREAD_CONTEXT_MAX_CHARS),
             input
                 .thread_context
+                .as_ref()
+                .is_some_and(|context| context.truncated),
+        ),
+        builtin_section(
+            PromptRuntimeBuiltInSectionId::SelectedCapabilities,
+            optional_text(input.selected_capabilities_context.as_ref()),
+            Some(SELECTED_CAPABILITIES_CONTEXT_MAX_CHARS),
+            input
+                .selected_capabilities_context
                 .as_ref()
                 .is_some_and(|context| context.truncated),
         ),
@@ -168,6 +179,7 @@ mod tests {
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
             memory_recall_context: None,
             thread_context: None,
+            selected_capabilities_context: None,
         }
     }
 
@@ -216,6 +228,10 @@ mod tests {
             text: "user: continue the migration".to_owned(),
             truncated: true,
         });
+        input.selected_capabilities_context = Some(CliRuntimeContextText {
+            text: "One MCP tool is active for this turn.".to_owned(),
+            truncated: false,
+        });
 
         let bundle =
             compile_cli_runtime_context_bundle(root.as_path(), input).expect("compile context");
@@ -230,8 +246,19 @@ mod tests {
             vec![
                 "pioneer_cli_runtime_context",
                 "memory_recall",
-                "thread_context"
+                "thread_context",
+                "selected_capabilities"
             ]
+        );
+        assert!(
+            bundle
+                .dynamic_system_text
+                .contains("## Selected Capabilities")
+        );
+        assert!(
+            bundle
+                .dynamic_system_text
+                .contains("One MCP tool is active")
         );
         assert!(
             bundle.diagnostics.iter().any(|diagnostic| {
