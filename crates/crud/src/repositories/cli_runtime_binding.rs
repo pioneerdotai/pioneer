@@ -6,7 +6,8 @@ use pioneer_entity::{
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder,
+    QuerySelect, Set,
 };
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -57,8 +58,76 @@ pub struct CliRuntimeThreadBindingRecord {
     pub native_model: Option<String>,
     pub resume_cursor_json: String,
     pub status: String,
+    pub mcp: Option<CliRuntimeThreadMcpMetadata>,
+    pub provider_session: Option<CliRuntimeProviderSessionBinding>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliRuntimeProviderSessionLifecycle {
+    Prepared,
+    Verified,
+    Invalid,
+}
+
+impl CliRuntimeProviderSessionLifecycle {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prepared => "prepared",
+            Self::Verified => "verified",
+            Self::Invalid => "invalid",
+        }
+    }
+
+    fn from_db(value: &str) -> Result<Self> {
+        match value {
+            "prepared" => Ok(Self::Prepared),
+            "verified" => Ok(Self::Verified),
+            "invalid" => Ok(Self::Invalid),
+            other => Err(anyhow!(
+                "unknown CLI provider session lifecycle state `{other}`"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliRuntimeProviderSessionBinding {
+    pub provider_session_id: String,
+    pub lifecycle: CliRuntimeProviderSessionLifecycle,
+    pub last_verified_process_generation: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrepareClaudeProviderSessionBinding {
+    pub thread_binding: NewCliRuntimeThreadBinding,
+    pub proposed_provider_session_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreparedClaudeProviderSessionMode {
+    New,
+    Resume,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedClaudeProviderSessionBinding {
+    pub binding: CliRuntimeThreadBindingRecord,
+    pub mode: PreparedClaudeProviderSessionMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliRuntimeThreadMcpMetadata {
+    pub adapter_kind: String,
+    pub manifest_hash: String,
+    pub projection_fingerprint: String,
+    pub provider_contract_fingerprint: String,
+    pub isolation_contract_fingerprint: String,
+    pub session_generation: i64,
+    pub provider_session_id: Option<String>,
+    pub provider_session_lifecycle_state: Option<String>,
+    pub provider_session_last_verified_process_generation: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,8 +163,20 @@ pub struct CliRuntimeTurnBindingRecord {
     pub sandbox_json: Option<String>,
     pub approval_policy: Option<String>,
     pub input_mapping_json: String,
+    pub mcp: Option<CliRuntimeTurnMcpMetadata>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliRuntimeTurnMcpMetadata {
+    pub adapter_kind: String,
+    pub manifest_hash: String,
+    pub projection_fingerprint: String,
+    pub provider_contract_fingerprint: String,
+    pub isolation_contract_fingerprint: String,
+    pub session_generation: i64,
+    pub projection_activation_generation: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -355,6 +436,248 @@ pub async fn find_thread_binding<C: ConnectionTrait>(
         .transpose()
 }
 
+/// Atomically load or create the durable Claude provider UUID before a
+/// provider process can be spawned. The caller supplies a freshly generated
+/// candidate, but an existing binding always wins.
+pub async fn prepare_claude_provider_session_binding<C: ConnectionTrait>(
+    db: &C,
+    request: PrepareClaudeProviderSessionBinding,
+) -> Result<PreparedClaudeProviderSessionBinding> {
+    validate_provider_session_id(request.proposed_provider_session_id.as_str())?;
+    let thread_id = request.thread_binding.thread_id.clone();
+    let workspace_id = request.thread_binding.workspace_id.clone();
+    let runtime_id = request.thread_binding.runtime_id.clone();
+    if let Some(model) = thread_cli_runtime_binding::Entity::find_by_id(thread_id.clone())
+        .one(db)
+        .await
+        .context("failed to query Claude provider session binding")?
+    {
+        validate_claude_binding_identity(&model, &request.thread_binding)?;
+        let existing = provider_session_binding_from_model(&model)?;
+        if let Some(existing) = existing {
+            if existing.lifecycle == CliRuntimeProviderSessionLifecycle::Invalid {
+                return Err(anyhow!(
+                    "Claude provider session binding for thread `{thread_id}` is invalid"
+                ));
+            }
+            let mode = if existing.lifecycle == CliRuntimeProviderSessionLifecycle::Verified {
+                PreparedClaudeProviderSessionMode::Resume
+            } else {
+                PreparedClaudeProviderSessionMode::New
+            };
+            return Ok(PreparedClaudeProviderSessionBinding {
+                binding: thread_binding_record_from_model(model)?,
+                mode,
+            });
+        }
+
+        return Err(anyhow!(
+            "existing Claude thread binding has no durable real provider session identity"
+        ));
+    }
+
+    let proposed_provider_session_id = request.proposed_provider_session_id;
+    let mut active = active_thread_binding_from_new(request.thread_binding);
+    active.native_thread_id = Set(proposed_provider_session_id.clone());
+    active.native_session_id = Set(Some(proposed_provider_session_id.clone()));
+    active.provider_session_id = Set(Some(proposed_provider_session_id));
+    active.provider_session_lifecycle_state = Set(Some(
+        CliRuntimeProviderSessionLifecycle::Prepared
+            .as_str()
+            .to_owned(),
+    ));
+    active.provider_session_last_verified_process_generation = Set(None);
+    thread_cli_runtime_binding::Entity::insert(active)
+        .on_conflict(
+            OnConflict::column(thread_cli_runtime_binding::Column::ThreadId)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec(db)
+        .await
+        .context("failed to atomically prepare Claude provider session binding")?;
+    let binding = find_thread_binding(db, thread_id.as_str())
+        .await?
+        .context("prepared Claude provider session binding is missing")?;
+    if binding.workspace_id != workspace_id
+        || binding.runtime_id != runtime_id
+        || binding.runtime_kind != "claude"
+    {
+        return Err(anyhow!(
+            "concurrent Claude provider session binding has an incompatible identity"
+        ));
+    }
+    let lifecycle = binding
+        .provider_session
+        .as_ref()
+        .context("concurrent Claude provider session binding is incomplete")?
+        .lifecycle;
+    if lifecycle == CliRuntimeProviderSessionLifecycle::Invalid {
+        return Err(anyhow!(
+            "concurrent Claude provider session binding is invalid"
+        ));
+    }
+    Ok(PreparedClaudeProviderSessionBinding {
+        binding,
+        mode: if lifecycle == CliRuntimeProviderSessionLifecycle::Verified {
+            PreparedClaudeProviderSessionMode::Resume
+        } else {
+            PreparedClaudeProviderSessionMode::New
+        },
+    })
+}
+
+/// Verify the emitted Claude UUID against the durable prepared identity. A
+/// mismatch is terminal for the binding. An event from an older process
+/// generation can neither verify nor invalidate a newer generation.
+pub async fn verify_claude_provider_session_binding<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    expected_provider_session_id: &str,
+    emitted_provider_session_id: Option<&str>,
+    process_generation: i64,
+) -> Result<CliRuntimeThreadBindingRecord> {
+    if process_generation <= 0 {
+        return Err(anyhow!(
+            "Claude provider session process generation must be positive"
+        ));
+    }
+    validate_provider_session_id(expected_provider_session_id)?;
+    let model = thread_cli_runtime_binding::Entity::find_by_id(thread_id.to_owned())
+        .one(db)
+        .await
+        .context("failed to query Claude provider session for verification")?
+        .context("Claude provider session binding is missing")?;
+    let provider = provider_session_binding_from_model(&model)?
+        .context("Claude provider session identity is missing")?;
+    if provider.provider_session_id != expected_provider_session_id {
+        return Err(anyhow!(
+            "Claude provider session launch identity does not match the durable binding"
+        ));
+    }
+    if provider.lifecycle == CliRuntimeProviderSessionLifecycle::Invalid {
+        return Err(anyhow!("Claude provider session binding is invalid"));
+    }
+    if provider
+        .last_verified_process_generation
+        .is_some_and(|generation| process_generation < generation)
+    {
+        return Err(anyhow!(
+            "stale Claude process generation cannot verify the provider session"
+        ));
+    }
+
+    let emitted_matches = emitted_provider_session_id
+        .and_then(|value| validate_provider_session_id(value).ok().map(|_| value))
+        == Some(expected_provider_session_id);
+    let mut active: thread_cli_runtime_binding::ActiveModel = model.into();
+    if emitted_matches {
+        active.provider_session_lifecycle_state = Set(Some(
+            CliRuntimeProviderSessionLifecycle::Verified
+                .as_str()
+                .to_owned(),
+        ));
+        active.provider_session_last_verified_process_generation = Set(Some(process_generation));
+    } else {
+        active.provider_session_lifecycle_state = Set(Some(
+            CliRuntimeProviderSessionLifecycle::Invalid
+                .as_str()
+                .to_owned(),
+        ));
+    }
+    let model = active
+        .update(db)
+        .await
+        .context("failed to persist Claude provider session verification")?;
+    let binding = thread_binding_record_from_model(model)?;
+    if !emitted_matches {
+        return Err(anyhow!(
+            "Claude emitted a missing, invalid, or mismatched provider session identity"
+        ));
+    }
+    Ok(binding)
+}
+
+fn validate_provider_session_id(value: &str) -> Result<()> {
+    let provider_session_id = uuid::Uuid::parse_str(value)
+        .map_err(|_| anyhow!("invalid CLI provider session identity"))?;
+    if provider_session_id.is_nil() {
+        return Err(anyhow!("invalid CLI provider session identity"));
+    }
+    Ok(())
+}
+
+fn validate_claude_binding_identity(
+    model: &thread_cli_runtime_binding::Model,
+    requested: &NewCliRuntimeThreadBinding,
+) -> Result<()> {
+    if model.workspace_id != requested.workspace_id
+        || model.runtime_id != requested.runtime_id
+        || model.runtime_kind != "claude"
+        || requested.runtime_kind != "claude"
+    {
+        return Err(anyhow!(
+            "existing CLI thread binding does not match the requested Claude runtime identity"
+        ));
+    }
+    if model.status != "active" {
+        return Err(anyhow!("existing Claude thread binding is not active"));
+    }
+    Ok(())
+}
+
+pub async fn set_thread_mcp_metadata<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    metadata: Option<CliRuntimeThreadMcpMetadata>,
+) -> Result<CliRuntimeThreadBindingRecord> {
+    let model = thread_cli_runtime_binding::Entity::find_by_id(thread_id.to_owned())
+        .one(db)
+        .await
+        .context("failed to query CLI runtime thread binding for MCP metadata update")?
+        .context("CLI runtime thread binding is missing for MCP metadata update")?;
+    let mut active: thread_cli_runtime_binding::ActiveModel = model.into();
+    let (
+        adapter_kind,
+        manifest_hash,
+        projection_fingerprint,
+        provider_contract_fingerprint,
+        isolation_contract_fingerprint,
+        session_generation,
+        provider_session_id,
+        provider_session_lifecycle_state,
+        provider_session_last_verified_process_generation,
+    ) = match metadata {
+        Some(metadata) => (
+            Some(metadata.adapter_kind),
+            Some(metadata.manifest_hash),
+            Some(metadata.projection_fingerprint),
+            Some(metadata.provider_contract_fingerprint),
+            Some(metadata.isolation_contract_fingerprint),
+            Some(metadata.session_generation),
+            metadata.provider_session_id,
+            metadata.provider_session_lifecycle_state,
+            metadata.provider_session_last_verified_process_generation,
+        ),
+        None => (None, None, None, None, None, None, None, None, None),
+    };
+    active.mcp_adapter_kind = Set(adapter_kind);
+    active.mcp_manifest_hash = Set(manifest_hash);
+    active.mcp_projection_fingerprint = Set(projection_fingerprint);
+    active.mcp_provider_contract_fingerprint = Set(provider_contract_fingerprint);
+    active.mcp_isolation_contract_fingerprint = Set(isolation_contract_fingerprint);
+    active.mcp_session_generation = Set(session_generation);
+    active.provider_session_id = Set(provider_session_id);
+    active.provider_session_lifecycle_state = Set(provider_session_lifecycle_state);
+    active.provider_session_last_verified_process_generation =
+        Set(provider_session_last_verified_process_generation);
+    let model = active
+        .update(db)
+        .await
+        .context("failed to update CLI runtime thread MCP metadata")?;
+    thread_binding_record_from_model(model)
+}
+
 pub async fn find_thread_binding_by_native_thread<C: ConnectionTrait>(
     db: &C,
     runtime_id: &str,
@@ -432,6 +755,51 @@ pub async fn find_turn_binding<C: ConnectionTrait>(
         .context("failed to query CLI runtime turn binding")?
         .map(turn_binding_record_from_model)
         .transpose()
+}
+
+pub async fn set_turn_mcp_metadata<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    metadata: Option<CliRuntimeTurnMcpMetadata>,
+) -> Result<CliRuntimeTurnBindingRecord> {
+    let model = turn_cli_runtime_binding::Entity::find_by_id(turn_id.to_owned())
+        .one(db)
+        .await
+        .context("failed to query CLI runtime turn binding for MCP metadata update")?
+        .context("CLI runtime turn binding is missing for MCP metadata update")?;
+    let mut active: turn_cli_runtime_binding::ActiveModel = model.into();
+    let (
+        adapter_kind,
+        manifest_hash,
+        projection_fingerprint,
+        provider_contract_fingerprint,
+        isolation_contract_fingerprint,
+        session_generation,
+        projection_activation_generation,
+    ) = match metadata {
+        Some(metadata) => (
+            Some(metadata.adapter_kind),
+            Some(metadata.manifest_hash),
+            Some(metadata.projection_fingerprint),
+            Some(metadata.provider_contract_fingerprint),
+            Some(metadata.isolation_contract_fingerprint),
+            Some(metadata.session_generation),
+            Some(metadata.projection_activation_generation),
+        ),
+        None => (None, None, None, None, None, None, None),
+    };
+    active.mcp_adapter_kind = Set(adapter_kind);
+    active.mcp_manifest_hash = Set(manifest_hash);
+    active.mcp_projection_fingerprint = Set(projection_fingerprint);
+    active.mcp_provider_contract_fingerprint = Set(provider_contract_fingerprint);
+    active.mcp_isolation_contract_fingerprint = Set(isolation_contract_fingerprint);
+    active.mcp_session_generation = Set(session_generation);
+    active.mcp_projection_activation_generation = Set(projection_activation_generation);
+    let model = active
+        .update(db)
+        .await
+        .context("failed to update CLI runtime turn MCP metadata")?;
+    turn_binding_record_from_model(model)
 }
 
 pub async fn find_turn_binding_by_request<C: ConnectionTrait>(
@@ -961,6 +1329,7 @@ fn active_thread_binding_from_new(
         status: Set(binding.status),
         created_at: Set(binding.created_at),
         updated_at: Set(binding.updated_at),
+        ..Default::default()
     }
 }
 
@@ -984,6 +1353,7 @@ fn active_turn_binding_from_new(
         input_mapping_json: Set(binding.input_mapping_json),
         created_at: Set(binding.created_at),
         updated_at: Set(binding.updated_at),
+        ..Default::default()
     }
 }
 
@@ -1085,6 +1455,8 @@ fn active_native_event_from_new(
 fn thread_binding_record_from_model(
     model: thread_cli_runtime_binding::Model,
 ) -> Result<CliRuntimeThreadBindingRecord> {
+    let mcp = thread_mcp_metadata_from_model(&model);
+    let provider_session = provider_session_binding_from_model(&model)?;
     Ok(CliRuntimeThreadBindingRecord {
         thread_id: model.thread_id,
         workspace_id: model.workspace_id,
@@ -1097,14 +1469,60 @@ fn thread_binding_record_from_model(
         native_model: model.native_model,
         resume_cursor_json: model.resume_cursor_json,
         status: model.status,
+        mcp,
+        provider_session,
         created_at: model.created_at,
         updated_at: model.updated_at,
     })
 }
 
+fn provider_session_binding_from_model(
+    model: &thread_cli_runtime_binding::Model,
+) -> Result<Option<CliRuntimeProviderSessionBinding>> {
+    match (
+        model.provider_session_id.as_deref(),
+        model.provider_session_lifecycle_state.as_deref(),
+    ) {
+        (None, None)
+            if model
+                .provider_session_last_verified_process_generation
+                .is_none() =>
+        {
+            Ok(None)
+        }
+        (Some(provider_session_id), Some(lifecycle)) => {
+            validate_provider_session_id(provider_session_id)?;
+            let lifecycle = CliRuntimeProviderSessionLifecycle::from_db(lifecycle)?;
+            let last_verified_process_generation =
+                model.provider_session_last_verified_process_generation;
+            if last_verified_process_generation.is_some_and(|generation| generation <= 0) {
+                return Err(anyhow!(
+                    "CLI provider session verified process generation must be positive"
+                ));
+            }
+            if lifecycle == CliRuntimeProviderSessionLifecycle::Prepared
+                && last_verified_process_generation.is_some()
+            {
+                return Err(anyhow!(
+                    "prepared CLI provider session cannot have a verified process generation"
+                ));
+            }
+            Ok(Some(CliRuntimeProviderSessionBinding {
+                provider_session_id: provider_session_id.to_owned(),
+                lifecycle,
+                last_verified_process_generation,
+            }))
+        }
+        _ => Err(anyhow!(
+            "CLI provider session binding columns are incomplete"
+        )),
+    }
+}
+
 fn turn_binding_record_from_model(
     model: turn_cli_runtime_binding::Model,
 ) -> Result<CliRuntimeTurnBindingRecord> {
+    let mcp = turn_mcp_metadata_from_model(&model);
     Ok(CliRuntimeTurnBindingRecord {
         turn_id: model.turn_id,
         thread_id: model.thread_id,
@@ -1120,6 +1538,7 @@ fn turn_binding_record_from_model(
         sandbox_json: model.sandbox_json,
         approval_policy: model.approval_policy,
         input_mapping_json: model.input_mapping_json,
+        mcp,
         created_at: model.created_at,
         updated_at: model.updated_at,
     })
@@ -1151,6 +1570,37 @@ fn turn_attempt_record_from_model(
         completed_at: model.completed_at,
         created_at: model.created_at,
         updated_at: model.updated_at,
+    })
+}
+
+fn thread_mcp_metadata_from_model(
+    model: &thread_cli_runtime_binding::Model,
+) -> Option<CliRuntimeThreadMcpMetadata> {
+    Some(CliRuntimeThreadMcpMetadata {
+        adapter_kind: model.mcp_adapter_kind.clone()?,
+        manifest_hash: model.mcp_manifest_hash.clone()?,
+        projection_fingerprint: model.mcp_projection_fingerprint.clone()?,
+        provider_contract_fingerprint: model.mcp_provider_contract_fingerprint.clone()?,
+        isolation_contract_fingerprint: model.mcp_isolation_contract_fingerprint.clone()?,
+        session_generation: model.mcp_session_generation?,
+        provider_session_id: model.provider_session_id.clone(),
+        provider_session_lifecycle_state: model.provider_session_lifecycle_state.clone(),
+        provider_session_last_verified_process_generation: model
+            .provider_session_last_verified_process_generation,
+    })
+}
+
+fn turn_mcp_metadata_from_model(
+    model: &turn_cli_runtime_binding::Model,
+) -> Option<CliRuntimeTurnMcpMetadata> {
+    Some(CliRuntimeTurnMcpMetadata {
+        adapter_kind: model.mcp_adapter_kind.clone()?,
+        manifest_hash: model.mcp_manifest_hash.clone()?,
+        projection_fingerprint: model.mcp_projection_fingerprint.clone()?,
+        provider_contract_fingerprint: model.mcp_provider_contract_fingerprint.clone()?,
+        isolation_contract_fingerprint: model.mcp_isolation_contract_fingerprint.clone()?,
+        session_generation: model.mcp_session_generation?,
+        projection_activation_generation: model.mcp_projection_activation_generation?,
     })
 }
 

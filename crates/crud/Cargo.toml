@@ -18,6 +18,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 hex.workspace = true
 sha2.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 pioneer-migration.workspace = true

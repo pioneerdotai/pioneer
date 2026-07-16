@@ -331,11 +331,14 @@ pub use crate::repositories::artifact::{
 pub use crate::repositories::cli_runtime_binding::{
     CliRuntimeNativeEventListFilter, CliRuntimeNativeEventRecord,
     CliRuntimePendingRequestListFilter, CliRuntimePendingRequestRecord,
-    CliRuntimePendingRequestStatus, CliRuntimeThreadBindingRecord, CliRuntimeTurnAttemptRecord,
-    CliRuntimeTurnAttemptStatus, CliRuntimeTurnBindingListFilter, CliRuntimeTurnBindingRecord,
-    NewCliRuntimeNativeEvent, NewCliRuntimePendingRequest, NewCliRuntimeThreadBinding,
-    NewCliRuntimeTurnBinding, ResolveCliRuntimePendingRequest, deserialize_cli_runtime_json,
-    serialize_cli_runtime_json,
+    CliRuntimePendingRequestStatus, CliRuntimeProviderSessionBinding,
+    CliRuntimeProviderSessionLifecycle, CliRuntimeThreadBindingRecord, CliRuntimeThreadMcpMetadata,
+    CliRuntimeTurnAttemptRecord, CliRuntimeTurnAttemptStatus, CliRuntimeTurnBindingListFilter,
+    CliRuntimeTurnBindingRecord, CliRuntimeTurnMcpMetadata, NewCliRuntimeNativeEvent,
+    NewCliRuntimePendingRequest, NewCliRuntimeThreadBinding, NewCliRuntimeTurnBinding,
+    PrepareClaudeProviderSessionBinding, PreparedClaudeProviderSessionBinding,
+    PreparedClaudeProviderSessionMode, ResolveCliRuntimePendingRequest,
+    deserialize_cli_runtime_json, serialize_cli_runtime_json,
 };
 pub use crate::repositories::thread_agents_doc::{
     ResolvedThreadAgentsDocRecord, ThreadAgentsDocError, ThreadAgentsDocRecord,
@@ -359,6 +362,10 @@ pub use crate::repositories::thread_timeline_projection::{
     upsert_projection_meta, upsert_projection_meta_with_config, upsert_thread_timeline_block,
     upsert_turn_work_item_projection, upsert_turn_work_projection,
 };
+pub use crate::repositories::turn_mcp_projection::{
+    TurnMcpProjectionPersistenceError, TurnMcpProjectionReplaceOutcome,
+    TurnMcpProjectionReplacement,
+};
 use crate::repositories::{
     agent_memory, agent_memory_candidate, agent_memory_capsule, agent_memory_event,
     agent_memory_policy_decision, agent_memory_quality_decision, agent_memory_quarantine,
@@ -370,8 +377,8 @@ use crate::repositories::{
     task_run_execution, task_run_thread_binding, task_run_turn, task_trigger, task_write_lock,
     thread, thread_agents_doc, thread_episodic as thread_episodic_repository, thread_lineage,
     thread_tree, turn, turn_event, turn_event_projection_state, turn_execution_window,
-    turn_item_attempt, turn_liveness, turn_llm_context, turn_mcp_binding, turn_runtime_snapshot,
-    turn_skill_binding,
+    turn_item_attempt, turn_liveness, turn_llm_context, turn_mcp_binding, turn_mcp_projection,
+    turn_runtime_snapshot, turn_skill_binding,
 };
 pub use crate::task_events::{AppendedTaskEvent, TaskEventAppendStatus, TaskEventPayload};
 use crate::task_projector::TaskProjector;
@@ -810,10 +817,30 @@ pub struct TurnMcpBindingRecord {
     pub server_name: String,
     pub raw_tool_name: String,
     pub callable_name: String,
+    pub canonical_callable_name: String,
+    pub provider_callable_name: String,
     pub catalog_version: String,
     pub fingerprint: String,
+    pub canonical_schema_fingerprint: String,
+    pub provider_schema_fingerprint: String,
+    pub annotations_json: String,
+    pub annotations_digest: String,
+    pub effective_timeout_ms: i64,
+    pub runtime_generation: i64,
+    pub projection_activation_generation: i64,
     pub selection_reason: String,
     pub capability_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnMcpProjectionRecord {
+    pub turn_id: String,
+    pub workspace_id: String,
+    pub projection_version: i32,
+    pub manifest_hash: String,
+    pub resolution_status: String,
+    pub tool_count: i32,
+    pub created_at_unix: i64,
 }
 
 #[derive(Clone)]
@@ -956,6 +983,60 @@ impl CrudStore {
         cli_runtime_binding::find_thread_binding(&self.connection, thread_id.as_str()).await
     }
 
+    pub async fn prepare_claude_provider_session_binding(
+        &self,
+        request: PrepareClaudeProviderSessionBinding,
+    ) -> Result<PreparedClaudeProviderSessionBinding> {
+        self.run_serialized_write(|| async {
+            cli_runtime_binding::prepare_claude_provider_session_binding(
+                &self.connection,
+                request.clone(),
+            )
+            .await
+        })
+        .await
+    }
+
+    pub async fn verify_claude_provider_session_binding(
+        &self,
+        thread_id: &str,
+        expected_provider_session_id: &str,
+        emitted_provider_session_id: Option<&str>,
+        process_generation: i64,
+    ) -> Result<CliRuntimeThreadBindingRecord> {
+        let thread_id = thread_id.to_owned();
+        let expected_provider_session_id = expected_provider_session_id.to_owned();
+        let emitted_provider_session_id = emitted_provider_session_id.map(str::to_owned);
+        self.run_serialized_write(|| async {
+            cli_runtime_binding::verify_claude_provider_session_binding(
+                &self.connection,
+                thread_id.as_str(),
+                expected_provider_session_id.as_str(),
+                emitted_provider_session_id.as_deref(),
+                process_generation,
+            )
+            .await
+        })
+        .await
+    }
+
+    pub async fn set_cli_runtime_thread_mcp_metadata(
+        &self,
+        thread_id: &str,
+        metadata: Option<CliRuntimeThreadMcpMetadata>,
+    ) -> Result<CliRuntimeThreadBindingRecord> {
+        let thread_id = thread_id.to_owned();
+        self.run_serialized_write(|| async {
+            cli_runtime_binding::set_thread_mcp_metadata(
+                &self.connection,
+                thread_id.as_str(),
+                metadata.clone(),
+            )
+            .await
+        })
+        .await
+    }
+
     pub async fn get_cli_runtime_thread_binding_by_native_thread(
         &self,
         runtime_id: &str,
@@ -1002,6 +1083,74 @@ impl CrudStore {
     ) -> Result<Option<CliRuntimeTurnBindingRecord>> {
         let turn_id = turn_id.to_owned();
         cli_runtime_binding::find_turn_binding(&self.connection, turn_id.as_str()).await
+    }
+
+    pub async fn set_cli_runtime_turn_mcp_metadata(
+        &self,
+        turn_id: &str,
+        metadata: Option<CliRuntimeTurnMcpMetadata>,
+    ) -> Result<CliRuntimeTurnBindingRecord> {
+        let turn_id = turn_id.to_owned();
+        self.run_serialized_write(|| async {
+            cli_runtime_binding::set_turn_mcp_metadata(
+                &self.connection,
+                turn_id.as_str(),
+                metadata.clone(),
+            )
+            .await
+        })
+        .await
+    }
+
+    /// Atomically binds the runtime turn metadata and the same activation
+    /// generation to every tool in the already-frozen MCP projection.
+    pub async fn bind_cli_runtime_turn_mcp_activation(
+        &self,
+        turn_id: &str,
+        metadata: CliRuntimeTurnMcpMetadata,
+    ) -> Result<CliRuntimeTurnBindingRecord> {
+        let turn_id = turn_id.to_owned();
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin CLI MCP activation binding transaction")?;
+            let projection = turn_mcp_binding::find_turn_mcp_projection(
+                &transaction,
+                turn_id.as_str(),
+            )
+            .await?
+            .context("frozen MCP projection is missing for CLI activation")?;
+            if projection.manifest_hash != metadata.manifest_hash {
+                bail!("CLI MCP activation manifest does not match the frozen projection");
+            }
+            let updated = turn_mcp_binding::set_projection_activation_generation(
+                &transaction,
+                turn_id.as_str(),
+                metadata.projection_activation_generation,
+            )
+            .await?;
+            let expected = u64::try_from(projection.tool_count)
+                .context("frozen MCP projection has an invalid tool count")?;
+            if updated != expected {
+                bail!(
+                    "CLI MCP activation updated {updated} bindings but frozen projection declares {expected}"
+                );
+            }
+            let binding = cli_runtime_binding::set_turn_mcp_metadata(
+                &transaction,
+                turn_id.as_str(),
+                Some(metadata.clone()),
+            )
+            .await?;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit CLI MCP activation binding transaction")?;
+            Ok(binding)
+        })
+        .await
     }
 
     pub async fn get_cli_runtime_turn_binding_by_request(
@@ -9080,6 +9229,31 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         .await
     }
 
+    /// Atomically persists one complete turn MCP projection. This is the only
+    /// repository entry point callers need for a projection header plus zero/N bindings.
+    pub async fn replace_turn_mcp_projection(
+        &self,
+        replacement: &TurnMcpProjectionReplacement,
+    ) -> std::result::Result<TurnMcpProjectionReplaceOutcome, TurnMcpProjectionPersistenceError>
+    {
+        let replacement = replacement.clone();
+        self.write_coordinator
+            .run_serialized_with_retry(
+                || {
+                    let replacement = replacement.clone();
+                    async move {
+                        turn_mcp_projection::replace_turn_mcp_projection(
+                            &self.connection,
+                            &replacement,
+                        )
+                        .await
+                    }
+                },
+                TurnMcpProjectionPersistenceError::is_sqlite_lock,
+            )
+            .await
+    }
+
     pub async fn list_turn_mcp_bindings(&self, turn_id: &str) -> Result<Vec<TurnMcpBindingRecord>> {
         let rows = turn_mcp_binding::list_turn_mcp_bindings(&self.connection, turn_id).await?;
         Ok(rows
@@ -9089,12 +9263,42 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                 server_name: model.server_name,
                 raw_tool_name: model.raw_tool_name,
                 callable_name: model.callable_name,
+                canonical_callable_name: model.canonical_callable_name,
+                provider_callable_name: model.provider_callable_name,
                 catalog_version: model.catalog_version,
                 fingerprint: model.fingerprint,
+                canonical_schema_fingerprint: model.canonical_schema_fingerprint,
+                provider_schema_fingerprint: model.provider_schema_fingerprint,
+                annotations_json: model.annotations_json,
+                annotations_digest: model.annotations_digest,
+                effective_timeout_ms: model.effective_timeout_ms,
+                runtime_generation: model.runtime_generation,
+                projection_activation_generation: model.projection_activation_generation,
                 selection_reason: model.selection_reason,
                 capability_id: model.capability_id,
             })
             .collect())
+    }
+
+    pub async fn get_turn_mcp_projection(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<TurnMcpProjectionRecord>> {
+        let row = turn_mcp_binding::find_turn_mcp_projection(&self.connection, turn_id).await?;
+        row.map(|model| {
+            Ok(TurnMcpProjectionRecord {
+                turn_id: model.turn_id,
+                workspace_id: model.workspace_id,
+                projection_version: i32::try_from(model.projection_version)
+                    .context("turn MCP projection version is outside the supported range")?,
+                manifest_hash: model.manifest_hash,
+                resolution_status: model.resolution_status,
+                tool_count: i32::try_from(model.tool_count)
+                    .context("turn MCP projection tool count is outside the supported range")?,
+                created_at_unix: model.created_at.timestamp(),
+            })
+        })
+        .transpose()
     }
 
     pub async fn list_recent_turn_mcp_bindings_for_server(
@@ -9115,8 +9319,17 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                 server_name: model.server_name,
                 raw_tool_name: model.raw_tool_name,
                 callable_name: model.callable_name,
+                canonical_callable_name: model.canonical_callable_name,
+                provider_callable_name: model.provider_callable_name,
                 catalog_version: model.catalog_version,
                 fingerprint: model.fingerprint,
+                canonical_schema_fingerprint: model.canonical_schema_fingerprint,
+                provider_schema_fingerprint: model.provider_schema_fingerprint,
+                annotations_json: model.annotations_json,
+                annotations_digest: model.annotations_digest,
+                effective_timeout_ms: model.effective_timeout_ms,
+                runtime_generation: model.runtime_generation,
+                projection_activation_generation: model.projection_activation_generation,
                 selection_reason: model.selection_reason,
                 capability_id: model.capability_id,
             })
@@ -13359,12 +13572,14 @@ mod tests {
         ATTEMPT_STATUS_COMPLETED, ArtifactBindingTargetRecord, BlockedTurnRecoveryResumeOutcome,
         ClaimedRecoveryActivation, CliRuntimeNativeEventListFilter,
         CliRuntimePendingRequestListFilter, CliRuntimePendingRequestStatus,
-        CliRuntimeTurnBindingListFilter, ConversationArtifactRefLimits, CrudStore,
-        IngestArtifactMetadataRecord, McpAuditEventRecord, McpServerCatalogSnapshotRecord,
-        McpServerInstallationRecord, NewArtifactBlobRecord, NewCliRuntimeNativeEvent,
-        NewCliRuntimePendingRequest, NewCliRuntimeThreadBinding, NewCliRuntimeTurnBinding,
-        NewThreadEpisodicItemRecord, NewTurnExecutionCheckpointRecord,
+        CliRuntimeProviderSessionLifecycle, CliRuntimeThreadMcpMetadata,
+        CliRuntimeTurnBindingListFilter, CliRuntimeTurnMcpMetadata, ConversationArtifactRefLimits,
+        CrudStore, IngestArtifactMetadataRecord, McpAuditEventRecord,
+        McpServerCatalogSnapshotRecord, McpServerInstallationRecord, NewArtifactBlobRecord,
+        NewCliRuntimeNativeEvent, NewCliRuntimePendingRequest, NewCliRuntimeThreadBinding,
+        NewCliRuntimeTurnBinding, NewThreadEpisodicItemRecord, NewTurnExecutionCheckpointRecord,
         NewTurnExecutionWindowRecord, NewTurnLlmContextEntry, NewTurnRuntimeSnapshot,
+        PrepareClaudeProviderSessionBinding, PreparedClaudeProviderSessionMode,
         ResolveCliRuntimePendingRequest, SkillAuditEventRecord, SkillInstallationRecord,
         THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID,
         THREAD_EPISODIC_WORKSPACE_SEGMENT_CAPACITY_BYTES, TaskEventPayload, TaskRunChildAnchor,
@@ -13374,7 +13589,8 @@ mod tests {
         ThreadEpisodicSourceActorRole, ThreadEpisodicSourceRuntimeKind,
         ThreadEpisodicWorkspaceActiveWriteSegmentRequest, TurnExecutionCheckpointKind,
         TurnExecutionWindowStatsRecord, TurnExecutionWindowUsageAggregateRecord,
-        TurnItemAttemptDeadlines, TurnMcpBindingRecord, TurnSkillBindingRecord,
+        TurnItemAttemptDeadlines, TurnMcpBindingRecord, TurnMcpProjectionPersistenceError,
+        TurnMcpProjectionRecord, TurnMcpProjectionReplacement, TurnSkillBindingRecord,
         WorkspaceSkillPolicyRecord,
     };
     use crate::util::unix_to_datetime;
@@ -13486,6 +13702,46 @@ mod tests {
             .expect("turn should persist");
 
         (store, thread, turn)
+    }
+
+    fn test_turn_mcp_projection(
+        turn_id: &str,
+        workspace_id: &str,
+        manifest_hash: &str,
+        tool_count: i32,
+    ) -> TurnMcpProjectionRecord {
+        TurnMcpProjectionRecord {
+            turn_id: turn_id.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            projection_version: 1,
+            manifest_hash: manifest_hash.to_owned(),
+            resolution_status: "resolved".to_owned(),
+            tool_count,
+            created_at_unix: 1_700_000_100,
+        }
+    }
+
+    fn test_turn_mcp_binding(index: usize) -> TurnMcpBindingRecord {
+        let canonical_callable_name = format!("mcp_test_tool_{index}");
+        TurnMcpBindingRecord {
+            server_installation_id: format!("server_mcp_{index:02}"),
+            server_name: "test".to_owned(),
+            raw_tool_name: format!("tool_{index}"),
+            callable_name: canonical_callable_name.clone(),
+            canonical_callable_name: canonical_callable_name.clone(),
+            provider_callable_name: format!("mcp__pioneer__{canonical_callable_name}"),
+            catalog_version: "catalog-v1".to_owned(),
+            fingerprint: format!("installation-fingerprint-{index}"),
+            canonical_schema_fingerprint: format!("canonical-schema-{index}"),
+            provider_schema_fingerprint: format!("provider-schema-{index}"),
+            annotations_json: r#"{"readOnlyHint":true}"#.to_owned(),
+            annotations_digest: format!("annotations-{index}"),
+            effective_timeout_ms: 20_000,
+            runtime_generation: 7,
+            projection_activation_generation: 3,
+            selection_reason: "explicit_composer_capability".to_owned(),
+            capability_id: Some(format!("mcp:test:tool_{index}")),
+        }
     }
 
     fn test_artifact_binding(
@@ -14117,6 +14373,24 @@ mod tests {
             inserted_thread.native_session_id.as_deref(),
             Some("session-a")
         );
+        assert!(inserted_thread.mcp.is_none());
+
+        let thread_mcp = CliRuntimeThreadMcpMetadata {
+            adapter_kind: "codex_stdio_bridge".to_owned(),
+            manifest_hash: "manifest-thread-v1".to_owned(),
+            projection_fingerprint: "projection-thread-v1".to_owned(),
+            provider_contract_fingerprint: "provider-contract-v1".to_owned(),
+            isolation_contract_fingerprint: "isolation-contract-v1".to_owned(),
+            session_generation: 11,
+            provider_session_id: Some("01900000-0000-7000-8000-000000000021".to_owned()),
+            provider_session_lifecycle_state: Some("verified".to_owned()),
+            provider_session_last_verified_process_generation: Some(11),
+        };
+        let thread_with_mcp = store
+            .set_cli_runtime_thread_mcp_metadata("thread_cli_bind", Some(thread_mcp.clone()))
+            .await
+            .expect("thread MCP metadata update should succeed");
+        assert_eq!(thread_with_mcp.mcp, Some(thread_mcp.clone()));
 
         let mut replacement_thread = thread_binding;
         replacement_thread.native_session_id = Some("session-b".to_owned());
@@ -14134,6 +14408,7 @@ mod tests {
             updated_thread.native_session_id.as_deref(),
             Some("session-b")
         );
+        assert_eq!(updated_thread.mcp, Some(thread_mcp));
 
         let by_native = store
             .get_cli_runtime_thread_binding_by_native_thread("codex", "codex-thread-a")
@@ -14173,6 +14448,21 @@ mod tests {
             .await
             .expect("turn binding insert should succeed");
 
+        let turn_mcp = CliRuntimeTurnMcpMetadata {
+            adapter_kind: "codex_stdio_bridge".to_owned(),
+            manifest_hash: "manifest-turn-v1".to_owned(),
+            projection_fingerprint: "projection-turn-v1".to_owned(),
+            provider_contract_fingerprint: "provider-contract-v1".to_owned(),
+            isolation_contract_fingerprint: "isolation-contract-v1".to_owned(),
+            session_generation: 11,
+            projection_activation_generation: 3,
+        };
+        let turn_with_mcp = store
+            .set_cli_runtime_turn_mcp_metadata("turn_cli_bind", Some(turn_mcp.clone()))
+            .await
+            .expect("turn MCP metadata update should succeed");
+        assert_eq!(turn_with_mcp.mcp, Some(turn_mcp.clone()));
+
         let mut replacement_turn = turn_binding;
         replacement_turn.status = "completed".to_owned();
         replacement_turn.model = Some("gpt-5.1".to_owned());
@@ -14184,6 +14474,7 @@ mod tests {
             .expect("turn binding update should succeed");
         assert_eq!(updated_turn.created_at, created_at);
         assert_eq!(updated_turn.status, "completed");
+        assert_eq!(updated_turn.mcp, Some(turn_mcp));
 
         let by_request = store
             .get_cli_runtime_turn_binding_by_request("rpc-request-a")
@@ -14238,6 +14529,183 @@ mod tests {
             .expect("active CLI runtime turn bindings should list");
         assert_eq!(active_turn_bindings.len(), 1);
         assert_eq!(active_turn_bindings[0].turn_id, "turn_cli_running");
+    }
+
+    #[tokio::test]
+    async fn cli_runtime_binding_claude_session_identity_is_durable_and_generation_fenced() {
+        let store = test_store_with_workspace("ws_claude_session_identity").await;
+        let now = unix_to_datetime(1_700_020_000);
+        let new_binding = |thread_id: &str| NewCliRuntimeThreadBinding {
+            thread_id: thread_id.to_owned(),
+            workspace_id: "ws_claude_session_identity".to_owned(),
+            runtime_id: "claude".to_owned(),
+            runtime_kind: "claude".to_owned(),
+            native_thread_id: "pending".to_owned(),
+            native_session_id: None,
+            native_root_thread_id: None,
+            native_cwd: Some("/tmp/project".to_owned()),
+            native_model: Some("claude-sonnet".to_owned()),
+            resume_cursor_json: "{}".to_owned(),
+            status: "active".to_owned(),
+            created_at: now,
+            updated_at: now,
+        };
+        let first_id = "01900000-0000-7000-8000-000000000001";
+        let prepared = store
+            .prepare_claude_provider_session_binding(PrepareClaudeProviderSessionBinding {
+                thread_binding: new_binding("claude-thread"),
+                proposed_provider_session_id: first_id.to_owned(),
+            })
+            .await
+            .expect("prepare Claude identity");
+        assert_eq!(prepared.mode, PreparedClaudeProviderSessionMode::New);
+        assert_eq!(
+            prepared
+                .binding
+                .provider_session
+                .as_ref()
+                .expect("provider binding")
+                .lifecycle,
+            CliRuntimeProviderSessionLifecycle::Prepared
+        );
+
+        let duplicate = store
+            .prepare_claude_provider_session_binding(PrepareClaudeProviderSessionBinding {
+                thread_binding: new_binding("claude-thread"),
+                proposed_provider_session_id: "01900000-0000-7000-8000-000000000099".to_owned(),
+            })
+            .await
+            .expect("idempotent duplicate prepare");
+        assert_eq!(
+            duplicate
+                .binding
+                .provider_session
+                .as_ref()
+                .expect("duplicate provider binding")
+                .provider_session_id,
+            first_id
+        );
+
+        let reloaded = CrudStore::new(store.database_connection());
+        assert_eq!(
+            reloaded
+                .get_cli_runtime_thread_binding("claude-thread")
+                .await
+                .expect("reload binding")
+                .expect("reloaded binding")
+                .provider_session
+                .expect("reloaded provider binding")
+                .provider_session_id,
+            first_id
+        );
+        let verified = reloaded
+            .verify_claude_provider_session_binding("claude-thread", first_id, Some(first_id), 2)
+            .await
+            .expect("verify emitted identity");
+        let provider = verified
+            .provider_session
+            .expect("verified provider binding");
+        assert_eq!(
+            provider.lifecycle,
+            CliRuntimeProviderSessionLifecycle::Verified
+        );
+        assert_eq!(provider.last_verified_process_generation, Some(2));
+        assert!(
+            reloaded
+                .verify_claude_provider_session_binding(
+                    "claude-thread",
+                    first_id,
+                    Some(first_id),
+                    1,
+                )
+                .await
+                .is_err(),
+            "stale process generation must not verify"
+        );
+        assert_eq!(
+            reloaded
+                .prepare_claude_provider_session_binding(PrepareClaudeProviderSessionBinding {
+                    thread_binding: new_binding("claude-thread"),
+                    proposed_provider_session_id: "01900000-0000-7000-8000-000000000098".to_owned(),
+                })
+                .await
+                .expect("prepare verified identity")
+                .mode,
+            PreparedClaudeProviderSessionMode::Resume
+        );
+
+        for (thread_id, emitted) in [
+            ("claude-missing", None),
+            (
+                "claude-mismatch",
+                Some("01900000-0000-7000-8000-000000000077"),
+            ),
+        ] {
+            let expected = if thread_id == "claude-missing" {
+                "01900000-0000-7000-8000-000000000010"
+            } else {
+                "01900000-0000-7000-8000-000000000011"
+            };
+            reloaded
+                .prepare_claude_provider_session_binding(PrepareClaudeProviderSessionBinding {
+                    thread_binding: new_binding(thread_id),
+                    proposed_provider_session_id: expected.to_owned(),
+                })
+                .await
+                .expect("prepare rejection fixture");
+            assert!(
+                reloaded
+                    .verify_claude_provider_session_binding(thread_id, expected, emitted, 3,)
+                    .await
+                    .is_err()
+            );
+            let invalid = reloaded
+                .get_cli_runtime_thread_binding(thread_id)
+                .await
+                .expect("read invalid fixture")
+                .expect("invalid fixture")
+                .provider_session
+                .expect("invalid provider binding");
+            assert_eq!(
+                invalid.lifecycle,
+                CliRuntimeProviderSessionLifecycle::Invalid
+            );
+            assert!(
+                reloaded
+                    .prepare_claude_provider_session_binding(PrepareClaudeProviderSessionBinding {
+                        thread_binding: new_binding(thread_id),
+                        proposed_provider_session_id: expected.to_owned(),
+                    })
+                    .await
+                    .is_err(),
+                "invalid identity must not be silently replaced"
+            );
+        }
+
+        assert!(
+            reloaded
+                .prepare_claude_provider_session_binding(PrepareClaudeProviderSessionBinding {
+                    thread_binding: new_binding("claude-invalid-uuid"),
+                    proposed_provider_session_id: String::new(),
+                })
+                .await
+                .is_err()
+        );
+
+        reloaded
+            .upsert_cli_runtime_thread_binding(new_binding("claude-legacy-without-real-id"))
+            .await
+            .expect("legacy Claude binding fixture");
+        assert!(
+            reloaded
+                .prepare_claude_provider_session_binding(PrepareClaudeProviderSessionBinding {
+                    thread_binding: new_binding("claude-legacy-without-real-id"),
+                    proposed_provider_session_id: "01900000-0000-7000-8000-000000000012".to_owned(),
+                })
+                .await
+                .is_err(),
+            "legacy synthetic binding must not be silently treated as durable continuity"
+        );
     }
 
     #[tokio::test]
@@ -19843,7 +20311,291 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_repositories_round_trip_installation_audit_catalog_and_bindings() {
+    async fn turn_mcp_projection_atomic_projection_replace_handles_zero_one_many_and_invalid_inputs()
+     {
+        let (store, _, _) = test_store_with_started_turn(
+            "workspace_projection_replace",
+            "thread_projection_replace",
+            "turn_projection_replace",
+        )
+        .await;
+
+        let invalid_count = TurnMcpProjectionReplacement {
+            projection: test_turn_mcp_projection(
+                "turn_projection_replace",
+                "workspace_projection_replace",
+                "manifest-invalid-count",
+                2,
+            ),
+            bindings: vec![test_turn_mcp_binding(1)],
+        };
+        assert!(matches!(
+            store
+                .replace_turn_mcp_projection(&invalid_count)
+                .await
+                .expect_err("declared count mismatch must fail"),
+            TurnMcpProjectionPersistenceError::InvalidToolCount {
+                declared: 2,
+                actual: 1
+            }
+        ));
+
+        let wrong_workspace = TurnMcpProjectionReplacement {
+            projection: test_turn_mcp_projection(
+                "turn_projection_replace",
+                "workspace_other",
+                "manifest-wrong-workspace",
+                0,
+            ),
+            bindings: Vec::new(),
+        };
+        assert!(matches!(
+            store
+                .replace_turn_mcp_projection(&wrong_workspace)
+                .await
+                .expect_err("workspace mismatch must fail"),
+            TurnMcpProjectionPersistenceError::WorkspaceMismatch { .. }
+        ));
+
+        let one = TurnMcpProjectionReplacement {
+            projection: test_turn_mcp_projection(
+                "turn_projection_replace",
+                "workspace_projection_replace",
+                "manifest-one",
+                1,
+            ),
+            bindings: vec![test_turn_mcp_binding(1)],
+        };
+        let one_outcome = store
+            .replace_turn_mcp_projection(&one)
+            .await
+            .expect("one-tool projection should persist");
+        assert_eq!(one_outcome.manifest_hash, "manifest-one");
+        assert_eq!(
+            store
+                .get_turn_mcp_projection("turn_projection_replace")
+                .await
+                .expect("projection header query should succeed"),
+            Some(one.projection.clone())
+        );
+        assert_eq!(
+            store
+                .list_turn_mcp_bindings("turn_projection_replace")
+                .await
+                .expect("one-tool bindings should load"),
+            one.bindings
+        );
+
+        store
+            .replace_turn_mcp_projection(&one)
+            .await
+            .expect("identical projection replacement should be safe");
+        assert_eq!(
+            store
+                .list_turn_mcp_bindings("turn_projection_replace")
+                .await
+                .expect("repeated bindings should load"),
+            one.bindings
+        );
+
+        let many = TurnMcpProjectionReplacement {
+            projection: test_turn_mcp_projection(
+                "turn_projection_replace",
+                "workspace_projection_replace",
+                "manifest-many",
+                3,
+            ),
+            bindings: vec![
+                test_turn_mcp_binding(3),
+                test_turn_mcp_binding(1),
+                test_turn_mcp_binding(2),
+            ],
+        };
+        store
+            .replace_turn_mcp_projection(&many)
+            .await
+            .expect("many-tool projection should replace prior state");
+        let persisted_many = store
+            .list_turn_mcp_bindings("turn_projection_replace")
+            .await
+            .expect("many-tool bindings should load");
+        assert_eq!(
+            persisted_many
+                .iter()
+                .map(|binding| binding.canonical_callable_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mcp_test_tool_1", "mcp_test_tool_2", "mcp_test_tool_3"]
+        );
+        assert_eq!(persisted_many[0].annotations_digest, "annotations-1");
+        assert_eq!(persisted_many[2].runtime_generation, 7);
+
+        let zero = TurnMcpProjectionReplacement {
+            projection: test_turn_mcp_projection(
+                "turn_projection_replace",
+                "workspace_projection_replace",
+                "manifest-zero",
+                0,
+            ),
+            bindings: Vec::new(),
+        };
+        store
+            .replace_turn_mcp_projection(&zero)
+            .await
+            .expect("zero-tool projection should persist and clear bindings");
+        assert_eq!(
+            store
+                .get_turn_mcp_projection("turn_projection_replace")
+                .await
+                .expect("zero projection header query should succeed"),
+            Some(zero.projection)
+        );
+        assert!(
+            store
+                .list_turn_mcp_bindings("turn_projection_replace")
+                .await
+                .expect("zero projection binding query should succeed")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_mcp_activation_atomically_binds_turn_and_every_frozen_tool() {
+        let (store, _, _) = test_store_with_started_turn(
+            "workspace_projection_activation",
+            "thread_projection_activation",
+            "turn_projection_activation",
+        )
+        .await;
+        let replacement = TurnMcpProjectionReplacement {
+            projection: test_turn_mcp_projection(
+                "turn_projection_activation",
+                "workspace_projection_activation",
+                "manifest-activation",
+                2,
+            ),
+            bindings: vec![test_turn_mcp_binding(1), test_turn_mcp_binding(2)],
+        };
+        store
+            .replace_turn_mcp_projection(&replacement)
+            .await
+            .expect("projection should persist");
+        let timestamp = unix_to_datetime(1_700_000_101);
+        store
+            .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+                turn_id: "turn_projection_activation".to_owned(),
+                thread_id: "thread_projection_activation".to_owned(),
+                workspace_id: "workspace_projection_activation".to_owned(),
+                runtime_id: "codex".to_owned(),
+                runtime_kind: "codex".to_owned(),
+                native_thread_id: "native-thread".to_owned(),
+                native_turn_id: None,
+                request_id: None,
+                status: "running".to_owned(),
+                model: None,
+                cwd: None,
+                sandbox_json: None,
+                approval_policy: None,
+                input_mapping_json: "{}".to_owned(),
+                created_at: timestamp,
+                updated_at: timestamp,
+            })
+            .await
+            .expect("CLI turn binding should persist");
+        let metadata = CliRuntimeTurnMcpMetadata {
+            adapter_kind: "codex_synthetic_mcp".to_owned(),
+            manifest_hash: "manifest-activation".to_owned(),
+            projection_fingerprint: "projection-fingerprint".to_owned(),
+            provider_contract_fingerprint: "provider-contract".to_owned(),
+            isolation_contract_fingerprint: "isolation-contract".to_owned(),
+            session_generation: 4,
+            projection_activation_generation: 9,
+        };
+        let turn_binding = store
+            .bind_cli_runtime_turn_mcp_activation("turn_projection_activation", metadata.clone())
+            .await
+            .expect("activation should bind atomically");
+
+        assert_eq!(turn_binding.mcp, Some(metadata));
+        assert!(
+            store
+                .list_turn_mcp_bindings("turn_projection_activation")
+                .await
+                .expect("bindings should load")
+                .iter()
+                .all(|binding| binding.projection_activation_generation == 9)
+        );
+    }
+
+    #[tokio::test]
+    async fn atomic_projection_replace_rolls_back_header_delete_and_every_insert_fault() {
+        use crate::repositories::turn_mcp_projection::{
+            AtomicProjectionReplaceFault, replace_turn_mcp_projection_with_fault,
+        };
+
+        let (store, _, _) = test_store_with_started_turn(
+            "workspace_projection_fault",
+            "thread_projection_fault",
+            "turn_projection_fault",
+        )
+        .await;
+        let committed = TurnMcpProjectionReplacement {
+            projection: test_turn_mcp_projection(
+                "turn_projection_fault",
+                "workspace_projection_fault",
+                "manifest-committed",
+                1,
+            ),
+            bindings: vec![test_turn_mcp_binding(9)],
+        };
+        store
+            .replace_turn_mcp_projection(&committed)
+            .await
+            .expect("baseline projection should persist");
+
+        let attempted = TurnMcpProjectionReplacement {
+            projection: test_turn_mcp_projection(
+                "turn_projection_fault",
+                "workspace_projection_fault",
+                "manifest-attempted",
+                3,
+            ),
+            bindings: vec![
+                test_turn_mcp_binding(1),
+                test_turn_mcp_binding(2),
+                test_turn_mcp_binding(3),
+            ],
+        };
+        for fault in [
+            AtomicProjectionReplaceFault::AfterHeader,
+            AtomicProjectionReplaceFault::AfterDelete,
+            AtomicProjectionReplaceFault::AfterInsert(1),
+            AtomicProjectionReplaceFault::AfterInsert(2),
+            AtomicProjectionReplaceFault::AfterInsert(3),
+        ] {
+            replace_turn_mcp_projection_with_fault(&store.connection, &attempted, fault)
+                .await
+                .expect_err("injected transaction fault must fail");
+            assert_eq!(
+                store
+                    .get_turn_mcp_projection("turn_projection_fault")
+                    .await
+                    .expect("committed header query should succeed"),
+                Some(committed.projection.clone()),
+                "header changed after {fault:?}"
+            );
+            assert_eq!(
+                store
+                    .list_turn_mcp_bindings("turn_projection_fault")
+                    .await
+                    .expect("committed bindings query should succeed"),
+                committed.bindings,
+                "bindings changed after {fault:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_mcp_binding_repositories_round_trip_all_digest_fields() {
         let connection = Database::connect("sqlite::memory:")
             .await
             .expect("must connect to sqlite memory");
@@ -19945,8 +20697,17 @@ mod tests {
             server_name: "beta".to_owned(),
             raw_tool_name: "send".to_owned(),
             callable_name: "mcp_beta_send".to_owned(),
+            canonical_callable_name: "mcp_beta_send".to_owned(),
+            provider_callable_name: "mcp__pioneer__mcp_beta_send".to_owned(),
             catalog_version: "catalog-v1".to_owned(),
             fingerprint: "fingerprint-beta-updated".to_owned(),
+            canonical_schema_fingerprint: "canonical-schema-v1".to_owned(),
+            provider_schema_fingerprint: "provider-schema-v1".to_owned(),
+            annotations_json: r#"{"readOnlyHint":true}"#.to_owned(),
+            annotations_digest: "annotations-v1".to_owned(),
+            effective_timeout_ms: 20_000,
+            runtime_generation: 7,
+            projection_activation_generation: 2,
             selection_reason: "explicit_composer_capability".to_owned(),
             capability_id: Some("mcp:workspace:beta:send".to_owned()),
         }];
