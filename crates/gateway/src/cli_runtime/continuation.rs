@@ -135,6 +135,16 @@ fn restart_relevant_options_changed(
         || old.app_server_args != new.app_server_args
         || old.env != new.env
         || old.enable_user_skills != new.enable_user_skills
+        || instruction_fingerprint(&old.elevated_instructions)
+            != instruction_fingerprint(&new.elevated_instructions)
+}
+
+fn instruction_fingerprint(
+    instructions: &Option<pioneer_cli_agent_runtime::instructions::CLIRuntimeElevatedInstructions>,
+) -> Option<&str> {
+    instructions
+        .as_ref()
+        .map(pioneer_cli_agent_runtime::instructions::CLIRuntimeElevatedInstructions::fingerprint)
 }
 
 fn continuation_identity_changed(
@@ -167,6 +177,17 @@ fn continuation_identity_changed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pioneer_cli_agent_runtime::instructions::CLIRuntimeElevatedInstructions;
+    use sha2::{Digest, Sha256};
+
+    fn elevated(text: &str) -> CLIRuntimeElevatedInstructions {
+        let fingerprint = Sha256::digest(text.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        CLIRuntimeElevatedInstructions::try_new(text, fingerprint)
+            .expect("valid elevated instructions")
+    }
 
     #[test]
     fn codex_continuation_id_is_not_a_process_restart_trigger() {
@@ -214,5 +235,33 @@ mod tests {
         let debug = format!("{launch:?}");
         assert!(!debug.contains(provider_session_id.to_string().as_str()));
         assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn elevated_instruction_identity_controls_process_reuse() {
+        let mut first_options = CLIAgentRuntimeSessionStartOptions::default();
+        first_options.elevated_instructions = Some(elevated("first governing prompt"));
+        let same_options = first_options.clone();
+        let mut changed_options = first_options.clone();
+        changed_options.elevated_instructions = Some(elevated("changed governing prompt"));
+
+        let first = CliSessionLaunchSpec::codex(
+            first_options,
+            CliMcpSessionLaunch::Disabled,
+            Some("native-thread".to_owned()),
+        );
+        let same = CliSessionLaunchSpec::codex(
+            same_options,
+            CliMcpSessionLaunch::Disabled,
+            Some("native-thread".to_owned()),
+        );
+        let changed = CliSessionLaunchSpec::codex(
+            changed_options,
+            CliMcpSessionLaunch::Disabled,
+            Some("native-thread".to_owned()),
+        );
+
+        assert!(!requires_restart(&first, &same));
+        assert!(requires_restart(&first, &changed));
     }
 }

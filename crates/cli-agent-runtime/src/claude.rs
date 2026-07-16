@@ -1,6 +1,7 @@
 //! Claude CLI streaming runtime primitives.
 
 use crate::codex::CodexMcpSchemaTransformer;
+use crate::instructions::CLIRuntimeElevatedInstructions;
 use crate::mcp::{
     CanonicalMcpToolSchema, McpSchemaIncompatibility, McpSchemaTransformContract,
     McpSchemaTransformer,
@@ -27,6 +28,7 @@ use tokio::time::timeout;
 const MINIMUM_CLAUDE_CODE_VERSION: &str = "2.0.0";
 const CLAUDE_EMPTY_MCP_CONFIG_FILE_NAME: &str = "mcp-config.json";
 const CLAUDE_EMPTY_MCP_CONFIG_MARKER_FILE_NAME: &str = ".pioneer-claude-mcp-config.json";
+const CLAUDE_SYSTEM_PROMPT_EXTENSION_FILE_NAME: &str = "pioneer-system-prompt.md";
 const CLAUDE_PIONEER_MCP_SERVER_NAME: &str = "pioneer";
 const CLAUDE_PIONEER_MCP_SERVER_TYPE: &str = "stdio";
 const CLAUDE_PIONEER_HELPER_SUBCOMMAND: &str = "__cli-mcp-stdio";
@@ -717,6 +719,37 @@ pub fn materialize_claude_empty_mcp_config(
 ) -> Result<ClaudeManagedMcpConfigDescriptor, ClaudeManagedMcpConfigError> {
     let artifact = serialize_claude_managed_mcp_config(ClaudeManagedMcpConfigInput::empty())?;
     materialize_claude_managed_mcp_config(managed_root_path, identity, &artifact)
+}
+
+pub fn materialize_claude_system_prompt_extension(
+    descriptor: &ClaudeManagedMcpConfigDescriptor,
+    instructions: &CLIRuntimeElevatedInstructions,
+) -> Result<PathBuf, ClaudeManagedMcpConfigError> {
+    let managed_root = claude_normalize_absolute_path(descriptor.managed_root_path.as_path())?;
+    let session_root = claude_normalize_absolute_path(descriptor.session_root_path.as_path())?;
+    if session_root == managed_root || !session_root.starts_with(managed_root.as_path()) {
+        return Err(ClaudeManagedMcpConfigError::new(
+            "Claude system prompt extension path escapes the managed root",
+        ));
+    }
+    claude_validate_directory_chain_no_follow(session_root.as_path())?;
+    let marker = claude_read_mcp_config_marker(
+        session_root
+            .join(CLAUDE_EMPTY_MCP_CONFIG_MARKER_FILE_NAME)
+            .as_path(),
+    )?;
+    if marker.identity != descriptor.identity
+        || marker.materialization_nonce != descriptor.materialization_nonce
+        || marker.artifact_digest != descriptor.artifact_digest
+        || marker.has_pioneer_server != descriptor.has_pioneer_server
+    {
+        return Err(ClaudeManagedMcpConfigError::new(
+            "Claude system prompt extension refused a replacement managed root",
+        ));
+    }
+    let prompt_path = session_root.join(CLAUDE_SYSTEM_PROMPT_EXTENSION_FILE_NAME);
+    claude_ensure_exact_owner_only_file(prompt_path.as_path(), instructions.text().as_bytes())?;
+    Ok(prompt_path)
 }
 
 pub fn cleanup_claude_managed_mcp_config(
@@ -1555,8 +1588,6 @@ async fn run_initialize_probe(
             "--output-format",
             "stream-json",
             "--verbose",
-            "--system-prompt",
-            "",
             "--permission-prompt-tool",
             "stdio",
             "--permission-mode",
@@ -2413,6 +2444,43 @@ mod tests {
         cleanup_claude_managed_mcp_config(&first).expect("cleanup first");
         cleanup_claude_managed_mcp_config(&first_again).expect("idempotent cleanup");
         cleanup_claude_managed_mcp_config(&second).expect("cleanup second");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn claude_system_prompt_extension_is_exact_owner_only_and_generation_scoped() {
+        let root = claude_mcp_config_temp_dir("system-prompt-extension");
+        let managed = root.join("managed");
+        let descriptor =
+            materialize_claude_empty_mcp_config(managed.as_path(), claude_mcp_config_identity(1))
+                .expect("managed config");
+        let text = "Pioneer elevated system instructions";
+        let instructions =
+            CLIRuntimeElevatedInstructions::try_new(text, claude_sha256_hex(text.as_bytes()))
+                .expect("elevated instructions");
+
+        let prompt_path = materialize_claude_system_prompt_extension(&descriptor, &instructions)
+            .expect("system prompt extension");
+        assert_eq!(
+            prompt_path.parent(),
+            Some(descriptor.session_root_path.as_path())
+        );
+        assert_eq!(
+            fs::read(prompt_path.as_path()).expect("prompt text"),
+            text.as_bytes()
+        );
+        assert_eq!(
+            fs::metadata(prompt_path.as_path())
+                .expect("prompt metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        cleanup_claude_managed_mcp_config(&descriptor).expect("cleanup managed session");
+        assert!(!prompt_path.exists());
         let _ = fs::remove_dir_all(root);
     }
 

@@ -1,7 +1,8 @@
 use pioneer_promt::{
     CompiledPromptBundle, ExecutionContinuationRuntimeFactsInput, PromptCompileInput, PromptLimits,
     PromptProfile, PromptRuntimeBuiltInSectionId, PromptRuntimeSectionId,
-    PromptRuntimeSectionInput, REQUEST_TOOLS_HIDDEN_DOMAIN_SECTION_ID, compile_prompt,
+    PromptRuntimeSectionInput, REQUEST_TOOLS_HIDDEN_DOMAIN_SECTION_ID,
+    compile_instruction_delivery_plan, compile_prompt,
     execution_continuation_section_with_runtime_facts, runtime_sections_with_request_tools_catalog,
 };
 use pioneer_protocol::{
@@ -284,6 +285,43 @@ fn assistant_none_snapshot() {
 
     insta::assert_snapshot!("assistant_none", compiled.full_system_text);
     assert!(compiled.dynamic_system_text.is_empty());
+}
+
+#[test]
+fn native_delivery_plan_preserves_compiled_prompt_bytes_for_every_profile() {
+    for profile in [
+        PromptProfile::AssistantFull,
+        PromptProfile::AssistantMinimal,
+        PromptProfile::AssistantNone,
+    ] {
+        let root = fixture_root(&format!("native_delivery_{profile:?}"));
+        write_fixture_files(&root);
+        let compiled = compile_prompt(PromptCompileInput {
+            workspace_root: root,
+            profile,
+            skills_prompt: Some("[Skills]\n- sample.skill".to_owned()),
+            retry_instruction: Some("retry with corrected arguments".to_owned()),
+            include_tool_recovery_policy: true,
+            include_task_orchestration_policy: false,
+            continue_generation_hint: true,
+            runtime_sections: Vec::new(),
+            dynamic_sections: Vec::new(),
+            dynamic_context: Some("session dynamic context".to_owned()),
+            extra_system: Some("extra runtime system".to_owned()),
+            limits: PromptLimits::default(),
+        })
+        .expect("compile native prompt");
+        let expected_full = compiled.full_system_text.clone();
+        let expected_stable = compiled.stable_system_text.clone();
+        let expected_dynamic = compiled.dynamic_system_text.clone();
+
+        let plan = compile_instruction_delivery_plan(compiled).expect("compile delivery plan");
+
+        assert_eq!(plan.provider_instructions.text, expected_full);
+        assert_eq!(plan.bundle.stable_system_text, expected_stable);
+        assert_eq!(plan.bundle.dynamic_system_text, expected_dynamic);
+        assert!(plan.turn_context.is_empty());
+    }
 }
 
 #[test]

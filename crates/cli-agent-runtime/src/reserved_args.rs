@@ -261,6 +261,8 @@ fn claude_reserved_flag(flag: &str) -> Option<&'static str> {
         "--output-format" => Some("--output-format"),
         "--input-format" => Some("--input-format"),
         "--system-prompt" => Some("--system-prompt"),
+        "--append-system-prompt" => Some("--append-system-prompt"),
+        "--append-system-prompt-file" => Some("--append-system-prompt-file"),
         "--include-partial-messages" => Some("--include-partial-messages"),
         "--verbose" => Some("--verbose"),
         "--print" | "-p" => Some("--print"),
@@ -325,6 +327,9 @@ mod tests {
             args(&["--plugin-dir", "/tmp/plugin"]),
             args(&["--input-format", "text"]),
             args(&["--output-format=json"]),
+            args(&["--system-prompt", "replacement"]),
+            args(&["--append-system-prompt", "unmanaged"]),
+            args(&["--append-system-prompt-file=/tmp/unmanaged.md"]),
         ] {
             assert!(validate_claude_custom_args(&values).is_err(), "{values:?}");
         }

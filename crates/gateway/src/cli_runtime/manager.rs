@@ -9,6 +9,7 @@ use pioneer_cli_agent_runtime::codex::{
     CodexJsonlRpcClientDiagnostic, CodexJsonlRpcNotificationEvent, CodexJsonlRpcServerRequest,
 };
 use pioneer_cli_agent_runtime::event::RuntimeEvent;
+use pioneer_cli_agent_runtime::instructions::CLIRuntimeElevatedInstructions;
 use pioneer_cli_agent_runtime::process::SensitiveEnvironment;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
@@ -99,6 +100,7 @@ pub(crate) struct CLIAgentRuntimeSessionStartOptions {
     pub app_server_args: Vec<String>,
     pub env: SensitiveEnvironment,
     pub enable_user_skills: bool,
+    pub elevated_instructions: Option<CLIRuntimeElevatedInstructions>,
 }
 
 pub(crate) struct CLIAgentRuntimeCodexEventReceivers {
@@ -122,6 +124,7 @@ pub(crate) struct CLIAgentRuntimeThreadOpenParams {
     pub sandbox: Option<JsonValue>,
     pub permissions: Option<String>,
     pub service_tier: Option<String>,
+    pub elevated_instructions: Option<CLIRuntimeElevatedInstructions>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1330,6 +1333,7 @@ mod tests {
             app_server_args: vec!["-c".to_owned(), "model=\"gpt-5-codex\"".to_owned()],
             env: Default::default(),
             enable_user_skills: false,
+            elevated_instructions: None,
         };
         let options_b = CLIAgentRuntimeSessionStartOptions {
             cwd: None,
@@ -1337,6 +1341,7 @@ mod tests {
             app_server_args: vec!["-c".to_owned(), "model=\"gpt-5\"".to_owned()],
             env: Default::default(),
             enable_user_skills: false,
+            elevated_instructions: None,
         };
 
         let first = manager

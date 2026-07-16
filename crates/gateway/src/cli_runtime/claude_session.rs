@@ -42,6 +42,7 @@ use base64::Engine as _;
 use pioneer_cli_agent_runtime::claude::{
     ClaudeAccountProbeStatus, ClaudeManagedMcpConfigDescriptor, ClaudeManagedMcpConfigIdentity,
     ClaudeProbe, ClaudeProviderSessionLaunch, cleanup_claude_managed_mcp_config,
+    materialize_claude_system_prompt_extension,
 };
 use pioneer_cli_agent_runtime::event::{
     RuntimeAgentMessagePhase, RuntimeErrorEvent, RuntimeEvent, RuntimeItemCompleted,
@@ -1032,12 +1033,25 @@ fn claude_process_config_from_instance_with_managed_mcp(
         .unwrap_or("default")
         .to_owned();
 
+    let elevated_prompt_path = options
+        .elevated_instructions
+        .as_ref()
+        .map(|instructions| {
+            materialize_claude_system_prompt_extension(managed_mcp_config, instructions)
+        })
+        .transpose()
+        .context("failed to materialize Claude elevated system prompt extension")?;
+
     let mut args = vec![
         "--output-format".to_owned(),
         "stream-json".to_owned(),
         "--verbose".to_owned(),
-        "--system-prompt".to_owned(),
-        String::new(),
+    ];
+    if let Some(path) = elevated_prompt_path {
+        args.push("--append-system-prompt-file".to_owned());
+        args.push(path.to_string_lossy().into_owned());
+    }
+    args.extend([
         "--permission-prompt-tool".to_owned(),
         "stdio".to_owned(),
         "--permission-mode".to_owned(),
@@ -1056,7 +1070,7 @@ fn claude_process_config_from_instance_with_managed_mcp(
         "--include-partial-messages".to_owned(),
         "--input-format".to_owned(),
         "stream-json".to_owned(),
-    ];
+    ]);
     if !options.enable_user_skills
         && !managed_mcp_config.has_pioneer_server
         && permission_mode != "bypassPermissions"
@@ -3621,8 +3635,10 @@ mod tests {
     use crate::turn_mcp::projection::{
         McpProjectionLimits, McpSelectionReason, ResolvedMcpTurnProjection, ResolvedMcpTurnTool,
     };
+    use pioneer_cli_agent_runtime::instructions::CLIRuntimeElevatedInstructions;
     use pioneer_cli_mcp_bridge::helper::run_hidden_helper_with_io;
     use pioneer_protocol::{AgentDurableEvent, ToolCallStatus, ToolMetadata, TurnItem};
+    use sha2::{Digest, Sha256};
     use std::collections::HashSet;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -4570,6 +4586,15 @@ done
         args.iter().any(|arg| arg == flag)
     }
 
+    fn elevated_instructions(text: &str) -> CLIRuntimeElevatedInstructions {
+        let fingerprint = Sha256::digest(text.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        CLIRuntimeElevatedInstructions::try_new(text, fingerprint)
+            .expect("valid elevated instructions")
+    }
+
     #[test]
     #[cfg(unix)]
     fn claude_mcp_launch_four_cell_matrix_preserves_strict_permission_boundary() {
@@ -4764,6 +4789,46 @@ done
     }
 
     #[test]
+    #[cfg(unix)]
+    fn claude_process_appends_elevated_prompt_from_owner_only_file() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let instance = claude_instance(temp_dir.path().to_string_lossy().into_owned());
+        let governing_text = "Pioneer elevated instructions for Claude";
+        let config = claude_process_config_from_instance(
+            &instance,
+            &CLIAgentRuntimeSessionStartOptions {
+                elevated_instructions: Some(elevated_instructions(governing_text)),
+                ..Default::default()
+            },
+        )
+        .expect("config should build");
+
+        let prompt_path = arg_value_after(&config.args, "--append-system-prompt-file")
+            .expect("managed system prompt path");
+        assert_eq!(
+            std::fs::read_to_string(prompt_path.as_str()).expect("system prompt contents"),
+            governing_text
+        );
+        assert_eq!(
+            std::fs::metadata(prompt_path.as_str())
+                .expect("system prompt metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert!(!has_arg(&config.args, "--system-prompt"));
+        assert!(!has_arg(&config.args, "--append-system-prompt"));
+        assert!(
+            !config
+                .args
+                .iter()
+                .any(|argument| argument.contains(governing_text)),
+            "governing prompt text must not be exposed in argv"
+        );
+    }
+
+    #[test]
     fn claude_process_config_uses_session_permission_mode() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let instance = claude_instance(temp_dir.path().to_string_lossy().into_owned());
@@ -4776,6 +4841,7 @@ done
                 app_server_args: Vec::new(),
                 env: Default::default(),
                 enable_user_skills: false,
+                elevated_instructions: None,
             },
         )
         .expect("config should build");
@@ -4799,6 +4865,7 @@ done
                 app_server_args: Vec::new(),
                 env: Default::default(),
                 enable_user_skills: false,
+                elevated_instructions: None,
             },
         )
         .expect("config should build");
@@ -4827,6 +4894,7 @@ done
                     app_server_args: Vec::new(),
                     env: Default::default(),
                     enable_user_skills: false,
+                    elevated_instructions: None,
                 },
             )
             .expect("config should build");

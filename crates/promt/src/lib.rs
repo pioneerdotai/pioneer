@@ -7,6 +7,7 @@ mod content;
 pub mod diagnostics;
 pub mod fingerprint;
 pub mod hooks;
+pub mod instruction_delivery;
 pub mod profile;
 pub mod render;
 pub mod runtime_files;
@@ -18,13 +19,19 @@ pub use bundle::{
     PromptSourceStatus,
 };
 pub use cli_runtime_context::{
-    CliRuntimeContextInput, CliRuntimeContextText, compile_cli_runtime_context_bundle,
+    CliRuntimeContextInput, CliRuntimeContextText, CliRuntimeSelectedCapabilitiesInput,
+    CliRuntimeSelectedServerInput, CliRuntimeSelectedSkillsInput,
+    compile_cli_runtime_delivery_plan,
 };
 pub use compile::compile_prompt;
 pub use diagnostics::{PromptDiagnostic, PromptDiagnosticCode};
 pub use hooks::{
     AGENTS_DOC_PROMPT_HOOK_PACKAGE_ID, AgentsDocPromptResolver, ResolvedAgentsDocPrompt,
     agents_doc_package,
+};
+pub use instruction_delivery::{
+    CompiledInstructionDeliveryPlan, CompiledInstructionPayload, InstructionDeliveryChannel,
+    InstructionScope, InstructionSectionPlan, InstructionTrust, compile_instruction_delivery_plan,
 };
 pub use profile::PromptProfile;
 pub use render::{

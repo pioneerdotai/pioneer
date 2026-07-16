@@ -55,12 +55,13 @@ use pioneer_memory::hooks::{
     deterministic_recall_context_summary, memory_turn_policy_from_hook_policy_set,
 };
 use pioneer_promt::{
-    CompiledPromptBundle, ExecutionContinuationRuntimeFactsInput, PromptCompileInput,
-    PromptDiagnosticCode, PromptDynamicSectionId, PromptLimits, PromptProfile,
+    CompiledInstructionDeliveryPlan, CompiledPromptBundle, ExecutionContinuationRuntimeFactsInput,
+    PromptCompileInput, PromptDiagnosticCode, PromptDynamicSectionId, PromptLimits, PromptProfile,
     PromptRuntimeBuiltInSectionId, PromptRuntimeSectionId, PromptRuntimeSectionInput,
-    ToolRetryInstructionKind, compile_prompt, current_permission_guidance,
-    execution_continuation_section_with_runtime_facts, render_tool_retry_instruction,
-    runtime_sections_with_request_tools_catalog, tool_loop_final_answer_instruction,
+    ToolRetryInstructionKind, compile_instruction_delivery_plan, compile_prompt,
+    current_permission_guidance, execution_continuation_section_with_runtime_facts,
+    render_tool_retry_instruction, runtime_sections_with_request_tools_catalog,
+    tool_loop_final_answer_instruction,
 };
 use pioneer_protocol::{
     AgentDurableEvent, AgentProgressEvent, EXECUTION_CHECKPOINT_DEFAULT_TOOL_DETAIL_LIMIT,
@@ -1774,7 +1775,7 @@ fn preflight_active_recall_prompt_context_input(
     )
 }
 
-fn compile_agent_prompt_bundle(
+fn compile_agent_instruction_delivery_plan(
     skills_prompt: Option<String>,
     retry_instruction: Option<String>,
     runtime_sections: &[PromptRuntimeSectionInput],
@@ -1784,7 +1785,7 @@ fn compile_agent_prompt_bundle(
     continue_generation_hint: bool,
     thread_id: &str,
     turn_id: &str,
-) -> Result<CompiledPromptBundle, ChatTurnError> {
+) -> Result<CompiledInstructionDeliveryPlan, ChatTurnError> {
     let prompt_root = AppConfig::load()
         .map_err(|error| ChatTurnError::Terminal(format!("failed to load app config: {error}")))?
         .runtime_home_dir()
@@ -1792,7 +1793,7 @@ fn compile_agent_prompt_bundle(
             ChatTurnError::Terminal(format!("failed to resolve runtime home: {error:#}"))
         })?;
 
-    compile_agent_prompt_bundle_with_prompt_root(
+    compile_agent_instruction_delivery_plan_with_prompt_root(
         prompt_root.as_path(),
         skills_prompt,
         retry_instruction,
@@ -1806,7 +1807,7 @@ fn compile_agent_prompt_bundle(
     )
 }
 
-fn compile_agent_prompt_bundle_with_prompt_root(
+fn compile_agent_instruction_delivery_plan_with_prompt_root(
     prompt_root: &std::path::Path,
     skills_prompt: Option<String>,
     retry_instruction: Option<String>,
@@ -1817,7 +1818,7 @@ fn compile_agent_prompt_bundle_with_prompt_root(
     continue_generation_hint: bool,
     thread_id: &str,
     turn_id: &str,
-) -> Result<CompiledPromptBundle, ChatTurnError> {
+) -> Result<CompiledInstructionDeliveryPlan, ChatTurnError> {
     let now = Local::now();
 
     let extra_system = format!(
@@ -1859,7 +1860,11 @@ fn compile_agent_prompt_bundle_with_prompt_root(
         );
     }
 
-    Ok(bundle)
+    compile_instruction_delivery_plan(bundle).map_err(|error| {
+        ChatTurnError::Terminal(format!(
+            "failed to compile native instruction delivery plan: {error:#}"
+        ))
+    })
 }
 
 fn runtime_sections_with_current_permissions(
@@ -1881,12 +1886,15 @@ fn runtime_sections_with_current_permissions(
     sections
 }
 
-fn compiled_prompt_payload_from_bundle(bundle: &CompiledPromptBundle) -> CompiledPromptPayload {
+fn compiled_prompt_payload_from_delivery_plan(
+    plan: &CompiledInstructionDeliveryPlan,
+) -> CompiledPromptPayload {
+    let bundle = &plan.bundle;
     CompiledPromptPayload {
         stable_system_text: bundle.stable_system_text.clone(),
         dynamic_system_text: bundle.dynamic_system_text.clone(),
         boundary_marker: bundle.boundary_marker.to_owned(),
-        full_system_text: bundle.full_system_text.clone(),
+        full_system_text: plan.provider_instructions.text.clone(),
     }
 }
 
@@ -3309,7 +3317,7 @@ async fn execute_agent_provider_response(
             ),
         )?;
 
-        let initial_prompt_bundle = compile_agent_prompt_bundle(
+        let initial_instruction_plan = compile_agent_instruction_delivery_plan(
             skills_prompt.clone(),
             None,
             prompt_runtime_sections.as_slice(),
@@ -3336,7 +3344,7 @@ async fn execute_agent_provider_response(
                 thread_id: thread_id.to_owned(),
                 turn_id: turn_id.to_owned(),
                 manifest: prompt_manifest_from_bundle(
-                    &initial_prompt_bundle,
+                    &initial_instruction_plan.bundle,
                     &EffectiveTurnPromptManifestHookMetadata::combined(
                         effective_prompt_context_set.manifest_metadata(),
                         effective_prompt_section_set.manifest_metadata(),
@@ -3353,7 +3361,9 @@ async fn execute_agent_provider_response(
             history,
             user_message.clone(),
             reasoning,
-            Some(compiled_prompt_payload_from_bundle(&initial_prompt_bundle)),
+            Some(compiled_prompt_payload_from_delivery_plan(
+                &initial_instruction_plan,
+            )),
             false,
             force_non_stream,
             workspace_id,
@@ -3654,7 +3664,7 @@ async fn execute_agent_provider_response(
         ),
     )?;
 
-    let initial_prompt_bundle = compile_agent_prompt_bundle(
+    let initial_instruction_plan = compile_agent_instruction_delivery_plan(
         skills_prompt.clone(),
         None,
         prompt_runtime_sections.as_slice(),
@@ -3681,7 +3691,7 @@ async fn execute_agent_provider_response(
             thread_id: thread_id.to_owned(),
             turn_id: turn_id.to_owned(),
             manifest: prompt_manifest_from_bundle(
-                &initial_prompt_bundle,
+                &initial_instruction_plan.bundle,
                 &EffectiveTurnPromptManifestHookMetadata::combined(
                     effective_prompt_context_set.manifest_metadata(),
                     effective_prompt_section_set.manifest_metadata(),
@@ -3740,8 +3750,9 @@ async fn execute_agent_provider_response(
         .into_iter()
         .filter(|message| message.role != pioneer_provider::Role::System)
         .collect::<Vec<_>>();
-    let mut active_compiled_prompt =
-        Some(compiled_prompt_payload_from_bundle(&initial_prompt_bundle));
+    let mut active_compiled_prompt = Some(compiled_prompt_payload_from_delivery_plan(
+        &initial_instruction_plan,
+    ));
 
     messages.push(user_message);
     append_recovered_tool_llm_context(&mut messages, retained_llm_context);
@@ -3938,7 +3949,7 @@ async fn execute_agent_provider_response(
                 }
                 let next_retry_instruction = normalize_optional_prompt(Some(instruction));
                 if next_retry_instruction != applied_retry_instruction {
-                    let refreshed_prompt_bundle = compile_agent_prompt_bundle(
+                    let refreshed_instruction_plan = compile_agent_instruction_delivery_plan(
                         skills_prompt.clone(),
                         next_retry_instruction.clone(),
                         prompt_runtime_sections.as_slice(),
@@ -3950,8 +3961,8 @@ async fn execute_agent_provider_response(
                         turn_id,
                     )
                     .map_err(|error| (error, current_thinking_id.clone()))?;
-                    active_compiled_prompt = Some(compiled_prompt_payload_from_bundle(
-                        &refreshed_prompt_bundle,
+                    active_compiled_prompt = Some(compiled_prompt_payload_from_delivery_plan(
+                        &refreshed_instruction_plan,
                     ));
 
                     emit_durable_event(
@@ -3960,7 +3971,7 @@ async fn execute_agent_provider_response(
                             thread_id: thread_id.to_owned(),
                             turn_id: turn_id.to_owned(),
                             manifest: prompt_manifest_from_bundle(
-                                &refreshed_prompt_bundle,
+                                &refreshed_instruction_plan.bundle,
                                 &EffectiveTurnPromptManifestHookMetadata::combined(
                                     effective_prompt_context_set.manifest_metadata(),
                                     effective_prompt_section_set.manifest_metadata(),
@@ -4031,7 +4042,7 @@ async fn execute_agent_provider_response(
                     include_artifact_reference_policy,
                 )
                 .map_err(|error| (error, current_thinking_id.clone()))?;
-                let prompt_without_tools = compile_agent_prompt_bundle(
+                let no_tool_instruction_plan = compile_agent_instruction_delivery_plan(
                     skills_prompt.clone(),
                     applied_retry_instruction.clone(),
                     no_tool_runtime_sections.as_slice(),
@@ -4049,7 +4060,7 @@ async fn execute_agent_provider_response(
                         thread_id: thread_id.to_owned(),
                         turn_id: turn_id.to_owned(),
                         manifest: prompt_manifest_from_bundle(
-                            &prompt_without_tools,
+                            &no_tool_instruction_plan.bundle,
                             &EffectiveTurnPromptManifestHookMetadata::combined(
                                 effective_prompt_context_set.manifest_metadata(),
                                 no_tool_prompt_section_set.manifest_metadata(),
@@ -4060,7 +4071,7 @@ async fn execute_agent_provider_response(
                 )
                 .await
                 .map_err(|error| (error, current_thinking_id.clone()))?;
-                Some(compiled_prompt_payload_from_bundle(&prompt_without_tools))
+                Some(compiled_prompt_payload_from_delivery_plan(&no_tool_instruction_plan))
             };
 
             let post_turn_assistant_text_len_before_round = post_turn_assistant_text.len();
@@ -4247,7 +4258,7 @@ async fn execute_agent_provider_response(
                     pending_retry_instruction =
                         normalize_optional_prompt(Some(instruction.clone()));
                     if pending_retry_instruction != applied_retry_instruction {
-                        let refreshed_prompt_bundle = compile_agent_prompt_bundle(
+                        let refreshed_instruction_plan = compile_agent_instruction_delivery_plan(
                             skills_prompt.clone(),
                             pending_retry_instruction.clone(),
                             prompt_runtime_sections.as_slice(),
@@ -4259,8 +4270,8 @@ async fn execute_agent_provider_response(
                             turn_id,
                         )
                         .map_err(|error| (error, current_thinking_id.clone()))?;
-                        active_compiled_prompt = Some(compiled_prompt_payload_from_bundle(
-                            &refreshed_prompt_bundle,
+                        active_compiled_prompt = Some(compiled_prompt_payload_from_delivery_plan(
+                            &refreshed_instruction_plan,
                         ));
 
                         emit_durable_event(
@@ -4269,7 +4280,7 @@ async fn execute_agent_provider_response(
                                 thread_id: thread_id.to_owned(),
                                 turn_id: turn_id.to_owned(),
                                 manifest: prompt_manifest_from_bundle(
-                                    &refreshed_prompt_bundle,
+                                    &refreshed_instruction_plan.bundle,
                                     &EffectiveTurnPromptManifestHookMetadata::combined(
                                         effective_prompt_context_set.manifest_metadata(),
                                         effective_prompt_section_set.manifest_metadata(),
@@ -5156,7 +5167,7 @@ async fn execute_agent_provider_response(
                 normalize_optional_prompt(pending_retry_instruction.clone());
 
             if next_retry_instruction != applied_retry_instruction {
-                let refreshed_prompt_bundle = compile_agent_prompt_bundle(
+                let refreshed_instruction_plan = compile_agent_instruction_delivery_plan(
                     skills_prompt.clone(),
                     next_retry_instruction.clone(),
                     prompt_runtime_sections.as_slice(),
@@ -5168,8 +5179,8 @@ async fn execute_agent_provider_response(
                     turn_id,
                 )
                 .map_err(|error| (error, current_thinking_id.clone()))?;
-                active_compiled_prompt = Some(compiled_prompt_payload_from_bundle(
-                    &refreshed_prompt_bundle,
+                active_compiled_prompt = Some(compiled_prompt_payload_from_delivery_plan(
+                    &refreshed_instruction_plan,
                 ));
 
                 emit_durable_event(
@@ -5178,7 +5189,7 @@ async fn execute_agent_provider_response(
                         thread_id: thread_id.to_owned(),
                         turn_id: turn_id.to_owned(),
                         manifest: prompt_manifest_from_bundle(
-                            &refreshed_prompt_bundle,
+                            &refreshed_instruction_plan.bundle,
                             &EffectiveTurnPromptManifestHookMetadata::combined(
                                 effective_prompt_context_set.manifest_metadata(),
                                 effective_prompt_section_set.manifest_metadata(),
@@ -5565,7 +5576,8 @@ mod tests {
         ExecutedToolResult, TaskMutationFinalizationGuard, append_recovered_tool_llm_context,
         apply_request_tools_results_to_visible_tools, apply_request_tools_visibility_expansion,
         apply_review_required_tools_to_visible_tools, build_user_message,
-        compile_agent_prompt_bundle_with_prompt_root, materialize_mcp_tooling,
+        compile_agent_instruction_delivery_plan_with_prompt_root,
+        compiled_prompt_payload_from_delivery_plan, materialize_mcp_tooling,
         normalize_turn_capabilities, resolve_skill_capability_summary,
         retain_agent_attachment_messages, retain_agent_attachment_messages_with_budget,
         retain_chat_mode_attachment_messages, review_required_observation_payload,
@@ -7353,7 +7365,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_bundle_uses_runtime_home_root_not_workspace_root() {
+    fn native_delivery_plan_uses_runtime_home_root_not_workspace_root() {
         let workspace_root = temp_dir("workspace_root");
         let runtime_home = temp_dir("runtime_home");
         std::fs::write(workspace_root.join("SOUL.md"), "workspace soul")
@@ -7364,7 +7376,7 @@ mod tests {
         std::fs::write(runtime_home.join("IDENTITY.md"), "runtime identity")
             .expect("write runtime IDENTITY");
 
-        let bundle = compile_agent_prompt_bundle_with_prompt_root(
+        let plan = compile_agent_instruction_delivery_plan_with_prompt_root(
             runtime_home.as_path(),
             None,
             None,
@@ -7376,14 +7388,23 @@ mod tests {
             "thread_test",
             "turn_test",
         )
-        .expect("compile prompt bundle");
+        .expect("compile native delivery plan");
 
-        assert!(bundle.full_system_text.contains("runtime soul"));
-        assert!(bundle.full_system_text.contains("runtime identity"));
-        assert!(!bundle.full_system_text.contains("workspace soul"));
-        assert!(!bundle.full_system_text.contains("workspace identity"));
+        assert!(plan.bundle.full_system_text.contains("runtime soul"));
+        assert!(plan.bundle.full_system_text.contains("runtime identity"));
+        assert!(!plan.bundle.full_system_text.contains("workspace soul"));
+        assert!(!plan.bundle.full_system_text.contains("workspace identity"));
+        assert_eq!(
+            plan.provider_instructions.text,
+            plan.bundle.full_system_text
+        );
+        let payload = compiled_prompt_payload_from_delivery_plan(&plan);
+        assert_eq!(payload.full_system_text, plan.bundle.full_system_text);
+        assert_eq!(payload.stable_system_text, plan.bundle.stable_system_text);
+        assert_eq!(payload.dynamic_system_text, plan.bundle.dynamic_system_text);
         assert!(
-            !bundle
+            !plan
+                .bundle
                 .sections
                 .iter()
                 .any(|section| section.id == PromptSectionId::CurrentPermissions)
@@ -7391,7 +7412,7 @@ mod tests {
     }
 
     #[test]
-    fn agents_md_runtime_section_is_compiled_by_agent_prompt_bundle() {
+    fn agents_md_runtime_section_is_compiled_by_native_delivery_plan() {
         let runtime_home = temp_dir("agents_md_runtime_prompt");
         let agents_section = PromptRuntimeSectionInput {
             id: PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::AgentsMd),
@@ -7401,7 +7422,7 @@ mod tests {
             truncated: false,
         };
 
-        let bundle = compile_agent_prompt_bundle_with_prompt_root(
+        let plan = compile_agent_instruction_delivery_plan_with_prompt_root(
             runtime_home.as_path(),
             None,
             None,
@@ -7413,27 +7434,28 @@ mod tests {
             "thread_agents_md",
             "turn_agents_md",
         )
-        .expect("compile prompt bundle");
+        .expect("compile native delivery plan");
 
-        let agents_section = bundle
+        let agents_section = plan
+            .bundle
             .sections
             .iter()
             .find(|section| section.id == PromptSectionId::AgentsMd)
             .expect("agents_md section should be compiled");
         assert_eq!(agents_section.title, "AGENTS.md");
-        assert!(bundle.dynamic_system_text.contains("## AGENTS.md"));
-        assert!(bundle.dynamic_system_text.contains("Use repo rules."));
+        assert!(plan.bundle.dynamic_system_text.contains("## AGENTS.md"));
+        assert!(plan.bundle.dynamic_system_text.contains("Use repo rules."));
     }
 
     #[test]
-    fn current_permissions_section_is_compiled_for_restricted_prompt_bundle() {
+    fn current_permissions_section_is_compiled_for_restricted_native_delivery_plan() {
         let runtime_home = temp_dir("current_permissions_prompt");
         let profile = pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
             pioneer_protocol::TurnPermissionMode::Supervised,
             pioneer_protocol::TurnPermissionProfileSource::Composer,
         );
 
-        let bundle = compile_agent_prompt_bundle_with_prompt_root(
+        let plan = compile_agent_instruction_delivery_plan_with_prompt_root(
             runtime_home.as_path(),
             None,
             None,
@@ -7445,37 +7467,43 @@ mod tests {
             "thread_permissions",
             "turn_permissions",
         )
-        .expect("compile prompt bundle");
+        .expect("compile native delivery plan");
 
-        let permissions_section = bundle
+        let permissions_section = plan
+            .bundle
             .sections
             .iter()
             .find(|section| section.id == PromptSectionId::CurrentPermissions)
             .expect("current permissions section should be compiled");
         assert_eq!(permissions_section.title, "Current Permissions");
         assert!(
-            bundle
+            plan.bundle
                 .dynamic_system_text
                 .contains("## Current Permissions")
         );
-        assert!(bundle.dynamic_system_text.contains("- mode: supervised"));
         assert!(
-            bundle
+            plan.bundle
+                .dynamic_system_text
+                .contains("- mode: supervised")
+        );
+        assert!(
+            plan.bundle
                 .dynamic_system_text
                 .contains("may require user approval")
         );
         assert!(
-            !bundle
+            !plan
+                .bundle
                 .dynamic_system_text
                 .contains("ToolPermissionPolicySnapshot")
         );
     }
 
     #[test]
-    fn request_tools_catalog_is_compiled_for_tool_enabled_prompt_bundle() {
+    fn request_tools_catalog_is_compiled_for_tool_enabled_native_delivery_plan() {
         let runtime_home = temp_dir("request_tools_catalog_prompt");
 
-        let bundle = compile_agent_prompt_bundle_with_prompt_root(
+        let plan = compile_agent_instruction_delivery_plan_with_prompt_root(
             runtime_home.as_path(),
             None,
             None,
@@ -7487,9 +7515,10 @@ mod tests {
             "thread_request_tools_catalog",
             "turn_request_tools_catalog",
         )
-        .expect("compile prompt bundle");
+        .expect("compile native delivery plan");
 
-        let catalog_section = bundle
+        let catalog_section = plan
+            .bundle
             .sections
             .iter()
             .find(|section| {
@@ -7500,33 +7529,34 @@ mod tests {
             catalog_section.title,
             pioneer_promt::REQUEST_TOOLS_HIDDEN_DOMAIN_SECTION_TITLE
         );
-        assert!(bundle.dynamic_system_text.contains(
+        assert!(plan.bundle.dynamic_system_text.contains(
             "If you need a hidden domain and its tools are not currently visible, call request_tools"
         ));
         for (domain, tool_names) in pioneer_tools::builtin_tool_domain_map() {
             let expected = format!("- {}: {}.", domain.as_str(), tool_names.join(", "));
             assert!(
-                bundle.dynamic_system_text.contains(expected.as_str()),
+                plan.bundle.dynamic_system_text.contains(expected.as_str()),
                 "catalog missing domain line `{expected}`"
             );
         }
-        assert!(!bundle.dynamic_system_text.contains("mcp_"));
-        assert!(!bundle.dynamic_system_text.contains("mcp."));
-        assert!(!bundle.dynamic_system_text.contains("skill."));
-        assert!(!bundle.dynamic_system_text.contains("\"parameters\""));
-        assert!(!bundle.dynamic_system_text.contains("\"properties\""));
+        assert!(!plan.bundle.dynamic_system_text.contains("mcp_"));
+        assert!(!plan.bundle.dynamic_system_text.contains("mcp."));
+        assert!(!plan.bundle.dynamic_system_text.contains("skill."));
+        assert!(!plan.bundle.dynamic_system_text.contains("\"parameters\""));
+        assert!(!plan.bundle.dynamic_system_text.contains("\"properties\""));
         assert!(
-            !bundle
+            !plan
+                .bundle
                 .dynamic_system_text
                 .contains("\"additionalProperties\"")
         );
     }
 
     #[test]
-    fn request_tools_catalog_is_omitted_from_no_tool_prompt_bundle() {
+    fn request_tools_catalog_is_omitted_from_no_tool_native_delivery_plan() {
         let runtime_home = temp_dir("request_tools_catalog_no_tools");
 
-        let bundle = compile_agent_prompt_bundle_with_prompt_root(
+        let plan = compile_agent_instruction_delivery_plan_with_prompt_root(
             runtime_home.as_path(),
             None,
             None,
@@ -7538,17 +7568,19 @@ mod tests {
             "thread_no_request_tools_catalog",
             "turn_no_request_tools_catalog",
         )
-        .expect("compile prompt bundle");
+        .expect("compile native delivery plan");
 
         assert!(
-            !bundle
+            !plan
+                .bundle
                 .sections
                 .iter()
                 .any(|section| section.id.manifest_id()
                     == pioneer_promt::REQUEST_TOOLS_HIDDEN_DOMAIN_SECTION_ID)
         );
         assert!(
-            !bundle
+            !plan
+                .bundle
                 .dynamic_system_text
                 .contains("Some tool domains and their tools are hidden until requested")
         );

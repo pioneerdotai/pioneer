@@ -443,24 +443,14 @@ pub(crate) async fn install_one_cli_runtime_skill(
     })
 }
 
-pub(crate) fn prepend_codex_installed_skill_inputs(
+pub(crate) fn prepend_codex_installed_skill_items(
     installed: &[CliRuntimeSkillInstallResult],
     mapping: &mut pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputMapping,
 ) {
     if installed.is_empty() {
         return;
     }
-    let markers = installed
-        .iter()
-        .map(|skill| format!("${}", skill.install_name))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let mut prefix = Vec::with_capacity(installed.len() + 1);
-    prefix.push(
-        pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Text {
-            text: format!("Pioneer selected skills: {markers}"),
-        },
-    );
+    let mut prefix = Vec::with_capacity(installed.len());
     prefix.extend(installed.iter().map(|skill| {
         pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Skill {
             name: skill.install_name.clone(),
@@ -473,28 +463,6 @@ pub(crate) fn prepend_codex_installed_skill_inputs(
     }));
     prefix.append(&mut mapping.input);
     mapping.input = prefix;
-}
-
-pub(crate) fn prepend_claude_installed_skill_directive(
-    installed: &[CliRuntimeSkillInstallResult],
-    mapping: &mut pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputMapping,
-) {
-    if installed.is_empty() {
-        return;
-    }
-    let names = installed
-        .iter()
-        .map(|skill| skill.install_name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    mapping.input.insert(
-        0,
-        pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Text {
-            text: format!(
-                "Before completing the user's task, invoke every selected skill through Claude's native Skill tool in this order: {names}."
-            ),
-        },
-    );
 }
 
 #[cfg(test)]
@@ -899,12 +867,12 @@ mod tests {
             diagnostics: Vec::new(),
         };
         let before = mapping.clone();
-        prepend_codex_installed_skill_inputs(&[], &mut mapping);
+        prepend_codex_installed_skill_items(&[], &mut mapping);
         assert_eq!(mapping, before);
     }
 
     #[test]
-    fn cli_runtime_codex_skill_input_builder_prepends_markers_and_structured_items() {
+    fn cli_runtime_codex_skill_input_builder_prepends_only_structured_items() {
         let mut mapping = pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputMapping {
             input: vec![
                 pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Text {
@@ -913,7 +881,7 @@ mod tests {
             ],
             diagnostics: Vec::new(),
         };
-        prepend_codex_installed_skill_inputs(
+        prepend_codex_installed_skill_items(
             &[
                 installed_skill("pdf", "/native/skills/pdf"),
                 installed_skill("slides", "/native/skills/slides"),
@@ -923,9 +891,6 @@ mod tests {
         assert_eq!(
             mapping.input,
             vec![
-                pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Text {
-                    text: "Pioneer selected skills: $pdf $slides".to_owned(),
-                },
                 pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Skill {
                     name: "pdf".to_owned(),
                     path: "/native/skills/pdf/SKILL.md".to_owned(),
@@ -972,14 +937,11 @@ mod tests {
             diagnostics: Vec::new(),
         };
 
-        prepend_codex_installed_skill_inputs(&[installed], &mut mapping);
+        prepend_codex_installed_skill_items(&[installed], &mut mapping);
 
         assert_eq!(
             mapping.input,
             vec![
-                pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Text {
-                    text: "Pioneer selected skills: $proposal-51-sentinel".to_owned(),
-                },
                 pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Skill {
                     name: "proposal-51-sentinel".to_owned(),
                     path: installed_path
@@ -995,45 +957,6 @@ mod tests {
         assert_eq!(
             std::fs::read(installed_path.join("references/guide.txt")).unwrap(),
             b"CODEX SUPPORTING FILE SENTINEL\n"
-        );
-    }
-
-    #[test]
-    fn claude_native_skill_directive_is_names_only_ordered_and_zero_safe() {
-        let mut mapping = pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputMapping {
-            input: vec![
-                pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Text {
-                    text: "original user request".to_owned(),
-                },
-            ],
-            diagnostics: Vec::new(),
-        };
-        let original = mapping.clone();
-        prepend_claude_installed_skill_directive(&[], &mut mapping);
-        assert_eq!(mapping, original);
-
-        prepend_claude_installed_skill_directive(
-            &[
-                installed_skill("pdf", "/native/skills/pdf"),
-                installed_skill("slides", "/native/skills/slides"),
-            ],
-            &mut mapping,
-        );
-        let pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Text { text } =
-            &mapping.input[0]
-        else {
-            panic!("Claude directive must be text");
-        };
-        assert!(text.contains("native Skill tool"));
-        assert!(text.contains("pdf, slides"));
-        assert!(!text.contains("/native/"));
-        assert!(!text.contains("SKILL.md"));
-        assert!(!text.contains("SKILL BODY SENTINEL"));
-        assert_eq!(
-            mapping.input[1],
-            pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Text {
-                text: "original user request".to_owned()
-            }
         );
     }
 

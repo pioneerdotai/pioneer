@@ -1703,7 +1703,6 @@ pub enum PromptManifestProfile {
     AssistantFull,
     AssistantMinimal,
     AssistantNone,
-    #[serde(alias = "cli_runtime_codex")]
     CliRuntime,
 }
 

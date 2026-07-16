@@ -1387,12 +1387,7 @@ impl MessageProcessor {
                 return;
             }
             if matches!(runtime_kind, CLIAgentRuntimeKind::Codex) {
-                crate::cli_runtime::skills::prepend_codex_installed_skill_inputs(
-                    &installed_skills,
-                    &mut input_mapping,
-                );
-            } else {
-                crate::cli_runtime::skills::prepend_claude_installed_skill_directive(
+                crate::cli_runtime::skills::prepend_codex_installed_skill_items(
                     &installed_skills,
                     &mut input_mapping,
                 );
@@ -1431,34 +1426,78 @@ impl MessageProcessor {
                 None => None,
             };
             self.ensure_hook_runtime_with_run_store().await;
-            let context_bundle = match self
-                .compile_cli_runtime_context_bundle_for_turn(
+            let selected_skill_names = installed_skills
+                .iter()
+                .map(|skill| skill.install_name.clone())
+                .collect::<Vec<_>>();
+            let delivery_plan = match self
+                .compile_cli_runtime_delivery_plan_for_turn(
                     runtime_id.as_str(),
                     runtime_kind,
                     &outcome,
                     combined_preflight.mcp_projection.as_ref(),
+                    selected_skill_names.as_slice(),
                 )
                 .await
             {
-                Ok(context_bundle) => context_bundle,
+                Ok(delivery_plan) => delivery_plan,
                 Err(error) => {
                     self.mark_turn_blocked(
                         outcome.started_notification.thread_id.clone(),
                         outcome.started_notification.turn.id.clone(),
-                        format!("failed to compile CLI runtime context bundle: {error:#}"),
+                        format!("failed to compile CLI runtime delivery plan: {error:#}"),
                     )
                     .await;
                     send_turn_start_failure!(format!(
-                        "failed to compile CLI runtime context bundle: {error:#}"
+                        "failed to compile CLI runtime delivery plan: {error:#}"
                     ));
                     return;
                 }
             };
-            crate::cli_runtime::context::prepend_cli_runtime_context_input(
+            crate::cli_runtime::context::prepend_cli_turn_context_input(
                 &mut input_mapping,
-                &context_bundle,
+                &delivery_plan,
                 cli_runtime_context_label(runtime_kind),
             );
+            let elevated_instructions = match pioneer_cli_agent_runtime::instructions::CLIRuntimeElevatedInstructions::try_new(
+                delivery_plan.provider_instructions.text.clone(),
+                delivery_plan.provider_instructions.fingerprint.clone(),
+            ) {
+                Ok(instructions) => instructions,
+                Err(error) => {
+                    self.mark_turn_blocked(
+                        outcome.started_notification.thread_id.clone(),
+                        outcome.started_notification.turn.id.clone(),
+                        format!("failed to project CLI elevated instructions: {error:#}"),
+                    )
+                    .await;
+                    send_turn_start_failure!(format!(
+                        "failed to project CLI elevated instructions: {error:#}"
+                    ));
+                    return;
+                }
+            };
+            if let Err(error) =
+                crate::cli_runtime::instruction_projection::persist_cli_runtime_instruction_projection(
+                    self.crud_store.as_ref(),
+                    outcome.started_notification.turn.id.as_str(),
+                    runtime_kind,
+                    &delivery_plan,
+                    &elevated_instructions,
+                )
+                .await
+            {
+                self.mark_turn_blocked(
+                    outcome.started_notification.thread_id.clone(),
+                    outcome.started_notification.turn.id.clone(),
+                    format!("failed to persist CLI elevated instructions: {error:#}"),
+                )
+                .await;
+                send_turn_start_failure!(format!(
+                    "failed to persist CLI elevated instructions: {error:#}"
+                ));
+                return;
+            }
             let native_cwd = security_snapshot.sandbox.cwd.clone();
             let proxy_env = crate::cli_runtime::config::proxy_env(proxy_url.as_deref());
             let session_options = crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
@@ -1467,6 +1506,7 @@ impl MessageProcessor {
                 env: proxy_env,
                 enable_user_skills: matches!(runtime_kind, CLIAgentRuntimeKind::Claude)
                     && !installed_skills.is_empty(),
+                elevated_instructions: Some(elevated_instructions.clone()),
                 ..Default::default()
             };
             let session_result = if runtime_kind == CLIAgentRuntimeKind::Codex {
@@ -1631,6 +1671,7 @@ impl MessageProcessor {
                         sandbox: thread_sandbox_label,
                         permissions: provider_permissions_id.clone(),
                         service_tier: None,
+                        elevated_instructions: Some(elevated_instructions),
                         resume_existing: cli_runtime_supports_durable_thread_resume(runtime_kind),
                         request_timeout: std::time::Duration::from_millis(
                             runtime_config.request_timeout_ms,
@@ -1711,7 +1752,7 @@ impl MessageProcessor {
                 .persist_cli_runtime_prompt_manifest(
                     outcome.started_notification.thread_id.as_str(),
                     outcome.started_notification.turn.id.as_str(),
-                    &context_bundle,
+                    &delivery_plan,
                 )
                 .await
             {
@@ -2217,6 +2258,14 @@ impl MessageProcessor {
             "claude" => CLIAgentRuntimeKind::Claude,
             other => anyhow::bail!("unsupported CLI runtime kind `{other}`"),
         };
+        let elevated_instructions =
+            crate::cli_runtime::instruction_projection::load_cli_runtime_instruction_projection(
+                self.crud_store.as_ref(),
+                binding.turn_id.as_str(),
+                runtime_kind,
+            )
+            .await
+            .context("CLI runtime recovery cannot restore elevated instructions")?;
         let runtime = self
             .load_cli_runtime_instances()?
             .into_iter()
@@ -2263,6 +2312,7 @@ impl MessageProcessor {
                     approval_policy: binding.approval_policy.clone(),
                     env: crate::cli_runtime::config::proxy_env(proxy_url.as_deref()),
                     enable_user_skills: matches!(runtime_kind, CLIAgentRuntimeKind::Claude),
+                    elevated_instructions: Some(elevated_instructions.clone()),
                     ..Default::default()
                 },
             )
@@ -2305,6 +2355,7 @@ impl MessageProcessor {
                     sandbox: sandbox.clone(),
                     permissions: permissions.clone(),
                     service_tier: None,
+                    elevated_instructions: Some(elevated_instructions),
                 },
                 std::time::Duration::from_millis(runtime.request_timeout_ms),
             )
@@ -2876,13 +2927,14 @@ impl MessageProcessor {
         }
     }
 
-    async fn compile_cli_runtime_context_bundle_for_turn(
+    async fn compile_cli_runtime_delivery_plan_for_turn(
         &self,
         runtime_id: &str,
         runtime_kind: CLIAgentRuntimeKind,
         outcome: &crate::thread::TurnStartOutcome,
         mcp_projection: Option<&crate::turn_mcp::ResolvedMcpTurnProjection>,
-    ) -> anyhow::Result<pioneer_promt::CompiledPromptBundle> {
+        selected_skill_names: &[String],
+    ) -> anyhow::Result<pioneer_promt::CompiledInstructionDeliveryPlan> {
         let native_cwd = self
             .crud_store
             .get_cli_runtime_thread_binding(outcome.started_notification.thread_id.as_str())
@@ -2897,7 +2949,7 @@ impl MessageProcessor {
             .await;
         let permission_profile =
             self.materialized_turn_permission_profile(&outcome.materialization.turn)?;
-        crate::cli_runtime::context::compile_cli_runtime_context_bundle(
+        crate::cli_runtime::context::compile_cli_runtime_delivery_plan(
             self.artifact_runtime_home.as_path(),
             crate::cli_runtime::context::CLIRuntimeContextBuildInput {
                 workspace_id: outcome.started_notification.workspace_id.as_str(),
@@ -2905,15 +2957,14 @@ impl MessageProcessor {
                 turn_id: outcome.started_notification.turn.id.as_str(),
                 runtime_id,
                 runtime_label: cli_runtime_context_label(runtime_kind),
+                runtime_kind,
                 model: Some(outcome.materialization.thread.model.as_str()),
                 cwd: native_cwd.as_deref(),
                 permission_profile,
                 history: history.as_slice(),
-                selected_capabilities_context:
-                    crate::cli_runtime::context::cli_runtime_mcp_capabilities_context(
-                        runtime_kind,
-                        mcp_projection,
-                    ),
+                selected_skill_names,
+                selected_capabilities:
+                    crate::cli_runtime::context::cli_runtime_mcp_capabilities_input(mcp_projection),
             },
         )
     }
@@ -2922,9 +2973,9 @@ impl MessageProcessor {
         &self,
         thread_id: &str,
         turn_id: &str,
-        bundle: &pioneer_promt::CompiledPromptBundle,
+        plan: &pioneer_promt::CompiledInstructionDeliveryPlan,
     ) -> anyhow::Result<()> {
-        let manifest = crate::cli_runtime::context::cli_runtime_prompt_manifest_from_bundle(bundle);
+        let manifest = crate::cli_runtime::context::cli_runtime_prompt_manifest_from_plan(plan);
         self.thread_manager
             .set_turn_prompt_manifest(thread_id, turn_id, manifest.clone())
             .await;

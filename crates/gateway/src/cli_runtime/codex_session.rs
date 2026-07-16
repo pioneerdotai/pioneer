@@ -370,6 +370,7 @@ pub(crate) async fn run_codex_mcp_local_provider_probe(
             CodexThreadStartParams {
                 cwd,
                 approval_policy: "never".to_owned(),
+                developer_instructions: None,
                 ephemeral: true,
                 sandbox: Some("read-only".to_owned()),
                 permissions: None,
@@ -1694,6 +1695,9 @@ fn codex_read_only_thread_open_params(
         approval_policy: params
             .approval_policy
             .unwrap_or_else(|| "default".to_owned()),
+        developer_instructions: params
+            .elevated_instructions
+            .map(|instructions| instructions.text().to_owned()),
         ephemeral: false,
         sandbox: Some("read-only".to_owned()),
         permissions: None,
@@ -2295,8 +2299,10 @@ mod tests {
         CodexConfigIsolationEvidence, CodexConfigIsolationFeatures,
         CodexConfigLayerIsolationEvidence, CodexConfigLayerSourceKind,
     };
+    use pioneer_cli_agent_runtime::instructions::CLIRuntimeElevatedInstructions;
     use pioneer_cli_mcp_bridge::helper::run_hidden_helper_with_io;
     use serde_json::{Value as JsonValue, json};
+    use sha2::{Digest, Sha256};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex, split};
     use tokio_util::sync::CancellationToken;
@@ -2453,7 +2459,26 @@ mod tests {
             sandbox: Some(json!("danger-full-access")),
             permissions: Some("full-access".to_owned()),
             service_tier: None,
+            elevated_instructions: None,
         }
+    }
+
+    #[test]
+    fn codex_thread_open_maps_elevated_prompt_to_developer_instructions() {
+        let text = "Pioneer elevated instructions for Codex";
+        let fingerprint = Sha256::digest(text.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let mut params = thread_open_params("/workspace");
+        params.elevated_instructions = Some(
+            CLIRuntimeElevatedInstructions::try_new(text, fingerprint)
+                .expect("valid elevated instructions"),
+        );
+
+        let mapped = codex_read_only_thread_open_params(params, "/workspace".to_owned());
+        assert_eq!(mapped.developer_instructions.as_deref(), Some(text));
+        assert_eq!(mapped.sandbox.as_deref(), Some("read-only"));
     }
 
     #[test]

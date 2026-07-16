@@ -55,10 +55,12 @@ impl fmt::Display for PromptDynamicSectionId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptRuntimeBuiltInSectionId {
+    PioneerCliRuntimeInstructions,
     PioneerCliRuntimeContext,
     AgentsMd,
     MemoryRecall,
     ThreadContext,
+    SelectedSkills,
     SelectedCapabilities,
     CurrentPermissions,
     ExecutionContinuation,
@@ -67,10 +69,12 @@ pub enum PromptRuntimeBuiltInSectionId {
 impl PromptRuntimeBuiltInSectionId {
     pub fn from_manifest_id(value: &str) -> Option<Self> {
         match value {
+            "pioneer_cli_runtime_instructions" => Some(Self::PioneerCliRuntimeInstructions),
             "pioneer_cli_runtime_context" => Some(Self::PioneerCliRuntimeContext),
             "agents_md" => Some(Self::AgentsMd),
             "memory_recall" => Some(Self::MemoryRecall),
             "thread_context" => Some(Self::ThreadContext),
+            "selected_skills" => Some(Self::SelectedSkills),
             "selected_capabilities" => Some(Self::SelectedCapabilities),
             "current_permissions" => Some(Self::CurrentPermissions),
             "execution_continuation" => Some(Self::ExecutionContinuation),
@@ -80,10 +84,12 @@ impl PromptRuntimeBuiltInSectionId {
 
     pub fn manifest_id(self) -> &'static str {
         match self {
+            Self::PioneerCliRuntimeInstructions => "pioneer_cli_runtime_instructions",
             Self::PioneerCliRuntimeContext => "pioneer_cli_runtime_context",
             Self::AgentsMd => "agents_md",
             Self::MemoryRecall => "memory_recall",
             Self::ThreadContext => "thread_context",
+            Self::SelectedSkills => "selected_skills",
             Self::SelectedCapabilities => "selected_capabilities",
             Self::CurrentPermissions => "current_permissions",
             Self::ExecutionContinuation => "execution_continuation",
@@ -92,10 +98,12 @@ impl PromptRuntimeBuiltInSectionId {
 
     pub fn prompt_section_id(self) -> PromptSectionId {
         match self {
+            Self::PioneerCliRuntimeInstructions => PromptSectionId::PioneerCliRuntimeInstructions,
             Self::PioneerCliRuntimeContext => PromptSectionId::PioneerCliRuntimeContext,
             Self::AgentsMd => PromptSectionId::AgentsMd,
             Self::MemoryRecall => PromptSectionId::MemoryRecall,
             Self::ThreadContext => PromptSectionId::ThreadContext,
+            Self::SelectedSkills => PromptSectionId::SelectedSkills,
             Self::SelectedCapabilities => PromptSectionId::SelectedCapabilities,
             Self::CurrentPermissions => PromptSectionId::CurrentPermissions,
             Self::ExecutionContinuation => PromptSectionId::ExecutionContinuation,
@@ -104,12 +112,16 @@ impl PromptRuntimeBuiltInSectionId {
 
     pub fn default_title(self) -> &'static str {
         match self {
+            Self::PioneerCliRuntimeInstructions => {
+                crate::content::SECTION_TITLE_PIONEER_CLI_RUNTIME_INSTRUCTIONS
+            }
             Self::PioneerCliRuntimeContext => {
                 crate::content::SECTION_TITLE_PIONEER_CLI_RUNTIME_CONTEXT
             }
             Self::AgentsMd => crate::content::SECTION_TITLE_AGENTS_MD,
             Self::MemoryRecall => crate::content::SECTION_TITLE_MEMORY_RECALL,
             Self::ThreadContext => crate::content::SECTION_TITLE_THREAD_CONTEXT,
+            Self::SelectedSkills => crate::content::SECTION_TITLE_SELECTED_SKILLS,
             Self::SelectedCapabilities => crate::content::SECTION_TITLE_SELECTED_CAPABILITIES,
             Self::CurrentPermissions => crate::content::SECTION_TITLE_CURRENT_PERMISSIONS,
             Self::ExecutionContinuation => crate::content::SECTION_TITLE_EXECUTION_CONTINUATION,
@@ -161,10 +173,12 @@ pub enum PromptSectionId {
     TaskOrchestrationPolicy,
     SubagentsPolicy,
     TasksPolicy,
+    PioneerCliRuntimeInstructions,
     PioneerCliRuntimeContext,
     AgentsMd,
     MemoryRecall,
     ThreadContext,
+    SelectedSkills,
     SelectedCapabilities,
     CurrentPermissions,
     RecoveryContinuation,
@@ -190,10 +204,12 @@ impl PromptSectionId {
             Self::TaskOrchestrationPolicy => "task_orchestration_policy",
             Self::SubagentsPolicy => "subagents_policy",
             Self::TasksPolicy => "tasks_policy",
+            Self::PioneerCliRuntimeInstructions => "pioneer_cli_runtime_instructions",
             Self::PioneerCliRuntimeContext => "pioneer_cli_runtime_context",
             Self::AgentsMd => "agents_md",
             Self::MemoryRecall => "memory_recall",
             Self::ThreadContext => "thread_context",
+            Self::SelectedSkills => "selected_skills",
             Self::SelectedCapabilities => "selected_capabilities",
             Self::CurrentPermissions => "current_permissions",
             Self::RecoveryContinuation => "recovery_continuation",
@@ -221,10 +237,12 @@ impl PromptSectionId {
                 | "task_orchestration_policy"
                 | "subagents_policy"
                 | "tasks_policy"
+                | "pioneer_cli_runtime_instructions"
                 | "pioneer_cli_runtime_context"
                 | "agents_md"
                 | "memory_recall"
                 | "thread_context"
+                | "selected_skills"
                 | "selected_capabilities"
                 | "current_permissions"
                 | "recovery_continuation"

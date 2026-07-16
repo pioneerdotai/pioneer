@@ -34,6 +34,8 @@ pub struct Model {
     #[sea_orm(column_type = "Text", nullable)]
     pub execution_security_snapshot_json: Option<String>,
     #[sea_orm(has_one)]
+    pub turn_cli_runtime_instruction: HasOne<super::turn_cli_runtime_instruction::Entity>,
+    #[sea_orm(has_one)]
     pub turn_mcp_projection: HasOne<super::turn_mcp_projection::Entity>,
 }
 

@@ -6,8 +6,10 @@ use pioneer_cli_agent_runtime::input::{
     CLIRuntimeTurnInputItem, CLIRuntimeTurnInputMapping,
 };
 use pioneer_promt::{
-    CliRuntimeContextInput, CliRuntimeContextText, CompiledPromptBundle, PromptDiagnosticCode,
-    PromptProfile, compile_cli_runtime_context_bundle as compile_prompt_cli_runtime_context_bundle,
+    CliRuntimeContextInput, CliRuntimeContextText, CliRuntimeSelectedCapabilitiesInput,
+    CliRuntimeSelectedServerInput, CliRuntimeSelectedSkillsInput, CompiledInstructionDeliveryPlan,
+    PromptDiagnosticCode, PromptProfile,
+    compile_cli_runtime_delivery_plan as compile_prompt_cli_runtime_delivery_plan,
 };
 use pioneer_protocol::{
     PromptManifest, PromptManifestDiagnostic, PromptManifestDiagnosticCode, PromptManifestProfile,
@@ -20,7 +22,6 @@ use std::path::Path;
 const THREAD_CONTEXT_MAX_MESSAGES: usize = 12;
 const THREAD_CONTEXT_MAX_CHARS: usize = 6_000;
 const THREAD_CONTEXT_MESSAGE_MAX_CHARS: usize = 800;
-const MAX_EXACT_MCP_TOOL_NAMES_IN_CONTEXT: usize = 24;
 
 pub(crate) struct CLIRuntimeContextBuildInput<'a> {
     pub workspace_id: &'a str,
@@ -28,18 +29,25 @@ pub(crate) struct CLIRuntimeContextBuildInput<'a> {
     pub turn_id: &'a str,
     pub runtime_id: &'a str,
     pub runtime_label: &'a str,
+    pub runtime_kind: pioneer_protocol::CLIAgentRuntimeKind,
     pub model: Option<&'a str>,
     pub cwd: Option<&'a str>,
     pub permission_profile: TurnPermissionProfileSnapshot,
     pub history: &'a [ChatMessage],
-    pub selected_capabilities_context: Option<CliRuntimeContextText>,
+    pub selected_skill_names: &'a [String],
+    pub selected_capabilities: Option<CliRuntimeSelectedCapabilitiesInput>,
 }
 
-pub(crate) fn compile_cli_runtime_context_bundle(
+pub(crate) fn compile_cli_runtime_delivery_plan(
     prompt_root: &Path,
     input: CLIRuntimeContextBuildInput<'_>,
-) -> Result<CompiledPromptBundle> {
-    compile_prompt_cli_runtime_context_bundle(
+) -> Result<CompiledInstructionDeliveryPlan> {
+    let selected_skills =
+        (!input.selected_skill_names.is_empty()).then(|| CliRuntimeSelectedSkillsInput {
+            runtime_kind: input.runtime_kind,
+            skill_names: input.selected_skill_names.to_vec(),
+        });
+    compile_prompt_cli_runtime_delivery_plan(
         prompt_root,
         CliRuntimeContextInput {
             workspace_id: input.workspace_id.to_owned(),
@@ -52,15 +60,15 @@ pub(crate) fn compile_cli_runtime_context_bundle(
             permission_profile: input.permission_profile,
             memory_recall_context: None,
             thread_context: thread_context_from_history(input.history),
-            selected_capabilities_context: input.selected_capabilities_context,
+            selected_skills,
+            selected_capabilities: input.selected_capabilities,
         },
     )
 }
 
-pub(crate) fn cli_runtime_mcp_capabilities_context(
-    runtime_kind: pioneer_protocol::CLIAgentRuntimeKind,
+pub(crate) fn cli_runtime_mcp_capabilities_input(
     projection: Option<&crate::turn_mcp::ResolvedMcpTurnProjection>,
-) -> Option<CliRuntimeContextText> {
+) -> Option<CliRuntimeSelectedCapabilitiesInput> {
     let projection = projection.filter(|projection| !projection.tools.is_empty())?;
     let mut explicit_servers = BTreeMap::<String, usize>::new();
     let mut explicit_tools = Vec::new();
@@ -69,7 +77,7 @@ pub(crate) fn cli_runtime_mcp_capabilities_context(
         match tool.selection_reason {
             crate::turn_mcp::McpSelectionReason::ExplicitServer => {
                 *explicit_servers
-                    .entry(safe_context_label(tool.server_name.as_str()))
+                    .entry(tool.server_name.clone())
                     .or_default() += 1;
             }
             crate::turn_mcp::McpSelectionReason::ExplicitTool => {
@@ -82,103 +90,40 @@ pub(crate) fn cli_runtime_mcp_capabilities_context(
     }
     explicit_tools.sort();
     explicit_tools.dedup();
-
-    let mut lines = vec![
-        format!(
-            "Pioneer has activated {} executable MCP tool(s) for this turn.",
-            projection.tools.len()
-        ),
-        "Before claiming that a matching action is unavailable or offering a manual substitute, discover and use the matching active MCP tool.".to_owned(),
-        "Only the tools activated for this turn may be used; Gateway still enforces permissions and approval.".to_owned(),
-    ];
-    match runtime_kind {
-        pioneer_protocol::CLIAgentRuntimeKind::Codex => lines.push(
-            "Codex may defer MCP tools behind its built-in tool_search. You must call tool_search using the user's intent, server name, or tool name before concluding that an attached MCP capability is unavailable, then invoke the matching returned tool.".to_owned(),
-        ),
-        pioneer_protocol::CLIAgentRuntimeKind::Claude => lines.push(
-            "Check the Pioneer MCP tools exposed for this turn and invoke the matching tool before concluding that an attached MCP capability is unavailable.".to_owned(),
-        ),
-    }
-    if !explicit_servers.is_empty() {
-        lines.push(String::new());
-        lines.push("Attached MCP servers:".to_owned());
-        for (server, count) in explicit_servers {
-            lines.push(format!("- {server}: {count} tool(s)"));
-        }
-    }
-    if !explicit_tools.is_empty() {
-        lines.push(String::new());
-        lines.push("Individually attached MCP tools:".to_owned());
-        for name in explicit_tools
-            .iter()
-            .take(MAX_EXACT_MCP_TOOL_NAMES_IN_CONTEXT)
-        {
-            lines.push(format!("- {name}"));
-        }
-        let omitted = explicit_tools
-            .len()
-            .saturating_sub(MAX_EXACT_MCP_TOOL_NAMES_IN_CONTEXT);
-        if omitted > 0 {
-            lines.push(format!(
-                "- and {omitted} more attached tool(s); use tool discovery by user intent"
-            ));
-        }
-    }
-    if policy_tools > 0 {
-        lines.push(format!(
-            "- {policy_tools} additional MCP tool(s) are active by workspace policy"
-        ));
-    }
-    Some(CliRuntimeContextText {
-        text: lines.join("\n"),
-        truncated: explicit_tools.len() > MAX_EXACT_MCP_TOOL_NAMES_IN_CONTEXT,
+    Some(CliRuntimeSelectedCapabilitiesInput {
+        total_tool_count: projection.tools.len(),
+        explicit_servers: explicit_servers
+            .into_iter()
+            .map(|(server_name, tool_count)| CliRuntimeSelectedServerInput {
+                server_name,
+                tool_count,
+            })
+            .collect(),
+        explicit_tool_names: explicit_tools,
+        implicit_policy_tool_count: policy_tools,
     })
 }
 
-fn safe_context_label(value: &str) -> String {
-    let sanitized = value
-        .trim()
-        .chars()
-        .take(80)
-        .map(|character| {
-            if character.is_alphanumeric()
-                || character.is_whitespace()
-                || matches!(character, '_' | '-' | '.' | '/')
-            {
-                character
-            } else {
-                ' '
-            }
-        })
-        .collect::<String>();
-    let normalized = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.is_empty() {
-        "MCP server".to_owned()
-    } else {
-        normalized
-    }
-}
-
-pub(crate) fn prepend_cli_runtime_context_input(
+pub(crate) fn prepend_cli_turn_context_input(
     mapping: &mut CLIRuntimeTurnInputMapping,
-    bundle: &CompiledPromptBundle,
+    plan: &CompiledInstructionDeliveryPlan,
     runtime_label: &str,
 ) -> bool {
-    prepend_cli_runtime_context_input_with_diagnostic(
+    prepend_cli_turn_context_input_with_diagnostic(
         mapping,
-        bundle,
+        plan,
         runtime_label,
-        "cli_runtime_input.pioneer_context_mapped",
+        "cli_runtime_input.turn_context_mapped",
     )
 }
 
-fn prepend_cli_runtime_context_input_with_diagnostic(
+fn prepend_cli_turn_context_input_with_diagnostic(
     mapping: &mut CLIRuntimeTurnInputMapping,
-    bundle: &CompiledPromptBundle,
+    plan: &CompiledInstructionDeliveryPlan,
     runtime_label: &str,
     diagnostic_code: &str,
 ) -> bool {
-    let Some(context_text) = cli_runtime_context_text(bundle) else {
+    let Some(context_text) = cli_runtime_context_text(plan) else {
         return false;
     };
     let runtime_label = normalized_optional(runtime_label).unwrap_or("CLI runtime");
@@ -188,15 +133,16 @@ fn prepend_cli_runtime_context_input_with_diagnostic(
     mapping.diagnostics.push(CLIRuntimeInputMappingDiagnostic {
         level: CLIRuntimeInputMappingDiagnosticLevel::Info,
         code: diagnostic_code.to_owned(),
-        message: format!("Prepended compact Pioneer CLI runtime context for {runtime_label}."),
+        message: format!("Prepended non-governing Pioneer turn context for {runtime_label}."),
         input_index: None,
     });
     true
 }
 
-pub(crate) fn cli_runtime_prompt_manifest_from_bundle(
-    bundle: &CompiledPromptBundle,
+pub(crate) fn cli_runtime_prompt_manifest_from_plan(
+    plan: &CompiledInstructionDeliveryPlan,
 ) -> PromptManifest {
+    let bundle = &plan.bundle;
     PromptManifest {
         compiler_version: bundle.compiler_version.to_owned(),
         profile: prompt_manifest_profile(bundle.profile),
@@ -223,8 +169,8 @@ pub(crate) fn cli_runtime_prompt_manifest_from_bundle(
     }
 }
 
-fn cli_runtime_context_text(bundle: &CompiledPromptBundle) -> Option<String> {
-    let text = bundle.dynamic_system_text.trim();
+fn cli_runtime_context_text(plan: &CompiledInstructionDeliveryPlan) -> Option<String> {
+    let text = plan.turn_context.text.trim();
     (!text.is_empty()).then(|| text.to_owned())
 }
 
@@ -332,9 +278,9 @@ fn normalized_optional(value: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CLIRuntimeContextBuildInput, cli_runtime_mcp_capabilities_context,
-        cli_runtime_prompt_manifest_from_bundle, compile_cli_runtime_context_bundle,
-        prepend_cli_runtime_context_input,
+        CLIRuntimeContextBuildInput, cli_runtime_mcp_capabilities_input,
+        cli_runtime_prompt_manifest_from_plan, compile_cli_runtime_delivery_plan,
+        prepend_cli_turn_context_input,
     };
     use pioneer_cli_agent_runtime::input::{CLIRuntimeTurnInputItem, CLIRuntimeTurnInputMapping};
     use pioneer_protocol::{CLIAgentRuntimeKind, PromptManifestProfile};
@@ -393,7 +339,7 @@ mod tests {
     fn cli_runtime_prompt_manifest_uses_runtime_profile_without_api_sections() {
         let root = temp_workspace("manifest");
         std::fs::write(root.join("SOUL.md"), "api prompt file").expect("write SOUL");
-        let bundle = compile_cli_runtime_context_bundle(
+        let plan = compile_cli_runtime_delivery_plan(
             root.as_path(),
             CLIRuntimeContextBuildInput {
                 workspace_id: "workspace_1",
@@ -401,16 +347,18 @@ mod tests {
                 turn_id: "turn_1",
                 runtime_id: "codex-default",
                 runtime_label: "Codex CLI",
+                runtime_kind: CLIAgentRuntimeKind::Codex,
                 model: Some("gpt-5-codex"),
                 cwd: Some("/workspace"),
                 permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
                 history: &[ChatMessage::user("continue from prior context")],
-                selected_capabilities_context: None,
+                selected_skill_names: &[],
+                selected_capabilities: None,
             },
         )
-        .expect("compile bundle");
+        .expect("compile plan");
 
-        let manifest = cli_runtime_prompt_manifest_from_bundle(&bundle);
+        let manifest = cli_runtime_prompt_manifest_from_plan(&plan);
         assert_eq!(manifest.profile, PromptManifestProfile::CliRuntime);
         assert!(
             manifest
@@ -418,14 +366,14 @@ mod tests {
                 .contains(&"pioneer_cli_runtime_context".to_owned())
         );
         assert!(manifest.section_ids.contains(&"thread_context".to_owned()));
-        assert!(!bundle.full_system_text.contains("Tool Usage"));
-        assert!(!bundle.full_system_text.contains("api prompt file"));
+        assert!(!plan.bundle.full_system_text.contains("Tool Usage"));
+        assert!(!plan.bundle.full_system_text.contains("api prompt file"));
     }
 
     #[test]
     fn cli_runtime_context_is_prepended_to_runtime_input_mapping() {
         let root = temp_workspace("input");
-        let bundle = compile_cli_runtime_context_bundle(
+        let plan = compile_cli_runtime_delivery_plan(
             root.as_path(),
             CLIRuntimeContextBuildInput {
                 workspace_id: "workspace_1",
@@ -433,11 +381,13 @@ mod tests {
                 turn_id: "turn_1",
                 runtime_id: "claude-default",
                 runtime_label: "Claude CLI",
+                runtime_kind: CLIAgentRuntimeKind::Claude,
                 model: None,
                 cwd: None,
                 permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
                 history: &[],
-                selected_capabilities_context: None,
+                selected_skill_names: &[],
+                selected_capabilities: None,
             },
         )
         .expect("compile bundle");
@@ -448,13 +398,13 @@ mod tests {
             diagnostics: Vec::new(),
         };
 
-        assert!(prepend_cli_runtime_context_input(
+        assert!(prepend_cli_turn_context_input(
             &mut mapping,
-            &bundle,
+            &plan,
             "Claude CLI"
         ));
         let CLIRuntimeTurnInputItem::Text { text } = &mapping.input[0] else {
-            panic!("prepended Pioneer context should be text input");
+            panic!("prepended Pioneer turn context should be text input");
         };
         assert!(text.contains("Pioneer Context"));
         assert!(text.contains("Claude CLI"));
@@ -464,14 +414,14 @@ mod tests {
             mapping
                 .diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.code == "cli_runtime_input.pioneer_context_mapped")
+                .any(|diagnostic| diagnostic.code == "cli_runtime_input.turn_context_mapped")
         );
     }
 
     #[test]
     fn cli_runtime_context_build_input_carries_restricted_permissions() {
         let root = temp_workspace("permissions");
-        let bundle = compile_cli_runtime_context_bundle(
+        let plan = compile_cli_runtime_delivery_plan(
             root.as_path(),
             CLIRuntimeContextBuildInput {
                 workspace_id: "workspace_1",
@@ -479,6 +429,7 @@ mod tests {
                 turn_id: "turn_1",
                 runtime_id: "codex-default",
                 runtime_label: "Codex CLI",
+                runtime_kind: CLIAgentRuntimeKind::Codex,
                 model: Some("gpt-5-codex"),
                 cwd: Some("/workspace"),
                 permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
@@ -486,42 +437,39 @@ mod tests {
                     pioneer_protocol::TurnPermissionProfileSource::Composer,
                 ),
                 history: &[],
-                selected_capabilities_context: None,
+                selected_skill_names: &[],
+                selected_capabilities: None,
             },
         )
         .expect("compile bundle");
 
-        let manifest = cli_runtime_prompt_manifest_from_bundle(&bundle);
+        let manifest = cli_runtime_prompt_manifest_from_plan(&plan);
         assert!(
             manifest
                 .section_ids
                 .contains(&"current_permissions".to_owned())
         );
         assert!(
-            bundle
-                .dynamic_system_text
+            plan.provider_instructions
+                .text
                 .contains("## Current Permissions")
         );
-        assert!(bundle.dynamic_system_text.contains("- mode: supervised"));
+        assert!(
+            plan.provider_instructions
+                .text
+                .contains("- mode: supervised")
+        );
+        assert!(!plan.turn_context.text.contains("Current Permissions"));
     }
 
     #[test]
-    fn codex_selected_mcp_context_requires_deferred_tool_discovery() {
+    fn selected_mcp_context_requires_provider_neutral_tool_discovery() {
         let projection = mcp_projection();
         let selected =
-            cli_runtime_mcp_capabilities_context(CLIAgentRuntimeKind::Codex, Some(&projection))
-                .expect("selected MCP context");
-        assert!(selected.text.contains("2 executable MCP tool(s)"));
-        assert!(selected.text.contains("tool_search"));
-        assert!(selected.text.contains("resend: 1 tool(s)"));
-        assert!(selected.text.contains("mcp_resend_send_email"));
-        assert!(
-            !selected.text.contains("UNTRUSTED DESCRIPTION"),
-            "MCP-controlled descriptions must not enter governing context"
-        );
+            cli_runtime_mcp_capabilities_input(Some(&projection)).expect("selected MCP input");
 
         let root = temp_workspace("selected_mcp");
-        let bundle = compile_cli_runtime_context_bundle(
+        let plan = compile_cli_runtime_delivery_plan(
             root.as_path(),
             CLIRuntimeContextBuildInput {
                 workspace_id: "workspace_1",
@@ -529,24 +477,61 @@ mod tests {
                 turn_id: "turn_1",
                 runtime_id: "codex-default",
                 runtime_label: "Codex CLI",
+                runtime_kind: CLIAgentRuntimeKind::Codex,
                 model: Some("gpt-5-codex"),
                 cwd: Some("/workspace"),
                 permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
                 history: &[],
-                selected_capabilities_context: Some(selected),
+                selected_skill_names: &[],
+                selected_capabilities: Some(selected),
             },
         )
         .expect("compile selected MCP context");
-        let manifest = cli_runtime_prompt_manifest_from_bundle(&bundle);
+        let manifest = cli_runtime_prompt_manifest_from_plan(&plan);
         assert!(
             manifest
                 .section_ids
                 .contains(&"selected_capabilities".to_owned())
         );
         assert!(
-            bundle
-                .dynamic_system_text
-                .contains("before concluding that an attached MCP capability is unavailable")
+            plan.provider_instructions
+                .text
+                .contains("Before answering, determine whether the user's request")
         );
+        assert!(
+            plan.provider_instructions
+                .text
+                .contains("2 executable MCP tool(s)")
+        );
+        assert!(
+            plan.provider_instructions
+                .text
+                .contains("through the runtime's available tool-discovery mechanism")
+        );
+        assert!(
+            plan.provider_instructions
+                .text
+                .contains("the user does not need to mention an MCP server, tool name")
+        );
+        assert!(!plan.provider_instructions.text.contains("tool_search"));
+        assert!(!plan.provider_instructions.text.contains("ALL_TOOLS"));
+        assert!(
+            plan.provider_instructions
+                .text
+                .contains("resend: 1 tool(s)")
+        );
+        assert!(
+            plan.provider_instructions
+                .text
+                .contains("mcp_resend_send_email")
+        );
+        assert!(
+            !plan
+                .provider_instructions
+                .text
+                .contains("UNTRUSTED DESCRIPTION"),
+            "MCP-controlled descriptions must not enter governing context"
+        );
+        assert!(!plan.turn_context.text.contains("tool_search"));
     }
 }

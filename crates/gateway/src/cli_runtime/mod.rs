@@ -7,6 +7,7 @@ pub(crate) mod config;
 pub(crate) mod context;
 pub(crate) mod continuation;
 pub(crate) mod input_mapping;
+pub(crate) mod instruction_projection;
 pub(crate) mod manager;
 pub(crate) mod mcp;
 pub(crate) mod permissions;

@@ -17,6 +17,7 @@ pub mod config;
 pub mod driver;
 pub mod event;
 pub mod input;
+pub mod instructions;
 pub mod mcp;
 pub mod process;
 pub mod registry;

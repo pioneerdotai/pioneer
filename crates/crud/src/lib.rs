@@ -376,9 +376,9 @@ use crate::repositories::{
     task_dependency, task_event, task_result_candidate, task_result_review_event, task_run,
     task_run_execution, task_run_thread_binding, task_run_turn, task_trigger, task_write_lock,
     thread, thread_agents_doc, thread_episodic as thread_episodic_repository, thread_lineage,
-    thread_tree, turn, turn_event, turn_event_projection_state, turn_execution_window,
-    turn_item_attempt, turn_liveness, turn_llm_context, turn_mcp_binding, turn_mcp_projection,
-    turn_runtime_snapshot, turn_skill_binding,
+    thread_tree, turn, turn_cli_runtime_instruction, turn_event, turn_event_projection_state,
+    turn_execution_window, turn_item_attempt, turn_liveness, turn_llm_context, turn_mcp_binding,
+    turn_mcp_projection, turn_runtime_snapshot, turn_skill_binding,
 };
 pub use crate::task_events::{AppendedTaskEvent, TaskEventAppendStatus, TaskEventPayload};
 use crate::task_projector::TaskProjector;
@@ -414,6 +414,9 @@ pub use crate::repositories::hook_run::{
     NewHookAuditEventRecord, NewHookRunAttemptRecord, NewHookRunRecord, RecoverableHookRunRecord,
 };
 pub use crate::repositories::turn::TurnExecutionSecuritySnapshotRecord;
+pub use crate::repositories::turn_cli_runtime_instruction::{
+    CliRuntimeInstructionProjectionRecord, NewCliRuntimeInstructionProjection,
+};
 pub use crate::repositories::turn_execution_window::{
     NewTurnExecutionCheckpointRecord, NewTurnExecutionWindowRecord,
     TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES, TurnExecutionCheckpointKind,
@@ -962,6 +965,31 @@ impl CrudStore {
             turn_runtime_snapshot::delete_turn_runtime_snapshots_for_closed_turns(&self.connection)
                 .await
         })
+        .await
+    }
+
+    pub async fn insert_cli_runtime_instruction_projection_if_absent(
+        &self,
+        projection: NewCliRuntimeInstructionProjection,
+    ) -> Result<CliRuntimeInstructionProjectionRecord> {
+        self.run_serialized_write(|| async {
+            turn_cli_runtime_instruction::insert_cli_runtime_instruction_projection_if_absent(
+                &self.connection,
+                projection.clone(),
+            )
+            .await
+        })
+        .await
+    }
+
+    pub async fn get_cli_runtime_instruction_projection(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<CliRuntimeInstructionProjectionRecord>> {
+        turn_cli_runtime_instruction::find_cli_runtime_instruction_projection(
+            &self.connection,
+            turn_id,
+        )
         .await
     }
 
@@ -13576,12 +13604,12 @@ mod tests {
         CliRuntimeTurnBindingListFilter, CliRuntimeTurnMcpMetadata, ConversationArtifactRefLimits,
         CrudStore, IngestArtifactMetadataRecord, McpAuditEventRecord,
         McpServerCatalogSnapshotRecord, McpServerInstallationRecord, NewArtifactBlobRecord,
-        NewCliRuntimeNativeEvent, NewCliRuntimePendingRequest, NewCliRuntimeThreadBinding,
-        NewCliRuntimeTurnBinding, NewThreadEpisodicItemRecord, NewTurnExecutionCheckpointRecord,
-        NewTurnExecutionWindowRecord, NewTurnLlmContextEntry, NewTurnRuntimeSnapshot,
-        PrepareClaudeProviderSessionBinding, PreparedClaudeProviderSessionMode,
-        ResolveCliRuntimePendingRequest, SkillAuditEventRecord, SkillInstallationRecord,
-        THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID,
+        NewCliRuntimeInstructionProjection, NewCliRuntimeNativeEvent, NewCliRuntimePendingRequest,
+        NewCliRuntimeThreadBinding, NewCliRuntimeTurnBinding, NewThreadEpisodicItemRecord,
+        NewTurnExecutionCheckpointRecord, NewTurnExecutionWindowRecord, NewTurnLlmContextEntry,
+        NewTurnRuntimeSnapshot, PrepareClaudeProviderSessionBinding,
+        PreparedClaudeProviderSessionMode, ResolveCliRuntimePendingRequest, SkillAuditEventRecord,
+        SkillInstallationRecord, THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID,
         THREAD_EPISODIC_WORKSPACE_SEGMENT_CAPACITY_BYTES, TaskEventPayload, TaskRunChildAnchor,
         ThreadAgentsDocError, ThreadAgentsDocSaveReason, ThreadAgentsDocStatus,
         ThreadEpisodicActiveWriteSegmentRequest, ThreadEpisodicCapsuleCapacityUpdate,
@@ -14255,6 +14283,61 @@ mod tests {
                 .expect("snapshot read after delete should succeed")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn cli_runtime_instruction_projection_round_trips_without_debug_text_leakage() {
+        let workspace_id = "ws_cli_instruction_projection";
+        let thread_id = "thr_cli_instruction";
+        let turn_id = "turn_cli_instruction";
+        let timestamp = 1_700_000_000;
+        let store = test_store_with_workspace(workspace_id).await;
+        store
+            .materialize_turn_start(
+                &sample_thread(workspace_id, thread_id, timestamp),
+                SandboxMode::FullAccess,
+                &sample_turn(turn_id),
+                &[],
+            )
+            .await
+            .expect("turn start should persist");
+        let now = unix_to_datetime(timestamp);
+        let governing_text = "durable governing prompt canary";
+
+        let projection = NewCliRuntimeInstructionProjection {
+            turn_id: turn_id.to_owned(),
+            runtime_kind: "codex".to_owned(),
+            transport_kind: "codex_developer_instructions".to_owned(),
+            instruction_text: governing_text.to_owned(),
+            instruction_fingerprint: "a".repeat(64),
+            section_ids_json: r#"["pioneer_cli_runtime_instructions"]"#.to_owned(),
+            compiler_version: "test".to_owned(),
+            created_at: now,
+            updated_at: now,
+        };
+        let inserted = store
+            .insert_cli_runtime_instruction_projection_if_absent(projection.clone())
+            .await
+            .expect("instruction projection insert should succeed");
+        assert_eq!(inserted.instruction_text, governing_text);
+        assert!(!format!("{inserted:?}").contains(governing_text));
+
+        let fetched = store
+            .get_cli_runtime_instruction_projection(turn_id)
+            .await
+            .expect("instruction projection read should succeed")
+            .expect("instruction projection should exist");
+        assert_eq!(fetched, inserted);
+
+        let mut conflicting = projection;
+        conflicting.instruction_text = "replacement governing prompt".to_owned();
+        conflicting.instruction_fingerprint = "b".repeat(64);
+        let preserved = store
+            .insert_cli_runtime_instruction_projection_if_absent(conflicting)
+            .await
+            .expect("idempotent projection insert should succeed");
+        assert_eq!(preserved, inserted);
+        assert_eq!(preserved.instruction_text, governing_text);
     }
 
     #[tokio::test]

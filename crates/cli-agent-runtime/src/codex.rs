@@ -3042,11 +3042,13 @@ pub struct CodexAccountReadResponse {
     pub extra: BTreeMap<String, JsonValue>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexThreadStartParams {
     pub cwd: String,
     pub approval_policy: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub developer_instructions: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ephemeral: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3059,12 +3061,41 @@ pub struct CodexThreadStartParams {
     pub service_tier: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+impl fmt::Debug for CodexThreadStartParams {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CodexThreadStartParams")
+            .field("cwd", &self.cwd)
+            .field("approval_policy", &self.approval_policy)
+            .field(
+                "developer_instructions",
+                &self.developer_instructions.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("ephemeral", &self.ephemeral)
+            .field("sandbox", &self.sandbox)
+            .field("permissions", &self.permissions)
+            .field("model", &self.model)
+            .field("service_tier", &self.service_tier)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CodexThreadResumeParams {
     pub thread_id: String,
     #[serde(flatten)]
     pub start: CodexThreadStartParams,
+}
+
+impl fmt::Debug for CodexThreadResumeParams {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CodexThreadResumeParams")
+            .field("thread_id", &self.thread_id)
+            .field("start", &self.start)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -6462,6 +6493,7 @@ while read line; do :; done
                     CodexThreadStartParams {
                         cwd: "/tmp/project".to_owned(),
                         approval_policy: "on-request".to_owned(),
+                        developer_instructions: Some("Pioneer elevated instructions".to_owned()),
                         ephemeral: false,
                         sandbox: Some("workspace-write".to_owned()),
                         permissions: None,
@@ -6480,6 +6512,7 @@ while read line; do :; done
             json!({
                 "cwd": "/tmp/project",
                 "approvalPolicy": "on-request",
+                "developerInstructions": "Pioneer elevated instructions",
                 "sandbox": "workspace-write",
                 "model": "gpt-5",
                 "serviceTier": "priority"
@@ -6504,6 +6537,25 @@ while read line; do :; done
         assert_eq!(snapshot.native_thread_id, "codex-thread-started");
         assert_eq!(snapshot.cwd.as_deref(), Some("/tmp/project"));
         assert_eq!(snapshot.model.as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn codex_thread_start_debug_redacts_developer_instructions() {
+        let canary = "codex-developer-instruction-canary";
+        let params = CodexThreadStartParams {
+            cwd: "/tmp/project".to_owned(),
+            approval_policy: "on-request".to_owned(),
+            developer_instructions: Some(canary.to_owned()),
+            ephemeral: false,
+            sandbox: Some("workspace-write".to_owned()),
+            permissions: None,
+            model: Some("gpt-5".to_owned()),
+            service_tier: None,
+        };
+
+        let debug = format!("{params:?}");
+        assert!(!debug.contains(canary));
+        assert!(debug.contains("[REDACTED]"));
     }
 
     #[tokio::test]
@@ -6597,6 +6649,7 @@ while read line; do :; done
                     CodexThreadStartParams {
                         cwd: "/tmp/project".to_owned(),
                         approval_policy: "never".to_owned(),
+                        developer_instructions: None,
                         ephemeral: false,
                         sandbox: Some("danger-full-access".to_owned()),
                         permissions: None,
@@ -7038,6 +7091,7 @@ while read line; do :; done
                     CodexThreadStartParams {
                         cwd: "/tmp/project".to_owned(),
                         approval_policy: "never".to_owned(),
+                        developer_instructions: Some("Pioneer resumed instructions".to_owned()),
                         ephemeral: false,
                         sandbox: Some("danger-full-access".to_owned()),
                         permissions: None,
@@ -7057,6 +7111,7 @@ while read line; do :; done
                 "threadId": "codex-thread-existing",
                 "cwd": "/tmp/project",
                 "approvalPolicy": "never",
+                "developerInstructions": "Pioneer resumed instructions",
                 "sandbox": "danger-full-access"
             })
         );
