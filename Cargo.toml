@@ -6,6 +6,7 @@ members = [
   "crates/client",
   "crates/client-ffi",
   "crates/cli-agent-runtime",
+  "crates/cli-mcp-bridge",
   "crates/promt",
   "crates/config",
   "crates/keystore",
@@ -43,6 +44,7 @@ pioneer-artifacts = { path = "crates/artifacts" }
 pioneer-client = { path = "crates/client" }
 pioneer-client-ffi = { path = "crates/client-ffi" }
 pioneer-cli-agent-runtime = { path = "crates/cli-agent-runtime" }
+pioneer-cli-mcp-bridge = { path = "crates/cli-mcp-bridge" }
 pioneer-keystore = { path = "crates/keystore" }
 pioneer-gateway = { path = "crates/gateway" }
 pioneer-hooks = { path = "crates/hooks" }
@@ -77,6 +79,7 @@ semver = "1"
 toml = "1.1"
 schemars = { version = "1.2", features = ["derive"] }
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+uuid = "1.23"
 
 # Async
 tokio = { version = "1.52", features = ["full"] }
@@ -150,6 +153,7 @@ rathole = { git = "https://github.com/pioneerdotai/relay.git", default-features 
 # Crypto
 hmac = "0.13"
 sha2 = "0.11"
+subtle = "2.6"
 hex = "0.4"
 icu_collator = "2.2.1"
 base64 = "0.22"
