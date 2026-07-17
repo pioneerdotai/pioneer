@@ -516,6 +516,7 @@ impl crate::traits::Provider for GlmProvider {
             vision: false,
             tool_calling: true,
             embeddings: false,
+            transcription: false,
             input_types: ProviderInputCapabilities::disabled_for_all_file_types(),
         }
     }
@@ -776,6 +777,7 @@ impl crate::traits::Provider for GlmProvider {
                 owned_by: m.owned_by.or(Some("zhipu".to_owned())),
                 limits: ProviderModelLimits::default(),
                 capabilities: ProviderModelCapabilities::default(),
+                transcription: None,
                 pricing: None,
                 active: Some(true),
                 family: None,

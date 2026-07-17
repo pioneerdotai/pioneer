@@ -762,6 +762,7 @@ impl crate::traits::Provider for OpenAiProvider {
             vision: true,
             tool_calling: true,
             embeddings: true,
+            transcription: false,
             input_types: ProviderInputCapabilities {
                 text: true,
                 file: InputTypeSupport {
@@ -1098,6 +1099,7 @@ fn provider_model_from_openai_model_entry(m: ApiModelEntry) -> ProviderModelInfo
         owned_by: m.owned_by,
         limits: ProviderModelLimits::default(),
         capabilities,
+        transcription: None,
         pricing: None,
         active: Some(true),
         family: None,
@@ -1118,6 +1120,7 @@ fn openai_embedding_model_info(model: &OpenAiEmbeddingModelDefinition) -> Provid
             embeddings: Some(true),
             ..ProviderModelCapabilities::default()
         },
+        transcription: None,
         pricing: None,
         active: Some(true),
         family: Some("embedding".to_owned()),

@@ -434,6 +434,7 @@ impl crate::traits::Provider for AnthropicProvider {
             vision: true,
             tool_calling: true,
             embeddings: false,
+            transcription: false,
             input_types: ProviderInputCapabilities {
                 text: true,
                 file: InputTypeSupport::native_inline_only(),
@@ -782,6 +783,7 @@ fn provider_model_from_anthropic_model_entry(m: AnthropicModelEntry) -> Provider
             },
         },
         capabilities,
+        transcription: None,
         pricing: None,
         active: Some(true),
         family: None,

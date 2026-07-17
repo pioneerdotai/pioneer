@@ -47,6 +47,15 @@ pub trait Provider: Send + Sync {
         )
     }
 
+    /// List transcription models available from this provider.
+    /// Default implementation returns an error for providers that don't support transcription.
+    async fn list_transcription_models(&self) -> Result<Vec<ProviderModelInfo>> {
+        anyhow::bail!(
+            "provider '{}' does not support listing transcription models",
+            self.name()
+        )
+    }
+
     /// Create embeddings for one or more input texts.
     /// Default implementation returns an error for providers that do not support embeddings.
     async fn embed(&self, _request: EmbeddingRequest) -> Result<EmbeddingResponse> {
@@ -83,6 +92,7 @@ mod tests {
                 vision: false,
                 tool_calling: false,
                 embeddings: false,
+                transcription: false,
                 input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
             }
         }
@@ -173,5 +183,18 @@ mod tests {
 
         let chunk3 = stream.next().await.unwrap().unwrap();
         assert!(chunk3.is_final);
+    }
+
+    #[tokio::test]
+    async fn provider_defaults_to_unsupported_transcription_listing() {
+        let error = MockProvider
+            .list_transcription_models()
+            .await
+            .expect_err("mock provider should not list transcription models");
+
+        assert_eq!(
+            error.to_string(),
+            "provider 'mock' does not support listing transcription models"
+        );
     }
 }

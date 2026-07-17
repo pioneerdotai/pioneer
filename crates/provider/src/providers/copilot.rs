@@ -502,6 +502,7 @@ impl crate::traits::Provider for CopilotProvider {
             vision: true,
             tool_calling: true,
             embeddings: false,
+            transcription: false,
             input_types: ProviderInputCapabilities {
                 text: true,
                 file: InputTypeSupport::disabled(),
@@ -779,6 +780,7 @@ impl crate::traits::Provider for CopilotProvider {
                 owned_by: m.owned_by.or(Some("github".to_owned())),
                 limits: ProviderModelLimits::default(),
                 capabilities: ProviderModelCapabilities::default(),
+                transcription: None,
                 pricing: None,
                 active: Some(true),
                 family: None,

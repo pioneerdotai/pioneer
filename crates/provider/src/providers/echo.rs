@@ -32,6 +32,7 @@ impl crate::traits::Provider for EchoProvider {
             vision: false,
             tool_calling: true,
             embeddings: false,
+            transcription: false,
             input_types: ProviderInputCapabilities::disabled_for_all_file_types(),
         }
     }

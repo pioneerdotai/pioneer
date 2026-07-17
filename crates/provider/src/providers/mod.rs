@@ -21,7 +21,9 @@ pub use echo::EchoProvider;
 pub use gemini::GeminiProvider;
 pub use glm::GlmProvider;
 pub use local::{
-    LOCAL_EMBEDDING_MODELS, LocalEmbeddingModelInfo, LocalProvider, local_embedding_model_info,
+    LOCAL_EMBEDDING_MODELS, LOCAL_TRANSCRIPTION_MODELS, LocalEmbeddingModelInfo, LocalProvider,
+    LocalTranscriptionArtifactKind, LocalTranscriptionEngine, LocalTranscriptionModelInfo,
+    local_embedding_model_info, local_transcription_model_info,
 };
 pub use ollama::OllamaProvider;
 pub use openai::OpenAiProvider;

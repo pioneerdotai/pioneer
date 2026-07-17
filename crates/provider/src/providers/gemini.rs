@@ -585,6 +585,7 @@ impl crate::traits::Provider for GeminiProvider {
             vision: true,
             tool_calling: true,
             embeddings: false,
+            transcription: false,
             input_types: ProviderInputCapabilities {
                 text: true,
                 file: InputTypeSupport::native_inline_only(),
@@ -789,6 +790,7 @@ fn provider_model_from_gemini_model_entry(m: GeminiModelEntry) -> ProviderModelI
             reasoning,
             ..ProviderModelCapabilities::default()
         },
+        transcription: None,
         pricing: None,
         active: Some(true),
         family: None,

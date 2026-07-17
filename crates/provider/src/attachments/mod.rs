@@ -317,6 +317,7 @@ mod tests {
             vision: false,
             tool_calling: true,
             embeddings: false,
+            transcription: false,
             input_types: ProviderInputCapabilities {
                 text: true,
                 file: InputTypeSupport::native_inline_only(),
@@ -376,6 +377,7 @@ mod tests {
             vision: false,
             tool_calling: true,
             embeddings: false,
+            transcription: false,
             input_types: ProviderInputCapabilities::disabled_for_all_file_types(),
         };
 
@@ -470,6 +472,7 @@ mod tests {
             vision: true,
             tool_calling: true,
             embeddings: false,
+            transcription: false,
             input_types: ProviderInputCapabilities {
                 text: true,
                 file: InputTypeSupport {

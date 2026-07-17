@@ -766,6 +766,7 @@ pub struct ProviderCapabilities {
     pub vision: bool,
     pub tool_calling: bool,
     pub embeddings: bool,
+    pub transcription: bool,
     pub input_types: ProviderInputCapabilities,
 }
 

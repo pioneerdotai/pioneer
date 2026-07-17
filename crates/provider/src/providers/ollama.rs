@@ -310,6 +310,7 @@ impl crate::traits::Provider for OllamaProvider {
             vision: true,
             tool_calling: true,
             embeddings: false,
+            transcription: false,
             input_types: ProviderInputCapabilities {
                 text: true,
                 file: InputTypeSupport::disabled(),
@@ -544,6 +545,7 @@ impl crate::traits::Provider for OllamaProvider {
                         tool_calling: Some(true),
                         ..ProviderModelCapabilities::default()
                     },
+                    transcription: None,
                     pricing: None,
                     active: Some(true),
                     family: m.details.and_then(|d| d.family),

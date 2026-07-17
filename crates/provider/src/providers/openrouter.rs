@@ -690,6 +690,7 @@ impl crate::traits::Provider for OpenRouterProvider {
             vision: true,
             tool_calling: true,
             embeddings: true,
+            transcription: false,
             input_types: ProviderInputCapabilities {
                 text: true,
                 file: InputTypeSupport {
@@ -1062,6 +1063,7 @@ fn provider_model_from_openrouter_model_entry(m: OpenRouterModelEntry) -> Provid
             context_window: m.context_length,
         },
         capabilities,
+        transcription: None,
         pricing,
         active: Some(true),
         family: None,

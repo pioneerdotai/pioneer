@@ -617,6 +617,7 @@ impl crate::traits::Provider for AzureOpenAiProvider {
             vision: true,
             tool_calling: true,
             embeddings: false,
+            transcription: false,
             input_types: ProviderInputCapabilities {
                 text: true,
                 file: InputTypeSupport::disabled(),
@@ -895,6 +896,7 @@ impl crate::traits::Provider for AzureOpenAiProvider {
                     owned_by: m.owned_by,
                     limits: ProviderModelLimits::default(),
                     capabilities,
+                    transcription: None,
                     pricing: None,
                     active: Some(true),
                     family: None,

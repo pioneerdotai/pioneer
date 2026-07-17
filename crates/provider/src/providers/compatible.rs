@@ -905,6 +905,7 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
             vision: self.input_types.image.is_supported(),
             tool_calling: true,
             embeddings: false,
+            transcription: false,
             input_types: self.input_types.clone(),
         }
     }
@@ -1132,6 +1133,7 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
                 owned_by: m.owned_by,
                 limits: ProviderModelLimits::default(),
                 capabilities: ProviderModelCapabilities::default(),
+                transcription: None,
                 pricing: None,
                 active: Some(true),
                 family: None,

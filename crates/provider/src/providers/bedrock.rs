@@ -797,6 +797,7 @@ impl crate::traits::Provider for BedrockProvider {
             vision: true,
             tool_calling: true,
             embeddings: false,
+            transcription: false,
             input_types: ProviderInputCapabilities {
                 text: true,
                 file: InputTypeSupport::native_inline_only(),
@@ -1006,6 +1007,7 @@ fn provider_model_from_bedrock_model_summary(m: BedrockModelSummary) -> Provider
         owned_by: m.provider_name,
         limits: ProviderModelLimits::default(),
         capabilities,
+        transcription: None,
         pricing: None,
         active: lifecycle_status.as_deref().map(|s| s == "ACTIVE"),
         family: None,
