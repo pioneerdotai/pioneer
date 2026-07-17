@@ -299,14 +299,16 @@ pub struct ComposerSubmissionPlan {
     pub has_composer_payload: bool,
 }
 
+/// Picker entry points are structural composer actions, not catalog or
+/// provider-readiness indicators. Empty and unavailable states belong inside
+/// the picker so installing a capability never requires restarting a shell.
 pub const fn composer_capability_menu_visibility(
-    target: ComposerCapabilityTarget,
+    _target: ComposerCapabilityTarget,
 ) -> ComposerCapabilityMenuVisibility {
-    let policy = target.policy();
     ComposerCapabilityMenuVisibility {
-        skills: policy.supports_skills,
-        mcp: policy.supports_mcp_tools,
-        any: policy.supports_skills || policy.supports_mcp_tools,
+        skills: true,
+        mcp: true,
+        any: true,
     }
 }
 
@@ -1322,6 +1324,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn capability_picker_entry_points_are_visible_for_every_policy_shape() {
+        for case in COMPOSER_CAPABILITY_MATRIX {
+            assert_eq!(
+                composer_capability_menu_visibility(case.target),
+                ComposerCapabilityMenuVisibility {
+                    skills: true,
+                    mcp: true,
+                    any: true,
+                },
+                "{}",
+                case.id
+            );
+        }
+    }
+
     fn skill_capability(slug: &str) -> ComposerCapability {
         skill_capability_from_source(slug, "user")
     }
@@ -1613,7 +1631,7 @@ mod tests {
     }
 
     #[test]
-    fn presentation_readiness_cannot_strip_the_structural_submission_plan() {
+    fn presentation_readiness_cannot_hide_pickers_or_strip_the_structural_submission_plan() {
         let input = vec![
             skill_capability_from_source("user", "user"),
             skill_capability_from_source("system", "system"),
@@ -1633,9 +1651,9 @@ mod tests {
         assert_eq!(
             presentation.menu_visibility,
             ComposerCapabilityMenuVisibility {
-                skills: false,
-                mcp: false,
-                any: false,
+                skills: true,
+                mcp: true,
+                any: true,
             }
         );
 

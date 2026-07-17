@@ -211,10 +211,6 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.composer_capability_target().policy().supports_skills {
-            return;
-        }
-
         let desktop_entity = cx.entity().clone();
         let rows = self.selectable_skill_capabilities("");
         let picker_state = cx.new(|cx| {
@@ -309,14 +305,6 @@ impl PioneerDesktop {
     }
 
     pub(super) fn open_composer_mcp_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self
-            .composer_capability_target()
-            .policy()
-            .supports_mcp_tools
-        {
-            return;
-        }
-
         let desktop_entity = cx.entity().clone();
         let server_rows = self.selectable_mcp_server_capabilities("");
         let initial_details = self.mcp_server_details.clone();
@@ -469,13 +457,9 @@ impl PioneerDesktop {
         &self,
         query: &str,
     ) -> Vec<SelectableSkillCapability> {
-        let rows = composer_capabilities::filter_installed_skill_capability_rows(
+        composer_capabilities::filter_installed_skill_capability_rows(
             self.installed_skills.as_slice(),
             query,
-        );
-        composer_capabilities::filter_selectable_skill_capabilities_for_target(
-            rows.as_slice(),
-            self.composer_capability_target(),
         )
     }
 
@@ -483,14 +467,7 @@ impl PioneerDesktop {
         &self,
         query: &str,
     ) -> Vec<SelectableMcpCapability> {
-        let rows = composer_capabilities::filter_mcp_server_capability_rows(
-            self.mcp_servers.as_slice(),
-            query,
-        );
-        composer_capabilities::filter_selectable_mcp_capabilities_for_target(
-            rows.as_slice(),
-            self.composer_capability_target(),
-        )
+        composer_capabilities::filter_mcp_server_capability_rows(self.mcp_servers.as_slice(), query)
     }
 
     fn load_composer_skill_picker_rows(
@@ -516,7 +493,6 @@ impl PioneerDesktop {
         };
 
         let ws_sender = self.gateway.ws_command_sender.clone();
-        let capability_target = self.composer_capability_target();
         cx.spawn(move |_this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let cx = cx.clone();
             async move {
@@ -533,13 +509,7 @@ impl PioneerDesktop {
                                 composer_capabilities::reduce_composer_skill_picker_rows_response(
                                     response, "",
                                 );
-                            state.finish_loading_skills(
-                                composer_capabilities::filter_selectable_skill_capabilities_for_target(
-                                    reduction.rows.as_slice(),
-                                    capability_target,
-                                ),
-                                cx,
-                            );
+                            state.finish_loading_skills(reduction.rows, cx);
                         }
                         Err(error) => {
                             state.fail_loading_skills(

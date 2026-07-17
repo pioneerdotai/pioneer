@@ -2001,9 +2001,9 @@ mod tests {
                     .as_str(),
             )
             .expect("menu visibility");
-        assert!(!visibility.skills);
-        assert!(!visibility.mcp);
-        assert!(!visibility.any);
+        assert!(visibility.skills);
+        assert!(visibility.mcp);
+        assert!(visibility.any);
 
         let capabilities = serde_json::json!([
             {

@@ -1,10 +1,11 @@
 use super::*;
 use pioneer_client::agents_doc::scope as agents_doc_scope;
 #[cfg(test)]
-use pioneer_client::composer::capabilities::composer_capability_target_for_provider as shared_composer_capability_target_for_provider;
 use pioneer_client::composer::capabilities::{
-    ComposerCapabilityTarget, ComposerSubmissionPlan, plan_composer_submission,
+    ComposerCapabilityTarget,
+    composer_capability_target_for_provider as shared_composer_capability_target_for_provider,
 };
+use pioneer_client::composer::capabilities::{ComposerSubmissionPlan, plan_composer_submission};
 use pioneer_client::providers::list as provider_list;
 use pioneer_client::state::selectors as client_selectors;
 use pioneer_client::state::snapshot::{ClientSnapshot, ClientSnapshotInput};
@@ -138,10 +139,6 @@ impl PioneerDesktop {
             .as_deref()
             .and_then(provider_list::runtime_id_from_cli_runtime_provider_key)
             .is_some()
-    }
-
-    pub(in crate::app) fn composer_capability_target(&self) -> ComposerCapabilityTarget {
-        self.composer_capability_target
     }
 
     pub(in crate::app) fn effective_composer_capabilities(&self) -> Vec<ComposerCapability> {

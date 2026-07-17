@@ -299,9 +299,6 @@ impl PioneerDesktop {
         let disabled = self.composer_upload_in_progress
             || self.active_task_thread_navigation().is_some()
             || self.desktop_voice_context_locked();
-        let capability_target = self.composer_capability_target();
-        let capability_policy = capability_target.policy();
-
         Button::new("composer-add-attachment")
             .small()
             .ghost()
@@ -323,41 +320,33 @@ impl PioneerDesktop {
                     },
                 ));
 
-                let menu = if capability_policy.supports_skills {
-                    menu.item(Self::composer_add_menu_item(
-                        t!("chat.composer.add_menu.skills").to_string().into(),
-                        PioneerIconName::Zap,
-                        {
-                            let desktop_entity = desktop_entity.clone();
-                            move |window, cx| {
-                                let _ = desktop_entity.update(cx, |view, cx| {
-                                    view.open_composer_skills_picker(window, cx);
-                                    cx.notify();
-                                });
-                            }
-                        },
-                    ))
-                } else {
-                    menu
-                };
+                let menu = menu.item(Self::composer_add_menu_item(
+                    t!("chat.composer.add_menu.skills").to_string().into(),
+                    PioneerIconName::Zap,
+                    {
+                        let desktop_entity = desktop_entity.clone();
+                        move |window, cx| {
+                            let _ = desktop_entity.update(cx, |view, cx| {
+                                view.open_composer_skills_picker(window, cx);
+                                cx.notify();
+                            });
+                        }
+                    },
+                ));
 
-                if capability_policy.supports_mcp_tools {
-                    menu.item(Self::composer_add_menu_item(
-                        t!("chat.composer.add_menu.mcp").to_string().into(),
-                        PioneerIconName::Mcp,
-                        {
-                            let desktop_entity = desktop_entity.clone();
-                            move |window, cx| {
-                                let _ = desktop_entity.update(cx, |view, cx| {
-                                    view.open_composer_mcp_picker(window, cx);
-                                    cx.notify();
-                                });
-                            }
-                        },
-                    ))
-                } else {
-                    menu
-                }
+                menu.item(Self::composer_add_menu_item(
+                    t!("chat.composer.add_menu.mcp").to_string().into(),
+                    PioneerIconName::Mcp,
+                    {
+                        let desktop_entity = desktop_entity.clone();
+                        move |window, cx| {
+                            let _ = desktop_entity.update(cx, |view, cx| {
+                                view.open_composer_mcp_picker(window, cx);
+                                cx.notify();
+                            });
+                        }
+                    },
+                ))
             })
             .into_any_element()
     }
