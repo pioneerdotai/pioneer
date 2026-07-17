@@ -1,6 +1,8 @@
 //! Composer capability selection helpers.
 
-use crate::providers::list::runtime_id_from_cli_runtime_provider_key;
+use crate::{
+    providers::list::runtime_id_from_cli_runtime_provider_key, skills::catalog as skill_catalog,
+};
 
 use pioneer_protocol::{
     McpListItem, McpListResponse, McpRuntimeState, McpScopeKind, McpServerDetailsResponse,
@@ -357,7 +359,7 @@ pub fn plan_composer_submission(
 }
 
 fn is_cli_exportable_skill_source(source_kind: &str) -> bool {
-    matches!(source_kind, "user" | "registry")
+    matches!(source_kind, "system" | "user" | "registry")
 }
 
 pub fn composer_capability_is_eligible_for_target(
@@ -1065,6 +1067,7 @@ pub fn filter_skill_capability_rows(
 ) -> Vec<SelectableSkillCapability> {
     let mut rows = skills
         .iter()
+        .filter(|skill| skill_catalog::skill_is_user_selectable(skill))
         .map(selectable_skill_from_item)
         .collect::<Vec<_>>();
     rows = filter_selectable_skill_capability_rows(rows.as_slice(), query);
@@ -1457,7 +1460,7 @@ mod tests {
             skill_capability_from_source("user-first", "user"),
             mcp_server_capability("docs"),
             skill_capability_from_source("registry-second", "registry"),
-            skill_capability_from_source("system", "system"),
+            skill_capability_from_source("browser", "system"),
             mcp_tool_capability("docs", "search"),
             skill_capability_from_source("unknown", "future"),
         ];
@@ -1471,7 +1474,7 @@ mod tests {
                     "skill:user:user-first",
                     "mcp-server:workspace:docs",
                     "skill:registry:registry-second",
-                    "skill:system:system",
+                    "skill:system:browser",
                     "mcp-tool:workspace:docs:search",
                     "skill:future:unknown",
                 ],
@@ -1484,7 +1487,11 @@ mod tests {
             (
                 "skills-only CLI",
                 ComposerCapabilityTarget::cli(ComposerCapabilityPolicy::cli(true, false)),
-                vec!["skill:user:user-first", "skill:registry:registry-second"],
+                vec![
+                    "skill:user:user-first",
+                    "skill:registry:registry-second",
+                    "skill:system:browser",
+                ],
             ),
             (
                 "MCP-only CLI",
@@ -1501,6 +1508,7 @@ mod tests {
                     "skill:user:user-first",
                     "mcp-server:workspace:docs",
                     "skill:registry:registry-second",
+                    "skill:system:browser",
                     "mcp-tool:workspace:docs:search",
                 ],
             ),
@@ -1531,7 +1539,8 @@ mod tests {
     fn capability_policy_reports_stable_kind_and_source_removal_reasons() {
         let input = vec![
             skill_capability_from_source("user", "user"),
-            skill_capability_from_source("system", "system"),
+            skill_capability_from_source("browser", "system"),
+            skill_capability_from_source("unknown", "future"),
             mcp_server_capability("docs"),
             mcp_tool_capability("docs", "search"),
         ];
@@ -1547,6 +1556,7 @@ mod tests {
                 .map(|removed| removed.reason)
                 .collect::<Vec<_>>(),
             vec![
+                ComposerCapabilityRemovalReason::SkillsUnsupported,
                 ComposerCapabilityRemovalReason::SkillsUnsupported,
                 ComposerCapabilityRemovalReason::SkillsUnsupported,
                 ComposerCapabilityRemovalReason::McpToolsUnsupported,
@@ -1565,7 +1575,7 @@ mod tests {
                 .map(|removed| (removed.capability.id.as_str(), removed.reason))
                 .collect::<Vec<_>>(),
             vec![(
-                "skill:system:system",
+                "skill:future:unknown",
                 ComposerCapabilityRemovalReason::SkillSourceNotExportable,
             )]
         );
@@ -1594,7 +1604,8 @@ mod tests {
         let input = vec![
             skill_capability_from_source("user", "user"),
             skill_capability_from_source("registry", "registry"),
-            skill_capability_from_source("system", "system"),
+            skill_capability_from_source("browser", "system"),
+            skill_capability_from_source("unknown", "future"),
             mcp_server_capability("docs"),
             mcp_tool_capability("docs", "search"),
         ];
@@ -1613,6 +1624,7 @@ mod tests {
             vec![
                 "skill:user:user",
                 "skill:registry:registry",
+                "skill:system:browser",
                 "mcp-server:workspace:docs",
                 "mcp-tool:workspace:docs:search",
             ]
@@ -1624,7 +1636,7 @@ mod tests {
                 .map(|removed| (removed.capability.id.as_str(), removed.reason))
                 .collect::<Vec<_>>(),
             vec![(
-                "skill:system:system",
+                "skill:future:unknown",
                 ComposerCapabilityRemovalReason::SkillSourceNotExportable,
             )]
         );
@@ -1634,7 +1646,8 @@ mod tests {
     fn presentation_readiness_cannot_hide_pickers_or_strip_the_structural_submission_plan() {
         let input = vec![
             skill_capability_from_source("user", "user"),
-            skill_capability_from_source("system", "system"),
+            skill_capability_from_source("browser", "system"),
+            skill_capability_from_source("unknown", "future"),
             mcp_server_capability("docs"),
             mcp_tool_capability("docs", "search"),
         ];
@@ -1666,6 +1679,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 "skill:user:user",
+                "skill:system:browser",
                 "mcp-server:workspace:docs",
                 "mcp-tool:workspace:docs:search",
             ]
@@ -1677,7 +1691,7 @@ mod tests {
                 .map(|removed| (removed.capability.id.as_str(), removed.reason))
                 .collect::<Vec<_>>(),
             vec![(
-                "skill:system:system",
+                "skill:future:unknown",
                 ComposerCapabilityRemovalReason::SkillSourceNotExportable,
             )]
         );
@@ -1707,7 +1721,7 @@ mod tests {
     }
 
     #[test]
-    fn selectable_skill_target_filter_uses_the_same_exact_source_rule() {
+    fn selectable_skill_target_filter_allows_system_browser_and_rejects_unknown_cli_sources() {
         let rows = ["user", "registry", "system", "future"]
             .into_iter()
             .map(|source_kind| {
@@ -1722,8 +1736,11 @@ mod tests {
             filter_selectable_skill_capabilities_for_target(
                 &rows,
                 ComposerCapabilityTarget::native()
-            ),
-            rows
+            )
+            .iter()
+            .map(|row| row.source_kind.as_str())
+            .collect::<Vec<_>>(),
+            vec!["user", "registry", "system", "future"]
         );
         assert!(
             filter_selectable_skill_capabilities_for_target(
@@ -1742,7 +1759,7 @@ mod tests {
                 .iter()
                 .map(|row| row.source_kind.as_str())
                 .collect::<Vec<_>>(),
-            vec!["user", "registry"]
+            vec!["user", "registry", "system"]
         );
         assert!(cli_rows.iter().all(|row| {
             selectable_skill_capability_is_eligible_for_target(
@@ -1991,17 +2008,27 @@ mod tests {
     }
 
     #[test]
-    fn installed_skill_rows_filter_out_uninstalled_items() {
+    fn installed_skill_rows_keep_system_browser_and_hide_required_system_skills() {
         let mut installed = skill_item("tests/installed");
         installed.display_name = "Installed".to_owned();
         let mut uninstalled = skill_item("tests/uninstalled");
         uninstalled.display_name = "Uninstalled".to_owned();
         uninstalled.install.installed = false;
+        let mut browser = skill_item("browser");
+        browser.source_kind = "system".to_owned();
+        browser.display_name = "Browser".to_owned();
+        let mut memory = skill_item("memory");
+        memory.source_kind = "system".to_owned();
+        memory.policy.allow_implicit_invocation = true;
+        memory.policy.allow_implicit_invocation_editable = false;
 
-        let rows = filter_installed_skill_capability_rows(&[uninstalled, installed], "");
+        let rows =
+            filter_installed_skill_capability_rows(&[uninstalled, memory, installed, browser], "");
 
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].slug, "tests/installed");
+        assert_eq!(
+            rows.iter().map(|row| row.slug.as_str()).collect::<Vec<_>>(),
+            vec!["browser", "tests/installed"]
+        );
     }
 
     #[test]
@@ -2010,18 +2037,31 @@ mod tests {
         installed.display_name = "Installed".to_owned();
         let mut uninstalled = skill_item("tests/uninstalled");
         uninstalled.install.installed = false;
+        let mut browser = skill_item("browser");
+        browser.source_kind = "system".to_owned();
+        browser.display_name = "Browser".to_owned();
+        let mut tasks = skill_item("tasks");
+        tasks.source_kind = "system".to_owned();
+        tasks.policy.allow_implicit_invocation = true;
+        tasks.policy.allow_implicit_invocation_editable = false;
 
         let reduction = reduce_composer_skill_picker_rows_response(
             SkillListResponse {
                 snapshot_version: 1,
                 generated_at: 1,
-                skills: vec![uninstalled, installed],
+                skills: vec![uninstalled, tasks, browser, installed],
             },
             "",
         );
 
-        assert_eq!(reduction.rows.len(), 1);
-        assert_eq!(reduction.rows[0].slug, "tests/installed");
+        assert_eq!(
+            reduction
+                .rows
+                .iter()
+                .map(|row| row.slug.as_str())
+                .collect::<Vec<_>>(),
+            vec!["browser", "tests/installed"]
+        );
     }
 
     #[test]

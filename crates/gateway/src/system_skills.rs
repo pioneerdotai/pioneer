@@ -226,6 +226,7 @@ mod tests {
         bundled_system_skills_hash, is_bundle_hash_dir_name, is_bundle_staging_dir_name,
         materialize_bundled_system_skill_roots,
     };
+    use pioneer_protocol::CLIAgentRuntimeKind;
     use pioneer_skills::{
         ResolvedSkill, SkillCatalogLoadParams, SkillImplicitInvocationPolicy, SkillPromptBudget,
         SkillResolvedReason, SkillRuntimeBudget, SkillSourceKind, SkillTrustLevel,
@@ -277,6 +278,20 @@ mod tests {
             reason: SkillResolvedReason::ExplicitCapability,
             definition: browser.clone(),
         }];
+        assert!(
+            crate::cli_runtime::skills::ensure_cli_runtime_skills_exportable(active.as_slice())
+                .is_ok()
+        );
+        for runtime_kind in [CLIAgentRuntimeKind::Codex, CLIAgentRuntimeKind::Claude] {
+            assert!(
+                crate::cli_runtime::skills::ensure_cli_runtime_skill_invocation_eligible(
+                    runtime_kind,
+                    "runtime",
+                    active.as_slice(),
+                )
+                .is_ok()
+            );
+        }
         let prompt = build_skill_prompt(
             active.as_slice(),
             SkillPromptBudget {
@@ -334,6 +349,14 @@ mod tests {
             SkillImplicitInvocationPolicy::Required
         );
         assert!(subagents.policy_hints.catalog_hidden);
+        let required = [ResolvedSkill {
+            slug: "pioneer/subagents".to_owned(),
+            reason: SkillResolvedReason::ExplicitCapability,
+            definition: subagents.clone(),
+        }];
+        assert!(
+            crate::cli_runtime::skills::ensure_cli_runtime_skills_exportable(&required).is_err()
+        );
 
         let expected_subagents_asset_root = root_canonical
             .join("pioneer/subagents")

@@ -72,6 +72,16 @@ pub fn skill_key(slug: &str, source_kind: &str) -> String {
     format!("{}::{}", slug.trim(), source_kind.trim())
 }
 
+/// Returns whether a skill has a user-controlled invocation policy.
+///
+/// Source origin is intentionally irrelevant here: bundled system skills such
+/// as Browser are user-controlled, while required system skills such as Memory,
+/// Tasks, and Subagents are always active and therefore do not belong in
+/// user-managed catalog or composer-selection surfaces.
+pub fn skill_is_user_selectable(skill: &SkillListItem) -> bool {
+    skill.policy.allow_implicit_invocation_editable
+}
+
 pub fn normalize_skill_target(slug: &str, source_kind: &str) -> Option<(String, String)> {
     let slug = slug.trim();
     let source_kind = source_kind.trim();
@@ -92,6 +102,7 @@ pub fn skill_list_params(workspace_id: impl Into<String>) -> SkillListParams {
 }
 
 pub fn derive_skills_catalog_and_installed(mut catalog: Vec<SkillListItem>) -> SkillsCatalogSplit {
+    catalog.retain(skill_is_user_selectable);
     catalog.sort_by(|left, right| {
         left.source_kind
             .cmp(&right.source_kind)
@@ -312,10 +323,15 @@ mod tests {
     }
 
     #[test]
-    fn catalog_split_sorts_and_keeps_installed_subset() {
+    fn catalog_split_uses_invocation_policy_instead_of_system_origin() {
+        let browser = skill("browser", "system", true);
+        let mut memory = skill("memory", "system", true);
+        memory.policy.allow_implicit_invocation_editable = false;
+
         let split = derive_skills_catalog_and_installed(vec![
             skill("zeta", "user", true),
-            skill("alpha", "system", false),
+            browser,
+            memory,
             skill("beta", "user", true),
         ]);
 
@@ -325,10 +341,14 @@ mod tests {
                 .iter()
                 .map(|skill| skill_key(&skill.slug, &skill.source_kind))
                 .collect::<Vec<_>>(),
-            vec!["alpha::system", "beta::user", "zeta::user"]
+            vec!["browser::system", "beta::user", "zeta::user"]
         );
-        assert_eq!(split.installed.len(), 2);
+        assert_eq!(split.installed.len(), 3);
+        assert!(skill_exists(&split.catalog, "browser", "system"));
+        assert!(skill_exists(&split.installed, "browser", "system"));
         assert!(skill_exists(&split.installed, "beta", "user"));
+        assert!(!skill_exists(&split.catalog, "memory", "system"));
+        assert!(!skill_exists(&split.installed, "memory", "system"));
     }
 
     #[test]

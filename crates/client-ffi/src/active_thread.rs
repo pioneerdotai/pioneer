@@ -1916,7 +1916,8 @@ mod tests {
             capability("user", "user"),
             mcp_capability(),
             capability("registry", "registry"),
-            capability("system", "system"),
+            capability("browser", "system"),
+            capability("unknown", "future"),
             mcp_tool_capability(),
         ];
         let cases = [
@@ -1948,6 +1949,7 @@ mod tests {
             "skill:user:user",
             "mcp-server:workspace:docs",
             "skill:registry:registry",
+            "skill:system:browser",
             "mcp-tool:workspace:docs:search",
         ];
 
@@ -1978,6 +1980,11 @@ mod tests {
                         .map(|capability| capability.id.as_str())
                         .collect::<Vec<_>>(),
                     expected_ids,
+                    "{case}"
+                );
+                assert_eq!(plan.removed.len(), 1, "{case}");
+                assert_eq!(
+                    plan.removed[0].capability.id, "skill:future:unknown",
                     "{case}"
                 );
             }
@@ -2020,6 +2027,7 @@ mod tests {
                 "skill:user:user",
                 "mcp-server:workspace:docs",
                 "skill:registry:registry",
+                "skill:system:browser",
                 "mcp-tool:workspace:docs:search",
             ]
         );

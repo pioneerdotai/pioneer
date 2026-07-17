@@ -33,7 +33,7 @@ impl std::fmt::Display for CliRuntimeSystemSkillNotExportable {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "{CLI_RUNTIME_SYSTEM_SKILL_NOT_EXPORTABLE}: skill `{}` (`{}`) is Pioneer-only at export_boundary stage",
+            "{CLI_RUNTIME_SYSTEM_SKILL_NOT_EXPORTABLE}: required system skill `{}` (`{}`) is Pioneer-only at export_boundary stage",
             self.skill_slug, self.display_name
         )
     }
@@ -63,10 +63,7 @@ pub(crate) fn ensure_cli_runtime_skills_exportable(
     resolved: &[pioneer_skills::ResolvedSkill],
 ) -> std::result::Result<&[pioneer_skills::ResolvedSkill], CliRuntimeSystemSkillNotExportable> {
     for skill in resolved {
-        if matches!(
-            skill.definition.identity.source_kind,
-            pioneer_skills::SkillSourceKind::System
-        ) {
+        if !pioneer_skills::skill_implicit_invocation_editable(&skill.definition) {
             return Err(CliRuntimeSystemSkillNotExportable {
                 skill_slug: skill.slug.clone(),
                 display_name: skill.definition.identity.display_name.clone(),
@@ -469,7 +466,8 @@ pub(crate) fn prepend_codex_installed_skill_items(
 mod tests {
     use super::*;
     use pioneer_skills::{
-        SkillDependencies, SkillResolvedReason, SkillSourceKind, SkillTrustLevel,
+        SkillDependencies, SkillImplicitInvocationPolicy, SkillResolvedReason, SkillSourceKind,
+        SkillTrustLevel,
         compile::{CompileSkillInput, compile_skill_definition},
         contract::default_skill_conformance,
     };
@@ -648,23 +646,82 @@ mod tests {
     }
 
     #[test]
-    fn cli_runtime_system_skill_export_boundary_is_authoritative_and_all_or_nothing() {
+    fn cli_runtime_export_allows_user_controlled_system_skills_and_rejects_required_ones() {
         let user = resolved_skill("user-skill", SkillSourceKind::User);
         let registry = resolved_skill("registry-skill", SkillSourceKind::Registry);
-        let exportable = vec![user.clone(), registry.clone()];
+        let browser = resolved_skill("browser", SkillSourceKind::System);
+        let exportable = vec![user.clone(), browser, registry.clone()];
         assert_eq!(
             ensure_cli_runtime_skills_exportable(&exportable).unwrap(),
             exportable.as_slice()
         );
 
-        let system = resolved_skill("future-system-skill", SkillSourceKind::System);
-        let error = ensure_cli_runtime_skills_exportable(&[user, system, registry]).unwrap_err();
-        assert_eq!(error.skill_slug, "workspace/future-system-skill");
+        let mut subagents = resolved_skill("subagents", SkillSourceKind::System);
+        subagents.definition.policy_hints.implicit_invocation =
+            SkillImplicitInvocationPolicy::Required;
+        let error = ensure_cli_runtime_skills_exportable(&[user, subagents, registry]).unwrap_err();
+        assert_eq!(error.skill_slug, "workspace/subagents");
         let message = error.to_string();
         assert!(message.contains(CLI_RUNTIME_SYSTEM_SKILL_NOT_EXPORTABLE));
+        assert!(message.contains("required system skill"));
         assert!(message.contains("export_boundary"));
         assert!(!message.contains("destination"));
         assert!(!message.contains("hash"));
+    }
+
+    #[test]
+    fn user_controlled_system_browser_reaches_codex_and_claude_install_plans() {
+        use pioneer_config::GatewayCliAgentRuntimeKindConfig;
+        use pioneer_protocol::CLIAgentRuntimeKind;
+
+        let temp = tempfile::tempdir().unwrap();
+        let receipt = temp.path().join("state/receipt.json");
+        let browser = resolved_skill("browser", SkillSourceKind::System);
+        assert!(ensure_cli_runtime_skills_exportable(std::slice::from_ref(&browser)).is_ok());
+
+        let runtimes = [
+            (
+                CLIAgentRuntimeKind::Codex,
+                runtime_instance(
+                    GatewayCliAgentRuntimeKindConfig::Codex,
+                    temp.path().join("codex").to_string_lossy().into_owned(),
+                    None,
+                ),
+            ),
+            (
+                CLIAgentRuntimeKind::Claude,
+                runtime_instance(
+                    GatewayCliAgentRuntimeKindConfig::Claude,
+                    temp.path().join("claude").to_string_lossy().into_owned(),
+                    Some(
+                        temp.path()
+                            .join("claude-shadow")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                ),
+            ),
+        ];
+
+        for (runtime_kind, runtime) in runtimes {
+            ensure_cli_runtime_skill_invocation_eligible(
+                runtime_kind,
+                runtime.display_name.as_str(),
+                std::slice::from_ref(&browser),
+            )
+            .unwrap();
+            let plans = build_cli_runtime_skill_install_plans(
+                &runtime,
+                runtime_kind,
+                std::slice::from_ref(&browser),
+                &receipt,
+            )
+            .unwrap();
+            assert_eq!(plans.len(), 1);
+            assert_eq!(plans[0].skill_slug, "workspace/browser");
+            assert_eq!(plans[0].source_kind, "system");
+            assert_eq!(plans[0].install_name, "browser");
+        }
     }
 
     #[test]

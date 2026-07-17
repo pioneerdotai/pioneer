@@ -733,7 +733,7 @@ impl MessageProcessor {
                         result = "failed",
                         failure_reason = crate::cli_runtime::skills::CLI_RUNTIME_SYSTEM_SKILL_NOT_EXPORTABLE,
                         elapsed_ms = preflight_started.elapsed().as_millis(),
-                        "CLI runtime skill preflight rejected Pioneer-only system skill"
+                        "CLI runtime skill preflight rejected Pioneer-only required system skill"
                     );
                     send_turn_start_failure!(error.to_string());
                     return;

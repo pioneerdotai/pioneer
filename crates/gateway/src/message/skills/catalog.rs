@@ -165,6 +165,35 @@ mod cli_runtime_resolver_tests {
     }
 
     #[test]
+    fn cli_runtime_skill_resolver_accepts_explicit_user_controlled_system_browser() {
+        let catalog = SkillCatalogSnapshot {
+            version: 1,
+            generated_at_unix: 1,
+            skills: vec![definition("browser", SkillSourceKind::System)],
+        };
+        let attachments = [attachment("browser", "browser", "system")];
+
+        let resolved = resolve_for(
+            &catalog,
+            &attachments,
+            &SkillPolicySet::default(),
+            &pioneer_agent::AgentMcpAvailability::default(),
+        )
+        .expect("a user-controlled system skill must resolve as an explicit capability");
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].definition.identity.slug, "browser");
+        assert!(matches!(
+            resolved[0].definition.identity.source_kind,
+            SkillSourceKind::System
+        ));
+        assert!(matches!(
+            resolved[0].reason,
+            pioneer_skills::SkillResolvedReason::ExplicitCapability
+        ));
+    }
+
+    #[test]
     fn cli_runtime_skill_resolver_rejects_mismatch_disabled_and_missing() {
         let catalog = SkillCatalogSnapshot {
             version: 1,

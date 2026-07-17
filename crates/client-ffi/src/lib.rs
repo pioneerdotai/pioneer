@@ -2005,6 +2005,43 @@ mod tests {
         assert!(visibility.mcp);
         assert!(visibility.any);
 
+        let skill_rows = runtime
+            .composer_skill_rows_for_target(
+                serde_json::json!({
+                    "target": {
+                        "kind": "native",
+                        "supports_skills": true,
+                        "supports_mcp_tools": true
+                    },
+                    "rows": [
+                        {
+                            "key": "skill:system:browser",
+                            "label": "Browser",
+                            "description": "User-controlled bundled browser",
+                            "slug": "browser",
+                            "source_kind": "system",
+                            "selectable": true,
+                            "unavailable_reason": null
+                        },
+                        {
+                            "key": "skill:user:writer",
+                            "label": "Writer",
+                            "description": "User-installed writer",
+                            "slug": "writer",
+                            "source_kind": "user",
+                            "selectable": true,
+                            "unavailable_reason": null
+                        }
+                    ]
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("skill picker rows");
+        assert_eq!(skill_rows.len(), 2);
+        assert_eq!(skill_rows[0].key, "skill:system:browser");
+        assert_eq!(skill_rows[1].key, "skill:user:writer");
+
         let capabilities = serde_json::json!([
             {
                 "id": "mcp-server:workspace:appstoreconnect",
@@ -2017,11 +2054,11 @@ mod tests {
                 }
             },
             {
-                "id": "skill:system:memory",
-                "label": "memory",
+                "id": "skill:system:browser",
+                "label": "browser",
                 "kind": {
                     "Skill": {
-                        "slug": "memory",
+                        "slug": "browser",
                         "source_kind": "system"
                     }
                 }
@@ -2054,12 +2091,13 @@ mod tests {
 
         assert_eq!(text.capabilities, voice.capabilities);
         assert_eq!(text.removed, voice.removed);
-        assert_eq!(text.capabilities.len(), 1);
+        assert_eq!(text.capabilities.len(), 2);
         assert_eq!(
             text.capabilities[0].id,
             "mcp-server:workspace:appstoreconnect"
         );
-        assert_eq!(text.removed.len(), 1);
+        assert_eq!(text.capabilities[1].id, "skill:system:browser");
+        assert!(text.removed.is_empty());
         assert!(text.has_composer_payload);
         assert!(voice.has_composer_payload);
     }
