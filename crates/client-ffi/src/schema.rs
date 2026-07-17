@@ -120,6 +120,30 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             crate::composer::ClientComposerCapabilitiesUpdateRequest
         ),
         schema_doc!(
+            "client_composer_capability_target_request.json",
+            crate::composer::ClientComposerCapabilityTargetRequest
+        ),
+        schema_doc!(
+            "client_composer_capability_menu_visibility_request.json",
+            crate::composer::ClientComposerCapabilityMenuVisibilityRequest
+        ),
+        schema_doc!(
+            "client_composer_submission_plan_request.json",
+            crate::composer::ClientComposerSubmissionPlanRequest
+        ),
+        schema_doc!(
+            "client_composer_domain_transition_request.json",
+            crate::composer::ClientComposerDomainTransitionRequest
+        ),
+        schema_doc!(
+            "client_composer_draft_lifecycle_transition_request.json",
+            crate::composer::ClientComposerDraftLifecycleTransitionRequest
+        ),
+        schema_doc!(
+            "client_composer_skill_rows_for_target_request.json",
+            crate::composer::ClientComposerSkillRowsForTargetRequest
+        ),
+        schema_doc!(
             "client_composer_filter_mcp_rows_request.json",
             crate::composer::ClientComposerFilterMcpRowsRequest
         ),
@@ -174,6 +198,30 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "client_gateway_connect_result.json",
             crate::contracts::ClientGatewayConnectResult
+        ),
+        schema_doc!(
+            "client_gateway_settings_get_request.json",
+            crate::contracts::ClientGatewaySettingsGetRequest
+        ),
+        schema_doc!(
+            "client_gateway_settings_update_request.json",
+            crate::contracts::ClientGatewaySettingsUpdateRequest
+        ),
+        schema_doc!(
+            "gateway_settings_get_response.json",
+            pioneer_protocol::GatewaySettingsGetResponse
+        ),
+        schema_doc!(
+            "gateway_settings_update_response.json",
+            pioneer_protocol::GatewaySettingsUpdateResponse
+        ),
+        schema_doc!(
+            "client_voice_input_plan_request.json",
+            crate::contracts::ClientVoiceInputPlanRequest
+        ),
+        schema_doc!(
+            "client_voice_input_plan_result.json",
+            crate::contracts::ClientVoiceInputPlanResult
         ),
         schema_doc!(
             "client_gateway_ws_timings.json",

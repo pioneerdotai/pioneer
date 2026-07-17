@@ -142,11 +142,55 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             crate::composer::capabilities::ComposerCapabilityKind
         ),
         schema_doc!(
+            "composer_capability_target.json",
+            crate::composer::capabilities::ComposerCapabilityTarget
+        ),
+        schema_doc!(
+            "composer_capability_menu_visibility.json",
+            crate::composer::capabilities::ComposerCapabilityMenuVisibility
+        ),
+        schema_doc!(
+            "composer_capability_presentation.json",
+            crate::composer::capabilities::ComposerCapabilityPresentation
+        ),
+        schema_doc!(
+            "composer_submission_plan.json",
+            crate::composer::capabilities::ComposerSubmissionPlan
+        ),
+        schema_doc!(
+            "composer_domain_state.json",
+            crate::composer::state_machine::ComposerDomainState
+        ),
+        schema_doc!(
+            "composer_domain_action.json",
+            crate::composer::state_machine::ComposerDomainAction
+        ),
+        schema_doc!(
+            "composer_domain_transition.json",
+            crate::composer::state_machine::ComposerDomainTransition
+        ),
+        schema_doc!(
             "composer_draft.json",
             crate::composer::draft::ComposerDraft<
                 crate::composer::attachments::ComposerAttachment,
                 crate::composer::capabilities::ComposerCapability,
             >
+        ),
+        schema_doc!(
+            "composer_domain_draft.json",
+            crate::composer::draft::ComposerDomainDraft
+        ),
+        schema_doc!(
+            "composer_draft_lifecycle_state.json",
+            crate::composer::draft::ComposerDraftLifecycleState
+        ),
+        schema_doc!(
+            "composer_draft_lifecycle_action.json",
+            crate::composer::draft::ComposerDraftLifecycleAction
+        ),
+        schema_doc!(
+            "composer_draft_lifecycle_transition.json",
+            crate::composer::draft::ComposerDraftLifecycleTransition
         ),
         schema_doc!(
             "composer_permission_mode_option.json",
@@ -251,6 +295,30 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "gateway_settings_update_plan.json",
             crate::settings::gateway::GatewaySettingsUpdatePlan
+        ),
+        schema_doc!(
+            "voice_input_runtime_presentation.json",
+            crate::settings::voice::VoiceInputRuntimePresentation
+        ),
+        schema_doc!(
+            "voice_input_settings_action.json",
+            crate::settings::voice::VoiceInputSettingsAction
+        ),
+        schema_doc!(
+            "voice_input_settings_plan.json",
+            crate::settings::voice::VoiceInputSettingsPlan
+        ),
+        schema_doc!(
+            "voice_input_settings_plan_rejection.json",
+            crate::settings::voice::VoiceInputSettingsPlanRejection
+        ),
+        schema_doc!(
+            "voice_input_settings_plan_request.json",
+            crate::settings::voice::VoiceInputSettingsPlanRequest
+        ),
+        schema_doc!(
+            "voice_input_status_reduction.json",
+            crate::settings::voice::VoiceInputStatusReduction
         ),
         schema_doc!(
             "gateway_status_endpoint.json",

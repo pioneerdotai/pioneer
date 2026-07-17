@@ -27,31 +27,40 @@ use active_thread::{
 };
 use composer::{
     ClientComposerAttachmentFromPathRequest, ClientComposerAttachmentsUpdateRequest,
-    ClientComposerCapabilitiesUpdateRequest, ClientComposerFilterMcpRowsRequest,
+    ClientComposerCapabilitiesUpdateRequest, ClientComposerCapabilityMenuVisibilityRequest,
+    ClientComposerCapabilityTargetRequest, ClientComposerDomainTransitionRequest,
+    ClientComposerDraftLifecycleTransitionRequest, ClientComposerFilterMcpRowsRequest,
     ClientComposerFilterMcpRowsResult, ClientComposerFilterSkillRowsRequest,
     ClientComposerMcpCapabilityFromRowRequest, ClientComposerMcpPickerRowsRequest,
     ClientComposerMcpPickerRowsResult, ClientComposerMcpToggleRequest,
     ClientComposerMcpToggleResult, ClientComposerSkillCapabilityFromRowRequest,
-    ClientComposerSkillPickerRowsRequest, ClientComposerSkillToggleRequest,
-    ClientComposerSkillToggleResult, composer_attachment_from_path_request,
-    composer_mcp_picker_rows, composer_skill_picker_rows, filter_mcp_picker_rows,
+    ClientComposerSkillPickerRowsRequest, ClientComposerSkillRowsForTargetRequest,
+    ClientComposerSkillToggleRequest, ClientComposerSkillToggleResult,
+    ClientComposerSubmissionPlanRequest, composer_attachment_from_path_request,
+    composer_capability_menu, composer_capability_target, composer_domain_transition,
+    composer_draft_lifecycle_transition, composer_mcp_picker_rows, composer_skill_picker_rows,
+    composer_skill_rows_for_target, composer_submission_plan, filter_mcp_picker_rows,
     filter_skill_picker_rows, mcp_capability_from_row, skill_capability_from_row,
     toggle_mcp_picker_selection, toggle_skill_picker_selection, update_composer_attachments,
     update_composer_capabilities,
 };
 use contracts::{
     ClientEvent, ClientGatewayConnectRequest, ClientGatewayConnectResult,
+    ClientGatewaySettingsGetRequest, ClientGatewaySettingsUpdateRequest,
+    ClientVoiceInputPlanRequest, ClientVoiceInputPlanResult,
     reduce_gateway_ws_events_to_client_events,
 };
 use diagnostics::{ClientDiagnosticEvent, ClientFfiDiagnostics};
 use gateway::{
     AddAndActivateRemoteGatewayRegistryPlan, AddRemoteGatewayPlan, PlanActivateGatewayRequest,
     PlanAddRemoteGatewayRequest, PlanDeleteRemoteGatewayRequest, PlanSetGatewayWorkspaceRequest,
-    PlanUpdateRemoteGatewayRequest, RemoteGatewayValidationRequest,
+    PlanUpdateRemoteGatewayRequest, RemoteGatewayValidationRequest, gateway_settings_error_code,
+    gateway_settings_get_for_bridge, gateway_settings_update_for_bridge,
     plan_activate_gateway_registry_request, plan_add_and_activate_remote_gateway_registry_request,
     plan_add_remote_gateway_request, plan_delete_remote_gateway_registry_request,
     plan_set_gateway_workspace_registry_request, plan_update_remote_gateway_registry_request,
-    validate_remote_gateway_request,
+    provider_list_transcription_models_for_bridge, validate_remote_gateway_request,
+    voice_input_plan_for_bridge,
 };
 use pending_requests::{
     ClientPendingRequestPresentationRequest, ClientPendingRequestPresentationResult,
@@ -378,6 +387,93 @@ impl ClientFfiRuntime {
         Ok(ClientFfiGatewayDisconnectResult { disconnected: true })
     }
 
+    fn gateway_settings_get(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_protocol::GatewaySettingsGetResponse, ClientFfiError> {
+        let request = serde_json::from_str::<ClientGatewaySettingsGetRequest>(input_json).map_err(
+            |error| {
+                ClientFfiError::new(
+                    format!("invalid gateway settings get request: {error}"),
+                    gateway::INVALID_GATEWAY_SETTINGS_REQUEST_CODE,
+                )
+            },
+        )?;
+        self.require_initialized_and_connected()?;
+
+        gateway_settings_get_for_bridge(&self.client_runtime.ws_command_sender(), request).map_err(
+            |error| {
+                let message = format!("{error:#}");
+                ClientFfiError::new(
+                    message.clone(),
+                    gateway_settings_error_code(message.as_str()),
+                )
+            },
+        )
+    }
+
+    fn gateway_settings_update(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_protocol::GatewaySettingsUpdateResponse, ClientFfiError> {
+        let request = serde_json::from_str::<ClientGatewaySettingsUpdateRequest>(input_json)
+            .map_err(|error| {
+                ClientFfiError::new(
+                    format!("invalid gateway settings update request: {error}"),
+                    gateway::INVALID_GATEWAY_SETTINGS_REQUEST_CODE,
+                )
+            })?;
+        self.require_initialized_and_connected()?;
+
+        gateway_settings_update_for_bridge(&self.client_runtime.ws_command_sender(), request)
+            .map_err(|error| {
+                let message = format!("{error:#}");
+                ClientFfiError::new(
+                    message.clone(),
+                    gateway_settings_error_code(message.as_str()),
+                )
+            })
+    }
+
+    fn require_initialized_and_connected(&self) -> Result<u64, ClientFfiError> {
+        self.require_initialized()?;
+
+        self.active_connection_id
+            .lock()
+            .map_err(|_| {
+                ClientFfiError::new(
+                    "client ffi connection lock is poisoned",
+                    ClientFfiError::GENERIC_CODE,
+                )
+            })?
+            .ok_or_else(|| {
+                ClientFfiError::new(
+                    "no active Gateway connection",
+                    gateway::GATEWAY_DISCONNECTED_CODE,
+                )
+            })
+    }
+
+    fn require_initialized(&self) -> Result<(), ClientFfiError> {
+        let initialized = self
+            .config
+            .lock()
+            .map_err(|_| {
+                ClientFfiError::new(
+                    "client ffi config lock is poisoned",
+                    ClientFfiError::GENERIC_CODE,
+                )
+            })?
+            .is_some();
+        if !initialized {
+            return Err(ClientFfiError::new(
+                "client ffi is not initialized",
+                gateway::CLIENT_NOT_INITIALIZED_CODE,
+            ));
+        }
+        Ok(())
+    }
+
     fn workspace_bootstrap(
         &self,
         input_json: &str,
@@ -651,6 +747,42 @@ impl ClientFfiRuntime {
             .map_err(|error| format!("{error:#}"))
     }
 
+    fn provider_list_transcription_models(
+        &self,
+        input_json: &str,
+    ) -> Result<ProviderListModelsResponse, ClientFfiError> {
+        let params =
+            serde_json::from_str::<ProviderListModelsParams>(input_json).map_err(|error| {
+                ClientFfiError::new(
+                    format!("invalid provider transcription models params: {error}"),
+                    gateway::INVALID_TRANSCRIPTION_MODELS_REQUEST_CODE,
+                )
+            })?;
+        self.require_initialized_and_connected()?;
+
+        provider_list_transcription_models_for_bridge(
+            &self.client_runtime.ws_command_sender(),
+            params,
+        )
+        .map_err(|error| ClientFfiError::new(format!("{error:#}"), ClientFfiError::GENERIC_CODE))
+    }
+
+    fn voice_input_settings_plan(
+        &self,
+        input_json: &str,
+    ) -> Result<ClientVoiceInputPlanResult, ClientFfiError> {
+        let request =
+            serde_json::from_str::<ClientVoiceInputPlanRequest>(input_json).map_err(|error| {
+                ClientFfiError::new(
+                    format!("invalid Voice Input plan request: {error}"),
+                    gateway::INVALID_VOICE_INPUT_PLAN_REQUEST_CODE,
+                )
+            })?;
+        self.require_initialized()?;
+
+        Ok(voice_input_plan_for_bridge(request))
+    }
+
     fn provider_model_display(
         &self,
         input_json: &str,
@@ -762,6 +894,74 @@ impl ClientFfiRuntime {
             .map_err(parse_error)?;
 
         Ok(update_composer_capabilities(request))
+    }
+
+    fn composer_capability_target(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_client::composer::capabilities::ComposerCapabilityTarget, String> {
+        let request = serde_json::from_str::<ClientComposerCapabilityTargetRequest>(input_json)
+            .map_err(|error| format!("invalid composer capability target request: {error}"))?;
+
+        Ok(composer_capability_target(request))
+    }
+
+    fn composer_capability_menu_visibility(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_client::composer::capabilities::ComposerCapabilityMenuVisibility, String>
+    {
+        let request =
+            serde_json::from_str::<ClientComposerCapabilityMenuVisibilityRequest>(input_json)
+                .map_err(|error| {
+                    format!("invalid composer capability menu visibility request: {error}")
+                })?;
+
+        Ok(composer_capability_menu(request))
+    }
+
+    fn composer_submission_plan(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_client::composer::capabilities::ComposerSubmissionPlan, String> {
+        let request = serde_json::from_str::<ClientComposerSubmissionPlanRequest>(input_json)
+            .map_err(|error| format!("invalid composer submission plan request: {error}"))?;
+
+        Ok(composer_submission_plan(request))
+    }
+
+    fn composer_domain_transition(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_client::composer::state_machine::ComposerDomainTransition, String> {
+        let request = serde_json::from_str::<ClientComposerDomainTransitionRequest>(input_json)
+            .map_err(|error| format!("invalid composer domain transition request: {error}"))?;
+
+        Ok(composer_domain_transition(request))
+    }
+
+    fn composer_draft_lifecycle_transition(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_client::composer::draft::ComposerDraftLifecycleTransition, String> {
+        let request =
+            serde_json::from_str::<ClientComposerDraftLifecycleTransitionRequest>(input_json)
+                .map_err(|error| {
+                    format!("invalid composer draft lifecycle transition request: {error}")
+                })?;
+
+        Ok(composer_draft_lifecycle_transition(request))
+    }
+
+    fn composer_skill_rows_for_target(
+        &self,
+        input_json: &str,
+    ) -> Result<Vec<pioneer_client::composer::capabilities::SelectableSkillCapability>, String>
+    {
+        let request = serde_json::from_str::<ClientComposerSkillRowsForTargetRequest>(input_json)
+            .map_err(|error| format!("invalid composer skill target request: {error}"))?;
+
+        Ok(composer_skill_rows_for_target(request))
     }
 
     fn composer_skill_capability_from_row(
@@ -1251,6 +1451,14 @@ ffi_client_json_method!(
     gateway_plan_set_workspace_registry
 );
 ffi_client_json_method!(pioneer_client_ffi_gateway_connect, gateway_connect);
+ffi_client_json_typed_method!(
+    pioneer_client_ffi_gateway_settings_get,
+    gateway_settings_get
+);
+ffi_client_json_typed_method!(
+    pioneer_client_ffi_gateway_settings_update,
+    gateway_settings_update
+);
 ffi_client_json_method!(pioneer_client_ffi_workspace_bootstrap, workspace_bootstrap);
 ffi_client_json_method!(pioneer_client_ffi_workspace_switch, workspace_switch);
 ffi_client_json_method!(pioneer_client_ffi_workspace_create, workspace_create);
@@ -1341,6 +1549,14 @@ ffi_client_json_method!(
     pioneer_client_ffi_provider_list_models,
     provider_list_models
 );
+ffi_client_json_typed_method!(
+    pioneer_client_ffi_provider_list_transcription_models,
+    provider_list_transcription_models
+);
+ffi_client_json_typed_method!(
+    pioneer_client_ffi_voice_input_settings_plan,
+    voice_input_settings_plan
+);
 ffi_client_json_method!(
     pioneer_client_ffi_provider_model_display,
     provider_model_display
@@ -1376,6 +1592,30 @@ ffi_client_json_method!(
 ffi_client_json_method!(
     pioneer_client_ffi_composer_capabilities_update,
     composer_capabilities_update
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_composer_capability_target,
+    composer_capability_target
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_composer_capability_menu_visibility,
+    composer_capability_menu_visibility
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_composer_submission_plan,
+    composer_submission_plan
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_composer_domain_transition,
+    composer_domain_transition
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_composer_draft_lifecycle_transition,
+    composer_draft_lifecycle_transition
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_composer_skill_rows_for_target,
+    composer_skill_rows_for_target
 );
 ffi_client_json_method!(
     pioneer_client_ffi_composer_skill_capability_from_row,
@@ -1747,6 +1987,191 @@ mod tests {
     }
 
     #[test]
+    fn composer_presentation_and_submission_contracts_cross_the_json_boundary() {
+        let runtime = ClientFfiRuntime::default();
+        let presentation_target = runtime
+            .composer_capability_target(r#"{"provider":"cli_runtime:codex","runtimes":[]}"#)
+            .expect("presentation target");
+        assert!(presentation_target.is_cli());
+        assert!(!presentation_target.policy().supports_mcp_tools);
+        let visibility = runtime
+            .composer_capability_menu_visibility(
+                serde_json::json!({ "target": presentation_target })
+                    .to_string()
+                    .as_str(),
+            )
+            .expect("menu visibility");
+        assert!(!visibility.skills);
+        assert!(!visibility.mcp);
+        assert!(!visibility.any);
+
+        let capabilities = serde_json::json!([
+            {
+                "id": "mcp-server:workspace:appstoreconnect",
+                "label": "appstoreconnect",
+                "kind": {
+                    "McpServer": {
+                        "name": "appstoreconnect",
+                        "scope_kind": "workspace"
+                    }
+                }
+            },
+            {
+                "id": "skill:system:memory",
+                "label": "memory",
+                "kind": {
+                    "Skill": {
+                        "slug": "memory",
+                        "source_kind": "system"
+                    }
+                }
+            }
+        ]);
+        let text = runtime
+            .composer_submission_plan(
+                serde_json::json!({
+                    "provider": "cli_runtime:codex",
+                    "text": "inspect releases",
+                    "has_attachments": false,
+                    "capabilities": capabilities.clone(),
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("text submission plan");
+        let voice = runtime
+            .composer_submission_plan(
+                serde_json::json!({
+                    "provider": "cli_runtime:codex",
+                    "text": "",
+                    "has_attachments": true,
+                    "capabilities": capabilities,
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("voice submission plan");
+
+        assert_eq!(text.capabilities, voice.capabilities);
+        assert_eq!(text.removed, voice.removed);
+        assert_eq!(text.capabilities.len(), 1);
+        assert_eq!(
+            text.capabilities[0].id,
+            "mcp-server:workspace:appstoreconnect"
+        );
+        assert_eq!(text.removed.len(), 1);
+        assert!(text.has_composer_payload);
+        assert!(voice.has_composer_payload);
+    }
+
+    #[test]
+    fn composer_domain_transition_crosses_the_mobile_json_boundary() {
+        let runtime = ClientFfiRuntime::default();
+        let transition = runtime
+            .composer_domain_transition(
+                serde_json::json!({
+                    "state": {
+                        "attachments": [],
+                        "capabilities": [{
+                            "id": "mcp-server:workspace:appstoreconnect",
+                            "label": "appstoreconnect",
+                            "kind": {
+                                "McpServer": {
+                                    "name": "appstoreconnect",
+                                    "scope_kind": "workspace"
+                                }
+                            }
+                        }],
+                        "selected_mode": "Agent",
+                        "mode_manually_selected": false,
+                        "selected_provider": "cli_runtime:codex",
+                        "capability_target": {
+                            "kind": "cli",
+                            "supports_skills": true,
+                            "supports_mcp_tools": true
+                        },
+                        "selected_model": "gpt-5.6-sol",
+                        "selected_reasoning_effort": null,
+                        "selected_permission_mode": "full_access",
+                        "model_manually_selected": false
+                    },
+                    "action": {
+                        "SetReasoningEffortFromUser": {
+                            "effort": " max "
+                        }
+                    }
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("composer domain transition");
+
+        assert!(transition.changed);
+        assert!(transition.model_selection_changed);
+        assert_eq!(
+            transition.state.selected_reasoning_effort.as_deref(),
+            Some("max")
+        );
+        assert!(transition.state.model_manually_selected);
+        assert_eq!(transition.state.capabilities.len(), 1);
+        assert_eq!(
+            transition.state.capabilities[0].id,
+            "mcp-server:workspace:appstoreconnect"
+        );
+    }
+
+    #[test]
+    fn composer_draft_lifecycle_crosses_the_mobile_json_boundary() {
+        let runtime = ClientFfiRuntime::default();
+        let draft = serde_json::json!({
+            "text": "inspect releases",
+            "domain": {
+                "attachments": [],
+                "capabilities": [],
+                "selected_mode": "Agent",
+                "mode_manually_selected": false,
+                "selected_provider": "cli_runtime:codex",
+                "capability_target": {
+                    "kind": "cli",
+                    "supports_skills": true,
+                    "supports_mcp_tools": true
+                },
+                "selected_model": "gpt-5.6-sol",
+                "selected_reasoning_effort": "max",
+                "selected_permission_mode": "supervised",
+                "model_manually_selected": true
+            }
+        });
+        let transition = runtime
+            .composer_draft_lifecycle_transition(
+                serde_json::json!({
+                    "state": { "drafts": {} },
+                    "action": {
+                        "SwitchThread": {
+                            "current_thread_id": null,
+                            "current_draft": null,
+                            "target_thread_id": "thread-a",
+                            "fallback": draft
+                        }
+                    }
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("composer draft lifecycle transition");
+
+        assert!(transition.changed);
+        assert_eq!(
+            transition
+                .restored_draft
+                .as_ref()
+                .map(|draft| draft.text.as_str()),
+            Some("inspect releases")
+        );
+        assert!(transition.state.drafts.contains_key("thread-a"));
+    }
+
+    #[test]
     fn gateway_validation_uses_shared_request_contract() {
         let runtime = ClientFfiRuntime::default();
         let error = runtime
@@ -1754,6 +2179,108 @@ mod tests {
             .expect_err("zero timeout should fail");
 
         assert!(error.contains("timeout must be positive"));
+    }
+
+    #[test]
+    fn gateway_settings_ffi_rejects_null_and_invalid_json_safely() {
+        let client = pioneer_client_ffi_client_create();
+        assert!(!client.is_null());
+
+        let response_ptr =
+            unsafe { pioneer_client_ffi_gateway_settings_get(client, std::ptr::null()) };
+        assert!(!response_ptr.is_null());
+        let response = unsafe { CString::from_raw(response_ptr) }
+            .into_string()
+            .expect("UTF-8 FFI response");
+        let response: serde_json::Value =
+            serde_json::from_str(response.as_str()).expect("JSON FFI response");
+        assert_eq!(response["status"], "error");
+        assert_eq!(response["code"], ClientFfiError::GENERIC_CODE);
+
+        let runtime = ClientFfiRuntime::default();
+        let error = runtime
+            .gateway_settings_update("{")
+            .expect_err("invalid settings JSON");
+        assert_eq!(error.code, gateway::INVALID_GATEWAY_SETTINGS_REQUEST_CODE);
+
+        unsafe { pioneer_client_ffi_client_destroy(client) };
+    }
+
+    #[test]
+    fn gateway_settings_ffi_requires_initialized_active_gateway() {
+        let runtime = ClientFfiRuntime::default();
+        let error = runtime
+            .gateway_settings_get("{}")
+            .expect_err("uninitialized client");
+        assert_eq!(error.code, gateway::CLIENT_NOT_INITIALIZED_CODE);
+
+        runtime.initialize("{}").expect("initialize client");
+        let error = runtime
+            .gateway_settings_get("{}")
+            .expect_err("disconnected client");
+        assert_eq!(error.code, gateway::GATEWAY_DISCONNECTED_CODE);
+    }
+
+    #[test]
+    fn gateway_settings_ffi_preserves_voice_conflict_error_code() {
+        let response = to_json_typed_response::<()>(Err(ClientFfiError::new(
+            "voice input cannot be reconfigured while a voice session is active",
+            gateway::VOICE_RECONFIGURATION_BUSY_CODE,
+        )));
+        let response: serde_json::Value =
+            serde_json::from_str(response.as_str()).expect("typed FFI response");
+
+        assert_eq!(response["status"], "error");
+        assert_eq!(response["code"], gateway::VOICE_RECONFIGURATION_BUSY_CODE);
+    }
+
+    #[test]
+    fn transcription_models_ffi_validates_input_and_active_gateway() {
+        let runtime = ClientFfiRuntime::default();
+        let error = runtime
+            .provider_list_transcription_models("{")
+            .expect_err("invalid catalog JSON");
+        assert_eq!(
+            error.code,
+            gateway::INVALID_TRANSCRIPTION_MODELS_REQUEST_CODE
+        );
+
+        runtime.initialize("{}").expect("initialize client");
+        let error = runtime
+            .provider_list_transcription_models(
+                r#"{"workspace_id":"workspace-1","provider":"local"}"#,
+            )
+            .expect_err("disconnected catalog request");
+        assert_eq!(error.code, gateway::GATEWAY_DISCONNECTED_CODE);
+    }
+
+    #[test]
+    fn voice_input_plan_ffi_is_pure_after_initialization() {
+        let runtime = ClientFfiRuntime::default();
+        let error = runtime
+            .voice_input_settings_plan(r#"{"operation":"unknown"}"#)
+            .expect_err("unknown planner operation");
+        assert_eq!(error.code, gateway::INVALID_VOICE_INPUT_PLAN_REQUEST_CODE);
+
+        runtime.initialize("{}").expect("initialize client");
+        let result = runtime
+            .voice_input_settings_plan(
+                r#"{
+                    "operation":"status_reduction",
+                    "current":{
+                        "enabled":false,
+                        "runtime":{"phase":"disabled","effective_enabled":false}
+                    }
+                }"#,
+            )
+            .expect("pure status reduction does not require a connection");
+        let ClientVoiceInputPlanResult::StatusReduction { reduction } = result else {
+            panic!("status reduction result")
+        };
+        assert_eq!(
+            reduction.presentation,
+            pioneer_client::settings::voice::VoiceInputRuntimePresentation::Disabled
+        );
     }
 
     #[test]

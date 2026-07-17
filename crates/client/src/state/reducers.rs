@@ -6,7 +6,6 @@ use crate::{
     cli_runtime::approvals::{
         PendingRequestsReduction, reduce_pending_request_thread_closed_cleanup,
     },
-    composer::{draft as composer_draft, permissions as composer_permissions},
     gateway::{runtime::ActiveGatewayState, types::GatewayEndpointKind},
     notifications::effects::ClientEffect,
     state::client_state::{ClientState, ThreadAgentsDocSummaryKey},
@@ -18,9 +17,7 @@ use crate::{
     },
     workspaces::actions as workspace_actions,
 };
-use pioneer_protocol::{
-    Thread, ThreadAgentsDocSummary, ThreadFolder, ThreadPlacement, TurnPermissionMode, Workspace,
-};
+use pioneer_protocol::{Thread, ThreadAgentsDocSummary, ThreadFolder, ThreadPlacement, Workspace};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 pub fn set_active_thread_id(state: &mut ClientState, thread_id: Option<String>) -> bool {
@@ -157,14 +154,10 @@ pub fn clear_thread_pending_requests(
     )
 }
 
-pub fn remove_thread_scoped_entries<AttachmentDraft, CapabilityDraft>(
+pub fn remove_thread_scoped_entries(
     thread_id: &str,
     draft_thread_id: &mut Option<String>,
     coordinators: &mut HashMap<String, ThreadCoordinator>,
-    thread_drafts: &mut HashMap<String, String>,
-    thread_draft_attachments: &mut HashMap<String, AttachmentDraft>,
-    thread_draft_capabilities: &mut HashMap<String, CapabilityDraft>,
-    thread_draft_permission_modes: &mut HashMap<String, TurnPermissionMode>,
     thread_placements: &mut HashMap<String, ThreadPlacement>,
 ) -> bool {
     let cleared_draft = if draft_thread_id.as_deref() == Some(thread_id) {
@@ -174,30 +167,14 @@ pub fn remove_thread_scoped_entries<AttachmentDraft, CapabilityDraft>(
         false
     };
     coordinators.remove(thread_id);
-    thread_drafts.remove(thread_id);
-    thread_draft_attachments.remove(thread_id);
-    thread_draft_capabilities.remove(thread_id);
-    thread_draft_permission_modes.remove(thread_id);
     thread_placements.remove(thread_id);
     cleared_draft
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn clear_thread_client_state<Attachment, Capability>(
+pub fn clear_thread_client_state(
     draft_thread_id: &mut Option<String>,
     coordinators: &mut HashMap<String, ThreadCoordinator>,
-    thread_drafts: &mut HashMap<String, String>,
-    thread_draft_attachments: &mut HashMap<String, Vec<Attachment>>,
-    thread_draft_capabilities: &mut HashMap<String, Vec<Capability>>,
-    thread_draft_permission_modes: &mut HashMap<String, TurnPermissionMode>,
-    composer_attachments: &mut Vec<Attachment>,
-    composer_capabilities: &mut Vec<Capability>,
-    composer_permission_mode: &mut TurnPermissionMode,
-    composer_upload_in_progress: &mut bool,
-    composer_upload_error: &mut Option<String>,
-    composer_selected_provider: &mut Option<String>,
-    composer_selected_model: &mut Option<String>,
-    composer_model_selection_manually_selected: &mut bool,
     thread_folders: &mut HashMap<String, ThreadFolder>,
     thread_placements: &mut HashMap<String, ThreadPlacement>,
     thread_agents_doc_summaries: &mut HashMap<ThreadAgentsDocSummaryKey, ThreadAgentsDocSummary>,
@@ -206,20 +183,6 @@ pub fn clear_thread_client_state<Attachment, Capability>(
 ) {
     *draft_thread_id = None;
     coordinators.clear();
-    composer_draft::clear_all_composer_drafts(
-        thread_drafts,
-        thread_draft_attachments,
-        thread_draft_capabilities,
-        thread_draft_permission_modes,
-    );
-    composer_attachments.clear();
-    composer_capabilities.clear();
-    *composer_permission_mode = composer_permissions::default_composer_permission_mode();
-    *composer_upload_in_progress = false;
-    *composer_upload_error = None;
-    *composer_selected_provider = None;
-    *composer_selected_model = None;
-    *composer_model_selection_manually_selected = false;
     thread_folders.clear();
     thread_placements.clear();
     thread_agents_doc_summaries.clear();
@@ -918,27 +881,12 @@ mod tests {
     }
 
     #[test]
-    fn clear_thread_client_state_clears_thread_composer_and_selection_state() {
+    fn clear_thread_client_state_clears_thread_scoped_state() {
         let mut draft_thread_id = Some("thread_a".to_owned());
         let mut coordinators = HashMap::from([(
             "thread_a".to_owned(),
             ThreadCoordinator::new(thread("thread_a", "ws", 1)),
         )]);
-        let mut thread_drafts = HashMap::from([("thread_a".to_owned(), "draft".to_owned())]);
-        let mut thread_draft_attachments =
-            HashMap::from([("thread_a".to_owned(), vec!["attachment".to_owned()])]);
-        let mut thread_draft_capabilities =
-            HashMap::from([("thread_a".to_owned(), vec!["skill".to_owned()])]);
-        let mut thread_draft_permission_modes =
-            HashMap::from([("thread_a".to_owned(), TurnPermissionMode::Supervised)]);
-        let mut composer_attachments = vec!["active-attachment".to_owned()];
-        let mut composer_capabilities = vec!["active-skill".to_owned()];
-        let mut composer_permission_mode = TurnPermissionMode::Supervised;
-        let mut composer_upload_in_progress = true;
-        let mut composer_upload_error = Some("failed".to_owned());
-        let mut composer_selected_provider = Some("openai".to_owned());
-        let mut composer_selected_model = Some("gpt-5.4".to_owned());
-        let mut composer_model_selection_manually_selected = true;
         let mut thread_folders = HashMap::from([(
             "folder_a".to_owned(),
             ThreadFolder {
@@ -976,18 +924,6 @@ mod tests {
         clear_thread_client_state(
             &mut draft_thread_id,
             &mut coordinators,
-            &mut thread_drafts,
-            &mut thread_draft_attachments,
-            &mut thread_draft_capabilities,
-            &mut thread_draft_permission_modes,
-            &mut composer_attachments,
-            &mut composer_capabilities,
-            &mut composer_permission_mode,
-            &mut composer_upload_in_progress,
-            &mut composer_upload_error,
-            &mut composer_selected_provider,
-            &mut composer_selected_model,
-            &mut composer_model_selection_manually_selected,
             &mut thread_folders,
             &mut thread_placements,
             &mut thread_agents_doc_summaries,
@@ -997,18 +933,6 @@ mod tests {
 
         assert!(draft_thread_id.is_none());
         assert!(coordinators.is_empty());
-        assert!(thread_drafts.is_empty());
-        assert!(thread_draft_attachments.is_empty());
-        assert!(thread_draft_capabilities.is_empty());
-        assert!(thread_draft_permission_modes.is_empty());
-        assert!(composer_attachments.is_empty());
-        assert!(composer_capabilities.is_empty());
-        assert_eq!(composer_permission_mode, TurnPermissionMode::FullAccess);
-        assert!(!composer_upload_in_progress);
-        assert!(composer_upload_error.is_none());
-        assert!(composer_selected_provider.is_none());
-        assert!(composer_selected_model.is_none());
-        assert!(!composer_model_selection_manually_selected);
         assert!(thread_folders.is_empty());
         assert!(thread_placements.is_empty());
         assert!(thread_agents_doc_summaries.is_empty());
@@ -1186,7 +1110,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_thread_scoped_entries_clears_only_target_thread() {
+    fn remove_thread_scoped_entries_clears_only_target_thread_state() {
         let mut draft_thread_id = Some("thread_a".to_owned());
         let mut coordinators = HashMap::from([
             (
@@ -1197,22 +1121,6 @@ mod tests {
                 "thread_b".to_owned(),
                 ThreadCoordinator::new(thread("thread_b", "ws", 2)),
             ),
-        ]);
-        let mut drafts = HashMap::from([
-            ("thread_a".to_owned(), "draft a".to_owned()),
-            ("thread_b".to_owned(), "draft b".to_owned()),
-        ]);
-        let mut attachments = HashMap::from([
-            ("thread_a".to_owned(), vec!["a"]),
-            ("thread_b".to_owned(), vec!["b"]),
-        ]);
-        let mut capabilities = HashMap::from([
-            ("thread_a".to_owned(), vec!["a"]),
-            ("thread_b".to_owned(), vec!["b"]),
-        ]);
-        let mut permission_modes = HashMap::from([
-            ("thread_a".to_owned(), TurnPermissionMode::Supervised),
-            ("thread_b".to_owned(), TurnPermissionMode::AutoAcceptEdits),
         ]);
         let mut placements = HashMap::from([
             (
@@ -1236,21 +1144,14 @@ mod tests {
             "thread_a",
             &mut draft_thread_id,
             &mut coordinators,
-            &mut drafts,
-            &mut attachments,
-            &mut capabilities,
-            &mut permission_modes,
             &mut placements,
         ));
 
         assert!(draft_thread_id.is_none());
         assert!(!coordinators.contains_key("thread_a"));
         assert!(coordinators.contains_key("thread_b"));
-        assert!(!permission_modes.contains_key("thread_a"));
-        assert_eq!(
-            permission_modes.get("thread_b").copied(),
-            Some(TurnPermissionMode::AutoAcceptEdits)
-        );
+        assert!(!placements.contains_key("thread_a"));
+        assert!(placements.contains_key("thread_b"));
     }
 
     #[test]

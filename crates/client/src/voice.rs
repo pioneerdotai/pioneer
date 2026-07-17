@@ -48,6 +48,7 @@ pub fn reduce_voice_session_finalize_response(
                 VoiceFinalizeUiAction::KeepFinalizing
             }
             VoiceStatus::Ready
+            | VoiceStatus::Disabled
             | VoiceStatus::Unavailable
             | VoiceStatus::ModelDownloading
             | VoiceStatus::ModelLoading

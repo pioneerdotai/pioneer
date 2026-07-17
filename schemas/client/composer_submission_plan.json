@@ -1,0 +1,192 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ComposerSubmissionPlan",
+  "type": "object",
+  "properties": {
+    "capabilities": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ComposerCapability"
+      }
+    },
+    "has_composer_payload": {
+      "type": "boolean"
+    },
+    "removed": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/RemovedComposerCapability"
+      }
+    },
+    "target": {
+      "$ref": "#/$defs/ComposerCapabilityTarget"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "target",
+    "capabilities",
+    "removed",
+    "has_composer_payload"
+  ],
+  "$defs": {
+    "ComposerCapability": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ComposerCapabilityKind"
+        },
+        "label": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "kind"
+      ]
+    },
+    "ComposerCapabilityKind": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "Skill": {
+              "type": "object",
+              "properties": {
+                "slug": {
+                  "type": "string"
+                },
+                "source_kind": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "slug",
+                "source_kind"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Skill"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "McpServer": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "scope_kind": {
+                  "$ref": "#/$defs/McpScopeKind"
+                }
+              },
+              "required": [
+                "name",
+                "scope_kind"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "McpServer"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "McpTool": {
+              "type": "object",
+              "properties": {
+                "raw_tool_name": {
+                  "type": "string"
+                },
+                "scope_kind": {
+                  "$ref": "#/$defs/McpScopeKind"
+                },
+                "server_name": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "server_name",
+                "raw_tool_name",
+                "scope_kind"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "McpTool"
+          ]
+        }
+      ]
+    },
+    "ComposerCapabilityRemovalReason": {
+      "type": "string",
+      "enum": [
+        "skills_unsupported",
+        "skill_source_not_exportable",
+        "mcp_tools_unsupported"
+      ]
+    },
+    "ComposerCapabilityTarget": {
+      "description": "Capability eligibility context.\n\nThe target kind exists only because native skills retain their current\nsource policy while CLI skills must be exportable. Capability support is\nrepresented exclusively by [`ComposerCapabilityPolicy`].",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/ComposerCapabilityTargetKind"
+        },
+        "supports_mcp_tools": {
+          "type": "boolean"
+        },
+        "supports_skills": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "supports_skills",
+        "supports_mcp_tools"
+      ]
+    },
+    "ComposerCapabilityTargetKind": {
+      "type": "string",
+      "enum": [
+        "native",
+        "cli"
+      ]
+    },
+    "McpScopeKind": {
+      "type": "string",
+      "enum": [
+        "workspace",
+        "user"
+      ]
+    },
+    "RemovedComposerCapability": {
+      "type": "object",
+      "properties": {
+        "capability": {
+          "$ref": "#/$defs/ComposerCapability"
+        },
+        "reason": {
+          "$ref": "#/$defs/ComposerCapabilityRemovalReason"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "capability",
+        "reason"
+      ]
+    }
+  }
+}

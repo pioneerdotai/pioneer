@@ -1,8 +1,107 @@
 //! Composer draft state.
 
-use crate::composer::permissions::default_composer_permission_mode;
+use crate::composer::{
+    permissions::default_composer_permission_mode, state_machine::ComposerDomainState,
+};
 use pioneer_protocol::TurnPermissionMode;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+
+/// Complete, shell-neutral draft payload used by desktop and mobile.
+///
+/// Hot editor state (cursor, IME composition, focus, keyboard, sheets) is not
+/// part of this value. A shell snapshots its text only at lifecycle boundaries
+/// such as switching threads.
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ComposerDomainDraft {
+    #[serde(default)]
+    pub text: String,
+    pub domain: ComposerDomainState,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ComposerDraftLifecycleState {
+    #[serde(default)]
+    pub drafts: BTreeMap<String, ComposerDomainDraft>,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum ComposerDraftLifecycleAction {
+    SwitchThread {
+        #[serde(default)]
+        current_thread_id: Option<String>,
+        #[serde(default)]
+        current_draft: Option<ComposerDomainDraft>,
+        target_thread_id: String,
+        fallback: ComposerDomainDraft,
+    },
+    RememberThread {
+        thread_id: String,
+        draft: ComposerDomainDraft,
+    },
+    ClearThread {
+        thread_id: String,
+    },
+    ClearAll,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ComposerDraftLifecycleTransition {
+    pub state: ComposerDraftLifecycleState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_draft: Option<ComposerDomainDraft>,
+    pub changed: bool,
+}
+
+pub fn reduce_composer_draft_lifecycle(
+    state: &ComposerDraftLifecycleState,
+    action: ComposerDraftLifecycleAction,
+) -> ComposerDraftLifecycleTransition {
+    let mut next = state.clone();
+    let restored_draft = match action {
+        ComposerDraftLifecycleAction::SwitchThread {
+            current_thread_id,
+            current_draft,
+            target_thread_id,
+            fallback,
+        } => {
+            if let (Some(thread_id), Some(draft)) = (current_thread_id, current_draft) {
+                next.drafts.insert(thread_id, draft);
+            }
+            let draft = next
+                .drafts
+                .entry(target_thread_id)
+                .or_insert(fallback)
+                .clone();
+            Some(draft)
+        }
+        ComposerDraftLifecycleAction::RememberThread { thread_id, draft } => {
+            next.drafts.insert(thread_id, draft);
+            None
+        }
+        ComposerDraftLifecycleAction::ClearThread { thread_id } => {
+            next.drafts.remove(thread_id.as_str());
+            None
+        }
+        ComposerDraftLifecycleAction::ClearAll => {
+            next.drafts.clear();
+            None
+        }
+    };
+    let changed = next != *state;
+
+    ComposerDraftLifecycleTransition {
+        state: next,
+        restored_draft,
+        changed,
+    }
+}
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -223,5 +322,58 @@ mod tests {
         );
         assert!(missing.is_empty());
         assert_eq!(missing.permission_mode, TurnPermissionMode::FullAccess);
+    }
+
+    #[test]
+    fn lifecycle_switch_remembers_current_and_restores_target_domain() {
+        let mut current = ComposerDomainDraft {
+            text: "first".to_owned(),
+            domain: ComposerDomainState::default(),
+        };
+        current.domain.model_manually_selected = true;
+        current.domain.selected_model = Some("gpt-5".to_owned());
+        let mut fallback = ComposerDomainDraft {
+            text: "second".to_owned(),
+            domain: ComposerDomainState::default(),
+        };
+        fallback.domain.selected_permission_mode = TurnPermissionMode::Supervised;
+
+        let switched = reduce_composer_draft_lifecycle(
+            &ComposerDraftLifecycleState::default(),
+            ComposerDraftLifecycleAction::SwitchThread {
+                current_thread_id: Some("thread-a".to_owned()),
+                current_draft: Some(current.clone()),
+                target_thread_id: "thread-b".to_owned(),
+                fallback: fallback.clone(),
+            },
+        );
+
+        assert_eq!(switched.state.drafts.get("thread-a"), Some(&current));
+        assert_eq!(switched.state.drafts.get("thread-b"), Some(&fallback));
+        assert_eq!(switched.restored_draft, Some(fallback));
+    }
+
+    #[test]
+    fn lifecycle_clear_thread_does_not_touch_other_drafts() {
+        let draft = ComposerDomainDraft {
+            text: "draft".to_owned(),
+            domain: ComposerDomainState::default(),
+        };
+        let state = ComposerDraftLifecycleState {
+            drafts: BTreeMap::from([
+                ("thread-a".to_owned(), draft.clone()),
+                ("thread-b".to_owned(), draft),
+            ]),
+        };
+
+        let cleared = reduce_composer_draft_lifecycle(
+            &state,
+            ComposerDraftLifecycleAction::ClearThread {
+                thread_id: "thread-a".to_owned(),
+            },
+        );
+
+        assert!(!cleared.state.drafts.contains_key("thread-a"));
+        assert!(cleared.state.drafts.contains_key("thread-b"));
     }
 }

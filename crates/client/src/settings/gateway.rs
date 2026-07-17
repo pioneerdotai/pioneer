@@ -212,6 +212,7 @@ pub fn keepawake_update_plan(
             thread_episodic: None,
             cli_runtimes: None,
             remote_access: None,
+            voice_input: None,
         },
     })
 }
@@ -234,6 +235,7 @@ pub fn preflight_model_update_plan(
             thread_episodic: None,
             cli_runtimes: None,
             remote_access: None,
+            voice_input: None,
         },
     })
 }
@@ -253,6 +255,7 @@ pub fn thread_episodic_enabled_update_plan(
             thread_episodic: Some(GatewayThreadEpisodicSettingsUpdate::enabled(enabled)),
             cli_runtimes: None,
             remote_access: None,
+            voice_input: None,
         },
     })
 }
@@ -304,6 +307,7 @@ pub fn thread_episodic_vector_search_update_plan(
             }),
             cli_runtimes: None,
             remote_access: None,
+            voice_input: None,
         },
     })
 }
@@ -352,6 +356,7 @@ pub fn remote_access_update_plan(
                 key: normalized_key,
                 clear_key: clear_key.then_some(true),
             }),
+            voice_input: None,
         },
     })
 }
@@ -429,6 +434,7 @@ mod tests {
             thread_episodic: Default::default(),
             cli_runtimes: Default::default(),
             remote_access: Default::default(),
+            voice_input: Default::default(),
         }
     }
 

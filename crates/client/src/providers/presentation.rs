@@ -144,6 +144,52 @@ pub fn model_selector_model_secondary_text(model: &ProviderModelInfo) -> Option<
     (!id.eq_ignore_ascii_case(display_name.trim())).then(|| id.to_owned())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TranscriptionModelSelectorPresentation {
+    pub engine: String,
+    pub download_size: String,
+    pub language_summary: String,
+    pub recommended: bool,
+}
+
+pub fn transcription_model_selector_presentation(
+    model: &ProviderModelInfo,
+) -> Option<TranscriptionModelSelectorPresentation> {
+    let metadata = model.transcription.as_ref()?;
+    Some(TranscriptionModelSelectorPresentation {
+        engine: title_case_metadata_label(metadata.engine.as_str()),
+        download_size: format!("{} MB", metadata.download_size_mb),
+        language_summary: transcription_language_summary(metadata.supported_languages.as_slice()),
+        recommended: metadata.recommended,
+    })
+}
+
+fn title_case_metadata_label(value: &str) -> String {
+    value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut characters = part.chars();
+            let Some(first) = characters.next() else {
+                return String::new();
+            };
+            let mut label = first.to_uppercase().collect::<String>();
+            label.push_str(characters.as_str());
+            label
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn transcription_language_summary(languages: &[String]) -> String {
+    match languages {
+        [] => "No languages listed".to_owned(),
+        [language] => language.clone(),
+        languages if languages.len() <= 4 => languages.join(", "),
+        languages => format!("{} languages", languages.len()),
+    }
+}
+
 pub fn resolve_provider_model_display_name(
     models: &[ProviderModelInfo],
     selected_model: &str,
@@ -380,6 +426,7 @@ mod tests {
             active: Some(true),
             family: None,
             lifecycle_status: None,
+            transcription: None,
         }
     }
 
@@ -694,6 +741,46 @@ mod tests {
                 label: "Low".to_owned(),
                 selected: false,
             }]
+        );
+    }
+
+    #[test]
+    fn provider_model_selector_transcription_presents_only_typed_safe_metadata() {
+        let mut transcription_model = model("parakeet-tdt-0.6b-v3", Some("Parakeet V3"));
+        transcription_model.description = Some("Fast and accurate".to_owned());
+        transcription_model.pricing = None;
+        transcription_model.transcription =
+            Some(pioneer_protocol::ProviderTranscriptionModelMetadata {
+                engine: "moonshine_streaming".to_owned(),
+                download_size_mb: 456,
+                accuracy_score: 80,
+                speed_score: 85,
+                supports_translation: false,
+                supported_languages: (0..25).map(|index| format!("lang-{index}")).collect(),
+                supports_language_selection: false,
+                recommended: true,
+            });
+
+        assert_eq!(
+            transcription_model_selector_presentation(&transcription_model),
+            Some(TranscriptionModelSelectorPresentation {
+                engine: "Moonshine Streaming".to_owned(),
+                download_size: "456 MB".to_owned(),
+                language_summary: "25 languages".to_owned(),
+                recommended: true,
+            })
+        );
+
+        transcription_model
+            .transcription
+            .as_mut()
+            .expect("transcription metadata")
+            .supported_languages = vec!["en".to_owned(), "de".to_owned()];
+        assert_eq!(
+            transcription_model_selector_presentation(&transcription_model)
+                .expect("transcription presentation")
+                .language_summary,
+            "en, de"
         );
     }
 }

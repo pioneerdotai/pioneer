@@ -356,6 +356,16 @@
               "use_search_instructions": false
             }
           }
+        },
+        "voice_input": {
+          "$ref": "#/$defs/GatewayVoiceInputSettings",
+          "default": {
+            "enabled": false,
+            "runtime": {
+              "effective_enabled": false,
+              "phase": "disabled"
+            }
+          }
         }
       },
       "required": [
@@ -576,6 +586,98 @@
         "use_search_instructions": {
           "type": "boolean",
           "default": false
+        }
+      }
+    },
+    "GatewayVoiceInputProvider": {
+      "type": "string",
+      "enum": [
+        "local"
+      ]
+    },
+    "GatewayVoiceInputRuntimePhase": {
+      "type": "string",
+      "enum": [
+        "disabled",
+        "model_not_selected",
+        "missing",
+        "downloading",
+        "installing",
+        "loading",
+        "ready",
+        "failed"
+      ]
+    },
+    "GatewayVoiceInputRuntimeSnapshot": {
+      "type": "object",
+      "properties": {
+        "downloaded_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "effective_enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "phase": {
+          "$ref": "#/$defs/GatewayVoiceInputRuntimePhase",
+          "default": "disabled"
+        },
+        "total_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      }
+    },
+    "GatewayVoiceInputSettings": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayVoiceInputProvider"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "runtime": {
+          "$ref": "#/$defs/GatewayVoiceInputRuntimeSnapshot",
+          "default": {
+            "effective_enabled": false,
+            "phase": "disabled"
+          }
         }
       }
     }

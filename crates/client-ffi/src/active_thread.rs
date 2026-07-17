@@ -6,17 +6,13 @@ use pioneer_client::{
     cli_runtime::approvals::{PendingRequest, PendingRequestState},
     composer::{
         attachments::ComposerAttachment,
-        capabilities::{
-            ComposerCapability, ComposerCapabilityPolicyReduction, ComposerCapabilityTarget,
-            composer_capability_target_for_provider, reduce_composer_capabilities_for_target,
-        },
+        capabilities::{ComposerCapability, plan_composer_submission},
         model_selection as composer_model_selection,
         turn_prepare::{
             ComposerSubmitAvailabilityInput, PrepareComposerTurnRequest,
             PrepareVoiceComposerSnapshotRequest, PreparedComposerTurnSubmitContext,
-            PreparedVoiceComposerSnapshot, can_submit_composer_message,
-            composer_has_sendable_content, prepare_composer_turn, prepare_voice_composer_snapshot,
-            reduce_prepared_composer_turn_submit_success,
+            PreparedVoiceComposerSnapshot, can_submit_composer_message, prepare_composer_turn,
+            prepare_voice_composer_snapshot, reduce_prepared_composer_turn_submit_success,
         },
     },
     conversation::ConversationViewState,
@@ -554,18 +550,18 @@ impl ClientFfiActiveThreadState {
             Some(selection.selected_provider.as_str()),
         )?;
         let cli_runtime_selected = execution_target.execution_backend.is_some();
-        let capabilities =
-            project_active_thread_capabilities(capabilities.as_slice(), &execution_target)
-                .capabilities;
-        if !composer_has_sendable_content(
+        let submission = plan_composer_submission(
+            Some(selection.selected_provider.as_str()),
             text.as_str(),
             !attachments.is_empty(),
-            !capabilities.is_empty(),
-        ) {
+            capabilities.as_slice(),
+        );
+        if !submission.has_composer_payload {
             return Err(anyhow::anyhow!(
                 "message content is required before starting turn"
             ));
         }
+        let capabilities = submission.capabilities;
         let prepared = prepare_composer_turn(
             &runtime.ws_command_sender(),
             &ClientFfiFileSystem,
@@ -725,9 +721,13 @@ impl ClientFfiActiveThreadState {
             Some(selection.selected_provider.as_str()),
         )?;
         let cli_runtime_selected = execution_target.execution_backend.is_some();
-        let capabilities =
-            project_active_thread_capabilities(capabilities.as_slice(), &execution_target)
-                .capabilities;
+        let capabilities = plan_composer_submission(
+            Some(selection.selected_provider.as_str()),
+            "",
+            !attachments.is_empty(),
+            capabilities.as_slice(),
+        )
+        .capabilities;
         let turn_model_provider = if cli_runtime_selected {
             None
         } else {
@@ -1100,6 +1100,7 @@ impl ClientFfiActiveThreadState {
             | ClientRuntimeNotification::CLIRuntimeRefresh(_)
             | ClientRuntimeNotification::GatewayRemoteAccessStatusChanged(_)
             | ClientRuntimeNotification::GatewayThreadEpisodicVectorRefillStatusChanged(_)
+            | ClientRuntimeNotification::GatewayVoiceInputStatusChanged(_)
             | ClientRuntimeNotification::VoiceSessionResult(_)
             | ClientRuntimeNotification::WorkspaceChanged { .. } => {
                 SemanticTimelineCachePatch::default()
@@ -1402,14 +1403,6 @@ fn non_empty_string(value: Option<String>) -> Option<String> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SelectedExecutionTarget {
     execution_backend: Option<AgentExecutionBackend>,
-    capability_target: ComposerCapabilityTarget,
-}
-
-fn project_active_thread_capabilities(
-    capabilities: &[ComposerCapability],
-    execution_target: &SelectedExecutionTarget,
-) -> ComposerCapabilityPolicyReduction {
-    reduce_composer_capabilities_for_target(capabilities, execution_target.capability_target)
 }
 
 fn resolve_selected_execution_target(
@@ -1423,13 +1416,11 @@ fn resolve_selected_execution_target(
     else {
         return Ok(SelectedExecutionTarget {
             execution_backend: None,
-            capability_target: ComposerCapabilityTarget::native(),
         });
     };
     let Some(_) = runtime_id_from_cli_runtime_provider_key(provider_key) else {
         return Ok(SelectedExecutionTarget {
             execution_backend: None,
-            capability_target: ComposerCapabilityTarget::native(),
         });
     };
 
@@ -1452,25 +1443,18 @@ fn selected_execution_target_from_runtimes(
     else {
         return Ok(SelectedExecutionTarget {
             execution_backend: None,
-            capability_target: ComposerCapabilityTarget::native(),
         });
     };
     let Some(_) = runtime_id_from_cli_runtime_provider_key(provider_key) else {
         return Ok(SelectedExecutionTarget {
             execution_backend: None,
-            capability_target: ComposerCapabilityTarget::native(),
         });
     };
 
     let execution_backend =
         resolve_cli_runtime_execution_backend(Some(provider_key), runtimes, None)
             .map_err(anyhow::Error::msg)?;
-    let capability_target = composer_capability_target_for_provider(Some(provider_key), runtimes);
-
-    Ok(SelectedExecutionTarget {
-        execution_backend,
-        capability_target,
-    })
+    Ok(SelectedExecutionTarget { execution_backend })
 }
 
 fn resolve_turn_selection(
@@ -1927,20 +1911,7 @@ mod tests {
     }
 
     #[test]
-    fn text_and_voice_execution_targets_share_the_cli_capability_matrix() {
-        assert_eq!(
-            pioneer_client::composer::capabilities::COMPOSER_CAPABILITY_MATRIX
-                .iter()
-                .map(|case| case.id)
-                .collect::<Vec<_>>(),
-            vec![
-                "native",
-                "cli_neither",
-                "cli_skills_only",
-                "cli_mcp_only",
-                "cli_both",
-            ]
-        );
+    fn text_and_voice_submission_preserves_capabilities_across_catalog_readiness_states() {
         let capabilities = vec![
             capability("user", "user"),
             mcp_capability(),
@@ -1950,25 +1921,19 @@ mod tests {
         ];
         let cases = [
             (
-                "unsupported",
-                runtime_summary("unsupported", false, false, RuntimeStatus::Ready),
-                Vec::<&str>::new(),
+                "phase-zero",
+                runtime_summary("phase-zero", false, false, RuntimeStatus::Ready),
             ),
             (
-                "skills-only",
+                "skills-only-catalog",
                 runtime_summary("skills", true, false, RuntimeStatus::Ready),
-                vec!["skill:user:user", "skill:registry:registry"],
             ),
             (
-                "MCP-only",
+                "mcp-only-catalog",
                 runtime_summary("mcp", false, true, RuntimeStatus::Ready),
-                vec![
-                    "mcp-server:workspace:docs",
-                    "mcp-tool:workspace:docs:search",
-                ],
             ),
             (
-                "combined",
+                "live-degraded",
                 runtime_summary(
                     "combined",
                     true,
@@ -1977,31 +1942,38 @@ mod tests {
                         message: "non-MCP diagnostic".to_owned(),
                     },
                 ),
-                vec![
-                    "skill:user:user",
-                    "mcp-server:workspace:docs",
-                    "skill:registry:registry",
-                    "mcp-tool:workspace:docs:search",
-                ],
             ),
         ];
+        let expected_ids = vec![
+            "skill:user:user",
+            "mcp-server:workspace:docs",
+            "skill:registry:registry",
+            "mcp-tool:workspace:docs:search",
+        ];
 
-        for (case, runtime, expected_ids) in cases {
+        for (case, runtime) in cases {
             let provider = format!("cli_runtime:{}", runtime.runtime_id);
             let target = selected_execution_target_from_runtimes(
                 Some(provider.as_str()),
                 std::slice::from_ref(&runtime),
             )
             .unwrap_or_else(|error| panic!("{case} CLI should resolve: {error:#}"));
-            let text_reduction =
-                project_active_thread_capabilities(capabilities.as_slice(), &target);
-            let voice_reduction =
-                project_active_thread_capabilities(capabilities.as_slice(), &target);
+            let text_plan = plan_composer_submission(
+                Some(provider.as_str()),
+                "typed",
+                false,
+                capabilities.as_slice(),
+            );
+            let voice_plan = plan_composer_submission(
+                Some(provider.as_str()),
+                "",
+                true,
+                capabilities.as_slice(),
+            );
 
-            for reduction in [&text_reduction, &voice_reduction] {
+            for plan in [&text_plan, &voice_plan] {
                 assert_eq!(
-                    reduction
-                        .capabilities
+                    plan.capabilities
                         .iter()
                         .map(|capability| capability.id.as_str())
                         .collect::<Vec<_>>(),
@@ -2009,7 +1981,8 @@ mod tests {
                     "{case}"
                 );
             }
-            assert_eq!(text_reduction, voice_reduction, "{case}");
+            assert_eq!(text_plan.capabilities, voice_plan.capabilities, "{case}");
+            assert_eq!(text_plan.removed, voice_plan.removed, "{case}");
             assert_eq!(
                 target.execution_backend.is_some(),
                 true,
@@ -2030,35 +2003,48 @@ mod tests {
             std::slice::from_ref(&stale_runtime),
         )
         .expect("stale runtime still resolves its execution backend");
-        let stale_reduction = project_active_thread_capabilities(capabilities.as_slice(), &stale);
-        assert!(stale_reduction.capabilities.is_empty());
+        let stale_plan = plan_composer_submission(
+            Some("cli_runtime:stale"),
+            "typed",
+            false,
+            capabilities.as_slice(),
+        );
+        assert!(stale.execution_backend.is_some());
         assert_eq!(
-            stale_reduction
+            stale_plan
+                .capabilities
+                .iter()
+                .map(|capability| capability.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "skill:user:user",
+                "mcp-server:workspace:docs",
+                "skill:registry:registry",
+                "mcp-tool:workspace:docs:search",
+            ]
+        );
+        assert_eq!(
+            stale_plan
                 .removed
                 .iter()
                 .map(|removed| removed.reason)
                 .collect::<Vec<_>>(),
             vec![
-                pioneer_client::composer::capabilities::ComposerCapabilityRemovalReason::SkillsUnsupported,
-                pioneer_client::composer::capabilities::ComposerCapabilityRemovalReason::McpToolsUnsupported,
-                pioneer_client::composer::capabilities::ComposerCapabilityRemovalReason::SkillsUnsupported,
-                pioneer_client::composer::capabilities::ComposerCapabilityRemovalReason::SkillsUnsupported,
-                pioneer_client::composer::capabilities::ComposerCapabilityRemovalReason::McpToolsUnsupported,
+                pioneer_client::composer::capabilities::ComposerCapabilityRemovalReason::SkillSourceNotExportable,
             ]
         );
 
         let native = selected_execution_target_from_runtimes(Some("openai"), &[])
             .expect("native provider should resolve");
         assert_eq!(
-            project_active_thread_capabilities(capabilities.as_slice(), &native).capabilities,
+            plan_composer_submission(Some("openai"), "typed", false, capabilities.as_slice(),)
+                .capabilities,
             capabilities
         );
         assert!(native.execution_backend.is_none());
 
-        let missing = composer_capability_target_for_provider(Some("cli_runtime:missing"), &[]);
-        assert!(missing.is_cli());
-        assert!(!missing.policy().supports_skills);
-        assert!(!missing.policy().supports_mcp_tools);
+        let missing = selected_execution_target_from_runtimes(Some("cli_runtime:missing"), &[]);
+        assert!(missing.is_err());
     }
 
     #[test]

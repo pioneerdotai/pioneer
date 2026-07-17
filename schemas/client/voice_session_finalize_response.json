@@ -16,6 +16,7 @@
         {
           "type": "string",
           "enum": [
+            "disabled",
             "unavailable",
             "model_loading",
             "ready",

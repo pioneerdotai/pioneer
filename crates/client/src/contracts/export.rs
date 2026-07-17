@@ -701,6 +701,55 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Stable
         ),
         contract_type!(
+            "composer_capability_target.json",
+            crate::composer::capabilities::ComposerCapabilityTarget,
+            Domain::Composer,
+            Kind::SelectorDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "composer_capability_menu_visibility.json",
+            crate::composer::capabilities::ComposerCapabilityMenuVisibility,
+            Domain::Composer,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "composer_capability_presentation.json",
+            crate::composer::capabilities::ComposerCapabilityPresentation,
+            Domain::Composer,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "composer_submission_plan.json",
+            crate::composer::capabilities::ComposerSubmissionPlan,
+            Domain::Composer,
+            Kind::ActionPlan,
+            Stability::Stable
+        ),
+        contract_type!(
+            "composer_domain_state.json",
+            crate::composer::state_machine::ComposerDomainState,
+            Domain::Composer,
+            Kind::ActionState,
+            Stability::Stable
+        ),
+        contract_type!(
+            "composer_domain_action.json",
+            crate::composer::state_machine::ComposerDomainAction,
+            Domain::Composer,
+            Kind::Command,
+            Stability::Stable
+        ),
+        contract_type!(
+            "composer_domain_transition.json",
+            crate::composer::state_machine::ComposerDomainTransition,
+            Domain::Composer,
+            Kind::Effect,
+            Stability::Stable
+        ),
+        contract_type!(
             "composer_draft.json",
             crate::composer::draft::ComposerDraft<
                 crate::composer::attachments::ComposerAttachment,
@@ -708,6 +757,34 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             >,
             Domain::Composer,
             Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "composer_domain_draft.json",
+            crate::composer::draft::ComposerDomainDraft,
+            Domain::Composer,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "composer_draft_lifecycle_state.json",
+            crate::composer::draft::ComposerDraftLifecycleState,
+            Domain::Composer,
+            Kind::ActionState,
+            Stability::Stable
+        ),
+        contract_type!(
+            "composer_draft_lifecycle_action.json",
+            crate::composer::draft::ComposerDraftLifecycleAction,
+            Domain::Composer,
+            Kind::Command,
+            Stability::Stable
+        ),
+        contract_type!(
+            "composer_draft_lifecycle_transition.json",
+            crate::composer::draft::ComposerDraftLifecycleTransition,
+            Domain::Composer,
+            Kind::Effect,
             Stability::Stable
         ),
         contract_type!(
@@ -821,6 +898,48 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Domain::Settings,
             Kind::ActionPlan,
             Stability::Stable
+        ),
+        contract_type!(
+            "voice_input_runtime_presentation.json",
+            crate::settings::voice::VoiceInputRuntimePresentation,
+            Domain::Settings,
+            Kind::PresentationDto,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "voice_input_settings_action.json",
+            crate::settings::voice::VoiceInputSettingsAction,
+            Domain::Settings,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "voice_input_settings_plan.json",
+            crate::settings::voice::VoiceInputSettingsPlan,
+            Domain::Settings,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "voice_input_settings_plan_rejection.json",
+            crate::settings::voice::VoiceInputSettingsPlanRejection,
+            Domain::Settings,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "voice_input_settings_plan_request.json",
+            crate::settings::voice::VoiceInputSettingsPlanRequest,
+            Domain::Settings,
+            Kind::ActionPlan,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "voice_input_status_reduction.json",
+            crate::settings::voice::VoiceInputStatusReduction,
+            Domain::Settings,
+            Kind::PresentationDto,
+            Stability::Provisional
         ),
         contract_type!(
             "gateway_status_endpoint.json",

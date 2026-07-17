@@ -611,6 +611,7 @@ pub struct ProviderModelSelectorState {
 pub enum ProviderModelSelectorMode {
     Chat,
     Embeddings,
+    Transcription,
 }
 
 impl ProviderModelSelectorState {
@@ -649,11 +650,11 @@ impl ProviderModelSelectorState {
         let mut rows = self
             .providers
             .iter()
-            .filter(|provider| {
-                if self.mode == ProviderModelSelectorMode::Chat {
-                    provider.name != "local"
-                } else {
-                    provider.capabilities.embeddings
+            .filter(|provider| match self.mode {
+                ProviderModelSelectorMode::Chat => provider.name != "local",
+                ProviderModelSelectorMode::Embeddings => provider.capabilities.embeddings,
+                ProviderModelSelectorMode::Transcription => {
+                    provider.name == "local" && provider.capabilities.transcription
                 }
             })
             .map(|provider| ProviderModelSelectorProvider {
@@ -768,6 +769,9 @@ impl ProviderModelSelectorState {
         }
 
         self.models = response.models;
+        if self.mode == ProviderModelSelectorMode::Transcription {
+            order_transcription_selector_models(&mut self.models);
+        }
         self.loading_models = false;
         self.error = None;
         true
@@ -782,6 +786,15 @@ impl ProviderModelSelectorState {
         self.error = Some(error);
         true
     }
+}
+
+pub fn order_transcription_selector_models(models: &mut [ProviderModelInfo]) {
+    models.sort_by_key(|model| {
+        !model
+            .transcription
+            .as_ref()
+            .is_some_and(|metadata| metadata.recommended)
+    });
 }
 
 pub fn cli_runtime_provider_key(runtime_id: &str) -> String {
@@ -929,6 +942,7 @@ fn provider_model_from_runtime_model(
             json_output: None,
             streaming: Some(true),
             embeddings: None,
+            transcription: None,
             thinking: supports_reasoning,
             reasoning,
             fine_tuning: None,
@@ -937,6 +951,7 @@ fn provider_model_from_runtime_model(
             output_modalities: (!model.output_modalities.is_empty())
                 .then_some(model.output_modalities),
         },
+        transcription: None,
         pricing: None,
         active: model.active,
         family: model.family,
@@ -984,6 +999,16 @@ pub fn provider_list_models_params(
 }
 
 pub fn provider_list_embedding_models_params(
+    workspace_id: impl Into<String>,
+    provider: impl Into<String>,
+) -> ProviderListModelsParams {
+    ProviderListModelsParams {
+        workspace_id: workspace_id.into(),
+        provider: provider.into(),
+    }
+}
+
+pub fn provider_list_transcription_models_params(
     workspace_id: impl Into<String>,
     provider: impl Into<String>,
 ) -> ProviderListModelsParams {
@@ -1390,6 +1415,7 @@ mod tests {
                 active: Some(true),
                 family: None,
                 lifecycle_status: None,
+                transcription: None,
             }],
         });
         assert!(applied);
@@ -1478,6 +1504,7 @@ mod tests {
                     name: "openai".to_owned(),
                     capabilities: pioneer_protocol::ProviderSummaryCapabilities {
                         embeddings: true,
+                        transcription: false,
                     },
                     api_key_configured: true,
                     proxy_url: None,
@@ -1522,6 +1549,7 @@ mod tests {
                 active: Some(true),
                 family: None,
                 lifecycle_status: None,
+                transcription: None,
             }],
         });
 
@@ -1531,17 +1559,139 @@ mod tests {
     }
 
     #[test]
+    fn provider_model_selector_transcription_mode_exposes_only_local() {
+        let mut state = ProviderModelSelectorState::new_with_mode(
+            None,
+            None,
+            ProviderModelSelectorMode::Transcription,
+        );
+        state.mark_providers_loading();
+        assert!(state.loading_providers());
+
+        state.apply_provider_list_success(ProviderListResponse {
+            providers: vec![
+                ProviderSummary {
+                    name: "local".to_owned(),
+                    capabilities: pioneer_protocol::ProviderSummaryCapabilities {
+                        embeddings: true,
+                        transcription: true,
+                    },
+                    api_key_configured: true,
+                    proxy_url: None,
+                },
+                ProviderSummary {
+                    name: "remote-transcription".to_owned(),
+                    capabilities: pioneer_protocol::ProviderSummaryCapabilities {
+                        embeddings: false,
+                        transcription: true,
+                    },
+                    api_key_configured: true,
+                    proxy_url: None,
+                },
+                ProviderSummary {
+                    name: "openai".to_owned(),
+                    capabilities: pioneer_protocol::ProviderSummaryCapabilities {
+                        embeddings: true,
+                        transcription: false,
+                    },
+                    api_key_configured: true,
+                    proxy_url: None,
+                },
+            ],
+        });
+        state.apply_cli_runtime_list_success(CLIRuntimeListResponse {
+            runtimes: vec![runtime_summary(
+                "codex_work",
+                "Codex Work",
+                RuntimeStatus::Ready,
+            )],
+        });
+
+        let rows = state.provider_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "local");
+        assert_eq!(
+            rows[0].kind,
+            ProviderModelSelectorProviderKind::ApiProvider {
+                provider: "local".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn provider_model_selector_transcription_orders_recommended_first_and_selects_identity_only() {
+        let mut state = ProviderModelSelectorState::new_with_mode(
+            Some("local".to_owned()),
+            None,
+            ProviderModelSelectorMode::Transcription,
+        );
+        let models = (0..16)
+            .map(|index| ProviderModelInfo {
+                id: format!("model-{index:02}"),
+                name: Some(format!("Model {index:02}")),
+                description: Some("Client-safe transcription model".to_owned()),
+                created: None,
+                provider: "local".to_owned(),
+                owned_by: Some("local".to_owned()),
+                limits: ProviderModelLimits::default(),
+                capabilities: ProviderModelCapabilities {
+                    transcription: Some(true),
+                    ..ProviderModelCapabilities::default()
+                },
+                transcription: Some(pioneer_protocol::ProviderTranscriptionModelMetadata {
+                    engine: if index < 8 { "engine-a" } else { "engine-b" }.to_owned(),
+                    download_size_mb: 100 + index as u64,
+                    accuracy_score: 80,
+                    speed_score: 80,
+                    supports_translation: false,
+                    supported_languages: vec!["en".to_owned()],
+                    supports_language_selection: false,
+                    recommended: index == 6,
+                }),
+                pricing: None,
+                active: Some(true),
+                family: None,
+                lifecycle_status: None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            state.apply_provider_models_success(ProviderListModelsResponse {
+                provider: "local".to_owned(),
+                models,
+            })
+        );
+        assert_eq!(state.models().len(), 16);
+        assert_eq!(state.models()[0].id, "model-06");
+        assert_eq!(state.models()[1].id, "model-00");
+        assert_eq!(state.models()[7].id, "model-07");
+        assert_eq!(state.models()[8].id, "model-08");
+
+        state.set_selected_model("model-11".to_owned());
+        assert_eq!(
+            state.selection_parts(),
+            (Some("local".to_owned()), Some("model-11".to_owned()))
+        );
+    }
+
+    #[test]
     fn provider_model_selector_hides_local_from_chat_and_shows_it_for_embeddings() {
         let providers = vec![
             ProviderSummary {
                 name: "openai".to_owned(),
-                capabilities: pioneer_protocol::ProviderSummaryCapabilities { embeddings: true },
+                capabilities: pioneer_protocol::ProviderSummaryCapabilities {
+                    embeddings: true,
+                    transcription: false,
+                },
                 api_key_configured: true,
                 proxy_url: None,
             },
             ProviderSummary {
                 name: "local".to_owned(),
-                capabilities: pioneer_protocol::ProviderSummaryCapabilities { embeddings: true },
+                capabilities: pioneer_protocol::ProviderSummaryCapabilities {
+                    embeddings: true,
+                    transcription: false,
+                },
                 api_key_configured: true,
                 proxy_url: None,
             },
@@ -1688,6 +1838,10 @@ mod tests {
         let params = provider_list_embedding_models_params("ws", "openrouter");
         assert_eq!(params.workspace_id, "ws");
         assert_eq!(params.provider, "openrouter");
+
+        let params = provider_list_transcription_models_params("ws", "local");
+        assert_eq!(params.workspace_id, "ws");
+        assert_eq!(params.provider, "local");
 
         let params = cli_runtime_list_models_params("ws", "codex_work");
         assert_eq!(params.workspace_id, "ws");

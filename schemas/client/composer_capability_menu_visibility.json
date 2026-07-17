@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ComposerCapabilityMenuVisibility",
+  "type": "object",
+  "properties": {
+    "any": {
+      "type": "boolean"
+    },
+    "mcp": {
+      "type": "boolean"
+    },
+    "skills": {
+      "type": "boolean"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "skills",
+    "mcp",
+    "any"
+  ]
+}

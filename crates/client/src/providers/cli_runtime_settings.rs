@@ -268,6 +268,7 @@ fn cli_runtime_provider_settings_plan(
             thread_episodic: None,
             cli_runtimes: Some(cli_runtimes),
             remote_access: None,
+            voice_input: None,
         },
     })
 }
@@ -587,6 +588,7 @@ mod tests {
             thread_episodic: Default::default(),
             cli_runtimes: GatewayCliRuntimeSettings { instances },
             remote_access: Default::default(),
+            voice_input: Default::default(),
         }
     }
 

@@ -8,20 +8,32 @@ use pioneer_client::{
             composer_attachment_has_path, remove_composer_attachment_at,
         },
         capabilities::{
-            ComposerCapability, SelectableMcpCapability, SelectableSkillCapability,
-            add_composer_capability, filter_search_mcp_tool_capability_rows,
-            filter_selectable_mcp_capability_rows, filter_selectable_skill_capability_rows,
-            mcp_row_to_composer_capability, reduce_composer_mcp_server_picker_rows_response,
+            ComposerCapability, ComposerCapabilityMenuVisibility, ComposerCapabilityTarget,
+            ComposerSubmissionPlan, SelectableMcpCapability, SelectableSkillCapability,
+            add_composer_capability, composer_capability_menu_visibility,
+            composer_capability_target_for_provider, filter_search_mcp_tool_capability_rows,
+            filter_selectable_mcp_capability_rows, filter_selectable_skill_capabilities_for_target,
+            filter_selectable_skill_capability_rows, mcp_row_to_composer_capability,
+            plan_composer_submission, reduce_composer_mcp_server_picker_rows_response,
             reduce_composer_mcp_tool_picker_rows_response,
             reduce_composer_skill_picker_rows_response, remove_composer_capability_at,
-            selected_mcp_server_ids, toggle_mcp_capability_selection,
-            toggle_selected_capability_key,
+            replace_selected_mcp_composer_capabilities, selected_mcp_server_ids,
+            toggle_mcp_capability_selection, toggle_selected_capability_key,
+        },
+        draft::{
+            ComposerDraftLifecycleAction, ComposerDraftLifecycleState,
+            ComposerDraftLifecycleTransition, reduce_composer_draft_lifecycle,
+        },
+        state_machine::{
+            ComposerDomainAction, ComposerDomainState, ComposerDomainTransition,
+            reduce_composer_domain_state,
         },
     },
     mcp::{details as mcp_details, list as mcp_list},
     skills::catalog as skill_catalog,
     transport::ws::GatewayWsCommandSender,
 };
+use pioneer_protocol::RuntimeSummary;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, path::Path};
 
@@ -87,6 +99,62 @@ pub struct ClientComposerCapabilitiesUpdateRequest {
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientComposerCapabilityTargetRequest {
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub runtimes: Vec<RuntimeSummary>,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientComposerCapabilityMenuVisibilityRequest {
+    pub target: ComposerCapabilityTarget,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientComposerSubmissionPlanRequest {
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub has_attachments: bool,
+    #[serde(default)]
+    pub capabilities: Vec<ComposerCapability>,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientComposerDomainTransitionRequest {
+    pub state: ComposerDomainState,
+    pub action: ComposerDomainAction,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientComposerDraftLifecycleTransitionRequest {
+    pub state: ComposerDraftLifecycleState,
+    pub action: ComposerDraftLifecycleAction,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientComposerSkillRowsForTargetRequest {
+    #[serde(default)]
+    pub rows: Vec<SelectableSkillCapability>,
+    pub target: ComposerCapabilityTarget,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub enum ClientComposerCapabilitiesUpdateAction {
     Add { capability: ComposerCapability },
@@ -112,6 +180,7 @@ pub struct ClientComposerMcpCapabilityFromRowRequest {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ClientComposerMcpToggleRequest {
+    pub capabilities: Vec<ComposerCapability>,
     pub selected_keys: Vec<String>,
     pub server_rows: Vec<SelectableMcpCapability>,
     pub tool_rows: Vec<SelectableMcpCapability>,
@@ -121,6 +190,7 @@ pub struct ClientComposerMcpToggleRequest {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct ClientComposerMcpToggleResult {
+    pub capabilities: Vec<ComposerCapability>,
     pub selected_keys: Vec<String>,
     pub collapse_active_server: bool,
 }
@@ -267,6 +337,50 @@ pub fn update_composer_capabilities(
     request.capabilities
 }
 
+pub fn composer_capability_target(
+    request: ClientComposerCapabilityTargetRequest,
+) -> ComposerCapabilityTarget {
+    composer_capability_target_for_provider(
+        request.provider.as_deref(),
+        request.runtimes.as_slice(),
+    )
+}
+
+pub fn composer_capability_menu(
+    request: ClientComposerCapabilityMenuVisibilityRequest,
+) -> ComposerCapabilityMenuVisibility {
+    composer_capability_menu_visibility(request.target)
+}
+
+pub fn composer_submission_plan(
+    request: ClientComposerSubmissionPlanRequest,
+) -> ComposerSubmissionPlan {
+    plan_composer_submission(
+        request.provider.as_deref(),
+        request.text.as_str(),
+        request.has_attachments,
+        request.capabilities.as_slice(),
+    )
+}
+
+pub fn composer_domain_transition(
+    request: ClientComposerDomainTransitionRequest,
+) -> ComposerDomainTransition {
+    reduce_composer_domain_state(&request.state, request.action)
+}
+
+pub fn composer_draft_lifecycle_transition(
+    request: ClientComposerDraftLifecycleTransitionRequest,
+) -> ComposerDraftLifecycleTransition {
+    reduce_composer_draft_lifecycle(&request.state, request.action)
+}
+
+pub fn composer_skill_rows_for_target(
+    request: ClientComposerSkillRowsForTargetRequest,
+) -> Vec<SelectableSkillCapability> {
+    filter_selectable_skill_capabilities_for_target(request.rows.as_slice(), request.target)
+}
+
 pub fn skill_capability_from_row(
     request: ClientComposerSkillCapabilityFromRowRequest,
 ) -> ComposerCapability {
@@ -307,7 +421,15 @@ pub fn toggle_mcp_picker_selection(
         &request.row,
     );
 
+    let capabilities = replace_selected_mcp_composer_capabilities(
+        request.capabilities.as_slice(),
+        request.server_rows.as_slice(),
+        request.tool_rows.as_slice(),
+        &selected,
+    );
+
     ClientComposerMcpToggleResult {
+        capabilities,
         selected_keys: sorted_keys(selected),
         collapse_active_server: update.collapse_active_server,
     }

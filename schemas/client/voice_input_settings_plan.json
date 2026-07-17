@@ -1,0 +1,545 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "VoiceInputSettingsPlan",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "update"
+        },
+        "update": {
+          "$ref": "#/$defs/GatewaySettingsUpdate"
+        }
+      },
+      "required": [
+        "kind",
+        "update"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "needs_selection"
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "noop"
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "rejected"
+        },
+        "reason": {
+          "$ref": "#/$defs/VoiceInputSettingsPlanRejection"
+        }
+      },
+      "required": [
+        "kind",
+        "reason"
+      ]
+    }
+  ],
+  "$defs": {
+    "CLIAgentRuntimeKind": {
+      "type": "string",
+      "enum": [
+        "codex",
+        "claude"
+      ]
+    },
+    "GatewayCliRuntimeInstanceSettings": {
+      "type": "object",
+      "properties": {
+        "binary_path": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "home_path": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/CLIAgentRuntimeKind"
+        },
+        "shadow_home_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "display_name",
+        "enabled",
+        "binary_path",
+        "home_path"
+      ]
+    },
+    "GatewayCliRuntimeSettings": {
+      "type": "object",
+      "properties": {
+        "instances": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/GatewayCliRuntimeInstanceSettings"
+          }
+        }
+      }
+    },
+    "GatewayGeneralSettingsUpdate": {
+      "type": "object",
+      "properties": {
+        "keepawake": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "preflight_model": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayMemoryModelSelection"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "GatewayMemoryModelSelection": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model_provider": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "$ref": "#/$defs/GatewayMemoryModelSelectionSource",
+          "default": "thread"
+        }
+      }
+    },
+    "GatewayMemoryModelSelectionSource": {
+      "type": "string",
+      "enum": [
+        "thread",
+        "custom"
+      ]
+    },
+    "GatewayMemorySettings": {
+      "type": "object",
+      "properties": {
+        "active_recall_enabled": {
+          "type": "boolean"
+        },
+        "background_extraction_enabled": {
+          "type": "boolean"
+        },
+        "debug_trace_enabled": {
+          "type": "boolean"
+        },
+        "deterministic_recall_enabled": {
+          "type": "boolean"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "proactive_writes_enabled": {
+          "type": "boolean"
+        },
+        "proactive_writes_model": {
+          "$ref": "#/$defs/GatewayMemoryModelSelection",
+          "default": {
+            "source": "thread"
+          }
+        },
+        "strict_diagnostics_enabled": {
+          "type": "boolean"
+        },
+        "tools_enabled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled",
+        "deterministic_recall_enabled",
+        "active_recall_enabled",
+        "tools_enabled",
+        "proactive_writes_enabled",
+        "background_extraction_enabled",
+        "debug_trace_enabled",
+        "strict_diagnostics_enabled"
+      ]
+    },
+    "GatewayRemoteAccessSettingsUpdate": {
+      "type": "object",
+      "properties": {
+        "clear_key": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "server": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "GatewaySettingsUpdate": {
+      "type": "object",
+      "properties": {
+        "cli_runtimes": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayCliRuntimeSettings"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "general": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayGeneralSettingsUpdate"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "memory": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayMemorySettings"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "remote_access": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayRemoteAccessSettingsUpdate"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "thread_episodic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayThreadEpisodicSettingsUpdate"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "voice_input": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayVoiceInputSettingsUpdate"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "GatewayThreadEpisodicSettingsUpdate": {
+      "type": "object",
+      "properties": {
+        "default_max_candidates": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "default_prompt_chars": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "index_batch_limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "indexing_enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "max_attempts": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "max_candidate_work": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_hit_chars": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_prompt_chars": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_segments": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "min_relevancy": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "min_results": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "near_capacity_percent": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "recall_enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "retry_base_delay_secs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "retry_max_delay_secs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "snippet_chars": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "vector_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayThreadEpisodicVectorSearchSettingsUpdate"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "GatewayThreadEpisodicVectorProvider": {
+      "type": "string",
+      "enum": [
+        "openai",
+        "openrouter",
+        "local"
+      ]
+    },
+    "GatewayThreadEpisodicVectorSearchSettingsUpdate": {
+      "type": "object",
+      "properties": {
+        "embedding_normalized": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "local_model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayThreadEpisodicVectorProvider"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "use_search_instructions": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "GatewayVoiceInputProvider": {
+      "type": "string",
+      "enum": [
+        "local"
+      ]
+    },
+    "GatewayVoiceInputSettingsUpdate": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayVoiceInputProvider"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "retry_install": {
+          "type": "boolean"
+        }
+      }
+    },
+    "VoiceInputSettingsPlanRejection": {
+      "type": "string",
+      "enum": [
+        "invalid_provider",
+        "missing_model",
+        "retry_unavailable"
+      ]
+    }
+  }
+}

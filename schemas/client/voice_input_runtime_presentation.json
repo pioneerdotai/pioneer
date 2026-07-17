@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "VoiceInputRuntimePresentation",
+  "type": "string",
+  "enum": [
+    "disabled",
+    "needs_selection",
+    "preparing",
+    "ready",
+    "failed"
+  ]
+}

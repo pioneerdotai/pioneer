@@ -1,0 +1,476 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ComposerDomainTransition",
+  "type": "object",
+  "properties": {
+    "changed": {
+      "type": "boolean"
+    },
+    "model_selection_changed": {
+      "type": "boolean"
+    },
+    "payload_changed": {
+      "type": "boolean"
+    },
+    "state": {
+      "$ref": "#/$defs/ComposerDomainState"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "state",
+    "changed",
+    "payload_changed",
+    "model_selection_changed"
+  ],
+  "$defs": {
+    "ArtifactKind": {
+      "type": "string",
+      "enum": [
+        "file",
+        "text",
+        "image",
+        "audio",
+        "video",
+        "pdf",
+        "spreadsheet",
+        "archive",
+        "json",
+        "generated_image",
+        "screenshot",
+        "workspace_file",
+        "directory_manifest",
+        "unknown"
+      ]
+    },
+    "ArtifactPreviewRef": {
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "type": "string"
+        },
+        "blob_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mime_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "projection_kind": {
+          "$ref": "#/$defs/ArtifactProjectionKind"
+        },
+        "sha256": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "size_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "status": {
+          "$ref": "#/$defs/ArtifactProjectionStatus"
+        },
+        "version_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "projection_kind",
+        "status",
+        "artifact_id",
+        "version_id"
+      ]
+    },
+    "ArtifactProjectionKind": {
+      "type": "string",
+      "enum": [
+        "plain_text",
+        "thumbnail",
+        "json_summary",
+        "pdf_text"
+      ]
+    },
+    "ArtifactProjectionStatus": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "ready",
+        "failed",
+        "stale"
+      ]
+    },
+    "ArtifactRef": {
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ArtifactKind"
+        },
+        "mime_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "preview": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArtifactPreviewRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sha256": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "size_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "status": {
+          "$ref": "#/$defs/ArtifactStatus"
+        },
+        "version_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "artifact_id",
+        "display_name",
+        "kind",
+        "status"
+      ]
+    },
+    "ArtifactStatus": {
+      "type": "string",
+      "enum": [
+        "ready",
+        "pending",
+        "quarantined",
+        "deleted",
+        "missing_external_source",
+        "failed"
+      ]
+    },
+    "ComposerAttachment": {
+      "type": "object",
+      "properties": {
+        "file_name": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ComposerAttachmentKind"
+        },
+        "path": {
+          "type": "string"
+        },
+        "upload_state": {
+          "$ref": "#/$defs/ComposerAttachmentUploadState"
+        }
+      },
+      "required": [
+        "path",
+        "file_name",
+        "kind",
+        "upload_state"
+      ]
+    },
+    "ComposerAttachmentKind": {
+      "type": "string",
+      "enum": [
+        "Image",
+        "File",
+        "Audio",
+        "Video"
+      ]
+    },
+    "ComposerAttachmentUploadState": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "Local",
+            "Uploading"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Uploaded": {
+              "type": "object",
+              "properties": {
+                "artifact": {
+                  "$ref": "#/$defs/ArtifactRef"
+                }
+              },
+              "required": [
+                "artifact"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Uploaded"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Failed": {
+              "type": "object",
+              "properties": {
+                "error": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "error"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Failed"
+          ]
+        }
+      ]
+    },
+    "ComposerCapability": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ComposerCapabilityKind"
+        },
+        "label": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "kind"
+      ]
+    },
+    "ComposerCapabilityKind": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "Skill": {
+              "type": "object",
+              "properties": {
+                "slug": {
+                  "type": "string"
+                },
+                "source_kind": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "slug",
+                "source_kind"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Skill"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "McpServer": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "scope_kind": {
+                  "$ref": "#/$defs/McpScopeKind"
+                }
+              },
+              "required": [
+                "name",
+                "scope_kind"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "McpServer"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "McpTool": {
+              "type": "object",
+              "properties": {
+                "raw_tool_name": {
+                  "type": "string"
+                },
+                "scope_kind": {
+                  "$ref": "#/$defs/McpScopeKind"
+                },
+                "server_name": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "server_name",
+                "raw_tool_name",
+                "scope_kind"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "McpTool"
+          ]
+        }
+      ]
+    },
+    "ComposerCapabilityTarget": {
+      "description": "Capability eligibility context.\n\nThe target kind exists only because native skills retain their current\nsource policy while CLI skills must be exportable. Capability support is\nrepresented exclusively by [`ComposerCapabilityPolicy`].",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/ComposerCapabilityTargetKind"
+        },
+        "supports_mcp_tools": {
+          "type": "boolean"
+        },
+        "supports_skills": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "supports_skills",
+        "supports_mcp_tools"
+      ]
+    },
+    "ComposerCapabilityTargetKind": {
+      "type": "string",
+      "enum": [
+        "native",
+        "cli"
+      ]
+    },
+    "ComposerDomainState": {
+      "type": "object",
+      "properties": {
+        "attachments": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ComposerAttachment"
+          }
+        },
+        "capabilities": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ComposerCapability"
+          }
+        },
+        "capability_target": {
+          "$ref": "#/$defs/ComposerCapabilityTarget"
+        },
+        "mode_manually_selected": {
+          "type": "boolean",
+          "default": false
+        },
+        "model_manually_selected": {
+          "type": "boolean",
+          "default": false
+        },
+        "selected_mode": {
+          "$ref": "#/$defs/ThreadMode",
+          "default": "Agent"
+        },
+        "selected_model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "selected_permission_mode": {
+          "$ref": "#/$defs/TurnPermissionMode",
+          "default": "full_access"
+        },
+        "selected_provider": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "selected_reasoning_effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "capability_target"
+      ]
+    },
+    "McpScopeKind": {
+      "type": "string",
+      "enum": [
+        "workspace",
+        "user"
+      ]
+    },
+    "ThreadMode": {
+      "type": "string",
+      "enum": [
+        "Chat",
+        "Agent"
+      ]
+    },
+    "TurnPermissionMode": {
+      "type": "string",
+      "enum": [
+        "full_access",
+        "auto_accept_edits",
+        "supervised"
+      ]
+    }
+  }
+}

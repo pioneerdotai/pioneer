@@ -36,7 +36,9 @@ pub enum ComposerCapabilityKind {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ComposerCapabilityPolicy {
     pub supports_skills: bool,
     pub supports_mcp_tools: bool,
@@ -72,8 +74,10 @@ impl ComposerCapabilityPolicy {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ComposerCapabilityTargetKind {
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposerCapabilityTargetKind {
     Native,
     Cli,
 }
@@ -83,25 +87,43 @@ enum ComposerCapabilityTargetKind {
 /// The target kind exists only because native skills retain their current
 /// source policy while CLI skills must be exportable. Capability support is
 /// represented exclusively by [`ComposerCapabilityPolicy`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ComposerCapabilityTarget {
     kind: ComposerCapabilityTargetKind,
-    policy: ComposerCapabilityPolicy,
+    supports_skills: bool,
+    supports_mcp_tools: bool,
 }
 
 impl ComposerCapabilityTarget {
     pub const fn native() -> Self {
         Self {
             kind: ComposerCapabilityTargetKind::Native,
-            policy: ComposerCapabilityPolicy::native(),
+            supports_skills: true,
+            supports_mcp_tools: true,
         }
     }
 
     pub const fn cli(policy: ComposerCapabilityPolicy) -> Self {
         Self {
             kind: ComposerCapabilityTargetKind::Cli,
-            policy,
+            supports_skills: policy.supports_skills,
+            supports_mcp_tools: policy.supports_mcp_tools,
         }
+    }
+
+    /// Structural capability target used at the CLI turn-submission boundary.
+    ///
+    /// Runtime summaries are suitable for presenting the composer picker, but
+    /// they are not authoritative at submission time: the phase-zero catalog
+    /// intentionally reports MCP as unavailable until a live readiness probe
+    /// has run. The Gateway performs that live, fail-closed validation while
+    /// preparing the turn, so clients must preserve an explicit selection on
+    /// the wire instead of silently reducing it from a stale catalog summary.
+    /// CLI-only source restrictions still apply to skills.
+    pub const fn cli_submission() -> Self {
+        Self::cli(ComposerCapabilityPolicy::cli(true, true))
     }
 
     pub fn from_cli_runtime_capabilities(capabilities: &RuntimeCapabilities) -> Self {
@@ -111,7 +133,14 @@ impl ComposerCapabilityTarget {
     }
 
     pub const fn policy(self) -> ComposerCapabilityPolicy {
-        self.policy
+        ComposerCapabilityPolicy {
+            supports_skills: self.supports_skills,
+            supports_mcp_tools: self.supports_mcp_tools,
+        }
+    }
+
+    pub const fn kind(self) -> ComposerCapabilityTargetKind {
+        self.kind
     }
 
     pub const fn is_native(self) -> bool {
@@ -196,6 +225,25 @@ pub fn composer_capability_target_for_provider(
     ComposerCapabilityTarget::from_cli_runtime_capabilities(&runtime.capabilities)
 }
 
+/// Structural capability target used when a turn is submitted.
+///
+/// Live runtime summaries are presentation evidence only. Submission keeps an
+/// explicit selection intact and lets Gateway perform the authoritative live
+/// readiness and projection validation. The only client-side reduction here
+/// is the stable source rule for skills exported to CLI runtimes.
+pub fn composer_submission_target_for_provider(provider: Option<&str>) -> ComposerCapabilityTarget {
+    if provider
+        .map(str::trim)
+        .filter(|provider| !provider.is_empty())
+        .and_then(runtime_id_from_cli_runtime_provider_key)
+        .is_some()
+    {
+        ComposerCapabilityTarget::cli_submission()
+    } else {
+        ComposerCapabilityTarget::native()
+    }
+}
+
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -205,16 +253,105 @@ pub enum ComposerCapabilityRemovalReason {
     McpToolsUnsupported,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RemovedComposerCapability {
     pub capability: ComposerCapability,
     pub reason: ComposerCapabilityRemovalReason,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ComposerCapabilityPolicyReduction {
     pub capabilities: Vec<ComposerCapability>,
     pub removed: Vec<RemovedComposerCapability>,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ComposerCapabilityMenuVisibility {
+    pub skills: bool,
+    pub mcp: bool,
+    pub any: bool,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ComposerCapabilityPresentation {
+    pub target: ComposerCapabilityTarget,
+    pub menu_visibility: ComposerCapabilityMenuVisibility,
+    pub capabilities: Vec<ComposerCapability>,
+    pub removed: Vec<RemovedComposerCapability>,
+    pub has_composer_payload: bool,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ComposerSubmissionPlan {
+    pub target: ComposerCapabilityTarget,
+    pub capabilities: Vec<ComposerCapability>,
+    pub removed: Vec<RemovedComposerCapability>,
+    pub has_composer_payload: bool,
+}
+
+pub const fn composer_capability_menu_visibility(
+    target: ComposerCapabilityTarget,
+) -> ComposerCapabilityMenuVisibility {
+    let policy = target.policy();
+    ComposerCapabilityMenuVisibility {
+        skills: policy.supports_skills,
+        mcp: policy.supports_mcp_tools,
+        any: policy.supports_skills || policy.supports_mcp_tools,
+    }
+}
+
+pub fn project_composer_capability_presentation(
+    provider: Option<&str>,
+    runtimes: &[RuntimeSummary],
+    text: &str,
+    has_attachments: bool,
+    capabilities: &[ComposerCapability],
+) -> ComposerCapabilityPresentation {
+    let target = composer_capability_target_for_provider(provider, runtimes);
+    let reduction = reduce_composer_capabilities_for_target(capabilities, target);
+    let has_composer_payload = super::turn_prepare::composer_has_sendable_content(
+        text,
+        has_attachments,
+        !reduction.capabilities.is_empty(),
+    );
+    ComposerCapabilityPresentation {
+        target,
+        menu_visibility: composer_capability_menu_visibility(target),
+        capabilities: reduction.capabilities,
+        removed: reduction.removed,
+        has_composer_payload,
+    }
+}
+
+pub fn plan_composer_submission(
+    provider: Option<&str>,
+    text: &str,
+    has_attachments: bool,
+    capabilities: &[ComposerCapability],
+) -> ComposerSubmissionPlan {
+    let target = composer_submission_target_for_provider(provider);
+    let reduction = reduce_composer_capabilities_for_target(capabilities, target);
+    let has_composer_payload = super::turn_prepare::composer_has_sendable_content(
+        text,
+        has_attachments,
+        !reduction.capabilities.is_empty(),
+    );
+    ComposerSubmissionPlan {
+        target,
+        capabilities: reduction.capabilities,
+        removed: reduction.removed,
+        has_composer_payload,
+    }
 }
 
 fn is_cli_exportable_skill_source(source_kind: &str) -> bool {
@@ -803,6 +940,33 @@ pub fn selected_mcp_composer_capabilities_from_rows(
         .cloned()
         .map(mcp_row_to_composer_capability)
         .collect()
+}
+
+/// Replaces the MCP portion of a composer selection from canonical picker
+/// rows while preserving unrelated capabilities. Whole-server selection wins
+/// over individual tools for the same server through
+/// [`selected_mcp_composer_capabilities_from_rows`].
+pub fn replace_selected_mcp_composer_capabilities(
+    current: &[ComposerCapability],
+    server_rows: &[SelectableMcpCapability],
+    tool_rows: &[SelectableMcpCapability],
+    selected: &HashSet<String>,
+) -> Vec<ComposerCapability> {
+    let mut capabilities = current
+        .iter()
+        .filter(|capability| {
+            !matches!(
+                &capability.kind,
+                ComposerCapabilityKind::McpServer { .. } | ComposerCapabilityKind::McpTool { .. }
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for capability in selected_mcp_composer_capabilities_from_rows(server_rows, tool_rows, selected)
+    {
+        add_composer_capability(&mut capabilities, capability);
+    }
+    capabilities
 }
 
 pub fn filter_selectable_skill_capability_rows(
@@ -1408,6 +1572,123 @@ mod tests {
     }
 
     #[test]
+    fn cli_submission_preserves_explicit_capabilities_for_gateway_live_validation() {
+        let input = vec![
+            skill_capability_from_source("user", "user"),
+            skill_capability_from_source("registry", "registry"),
+            skill_capability_from_source("system", "system"),
+            mcp_server_capability("docs"),
+            mcp_tool_capability("docs", "search"),
+        ];
+
+        let reduction = reduce_composer_capabilities_for_target(
+            &input,
+            ComposerCapabilityTarget::cli_submission(),
+        );
+
+        assert_eq!(
+            reduction
+                .capabilities
+                .iter()
+                .map(|capability| capability.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "skill:user:user",
+                "skill:registry:registry",
+                "mcp-server:workspace:docs",
+                "mcp-tool:workspace:docs:search",
+            ]
+        );
+        assert_eq!(
+            reduction
+                .removed
+                .iter()
+                .map(|removed| (removed.capability.id.as_str(), removed.reason))
+                .collect::<Vec<_>>(),
+            vec![(
+                "skill:system:system",
+                ComposerCapabilityRemovalReason::SkillSourceNotExportable,
+            )]
+        );
+    }
+
+    #[test]
+    fn presentation_readiness_cannot_strip_the_structural_submission_plan() {
+        let input = vec![
+            skill_capability_from_source("user", "user"),
+            skill_capability_from_source("system", "system"),
+            mcp_server_capability("docs"),
+            mcp_tool_capability("docs", "search"),
+        ];
+        let provider = Some("cli_runtime:codex");
+
+        let presentation = project_composer_capability_presentation(
+            provider,
+            &[],
+            "send",
+            false,
+            input.as_slice(),
+        );
+        assert!(presentation.capabilities.is_empty());
+        assert_eq!(
+            presentation.menu_visibility,
+            ComposerCapabilityMenuVisibility {
+                skills: false,
+                mcp: false,
+                any: false,
+            }
+        );
+
+        let submission = plan_composer_submission(provider, "send", false, input.as_slice());
+        assert_eq!(
+            submission
+                .capabilities
+                .iter()
+                .map(|capability| capability.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "skill:user:user",
+                "mcp-server:workspace:docs",
+                "mcp-tool:workspace:docs:search",
+            ]
+        );
+        assert_eq!(
+            submission
+                .removed
+                .iter()
+                .map(|removed| (removed.capability.id.as_str(), removed.reason))
+                .collect::<Vec<_>>(),
+            vec![(
+                "skill:system:system",
+                ComposerCapabilityRemovalReason::SkillSourceNotExportable,
+            )]
+        );
+        assert!(submission.has_composer_payload);
+    }
+
+    #[test]
+    fn text_and_voice_build_the_same_cli_capability_submission() {
+        let input = vec![
+            skill_capability_from_source("registry", "registry"),
+            mcp_server_capability("appstoreconnect"),
+            mcp_tool_capability("appstoreconnect", "list_apps"),
+        ];
+        let text = plan_composer_submission(
+            Some("cli_runtime:codex"),
+            "inspect releases",
+            false,
+            input.as_slice(),
+        );
+        let voice = plan_composer_submission(Some("cli_runtime:codex"), "", true, input.as_slice());
+
+        assert_eq!(text.target, voice.target);
+        assert_eq!(text.capabilities, voice.capabilities);
+        assert_eq!(text.removed, voice.removed);
+        assert!(text.has_composer_payload);
+        assert!(voice.has_composer_payload);
+    }
+
+    #[test]
     fn selectable_skill_target_filter_uses_the_same_exact_source_rule() {
         let rows = ["user", "registry", "system", "future"]
             .into_iter()
@@ -1947,6 +2228,32 @@ mod tests {
 
         assert_eq!(capabilities.len(), 1);
         assert_eq!(capabilities[0].id, "mcp-server:workspace:resend");
+    }
+
+    #[test]
+    fn replacing_mcp_picker_selection_preserves_skills_and_removes_stale_mcp_rows() {
+        let old_server = mcp_server_capability("old");
+        let skill = skill_capability("docs");
+        let server = selectable_mcp_server_from_item(&mcp_server("resend"));
+        let tool = filter_mcp_tool_capability_rows(
+            &mcp_details("resend", vec![mcp_tool("send", "Send email")]),
+            "",
+        )
+        .into_iter()
+        .next()
+        .expect("tool row");
+        let selected = HashSet::from([tool.key.clone()]);
+
+        let capabilities = replace_selected_mcp_composer_capabilities(
+            &[skill.clone(), old_server],
+            std::slice::from_ref(&server),
+            std::slice::from_ref(&tool),
+            &selected,
+        );
+
+        assert_eq!(capabilities.len(), 2);
+        assert_eq!(capabilities[0], skill);
+        assert_eq!(capabilities[1].id, "mcp-tool:workspace:resend:send");
     }
 
     #[test]

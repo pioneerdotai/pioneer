@@ -60,8 +60,8 @@ use crate::{
 };
 use pioneer_protocol::{
     ArtifactSummary, GatewayNotification, GatewayRemoteAccessStatusChangedNotification,
-    GatewayThreadEpisodicVectorRefillStatusChangedNotification, Workspace,
-    WorkspaceChangedNotification,
+    GatewayThreadEpisodicVectorRefillStatusChangedNotification,
+    GatewayVoiceInputStatusChangedNotification, Workspace, WorkspaceChangedNotification,
 };
 
 #[derive(Clone)]
@@ -141,6 +141,7 @@ pub enum ClientRuntimeNotification {
     GatewayThreadEpisodicVectorRefillStatusChanged(
         GatewayThreadEpisodicVectorRefillStatusChangedNotification,
     ),
+    GatewayVoiceInputStatusChanged(GatewayVoiceInputStatusChangedNotification),
     WorkspaceChanged {
         notification: WorkspaceChangedNotification,
         preference: WorkspacePreferenceReduction,
@@ -634,6 +635,9 @@ pub fn reduce_gateway_notification(
                 None
             }
         }
+        GatewayNotification::GatewayVoiceInputStatusChanged(notification) => Some(
+            ClientRuntimeNotification::GatewayVoiceInputStatusChanged(notification),
+        ),
         GatewayNotification::ThreadTimelineBlocksChanged(notification) => {
             Some(ClientRuntimeNotification::SemanticTimeline(
                 SemanticTimelineLiveUpdate::ThreadTimelineBlocksChanged(notification),
@@ -709,7 +713,9 @@ mod tests {
         GatewayRemoteAccessErrorKind, GatewayRemoteAccessState,
         GatewayRemoteAccessStatusChangedNotification, GatewayRemoteAccessStatusSnapshot,
         GatewayThreadEpisodicVectorRefillStatus,
-        GatewayThreadEpisodicVectorRefillStatusChangedNotification, SkillsChangedNotification,
+        GatewayThreadEpisodicVectorRefillStatusChangedNotification, GatewayVoiceInputProvider,
+        GatewayVoiceInputRuntimePhase, GatewayVoiceInputRuntimeSnapshot, GatewayVoiceInputSettings,
+        GatewayVoiceInputStatusChangedNotification, SkillsChangedNotification,
         ThreadTimelineBlocksChangedNotification, TimelineChangeReason,
         TurnPermissionApprovalRequest, TurnPermissionApprovalResolution,
         TurnPermissionRequestOpenedNotification, TurnPermissionRequestResolvedNotification,
@@ -1157,6 +1163,36 @@ mod tests {
             },
         );
         assert!(ignored.is_none());
+    }
+
+    #[test]
+    fn voice_input_status_notification_reaches_shared_client_runtime() {
+        let expected = GatewayVoiceInputStatusChangedNotification {
+            settings: GatewayVoiceInputSettings {
+                enabled: true,
+                provider: Some(GatewayVoiceInputProvider::Local),
+                model: Some("parakeet-tdt-0.6b-v3".to_owned()),
+                runtime: GatewayVoiceInputRuntimeSnapshot {
+                    phase: GatewayVoiceInputRuntimePhase::Downloading,
+                    effective_enabled: false,
+                    model: Some("parakeet-tdt-0.6b-v3".to_owned()),
+                    downloaded_bytes: Some(1024),
+                    total_bytes: Some(4096),
+                    error: None,
+                },
+            },
+        };
+
+        let reduced = reduce_gateway_notification(
+            GatewayNotification::GatewayVoiceInputStatusChanged(expected.clone()),
+            ClientRuntimeNotificationContext::default(),
+        );
+
+        let Some(ClientRuntimeNotification::GatewayVoiceInputStatusChanged(actual)) = reduced
+        else {
+            panic!("expected Voice Input status notification");
+        };
+        assert_eq!(actual, expected);
     }
 
     #[test]

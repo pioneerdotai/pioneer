@@ -1147,6 +1147,32 @@ where
     )
 }
 
+pub fn provider_list_transcription_models<TTransport>(
+    transport: &TTransport,
+    params: ProviderListModelsParams,
+) -> Result<ProviderListModelsResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.workspace_id.as_str(),
+        "workspace_id",
+        methods::PROVIDER_TRANSCRIPTION_MODELS_LIST,
+    )?;
+    require_non_empty_field(
+        params.provider.as_str(),
+        "provider",
+        methods::PROVIDER_TRANSCRIPTION_MODELS_LIST,
+    )?;
+
+    send_json_rpc_request_typed(
+        transport,
+        methods::PROVIDER_TRANSCRIPTION_MODELS_LIST,
+        &params,
+        PROVIDER_MODELS_TIMEOUT,
+    )
+}
+
 pub fn provider_set_api_key<TTransport>(
     transport: &TTransport,
     params: ProviderSetApiKeyParams,
@@ -2287,6 +2313,15 @@ mod tests {
                 methods::PROVIDER_LIST => json!({
                     "providers": [{"name": "openai"}]
                 }),
+                methods::PROVIDER_TRANSCRIPTION_MODELS_LIST => {
+                    let params = request.params.as_ref().expect("request params");
+                    assert_eq!(params["workspace_id"], json!("ws_1"));
+                    assert_eq!(params["provider"], json!("local"));
+                    json!({
+                        "provider": "local",
+                        "models": []
+                    })
+                }
                 _ => return Err(WEBSOCKET_WORKER_UNAVAILABLE_MESSAGE.to_owned()),
             };
 
@@ -2714,6 +2749,21 @@ mod tests {
     }
 
     #[test]
+    fn provider_list_transcription_models_uses_exact_method_and_payload() {
+        let response = provider_list_transcription_models(
+            &FakeTransport,
+            ProviderListModelsParams {
+                workspace_id: "ws_1".to_owned(),
+                provider: "local".to_owned(),
+            },
+        )
+        .expect("transcription model list");
+
+        assert_eq!(response.provider, "local");
+        assert!(response.models.is_empty());
+    }
+
+    #[test]
     fn ws_command_sender_provider_validation_matches_desktop_contract() {
         assert_eq!(
             format!(
@@ -2755,6 +2805,20 @@ mod tests {
                 .expect_err("provider should be required")
             ),
             "provider is required for provider/embedding_models/list"
+        );
+        assert_eq!(
+            format!(
+                "{:#}",
+                provider_list_transcription_models(
+                    &PanicTransport,
+                    ProviderListModelsParams {
+                        workspace_id: "ws_1".to_owned(),
+                        provider: " ".to_owned(),
+                    },
+                )
+                .expect_err("provider should be required")
+            ),
+            "provider is required for provider/transcription_models/list"
         );
         assert_eq!(
             format!(

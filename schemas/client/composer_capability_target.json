@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ComposerCapabilityTarget",
+  "description": "Capability eligibility context.\n\nThe target kind exists only because native skills retain their current\nsource policy while CLI skills must be exportable. Capability support is\nrepresented exclusively by [`ComposerCapabilityPolicy`].",
+  "type": "object",
+  "properties": {
+    "kind": {
+      "$ref": "#/$defs/ComposerCapabilityTargetKind"
+    },
+    "supports_mcp_tools": {
+      "type": "boolean"
+    },
+    "supports_skills": {
+      "type": "boolean"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "kind",
+    "supports_skills",
+    "supports_mcp_tools"
+  ],
+  "$defs": {
+    "ComposerCapabilityTargetKind": {
+      "type": "string",
+      "enum": [
+        "native",
+        "cli"
+      ]
+    }
+  }
+}

@@ -1,3 +1,6 @@
+use pioneer_client::settings::voice::{
+    VoiceInputSettingsPlan, VoiceInputSettingsPlanRequest, VoiceInputStatusReduction,
+};
 use pioneer_client::{
     gateway::{
         timings::{GatewayTimingError, GatewayWsTimings},
@@ -12,7 +15,7 @@ use pioneer_client::{
     transport::ws::GatewayWsEvent,
     voice::{VoiceSessionResultReduction, reduce_voice_session_result_notification},
 };
-use pioneer_protocol::GatewayNotification;
+use pioneer_protocol::{GatewayNotification, GatewaySettingsUpdate, GatewayVoiceInputSettings};
 use serde::{Deserialize, Serialize};
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -88,6 +91,42 @@ pub struct ClientGatewayConnectRequest {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClientGatewayConnectResult {
     pub connection_id: u64,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientGatewaySettingsGetRequest {}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientGatewaySettingsUpdateRequest {
+    pub update: GatewaySettingsUpdate,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ClientVoiceInputPlanRequest {
+    SettingsAction {
+        request: VoiceInputSettingsPlanRequest,
+    },
+    StatusReduction {
+        current: GatewayVoiceInputSettings,
+    },
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum ClientVoiceInputPlanResult {
+    SettingsAction {
+        plan: VoiceInputSettingsPlan,
+    },
+    StatusReduction {
+        reduction: VoiceInputStatusReduction,
+    },
 }
 
 pub fn reduce_gateway_ws_events_to_client_events(

@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "VoiceInputStatusReduction",
+  "type": "object",
+  "properties": {
+    "desired_enabled": {
+      "type": "boolean"
+    },
+    "effective_enabled": {
+      "type": "boolean"
+    },
+    "model_selected": {
+      "type": "boolean"
+    },
+    "non_terminal": {
+      "type": "boolean"
+    },
+    "phase": {
+      "$ref": "#/$defs/GatewayVoiceInputRuntimePhase"
+    },
+    "presentation": {
+      "$ref": "#/$defs/VoiceInputRuntimePresentation"
+    },
+    "retry_available": {
+      "type": "boolean"
+    },
+    "show_progress": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "phase",
+    "presentation",
+    "desired_enabled",
+    "effective_enabled",
+    "model_selected",
+    "non_terminal",
+    "show_progress",
+    "retry_available"
+  ],
+  "$defs": {
+    "GatewayVoiceInputRuntimePhase": {
+      "type": "string",
+      "enum": [
+        "disabled",
+        "model_not_selected",
+        "missing",
+        "downloading",
+        "installing",
+        "loading",
+        "ready",
+        "failed"
+      ]
+    },
+    "VoiceInputRuntimePresentation": {
+      "type": "string",
+      "enum": [
+        "disabled",
+        "needs_selection",
+        "preparing",
+        "ready",
+        "failed"
+      ]
+    }
+  }
+}

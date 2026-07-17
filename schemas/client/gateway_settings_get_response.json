@@ -1,31 +1,14 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "CLIRuntimeProviderSettingsPlan",
-  "oneOf": [
-    {
-      "type": "object",
-      "properties": {
-        "Send": {
-          "$ref": "#/$defs/GatewaySettingsUpdatePlan"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "Send"
-      ]
-    },
-    {
-      "type": "object",
-      "properties": {
-        "Reject": {
-          "$ref": "#/$defs/CLIRuntimeProviderSettingsRejection"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "Reject"
-      ]
+  "title": "GatewaySettingsGetResponse",
+  "type": "object",
+  "properties": {
+    "settings": {
+      "$ref": "#/$defs/GatewaySettingsSnapshot"
     }
+  },
+  "required": [
+    "settings"
   ],
   "$defs": {
     "CLIAgentRuntimeKind": {
@@ -33,166 +16,6 @@
       "enum": [
         "codex",
         "claude"
-      ]
-    },
-    "CLIRuntimeProviderSettingsRejection": {
-      "oneOf": [
-        {
-          "type": "string",
-          "enum": [
-            "MissingSettings",
-            "EmptyId",
-            "ShadowHomeMatchesHome"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "MissingRuntime": {
-              "type": "object",
-              "properties": {
-                "runtime_id": {
-                  "type": "string"
-                }
-              },
-              "required": [
-                "runtime_id"
-              ]
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "MissingRuntime"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "InvalidId": {
-              "type": "object",
-              "properties": {
-                "id": {
-                  "type": "string"
-                },
-                "message": {
-                  "type": "string"
-                }
-              },
-              "required": [
-                "id",
-                "message"
-              ]
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "InvalidId"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "DuplicateId": {
-              "type": "object",
-              "properties": {
-                "id": {
-                  "type": "string"
-                }
-              },
-              "required": [
-                "id"
-              ]
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "DuplicateId"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "DuplicateDisplayName": {
-              "type": "object",
-              "properties": {
-                "display_name": {
-                  "type": "string"
-                }
-              },
-              "required": [
-                "display_name"
-              ]
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "DuplicateDisplayName"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "EmptyPath": {
-              "type": "object",
-              "properties": {
-                "field": {
-                  "type": "string"
-                }
-              },
-              "required": [
-                "field"
-              ]
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "EmptyPath"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "InvalidPath": {
-              "type": "object",
-              "properties": {
-                "field": {
-                  "type": "string"
-                },
-                "message": {
-                  "type": "string"
-                }
-              },
-              "required": [
-                "field",
-                "message"
-              ]
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "InvalidPath"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "UnsupportedKind": {
-              "type": "object",
-              "properties": {
-                "kind": {
-                  "$ref": "#/$defs/CLIAgentRuntimeKind"
-                }
-              },
-              "required": [
-                "kind"
-              ]
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "UnsupportedKind"
-          ]
-        }
       ]
     },
     "GatewayCliRuntimeInstanceSettings": {
@@ -256,27 +79,6 @@
           "default": {
             "source": "thread"
           }
-        }
-      }
-    },
-    "GatewayGeneralSettingsUpdate": {
-      "type": "object",
-      "properties": {
-        "keepawake": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "preflight_model": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/GatewayMemoryModelSelection"
-            },
-            {
-              "type": "null"
-            }
-          ]
         }
       }
     },
@@ -402,35 +204,6 @@
         "transport": {
           "$ref": "#/$defs/GatewayRemoteAccessTransport",
           "default": "tcp"
-        }
-      }
-    },
-    "GatewayRemoteAccessSettingsUpdate": {
-      "type": "object",
-      "properties": {
-        "clear_key": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "enabled": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "key": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "server": {
-          "type": [
-            "string",
-            "null"
-          ]
         }
       }
     },
@@ -583,86 +356,6 @@
         "memory"
       ]
     },
-    "GatewaySettingsUpdate": {
-      "type": "object",
-      "properties": {
-        "cli_runtimes": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/GatewayCliRuntimeSettings"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "general": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/GatewayGeneralSettingsUpdate"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "memory": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/GatewayMemorySettings"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "remote_access": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/GatewayRemoteAccessSettingsUpdate"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "thread_episodic": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/GatewayThreadEpisodicSettingsUpdate"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "voice_input": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/GatewayVoiceInputSettingsUpdate"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        }
-      }
-    },
-    "GatewaySettingsUpdatePlan": {
-      "type": "object",
-      "properties": {
-        "snapshot": {
-          "$ref": "#/$defs/GatewaySettingsSnapshot"
-        },
-        "update": {
-          "$ref": "#/$defs/GatewaySettingsUpdate"
-        }
-      },
-      "required": [
-        "snapshot",
-        "update"
-      ]
-    },
     "GatewayThreadEpisodicSettings": {
       "type": "object",
       "properties": {
@@ -775,146 +468,6 @@
         "near_capacity_percent"
       ]
     },
-    "GatewayThreadEpisodicSettingsUpdate": {
-      "type": "object",
-      "properties": {
-        "default_max_candidates": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint32",
-          "minimum": 0
-        },
-        "default_prompt_chars": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint32",
-          "minimum": 0
-        },
-        "enabled": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "index_batch_limit": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint32",
-          "minimum": 0
-        },
-        "indexing_enabled": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "max_attempts": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "int64"
-        },
-        "max_candidate_work": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint32",
-          "minimum": 0
-        },
-        "max_hit_chars": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint32",
-          "minimum": 0
-        },
-        "max_prompt_chars": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint32",
-          "minimum": 0
-        },
-        "max_segments": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint32",
-          "minimum": 0
-        },
-        "min_relevancy": {
-          "type": [
-            "number",
-            "null"
-          ],
-          "format": "float"
-        },
-        "min_results": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint32",
-          "minimum": 0
-        },
-        "near_capacity_percent": {
-          "type": [
-            "number",
-            "null"
-          ],
-          "format": "double"
-        },
-        "recall_enabled": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "retry_base_delay_secs": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "int64"
-        },
-        "retry_max_delay_secs": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "int64"
-        },
-        "snippet_chars": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint32",
-          "minimum": 0
-        },
-        "vector_search": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/GatewayThreadEpisodicVectorSearchSettingsUpdate"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        }
-      }
-    },
     "GatewayThreadEpisodicVectorLocalModelStatus": {
       "type": "string",
       "enum": [
@@ -1020,51 +573,6 @@
         }
       }
     },
-    "GatewayThreadEpisodicVectorSearchSettingsUpdate": {
-      "type": "object",
-      "properties": {
-        "embedding_normalized": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "enabled": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "local_model": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "model": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "provider": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/GatewayThreadEpisodicVectorProvider"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "use_search_instructions": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        }
-      }
-    },
     "GatewayVoiceInputProvider": {
       "type": "string",
       "enum": [
@@ -1154,36 +662,6 @@
             "effective_enabled": false,
             "phase": "disabled"
           }
-        }
-      }
-    },
-    "GatewayVoiceInputSettingsUpdate": {
-      "type": "object",
-      "properties": {
-        "enabled": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "model": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "provider": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/GatewayVoiceInputProvider"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "retry_install": {
-          "type": "boolean"
         }
       }
     }
