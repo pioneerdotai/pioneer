@@ -70,12 +70,12 @@ jobs:
             asset_name: pioneer-gateway-windows-x86_64-computer-use.zip
             archive: zip
             cargo_features: computer-use
-          - os: windows-latest
+          - os: windows-11-arm
             target: aarch64-pc-windows-msvc
             asset_name: pioneer-gateway-windows-aarch64.zip
             archive: zip
             cargo_features: ""
-          - os: windows-latest
+          - os: windows-11-arm
             target: aarch64-pc-windows-msvc
             asset_name: pioneer-gateway-windows-aarch64-computer-use.zip
             archive: zip
@@ -178,6 +178,9 @@ jobs:
             $env:CMAKE_C_COMPILER_TARGET = $target
             $env:CMAKE_CXX_COMPILER_TARGET = $target
             $env:CL = "/EHsc"
+            # ccache exited successfully without producing clang-cl ARM64
+            # object files in release builds, so invoke the compiler directly.
+            $env:GGML_CCACHE = "OFF"
           }
 
           $cargoArgs = @("build", "--locked", "--release", "-p", "pioneer-cli")

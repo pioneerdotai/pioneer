@@ -287,6 +287,9 @@ if ($Target -eq "aarch64-pc-windows-msvc") {
     $env:CMAKE_C_COMPILER_TARGET = $Target
     $env:CMAKE_CXX_COMPILER_TARGET = $Target
     $env:CL = "/EHsc"
+    # ccache exited successfully without producing clang-cl ARM64 object files
+    # in release builds, so invoke the compiler directly.
+    $env:GGML_CCACHE = "OFF"
 }
 
 cargo build --release -p pioneer-desktop --target $Target

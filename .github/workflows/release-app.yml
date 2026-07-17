@@ -66,7 +66,7 @@ jobs:
             asset_name: Pioneer-x86_64.msi
             update_asset_name: Pioneer-x86_64.exe
             windows_exe_name: Pioneer-x86_64.exe
-          - os: windows-latest
+          - os: windows-11-arm
             target: aarch64-pc-windows-msvc
             package_kind: windows_msi
             asset_name: Pioneer-aarch64.msi
