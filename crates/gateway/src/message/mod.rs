@@ -89,32 +89,32 @@ use pioneer_protocol::{
     CLIRuntimeThreadCompactParams, CLIRuntimeThreadForkParams, CLIRuntimeThreadForkResponse,
     CLIRuntimeTurnSteerParams, CLIRuntimeTurnSteerResponse, ContextCompressedNotification,
     ContextCompressingNotification, GatewayRemoteAccessStatusChangedNotification,
-    GatewayThreadEpisodicVectorRefillStatusChangedNotification, INVALID_PARAMS_CODE,
-    INVALID_REQUEST_CODE, ItemCompletedNotification, ItemDeltaNotification, ItemDeltaStream,
-    ItemStartedNotification, ItemTimeoutDetectedNotification, JSONRPC_VERSION,
-    JsonRpcErrorResponse, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
-    MARKDOWN_AST_VERSION, METHOD_NOT_FOUND_CODE, McpAuditEventSummary, McpChangedAction,
-    McpChangedItem, McpChangedNotification, McpDiagnosticLevel, McpInstallParams,
-    McpInstallResponse, McpInstallResult, McpInstallResultStatus, McpInstallStatus,
-    McpLifecycleAuditSummary, McpListItem, McpListParams, McpListResponse, McpPolicySetParams,
-    McpPolicySetResponse, McpPolicyState, McpPromptCatalogItem, McpResourceCatalogItem,
-    McpResourceTemplateCatalogItem, McpRuntimeState, McpRuntimeStatus, McpServerCatalogDetails,
-    McpServerDetailsParams, McpServerDetailsResponse, McpServerHealthDetails, McpServerPolicy,
-    McpServerRestartParams, McpServerRestartResponse, McpServerStatus, McpSourceKind,
-    McpToolAnnotationSummary, McpToolCatalogItem, McpTransportSummary, McpTurnBindingSummary,
-    McpUninstallParams, McpUninstallResponse, McpValidationDiagnostic, PARSE_ERROR_CODE,
-    ProviderConfigureParams, ProviderConfigureResponse, ProviderDeleteApiKeyParams,
-    ProviderDeleteApiKeyResponse, ProviderListModelsParams, ProviderListModelsResponse,
-    ProviderListParams, ProviderListResponse, ProviderModelCapabilities, ProviderModelInfo,
-    ProviderModelLimits, ProviderModelPricing, ProviderModelReasoningCapabilities,
-    ProviderSetApiKeyParams, ProviderSetApiKeyResponse, ProviderSummary,
-    ProviderSummaryCapabilities, ReasoningCapabilitySource, RequestId, RuntimeAccountSnapshot,
-    RuntimeCapabilities, RuntimeDiagnostic, RuntimeDiagnosticLevel, RuntimeModelInfo,
-    RuntimeStatus, RuntimeSummary, SkillsUploadAbortParams, SkillsUploadFinishParams,
-    SkillsUploadStartParams, SystemEventLevel, TaskAcceptParams, TaskAgendaParams,
-    TaskCancelParams, TaskCreateParams, TaskDeliveriesParams, TaskDelivery, TaskDeliveryAttempt,
-    TaskDeliveryMode, TaskDetachParams, TaskEventsParams, TaskGetParams, TaskListParams,
-    TaskPauseParams, TaskRescheduleParams, TaskResumeParams, TaskReviseParams,
+    GatewayThreadEpisodicVectorRefillStatusChangedNotification, GatewayVoiceInputSettings,
+    GatewayVoiceInputStatusChangedNotification, INVALID_PARAMS_CODE, INVALID_REQUEST_CODE,
+    ItemCompletedNotification, ItemDeltaNotification, ItemDeltaStream, ItemStartedNotification,
+    ItemTimeoutDetectedNotification, JSONRPC_VERSION, JsonRpcErrorResponse, JsonRpcNotification,
+    JsonRpcRequest, JsonRpcResponse, MARKDOWN_AST_VERSION, METHOD_NOT_FOUND_CODE,
+    McpAuditEventSummary, McpChangedAction, McpChangedItem, McpChangedNotification,
+    McpDiagnosticLevel, McpInstallParams, McpInstallResponse, McpInstallResult,
+    McpInstallResultStatus, McpInstallStatus, McpLifecycleAuditSummary, McpListItem, McpListParams,
+    McpListResponse, McpPolicySetParams, McpPolicySetResponse, McpPolicyState,
+    McpPromptCatalogItem, McpResourceCatalogItem, McpResourceTemplateCatalogItem, McpRuntimeState,
+    McpRuntimeStatus, McpServerCatalogDetails, McpServerDetailsParams, McpServerDetailsResponse,
+    McpServerHealthDetails, McpServerPolicy, McpServerRestartParams, McpServerRestartResponse,
+    McpServerStatus, McpSourceKind, McpToolAnnotationSummary, McpToolCatalogItem,
+    McpTransportSummary, McpTurnBindingSummary, McpUninstallParams, McpUninstallResponse,
+    McpValidationDiagnostic, PARSE_ERROR_CODE, ProviderConfigureParams, ProviderConfigureResponse,
+    ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse, ProviderListModelsParams,
+    ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
+    ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits, ProviderModelPricing,
+    ProviderModelReasoningCapabilities, ProviderSetApiKeyParams, ProviderSetApiKeyResponse,
+    ProviderSummary, ProviderSummaryCapabilities, ReasoningCapabilitySource, RequestId,
+    RuntimeAccountSnapshot, RuntimeCapabilities, RuntimeDiagnostic, RuntimeDiagnosticLevel,
+    RuntimeModelInfo, RuntimeStatus, RuntimeSummary, SkillsUploadAbortParams,
+    SkillsUploadFinishParams, SkillsUploadStartParams, SystemEventLevel, TaskAcceptParams,
+    TaskAgendaParams, TaskCancelParams, TaskCreateParams, TaskDeliveriesParams, TaskDelivery,
+    TaskDeliveryAttempt, TaskDeliveryMode, TaskDetachParams, TaskEventsParams, TaskGetParams,
+    TaskListParams, TaskPauseParams, TaskRescheduleParams, TaskResumeParams, TaskReviseParams,
     TaskTreeParams as TaskTreeTaskParams, TaskWaitParams, ThreadAgentsDocArchiveParams,
     ThreadAgentsDocArchiveResponse, ThreadAgentsDocChangedNotification, ThreadAgentsDocGetParams,
     ThreadAgentsDocGetResponse, ThreadAgentsDocPayload, ThreadAgentsDocResolveForThreadParams,
@@ -135,10 +135,10 @@ use pioneer_protocol::{
     TurnResumeResponse, TurnStartParams, TurnStatus, VoiceError, VoiceErrorKind,
     VoiceSessionCancelParams, VoiceSessionCancelResponse, VoiceSessionFinalizeParams,
     VoiceSessionFinalizeResponse, VoiceSessionStartParams, VoiceSessionStartResponse, VoiceStatus,
-    VoiceStatusParams, Workspace, WorkspaceChangeKind, WorkspaceChangedNotification,
-    WorkspaceCreateParams, WorkspaceCreateResponse, WorkspaceDefaultParams,
-    WorkspaceDefaultResponse, WorkspaceListParams, WorkspaceListResponse, WorkspaceSelectParams,
-    WorkspaceSelectResponse, WorkspaceUpdateParams, WorkspaceUpdateResponse,
+    VoiceStatusParams, VoiceStatusResponse, Workspace, WorkspaceChangeKind,
+    WorkspaceChangedNotification, WorkspaceCreateParams, WorkspaceCreateResponse,
+    WorkspaceDefaultParams, WorkspaceDefaultResponse, WorkspaceListParams, WorkspaceListResponse,
+    WorkspaceSelectParams, WorkspaceSelectResponse, WorkspaceUpdateParams, WorkspaceUpdateResponse,
     constants::{events, methods},
     generate_id, sanitize_runtime_diagnostic_line, sanitize_runtime_diagnostic_lines,
     validate_voice_streaming_audio_format,
@@ -180,12 +180,9 @@ use crate::resilience::{
 use crate::secrets::GatewaySecrets;
 use crate::session::{ConnectionId, SessionManager};
 use crate::thread::ThreadManager;
-use crate::voice::model_bootstrap::VoiceModelBootstrapHandle;
 use crate::voice::session_buffer::GatewayVoiceSessionBufferStore;
 use crate::voice::session_store::GatewayVoiceSessionStore;
-use crate::voice::transcription::{
-    GatewayVoiceTranscriptionRuntime, UnconfiguredVoiceSpeechTranscriber, VoiceSpeechTranscriber,
-};
+use crate::voice::supervisor::VoiceInputSupervisor;
 use crate::workspace::{WorkspaceError, WorkspaceManager};
 
 pub(crate) type MessageFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -408,11 +405,10 @@ pub struct MessageProcessor {
     thread_episodic_embedding_provider_resolver:
         Arc<ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver>,
     thread_episodic_recall_service: Arc<ThreadEpisodicRecallService>,
-    voice_model_bootstrap: Arc<VoiceModelBootstrapHandle>,
+    voice_input_supervisor: Option<Arc<VoiceInputSupervisor>>,
+    gateway_settings_update_lock: Arc<Mutex<()>>,
     pub(crate) voice_sessions: GatewayVoiceSessionStore,
     pub(crate) voice_session_buffers: GatewayVoiceSessionBufferStore,
-    pub(crate) voice_transcription_runtime:
-        GatewayVoiceTranscriptionRuntime<Box<dyn VoiceSpeechTranscriber>>,
 }
 
 #[derive(Clone)]
@@ -711,15 +707,10 @@ impl MessageProcessor {
             thread_episodic_index_executor,
             thread_episodic_embedding_provider_resolver,
             thread_episodic_recall_service,
-            voice_model_bootstrap: Arc::new(VoiceModelBootstrapHandle::unavailable(
-                "local voice model bootstrap has not started",
-            )),
+            voice_input_supervisor: None,
+            gateway_settings_update_lock: Arc::new(Mutex::new(())),
             voice_sessions: GatewayVoiceSessionStore::default(),
             voice_session_buffers: GatewayVoiceSessionBufferStore::default(),
-            voice_transcription_runtime: GatewayVoiceTranscriptionRuntime::new(Box::new(
-                UnconfiguredVoiceSpeechTranscriber,
-            )
-                as Box<dyn VoiceSpeechTranscriber>),
         }
     }
 
@@ -735,22 +726,11 @@ impl MessageProcessor {
         self
     }
 
-    pub(crate) fn with_voice_model_bootstrap(
+    pub(crate) fn with_voice_input_supervisor(
         mut self,
-        voice_model_bootstrap: Arc<VoiceModelBootstrapHandle>,
+        supervisor: Arc<VoiceInputSupervisor>,
     ) -> Self {
-        self.voice_model_bootstrap = voice_model_bootstrap;
-        self
-    }
-
-    pub(crate) fn with_voice_transcriber<T>(mut self, transcriber: T) -> Self
-    where
-        T: VoiceSpeechTranscriber + 'static,
-    {
-        self.voice_transcription_runtime = GatewayVoiceTranscriptionRuntime::new(Box::new(
-            transcriber,
-        )
-            as Box<dyn VoiceSpeechTranscriber>);
+        self.voice_input_supervisor = Some(supervisor);
         self
     }
 
@@ -783,6 +763,70 @@ impl MessageProcessor {
                         &GatewayRemoteAccessStatusChangedNotification { status },
                     )
                     .await;
+            }
+        });
+    }
+
+    pub fn start_voice_input_status_notifications(self: &Arc<Self>) {
+        let Some(supervisor) = self.voice_input_supervisor.as_ref() else {
+            return;
+        };
+        let mut status_rx = supervisor.subscribe_settings();
+        let initial_settings = status_rx.borrow().clone();
+        let processor = Arc::downgrade(self);
+        let _status_notifications = tokio::spawn(async move {
+            const PROGRESS_THROTTLE: Duration = Duration::from_millis(250);
+            let mut previous = initial_settings;
+            let mut last_notification = tokio::time::Instant::now() - PROGRESS_THROTTLE;
+
+            loop {
+                if status_rx.changed().await.is_err() {
+                    break;
+                }
+                let mut settings = status_rx.borrow_and_update().clone();
+                if settings == previous {
+                    continue;
+                }
+
+                if !voice_input_semantic_status_changed(&previous, &settings)
+                    && last_notification.elapsed() < PROGRESS_THROTTLE
+                {
+                    let deadline = last_notification + PROGRESS_THROTTLE;
+                    loop {
+                        tokio::select! {
+                            _ = tokio::time::sleep_until(deadline) => break,
+                            changed = status_rx.changed() => {
+                                if changed.is_err() {
+                                    return;
+                                }
+                                let latest = status_rx.borrow_and_update().clone();
+                                let semantic_change =
+                                    voice_input_semantic_status_changed(&previous, &latest);
+                                settings = latest;
+                                if semantic_change {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if settings == previous {
+                    continue;
+                }
+                let Some(processor) = processor.upgrade() else {
+                    break;
+                };
+                processor
+                    .send_notification_to_all_connections(
+                        events::GATEWAY_VOICE_INPUT_STATUS_CHANGED,
+                        &GatewayVoiceInputStatusChangedNotification {
+                            settings: settings.clone(),
+                        },
+                    )
+                    .await;
+                previous = settings;
+                last_notification = tokio::time::Instant::now();
             }
         });
     }
@@ -1682,6 +1726,19 @@ impl MessageProcessor {
     }
 }
 
+fn voice_input_semantic_status_changed(
+    previous: &GatewayVoiceInputSettings,
+    current: &GatewayVoiceInputSettings,
+) -> bool {
+    previous.enabled != current.enabled
+        || previous.provider != current.provider
+        || previous.model != current.model
+        || previous.runtime.phase != current.runtime.phase
+        || previous.runtime.effective_enabled != current.runtime.effective_enabled
+        || previous.runtime.model != current.runtime.model
+        || previous.runtime.error != current.runtime.error
+}
+
 fn empty_object_value() -> JsonValue {
     JsonValue::Object(serde_json::Map::new())
 }
@@ -2325,13 +2382,10 @@ impl MessageProcessor {
             thread_episodic_index_executor,
             thread_episodic_embedding_provider_resolver,
             thread_episodic_recall_service,
-            voice_model_bootstrap: Arc::new(VoiceModelBootstrapHandle::ready()),
+            voice_input_supervisor: None,
+            gateway_settings_update_lock: Arc::new(Mutex::new(())),
             voice_sessions: GatewayVoiceSessionStore::default(),
             voice_session_buffers: GatewayVoiceSessionBufferStore::default(),
-            voice_transcription_runtime: GatewayVoiceTranscriptionRuntime::new(Box::new(
-                UnconfiguredVoiceSpeechTranscriber,
-            )
-                as Box<dyn VoiceSpeechTranscriber>),
         }
     }
 }

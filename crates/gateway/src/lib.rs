@@ -90,9 +90,11 @@ use crate::thread_episodic::{
     ThreadEpisodicRuntimeConfig,
 };
 use crate::transport::spawn_server;
-use crate::voice::model_bootstrap::start_parakeet_v3_int8_bootstrap;
-use crate::voice::model_catalog::{parakeet_v3_int8_install_layout, voice_model_catalog};
-use crate::voice::parakeet_runtime::TranscribeRsParakeetSpeechTranscriber;
+use crate::voice::model_catalog::voice_model_catalog;
+use crate::voice::supervisor::{
+    EagerVoiceEngineLoader, FilesystemVoiceModelInstaller, VoiceEngineLoader,
+    VoiceInputDesiredState, VoiceInputSupervisor, VoiceModelInstaller,
+};
 use crate::workspace::WorkspaceManager;
 
 pub use crate::operations::{
@@ -108,6 +110,24 @@ pub use crate::settings::{
 };
 
 const HOME_DIRECTORY_TOKEN: &str = "{homeDirectory}";
+
+fn start_voice_input_supervisor(
+    installer: Arc<dyn VoiceModelInstaller>,
+    engine_loader: Arc<dyn VoiceEngineLoader>,
+    desired: VoiceInputDesiredState,
+) -> Result<Arc<VoiceInputSupervisor>> {
+    let supervisor = Arc::new(VoiceInputSupervisor::new(installer, engine_loader));
+    let applied = supervisor
+        .apply_desired(desired, false)
+        .context("failed to apply persisted Voice Input settings")?;
+    if let Some(reconcile) = applied.reconcile {
+        let worker = supervisor.clone();
+        tokio::spawn(async move {
+            worker.reconcile(reconcile).await;
+        });
+    }
+    Ok(supervisor)
+}
 
 pub async fn run_gateway_until_shutdown() -> Result<()> {
     let mut config = AppConfig::load()?;
@@ -127,17 +147,18 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
     let gateway_settings = load_gateway_settings(&runtime_home, &config)?;
     config = gateway_settings.apply_to_app_config(config);
     let voice_models = voice_model_catalog();
-    let parakeet_layout = parakeet_v3_int8_install_layout(&config, runtime_home.as_path())
-        .context("failed to resolve local voice model install layout")?;
     info!(
         voice_model_count = voice_models.len(),
-        parakeet_model_dir = %parakeet_layout.install_dir.display(),
-        parakeet_archive = %parakeet_layout.archive_path.display(),
         "local voice model catalog is ready"
     );
-    let voice_model_bootstrap =
-        start_parakeet_v3_int8_bootstrap(config.clone(), runtime_home.clone())
-            .context("failed to start local voice model bootstrap")?;
+    let voice_input_supervisor = start_voice_input_supervisor(
+        Arc::new(FilesystemVoiceModelInstaller::new(
+            config.clone(),
+            runtime_home.clone(),
+        )),
+        Arc::new(EagerVoiceEngineLoader),
+        VoiceInputDesiredState::from_config(&config.gateway.voice),
+    )?;
     let gateway_secrets = Arc::new(GatewaySecrets::open(&runtime_home)?);
     let remote_access_supervisor = Arc::new(RemoteAccessSupervisor::new(
         runtime_home.as_path(),
@@ -523,14 +544,12 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
     message_processor.apply_thread_episodic_workspace_vector_search_configs(
         thread_episodic_workspace_vector_search_configs.clone(),
     );
-    message_processor = message_processor.with_voice_model_bootstrap(voice_model_bootstrap);
-    message_processor = message_processor.with_voice_transcriber(
-        TranscribeRsParakeetSpeechTranscriber::new(config.clone(), runtime_home.clone()),
-    );
+    message_processor = message_processor.with_voice_input_supervisor(voice_input_supervisor);
     message_processor =
         message_processor.with_remote_access_supervisor(remote_access_supervisor.clone());
     let message_processor = Arc::new(message_processor);
     message_processor.start_remote_access_status_notifications();
+    message_processor.start_voice_input_status_notifications();
     message_processor.start_thread_episodic_vector_refill_status_notifications();
 
     database::startup::spawn(
@@ -955,11 +974,22 @@ mod tests {
     use super::{
         execution_windows_config_from_gateway_tools_config, expand_home_directory_templates,
         memory_loop_config_from_gateway_memory_config, parse_skill_trust_level,
-        task_runtime_config_from_gateway_tasks_config,
+        start_voice_input_supervisor, task_runtime_config_from_gateway_tasks_config,
         thread_episodic_runtime_config_from_gateway_settings,
     };
     use crate::secrets::GatewaySecrets;
     use crate::settings::GatewayThreadEpisodicSettings;
+    use crate::voice::model_catalog::{VoiceModelCatalogEntry, VoiceModelInstallLayout};
+    use crate::voice::model_install::{
+        VoiceModelCleanupReport, VoiceModelInstallControl, VoiceModelInstallReport,
+    };
+    use crate::voice::runtime::LoadedVoiceEngine;
+    use crate::voice::supervisor::{
+        VoiceEngineLoader, VoiceInputDesiredState, VoiceModelInstaller,
+    };
+    use crate::voice::transcription::{VoiceTranscriptionError, VoiceTranscriptionErrorKind};
+    use anyhow::{Result, bail};
+    use async_trait::async_trait;
     use pioneer_config::{
         GatewayExecutionWindowBudgetConfig, GatewayExecutionWindowTotalBudgetConfig,
         GatewayExecutionWindowsConfig, GatewayMemoryConfig, GatewayMemoryModelSelectionConfig,
@@ -969,8 +999,139 @@ mod tests {
     use pioneer_hooks::HookAwaitPolicy;
     use pioneer_keystore::MemorySecretStore;
     use pioneer_memory::hooks::MemoryActiveRecallMode;
+    use pioneer_protocol::{GatewayVoiceInputProvider, GatewayVoiceInputRuntimePhase};
     use pioneer_skills::SkillTrustLevel;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
+    use tokio_util::sync::CancellationToken;
+
+    struct StartupProbeInstaller {
+        inspections: AtomicUsize,
+        inspected: Notify,
+    }
+
+    impl StartupProbeInstaller {
+        fn new() -> Self {
+            Self {
+                inspections: AtomicUsize::new(0),
+                inspected: Notify::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl VoiceModelInstaller for StartupProbeInstaller {
+        fn verified_install_layout(
+            &self,
+            _entry: &VoiceModelCatalogEntry,
+        ) -> Result<Option<VoiceModelInstallLayout>> {
+            self.inspections.fetch_add(1, Ordering::SeqCst);
+            self.inspected.notify_one();
+            bail!("startup probe stops before model I/O")
+        }
+
+        fn cleanup_non_selected(
+            &self,
+            _selected_model_id: &str,
+            _cancellation: &CancellationToken,
+            _protected_model_id: &std::sync::RwLock<Option<String>>,
+        ) -> Result<VoiceModelCleanupReport> {
+            bail!("startup probe must not clean model installs")
+        }
+
+        async fn install(
+            &self,
+            _entry: VoiceModelCatalogEntry,
+            _force_fresh: bool,
+            _control: VoiceModelInstallControl,
+        ) -> Result<VoiceModelInstallReport> {
+            bail!("startup probe must not download model artifacts")
+        }
+    }
+
+    struct StartupProbeEngineLoader;
+
+    impl VoiceEngineLoader for StartupProbeEngineLoader {
+        fn load(
+            &self,
+            _entry: &VoiceModelCatalogEntry,
+            _layout: &VoiceModelInstallLayout,
+        ) -> std::result::Result<LoadedVoiceEngine, VoiceTranscriptionError> {
+            Err(VoiceTranscriptionError {
+                kind: VoiceTranscriptionErrorKind::RuntimeFailure,
+                message: "startup probe must not load an engine".to_owned(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn voice_startup_disabled() {
+        let installer = Arc::new(StartupProbeInstaller::new());
+        let supervisor = start_voice_input_supervisor(
+            installer.clone(),
+            Arc::new(StartupProbeEngineLoader),
+            VoiceInputDesiredState::default(),
+        )
+        .expect("disabled startup");
+
+        tokio::task::yield_now().await;
+
+        assert_eq!(installer.inspections.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            supervisor.runtime_snapshot().phase,
+            GatewayVoiceInputRuntimePhase::Disabled
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_startup_selected() {
+        let installer = Arc::new(StartupProbeInstaller::new());
+        let supervisor = start_voice_input_supervisor(
+            installer.clone(),
+            Arc::new(StartupProbeEngineLoader),
+            VoiceInputDesiredState {
+                enabled: true,
+                provider: Some(GatewayVoiceInputProvider::Local),
+                model: Some("parakeet-tdt-0.6b-v3".to_owned()),
+            },
+        )
+        .expect("selected startup");
+
+        installer.inspected.notified().await;
+
+        assert_eq!(installer.inspections.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            supervisor.desired().model.as_deref(),
+            Some("parakeet-tdt-0.6b-v3")
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_startup_legacy_install() {
+        let runtime_home = tempfile::tempdir().expect("runtime home");
+        let legacy_install = runtime_home
+            .path()
+            .join("models/voice/parakeet-tdt-0.6b-v3-int8");
+        std::fs::create_dir_all(&legacy_install).expect("legacy install directory");
+        std::fs::write(legacy_install.join(".ready"), b"legacy").expect("legacy ready marker");
+        let installer = Arc::new(StartupProbeInstaller::new());
+
+        let supervisor = start_voice_input_supervisor(
+            installer.clone(),
+            Arc::new(StartupProbeEngineLoader),
+            VoiceInputDesiredState::default(),
+        )
+        .expect("legacy-disabled startup");
+        tokio::task::yield_now().await;
+
+        assert!(legacy_install.exists());
+        assert_eq!(installer.inspections.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            supervisor.runtime_snapshot().phase,
+            GatewayVoiceInputRuntimePhase::Disabled
+        );
+    }
 
     #[test]
     fn provider_key_resolver_reads_latest_keystore_value() {

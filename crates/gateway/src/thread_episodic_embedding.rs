@@ -1158,6 +1158,7 @@ mod tests {
                 vision: false,
                 tool_calling: false,
                 embeddings: self.embeddings,
+                transcription: false,
                 input_types:
                     pioneer_provider::ProviderInputCapabilities::disabled_for_all_file_types(),
             }

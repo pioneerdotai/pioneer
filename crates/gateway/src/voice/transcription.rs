@@ -3,7 +3,9 @@
 use super::vad::{VoiceNoSpeechReason, VoiceSpeechSegment, VoiceVadSegmentationOutcome};
 use pioneer_config::GatewayVoiceTranscriptionStrategy;
 use pioneer_protocol::{VoiceError, VoiceErrorKind};
+#[cfg(test)]
 use std::panic::{AssertUnwindSafe, catch_unwind};
+#[cfg(test)]
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -132,6 +134,8 @@ impl From<GatewayVoiceTranscriptionStrategy> for VoiceTranscriptionStrategy {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VoiceTranscriptionErrorKind {
     ModelUnavailable,
+    EngineNotImplemented,
+    UnsupportedAudioFormat,
     RuntimeFailure,
 }
 
@@ -144,8 +148,10 @@ pub(crate) struct VoiceTranscriptionError {
 impl VoiceTranscriptionError {
     pub(crate) fn into_voice_error(self) -> VoiceError {
         let kind = match self.kind {
-            VoiceTranscriptionErrorKind::ModelUnavailable => VoiceErrorKind::ModelUnavailable,
-            VoiceTranscriptionErrorKind::RuntimeFailure => VoiceErrorKind::TranscriptionFailed,
+            VoiceTranscriptionErrorKind::ModelUnavailable
+            | VoiceTranscriptionErrorKind::EngineNotImplemented => VoiceErrorKind::ModelUnavailable,
+            VoiceTranscriptionErrorKind::UnsupportedAudioFormat
+            | VoiceTranscriptionErrorKind::RuntimeFailure => VoiceErrorKind::TranscriptionFailed,
         };
         VoiceError {
             kind,
@@ -178,26 +184,13 @@ impl VoiceSpeechTranscriber for Box<dyn VoiceSpeechTranscriber> {
     }
 }
 
-#[derive(Clone, Debug, Default)]
-pub(crate) struct UnconfiguredVoiceSpeechTranscriber;
-
-impl VoiceSpeechTranscriber for UnconfiguredVoiceSpeechTranscriber {
-    fn transcribe_speech(
-        &self,
-        _buffer: &PreparedSpeechBuffer,
-    ) -> Result<String, VoiceTranscriptionError> {
-        Err(transcription_error(
-            VoiceTranscriptionErrorKind::ModelUnavailable,
-            "voice transcription runtime is not configured for this gateway processor",
-        ))
-    }
-}
-
+#[cfg(test)]
 pub(crate) struct GatewayVoiceTranscriptionRuntime<T> {
     transcriber: Arc<Mutex<T>>,
     strategy: VoiceTranscriptionStrategy,
 }
 
+#[cfg(test)]
 impl<T> Clone for GatewayVoiceTranscriptionRuntime<T> {
     fn clone(&self) -> Self {
         Self {
@@ -207,6 +200,7 @@ impl<T> Clone for GatewayVoiceTranscriptionRuntime<T> {
     }
 }
 
+#[cfg(test)]
 impl<T> GatewayVoiceTranscriptionRuntime<T>
 where
     T: VoiceSpeechTranscriber + 'static,
@@ -245,7 +239,6 @@ where
     }
 }
 
-#[cfg(test)]
 pub(crate) fn transcribe_prepared_speech_buffer<T>(
     transcriber: &T,
     buffer: PreparedSpeechBuffer,

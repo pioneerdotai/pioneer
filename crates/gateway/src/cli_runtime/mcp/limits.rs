@@ -1,3 +1,4 @@
+use pioneer_cli_agent_runtime::codex::codex_config_read_max_origins;
 use pioneer_cli_mcp_bridge::MAX_FRAME_PAYLOAD_BYTES;
 use std::fmt;
 use std::time::Duration;
@@ -11,6 +12,7 @@ pub(crate) struct CliMcpRuntimeLimits {
     max_tools: usize,
     max_total_schema_bytes: usize,
     max_concurrent_calls_per_turn: usize,
+    max_codex_config_origins: usize,
 }
 
 impl CliMcpRuntimeLimits {
@@ -19,6 +21,9 @@ impl CliMcpRuntimeLimits {
         max_total_schema_bytes: usize,
         max_concurrent_calls_per_turn: usize,
     ) -> Result<Self, CliMcpLimitConfigurationError> {
+        let Some(max_codex_config_origins) = codex_config_read_max_origins(max_tools) else {
+            return Err(CliMcpLimitConfigurationError::Runtime);
+        };
         if max_tools == 0
             || max_total_schema_bytes == 0
             || max_total_schema_bytes > MAX_FACADE_LIST_RESULT_BYTES
@@ -30,6 +35,7 @@ impl CliMcpRuntimeLimits {
             max_tools,
             max_total_schema_bytes,
             max_concurrent_calls_per_turn,
+            max_codex_config_origins,
         })
     }
 
@@ -43,6 +49,10 @@ impl CliMcpRuntimeLimits {
 
     pub(crate) const fn max_concurrent_calls_per_turn(self) -> usize {
         self.max_concurrent_calls_per_turn
+    }
+
+    pub(crate) const fn max_codex_config_origins(self) -> usize {
+        self.max_codex_config_origins
     }
 
     pub(crate) const fn facade_projection_limits(self) -> CliMcpFacadeProjectionLimits {
@@ -220,6 +230,7 @@ mod tests {
         assert_eq!(runtime.max_tools(), 512);
         assert_eq!(runtime.max_total_schema_bytes(), 3_145_728);
         assert_eq!(runtime.max_concurrent_calls_per_turn(), 16);
+        assert_eq!(runtime.max_codex_config_origins(), 1_536);
         assert_eq!(runtime.facade_projection_limits().max_tools, 512);
         assert_eq!(
             runtime.facade_projection_limits().max_list_result_bytes,

@@ -4461,6 +4461,7 @@ fn provider_model_from_runtime_model_for_reasoning_lookup(
             json_output: None,
             streaming: Some(true),
             embeddings: None,
+            transcription: None,
             thinking: supports_reasoning,
             reasoning,
             fine_tuning: None,
@@ -4469,6 +4470,7 @@ fn provider_model_from_runtime_model_for_reasoning_lookup(
             output_modalities: (!model.output_modalities.is_empty())
                 .then_some(model.output_modalities),
         },
+        transcription: None,
         pricing: None,
         active: model.active,
         family: model.family,
@@ -4634,11 +4636,13 @@ mod tests {
                 fine_tuning: None,
                 input_modalities: None,
                 output_modalities: None,
+                transcription: None,
             },
             pricing: None,
             active: None,
             family: None,
             lifecycle_status: None,
+            transcription: None,
         }
     }
 

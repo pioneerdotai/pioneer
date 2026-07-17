@@ -77,6 +77,7 @@ impl MessageProcessor {
                         let capabilities = provider.capabilities();
                         ProviderSummaryCapabilities {
                             embeddings: capabilities.embeddings,
+                            transcription: capabilities.transcription,
                         }
                     })
                     .unwrap_or_default();
@@ -318,6 +319,110 @@ impl MessageProcessor {
                         INVALID_REQUEST_CODE,
                         format!(
                             "failed to list embedding models for provider `{}`: {error:#}",
+                            params.provider
+                        ),
+                    ),
+                )
+                .await;
+            }
+        }
+    }
+
+    pub(super) async fn provider_list_transcription_models(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        params: ProviderListModelsParams,
+    ) {
+        let Some(workspace_id) = self
+            .validate_provider_workspace(
+                connection_id,
+                request_id.clone(),
+                methods::PROVIDER_TRANSCRIPTION_MODELS_LIST,
+                params.workspace_id.clone(),
+            )
+            .await
+        else {
+            return;
+        };
+
+        if params.provider.trim().is_empty() {
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_PARAMS_CODE,
+                    format!(
+                        "invalid params for `{}`: `provider` is required",
+                        methods::PROVIDER_TRANSCRIPTION_MODELS_LIST
+                    ),
+                ),
+            )
+            .await;
+            return;
+        }
+
+        let provider = match self
+            .provider_registry
+            .get_or_create_for_workspace(workspace_id.as_str(), &params.provider)
+        {
+            Ok(provider) => provider,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to create provider `{}`: {error:#}", params.provider),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+
+        match provider.list_transcription_models().await {
+            Ok(models) => {
+                let result = ProviderListModelsResponse {
+                    provider: params.provider,
+                    models: models
+                        .into_iter()
+                        .map(provider_model_info_to_protocol)
+                        .collect(),
+                };
+
+                let response = match JsonRpcResponse::from_result(request_id, &result) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                None,
+                                INVALID_REQUEST_CODE,
+                                format!("failed to encode response: {error}"),
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                };
+
+                if let Err(error) = self.send_json(connection_id, &response).await {
+                    warn!(
+                        connection_id,
+                        error = %format!("{error:#}"),
+                        "failed to send provider/list_transcription_models response"
+                    );
+                }
+            }
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!(
+                            "failed to list transcription models for provider `{}`: {error:#}",
                             params.provider
                         ),
                     ),
@@ -1250,12 +1355,14 @@ fn provider_model_info_to_protocol(m: ProviderModelInfo) -> ProviderModelInfo {
             json_output: m.capabilities.json_output,
             streaming: m.capabilities.streaming,
             embeddings: m.capabilities.embeddings,
+            transcription: m.capabilities.transcription,
             thinking: m.capabilities.thinking,
             reasoning: m.capabilities.reasoning,
             fine_tuning: m.capabilities.fine_tuning,
             input_modalities: m.capabilities.input_modalities,
             output_modalities: m.capabilities.output_modalities,
         },
+        transcription: m.transcription,
         pricing: m.pricing.map(|p| ProviderModelPricing {
             input_token: p.input_token,
             output_token: p.output_token,

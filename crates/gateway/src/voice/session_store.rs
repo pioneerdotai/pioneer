@@ -83,6 +83,10 @@ pub(crate) struct GatewayVoiceSessionStore {
 }
 
 impl GatewayVoiceSessionStore {
+    pub(crate) fn has_active_sessions(&self) -> Result<bool, GatewayVoiceSessionError> {
+        Ok(!self.lock_sessions()?.is_empty())
+    }
+
     pub(crate) fn create_session(
         &self,
         session_id: impl Into<String>,
@@ -358,6 +362,7 @@ mod tests {
     #[test]
     fn remove_and_cleanup_by_connection_release_sessions() {
         let store = GatewayVoiceSessionStore::default();
+        assert!(!store.has_active_sessions().expect("empty store"));
         store
             .create_session("voice_session_1", 7, test_context(), target_format())
             .expect("create 1");
@@ -367,6 +372,7 @@ mod tests {
         store
             .create_session("voice_session_3", 8, test_context(), target_format())
             .expect("create 3");
+        assert!(store.has_active_sessions().expect("active store"));
 
         let removed = store
             .remove_session("voice_session_1", 7)
@@ -379,6 +385,48 @@ mod tests {
         assert!(store.lookup_session("voice_session_1", 7).is_err());
         assert!(store.lookup_session("voice_session_2", 7).is_err());
         assert!(store.lookup_session("voice_session_3", 8).is_ok());
+        assert!(store.has_active_sessions().expect("one session remains"));
+        store.cleanup_connection(8);
+        assert!(!store.has_active_sessions().expect("all sessions removed"));
+    }
+
+    #[test]
+    fn voice_session_store_has_active_sessions_for_every_non_terminal_lifecycle_state() {
+        for state in [
+            GatewayVoiceSessionState::Created,
+            GatewayVoiceSessionState::Recording,
+            GatewayVoiceSessionState::Finalizing,
+            GatewayVoiceSessionState::Transcribing,
+        ] {
+            let store = GatewayVoiceSessionStore::default();
+            store
+                .create_session("voice_session_1", 7, test_context(), target_format())
+                .expect("create");
+            if matches!(
+                state,
+                GatewayVoiceSessionState::Recording
+                    | GatewayVoiceSessionState::Finalizing
+                    | GatewayVoiceSessionState::Transcribing
+            ) {
+                store
+                    .mark_recording("voice_session_1", 7)
+                    .expect("recording");
+            }
+            if matches!(
+                state,
+                GatewayVoiceSessionState::Finalizing | GatewayVoiceSessionState::Transcribing
+            ) {
+                store
+                    .mark_finalizing("voice_session_1", 7)
+                    .expect("finalizing");
+            }
+            if state == GatewayVoiceSessionState::Transcribing {
+                store
+                    .mark_transcribing("voice_session_1", 7)
+                    .expect("transcribing");
+            }
+            assert!(store.has_active_sessions().expect("active session state"));
+        }
     }
 
     fn test_context() -> VoiceSessionStartContext {

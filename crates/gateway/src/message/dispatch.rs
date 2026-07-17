@@ -1449,15 +1449,19 @@ impl MessageProcessor {
                                 }
                             }
                             Err(error) => {
-                                self.send_error(
-                                    connection_id,
+                                let response = if error
+                                    .downcast_ref::<VoiceReconfigurationBusyError>()
+                                    .is_some()
+                                {
+                                    voice_reconfiguration_busy_error(Some(request.id))
+                                } else {
                                     JsonRpcErrorResponse::new(
                                         Some(request.id),
                                         INVALID_REQUEST_CODE,
                                         format!("failed to update gateway settings: {error:#}"),
-                                    ),
-                                )
-                                .await;
+                                    )
+                                };
+                                self.send_error(connection_id, response).await;
                             }
                         },
                         Err(error) => {
@@ -1515,6 +1519,33 @@ impl MessageProcessor {
                                     format!(
                                         "invalid params for `{}`: {error}",
                                         methods::PROVIDER_EMBEDDING_MODELS_LIST
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::PROVIDER_TRANSCRIPTION_MODELS_LIST => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<ProviderListModelsParams>(params_value) {
+                        Ok(params) => {
+                            self.provider_list_transcription_models(
+                                connection_id,
+                                request.id,
+                                params,
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{}`: {error}",
+                                        methods::PROVIDER_TRANSCRIPTION_MODELS_LIST
                                     ),
                                 ),
                             )
@@ -2863,6 +2894,7 @@ impl MessageProcessor {
         connection_id: ConnectionId,
         update: pioneer_protocol::GatewaySettingsUpdate,
     ) -> anyhow::Result<pioneer_protocol::GatewaySettingsSnapshot> {
+        let _settings_guard = self.gateway_settings_update_lock.lock().await;
         let config =
             pioneer_config::AppConfig::load().context("failed to load app config for settings")?;
         let settings_file_name = crate::settings::normalize_settings_file_name(
@@ -2874,6 +2906,18 @@ impl MessageProcessor {
             config.gateway.settings_version,
             settings_file_name.as_str(),
         )?;
+        let voice_reconfiguration = match update.voice_input.as_ref() {
+            Some(voice_input) => settings.voice_input_update_would_reconfigure(voice_input)?,
+            None => false,
+        };
+        if voice_reconfiguration
+            && self
+                .voice_sessions
+                .has_active_sessions()
+                .context("failed to inspect active voice sessions")?
+        {
+            return Err(VoiceReconfigurationBusyError.into());
+        }
         let workspace_id = self
             .session_manager
             .connection_workspace_id(connection_id)
@@ -2935,6 +2979,23 @@ impl MessageProcessor {
                     )?)
                     .await
                     .context("failed to apply remote access settings")?;
+            }
+        }
+
+        if changes.voice_input.changed || changes.voice_input.retry_install {
+            if let Some(supervisor) = self.voice_input_supervisor.as_ref() {
+                let desired = crate::voice::supervisor::VoiceInputDesiredState::from_config(
+                    &settings.effective_voice_input_config(&config.gateway.voice),
+                );
+                let applied = supervisor
+                    .apply_desired(desired, changes.voice_input.retry_install)
+                    .context("failed to apply Voice Input settings")?;
+                if let Some(reconcile) = applied.reconcile {
+                    let worker = supervisor.clone();
+                    tokio::spawn(async move {
+                        worker.reconcile(reconcile).await;
+                    });
+                }
             }
         }
 
@@ -3047,6 +3108,11 @@ impl MessageProcessor {
         crate::settings::apply_thread_episodic_vector_search_status(
             &mut snapshot.thread_episodic.vector_search,
         );
+        snapshot.voice_input.runtime = self
+            .voice_input_supervisor
+            .as_ref()
+            .map(|supervisor| supervisor.runtime_snapshot())
+            .unwrap_or_default();
         self.apply_vector_local_model_status(&mut snapshot);
         self.apply_vector_refill_projection_status(&mut snapshot, workspace_id)
             .await?;
@@ -3189,5 +3255,37 @@ impl MessageProcessor {
             removed_thread_ids = ?removed_thread_ids,
             "removed detached idle threads after connection closed"
         );
+    }
+}
+
+const VOICE_RECONFIGURATION_BUSY_CODE: &str = "voice_reconfiguration_busy";
+
+#[derive(Debug)]
+struct VoiceReconfigurationBusyError;
+
+impl std::fmt::Display for VoiceReconfigurationBusyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("voice input cannot be reconfigured while a voice session is active")
+    }
+}
+
+impl std::error::Error for VoiceReconfigurationBusyError {}
+
+fn voice_reconfiguration_busy_error(
+    request_id: Option<pioneer_protocol::RequestId>,
+) -> JsonRpcErrorResponse {
+    JsonRpcErrorResponse {
+        jsonrpc: JSONRPC_VERSION.to_owned(),
+        id: request_id,
+        error: pioneer_protocol::JsonRpcError {
+            code: INVALID_REQUEST_CODE,
+            message: format!(
+                "{VOICE_RECONFIGURATION_BUSY_CODE}: voice input cannot be reconfigured while a voice session is active"
+            ),
+            data: Some(serde_json::json!({
+                "code": VOICE_RECONFIGURATION_BUSY_CODE,
+                "details": {},
+            })),
+        },
     }
 }

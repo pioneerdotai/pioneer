@@ -2,6 +2,7 @@ use super::*;
 use crate::voice::session_store::{GatewayVoiceSession, GatewayVoiceSessionState};
 use crate::voice::transcription::{
     PreparedSpeechBuffer, VoiceTranscript, VoiceTranscriptionNoSpeech, VoiceTranscriptionOutcome,
+    transcribe_prepared_speech_buffer,
 };
 use crate::voice::vad::{EnergyVoiceActivityDetector, SmoothedVoiceVad, VoiceVadConfig};
 use pioneer_protocol::{
@@ -35,7 +36,16 @@ impl MessageProcessor {
             return;
         }
 
-        let mut response_payload = self.voice_model_bootstrap.status_response();
+        let settings = self
+            .voice_input_supervisor
+            .as_ref()
+            .map(|supervisor| supervisor.settings_snapshot())
+            .unwrap_or_default();
+        let mut response_payload = VoiceStatusResponse {
+            status: settings.runtime.phase.coarse_voice_status(),
+            active_session_id: None,
+            error: voice_runtime_error(&settings.runtime),
+        };
         if let Some(session) = self
             .voice_sessions
             .active_session_for_connection(connection_id)
@@ -81,14 +91,24 @@ impl MessageProcessor {
             return;
         }
 
-        let model_snapshot = self.voice_model_bootstrap.snapshot();
-        if model_snapshot.status != VoiceStatus::Ready {
+        let _settings_guard = self.gateway_settings_update_lock.lock().await;
+
+        let settings = self
+            .voice_input_supervisor
+            .as_ref()
+            .map(|supervisor| supervisor.settings_snapshot())
+            .unwrap_or_default();
+        let model_status = settings.runtime.phase.coarse_voice_status();
+        if model_status != VoiceStatus::Ready || !settings.runtime.effective_enabled {
             self.send_voice_error(
                 connection_id,
                 request_id,
                 INVALID_REQUEST_CODE,
                 methods::VOICE_SESSION_START,
-                voice_error_for_unavailable_model(model_snapshot.status, model_snapshot.error),
+                voice_error_for_unavailable_model(
+                    model_status,
+                    voice_runtime_error(&settings.runtime),
+                ),
             )
             .await;
             return;
@@ -687,7 +707,13 @@ impl MessageProcessor {
             }
         };
 
-        match self.voice_transcription_runtime.transcribe(buffer) {
+        let Some(supervisor) = self.voice_input_supervisor.as_ref() else {
+            return Err(VoiceError {
+                kind: VoiceErrorKind::ModelUnavailable,
+                message: "Voice Input is not configured".to_owned(),
+            });
+        };
+        match transcribe_prepared_speech_buffer(supervisor.as_ref(), buffer) {
             Ok(Ok(transcript)) => Ok(GatewayVoiceSessionPipelineOutcome::Transcript {
                 transcript,
                 signal_stats,
@@ -771,6 +797,15 @@ impl MessageProcessor {
             "voice request failed"
         );
     }
+}
+
+fn voice_runtime_error(
+    runtime: &pioneer_protocol::GatewayVoiceInputRuntimeSnapshot,
+) -> Option<VoiceError> {
+    runtime.error.as_ref().map(|message| VoiceError {
+        kind: VoiceErrorKind::ModelUnavailable,
+        message: message.clone(),
+    })
 }
 
 enum GatewayVoiceSessionPipelineOutcome {

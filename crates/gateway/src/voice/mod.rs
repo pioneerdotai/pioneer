@@ -1,9 +1,9 @@
 pub(crate) mod audio_normalization;
-pub(crate) mod model_bootstrap;
 pub(crate) mod model_catalog;
 pub(crate) mod model_install;
-pub(crate) mod parakeet_runtime;
+pub(crate) mod runtime;
 pub(crate) mod session_buffer;
 pub(crate) mod session_store;
+pub(crate) mod supervisor;
 pub(crate) mod transcription;
 pub(crate) mod vad;

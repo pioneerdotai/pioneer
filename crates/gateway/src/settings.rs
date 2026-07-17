@@ -6,6 +6,7 @@ use pioneer_config::{
     GatewayMemoryModelSelectionSource as ConfigGatewayMemoryModelSelectionSource,
     GatewayRemoteAccessConfig, GatewayThreadEpisodicConfig,
     GatewayThreadEpisodicVectorProviderConfig, GatewayThreadEpisodicVectorSearchConfig,
+    GatewayVoiceConfig, GatewayVoiceInputProviderConfig,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -14,6 +15,7 @@ use std::fs;
 use std::path::{Component, Path};
 
 use crate::helpers::normalize_non_empty;
+use pioneer_provider::providers::local_transcription_model_info;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -35,6 +37,11 @@ pub struct GatewaySettings {
         skip_serializing_if = "GatewayRemoteAccessSettingsOverride::is_default"
     )]
     remote_access: GatewayRemoteAccessSettingsOverride,
+    #[serde(
+        default,
+        skip_serializing_if = "GatewayVoiceInputSettingsOverride::is_default"
+    )]
+    voice_input: GatewayVoiceInputSettingsOverride,
     #[serde(skip)]
     migrated: bool,
 }
@@ -56,6 +63,8 @@ struct GatewaySettingsWire {
     cli_runtimes: Option<GatewayCliRuntimeSettingsOverride>,
     #[serde(default)]
     remote_access: GatewayRemoteAccessSettingsOverride,
+    #[serde(default)]
+    voice_input: GatewayVoiceInputSettingsOverride,
 }
 
 impl<'de> Deserialize<'de> for GatewaySettings {
@@ -73,6 +82,7 @@ impl<'de> Deserialize<'de> for GatewaySettings {
             workspaces: wire.workspaces,
             cli_runtimes: wire.cli_runtimes,
             remote_access: wire.remote_access,
+            voice_input: wire.voice_input,
             migrated: false,
         };
         settings.migrate_legacy_active_recall_model();
@@ -89,6 +99,81 @@ struct GatewayGeneralSettings {
     keepawake: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     preflight_model: Option<GatewayMemoryModelSelectionConfig>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GatewayVoiceInputSettingsOverride {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider: Option<GatewayVoiceInputProviderConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+}
+
+impl GatewayVoiceInputSettingsOverride {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    fn apply_to_voice_config(&self, mut config: GatewayVoiceConfig) -> GatewayVoiceConfig {
+        config.enabled = self.enabled;
+        config.provider = self.provider;
+        config.model.clone_from(&self.model);
+        config
+    }
+
+    fn apply_protocol_update(
+        &mut self,
+        update: pioneer_protocol::GatewayVoiceInputSettingsUpdate,
+    ) -> Result<GatewayVoiceInputChangeSet> {
+        let previous = self.clone();
+        let mut next = self.clone();
+        let selection_changed = update.provider.is_some() || update.model.is_some();
+        if let Some(enabled) = update.enabled {
+            next.enabled = enabled;
+        }
+        if let Some(provider) = update.provider {
+            next.provider = provider.map(voice_input_provider_from_protocol);
+        }
+        if let Some(model) = update.model {
+            next.model = match model {
+                Some(model) => Some(normalize_non_empty(
+                    model.as_str(),
+                    "voice input model must not be empty",
+                )?),
+                None => None,
+            };
+        }
+        if (next.enabled || selection_changed || update.retry_install)
+            && let Some(model) = next.model.as_deref()
+        {
+            if next.provider != Some(GatewayVoiceInputProviderConfig::Local) {
+                bail!("local voice input models require the local provider");
+            }
+            if local_transcription_model_info(model).is_none() {
+                bail!("unknown local transcription model `{model}`");
+            }
+        }
+        if update.retry_install {
+            if !next.enabled {
+                bail!("voice input must be enabled to retry the selected model install");
+            }
+            if next.provider != Some(GatewayVoiceInputProviderConfig::Local) {
+                bail!("a local voice input provider must be selected before retry");
+            }
+            next.model
+                .as_deref()
+                .context("a local voice input model must be selected before retry")?;
+        }
+        *self = next;
+
+        Ok(GatewayVoiceInputChangeSet {
+            changed: *self != previous,
+            retry_install: update.retry_install,
+        })
+    }
 }
 
 impl GatewayGeneralSettings {
@@ -387,6 +472,15 @@ impl Default for GatewaySecretsSettings {
 }
 
 impl GatewaySettings {
+    pub fn voice_input_update_would_reconfigure(
+        &self,
+        update: &pioneer_protocol::GatewayVoiceInputSettingsUpdate,
+    ) -> Result<bool> {
+        let mut candidate = self.voice_input.clone();
+        let changes = candidate.apply_protocol_update(update.clone())?;
+        Ok(changes.changed || changes.retry_install)
+    }
+
     pub fn effective_general_settings(
         &self,
         config: &GatewayConfig,
@@ -493,6 +587,23 @@ impl GatewaySettings {
         }
     }
 
+    pub fn effective_voice_input_config(&self, config: &GatewayVoiceConfig) -> GatewayVoiceConfig {
+        self.voice_input.apply_to_voice_config(config.clone())
+    }
+
+    pub fn effective_voice_input_settings(
+        &self,
+        config: &GatewayVoiceConfig,
+    ) -> pioneer_protocol::GatewayVoiceInputSettings {
+        let effective = self.effective_voice_input_config(config);
+        pioneer_protocol::GatewayVoiceInputSettings {
+            enabled: effective.enabled,
+            provider: effective.provider.map(voice_input_provider_to_protocol),
+            model: effective.model,
+            runtime: pioneer_protocol::GatewayVoiceInputRuntimeSnapshot::default(),
+        }
+    }
+
     pub fn set_memory_settings(&mut self, memory: GatewayMemorySettings) {
         self.memory = Some(GatewayMemorySettingsOverride::from_memory_settings(memory));
     }
@@ -566,6 +677,7 @@ impl GatewaySettings {
                 has_remote_access_key,
                 remote_access_status,
             ),
+            voice_input: self.effective_voice_input_settings(&config.voice),
         }
     }
 
@@ -621,6 +733,9 @@ impl GatewaySettings {
         }
         if let Some(remote_access) = update.remote_access {
             changes.remote_access = self.remote_access.apply_protocol_update(remote_access)?;
+        }
+        if let Some(voice_input) = update.voice_input {
+            changes.voice_input = self.voice_input.apply_protocol_update(voice_input)?;
         }
         Ok(changes)
     }
@@ -731,6 +846,7 @@ impl GatewaySettings {
         config.memory = self.apply_to_gateway_memory_config(config.memory);
         config.thread_episodic =
             self.apply_to_gateway_thread_episodic_config(config.thread_episodic);
+        config.voice = self.effective_voice_input_config(&config.voice);
         if let Some(cli_runtimes) = &self.cli_runtimes {
             config.cli_agent_runtime.enabled = false;
             config.cli_agent_runtimes =
@@ -1315,6 +1431,26 @@ fn vector_provider_allows_runtime_dimension_probe(
         .is_some_and(|model| !model.is_empty())
 }
 
+const fn voice_input_provider_to_protocol(
+    provider: GatewayVoiceInputProviderConfig,
+) -> pioneer_protocol::GatewayVoiceInputProvider {
+    match provider {
+        GatewayVoiceInputProviderConfig::Local => {
+            pioneer_protocol::GatewayVoiceInputProvider::Local
+        }
+    }
+}
+
+const fn voice_input_provider_from_protocol(
+    provider: pioneer_protocol::GatewayVoiceInputProvider,
+) -> GatewayVoiceInputProviderConfig {
+    match provider {
+        pioneer_protocol::GatewayVoiceInputProvider::Local => {
+            GatewayVoiceInputProviderConfig::Local
+        }
+    }
+}
+
 fn selected_local_vector_model(config: &GatewayThreadEpisodicVectorSearchConfig) -> Option<&str> {
     config
         .model
@@ -1343,6 +1479,13 @@ pub struct GatewaySettingsChangeSet {
     pub thread_episodic_vector_projection_workspace_id: Option<String>,
     pub cli_runtimes: bool,
     pub remote_access: GatewayRemoteAccessChangeSet,
+    pub voice_input: GatewayVoiceInputChangeSet,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GatewayVoiceInputChangeSet {
+    pub changed: bool,
+    pub retry_install: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1939,6 +2082,7 @@ pub fn load_or_create_gateway_settings(
         workspaces: BTreeMap::new(),
         cli_runtimes: Some(GatewayCliRuntimeSettingsOverride::default_supported()?),
         remote_access: GatewayRemoteAccessSettingsOverride::default(),
+        voice_input: GatewayVoiceInputSettingsOverride::default(),
         migrated: false,
     };
 
@@ -2084,10 +2228,296 @@ mod tests {
         assert!(!content.contains("[mcp.secrets]"));
         assert!(!content.contains("[memory]"));
         assert!(!content.contains("[thread_episodic]"));
+        assert!(!content.contains("[voice_input]"));
         assert!(content.contains("[[cli_runtimes.instances]]"));
         assert!(content.contains("id = \"codex\""));
         assert!(content.contains("display_name = \"Codex CLI\""));
         assert!(content.contains("enabled = true"));
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn gateway_voice_settings_legacy_file_defaults_disabled_without_selection() {
+        let settings = toml::from_str::<super::GatewaySettings>(
+            r#"
+version = 1
+
+[secrets]
+backend = "keystore"
+"#,
+        )
+        .expect("legacy gateway settings should parse");
+        let config = gateway_config_with_keepawake(false);
+        let effective = settings.effective_voice_input_config(&config.voice);
+        let snapshot = settings.snapshot(&config);
+
+        assert!(!effective.enabled);
+        assert_eq!(effective.provider, None);
+        assert_eq!(effective.model, None);
+        assert!(!snapshot.voice_input.enabled);
+        assert_eq!(snapshot.voice_input.provider, None);
+        assert_eq!(snapshot.voice_input.model, None);
+        assert_eq!(
+            snapshot.voice_input.runtime.phase,
+            pioneer_protocol::GatewayVoiceInputRuntimePhase::Disabled
+        );
+    }
+
+    #[test]
+    fn gateway_voice_settings_enabled_selection_roundtrips_globally() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let path = temp_dir.join("gateway-settings.toml");
+        let mut settings = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
+            .expect("settings should be created");
+
+        let changes = settings
+            .apply_protocol_update_for_workspace(
+                pioneer_protocol::GatewaySettingsUpdate {
+                    voice_input: Some(pioneer_protocol::GatewayVoiceInputSettingsUpdate {
+                        enabled: Some(true),
+                        provider: Some(Some(pioneer_protocol::GatewayVoiceInputProvider::Local)),
+                        model: Some(Some("parakeet-tdt-0.6b-v3".to_owned())),
+                        retry_install: false,
+                    }),
+                    ..pioneer_protocol::GatewaySettingsUpdate::default()
+                },
+                Some("workspace-a"),
+            )
+            .expect("voice settings update should apply");
+        assert!(changes.voice_input.changed);
+        assert!(!changes.voice_input.retry_install);
+
+        save_gateway_settings(&path, &settings).expect("voice settings should save");
+        let content = fs::read_to_string(&path).expect("read settings");
+        assert!(content.contains("[voice_input]"));
+        assert!(content.contains("enabled = true"));
+        assert!(content.contains("provider = \"local\""));
+        assert!(content.contains("model = \"parakeet-tdt-0.6b-v3\""));
+        assert!(!content.contains("[workspaces.workspace-a.voice_input]"));
+
+        let loaded = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
+            .expect("voice settings should reload");
+        let mut config = gateway_config_with_keepawake(false);
+        config.voice.models_dir = "models/custom-voice".to_owned();
+        let effective = loaded.apply_to_gateway_config(config).voice;
+        assert!(effective.enabled);
+        assert_eq!(
+            effective.provider,
+            Some(pioneer_config::GatewayVoiceInputProviderConfig::Local)
+        );
+        assert_eq!(effective.model.as_deref(), Some("parakeet-tdt-0.6b-v3"));
+        assert_eq!(effective.models_dir, "models/custom-voice");
+        assert_eq!(
+            effective.transcription_strategy,
+            pioneer_config::GatewayVoiceTranscriptionStrategy::BufferedGatewaySession
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn gateway_voice_settings_disable_preserves_selection_and_retry_is_transient() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let path = temp_dir.join("gateway-settings.toml");
+        let mut settings = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
+            .expect("settings should be created");
+        settings
+            .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+                voice_input: Some(pioneer_protocol::GatewayVoiceInputSettingsUpdate {
+                    enabled: Some(true),
+                    provider: Some(Some(pioneer_protocol::GatewayVoiceInputProvider::Local)),
+                    model: Some(Some("small".to_owned())),
+                    retry_install: false,
+                }),
+                ..pioneer_protocol::GatewaySettingsUpdate::default()
+            })
+            .expect("initial voice selection should apply");
+
+        let retry = settings
+            .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+                voice_input: Some(pioneer_protocol::GatewayVoiceInputSettingsUpdate {
+                    retry_install: true,
+                    ..pioneer_protocol::GatewayVoiceInputSettingsUpdate::default()
+                }),
+                ..pioneer_protocol::GatewaySettingsUpdate::default()
+            })
+            .expect("retry should apply as a transient command");
+        assert!(!retry.voice_input.changed);
+        assert!(retry.voice_input.retry_install);
+
+        let disable = settings
+            .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+                voice_input: Some(pioneer_protocol::GatewayVoiceInputSettingsUpdate {
+                    enabled: Some(false),
+                    ..pioneer_protocol::GatewayVoiceInputSettingsUpdate::default()
+                }),
+                ..pioneer_protocol::GatewaySettingsUpdate::default()
+            })
+            .expect("disable should apply");
+        assert!(disable.voice_input.changed);
+        assert!(!disable.voice_input.retry_install);
+
+        save_gateway_settings(&path, &settings).expect("disabled selection should save");
+        let content = fs::read_to_string(&path).expect("read settings");
+        assert!(content.contains("enabled = false"));
+        assert!(content.contains("provider = \"local\""));
+        assert!(content.contains("model = \"small\""));
+        assert!(!content.contains("retry_install"));
+
+        let snapshot = settings.snapshot(&gateway_config_with_keepawake(false));
+        assert!(!snapshot.voice_input.enabled);
+        assert_eq!(
+            snapshot.voice_input.provider,
+            Some(pioneer_protocol::GatewayVoiceInputProvider::Local)
+        );
+        assert_eq!(snapshot.voice_input.model.as_deref(), Some("small"));
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn gateway_voice_settings_retry_requires_enabled_trusted_local_selection() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let path = temp_dir.join("gateway-settings.toml");
+        let mut settings = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
+            .expect("settings should be created");
+        let retry = pioneer_protocol::GatewaySettingsUpdate {
+            voice_input: Some(pioneer_protocol::GatewayVoiceInputSettingsUpdate {
+                retry_install: true,
+                ..pioneer_protocol::GatewayVoiceInputSettingsUpdate::default()
+            }),
+            ..pioneer_protocol::GatewaySettingsUpdate::default()
+        };
+        assert!(settings.apply_protocol_update(retry.clone()).is_err());
+
+        let invalid = settings.apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+            voice_input: Some(pioneer_protocol::GatewayVoiceInputSettingsUpdate {
+                enabled: Some(true),
+                provider: Some(Some(pioneer_protocol::GatewayVoiceInputProvider::Local)),
+                model: Some(Some("not-in-the-catalog".to_owned())),
+                retry_install: true,
+            }),
+            ..pioneer_protocol::GatewaySettingsUpdate::default()
+        });
+        assert!(invalid.is_err());
+        assert_eq!(
+            settings
+                .snapshot(&gateway_config_with_keepawake(false))
+                .voice_input,
+            pioneer_protocol::GatewayVoiceInputSettings::default()
+        );
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn gateway_voice_settings_rejects_untrusted_selection_before_mutation() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let path = temp_dir.join("gateway-settings.toml");
+        let mut settings = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
+            .expect("settings should be created");
+
+        for voice_input in [
+            pioneer_protocol::GatewayVoiceInputSettingsUpdate {
+                enabled: Some(true),
+                provider: Some(Some(pioneer_protocol::GatewayVoiceInputProvider::Local)),
+                model: Some(Some("not-in-the-catalog".to_owned())),
+                retry_install: false,
+            },
+            pioneer_protocol::GatewayVoiceInputSettingsUpdate {
+                enabled: Some(true),
+                provider: Some(None),
+                model: Some(Some("small".to_owned())),
+                retry_install: false,
+            },
+        ] {
+            let result = settings.apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+                voice_input: Some(voice_input),
+                ..pioneer_protocol::GatewaySettingsUpdate::default()
+            });
+            assert!(result.is_err());
+            assert_eq!(
+                settings
+                    .snapshot(&gateway_config_with_keepawake(false))
+                    .voice_input,
+                pioneer_protocol::GatewayVoiceInputSettings::default()
+            );
+        }
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn gateway_voice_settings_semantic_reconfiguration_detection_ignores_noops() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let path = temp_dir.join("gateway-settings.toml");
+        let mut settings = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
+            .expect("settings should be created");
+        assert!(
+            !settings
+                .voice_input_update_would_reconfigure(
+                    &pioneer_protocol::GatewayVoiceInputSettingsUpdate::default()
+                )
+                .expect("empty update")
+        );
+
+        let selection = pioneer_protocol::GatewayVoiceInputSettingsUpdate {
+            enabled: Some(true),
+            provider: Some(Some(pioneer_protocol::GatewayVoiceInputProvider::Local)),
+            model: Some(Some("small".to_owned())),
+            retry_install: false,
+        };
+        assert!(
+            settings
+                .voice_input_update_would_reconfigure(&selection)
+                .expect("new selection")
+        );
+        settings
+            .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+                voice_input: Some(selection.clone()),
+                ..pioneer_protocol::GatewaySettingsUpdate::default()
+            })
+            .expect("persist selection in memory");
+        assert!(
+            !settings
+                .voice_input_update_would_reconfigure(&selection)
+                .expect("same selection")
+        );
+        assert!(
+            settings
+                .voice_input_update_would_reconfigure(
+                    &pioneer_protocol::GatewayVoiceInputSettingsUpdate {
+                        retry_install: true,
+                        ..pioneer_protocol::GatewayVoiceInputSettingsUpdate::default()
+                    }
+                )
+                .expect("retry command")
+        );
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn gateway_voice_settings_installed_model_directory_does_not_enable_voice() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let path = temp_dir.join("gateway-settings.toml");
+        let settings = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
+            .expect("settings should be created");
+        let config = gateway_config_with_keepawake(false);
+        let models_root = config
+            .voice
+            .resolve_models_root(temp_dir.as_path())
+            .expect("models root");
+        fs::create_dir_all(models_root.join("parakeet-tdt-0.6b-v3-int8"))
+            .expect("legacy installed model directory");
+
+        assert!(!settings.effective_voice_input_config(&config.voice).enabled);
+        assert!(!settings.snapshot(&config).voice_input.enabled);
 
         let _ = fs::remove_dir_all(temp_dir);
     }
@@ -2260,6 +2690,7 @@ backend = "keystore"
                 thread_episodic: None,
                 cli_runtimes: None,
                 remote_access: None,
+                voice_input: None,
             })
             .expect("settings update should apply");
         save_gateway_settings(&path, &settings).expect("settings should save");

@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
-pub(crate) const CODEX_MCP_LOCAL_PROBE_CONTRACT_VERSION: u32 = 1;
+pub(crate) const CODEX_MCP_LOCAL_PROBE_CONTRACT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CliRuntimeCapabilityPolicy {
@@ -424,6 +424,8 @@ pub(crate) fn codex_mcp_probe_contract_hash() -> anyhow::Result<String> {
 
 fn codex_mcp_probe_contract_hash_for_instance(
     instance: &EffectiveGatewayCliAgentRuntimeInstanceConfig,
+    max_tools: usize,
+    max_schema_bytes: usize,
 ) -> anyhow::Result<String> {
     let helper = crate::cli_runtime::config::resolve_current_pioneer_cli_mcp_helper()?;
     let helper_metadata = std::fs::metadata(helper.as_path())?;
@@ -446,6 +448,8 @@ fn codex_mcp_probe_contract_hash_for_instance(
         "appServerArgs": instance.app_server_args,
         "startupProbeTimeoutMs": instance.startup_probe_timeout_ms,
         "requestTimeoutMs": instance.request_timeout_ms,
+        "maxTools": max_tools,
+        "maxSchemaBytes": max_schema_bytes,
     }))
 }
 
@@ -484,6 +488,8 @@ pub(crate) async fn codex_mcp_readiness_for_instance(
                 runtime_home,
                 provider_version,
                 proxy_url,
+                max_tools,
+                max_schema_bytes,
             )
             .await
         }
@@ -505,8 +511,11 @@ async fn build_or_load_codex_local_attestation(
     runtime_home: &Path,
     provider_version: &str,
     proxy_url: Option<&str>,
+    max_tools: usize,
+    max_schema_bytes: usize,
 ) -> Option<CodexMcpLocalAttestation> {
-    let contract_hash = codex_mcp_probe_contract_hash_for_instance(instance).ok()?;
+    let contract_hash =
+        codex_mcp_probe_contract_hash_for_instance(instance, max_tools, max_schema_bytes).ok()?;
     let cache_identity = codex_executable_cache_identity(
         instance.binary_path.as_str(),
         provider_version,
@@ -521,6 +530,7 @@ async fn build_or_load_codex_local_attestation(
         instance,
         runtime_home,
         proxy_url,
+        max_tools,
     )
     .await;
     let provider_detail = provider_probe
@@ -569,6 +579,8 @@ async fn build_or_load_codex_local_attestation(
         "appServerArgs": instance.app_server_args,
         "injection": "managed_stdio_mcp",
         "projectionUpdate": "restart_app_server_resume_thread",
+        "maxTools": max_tools,
+        "maxSchemaBytes": max_schema_bytes,
     }))
     .ok()?;
     let isolation_contract_fingerprint = sha256_json(&json!({
@@ -582,6 +594,12 @@ async fn build_or_load_codex_local_attestation(
         "overlayPolicyVersion": provider_evidence
             .as_ref()
             .map(|evidence| evidence.overlay_policy_version),
+        "toolCount": provider_evidence
+            .as_ref()
+            .map(|evidence| evidence.tool_count),
+        "maxConfigOrigins": provider_evidence
+            .as_ref()
+            .map(|evidence| evidence.max_config_origins),
     }))
     .ok()?;
     let schema_contract_fingerprint = sha256_json(&json!({
@@ -603,6 +621,9 @@ async fn build_or_load_codex_local_attestation(
         "helperBinarySha256": provider_evidence
             .as_ref()
             .map(|evidence| evidence.helper_binary_sha256.as_str()),
+        "toolCount": provider_evidence
+            .as_ref()
+            .map(|evidence| evidence.tool_count),
     }))
     .ok()?;
     let attestation = CodexMcpLocalAttestation::build(
@@ -1298,8 +1319,16 @@ mod tests {
             .app_server_args
             .push("--some-future-safe-flag".to_owned());
         assert_ne!(
-            codex_mcp_probe_contract_hash_for_instance(&first).expect("first contract"),
-            codex_mcp_probe_contract_hash_for_instance(&changed).expect("changed contract")
+            codex_mcp_probe_contract_hash_for_instance(&first, 512, 4 * 1024 * 1024)
+                .expect("first contract"),
+            codex_mcp_probe_contract_hash_for_instance(&changed, 512, 4 * 1024 * 1024)
+                .expect("changed contract")
+        );
+        assert_ne!(
+            codex_mcp_probe_contract_hash_for_instance(&first, 128, 4 * 1024 * 1024)
+                .expect("old limit contract"),
+            codex_mcp_probe_contract_hash_for_instance(&first, 512, 4 * 1024 * 1024)
+                .expect("new limit contract")
         );
     }
 

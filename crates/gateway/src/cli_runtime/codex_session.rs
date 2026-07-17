@@ -44,9 +44,10 @@ use pioneer_cli_agent_runtime::codex::{
     CodexManagedMcpConfigLimits, CodexManagedMcpSemanticInput, CodexManagedMcpToolIdentity,
     CodexThreadForkParams, CodexThreadNameSetParams, CodexThreadOpenSnapshot,
     CodexThreadStartParams, CodexTurnStartParams, CodexTurnSteerParams,
-    cleanup_codex_generation_overlay, codex_config_value_fingerprint,
-    codex_generation_app_server_process_config, serialize_codex_managed_mcp_config,
-    stage_codex_generation_mcp_config, verify_codex_generation_mcp_config,
+    cleanup_codex_generation_overlay, codex_config_read_max_origins,
+    codex_config_value_fingerprint, codex_generation_app_server_process_config,
+    serialize_codex_managed_mcp_config, stage_codex_generation_mcp_config,
+    verify_codex_generation_mcp_config,
 };
 use pioneer_cli_agent_runtime::codex_attestation::sha256_json;
 use pioneer_cli_agent_runtime::driver::JsonlRpcId;
@@ -76,6 +77,8 @@ const CODEX_READINESS_FORBIDDEN_SENTINEL: &str = "pioneer_readiness_forbidden_se
 
 #[derive(Debug, Clone)]
 pub(crate) struct CodexMcpLocalProviderProbeEvidence {
+    pub(crate) tool_count: usize,
+    pub(crate) max_config_origins: usize,
     pub(crate) config_artifact_digest: String,
     pub(crate) effective_mcp_servers_fingerprint: String,
     pub(crate) semantic_restart_fingerprint: String,
@@ -130,7 +133,10 @@ pub(crate) async fn run_codex_mcp_local_provider_probe(
     instance: &EffectiveGatewayCliAgentRuntimeInstanceConfig,
     runtime_home: &std::path::Path,
     proxy_url: Option<&str>,
+    max_tools: usize,
 ) -> Result<CodexMcpLocalProviderProbeEvidence> {
+    let max_config_origins = codex_config_read_max_origins(max_tools)
+        .context("invalid Codex readiness config origin budget")?;
     validate_codex_custom_args(&instance.app_server_args)
         .context("Codex readiness custom launch arguments are invalid")?;
     let key = CLIAgentRuntimeSessionKey::new(
@@ -179,14 +185,20 @@ pub(crate) async fn run_codex_mcp_local_provider_probe(
         bail!("Codex generation overlay isolation or shared-state policy is unavailable");
     }
 
+    let tool_names = codex_readiness_tool_names(max_tools)?;
     let projection = CliMcpFacadeProjection::new(
-        vec![CliMcpFacadeTool::new(
-            CODEX_READINESS_ALLOWED_TOOL,
-            Some("Pioneer no-model readiness sentinel".to_owned()),
-            serde_json::json!({"type": "object", "additionalProperties": false}),
-            serde_json::json!({"readOnlyHint": true}),
-        )?],
-        CliMcpFacadeProjectionLimits::transport_bounded(1),
+        tool_names
+            .iter()
+            .map(|name| {
+                CliMcpFacadeTool::new(
+                    name.clone(),
+                    None,
+                    serde_json::json!({"type": "object", "additionalProperties": false}),
+                    serde_json::json!({"readOnlyHint": true}),
+                )
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+        CliMcpFacadeProjectionLimits::transport_bounded(max_tools),
     )?;
     let projection_fingerprint = projection.fingerprint().as_str().to_owned();
     let supervisor = CliMcpBridgeSupervisor::new(
@@ -223,36 +235,44 @@ pub(crate) async fn run_codex_mcp_local_provider_probe(
     let helper_path = resolve_current_pioneer_cli_mcp_helper()?;
     let helper_binary_sha256 =
         pioneer_cli_agent_runtime::codex_attestation::sha256_file_contents(helper_path.as_path())?;
-    let tool_fingerprint = sha256_json(&serde_json::json!({
-        "name": CODEX_READINESS_ALLOWED_TOOL,
-        "schema": {"type": "object", "additionalProperties": false},
+    let transform_contract_fingerprint = sha256_json(&serde_json::json!({
+        "contract": "codex-readiness-schema-v1",
     }))?;
+    let semantic_tools = tool_names
+        .iter()
+        .map(|name| {
+            let tool_fingerprint = sha256_json(&serde_json::json!({
+                "name": name,
+                "schema": {"type": "object", "additionalProperties": false},
+            }))?;
+            Ok(CodexManagedMcpToolIdentity {
+                canonical_callable_name: name.clone(),
+                canonical_schema_fingerprint: tool_fingerprint.clone(),
+                transformed_schema_fingerprint: tool_fingerprint.clone(),
+                transform_contract_fingerprint: transform_contract_fingerprint.clone(),
+                transformed_fingerprint: tool_fingerprint,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     let artifact = serialize_codex_managed_mcp_config(CodexManagedMcpConfigInput {
         semantic: CodexManagedMcpSemanticInput {
             canonical_manifest_hash: manifest_hash,
             provider_manifest_hash: sha256_json(&serde_json::json!({
                 "provider": "codex",
-                "tool": CODEX_READINESS_ALLOWED_TOOL,
+                "tools": tool_names.as_slice(),
+                "projection": projection_fingerprint.as_str(),
             }))?,
             provider_contract_fingerprint: sha256_json(&serde_json::json!({
                 "contract": "codex-managed-mcp-readiness-v1",
             }))?,
             overlay_policy_version: CodexHomeOverlayPolicy::v1().version,
-            tools: vec![CodexManagedMcpToolIdentity {
-                canonical_callable_name: CODEX_READINESS_ALLOWED_TOOL.to_owned(),
-                canonical_schema_fingerprint: tool_fingerprint.clone(),
-                transformed_schema_fingerprint: tool_fingerprint.clone(),
-                transform_contract_fingerprint: sha256_json(&serde_json::json!({
-                    "contract": "codex-readiness-schema-v1",
-                }))?,
-                transformed_fingerprint: tool_fingerprint,
-            }],
+            tools: semantic_tools,
         },
-        limits: CodexManagedMcpConfigLimits { max_tools: 1 },
+        limits: CodexManagedMcpConfigLimits { max_tools },
         helper_path: Some(helper_path),
         bootstrap_path: Some(launch.bootstrap_path().to_path_buf()),
     })?;
-    if artifact.enabled_tools != [CODEX_READINESS_ALLOWED_TOOL]
+    if artifact.enabled_tools != tool_names
         || artifact
             .config_toml
             .contains(CODEX_READINESS_FORBIDDEN_SENTINEL)
@@ -356,6 +376,7 @@ pub(crate) async fn run_codex_mcp_local_provider_probe(
             staged_mcp_servers_fingerprint: artifact.staged_mcp_servers_fingerprint.clone(),
             effective_mcp_servers_fingerprint: artifact.effective_mcp_servers_fingerprint.clone(),
             requires_staged_artifact: true,
+            max_config_origins,
         };
         attest_codex_exact_isolation(
             &client,
@@ -440,6 +461,8 @@ pub(crate) async fn run_codex_mcp_local_provider_probe(
     }
     drop(coordinator);
     Ok(CodexMcpLocalProviderProbeEvidence {
+        tool_count: max_tools,
+        max_config_origins,
         config_artifact_digest: artifact.artifact_digest,
         effective_mcp_servers_fingerprint: artifact.effective_mcp_servers_fingerprint,
         semantic_restart_fingerprint: artifact.semantic_restart_fingerprint,
@@ -447,6 +470,18 @@ pub(crate) async fn run_codex_mcp_local_provider_probe(
         overlay_policy_version: CodexHomeOverlayPolicy::v1().version,
         helper_binary_sha256,
     })
+}
+
+fn codex_readiness_tool_names(max_tools: usize) -> Result<Vec<String>> {
+    if max_tools == 0 {
+        bail!("Codex readiness tool limit must be greater than zero");
+    }
+    let mut names = Vec::with_capacity(max_tools);
+    names.push(CODEX_READINESS_ALLOWED_TOOL.to_owned());
+    for index in 1..max_tools {
+        names.push(format!("pioneer_readiness_allowed_{index:08}"));
+    }
+    Ok(names)
 }
 
 fn bounded_codex_readiness_diagnostic(value: &str) -> String {
@@ -1161,7 +1196,9 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
         .map_err(|error| anyhow!("failed to prepare Codex generation overlay: {error}"))?;
         let mut overlay_guard = CodexGenerationOverlayStartupGuard::new(overlay);
         let mut prepared_mcp_bridge = None;
-        let mut mcp_attestation = CodexMcpAttestationExpectation::unmanaged_empty()?;
+        let mut mcp_attestation = CodexMcpAttestationExpectation::unmanaged_empty(
+            self.mcp_limits.max_codex_config_origins(),
+        )?;
         if let Some(launch_projection) = launch_projection {
             let setup = async {
                 let prepared = if launch_projection.preflight.tools.is_empty() {
@@ -1257,6 +1294,7 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
                     .effective_mcp_servers_fingerprint
                     .clone(),
                 requires_staged_artifact: true,
+                max_config_origins: self.mcp_limits.max_codex_config_origins(),
             };
         }
         process_config = process_config
@@ -1469,10 +1507,14 @@ struct CodexMcpAttestationExpectation {
     staged_mcp_servers_fingerprint: String,
     effective_mcp_servers_fingerprint: String,
     requires_staged_artifact: bool,
+    max_config_origins: usize,
 }
 
 impl CodexMcpAttestationExpectation {
-    fn unmanaged_empty() -> Result<Self> {
+    fn unmanaged_empty(max_config_origins: usize) -> Result<Self> {
+        if max_config_origins == 0 {
+            bail!("Codex config origin budget must be greater than zero");
+        }
         Ok(Self {
             server_names: Vec::new(),
             staged_mcp_servers_fingerprint: codex_config_value_fingerprint(&serde_json::json!({}))
@@ -1484,6 +1526,7 @@ impl CodexMcpAttestationExpectation {
             ))
             .map_err(|error| anyhow!("failed to fingerprint empty Codex MCP config: {error}"))?,
             requires_staged_artifact: false,
+            max_config_origins,
         })
     }
 }
@@ -1633,12 +1676,17 @@ async fn attest_codex_exact_isolation(
             )
         })?;
     }
-    let snapshot = client.config_read(cwd, timeout).await.map_err(|_| {
-        CodexIsolationAttestationError::new(
-            CodexIsolationAttestationFailureKind::ConfigRead,
-            "read-only effective config evidence was unavailable or malformed",
-        )
-    })?;
+    let snapshot = client
+        .config_read(cwd, expectation.max_config_origins, timeout)
+        .await
+        .map_err(|error| {
+            CodexIsolationAttestationError::new(
+                CodexIsolationAttestationFailureKind::ConfigRead,
+                format!(
+                    "read-only effective config evidence was unavailable or malformed: {error}"
+                ),
+            )
+        })?;
     validate_codex_exact_isolation_snapshot(&snapshot, expectation)
 }
 
@@ -2487,6 +2535,47 @@ mod tests {
         })
     }
 
+    fn with_managed_config_origins(mut result: JsonValue, enabled_tools: &[String]) -> JsonValue {
+        let fixed_keys = [
+            "mcp_servers.pioneer.command",
+            "mcp_servers.pioneer.args.0",
+            "mcp_servers.pioneer.args.1",
+            "mcp_servers.pioneer.args.2",
+            "mcp_servers.pioneer.required",
+            "features.apps",
+            "features.enable_mcp_apps",
+            "features.plugins",
+            "features.remote_plugin",
+            "features.skill_mcp_dependency_install",
+            "personality",
+        ];
+        let keys = fixed_keys.into_iter().map(str::to_owned).chain(
+            enabled_tools.iter().enumerate().flat_map(|(index, name)| {
+                [
+                    format!("mcp_servers.pioneer.enabled_tools.{index}"),
+                    format!("mcp_servers.pioneer.tools.{name}.approval_mode"),
+                ]
+            }),
+        );
+        result["origins"] = JsonValue::Object(
+            keys.map(|key| {
+                (
+                    key,
+                    json!({
+                        "name": {
+                            "type": "user",
+                            "file": "/managed/config.toml",
+                            "profile": null
+                        },
+                        "version": "sha256:managed"
+                    }),
+                )
+            })
+            .collect(),
+        );
+        result
+    }
+
     fn thread_open_params(cwd: &str) -> CLIAgentRuntimeThreadOpenParams {
         CLIAgentRuntimeThreadOpenParams {
             cwd: cwd.to_owned(),
@@ -2591,7 +2680,29 @@ mod tests {
     }
 
     fn empty_attestation() -> CodexMcpAttestationExpectation {
-        CodexMcpAttestationExpectation::unmanaged_empty().expect("empty attestation")
+        CodexMcpAttestationExpectation::unmanaged_empty(
+            codex_config_read_max_origins(512).expect("origin budget"),
+        )
+        .expect("empty attestation")
+    }
+
+    #[test]
+    fn codex_readiness_probe_materializes_the_configured_tool_limit() {
+        let names = codex_readiness_tool_names(512).expect("readiness tool names");
+        assert_eq!(names.len(), 512);
+        assert_eq!(
+            names.first().map(String::as_str),
+            Some(CODEX_READINESS_ALLOWED_TOOL)
+        );
+        assert_eq!(
+            names.last().map(String::as_str),
+            Some("pioneer_readiness_allowed_00000511")
+        );
+        assert_eq!(
+            names.iter().collect::<std::collections::HashSet<_>>().len(),
+            512
+        );
+        assert!(codex_readiness_tool_names(0).is_err());
     }
 
     fn exact_pioneer_snapshot(mcp_servers: JsonValue) -> CodexConfigReadSnapshot {
@@ -2694,6 +2805,64 @@ mod tests {
         assert!(start.await.expect("start task should join").is_ok());
     }
 
+    #[tokio::test]
+    async fn codex_isolation_accepts_production_shaped_config_origins() {
+        let enabled_tools = (0..306)
+            .map(|index| format!("mcp__appstoreconnect__tool_{index:03}"))
+            .collect::<Vec<_>>();
+        let tools = enabled_tools
+            .iter()
+            .map(|name| (name.clone(), json!({"approval_mode": "approve"})))
+            .collect::<serde_json::Map<_, _>>();
+        let mcp_servers = json!({
+            "pioneer": {
+                "command": "/opt/pioneer/pioneer",
+                "args": ["__cli-mcp-stdio", "--bootstrap-file", "/private/bootstrap"],
+                "required": true,
+                "enabled_tools": enabled_tools.as_slice(),
+                "tools": tools
+            }
+        });
+        let fingerprint =
+            codex_config_value_fingerprint(&mcp_servers).expect("managed MCP fingerprint");
+        let expectation = CodexMcpAttestationExpectation {
+            server_names: vec!["pioneer".to_owned()],
+            staged_mcp_servers_fingerprint: fingerprint.clone(),
+            effective_mcp_servers_fingerprint: fingerprint,
+            requires_staged_artifact: false,
+            max_config_origins: codex_config_read_max_origins(512).expect("origin budget"),
+        };
+        let mut fake = FakeCodexIsolationServer::new();
+        let client = fake.client.clone();
+        let attestation = tokio::spawn(async move {
+            attest_codex_exact_isolation(
+                &client,
+                "/workspace",
+                &expectation,
+                None,
+                Duration::from_secs(2),
+            )
+            .await
+        });
+
+        let config_read = fake.read_request().await;
+        assert_eq!(config_read["method"], json!("config/read"));
+        let result = with_managed_config_origins(
+            exact_pioneer_config_read_result(mcp_servers),
+            enabled_tools.as_slice(),
+        );
+        assert_eq!(
+            result["origins"].as_object().map(|origins| origins.len()),
+            Some(623)
+        );
+        fake.write_result(config_read["id"].clone(), result).await;
+
+        attestation
+            .await
+            .expect("attestation task should join")
+            .expect("623 origins must fit the configured 512-tool contract");
+    }
+
     #[test]
     fn codex_mcp_attestation_requires_exact_effective_server_and_layer_fingerprint() {
         let exact = json!({
@@ -2712,6 +2881,7 @@ mod tests {
             effective_mcp_servers_fingerprint: codex_config_value_fingerprint(&exact)
                 .expect("expected fingerprint"),
             requires_staged_artifact: true,
+            max_config_origins: codex_config_read_max_origins(512).expect("origin budget"),
         };
         let accepted = exact_pioneer_snapshot(exact.clone());
         validate_codex_exact_isolation_snapshot(&accepted, &expectation)
@@ -2862,6 +3032,7 @@ mod tests {
             effective_mcp_servers_fingerprint: codex_config_value_fingerprint(&mcp_servers)
                 .expect("expected fingerprint"),
             requires_staged_artifact: false,
+            max_config_origins: codex_config_read_max_origins(512).expect("origin budget"),
         };
         let mut fake = FakeCodexIsolationServer::new();
         let client = fake.client.clone();

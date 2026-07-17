@@ -1883,6 +1883,7 @@ impl Provider for DelayedProvider {
             vision: false,
             tool_calling: false,
             embeddings: false,
+            transcription: false,
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
         }
     }
@@ -1922,6 +1923,7 @@ impl Provider for RevisionProvider {
             vision: false,
             tool_calling: false,
             embeddings: false,
+            transcription: false,
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
         }
     }
@@ -1992,6 +1994,7 @@ impl Provider for RevisionHangingProvider {
             vision: false,
             tool_calling: false,
             embeddings: false,
+            transcription: false,
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
         }
     }
@@ -2079,6 +2082,7 @@ impl Provider for CountingDelayedProvider {
             vision: false,
             tool_calling: false,
             embeddings: false,
+            transcription: false,
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
         }
     }
@@ -2182,6 +2186,7 @@ impl Provider for CaptureSummaryProvider {
             vision: false,
             tool_calling: false,
             embeddings: false,
+            transcription: false,
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
         }
     }
@@ -2225,6 +2230,7 @@ impl Provider for PreflightCaptureProvider {
             vision: false,
             tool_calling: true,
             embeddings: false,
+            transcription: false,
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
         }
     }
@@ -2266,6 +2272,7 @@ impl Provider for HangingChildProvider {
             vision: false,
             tool_calling: true,
             embeddings: false,
+            transcription: false,
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
         }
     }
@@ -2308,6 +2315,7 @@ impl Provider for FlakyTitleProvider {
             vision: false,
             tool_calling: false,
             embeddings: false,
+            transcription: false,
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
         }
     }
@@ -2365,6 +2373,7 @@ impl Provider for GuardAwareProvider {
             vision: false,
             tool_calling: true,
             embeddings: false,
+            transcription: false,
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
         }
     }
@@ -2474,6 +2483,7 @@ impl Provider for CreateThenHangProvider {
             vision: false,
             tool_calling: true,
             embeddings: false,
+            transcription: false,
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
         }
     }
@@ -2940,6 +2950,7 @@ impl Provider for MemoryAgentE2eProvider {
             vision: false,
             tool_calling: false,
             embeddings: false,
+            transcription: false,
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
         }
     }
@@ -3138,6 +3149,7 @@ impl Provider for SequencedToolProvider {
             vision: false,
             tool_calling: true,
             embeddings: false,
+            transcription: false,
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
         }
     }
@@ -3319,6 +3331,7 @@ async fn provider_api_key_handlers_use_keystore_without_settings_write() {
         thread_episodic: Default::default(),
         cli_runtimes: Default::default(),
         remote_access: Default::default(),
+        voice_input: Default::default(),
     };
     settings_snapshot.thread_episodic.vector_search.enabled = true;
     settings_snapshot.thread_episodic.vector_search.provider =
@@ -3564,6 +3577,132 @@ async fn provider_set_api_key_rejects_empty_key_without_store_write() {
         .list(SecretFilter::Kind(SecretKind::ProviderApiKey))
         .expect("list provider keys");
     assert!(entries.is_empty());
+}
+
+#[tokio::test]
+async fn provider_list_transcription_models_covers_success_and_validation_errors() {
+    let (
+        processor,
+        _secret_store,
+        mut rx,
+        connection_id,
+        _workspace_manager,
+        workspace_id,
+        _settings_path,
+    ) = setup_provider_api_key_processor("provider_list_transcription_models").await;
+
+    let success_id = pioneer_protocol::RequestId::new(generate_test_request_id("tx", "success"))
+        .expect("valid success request id");
+    processor
+        .provider_list_transcription_models(
+            connection_id,
+            success_id.clone(),
+            ProviderListModelsParams {
+                workspace_id: workspace_id.clone(),
+                provider: "local".to_owned(),
+            },
+        )
+        .await;
+    let success = recv_response_by_id(&mut rx, success_id.as_str()).await;
+    let payload: ProviderListModelsResponse =
+        serde_json::from_value(success.result).expect("transcription model list payload");
+    assert_eq!(payload.provider, "local");
+    assert_eq!(payload.models.len(), 16);
+    assert_eq!(payload.models[0].id, "small");
+    assert_eq!(payload.models[6].id, "parakeet-tdt-0.6b-v3");
+    assert_eq!(payload.models[15].id, "cohere-int8");
+    assert!(
+        payload
+            .models
+            .iter()
+            .all(|model| model.capabilities.transcription == Some(true))
+    );
+    let serialized = serde_json::to_string(&payload).expect("payload should serialize");
+    for trusted_value in [
+        "blob.handy.computer",
+        "sha256",
+        "artifact_file_name",
+        "install_dir_name",
+        "runtime_file_name",
+    ] {
+        assert!(!serialized.contains(trusted_value));
+    }
+
+    let unknown_id = pioneer_protocol::RequestId::new(generate_test_request_id("tx", "unknown"))
+        .expect("valid unknown request id");
+    processor
+        .provider_list_transcription_models(
+            connection_id,
+            unknown_id.clone(),
+            ProviderListModelsParams {
+                workspace_id: workspace_id.clone(),
+                provider: "not-a-provider".to_owned(),
+            },
+        )
+        .await;
+    let unknown = recv_error_by_id(&mut rx, unknown_id.as_str()).await;
+    assert_eq!(unknown.error.code, INVALID_REQUEST_CODE);
+    assert!(unknown.error.message.contains("failed to create provider"));
+
+    processor
+        .provider_registry
+        .insert("echo", Arc::new(EchoProvider::new()));
+    let unsupported_id =
+        pioneer_protocol::RequestId::new(generate_test_request_id("tx", "unsupported"))
+            .expect("valid unsupported request id");
+    processor
+        .provider_list_transcription_models(
+            connection_id,
+            unsupported_id.clone(),
+            ProviderListModelsParams {
+                workspace_id: workspace_id.clone(),
+                provider: "echo".to_owned(),
+            },
+        )
+        .await;
+    let unsupported = recv_error_by_id(&mut rx, unsupported_id.as_str()).await;
+    assert_eq!(unsupported.error.code, INVALID_REQUEST_CODE);
+    assert!(
+        unsupported
+            .error
+            .message
+            .contains("does not support listing transcription models")
+    );
+
+    let malformed_id = generate_test_request_id("tx", "malformed");
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": malformed_id.clone(),
+                "method": pioneer_protocol::constants::methods::PROVIDER_TRANSCRIPTION_MODELS_LIST,
+                "params": { "workspace_id": workspace_id }
+            })
+            .to_string(),
+        )
+        .await;
+    let malformed = recv_error_by_id(&mut rx, malformed_id.as_str()).await;
+    assert_eq!(malformed.error.code, pioneer_protocol::INVALID_PARAMS_CODE);
+
+    let unauthorized_id =
+        pioneer_protocol::RequestId::new(generate_test_request_id("tx", "workspace"))
+            .expect("valid workspace request id");
+    processor
+        .provider_list_transcription_models(
+            connection_id,
+            unauthorized_id.clone(),
+            ProviderListModelsParams {
+                workspace_id: "unknown-workspace".to_owned(),
+                provider: "local".to_owned(),
+            },
+        )
+        .await;
+    let unauthorized = recv_error_by_id(&mut rx, unauthorized_id.as_str()).await;
+    assert_eq!(
+        unauthorized.error.code,
+        pioneer_protocol::INVALID_PARAMS_CODE
+    );
 }
 
 fn test_task_create_params(
@@ -6098,17 +6237,87 @@ async fn turn_start_with_capabilities_materializes_user_message_attachments() {
     );
 }
 
-struct StaticGatewayVoiceTranscriber {
-    text: &'static str,
+struct TestGatewayVoiceInstaller;
+
+#[async_trait]
+impl crate::voice::supervisor::VoiceModelInstaller for TestGatewayVoiceInstaller {
+    fn verified_install_layout(
+        &self,
+        _entry: &crate::voice::model_catalog::VoiceModelCatalogEntry,
+    ) -> anyhow::Result<Option<crate::voice::model_catalog::VoiceModelInstallLayout>> {
+        anyhow::bail!("ready test supervisor must not inspect model files")
+    }
+
+    fn cleanup_non_selected(
+        &self,
+        _selected_model_id: &str,
+        _cancellation: &tokio_util::sync::CancellationToken,
+        _protected_model_id: &std::sync::RwLock<Option<String>>,
+    ) -> anyhow::Result<crate::voice::model_install::VoiceModelCleanupReport> {
+        anyhow::bail!("ready test supervisor must not clean model files")
+    }
+
+    async fn install(
+        &self,
+        _entry: crate::voice::model_catalog::VoiceModelCatalogEntry,
+        _force_fresh: bool,
+        _control: crate::voice::model_install::VoiceModelInstallControl,
+    ) -> anyhow::Result<crate::voice::model_install::VoiceModelInstallReport> {
+        anyhow::bail!("ready test supervisor must not install model files")
+    }
 }
 
-impl crate::voice::transcription::VoiceSpeechTranscriber for StaticGatewayVoiceTranscriber {
-    fn transcribe_speech(
+struct TestGatewayVoiceEngineLoader;
+
+impl crate::voice::supervisor::VoiceEngineLoader for TestGatewayVoiceEngineLoader {
+    fn load(
         &self,
-        _buffer: &crate::voice::transcription::PreparedSpeechBuffer,
-    ) -> Result<String, crate::voice::transcription::VoiceTranscriptionError> {
-        Ok(self.text.to_owned())
+        _entry: &crate::voice::model_catalog::VoiceModelCatalogEntry,
+        _layout: &crate::voice::model_catalog::VoiceModelInstallLayout,
+    ) -> std::result::Result<
+        crate::voice::runtime::LoadedVoiceEngine,
+        crate::voice::transcription::VoiceTranscriptionError,
+    > {
+        Err(crate::voice::transcription::transcription_error(
+            crate::voice::transcription::VoiceTranscriptionErrorKind::RuntimeFailure,
+            "ready test supervisor must not load model files",
+        ))
     }
+}
+
+fn ready_gateway_voice_supervisor(
+    transcript: &str,
+) -> Arc<crate::voice::supervisor::VoiceInputSupervisor> {
+    let supervisor = test_gateway_voice_supervisor();
+    let desired = crate::voice::supervisor::VoiceInputDesiredState {
+        enabled: true,
+        provider: Some(pioneer_protocol::GatewayVoiceInputProvider::Local),
+        model: Some("parakeet-tdt-0.6b-v3".to_owned()),
+    };
+    let applied = supervisor
+        .apply_desired(desired, false)
+        .expect("ready test desired state");
+    supervisor
+        .mark_loading(applied.generation)
+        .expect("ready test loading transition");
+    supervisor
+        .mark_ready(
+            applied.generation,
+            crate::voice::supervisor::VoiceModelIdentity {
+                provider: pioneer_protocol::GatewayVoiceInputProvider::Local,
+                model: "parakeet-tdt-0.6b-v3".to_owned(),
+            },
+            crate::voice::runtime::LoadedVoiceEngine::test_stub_with_transcript(transcript),
+        )
+        .expect("ready test Ready transition");
+    supervisor
+}
+
+fn test_gateway_voice_supervisor() -> Arc<crate::voice::supervisor::VoiceInputSupervisor> {
+    Arc::new(crate::voice::supervisor::VoiceInputSupervisor::new(
+        Arc::new(TestGatewayVoiceInstaller),
+        Arc::new(TestGatewayVoiceEngineLoader),
+    ))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6134,12 +6343,9 @@ async fn voice_session_transcript_starts_turn_and_preserves_context_attachments(
         test_context_budget(),
         test_tool_loop_config(),
     )
-    .with_voice_model_bootstrap(Arc::new(
-        crate::voice::model_bootstrap::VoiceModelBootstrapHandle::ready(),
-    ))
-    .with_voice_transcriber(StaticGatewayVoiceTranscriber {
-        text: "voice transcript with context",
-    });
+    .with_voice_input_supervisor(ready_gateway_voice_supervisor(
+        "voice transcript with context",
+    ));
     let artifact =
         ingest_user_test_artifact(&processor, workspace_id.as_str(), "voice-artifact.txt").await;
     let thread = start_thread_for_artifact_test(
@@ -6352,10 +6558,7 @@ async fn voice_session_cancel_drops_session_without_creating_turn() {
         test_context_budget(),
         test_tool_loop_config(),
     )
-    .with_voice_model_bootstrap(Arc::new(
-        crate::voice::model_bootstrap::VoiceModelBootstrapHandle::ready(),
-    ))
-    .with_voice_transcriber(StaticGatewayVoiceTranscriber { text: "ignored" });
+    .with_voice_input_supervisor(ready_gateway_voice_supervisor("ignored"));
     let thread = start_thread_for_artifact_test(
         &processor,
         connection_id,
@@ -6422,12 +6625,7 @@ async fn voice_session_finalize_without_speech_does_not_create_turn() {
         test_context_budget(),
         test_tool_loop_config(),
     )
-    .with_voice_model_bootstrap(Arc::new(
-        crate::voice::model_bootstrap::VoiceModelBootstrapHandle::ready(),
-    ))
-    .with_voice_transcriber(StaticGatewayVoiceTranscriber {
-        text: "should not run",
-    });
+    .with_voice_input_supervisor(ready_gateway_voice_supervisor("should not run"));
     let thread = start_thread_for_artifact_test(
         &processor,
         connection_id,
@@ -6506,7 +6704,7 @@ async fn voice_session_finalize_without_speech_does_not_create_turn() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn voice_status_and_start_report_model_unavailable() {
+async fn voice_status_disabled_and_start_report_model_unavailable() {
     let (tx, mut rx) = mpsc::channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = session_manager.register_connection(tx).await;
@@ -6537,14 +6735,8 @@ async fn voice_status_and_start_report_model_unavailable() {
     let status_response = recv_response_by_id(&mut rx, status_request_id.as_str()).await;
     let status_payload: pioneer_protocol::VoiceStatusResponse =
         serde_json::from_value(status_response.result).expect("voice/status decode");
-    assert_eq!(status_payload.status, VoiceStatus::Unavailable);
-    assert!(matches!(
-        status_payload.error,
-        Some(pioneer_protocol::VoiceError {
-            kind: VoiceErrorKind::ModelUnavailable,
-            ..
-        })
-    ));
+    assert_eq!(status_payload.status, VoiceStatus::Disabled);
+    assert!(status_payload.error.is_none());
 
     let start_request_id = generate_test_request_id("voice", "start_unavailable");
     let start_request = json!({
@@ -6572,6 +6764,230 @@ async fn voice_status_and_start_report_model_unavailable() {
         serde_json::from_value(start_error.error.data.expect("voice error data"))
             .expect("voice error payload");
     assert_eq!(voice_error.kind, VoiceErrorKind::ModelUnavailable);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn voice_session_requires_ready_for_every_non_ready_phase() {
+    let (tx, mut rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let supervisor = test_gateway_voice_supervisor();
+    let processor = MessageProcessor::new(
+        Arc::new(ThreadManager::new("o4-mini", "openai")),
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_voice_input_supervisor(supervisor.clone());
+
+    async fn assert_rejected(
+        processor: &MessageProcessor,
+        connection_id: ConnectionId,
+        rx: &mut mpsc::Receiver<Message>,
+        workspace_id: &str,
+        suffix: &str,
+    ) {
+        let request_id = generate_test_request_id("voice_not_ready", suffix);
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": request_id.clone(),
+            "method": "voice/session/start",
+            "params": {
+                "context": {
+                    "workspace_id": workspace_id,
+                    "thread_id": "thr_voice_not_ready",
+                    "turn_id": format!("turn_voice_not_ready_{suffix}")
+                },
+                "audio_format": {
+                    "sample_rate_hz": 16000,
+                    "channels": 1,
+                    "encoding": "pcm_s16_le"
+                }
+            }
+        });
+        processor
+            .process_request(connection_id, &request.to_string())
+            .await;
+        let response = recv_error_by_id(rx, request_id.as_str()).await;
+        let error: pioneer_protocol::VoiceError =
+            serde_json::from_value(response.error.data.expect("typed voice error"))
+                .expect("voice error payload");
+        assert!(matches!(
+            error.kind,
+            VoiceErrorKind::ModelUnavailable | VoiceErrorKind::ModelDownloading
+        ));
+    }
+
+    assert_rejected(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        "disabled",
+    )
+    .await;
+
+    supervisor
+        .apply_desired(
+            crate::voice::supervisor::VoiceInputDesiredState {
+                enabled: true,
+                provider: None,
+                model: None,
+            },
+            false,
+        )
+        .expect("model-not-selected desired state");
+    assert_rejected(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        "model_not_selected",
+    )
+    .await;
+
+    let selected = supervisor
+        .apply_desired(
+            crate::voice::supervisor::VoiceInputDesiredState {
+                enabled: true,
+                provider: Some(pioneer_protocol::GatewayVoiceInputProvider::Local),
+                model: Some("parakeet-tdt-0.6b-v3".to_owned()),
+            },
+            false,
+        )
+        .expect("missing desired state");
+    assert_rejected(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        "missing",
+    )
+    .await;
+
+    supervisor
+        .mark_downloading(selected.generation)
+        .expect("downloading transition");
+    assert_rejected(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        "downloading",
+    )
+    .await;
+
+    supervisor
+        .mark_installing(selected.generation)
+        .expect("installing transition");
+    assert_rejected(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        "installing",
+    )
+    .await;
+
+    supervisor
+        .mark_loading(selected.generation)
+        .expect("loading transition");
+    assert_rejected(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        "loading",
+    )
+    .await;
+
+    supervisor
+        .mark_failed(selected.generation, "synthetic load failure")
+        .expect("failed transition");
+    assert_rejected(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        "failed",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn voice_input_status_notification_reports_transitions_and_coalesces_progress() {
+    let (tx, mut rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let _connection_id = session_manager.register_connection(tx).await;
+    let (workspace_manager, crud_store, _workspace_id) = setup_workspace_manager().await;
+    let supervisor = test_gateway_voice_supervisor();
+    let processor = Arc::new(
+        MessageProcessor::new(
+            Arc::new(ThreadManager::new("o4-mini", "openai")),
+            test_provider(),
+            session_manager,
+            workspace_manager,
+            crud_store,
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_context_budget(),
+            test_tool_loop_config(),
+        )
+        .with_voice_input_supervisor(supervisor.clone()),
+    );
+    processor.start_voice_input_status_notifications();
+
+    let selected = supervisor
+        .apply_desired(
+            crate::voice::supervisor::VoiceInputDesiredState {
+                enabled: true,
+                provider: Some(pioneer_protocol::GatewayVoiceInputProvider::Local),
+                model: Some("parakeet-tdt-0.6b-v3".to_owned()),
+            },
+            false,
+        )
+        .expect("selected desired state");
+    let missing =
+        recv_notification_by_method(&mut rx, events::GATEWAY_VOICE_INPUT_STATUS_CHANGED).await;
+    let missing: pioneer_protocol::GatewayVoiceInputStatusChangedNotification =
+        serde_json::from_value(missing.params.expect("missing notification params"))
+            .expect("missing notification payload");
+    assert_eq!(
+        missing.settings.runtime.phase,
+        pioneer_protocol::GatewayVoiceInputRuntimePhase::Missing
+    );
+
+    supervisor
+        .mark_downloading(selected.generation)
+        .expect("downloading transition");
+    let downloading =
+        recv_notification_by_method(&mut rx, events::GATEWAY_VOICE_INPUT_STATUS_CHANGED).await;
+    let downloading: pioneer_protocol::GatewayVoiceInputStatusChangedNotification =
+        serde_json::from_value(downloading.params.expect("downloading notification params"))
+            .expect("downloading notification payload");
+    assert_eq!(
+        downloading.settings.runtime.phase,
+        pioneer_protocol::GatewayVoiceInputRuntimePhase::Downloading
+    );
+
+    for downloaded_bytes in [1_u64, 2, 3] {
+        supervisor
+            .report_download_progress(selected.generation, downloaded_bytes, Some(10))
+            .expect("download progress");
+    }
+    let progress =
+        recv_notification_by_method(&mut rx, events::GATEWAY_VOICE_INPUT_STATUS_CHANGED).await;
+    let progress: pioneer_protocol::GatewayVoiceInputStatusChangedNotification =
+        serde_json::from_value(progress.params.expect("progress notification params"))
+            .expect("progress notification payload");
+    assert_eq!(progress.settings.runtime.downloaded_bytes, Some(3));
+    assert_eq!(progress.settings.runtime.total_bytes, Some(10));
 }
 
 async fn start_test_voice_session(
@@ -6605,6 +7021,345 @@ async fn start_test_voice_session(
         .await;
     let response = recv_response_by_id(rx, request_id).await;
     serde_json::from_value(response.result).expect("voice/session/start decode")
+}
+
+#[tokio::test]
+async fn voice_reconfiguration_busy_blocks_all_active_states_before_persistence() {
+    let runtime_home = unique_temp_dir("voice_reconfiguration_busy");
+    std::fs::create_dir_all(&runtime_home).expect("runtime home");
+    let (tx, mut rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_runtime_home_for_tests(runtime_home.clone());
+    processor
+        .voice_sessions
+        .create_session(
+            "voice_reconfiguration_busy_session",
+            connection_id,
+            pioneer_protocol::VoiceSessionStartContext {
+                workspace_id: workspace_id.clone(),
+                thread_id: "thread_voice_reconfiguration_busy".to_owned(),
+                turn_id: "turn_voice_reconfiguration_busy".to_owned(),
+            },
+            pioneer_protocol::VoiceAudioFormat {
+                sample_rate_hz: 16_000,
+                channels: 1,
+                encoding: pioneer_protocol::VoiceAudioEncoding::PcmS16Le,
+            },
+        )
+        .expect("create active voice session");
+    processor
+        .voice_sessions
+        .mark_recording("voice_reconfiguration_busy_session", connection_id)
+        .expect("recording");
+
+    for (state, transition) in [
+        ("recording", None),
+        ("finalizing", Some(false)),
+        ("transcribing", Some(true)),
+    ] {
+        if let Some(transcribing) = transition {
+            if transcribing {
+                processor
+                    .voice_sessions
+                    .mark_transcribing("voice_reconfiguration_busy_session", connection_id)
+                    .expect("transcribing");
+            } else {
+                processor
+                    .voice_sessions
+                    .mark_finalizing("voice_reconfiguration_busy_session", connection_id)
+                    .expect("finalizing");
+            }
+        }
+        let request_id = generate_test_request_id("voicebusy", state);
+        processor
+            .process_request(
+                connection_id,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id.clone(),
+                    "method": "settings/update",
+                    "params": {
+                        "update": {
+                            "voice_input": {
+                                "enabled": true,
+                                "provider": "local",
+                                "model": "small"
+                            }
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+        let error = recv_error_by_id(&mut rx, request_id.as_str()).await;
+        assert_eq!(
+            error
+                .error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("code"))
+                .and_then(JsonValue::as_str),
+            Some("voice_reconfiguration_busy")
+        );
+    }
+
+    let unrelated_request_id = generate_test_request_id("voicebusy", "unrelated");
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": unrelated_request_id.clone(),
+                "method": "settings/update",
+                "params": { "update": { "general": { "keepawake": false } } }
+            })
+            .to_string(),
+        )
+        .await;
+    let _ = recv_response_by_id(&mut rx, unrelated_request_id.as_str()).await;
+
+    let config = pioneer_config::AppConfig::load().expect("app config");
+    let settings_path = runtime_home.join(config.gateway.settings_file_name.as_str());
+    let settings = crate::settings::load_or_create_gateway_settings(
+        settings_path.as_path(),
+        config.gateway.settings_version,
+        config.gateway.settings_file_name.as_str(),
+    )
+    .expect("load settings after rejection");
+    let rejected_snapshot = settings.snapshot(&config.gateway);
+    assert!(!rejected_snapshot.voice_input.enabled);
+    assert_eq!(rejected_snapshot.voice_input.model, None);
+    assert!(!rejected_snapshot.general.keepawake);
+
+    let removed = processor.voice_sessions.cleanup_connection(connection_id);
+    assert_eq!(removed.len(), 1);
+    assert!(
+        !processor
+            .voice_sessions
+            .has_active_sessions()
+            .expect("clean session store")
+    );
+    let retry_request_id = generate_test_request_id("voicebusy", "after_cleanup");
+    processor
+        .process_request(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": retry_request_id.clone(),
+                "method": "settings/update",
+                "params": {
+                    "update": {
+                        "voice_input": {
+                            "enabled": true,
+                            "provider": "local",
+                            "model": "small"
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let response = recv_response_by_id(&mut rx, retry_request_id.as_str()).await;
+    let payload: pioneer_protocol::GatewaySettingsUpdateResponse =
+        serde_json::from_value(response.result).expect("settings update response");
+    assert!(payload.settings.voice_input.enabled);
+    assert_eq!(payload.settings.voice_input.model.as_deref(), Some("small"));
+
+    let _ = std::fs::remove_dir_all(runtime_home);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn voice_settings_two_client_race_serializes_to_one_consistent_outcome() {
+    let runtime_home = unique_temp_dir("voice_settings_two_client_race");
+    std::fs::create_dir_all(&runtime_home).expect("runtime home");
+    let config = pioneer_config::AppConfig::load().expect("app config");
+    let settings_path = runtime_home.join(config.gateway.settings_file_name.as_str());
+    let mut settings = crate::settings::load_or_create_gateway_settings(
+        settings_path.as_path(),
+        config.gateway.settings_version,
+        config.gateway.settings_file_name.as_str(),
+    )
+    .expect("initial settings");
+    settings
+        .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+            voice_input: Some(pioneer_protocol::GatewayVoiceInputSettingsUpdate {
+                enabled: Some(true),
+                provider: Some(Some(pioneer_protocol::GatewayVoiceInputProvider::Local)),
+                model: Some(Some("parakeet-tdt-0.6b-v3".to_owned())),
+                retry_install: false,
+            }),
+            ..pioneer_protocol::GatewaySettingsUpdate::default()
+        })
+        .expect("persisted enabled Voice Input");
+    crate::settings::save_gateway_settings(settings_path.as_path(), &settings)
+        .expect("save enabled Voice Input");
+
+    let (tx_a, mut rx_a) = mpsc::channel(32);
+    let (tx_b, mut rx_b) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_a = session_manager.register_connection(tx_a).await;
+    let connection_b = session_manager.register_connection(tx_b).await;
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_a, Some(workspace_id.clone()))
+        .await;
+    session_manager
+        .set_connection_workspace(connection_b, Some(workspace_id.clone()))
+        .await;
+    let processor = Arc::new(
+        MessageProcessor::new(
+            Arc::new(ThreadManager::new("o4-mini", "openai")),
+            test_provider(),
+            session_manager,
+            workspace_manager,
+            crud_store,
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_context_budget(),
+            test_tool_loop_config(),
+        )
+        .with_runtime_home_for_tests(runtime_home.clone())
+        .with_voice_input_supervisor(ready_gateway_voice_supervisor("race transcript")),
+    );
+    let thread = start_thread_for_artifact_test(
+        processor.as_ref(),
+        connection_a,
+        &mut rx_a,
+        workspace_id.as_str(),
+        "thr_voice_settings_race",
+    )
+    .await;
+
+    let start_id = generate_test_request_id("voice_race", "start");
+    let start_payload = json!({
+        "jsonrpc": "2.0",
+        "id": start_id.clone(),
+        "method": "voice/session/start",
+        "params": {
+            "context": {
+                "workspace_id": workspace_id,
+                "thread_id": thread.thread.id,
+                "turn_id": "turn_voice_settings_race"
+            },
+            "audio_format": {
+                "sample_rate_hz": 16000,
+                "channels": 1,
+                "encoding": "pcm_s16_le"
+            }
+        }
+    })
+    .to_string();
+    let race_barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let start_processor = processor.clone();
+    let start_barrier = race_barrier.clone();
+    let start_task = tokio::spawn(async move {
+        start_barrier.wait().await;
+        start_processor
+            .process_request(connection_a, start_payload.as_str())
+            .await;
+    });
+
+    let update_id = generate_test_request_id("voice_race", "disable");
+    let update_payload = json!({
+        "jsonrpc": "2.0",
+        "id": update_id.clone(),
+        "method": "settings/update",
+        "params": {
+            "update": {
+                "voice_input": { "enabled": false }
+            }
+        }
+    })
+    .to_string();
+    let update_processor = processor.clone();
+    let update_barrier = race_barrier.clone();
+    let update_task = tokio::spawn(async move {
+        update_barrier.wait().await;
+        update_processor
+            .process_request(connection_b, update_payload.as_str())
+            .await;
+    });
+    race_barrier.wait().await;
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), start_task)
+        .await
+        .expect("session start task must not deadlock")
+        .expect("session start task");
+    tokio::time::timeout(std::time::Duration::from_secs(5), update_task)
+        .await
+        .expect("settings update task must not deadlock")
+        .expect("settings update task");
+    let start_response: JsonValue = serde_json::from_str(
+        recv_jsonrpc_payload_by_id(&mut rx_a, start_id.as_str())
+            .await
+            .as_str(),
+    )
+    .expect("session start JSON-RPC response");
+    let update_response: JsonValue = serde_json::from_str(
+        recv_jsonrpc_payload_by_id(&mut rx_b, update_id.as_str())
+            .await
+            .as_str(),
+    )
+    .expect("settings update JSON-RPC response");
+    let start_succeeded = start_response.get("result").is_some();
+    let update_succeeded = update_response.get("result").is_some();
+    assert_ne!(
+        start_succeeded, update_succeeded,
+        "exactly one racing Voice Input operation must succeed"
+    );
+
+    let persisted = crate::settings::load_or_create_gateway_settings(
+        settings_path.as_path(),
+        config.gateway.settings_version,
+        config.gateway.settings_file_name.as_str(),
+    )
+    .expect("settings after race");
+    let snapshot = persisted.snapshot(&config.gateway);
+    if start_succeeded {
+        assert_eq!(
+            update_response
+                .pointer("/error/data/code")
+                .and_then(JsonValue::as_str),
+            Some("voice_reconfiguration_busy")
+        );
+        assert!(snapshot.voice_input.enabled);
+        assert_eq!(
+            snapshot.voice_input.model.as_deref(),
+            Some("parakeet-tdt-0.6b-v3")
+        );
+    } else {
+        assert_eq!(
+            start_response
+                .pointer("/error/data/kind")
+                .and_then(JsonValue::as_str),
+            Some("model_unavailable")
+        );
+        assert!(!snapshot.voice_input.enabled);
+        assert_eq!(
+            snapshot.voice_input.model.as_deref(),
+            Some("parakeet-tdt-0.6b-v3")
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(runtime_home);
 }
 
 fn voice_test_frame(session_id: &str, sequence: u64, samples: usize, sample: i16) -> Vec<u8> {
