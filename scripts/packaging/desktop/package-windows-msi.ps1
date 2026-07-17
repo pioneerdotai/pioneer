@@ -276,6 +276,19 @@ if (-not (Test-Path -Path $appIconPath)) {
     throw "missing Windows app icon: $appIconPath"
 }
 
+$env:BINDGEN_EXTRA_CLANG_ARGS = "--target=$Target"
+
+if ($Target -eq "aarch64-pc-windows-msvc") {
+    # ggml's ARM backend requires clang. Ninja lets CMake honor the compiler
+    # selection instead of forcing the Visual Studio MSVC toolset.
+    $env:CMAKE_GENERATOR = "Ninja"
+    $env:CMAKE_C_COMPILER = "clang-cl"
+    $env:CMAKE_CXX_COMPILER = "clang-cl"
+    $env:CMAKE_C_COMPILER_TARGET = $Target
+    $env:CMAKE_CXX_COMPILER_TARGET = $Target
+    $env:CL = "/EHsc"
+}
+
 cargo build --release -p pioneer-desktop --target $Target
 cargo build --release -p pioneer-app-updater --target $Target
 cargo build --release -p pioneer-cli --features computer-use --target $Target

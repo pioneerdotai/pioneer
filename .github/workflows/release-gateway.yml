@@ -166,11 +166,25 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          $target = "${{ matrix.target }}"
+          $env:BINDGEN_EXTRA_CLANG_ARGS = "--target=$target"
+
+          if ($target -eq "aarch64-pc-windows-msvc") {
+            # ggml's ARM backend requires clang. Ninja lets CMake honor the
+            # compiler selection instead of forcing the Visual Studio toolset.
+            $env:CMAKE_GENERATOR = "Ninja"
+            $env:CMAKE_C_COMPILER = "clang-cl"
+            $env:CMAKE_CXX_COMPILER = "clang-cl"
+            $env:CMAKE_C_COMPILER_TARGET = $target
+            $env:CMAKE_CXX_COMPILER_TARGET = $target
+            $env:CL = "/EHsc"
+          }
+
           $cargoArgs = @("build", "--locked", "--release", "-p", "pioneer-cli")
           if (-not [string]::IsNullOrWhiteSpace("${{ matrix.cargo_features }}")) {
             $cargoArgs += @("--features", "${{ matrix.cargo_features }}")
           }
-          $cargoArgs += @("--target", "${{ matrix.target }}")
+          $cargoArgs += @("--target", $target)
           cargo @cargoArgs
 
       - name: package-unix-artifact
