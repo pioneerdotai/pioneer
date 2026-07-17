@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GatewayVoiceInputRuntimeSnapshot",
+  "type": "object",
+  "properties": {
+    "downloaded_bytes": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    },
+    "effective_enabled": {
+      "type": "boolean",
+      "default": false
+    },
+    "error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "phase": {
+      "$ref": "#/$defs/GatewayVoiceInputRuntimePhase",
+      "default": "disabled"
+    },
+    "total_bytes": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "$defs": {
+    "GatewayVoiceInputRuntimePhase": {
+      "type": "string",
+      "enum": [
+        "disabled",
+        "model_not_selected",
+        "missing",
+        "downloading",
+        "installing",
+        "loading",
+        "ready",
+        "failed"
+      ]
+    }
+  }
+}

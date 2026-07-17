@@ -1,6 +1,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::VoiceStatus;
 use crate::turn::CLIAgentRuntimeKind;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -23,6 +24,8 @@ pub struct GatewaySettingsUpdate {
     pub cli_runtimes: Option<GatewayCliRuntimeSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_access: Option<GatewayRemoteAccessSettingsUpdate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_input: Option<GatewayVoiceInputSettingsUpdate>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -54,6 +57,91 @@ pub struct GatewaySettingsSnapshot {
     pub cli_runtimes: GatewayCliRuntimeSettings,
     #[serde(default)]
     pub remote_access: GatewayRemoteAccessSettings,
+    #[serde(default)]
+    pub voice_input: GatewayVoiceInputSettings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayVoiceInputProvider {
+    Local,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayVoiceInputRuntimePhase {
+    Disabled,
+    ModelNotSelected,
+    Missing,
+    Downloading,
+    Installing,
+    Loading,
+    Ready,
+    Failed,
+}
+
+impl Default for GatewayVoiceInputRuntimePhase {
+    fn default() -> Self {
+        Self::Disabled
+    }
+}
+
+impl GatewayVoiceInputRuntimePhase {
+    pub const fn coarse_voice_status(self) -> VoiceStatus {
+        match self {
+            Self::Disabled => VoiceStatus::Disabled,
+            Self::ModelNotSelected | Self::Missing => VoiceStatus::Unavailable,
+            Self::Downloading => VoiceStatus::ModelDownloading,
+            Self::Installing | Self::Loading => VoiceStatus::ModelLoading,
+            Self::Ready => VoiceStatus::Ready,
+            Self::Failed => VoiceStatus::Error,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GatewayVoiceInputRuntimeSnapshot {
+    #[serde(default)]
+    pub phase: GatewayVoiceInputRuntimePhase,
+    #[serde(default)]
+    pub effective_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub downloaded_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GatewayVoiceInputSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<GatewayVoiceInputProvider>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub runtime: GatewayVoiceInputRuntimeSnapshot,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GatewayVoiceInputSettingsUpdate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<Option<GatewayVoiceInputProvider>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub retry_install: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GatewayVoiceInputStatusChangedNotification {
+    pub settings: GatewayVoiceInputSettings,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -563,6 +651,10 @@ const fn default_gateway_thread_episodic_vector_normalized() -> bool {
     true
 }
 
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 fn normalized_optional_model_selection_text(value: Option<&str>, max_len: usize) -> Option<String> {
     let normalized = value?.trim();
     if normalized.is_empty() {
@@ -582,7 +674,10 @@ mod tests {
         GatewayThreadEpisodicVectorLocalModelStatus, GatewayThreadEpisodicVectorProvider,
         GatewayThreadEpisodicVectorProviderKeyStatus, GatewayThreadEpisodicVectorRefillStatus,
         GatewayThreadEpisodicVectorSearchSettings, GatewayThreadEpisodicVectorSearchSettingsUpdate,
+        GatewayVoiceInputProvider, GatewayVoiceInputRuntimePhase, GatewayVoiceInputRuntimeSnapshot,
+        GatewayVoiceInputSettings, GatewayVoiceInputSettingsUpdate,
     };
+    use crate::VoiceStatus;
     use crate::turn::CLIAgentRuntimeKind;
 
     #[test]
@@ -671,6 +766,7 @@ mod tests {
                 }],
             },
             remote_access: Default::default(),
+            voice_input: Default::default(),
         };
 
         let serialized = serde_json::to_string(&snapshot).expect("snapshot should serialize");
@@ -809,6 +905,7 @@ mod tests {
             },
             cli_runtimes: GatewayCliRuntimeSettings::default(),
             remote_access: GatewayRemoteAccessSettings::default(),
+            voice_input: GatewayVoiceInputSettings::default(),
         };
 
         let serialized =
@@ -874,5 +971,99 @@ mod tests {
         let roundtrip: GatewaySettingsUpdate =
             serde_json::from_str(serialized.as_str()).expect("settings update deserializes");
         assert_eq!(roundtrip.thread_episodic, update.thread_episodic);
+    }
+
+    #[test]
+    fn legacy_settings_snapshot_defaults_voice_input_to_disabled() {
+        let snapshot: GatewaySettingsSnapshot = serde_json::from_value(serde_json::json!({
+            "memory": GatewayMemorySettings::default()
+        }))
+        .expect("legacy settings snapshot should deserialize");
+
+        assert_eq!(snapshot.voice_input, GatewayVoiceInputSettings::default());
+        assert!(!snapshot.voice_input.enabled);
+        assert_eq!(snapshot.voice_input.provider, None);
+        assert_eq!(snapshot.voice_input.model, None);
+        assert_eq!(
+            snapshot.voice_input.runtime.phase,
+            GatewayVoiceInputRuntimePhase::Disabled
+        );
+        assert!(!snapshot.voice_input.runtime.effective_enabled);
+    }
+
+    #[test]
+    fn voice_input_settings_and_update_roundtrip_without_artifact_metadata() {
+        let settings = GatewayVoiceInputSettings {
+            enabled: true,
+            provider: Some(GatewayVoiceInputProvider::Local),
+            model: Some("parakeet-tdt-0.6b-v3".to_owned()),
+            runtime: GatewayVoiceInputRuntimeSnapshot {
+                phase: GatewayVoiceInputRuntimePhase::Downloading,
+                effective_enabled: false,
+                model: Some("parakeet-tdt-0.6b-v3".to_owned()),
+                downloaded_bytes: Some(128),
+                total_bytes: Some(512),
+                error: None,
+            },
+        };
+        let serialized = serde_json::to_value(&settings).expect("voice settings should serialize");
+        let roundtrip: GatewayVoiceInputSettings =
+            serde_json::from_value(serialized.clone()).expect("voice settings should deserialize");
+
+        assert_eq!(roundtrip, settings);
+        let text = serialized.to_string();
+        assert!(!text.contains("download_url"));
+        assert!(!text.contains("sha256"));
+        assert!(!text.contains("install_dir"));
+
+        let update = GatewayVoiceInputSettingsUpdate {
+            enabled: Some(true),
+            provider: Some(Some(GatewayVoiceInputProvider::Local)),
+            model: Some(Some("parakeet-tdt-0.6b-v3".to_owned())),
+            retry_install: true,
+        };
+        let serialized = serde_json::to_value(&update).expect("voice update should serialize");
+        assert_eq!(serialized["retry_install"], true);
+        let roundtrip: GatewayVoiceInputSettingsUpdate =
+            serde_json::from_value(serialized).expect("voice update should deserialize");
+        assert_eq!(roundtrip, update);
+
+        let default_update = serde_json::to_value(GatewayVoiceInputSettingsUpdate::default())
+            .expect("default voice update should serialize");
+        assert!(default_update.get("retry_install").is_none());
+    }
+
+    #[test]
+    fn voice_runtime_phases_map_to_exact_coarse_statuses() {
+        for (phase, expected) in [
+            (
+                GatewayVoiceInputRuntimePhase::Disabled,
+                VoiceStatus::Disabled,
+            ),
+            (
+                GatewayVoiceInputRuntimePhase::ModelNotSelected,
+                VoiceStatus::Unavailable,
+            ),
+            (
+                GatewayVoiceInputRuntimePhase::Missing,
+                VoiceStatus::Unavailable,
+            ),
+            (
+                GatewayVoiceInputRuntimePhase::Downloading,
+                VoiceStatus::ModelDownloading,
+            ),
+            (
+                GatewayVoiceInputRuntimePhase::Installing,
+                VoiceStatus::ModelLoading,
+            ),
+            (
+                GatewayVoiceInputRuntimePhase::Loading,
+                VoiceStatus::ModelLoading,
+            ),
+            (GatewayVoiceInputRuntimePhase::Ready, VoiceStatus::Ready),
+            (GatewayVoiceInputRuntimePhase::Failed, VoiceStatus::Error),
+        ] {
+            assert_eq!(phase.coarse_voice_status(), expected);
+        }
     }
 }

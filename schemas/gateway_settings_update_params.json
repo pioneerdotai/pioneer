@@ -242,6 +242,16 @@
               "type": "null"
             }
           ]
+        },
+        "voice_input": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayVoiceInputSettingsUpdate"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -435,6 +445,42 @@
             "boolean",
             "null"
           ]
+        }
+      }
+    },
+    "GatewayVoiceInputProvider": {
+      "type": "string",
+      "enum": [
+        "local"
+      ]
+    },
+    "GatewayVoiceInputSettingsUpdate": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayVoiceInputProvider"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "retry_install": {
+          "type": "boolean"
         }
       }
     }

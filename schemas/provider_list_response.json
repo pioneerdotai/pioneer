@@ -24,7 +24,8 @@
         "capabilities": {
           "$ref": "#/$defs/ProviderSummaryCapabilities",
           "default": {
-            "embeddings": false
+            "embeddings": false,
+            "transcription": false
           }
         },
         "name": {
@@ -45,6 +46,10 @@
       "type": "object",
       "properties": {
         "embeddings": {
+          "type": "boolean",
+          "default": false
+        },
+        "transcription": {
           "type": "boolean",
           "default": false
         }

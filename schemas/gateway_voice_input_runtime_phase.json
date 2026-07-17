@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GatewayVoiceInputRuntimePhase",
+  "type": "string",
+  "enum": [
+    "disabled",
+    "model_not_selected",
+    "missing",
+    "downloading",
+    "installing",
+    "loading",
+    "ready",
+    "failed"
+  ]
+}

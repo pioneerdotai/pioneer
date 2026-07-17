@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GatewayVoiceInputSettingsUpdate",
+  "type": "object",
+  "properties": {
+    "enabled": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "provider": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GatewayVoiceInputProvider"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "retry_install": {
+      "type": "boolean"
+    }
+  },
+  "$defs": {
+    "GatewayVoiceInputProvider": {
+      "type": "string",
+      "enum": [
+        "local"
+      ]
+    }
+  }
+}

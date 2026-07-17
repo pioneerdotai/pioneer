@@ -129,7 +129,7 @@ pub use provider::{
     ProviderListParams, ProviderListResponse, ProviderModelCapabilities, ProviderModelInfo,
     ProviderModelLimits, ProviderModelPricing, ProviderModelReasoningCapabilities,
     ProviderSetApiKeyParams, ProviderSetApiKeyResponse, ProviderSummary,
-    ProviderSummaryCapabilities, ReasoningCapabilitySource,
+    ProviderSummaryCapabilities, ProviderTranscriptionModelMetadata, ReasoningCapabilitySource,
 };
 pub use settings::{
     GatewayCliRuntimeInstanceSettings, GatewayCliRuntimeSettings, GatewayGeneralSettings,
@@ -145,6 +145,9 @@ pub use settings::{
     GatewayThreadEpisodicVectorRefillStatus,
     GatewayThreadEpisodicVectorRefillStatusChangedNotification,
     GatewayThreadEpisodicVectorSearchSettings, GatewayThreadEpisodicVectorSearchSettingsUpdate,
+    GatewayVoiceInputProvider, GatewayVoiceInputRuntimePhase, GatewayVoiceInputRuntimeSnapshot,
+    GatewayVoiceInputSettings, GatewayVoiceInputSettingsUpdate,
+    GatewayVoiceInputStatusChangedNotification,
 };
 pub use skills::{
     SkillArchiveFormat, SkillAuditTimelineItem, SkillChangedItem, SkillDependencyDiagnostic,

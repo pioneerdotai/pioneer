@@ -20,6 +20,7 @@ pub const VOICE_AUDIO_FORMAT_CONTRACT: &str =
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum VoiceStatus {
+    Disabled,
     Unavailable,
     /// Model download is happening in the gateway background. First pass UI
     /// should not infer or require detailed progress from this status.
@@ -809,5 +810,19 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn disabled_voice_status_roundtrips_and_disables_entry() {
+        let serialized = serde_json::to_string(&VoiceStatus::Disabled)
+            .expect("disabled voice status should serialize");
+        assert_eq!(serialized, "\"disabled\"");
+
+        let roundtrip: VoiceStatus =
+            serde_json::from_str(&serialized).expect("disabled voice status should deserialize");
+        assert_eq!(roundtrip, VoiceStatus::Disabled);
+        assert!(roundtrip.disables_voice_entry());
+        assert!(!roundtrip.is_model_bootstrap());
+        assert!(!roundtrip.is_active_session());
     }
 }

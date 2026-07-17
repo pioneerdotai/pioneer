@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ProviderTranscriptionModelMetadata",
+  "type": "object",
+  "properties": {
+    "accuracy_score": {
+      "type": "integer",
+      "format": "uint8",
+      "maximum": 255,
+      "minimum": 0
+    },
+    "download_size_mb": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "engine": {
+      "type": "string"
+    },
+    "recommended": {
+      "type": "boolean"
+    },
+    "speed_score": {
+      "type": "integer",
+      "format": "uint8",
+      "maximum": 255,
+      "minimum": 0
+    },
+    "supported_languages": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "supports_language_selection": {
+      "type": "boolean"
+    },
+    "supports_translation": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "engine",
+    "download_size_mb",
+    "accuracy_score",
+    "speed_score",
+    "supports_translation",
+    "supported_languages",
+    "supports_language_selection",
+    "recommended"
+  ]
+}

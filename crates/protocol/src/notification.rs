@@ -7,14 +7,14 @@ use crate::{
     CLIRuntimeRequestResolvedNotification, CLIRuntimeStatusChangedNotification,
     ContextCompressedNotification, ContextCompressingNotification,
     GatewayRemoteAccessStatusChangedNotification,
-    GatewayThreadEpisodicVectorRefillStatusChangedNotification, ItemCompletedNotification,
-    ItemDeltaNotification, ItemDeltaStream, ItemRecoveryAttachedNotification,
-    ItemRecoveryExhaustedNotification, ItemRecoveryOpenedNotification,
-    ItemRecoverySucceededNotification, ItemRetryAttemptStartedNotification,
-    ItemRetryScheduledNotification, ItemStartedNotification, ItemTimeoutDetectedNotification,
-    ItemToolRetryExhaustedNotification, ItemToolRetryResolvedNotification,
-    ItemToolRetryScheduledNotification, ItemUpdatedNotification, JsonRpcNotification,
-    McpChangedNotification, McpServerCatalogChangedNotification,
+    GatewayThreadEpisodicVectorRefillStatusChangedNotification,
+    GatewayVoiceInputStatusChangedNotification, ItemCompletedNotification, ItemDeltaNotification,
+    ItemDeltaStream, ItemRecoveryAttachedNotification, ItemRecoveryExhaustedNotification,
+    ItemRecoveryOpenedNotification, ItemRecoverySucceededNotification,
+    ItemRetryAttemptStartedNotification, ItemRetryScheduledNotification, ItemStartedNotification,
+    ItemTimeoutDetectedNotification, ItemToolRetryExhaustedNotification,
+    ItemToolRetryResolvedNotification, ItemToolRetryScheduledNotification, ItemUpdatedNotification,
+    JsonRpcNotification, McpChangedNotification, McpServerCatalogChangedNotification,
     McpServerStatusChangedNotification, MemoryCandidateCreatedNotification,
     MemoryChangedNotification, MemoryForgottenNotification, SkillsChangedNotification,
     SkillsUploadChunkAckNotification, TaskCancelledNotification, TaskCompletedNotification,
@@ -153,6 +153,8 @@ pub enum GatewayNotification {
     GatewayThreadEpisodicVectorRefillStatusChanged(
         GatewayThreadEpisodicVectorRefillStatusChangedNotification,
     ),
+    #[serde(rename = "gateway_voice_input_status_changed")]
+    GatewayVoiceInputStatusChanged(GatewayVoiceInputStatusChangedNotification),
     VoiceSessionResult(VoiceSessionResultNotification),
     Unknown(UnknownGatewayNotification),
 }
@@ -439,6 +441,14 @@ impl GatewayNotification {
                     Ok(notification) => Some(Self::GatewayThreadEpisodicVectorRefillStatusChanged(
                         notification,
                     )),
+                    Err(_) => Some(Self::Unknown(unknown_notification(method, params))),
+                }
+            }
+            events::GATEWAY_VOICE_INPUT_STATUS_CHANGED => {
+                match serde_json::from_value::<GatewayVoiceInputStatusChangedNotification>(
+                    params.clone(),
+                ) {
+                    Ok(notification) => Some(Self::GatewayVoiceInputStatusChanged(notification)),
                     Err(_) => Some(Self::Unknown(unknown_notification(method, params))),
                 }
             }
@@ -912,6 +922,40 @@ mod tests {
                 );
             }
             other => panic!("expected vector refill status changed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maps_gateway_voice_input_status_changed_notification() {
+        let notification = JsonRpcNotification::from_params(
+            events::GATEWAY_VOICE_INPUT_STATUS_CHANGED,
+            &json!({
+                "settings": {
+                    "enabled": true,
+                    "provider": "local",
+                    "model": "parakeet-tdt-0.6b-v3",
+                    "runtime": {
+                        "phase": "ready",
+                        "effective_enabled": true,
+                        "model": "parakeet-tdt-0.6b-v3"
+                    }
+                }
+            }),
+        )
+        .expect("voice status notification should encode");
+
+        let mapped = GatewayNotification::from_jsonrpc(notification)
+            .expect("voice status notification should map");
+        match mapped {
+            GatewayNotification::GatewayVoiceInputStatusChanged(notification) => {
+                assert!(notification.settings.enabled);
+                assert!(notification.settings.runtime.effective_enabled);
+                assert_eq!(
+                    notification.settings.runtime.phase,
+                    crate::GatewayVoiceInputRuntimePhase::Ready
+                );
+            }
+            other => panic!("expected voice status changed, got {other:?}"),
         }
     }
 

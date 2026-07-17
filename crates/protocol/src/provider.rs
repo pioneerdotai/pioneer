@@ -28,6 +28,8 @@ pub struct ProviderSummary {
 pub struct ProviderSummaryCapabilities {
     #[serde(default)]
     pub embeddings: bool,
+    #[serde(default)]
+    pub transcription: bool,
 }
 
 // --- Provider list models ---
@@ -92,12 +94,26 @@ pub struct ProviderModelCapabilities {
     pub json_output: Option<bool>,
     pub streaming: Option<bool>,
     pub embeddings: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcription: Option<bool>,
     pub thinking: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ProviderModelReasoningCapabilities>,
     pub fine_tuning: Option<bool>,
     pub input_modalities: Option<Vec<String>>,
     pub output_modalities: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ProviderTranscriptionModelMetadata {
+    pub engine: String,
+    pub download_size_mb: u64,
+    pub accuracy_score: u8,
+    pub speed_score: u8,
+    pub supports_translation: bool,
+    pub supported_languages: Vec<String>,
+    pub supports_language_selection: bool,
+    pub recommended: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -110,6 +126,8 @@ pub struct ProviderModelInfo {
     pub owned_by: Option<String>,
     pub limits: ProviderModelLimits,
     pub capabilities: ProviderModelCapabilities,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcription: Option<ProviderTranscriptionModelMetadata>,
     pub pricing: Option<ProviderModelPricing>,
     pub active: Option<bool>,
     pub family: Option<String>,
@@ -225,5 +243,89 @@ mod tests {
 
         assert_eq!(capabilities.thinking, Some(false));
         assert!(capabilities.reasoning.is_none());
+        assert!(capabilities.transcription.is_none());
+    }
+
+    #[test]
+    fn legacy_provider_payloads_decode_without_transcription_fields() {
+        let summary: ProviderSummaryCapabilities =
+            serde_json::from_value(json!({ "embeddings": true }))
+                .expect("legacy provider summary capabilities should decode");
+        assert!(summary.embeddings);
+        assert!(!summary.transcription);
+
+        let model: ProviderModelInfo = serde_json::from_value(json!({
+            "id": "legacy-model",
+            "name": "Legacy model",
+            "description": null,
+            "created": null,
+            "provider": "legacy",
+            "owned_by": null,
+            "limits": {
+                "max_input_tokens": null,
+                "max_output_tokens": null,
+                "context_window": null
+            },
+            "capabilities": {},
+            "pricing": null,
+            "active": true,
+            "family": null,
+            "lifecycle_status": null
+        }))
+        .expect("legacy provider model should decode");
+
+        assert!(model.capabilities.transcription.is_none());
+        assert!(model.transcription.is_none());
+
+        let encoded = serde_json::to_value(model).expect("legacy provider model should encode");
+        assert!(encoded.get("transcription").is_none());
+        assert!(encoded["capabilities"].get("transcription").is_none());
+    }
+
+    #[test]
+    fn provider_transcription_metadata_round_trips_without_trusted_fields() {
+        let metadata = ProviderTranscriptionModelMetadata {
+            engine: "parakeet".to_owned(),
+            download_size_mb: 456,
+            accuracy_score: 80,
+            speed_score: 85,
+            supports_translation: false,
+            supported_languages: vec!["en".to_owned(), "ru".to_owned()],
+            supports_language_selection: false,
+            recommended: true,
+        };
+
+        let encoded = serde_json::to_value(&metadata).expect("metadata should encode");
+        let decoded: ProviderTranscriptionModelMetadata =
+            serde_json::from_value(encoded.clone()).expect("metadata should decode");
+
+        assert_eq!(decoded, metadata);
+        for trusted_field in [
+            "url",
+            "sha256",
+            "artifact_file_name",
+            "install_dir_name",
+            "runtime_file_name",
+        ] {
+            assert!(
+                encoded.get(trusted_field).is_none(),
+                "trusted field leaked: {trusted_field}"
+            );
+        }
+
+        let schema = schemars::schema_for!(ProviderTranscriptionModelMetadata);
+        let schema_json = serde_json::to_string(&schema).expect("schema should encode");
+        for trusted_field in [
+            "url",
+            "sha256",
+            "artifact_file_name",
+            "install_dir_name",
+            "runtime_file_name",
+        ] {
+            assert!(
+                !schema_json.contains(trusted_field),
+                "trusted field leaked into schema: {trusted_field}"
+            );
+        }
     }
 }

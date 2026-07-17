@@ -32,6 +32,7 @@ pub mod methods {
     pub const PROVIDER_LIST: &str = "provider/list";
     pub const PROVIDER_MODELS_LIST: &str = "provider/models/list";
     pub const PROVIDER_EMBEDDING_MODELS_LIST: &str = "provider/embedding_models/list";
+    pub const PROVIDER_TRANSCRIPTION_MODELS_LIST: &str = "provider/transcription_models/list";
     pub const PROVIDER_CONFIGURE: &str = "provider/configure";
     pub const PROVIDER_SET_API_KEY: &str = "provider/set_api_key";
     pub const PROVIDER_DELETE_API_KEY: &str = "provider/delete_api_key";
@@ -168,6 +169,7 @@ pub mod events {
     pub const GATEWAY_REMOTE_ACCESS_STATUS_CHANGED: &str = "gateway/remote_access/status_changed";
     pub const GATEWAY_THREAD_EPISODIC_VECTOR_REFILL_STATUS_CHANGED: &str =
         "gateway/thread_episodic/vector_refill/status_changed";
+    pub const GATEWAY_VOICE_INPUT_STATUS_CHANGED: &str = "gateway_voice_input_status_changed";
     pub const CLI_RUNTIME_STATUS_CHANGED: &str = "cli_runtime/status_changed";
     pub const CLI_RUNTIME_ACCOUNT_UPDATED: &str = "cli_runtime/account_updated";
     pub const CLI_RUNTIME_REQUEST_OPENED: &str = "cli_runtime/request_opened";
