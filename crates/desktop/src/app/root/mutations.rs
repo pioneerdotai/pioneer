@@ -1,8 +1,8 @@
 use super::*;
 use crate::state;
 use pioneer_client::composer::draft::{
-    ComposerDomainDraft, ComposerDraftLifecycleAction, normalize_composer_draft_text,
-    reduce_composer_draft_lifecycle,
+    normalize_composer_draft_text, reduce_composer_draft_lifecycle, ComposerDomainDraft,
+    ComposerDraftLifecycleAction,
 };
 use pioneer_client::composer::state_machine::ComposerDomainAction;
 use pioneer_client::state::reducers as client_state_reducers;

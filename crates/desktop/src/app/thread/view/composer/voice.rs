@@ -41,6 +41,31 @@ pub(super) enum DesktopVoiceEntryAvailability {
     Ready,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DesktopVoiceEntryContext {
+    composer_payload_empty: bool,
+    voice_composer_idle: bool,
+    gateway_connected: bool,
+    task_thread_unlocked: bool,
+    active_thread: bool,
+    model_selected: bool,
+    conversation_can_submit: bool,
+    upload_idle: bool,
+}
+
+impl DesktopVoiceEntryContext {
+    fn allows_voice(self) -> bool {
+        self.composer_payload_empty
+            && self.voice_composer_idle
+            && self.gateway_connected
+            && self.task_thread_unlocked
+            && self.active_thread
+            && self.model_selected
+            && self.conversation_can_submit
+            && self.upload_idle
+    }
+}
+
 impl PioneerDesktop {
     pub(in crate::app) fn desktop_voice_hold_ui_active(&self) -> bool {
         matches!(
@@ -155,23 +180,32 @@ impl PioneerDesktop {
 
     pub(super) fn desktop_voice_entry_availability(
         &self,
-        composer_text: &str,
+        composer_payload_empty: bool,
     ) -> DesktopVoiceEntryAvailability {
-        let context_available = composer_text.trim().is_empty()
-            && !self.desktop_voice_composer.is_active()
-            && self.gateway.connection_state == GatewayConnectionState::Connected
-            && self.active_task_thread_navigation().is_none()
-            && self.current_active_thread_id().is_some()
-            && self.has_complete_composer_model_selection()
-            && self
-                .active_thread_conversation()
-                .is_some_and(|conversation| conversation.can_submit_message())
-            && !self.composer_upload_in_progress;
-        if !context_available {
-            return DesktopVoiceEntryAvailability::Hidden;
-        }
-
-        desktop_voice_entry_availability_for_status(self.desktop_voice_status)
+        let voice_input_enabled = effective_voice_input_enabled(
+            self.pending_voice_input_enabled,
+            self.gateway
+                .settings
+                .as_ref()
+                .map(|settings| settings.voice_input.enabled),
+        );
+        desktop_voice_entry_availability_for_context(
+            DesktopVoiceEntryContext {
+                composer_payload_empty,
+                voice_composer_idle: !self.desktop_voice_composer.is_active(),
+                gateway_connected: self.gateway.connection_state
+                    == GatewayConnectionState::Connected,
+                task_thread_unlocked: self.active_task_thread_navigation().is_none(),
+                active_thread: self.current_active_thread_id().is_some(),
+                model_selected: self.has_complete_composer_model_selection(),
+                conversation_can_submit: self
+                    .active_thread_conversation()
+                    .is_some_and(|conversation| conversation.can_submit_message()),
+                upload_idle: !self.composer_upload_in_progress,
+            },
+            voice_input_enabled,
+            self.desktop_voice_status,
+        )
     }
 
     pub(super) fn start_desktop_voice_hold(
@@ -625,13 +659,19 @@ fn desktop_voice_status_message(status: VoiceStatus) -> String {
     }
 }
 
-fn desktop_voice_entry_availability_for_status(
+fn desktop_voice_entry_availability_for_context(
+    context: DesktopVoiceEntryContext,
+    voice_input_enabled: bool,
     status: VoiceStatus,
 ) -> DesktopVoiceEntryAvailability {
+    if !context.allows_voice() || !voice_input_enabled {
+        return DesktopVoiceEntryAvailability::Hidden;
+    }
+
     match status {
-        VoiceStatus::Disabled => DesktopVoiceEntryAvailability::Hidden,
         VoiceStatus::Ready => DesktopVoiceEntryAvailability::Ready,
-        VoiceStatus::ModelDownloading
+        VoiceStatus::Disabled
+        | VoiceStatus::ModelDownloading
         | VoiceStatus::ModelLoading
         | VoiceStatus::Busy
         | VoiceStatus::Recording
@@ -639,6 +679,10 @@ fn desktop_voice_entry_availability_for_status(
         | VoiceStatus::Unavailable
         | VoiceStatus::Error => DesktopVoiceEntryAvailability::Disabled,
     }
+}
+
+fn effective_voice_input_enabled(pending: Option<bool>, authoritative: Option<bool>) -> bool {
+    pending.or(authoritative).unwrap_or(false)
 }
 
 fn desktop_voice_error_state_from_capture_error(
@@ -654,14 +698,109 @@ fn desktop_voice_error_state_from_capture_error(
 mod tests {
     use super::*;
 
+    const READY_CONTEXT: DesktopVoiceEntryContext = DesktopVoiceEntryContext {
+        composer_payload_empty: true,
+        voice_composer_idle: true,
+        gateway_connected: true,
+        task_thread_unlocked: true,
+        active_thread: true,
+        model_selected: true,
+        conversation_can_submit: true,
+        upload_idle: true,
+    };
+
     #[::core::prelude::v1::test]
-    fn composer_voice_readiness_matches_gateway_status_matrix() {
+    fn pending_voice_disable_hides_microphone_before_gateway_ack() {
+        assert!(!effective_voice_input_enabled(Some(false), Some(true)));
+        assert!(effective_voice_input_enabled(Some(true), Some(false)));
+        assert!(effective_voice_input_enabled(None, Some(true)));
+        assert!(!effective_voice_input_enabled(None, Some(false)));
+        assert!(!effective_voice_input_enabled(None, None));
+
         assert_eq!(
-            desktop_voice_entry_availability_for_status(VoiceStatus::Disabled),
+            desktop_voice_entry_availability_for_context(
+                READY_CONTEXT,
+                effective_voice_input_enabled(Some(false), Some(true)),
+                VoiceStatus::Unavailable,
+            ),
             DesktopVoiceEntryAvailability::Hidden
         );
+    }
+
+    #[::core::prelude::v1::test]
+    fn composer_voice_is_hidden_for_every_blocked_context() {
+        let blocked_contexts = [
+            DesktopVoiceEntryContext {
+                composer_payload_empty: false,
+                ..READY_CONTEXT
+            },
+            DesktopVoiceEntryContext {
+                voice_composer_idle: false,
+                ..READY_CONTEXT
+            },
+            DesktopVoiceEntryContext {
+                gateway_connected: false,
+                ..READY_CONTEXT
+            },
+            DesktopVoiceEntryContext {
+                task_thread_unlocked: false,
+                ..READY_CONTEXT
+            },
+            DesktopVoiceEntryContext {
+                active_thread: false,
+                ..READY_CONTEXT
+            },
+            DesktopVoiceEntryContext {
+                model_selected: false,
+                ..READY_CONTEXT
+            },
+            DesktopVoiceEntryContext {
+                conversation_can_submit: false,
+                ..READY_CONTEXT
+            },
+            DesktopVoiceEntryContext {
+                upload_idle: false,
+                ..READY_CONTEXT
+            },
+        ];
+
+        for context in blocked_contexts {
+            assert_eq!(
+                desktop_voice_entry_availability_for_context(context, true, VoiceStatus::Ready),
+                DesktopVoiceEntryAvailability::Hidden
+            );
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn composer_voice_readiness_matches_gateway_status_matrix() {
+        for status in [
+            VoiceStatus::Disabled,
+            VoiceStatus::Ready,
+            VoiceStatus::ModelDownloading,
+            VoiceStatus::ModelLoading,
+            VoiceStatus::Busy,
+            VoiceStatus::Recording,
+            VoiceStatus::Transcribing,
+            VoiceStatus::Unavailable,
+            VoiceStatus::Error,
+        ] {
+            assert_eq!(
+                desktop_voice_entry_availability_for_context(READY_CONTEXT, false, status),
+                DesktopVoiceEntryAvailability::Hidden
+            );
+        }
+
         assert_eq!(
-            desktop_voice_entry_availability_for_status(VoiceStatus::Ready),
+            desktop_voice_entry_availability_for_context(
+                READY_CONTEXT,
+                true,
+                VoiceStatus::Disabled,
+            ),
+            DesktopVoiceEntryAvailability::Disabled
+        );
+        assert_eq!(
+            desktop_voice_entry_availability_for_context(READY_CONTEXT, true, VoiceStatus::Ready,),
             DesktopVoiceEntryAvailability::Ready
         );
         for status in [
@@ -674,7 +813,7 @@ mod tests {
             VoiceStatus::Error,
         ] {
             assert_eq!(
-                desktop_voice_entry_availability_for_status(status),
+                desktop_voice_entry_availability_for_context(READY_CONTEXT, true, status),
                 DesktopVoiceEntryAvailability::Disabled
             );
         }

@@ -67,6 +67,11 @@ impl MessageProcessor {
                 .or_insert((false, Some(proxy_url)));
         }
 
+        // Local is built in, so there is no workspace secret or proxy from which to discover it.
+        provider_configs
+            .entry("local".to_owned())
+            .or_insert((false, None));
+
         let providers = provider_configs
             .into_iter()
             .map(|(name, (api_key_configured, proxy_url))| {

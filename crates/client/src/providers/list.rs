@@ -1576,7 +1576,7 @@ mod tests {
                         embeddings: true,
                         transcription: true,
                     },
-                    api_key_configured: true,
+                    api_key_configured: false,
                     proxy_url: None,
                 },
                 ProviderSummary {
@@ -1692,7 +1692,7 @@ mod tests {
                     embeddings: true,
                     transcription: false,
                 },
-                api_key_configured: true,
+                api_key_configured: false,
                 proxy_url: None,
             },
         ];

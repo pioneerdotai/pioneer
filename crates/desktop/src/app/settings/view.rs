@@ -7,6 +7,7 @@ use crate::{
     components::{
         buttonts::small_outline_button,
         model_selector::{ModelSelectorDialogOptions, ModelSelectorSelection},
+        progress_circle::ProgressCircle,
     },
     settings::{self, AppLanguagePreference, WindowThemePreference},
 };
@@ -27,12 +28,10 @@ use pioneer_protocol::{
     GatewayThreadEpisodicVectorLocalModelStatus, GatewayThreadEpisodicVectorProvider,
     GatewayThreadEpisodicVectorRefillStatus, GatewayThreadEpisodicVectorSearchSettings,
     GatewayVoiceInputProvider, GatewayVoiceInputRuntimePhase, GatewayVoiceInputSettings,
-    ProviderModelInfo,
 };
 use std::rc::Rc;
 
 const SETTINGS_CONTENT_MAX_WIDTH_PX: f32 = 860.0;
-const VOICE_INPUT_PROGRESS_WIDTH_PX: f32 = 240.0;
 
 #[derive(Clone, Debug, PartialEq)]
 struct VoiceInputDownloadPresentation {
@@ -112,10 +111,6 @@ impl PioneerDesktop {
                 .child(Self::render_settings_divider(cx))
                 .child(Self::render_voice_input_setting(
                     settings.voice_input.clone(),
-                    self.voice_input_settings_expanded,
-                    self.voice_input_models.as_slice(),
-                    self.voice_input_models_loading,
-                    self.voice_input_models_error.clone(),
                     self.voice_input_action_error.clone(),
                     desktop_entity.clone(),
                     window,
@@ -622,10 +617,6 @@ impl PioneerDesktop {
 
     fn render_voice_input_setting(
         settings: GatewayVoiceInputSettings,
-        expanded: bool,
-        models: &[ProviderModelInfo],
-        models_loading: bool,
-        models_error: Option<String>,
         action_error: Option<String>,
         desktop_entity: Entity<Self>,
         _window: &mut Window,
@@ -634,12 +625,9 @@ impl PioneerDesktop {
         let selected_provider = (settings.provider == Some(GatewayVoiceInputProvider::Local))
             .then(|| "local".to_owned());
         let selected_model = settings.model.clone();
-        let expanded_content = expanded.then(|| {
-            Self::render_voice_input_expanded(
+        let model_selection = settings.enabled.then(|| {
+            Self::render_voice_input_model_selection(
                 &settings,
-                models,
-                models_loading,
-                models_error,
                 action_error,
                 selected_provider.clone(),
                 selected_model.clone(),
@@ -649,24 +637,17 @@ impl PioneerDesktop {
         });
         let label = t!("settings.voice_input.label").to_string();
         let description = t!("settings.voice_input.description").to_string();
-        let expand_tooltip = if expanded {
-            t!("settings.voice_input.collapse").to_string()
-        } else {
-            t!("settings.voice_input.expand").to_string()
-        };
-        let expand_icon = if expanded {
-            IconName::ChevronUp
-        } else {
-            IconName::ChevronDown
-        };
+        let status_badge = Self::render_vector_status_badge(
+            Self::voice_input_runtime_phase_label(settings.runtime.phase),
+            Self::voice_input_runtime_phase_color(settings.runtime.phase, cx),
+        );
 
         v_flex()
             .w_full()
-            .gap_0()
             .child(
                 h_flex()
                     .w_full()
-                    .gap_4()
+                    .gap_6()
                     .py_3()
                     .justify_between()
                     .items_center()
@@ -674,80 +655,55 @@ impl PioneerDesktop {
                         v_flex()
                             .min_w_0()
                             .flex_1()
-                            .child(div().text_sm().font_semibold().child(label))
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(div().text_sm().font_semibold().child(label))
+                                    .child(status_badge),
+                            )
                             .child(div().text_xs().opacity(0.6).child(description)),
                     )
                     .child(
-                        h_flex()
-                            .flex_none()
-                            .gap_2()
-                            .items_center()
-                            .child(
-                                Button::new("settings-voice-input-expand")
-                                    .small()
-                                    .ghost()
-                                    .icon(expand_icon)
-                                    .tooltip(expand_tooltip)
-                                    .on_click({
-                                        let desktop_entity = desktop_entity.clone();
-                                        move |_, _, cx| {
-                                            let _ = desktop_entity.update(cx, |view, cx| {
-                                                view.toggle_voice_input_settings_expanded();
-                                                view.refresh_voice_input_models(cx);
-                                                cx.notify();
-                                            });
+                        Switch::new("settings-voice-input-enabled")
+                            .checked(settings.enabled)
+                            .on_click({
+                                let desktop_entity = desktop_entity.clone();
+                                let selected_provider = selected_provider.clone();
+                                let selected_model = selected_model.clone();
+                                move |enabled, window, cx| {
+                                    let _ = desktop_entity.update(cx, |view, cx| {
+                                        let action = view.apply_voice_input_enabled(*enabled, cx);
+                                        if action == VoiceInputEnableAction::NeedsSelection {
+                                            view.open_voice_input_model_selector(
+                                                selected_provider.clone(),
+                                                selected_model.clone(),
+                                                window,
+                                                cx,
+                                            );
                                         }
-                                    }),
-                            )
-                            .child(
-                                Switch::new("settings-voice-input-enabled")
-                                    .checked(settings.enabled)
-                                    .on_click({
-                                        let desktop_entity = desktop_entity.clone();
-                                        let selected_provider = selected_provider.clone();
-                                        let selected_model = selected_model.clone();
-                                        move |enabled, window, cx| {
-                                            let _ = desktop_entity.update(cx, |view, cx| {
-                                                let action =
-                                                    view.apply_voice_input_enabled(*enabled, cx);
-                                                if action == VoiceInputEnableAction::NeedsSelection
-                                                {
-                                                    view.open_voice_input_model_selector(
-                                                        selected_provider.clone(),
-                                                        selected_model.clone(),
-                                                        window,
-                                                        cx,
-                                                    );
-                                                }
-                                                cx.notify();
-                                            });
-                                        }
-                                    }),
-                            ),
+                                        cx.notify();
+                                    });
+                                }
+                            }),
                     ),
             )
-            .when_some(expanded_content, |this, content| this.child(content))
+            .when_some(model_selection, |this, selection| this.child(selection))
             .into_any_element()
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn render_voice_input_expanded(
+    fn render_voice_input_model_selection(
         settings: &GatewayVoiceInputSettings,
-        models: &[ProviderModelInfo],
-        models_loading: bool,
-        models_error: Option<String>,
         action_error: Option<String>,
         selected_provider: Option<String>,
         selected_model: Option<String>,
         desktop_entity: Entity<Self>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let model_summary =
-            Self::render_voice_input_model_summary(settings, models, models_loading, cx);
-        let status_badge = Self::render_vector_status_badge(
-            Self::voice_input_runtime_phase_label(settings.runtime.phase),
-            Self::voice_input_runtime_phase_color(settings.runtime.phase, cx),
-        );
+        let selection_label = selected_model
+            .as_ref()
+            .map(|model| format!("local/{model}"))
+            .unwrap_or_else(|| t!("settings.voice_input.no_model_selected").to_string());
         let progress =
             (settings.runtime.phase == GatewayVoiceInputRuntimePhase::Downloading).then(|| {
                 Self::render_voice_input_download_progress(
@@ -756,7 +712,7 @@ impl PioneerDesktop {
                     cx,
                 )
             });
-        let actions = Self::render_voice_input_actions(
+        let actions = Self::render_voice_input_model_actions(
             settings.runtime.phase == GatewayVoiceInputRuntimePhase::Failed,
             selected_provider,
             selected_model,
@@ -765,115 +721,33 @@ impl PioneerDesktop {
 
         v_flex()
             .w_full()
-            .border_t_1()
-            .px_0()
-            .py_3()
+            .pb_4()
             .gap_3()
             .child(
                 h_flex()
                     .w_full()
-                    .gap_3()
+                    .gap_6()
                     .justify_between()
-                    .items_start()
-                    .child(model_summary)
-                    .child(status_badge),
+                    .items_center()
+                    .mt_0p5()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .text_sm()
+                            .font_medium()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(selection_label),
+                    )
+                    .child(actions),
             )
             .when_some(progress, |this, progress| this.child(progress))
-            .when_some(models_error, |this, error| {
-                this.child(Self::render_voice_input_error(error, cx))
-            })
             .when_some(settings.runtime.error.clone(), |this, error| {
                 this.child(Self::render_voice_input_error(error, cx))
             })
             .when_some(action_error, |this, error| {
                 this.child(Self::render_voice_input_error(error, cx))
-            })
-            .child(actions)
-            .into_any_element()
-    }
-
-    fn render_voice_input_model_summary(
-        settings: &GatewayVoiceInputSettings,
-        models: &[ProviderModelInfo],
-        models_loading: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let selected_info = settings
-            .model
-            .as_deref()
-            .and_then(|selected| models.iter().find(|model| model.id == selected));
-        let label = selected_info
-            .map(pioneer_client::providers::presentation::model_selector_model_display_name)
-            .unwrap_or_else(|| {
-                if settings.model.is_none() {
-                    t!("settings.voice_input.no_model_selected").to_string()
-                } else if models_loading {
-                    t!("settings.voice_input.loading_model_details").to_string()
-                } else {
-                    t!("settings.voice_input.model_details_unavailable").to_string()
-                }
-            });
-        let presentation = selected_info.and_then(
-            pioneer_client::providers::presentation::transcription_model_selector_presentation,
-        );
-        let family = selected_info
-            .and_then(|model| model.family.as_deref())
-            .map(Self::voice_input_metadata_label)
-            .or_else(|| presentation.as_ref().map(|model| model.engine.clone()));
-        let family_label = family
-            .map(|family| t!("settings.voice_input.engine_family", family = family).to_string());
-
-        v_flex()
-            .min_w_0()
-            .flex_1()
-            .gap_1()
-            .child(
-                div()
-                    .text_sm()
-                    .font_medium()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .child(label),
-            )
-            .when_some(family_label, |this, family| {
-                this.child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(family),
-                )
-            })
-            .when_some(presentation, |this, model| {
-                this.child(Self::render_voice_input_metadata(model, cx))
-            })
-            .into_any_element()
-    }
-
-    fn render_voice_input_metadata(
-        model: pioneer_client::providers::presentation::TranscriptionModelSelectorPresentation,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        h_flex()
-            .gap_2()
-            .items_center()
-            .flex_wrap()
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(model.download_size),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(model.language_summary),
-            )
-            .when(model.recommended, |this| {
-                this.child(Self::render_vector_status_badge(
-                    t!("settings.voice_input.recommended").to_string(),
-                    cx.theme().success,
-                ))
             })
             .into_any_element()
     }
@@ -881,32 +755,21 @@ impl PioneerDesktop {
     fn render_voice_input_download_progress(
         downloaded_bytes: Option<u64>,
         total_bytes: Option<u64>,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) -> AnyElement {
         let progress = Self::voice_input_download_presentation(downloaded_bytes, total_bytes);
-        let fill = progress.fraction.map(|fraction| {
-            div()
-                .h(px(4.0))
-                .w(px(VOICE_INPUT_PROGRESS_WIDTH_PX * fraction))
-                .rounded_full()
-                .bg(cx.theme().accent)
-        });
-        v_flex()
-            .gap_1()
+        let progress_percent = progress.fraction.unwrap_or_default() * 100.0;
+
+        h_flex()
+            .gap_2()
+            .mb_0p5()
+            .items_center()
             .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(progress.label),
+                ProgressCircle::new("settings-voice-input-download-progress")
+                    .value(progress_percent)
+                    .size_4(),
             )
-            .child(
-                div()
-                    .w(px(VOICE_INPUT_PROGRESS_WIDTH_PX))
-                    .h(px(4.0))
-                    .rounded_full()
-                    .bg(cx.theme().border)
-                    .when_some(fill, |this, fill| this.child(fill)),
-            )
+            .child(div().text_xs().opacity(0.6).child(progress.label))
             .into_any_element()
     }
 
@@ -918,7 +781,7 @@ impl PioneerDesktop {
             .into_any_element()
     }
 
-    fn render_voice_input_actions(
+    fn render_voice_input_model_actions(
         retry_available: bool,
         selected_provider: Option<String>,
         selected_model: Option<String>,
@@ -953,8 +816,8 @@ impl PioneerDesktop {
         });
 
         h_flex()
-            .w_full()
-            .gap_2()
+            .flex_none()
+            .gap_1()
             .items_center()
             .child(change_model)
             .when_some(retry, |this, retry| this.child(retry))
@@ -1011,8 +874,8 @@ impl PioneerDesktop {
                     label: t!(
                         "settings.voice_input.progress_known",
                         percent = (fraction * 100.0).round() as u64,
-                        downloaded = Self::format_voice_input_bytes(downloaded_bytes),
-                        total = Self::format_voice_input_bytes(total_bytes)
+                        downloaded = Self::format_voice_input_megabytes(downloaded_bytes),
+                        total = Self::format_voice_input_megabytes(total_bytes)
                     )
                     .to_string(),
                     fraction: Some(fraction as f32),
@@ -1024,7 +887,7 @@ impl PioneerDesktop {
                 } else {
                     t!(
                         "settings.voice_input.progress_unknown_downloaded",
-                        downloaded = Self::format_voice_input_bytes(downloaded_bytes)
+                        downloaded = Self::format_voice_input_megabytes(downloaded_bytes)
                     )
                     .to_string()
                 },
@@ -1033,35 +896,9 @@ impl PioneerDesktop {
         }
     }
 
-    fn format_voice_input_bytes(bytes: u64) -> String {
-        const KIB: f64 = 1024.0;
-        const MIB: f64 = KIB * 1024.0;
-        const GIB: f64 = MIB * 1024.0;
-        let bytes = bytes as f64;
-        if bytes >= GIB {
-            format!("{:.1} GB", bytes / GIB)
-        } else if bytes >= MIB {
-            format!("{:.1} MB", bytes / MIB)
-        } else if bytes >= KIB {
-            format!("{:.1} KB", bytes / KIB)
-        } else {
-            format!("{} B", bytes as u64)
-        }
-    }
-
-    fn voice_input_metadata_label(value: &str) -> String {
-        value
-            .split(|character: char| !character.is_ascii_alphanumeric())
-            .filter(|part| !part.is_empty())
-            .map(|part| {
-                let mut characters = part.chars();
-                let Some(first) = characters.next() else {
-                    return String::new();
-                };
-                format!("{}{}", first.to_uppercase(), characters.as_str())
-            })
-            .collect::<Vec<_>>()
-            .join(" ")
+    fn format_voice_input_megabytes(bytes: u64) -> String {
+        const MIB: f64 = 1024.0 * 1024.0;
+        format!("{:.1} MB", bytes as f64 / MIB)
     }
 
     fn open_voice_input_model_selector(
@@ -1272,6 +1109,8 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let (selected_provider, selected_model) = Self::vector_search_model_selection(&settings);
+
         v_flex()
             .w_full()
             .child(
@@ -1303,9 +1142,20 @@ impl PioneerDesktop {
                             .checked(settings.enabled)
                             .on_click({
                                 let desktop_entity = desktop_entity.clone();
-                                move |enabled, _, cx| {
+                                let selected_provider = selected_provider.clone();
+                                let selected_model = selected_model.clone();
+                                move |enabled, window, cx| {
                                     let _ = desktop_entity.update(cx, |view, cx| {
-                                        view.apply_vector_search_enabled(*enabled, cx);
+                                        if *enabled {
+                                            view.open_vector_search_model_selector(
+                                                selected_provider.clone(),
+                                                selected_model.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        } else {
+                                            view.apply_vector_search_enabled(false, cx);
+                                        }
                                         cx.notify();
                                     });
                                 }
@@ -1335,22 +1185,7 @@ impl PioneerDesktop {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> AnyElement {
-        let selected_provider = match settings.provider {
-            Some(GatewayThreadEpisodicVectorProvider::OpenAi) => Some("openai".to_owned()),
-            Some(GatewayThreadEpisodicVectorProvider::OpenRouter) => Some("openrouter".to_owned()),
-            Some(GatewayThreadEpisodicVectorProvider::Local) => Some("local".to_owned()),
-            None => None,
-        };
-        let selected_model = match settings.provider {
-            Some(GatewayThreadEpisodicVectorProvider::Local) => settings
-                .model
-                .clone()
-                .or_else(|| settings.local_model.clone()),
-            _ => selected_provider
-                .as_ref()
-                .and(settings.model.as_ref())
-                .cloned(),
-        };
+        let (selected_provider, selected_model) = Self::vector_search_model_selection(settings);
         let selection_label = match (&selected_provider, &selected_model) {
             (Some(provider), Some(model)) => format!("{provider}/{model}"),
             _ => t!("settings.memory.vector_search.embedding_model_not_selected").to_string(),
@@ -1376,51 +1211,76 @@ impl PioneerDesktop {
                             .text_ellipsis()
                             .child(selection_label),
                     )
-                    .child(h_flex().flex_none().gap_1().child(
-                        small_outline_button(("settings-vector-search-embedding-model", 0usize))
-                            .label(
-                                t!("settings.memory.vector_search.select_embedding_model")
-                                    .to_string(),
-                            )
-                            .on_click({
-                                let desktop_entity = desktop_entity.clone();
-                                let selected_provider = selected_provider.clone();
-                                let selected_model = selected_model.clone();
-                                move |_, window, cx| {
-                                    let _ = desktop_entity.update(cx, |view, cx| {
-                                        let workspace_id = view.model_selector_workspace_id();
-                                        view.open_model_selector_dialog(
-                                            ModelSelectorDialogOptions {
-                                                title: t!(
-                                                    "settings.memory.vector_search.embedding_model_dialog_title"
-                                                )
-                                                .to_string(),
-                                                selected_provider: selected_provider.clone(),
-                                                selected_model: selected_model.clone(),
-                                                selected_reasoning_effort: None,
-                                                mode: ProviderModelSelectorMode::Embeddings,
-                                                workspace_id,
-                                                ws_sender: view.gateway.ws_command_sender.clone(),
-                                                on_save: Rc::new(
-                                                    move |view: &mut PioneerDesktop,
-                                                          selection: ModelSelectorSelection,
-                                                          cx| {
-                                                        view.apply_vector_search_embedding_model_selection(
-                                                            selection,
-                                                            cx,
-                                                        )
-                                                    },
-                                                ),
-                                            },
-                                            window,
-                                            cx,
-                                        );
-                                    });
-                                }
-                            }),
-                    )),
+                    .child(
+                        h_flex().flex_none().gap_1().child(
+                            small_outline_button("settings-vector-search-change-model")
+                                .label(t!("settings.memory.vector_search.change_model").to_string())
+                                .on_click({
+                                    let desktop_entity = desktop_entity.clone();
+                                    let selected_provider = selected_provider.clone();
+                                    let selected_model = selected_model.clone();
+                                    move |_, window, cx| {
+                                        let _ = desktop_entity.update(cx, |view, cx| {
+                                            view.open_vector_search_model_selector(
+                                                selected_provider.clone(),
+                                                selected_model.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        });
+                                    }
+                                }),
+                        ),
+                    ),
             )
             .into_any_element()
+    }
+
+    fn vector_search_model_selection(
+        settings: &GatewayThreadEpisodicVectorSearchSettings,
+    ) -> (Option<String>, Option<String>) {
+        let provider = match settings.provider {
+            Some(GatewayThreadEpisodicVectorProvider::OpenAi) => Some("openai".to_owned()),
+            Some(GatewayThreadEpisodicVectorProvider::OpenRouter) => Some("openrouter".to_owned()),
+            Some(GatewayThreadEpisodicVectorProvider::Local) => Some("local".to_owned()),
+            None => None,
+        };
+        let model = match settings.provider {
+            Some(GatewayThreadEpisodicVectorProvider::Local) => settings
+                .model
+                .clone()
+                .or_else(|| settings.local_model.clone()),
+            _ => provider.as_ref().and(settings.model.as_ref()).cloned(),
+        };
+        (provider, model)
+    }
+
+    fn open_vector_search_model_selector(
+        &mut self,
+        selected_provider: Option<String>,
+        selected_model: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace_id = self.model_selector_workspace_id();
+        self.open_model_selector_dialog(
+            ModelSelectorDialogOptions {
+                title: t!("settings.memory.vector_search.embedding_model_dialog_title").to_string(),
+                selected_provider,
+                selected_model,
+                selected_reasoning_effort: None,
+                mode: ProviderModelSelectorMode::Embeddings,
+                workspace_id,
+                ws_sender: self.gateway.ws_command_sender.clone(),
+                on_save: Rc::new(
+                    move |view: &mut PioneerDesktop, selection: ModelSelectorSelection, cx| {
+                        view.apply_vector_search_embedding_model_selection(selection, cx)
+                    },
+                ),
+            },
+            window,
+            cx,
+        );
     }
 
     fn render_vector_search_instructions_setting(
@@ -2110,8 +1970,13 @@ mod tests {
         assert!(clamped.label.starts_with("100%"));
 
         let unknown = PioneerDesktop::voice_input_download_presentation(Some(2048), None);
-        assert_eq!(unknown.label, "2.0 KB downloaded - size unknown");
+        assert_eq!(unknown.label, "0.0 MB downloaded - size unknown");
         assert_eq!(unknown.fraction, None);
+
+        assert_eq!(
+            PioneerDesktop::format_voice_input_megabytes(1024 * 1024 * 1024),
+            "1024.0 MB"
+        );
     }
 
     #[::core::prelude::v1::test]
@@ -2170,9 +2035,23 @@ mod tests {
             .split("fn render_vector_embedding_model_selection")
             .next()
             .expect("vector search renderer body exists");
+        assert!(vector_search_view.contains("if *enabled"));
+        assert!(vector_search_view.contains("open_vector_search_model_selector"));
+        assert!(vector_search_view.contains("apply_vector_search_enabled(false"));
+        assert!(!vector_search_view.contains("apply_vector_search_enabled(*enabled"));
         assert!(vector_search_view.contains("render_vector_embedding_model_selection"));
         assert!(vector_search_view.contains(".child(Self::render_settings_divider(cx))"));
         assert!(vector_search_view.contains("render_vector_search_instructions_setting"));
+        let vector_model_view = source
+            .split("fn render_vector_embedding_model_selection")
+            .nth(1)
+            .expect("vector model renderer exists")
+            .split("fn vector_search_model_selection")
+            .next()
+            .expect("vector model renderer body exists");
+        assert!(vector_model_view.contains("settings-vector-search-change-model"));
+        assert!(vector_model_view.contains("settings.memory.vector_search.change_model"));
+        assert!(vector_model_view.contains("open_vector_search_model_selector"));
         assert!(!memory_view.contains("ThreadEpisodicSettingToggle::Indexing"));
         assert!(!memory_view.contains("ThreadEpisodicSettingToggle::Recall"));
         assert!(!memory_view.contains("render_preflight_model_setting"));
@@ -2226,12 +2105,7 @@ mod tests {
         let required_keys = [
             "label",
             "description",
-            "expand",
-            "collapse",
             "no_model_selected",
-            "loading_model_details",
-            "model_details_unavailable",
-            "engine_family",
             "recommended",
             "change_model",
             "change_model_tooltip",
@@ -2275,7 +2149,38 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
-    fn voice_settings_compact_metadata_and_controls_are_accessible() {
+    fn settings_vector_search_locales_use_change_model_label() {
+        let locales = [
+            ("de", include_str!("../../../locales/de.toml")),
+            ("en", include_str!("../../../locales/en.toml")),
+            ("es", include_str!("../../../locales/es.toml")),
+            ("fr", include_str!("../../../locales/fr.toml")),
+            ("hi", include_str!("../../../locales/hi.toml")),
+            ("jp", include_str!("../../../locales/jp.toml")),
+            ("ru", include_str!("../../../locales/ru.toml")),
+            ("zh", include_str!("../../../locales/zh.toml")),
+        ];
+
+        for (locale, source) in locales {
+            let section = source
+                .split("[settings.memory.vector_search]")
+                .nth(1)
+                .unwrap_or_else(|| panic!("{locale} is missing settings.memory.vector_search"))
+                .split("\n[")
+                .next()
+                .expect("Vector Search locale section is bounded");
+            assert!(
+                section
+                    .lines()
+                    .any(|line| line.starts_with("change_model =")),
+                "{locale} is missing settings.memory.vector_search.change_model"
+            );
+            assert!(!section.contains("select_embedding_model ="));
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn voice_settings_match_vector_search_control_structure() {
         let source = production_view_source();
         let voice_view = source
             .split("fn render_voice_input_setting")
@@ -2287,10 +2192,16 @@ mod tests {
         assert!(voice_view.contains(".min_w_0()"));
         assert!(voice_view.contains(".overflow_hidden()"));
         assert!(voice_view.contains(".text_ellipsis()"));
-        assert!(voice_view.contains(".flex_wrap()"));
-        assert!(voice_view.contains("VOICE_INPUT_PROGRESS_WIDTH_PX"));
-        assert!(voice_view.contains("settings.voice_input.expand"));
-        assert!(voice_view.contains("settings.voice_input.collapse"));
+        assert!(voice_view.contains("render_vector_status_badge"));
+        assert!(voice_view.contains("render_voice_input_model_selection"));
+        assert!(voice_view.contains(".when_some(model_selection"));
+        assert!(voice_view.contains(".pb_4()"));
+        assert!(voice_view.contains("ProgressCircle::new"));
+        assert!(voice_view.contains("settings-voice-input-download-progress"));
+        assert!(!voice_view.contains("VOICE_INPUT_PROGRESS_WIDTH_PX"));
+        assert!(!voice_view.contains("settings-voice-input-expand"));
+        assert!(!voice_view.contains("settings.voice_input.expand"));
+        assert!(!voice_view.contains("settings.voice_input.collapse"));
         assert!(voice_view.contains("settings.voice_input.change_model_tooltip"));
         assert!(voice_view.contains("settings.voice_input.retry_tooltip"));
     }

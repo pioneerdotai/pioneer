@@ -17,6 +17,33 @@ use gpui_component::{
 };
 const COMPOSER_ATTACHMENT_TEXT_FADE_WIDTH: Pixels = px(24.);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DesktopComposerPrimaryAction {
+    Send,
+    Stop,
+    VoiceReady,
+    VoiceDisabled,
+}
+
+fn resolve_desktop_composer_primary_action(
+    voice_hold_ui_active: bool,
+    has_in_flight_turn: bool,
+    voice_entry_availability: DesktopVoiceEntryAvailability,
+) -> DesktopComposerPrimaryAction {
+    if voice_hold_ui_active {
+        return DesktopComposerPrimaryAction::VoiceReady;
+    }
+    if has_in_flight_turn {
+        return DesktopComposerPrimaryAction::Stop;
+    }
+
+    match voice_entry_availability {
+        DesktopVoiceEntryAvailability::Hidden => DesktopComposerPrimaryAction::Send,
+        DesktopVoiceEntryAvailability::Disabled => DesktopComposerPrimaryAction::VoiceDisabled,
+        DesktopVoiceEntryAvailability::Ready => DesktopComposerPrimaryAction::VoiceReady,
+    }
+}
+
 impl PioneerDesktop {
     pub(crate) fn render_composer(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let composer_state = self.composer_state.clone();
@@ -62,18 +89,24 @@ impl PioneerDesktop {
         let desktop_voice_context_locked = self.desktop_voice_context_locked();
         let desktop_voice_hold_ui_active = self.desktop_voice_hold_ui_active();
         let desktop_voice_send_processing = self.desktop_voice_send_processing();
+        let composer_payload_empty =
+            composer_text.is_empty() && attachments.is_empty() && capabilities.is_empty();
         let voice_entry_availability = if has_in_flight_turn {
             DesktopVoiceEntryAvailability::Hidden
         } else {
-            self.desktop_voice_entry_availability(composer_text.as_str())
+            self.desktop_voice_entry_availability(composer_payload_empty)
         };
-        let show_desktop_voice_button = desktop_voice_hold_ui_active
-            || voice_entry_availability != DesktopVoiceEntryAvailability::Hidden;
+        let composer_primary_action = resolve_desktop_composer_primary_action(
+            desktop_voice_hold_ui_active,
+            has_in_flight_turn,
+            voice_entry_availability,
+        );
         let composer_action_loading = self.composer_upload_in_progress
             || (has_in_flight_turn && is_cancelling)
             || desktop_voice_send_processing;
 
-        let composer_action_id = if has_in_flight_turn {
+        let composer_action_is_stop = composer_primary_action == DesktopComposerPrimaryAction::Stop;
+        let composer_action_id = if composer_action_is_stop {
             "stop-turn"
         } else {
             "send-message"
@@ -81,7 +114,7 @@ impl PioneerDesktop {
 
         let composer_action_disabled = if desktop_voice_send_processing {
             false
-        } else if has_in_flight_turn {
+        } else if composer_action_is_stop {
             !can_stop
         } else {
             !can_send
@@ -225,29 +258,29 @@ impl PioneerDesktop {
                                                     )),
                                             )
                                         })
-                                        .child(
-                                            if desktop_voice_hold_ui_active
-                                                || voice_entry_availability
-                                                    == DesktopVoiceEntryAvailability::Ready
-                                            {
+                                        .child(match composer_primary_action {
+                                            DesktopComposerPrimaryAction::VoiceReady => {
                                                 self.render_desktop_voice_idle_button(cx)
-                                            } else if show_desktop_voice_button {
+                                            }
+                                            DesktopComposerPrimaryAction::VoiceDisabled => {
                                                 self.render_desktop_voice_disabled_button(cx)
-                                            } else {
+                                            }
+                                            DesktopComposerPrimaryAction::Send
+                                            | DesktopComposerPrimaryAction::Stop => {
                                                 Button::new(composer_action_id)
                                                     .primary()
                                                     .rounded_full()
                                                     .disabled(composer_action_disabled)
                                                     .loading(composer_action_loading)
-                                                    .when(has_in_flight_turn, |this| {
+                                                    .when(composer_action_is_stop, |this| {
                                                         this.icon(PioneerIconName::Square)
                                                     })
-                                                    .when(!has_in_flight_turn, |this| {
+                                                    .when(!composer_action_is_stop, |this| {
                                                         this.icon(IconName::ArrowUp)
                                                     })
                                                     .on_click(cx.listener(
                                                         move |view, _, window, cx| {
-                                                            if has_in_flight_turn {
+                                                            if composer_action_is_stop {
                                                                 view.stop_active_turn(window, cx);
                                                             } else {
                                                                 view.submit_composer_message(
@@ -257,8 +290,8 @@ impl PioneerDesktop {
                                                         },
                                                     ))
                                                     .into_any_element()
-                                            },
-                                        ),
+                                            }
+                                        }),
                                 ),
                         ),
                 ),
@@ -615,4 +648,58 @@ enum ComposerChipRow {
         start_index: usize,
         items: Vec<ComposerCapability>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const VOICE_AVAILABILITIES: [DesktopVoiceEntryAvailability; 3] = [
+        DesktopVoiceEntryAvailability::Hidden,
+        DesktopVoiceEntryAvailability::Disabled,
+        DesktopVoiceEntryAvailability::Ready,
+    ];
+
+    #[::core::prelude::v1::test]
+    fn desktop_composer_primary_action_priority_matrix_is_complete() {
+        for availability in VOICE_AVAILABILITIES {
+            assert_eq!(
+                resolve_desktop_composer_primary_action(true, false, availability),
+                DesktopComposerPrimaryAction::VoiceReady
+            );
+            assert_eq!(
+                resolve_desktop_composer_primary_action(true, true, availability),
+                DesktopComposerPrimaryAction::VoiceReady
+            );
+            assert_eq!(
+                resolve_desktop_composer_primary_action(false, true, availability),
+                DesktopComposerPrimaryAction::Stop
+            );
+        }
+
+        assert_eq!(
+            resolve_desktop_composer_primary_action(
+                false,
+                false,
+                DesktopVoiceEntryAvailability::Hidden,
+            ),
+            DesktopComposerPrimaryAction::Send
+        );
+        assert_eq!(
+            resolve_desktop_composer_primary_action(
+                false,
+                false,
+                DesktopVoiceEntryAvailability::Disabled,
+            ),
+            DesktopComposerPrimaryAction::VoiceDisabled
+        );
+        assert_eq!(
+            resolve_desktop_composer_primary_action(
+                false,
+                false,
+                DesktopVoiceEntryAvailability::Ready,
+            ),
+            DesktopComposerPrimaryAction::VoiceReady
+        );
+    }
 }

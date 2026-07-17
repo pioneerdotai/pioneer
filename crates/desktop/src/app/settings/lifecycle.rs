@@ -1,8 +1,8 @@
 use crate::{
     app::root::{GatewayConnectionState, MainContentView, PioneerDesktop, SettingsContentView},
     app::settings::{
-        MemoryModelSetting, MemorySettingToggle, SETTINGS_CONTENT_GENERAL_NODE_ID,
-        SETTINGS_CONTENT_MEMORY_NODE_ID, VoiceInputEnableAction,
+        MemoryModelSetting, MemorySettingToggle, VoiceInputEnableAction,
+        SETTINGS_CONTENT_GENERAL_NODE_ID, SETTINGS_CONTENT_MEMORY_NODE_ID,
     },
     settings::{self, AppLanguagePreference, WindowThemePreference},
     window,
@@ -12,11 +12,8 @@ use gpui_component::{
     theme::{Theme, ThemeMode},
     tree::TreeItem,
 };
-use pioneer_client::{
-    providers::list as provider_list,
-    settings::{
-        gateway as gateway_settings, memory as settings_memory, voice as voice_input_settings,
-    },
+use pioneer_client::settings::{
+    gateway as gateway_settings, memory as settings_memory, voice as voice_input_settings,
 };
 use pioneer_protocol::{
     GatewayMemoryModelSelection, GatewayMemorySettings, GatewaySettingsUpdate,
@@ -53,9 +50,6 @@ impl PioneerDesktop {
         self.sync_settings_sidebar_tree_state(cx);
         self.set_main_content_view(MainContentView::Settings, cx);
         self.refresh_gateway_settings(cx);
-        if content_view == SettingsContentView::General {
-            self.refresh_voice_input_models(cx);
-        }
     }
 
     pub(in crate::app) fn sync_settings_sidebar_tree_state(&mut self, cx: &mut Context<Self>) {
@@ -142,70 +136,6 @@ impl PioneerDesktop {
         self.remote_access_settings_expanded = !self.remote_access_settings_expanded;
     }
 
-    pub(super) fn toggle_voice_input_settings_expanded(&mut self) {
-        self.voice_input_settings_expanded = !self.voice_input_settings_expanded;
-    }
-
-    pub(super) fn refresh_voice_input_models(&mut self, cx: &mut Context<Self>) {
-        if self.voice_input_models_loading || !self.voice_input_models.is_empty() {
-            return;
-        }
-        let Some(scope) = gateway_settings::plan_gateway_settings_update_action(
-            self.gateway.ws_connection_id,
-            self.gateway.connection_epoch,
-        ) else {
-            return;
-        };
-        let connection_id = scope.connection_id;
-        let connection_epoch = scope.connection_epoch;
-        let workspace_id = self.model_selector_workspace_id();
-        let ws_sender = self.gateway.ws_command_sender.clone();
-        self.voice_input_models_loading = true;
-        self.voice_input_models_error = None;
-
-        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let mut cx = cx.clone();
-            async move {
-                let result = cx
-                    .background_spawn(async move {
-                        ws_sender.provider_list_transcription_models(
-                            provider_list::provider_list_transcription_models_params(
-                                workspace_id,
-                                "local",
-                            ),
-                        )
-                    })
-                    .await;
-
-                let _ = this.update(&mut cx, |view, cx| {
-                    if !gateway_settings::settings_action_matches_connection(
-                        connection_id,
-                        connection_epoch,
-                        view.gateway.ws_connection_id,
-                        view.gateway.connection_epoch,
-                    ) {
-                        return;
-                    }
-                    view.voice_input_models_loading = false;
-                    match result {
-                        Ok(mut response) => {
-                            provider_list::order_transcription_selector_models(
-                                response.models.as_mut_slice(),
-                            );
-                            view.voice_input_models = response.models;
-                            view.voice_input_models_error = None;
-                        }
-                        Err(error) => {
-                            view.voice_input_models_error = Some(format!("{error:#}"));
-                        }
-                    }
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
-    }
-
     pub(super) fn apply_remote_access_setting(
         &mut self,
         enabled: bool,
@@ -270,7 +200,7 @@ impl PioneerDesktop {
         };
         match plan {
             voice_input_settings::VoiceInputSettingsPlan::Update { update } => {
-                if self.apply_gateway_voice_settings_update(update, cx) {
+                if self.apply_gateway_voice_settings_update(update, Some(enabled), cx) {
                     VoiceInputEnableAction::Sent
                 } else {
                     VoiceInputEnableAction::Noop
@@ -310,7 +240,7 @@ impl PioneerDesktop {
             return false;
         };
 
-        self.apply_gateway_voice_settings_update(update, cx)
+        self.apply_gateway_voice_settings_update(update, Some(true), cx)
     }
 
     pub(super) fn retry_voice_input_install(&mut self, cx: &mut Context<Self>) -> bool {
@@ -329,7 +259,7 @@ impl PioneerDesktop {
             return false;
         };
 
-        self.apply_gateway_voice_settings_update(update, cx)
+        self.apply_gateway_voice_settings_update(update, None, cx)
     }
 
     pub(super) fn apply_vector_search_use_search_instructions(
@@ -369,6 +299,7 @@ impl PioneerDesktop {
             return false;
         };
 
+        vector_search.enabled = true;
         vector_search.provider = Some(provider);
         vector_search.model = Some(model.clone());
         if provider == GatewayThreadEpisodicVectorProvider::Local {
@@ -547,6 +478,7 @@ impl PioneerDesktop {
     fn apply_gateway_voice_settings_update(
         &mut self,
         update: GatewaySettingsUpdate,
+        pending_enabled: Option<bool>,
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(scope) = gateway_settings::plan_gateway_settings_update_action(
@@ -558,6 +490,9 @@ impl PioneerDesktop {
         };
         let connection_id = scope.connection_id;
         let connection_epoch = scope.connection_epoch;
+        self.voice_input_action_generation = self.voice_input_action_generation.wrapping_add(1);
+        let action_generation = self.voice_input_action_generation;
+        self.pending_voice_input_enabled = pending_enabled;
         self.voice_input_action_error = None;
 
         let ws_sender = self.gateway.ws_command_sender.clone();
@@ -576,6 +511,10 @@ impl PioneerDesktop {
                         view.gateway.connection_epoch,
                     ) {
                         return;
+                    }
+
+                    if view.voice_input_action_generation == action_generation {
+                        view.pending_voice_input_enabled = None;
                     }
 
                     match result {
@@ -952,9 +891,7 @@ mod tests {
 
         assert!(thread_episodic_fn.contains("thread_episodic_enabled_update_plan"));
         assert!(thread_episodic_fn.contains("self.apply_gateway_settings_update"));
-        assert!(
-            !thread_episodic_fn.contains("settings_memory::gateway_settings_update_for_memory")
-        );
+        assert!(!thread_episodic_fn.contains("settings_memory::gateway_settings_update_for_memory"));
         assert!(!thread_episodic_fn.contains("desktop-settings.toml"));
     }
 
@@ -988,11 +925,10 @@ mod tests {
             .expect("vector embedding model function body exists");
 
         assert!(embedding_model_fn.contains("vector_search_embedding_provider_from_selector"));
+        assert!(embedding_model_fn.contains("vector_search.enabled = true"));
         assert!(embedding_model_fn.contains("self.apply_vector_search_settings"));
         assert!(!embedding_model_fn.contains("provider_set_api_key"));
-        assert!(
-            !embedding_model_fn.contains("settings_memory::gateway_settings_update_for_memory")
-        );
+        assert!(!embedding_model_fn.contains("settings_memory::gateway_settings_update_for_memory"));
     }
 
     #[::core::prelude::v1::test]

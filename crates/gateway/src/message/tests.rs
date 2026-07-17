@@ -3407,13 +3407,21 @@ async fn provider_api_key_handlers_use_keystore_without_settings_write() {
         .iter()
         .map(|provider| provider.name.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(provider_names, vec!["openai", "openrouter"]);
+    assert_eq!(provider_names, vec!["local", "openai", "openrouter"]);
     assert!(
         list_payload
             .providers
             .iter()
             .all(|provider| provider.capabilities.embeddings)
     );
+    let local_provider = list_payload
+        .providers
+        .iter()
+        .find(|provider| provider.name == "local")
+        .expect("provider/list should include the built-in local provider");
+    assert!(local_provider.capabilities.transcription);
+    assert!(!local_provider.api_key_configured);
+    assert!(local_provider.proxy_url.is_none());
 
     let embedding_models_request_id =
         pioneer_protocol::RequestId::new("provider-embed-models").expect("request id");
@@ -3458,7 +3466,13 @@ async fn provider_api_key_handlers_use_keystore_without_settings_write() {
     let other_list_response = recv_response_by_id(&mut rx, other_list_request_id.as_str()).await;
     let other_list_payload: ProviderListResponse =
         serde_json::from_value(other_list_response.result).expect("provider/list other payload");
-    assert!(other_list_payload.providers.is_empty());
+    assert_eq!(other_list_payload.providers.len(), 1);
+    let other_local_provider = &other_list_payload.providers[0];
+    assert_eq!(other_local_provider.name, "local");
+    assert!(other_local_provider.capabilities.embeddings);
+    assert!(other_local_provider.capabilities.transcription);
+    assert!(!other_local_provider.api_key_configured);
+    assert!(other_local_provider.proxy_url.is_none());
 
     processor
         .provider_delete_api_key(

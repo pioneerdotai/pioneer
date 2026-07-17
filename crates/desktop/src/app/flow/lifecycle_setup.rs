@@ -37,6 +37,8 @@ impl PioneerDesktop {
         self.gateway.settings_loading = plan.gateway_settings_loading;
         self.gateway.settings_error = plan.gateway_settings_error;
         self.voice_input_action_error = None;
+        self.voice_input_action_generation = self.voice_input_action_generation.wrapping_add(1);
+        self.pending_voice_input_enabled = None;
         plan.effects
     }
 

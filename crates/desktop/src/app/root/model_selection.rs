@@ -1,13 +1,14 @@
 use super::*;
 use pioneer_client::composer::{
     capabilities::composer_capability_target_for_provider,
-    model_selection::{ComposerModelSelection, has_complete_composer_model_selection},
+    model_selection::{has_complete_composer_model_selection, ComposerModelSelection},
     state_machine::ComposerDomainAction,
 };
 use pioneer_client::providers::list as provider_list;
 use pioneer_client::providers::presentation::{
-    ProviderModelDisplayKey, ProviderModelDisplayState, provider_model_display_key,
-    provider_model_display_models_params, resolve_provider_model_display_from_response,
+    provider_model_display_key, provider_model_display_models_params,
+    resolve_provider_model_display_from_response, ProviderModelDisplayKey,
+    ProviderModelDisplayState,
 };
 use pioneer_client::state::selectors as client_selectors;
 

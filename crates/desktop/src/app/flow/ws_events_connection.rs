@@ -49,6 +49,8 @@ impl PioneerDesktop {
             self.desktop_voice_status = pioneer_protocol::VoiceStatus::Unavailable;
             self.desktop_voice_status_error = None;
             self.voice_input_action_error = None;
+            self.voice_input_action_generation = self.voice_input_action_generation.wrapping_add(1);
+            self.pending_voice_input_enabled = None;
         }
 
         if let Some(cx) = cx.as_deref_mut() {

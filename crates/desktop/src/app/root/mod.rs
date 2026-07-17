@@ -12,7 +12,7 @@ use crate::{
         editor::AgentsDocEditor,
         gateway_setup::{GatewaySetupDialogState, GatewaySetupFormState},
         skills::details::table::SkillDiagnosticsTableDelegate,
-        thread::{ThreadCoordinator, view::timeline::TimelineRenderModel},
+        thread::{view::timeline::TimelineRenderModel, ThreadCoordinator},
     },
     audio::{
         capture::{
@@ -26,7 +26,7 @@ use crate::{
 pub(super) use desktop_update::DesktopUpdateUiState;
 use gpui::{prelude::*, *};
 use gpui_component::{
-    VirtualListScrollHandle, input::InputState, table::TableState, tree::TreeState,
+    input::InputState, table::TableState, tree::TreeState, VirtualListScrollHandle,
 };
 use gpui_terminal::TerminalView;
 pub(super) use pioneer_client::{
@@ -57,8 +57,8 @@ pub(super) use pioneer_client::{
 };
 use pioneer_protocol::{
     CLIRuntimeThreadBinding, GatewaySettingsSnapshot, McpListItem, McpServerDetailsResponse,
-    ProviderModelInfo, SkillHealthItem, SkillListItem, Thread, ThreadAgentsDocSummary,
-    ThreadFolder, ThreadMode, ThreadPlacement, TurnPermissionMode, VoiceStatus, Workspace,
+    SkillHealthItem, SkillListItem, Thread, ThreadAgentsDocSummary, ThreadFolder, ThreadMode,
+    ThreadPlacement, TurnPermissionMode, VoiceStatus, Workspace,
 };
 #[cfg(test)]
 pub(crate) use queries::{
@@ -68,7 +68,7 @@ use std::{
     cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
     rc::Rc,
-    sync::{Arc, atomic::AtomicBool},
+    sync::{atomic::AtomicBool, Arc},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -294,11 +294,9 @@ pub struct PioneerDesktop {
     pub(super) thread_tree_selected_node_id: Option<String>,
     pub(super) thread_tree_state: Entity<TreeState>,
     pub(super) settings_content_view: SettingsContentView,
-    pub(super) voice_input_settings_expanded: bool,
-    pub(super) voice_input_models: Vec<ProviderModelInfo>,
-    pub(super) voice_input_models_loading: bool,
-    pub(super) voice_input_models_error: Option<String>,
     pub(super) voice_input_action_error: Option<String>,
+    pub(super) voice_input_action_generation: u64,
+    pub(super) pending_voice_input_enabled: Option<bool>,
     pub(super) remote_access_settings_expanded: bool,
     pub(super) remote_access_key_input_revision: u64,
     pub(super) remote_access_status_poll_generation: u64,

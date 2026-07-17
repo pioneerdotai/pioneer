@@ -126,12 +126,10 @@ mod tests {
         let state = ready_state();
 
         assert!(state.should_render_sidebar_panel());
-        assert!(
-            DesktopUpdateUiState::Downloading {
-                style_preview: false
-            }
-            .should_render_sidebar_panel()
-        );
+        assert!(DesktopUpdateUiState::Downloading {
+            style_preview: false
+        }
+        .should_render_sidebar_panel());
     }
 
     #[test]

@@ -2,12 +2,11 @@ use super::{MainContentView, PioneerDesktop};
 use crate::{assets::PioneerIconName, settings::WindowThemePreference, window};
 use gpui::{prelude::*, *};
 use gpui_component::{
-    Disableable, Icon, Sizable,
     button::{Button, ButtonVariants},
     h_flex,
     resizable::{h_resizable, resizable_panel},
     theme::{ActiveTheme, Theme, ThemeMode},
-    v_flex,
+    v_flex, Disableable, Icon, Sizable,
 };
 
 impl Render for PioneerDesktop {
