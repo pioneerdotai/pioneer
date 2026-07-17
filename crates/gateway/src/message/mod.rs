@@ -1335,17 +1335,13 @@ impl MessageProcessor {
                                 "turn event projection replay found unrecoverable records"
                             );
                             for record in &summary.exhausted_records {
-                                let _ = this
-                                    .report_turn_failure(
-                                        record.thread_id.clone(),
-                                        record.turn_id.clone(),
-                                        agent_runtime::TurnFailureRecoveryKind::ProjectionFailure,
-                                        format!(
-                                            "turn event projection replay exhausted for event `{}`: {}",
-                                            record.event_id, record.error_message
-                                        ),
-                                    )
-                                    .await;
+                                error!(
+                                    event_id = record.event_id,
+                                    thread_id = record.thread_id,
+                                    turn_id = record.turn_id,
+                                    error = record.error_message,
+                                    "turn event projection requires operator repair; agent execution was not interrupted"
+                                );
                             }
                         } else if summary.projected > 0
                             || summary.deferred > 0

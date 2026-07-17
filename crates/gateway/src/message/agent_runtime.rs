@@ -247,7 +247,6 @@ fn normalized_titles_equal(left: &str, right: &str) -> bool {
 pub(super) enum TurnFailureRecoveryKind {
     TurnStart,
     TurnDispatch,
-    ProjectionFailure,
     ExecutionWindowContinuation,
     ArtifactFinalization,
     TaskDispatch,
@@ -259,7 +258,6 @@ impl TurnFailureRecoveryKind {
         match self {
             Self::TurnStart => pioneer_protocol::RecoveryTrigger::TurnStart,
             Self::TurnDispatch => pioneer_protocol::RecoveryTrigger::TurnDispatch,
-            Self::ProjectionFailure => pioneer_protocol::RecoveryTrigger::ProjectionFailure,
             Self::ExecutionWindowContinuation => {
                 pioneer_protocol::RecoveryTrigger::ExecutionWindowContinuation
             }
@@ -271,7 +269,6 @@ impl TurnFailureRecoveryKind {
 
     const fn action(self) -> pioneer_protocol::RecoveryAction {
         match self {
-            Self::ProjectionFailure => pioneer_protocol::RecoveryAction::RetryWithBackoff,
             Self::ArtifactFinalization => {
                 pioneer_protocol::RecoveryAction::RepairArtifactFinalization
             }
@@ -287,7 +284,6 @@ impl TurnFailureRecoveryKind {
         match self {
             Self::TurnStart => "turn_start",
             Self::TurnDispatch => "turn_dispatch",
-            Self::ProjectionFailure => "projection_failure",
             Self::ExecutionWindowContinuation => "execution_window_continuation",
             Self::ArtifactFinalization => "artifact_finalization",
             Self::TaskDispatch => "task_dispatch",
@@ -296,17 +292,7 @@ impl TurnFailureRecoveryKind {
     }
 }
 
-fn classify_legacy_turn_failure(error_message: &str) -> TurnFailureRecoveryKind {
-    let normalized = error_message.trim().to_ascii_lowercase();
-    if normalized.starts_with("failed to persist")
-        || normalized.starts_with("failed to load")
-        || normalized.starts_with("failed to create execution window")
-        || normalized.starts_with("failed to mark execution window")
-        || normalized.contains("projection")
-        || normalized.contains("materialize")
-    {
-        return TurnFailureRecoveryKind::ProjectionFailure;
-    }
+fn classify_legacy_turn_failure(_error_message: &str) -> TurnFailureRecoveryKind {
     TurnFailureRecoveryKind::RuntimeFailure
 }
 
@@ -868,18 +854,28 @@ impl MessageProcessor {
                 let thread_id = notification.thread_id.clone();
                 let turn_id = notification.turn_id.clone();
                 let event_timestamp = now_timestamp_secs();
-                if let Err(error) = message_future(
-                    self.crud_store
-                        .materialize_item_snapshot_updated(notification.clone(), event_timestamp),
-                )
-                .await
-                {
-                    self.report_legacy_turn_failure(
+                let persist_snapshot = || {
+                    let crud_store = self.crud_store.clone();
+                    let notification = notification.clone();
+                    async move {
+                        super::message_fresh_task(async move {
+                            crud_store
+                                .materialize_item_snapshot_updated(notification, event_timestamp)
+                                .await
+                        })
+                        .await
+                        .map_err(|error| {
+                            anyhow::anyhow!("item snapshot materialization task failed: {error}")
+                        })?
+                    }
+                };
+                if let Err(error) = super::retry_transient_storage_access(persist_snapshot).await {
+                    warn!(
                         thread_id,
                         turn_id,
-                        format!("failed to persist item snapshot update: {error:#}"),
-                    )
-                    .await;
+                        error = %format!("{error:#}"),
+                        "item snapshot update could not be materialized; keeping the native turn running"
+                    );
                     return;
                 }
 

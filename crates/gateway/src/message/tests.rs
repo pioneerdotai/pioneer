@@ -18058,6 +18058,165 @@ async fn cli_runtime_projection_backlog_does_not_start_agent_recovery() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_snapshot_materialization_failure_keeps_turn_running() {
+    let (tx, mut rx) = mpsc::channel(64);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+    let thread_id = "thread_cli_snapshot_failure";
+    let turn_id = "turn_cli_snapshot_failure";
+    start_loaded_thread_and_turn_for_cli_runtime_test(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+    )
+    .await;
+
+    processor
+        .handle_snapshot_agent_event(
+            crate::cli_runtime::projector::AgentSnapshotEvent::ItemUpdated {
+                notification: ItemUpdatedNotification {
+                    workspace_id: "wrong_workspace".to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: TurnItem::SystemEvent {
+                        id: "agent_diff_snapshot_failure".to_owned(),
+                        level: pioneer_protocol::SystemEventLevel::Info,
+                        message: "Diff updated".to_owned(),
+                        code: Some("agent_diff_updated".to_owned()),
+                        details: Some(serde_json::json!({"payload": "latest diff"})),
+                    },
+                },
+            },
+        )
+        .await;
+
+    let (_, turn) = crud_store
+        .get_turn(thread_id, turn_id)
+        .await
+        .expect("turn lookup should succeed")
+        .expect("turn should exist");
+    assert_eq!(turn.status, TurnStatus::InProgress);
+    assert!(turn.error.is_none());
+    assert!(
+        crud_store
+            .find_recovery_jobs_by_turn_and_status(turn_id, RecoveryJobStatus::Pending)
+            .await
+            .expect("pending recovery jobs should load")
+            .is_empty(),
+        "snapshot read-model failure must not start agent recovery"
+    );
+    assert!(
+        crud_store
+            .get_turn_item(turn_id, "agent_diff_snapshot_failure")
+            .await
+            .expect("snapshot item lookup should succeed")
+            .is_none(),
+        "a rejected snapshot must not partially mutate the read model"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_legacy_storage_failure_routes_claude_through_native_recovery() {
+    let (tx, mut rx) = mpsc::channel(64);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = session_manager.register_connection(tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("claude-sonnet", "anthropic"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+    let thread_id = "thread_claude_storage_recovery";
+    let turn_id = "turn_claude_storage_recovery";
+    start_loaded_thread_and_turn_for_cli_runtime_test(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+    )
+    .await;
+    let now = chrono::Utc::now().fixed_offset();
+    crud_store
+        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+            turn_id: turn_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            workspace_id,
+            runtime_id: "claude".to_owned(),
+            runtime_kind: "claude".to_owned(),
+            native_thread_id: "native_thread_claude_storage_recovery".to_owned(),
+            native_turn_id: Some("native_turn_claude_storage_recovery".to_owned()),
+            request_id: None,
+            status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING.to_owned(),
+            model: Some("claude-sonnet".to_owned()),
+            cwd: Some("/tmp/project".to_owned()),
+            sandbox_json: None,
+            approval_policy: None,
+            input_mapping_json: "{}".to_owned(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("Claude turn binding should upsert");
+
+    processor
+        .report_legacy_turn_failure(
+            thread_id.to_owned(),
+            turn_id.to_owned(),
+            "failed to persist canonical item/started: injected storage failure".to_owned(),
+        )
+        .await;
+
+    let pending_jobs = crud_store
+        .find_recovery_jobs_by_turn_and_status(turn_id, RecoveryJobStatus::Pending)
+        .await
+        .expect("pending recovery jobs should load");
+    assert_eq!(pending_jobs.len(), 1);
+    assert_eq!(pending_jobs[0].trigger, RecoveryTrigger::RuntimeFailure);
+    assert_eq!(pending_jobs[0].action, RecoveryAction::RestartTurn);
+
+    let events = processor
+        .recovery_coordinator
+        .run_ready_jobs(pending_jobs[0].scheduled_at_unix.saturating_add(10), 1)
+        .await
+        .expect("Claude recovery should claim its job");
+    let [crate::resilience::RecoveryCoordinatorEvent::CliRuntimeRetryAttemptRequested(request)] =
+        events.as_slice()
+    else {
+        panic!("Claude-backed recovery must request a native CLI attempt, got {events:?}");
+    };
+    assert_eq!(request.binding.runtime_kind, "claude");
+    assert_eq!(
+        request.binding.native_thread_id,
+        "native_thread_claude_storage_recovery"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_failure_keeps_binding_active_while_pioneer_recovery_is_pending() {
     let (tx, mut rx) = mpsc::channel(64);
     let session_manager = Arc::new(SessionManager::new());
