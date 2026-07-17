@@ -74,12 +74,18 @@ pub struct GatewayConfig {
     pub auth: GatewayAuthConfig,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct GatewayVoiceConfig {
     #[serde(default = "default_gateway_voice_models_dir")]
     pub models_dir: String,
     #[serde(default)]
     pub transcription_strategy: GatewayVoiceTranscriptionStrategy,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub provider: Option<GatewayVoiceInputProviderConfig>,
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 impl Default for GatewayVoiceConfig {
@@ -87,6 +93,9 @@ impl Default for GatewayVoiceConfig {
         Self {
             models_dir: default_gateway_voice_models_dir(),
             transcription_strategy: GatewayVoiceTranscriptionStrategy::default(),
+            enabled: false,
+            provider: None,
+            model: None,
         }
     }
 }
@@ -109,6 +118,12 @@ pub enum GatewayVoiceTranscriptionStrategy {
     #[default]
     BufferedGatewaySession,
     ExperimentalStreaming,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayVoiceInputProviderConfig {
+    Local,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -3970,6 +3985,9 @@ active_recall_model = { source = "custom", model_provider = "legacy-provider", m
             config.gateway.voice.transcription_strategy,
             super::GatewayVoiceTranscriptionStrategy::BufferedGatewaySession
         );
+        assert!(!config.gateway.voice.enabled);
+        assert_eq!(config.gateway.voice.provider, None);
+        assert_eq!(config.gateway.voice.model, None);
         assert_eq!(
             config
                 .gateway
@@ -4050,6 +4068,32 @@ active_recall_model = { source = "custom", model_provider = "legacy-provider", m
                 "models_dir `{models_dir}` must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn gateway_voice_config_selection_defaults_disabled_and_roundtrips() {
+        let defaults = super::GatewayVoiceConfig::default();
+        assert!(!defaults.enabled);
+        assert_eq!(defaults.provider, None);
+        assert_eq!(defaults.model, None);
+
+        let serialized = toml::to_string(&super::GatewayVoiceConfig {
+            enabled: true,
+            provider: Some(super::GatewayVoiceInputProviderConfig::Local),
+            model: Some("parakeet-tdt-0.6b-v3".to_owned()),
+            ..super::GatewayVoiceConfig::default()
+        })
+        .expect("voice config should serialize");
+        let roundtrip: super::GatewayVoiceConfig =
+            toml::from_str(serialized.as_str()).expect("voice config should deserialize");
+
+        assert!(roundtrip.enabled);
+        assert_eq!(
+            roundtrip.provider,
+            Some(super::GatewayVoiceInputProviderConfig::Local)
+        );
+        assert_eq!(roundtrip.model.as_deref(), Some("parakeet-tdt-0.6b-v3"));
+        assert_eq!(roundtrip.models_dir, "models/voice");
     }
 
     #[test]
