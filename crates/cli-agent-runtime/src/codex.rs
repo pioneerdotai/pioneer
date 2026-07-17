@@ -12,8 +12,8 @@ mod mcp_config;
 pub use mcp_config::{
     CodexManagedMcpConfigArtifact, CodexManagedMcpConfigError, CodexManagedMcpConfigInput,
     CodexManagedMcpConfigLimits, CodexManagedMcpSemanticInput, CodexManagedMcpToolIdentity,
-    codex_config_value_fingerprint, codex_managed_mcp_semantic_restart_fingerprint,
-    serialize_codex_managed_mcp_config,
+    codex_config_read_max_origins, codex_config_value_fingerprint,
+    codex_managed_mcp_semantic_restart_fingerprint, serialize_codex_managed_mcp_config,
 };
 
 use crate::driver::{
@@ -488,6 +488,7 @@ impl CodexAppServerClient {
     pub async fn config_read(
         &self,
         cwd: &str,
+        max_origins: usize,
         timeout: Duration,
     ) -> Result<CodexConfigReadSnapshot, CodexJsonlRpcClientError> {
         if cwd.trim().is_empty() {
@@ -496,13 +497,19 @@ impl CodexAppServerClient {
                 message: "config/read cwd must not be empty".to_owned(),
             });
         }
+        if max_origins == 0 {
+            return Err(CodexJsonlRpcClientError::Encode {
+                method: "config/read".to_owned(),
+                message: "config/read origin budget must be greater than zero".to_owned(),
+            });
+        }
         let params = CodexConfigReadParams {
             cwd: cwd.to_owned(),
             include_layers: true,
         };
         let response: CodexConfigReadWireResponse =
             self.rpc.request("config/read", &params, timeout).await?;
-        decode_codex_config_read_response(response).map_err(|message| {
+        decode_codex_config_read_response(response, max_origins).map_err(|message| {
             CodexJsonlRpcClientError::Decode {
                 method: "config/read".to_owned(),
                 message,
@@ -1038,17 +1045,20 @@ pub struct CodexThreadMetadataSnapshot {
 
 fn decode_codex_config_read_response(
     response: CodexConfigReadWireResponse,
+    max_origins: usize,
 ) -> Result<CodexConfigReadSnapshot, String> {
     const MAX_LAYERS: usize = 128;
-    const MAX_ORIGINS: usize = 512;
     let layers = response
         .layers
         .ok_or_else(|| "config/read omitted requested layer evidence".to_owned())?;
     if layers.len() > MAX_LAYERS {
         return Err("config/read returned too many config layers".to_owned());
     }
-    if response.origins.len() > MAX_ORIGINS {
-        return Err("config/read returned too many config origins".to_owned());
+    if response.origins.len() > max_origins {
+        return Err(format!(
+            "config/read returned {} config origins, maximum is {max_origins}",
+            response.origins.len()
+        ));
     }
     for (key, metadata) in response.origins {
         validate_codex_config_evidence_text("origin key", key.as_str())?;
@@ -6279,13 +6289,58 @@ while read line; do :; done
         })
     }
 
+    fn codex_config_read_result_with_origins(count: usize) -> JsonValue {
+        let mut result = empty_codex_config_read_result();
+        let origins = (0..count)
+            .map(|index| {
+                (
+                    format!("mcp_servers.pioneer.synthetic.{index}"),
+                    json!({
+                        "name": {
+                            "type": "user",
+                            "file": "/managed/config.toml",
+                            "profile": null
+                        },
+                        "version": "sha256:user"
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        result["origins"] = JsonValue::Object(origins);
+        result
+    }
+
+    #[test]
+    fn codex_config_read_origin_budget_scales_with_the_configured_tool_limit() {
+        let production_shape = serde_json::from_value::<CodexConfigReadWireResponse>(
+            codex_config_read_result_with_origins(623),
+        )
+        .expect("production-shaped config/read response");
+        decode_codex_config_read_response(
+            production_shape,
+            codex_config_read_max_origins(512).expect("configured origin budget"),
+        )
+        .expect("623 origins must fit the configured 512-tool contract");
+
+        let obsolete_shape = serde_json::from_value::<CodexConfigReadWireResponse>(
+            codex_config_read_result_with_origins(623),
+        )
+        .expect("production-shaped config/read response");
+        let error = decode_codex_config_read_response(obsolete_shape, 512)
+            .expect_err("the obsolete fixed origin limit must reject this response");
+        assert_eq!(
+            error,
+            "config/read returned 623 config origins, maximum is 512"
+        );
+    }
+
     #[tokio::test]
     async fn codex_config_read_sends_exact_read_only_request_and_decodes_safe_evidence() {
         let mut fake = FakeCodexAppServer::new();
         let client = fake.client.clone();
         let read = tokio::spawn(async move {
             client
-                .config_read("/workspace", Duration::from_secs(2))
+                .config_read("/workspace", 512, Duration::from_secs(2))
                 .await
         });
 
@@ -6350,7 +6405,7 @@ while read line; do :; done
             let client = fake.client.clone();
             let read = tokio::spawn(async move {
                 client
-                    .config_read("/workspace", Duration::from_secs(2))
+                    .config_read("/workspace", 512, Duration::from_secs(2))
                     .await
             });
             let request = fake.read_message().await;
@@ -6370,7 +6425,7 @@ while read line; do :; done
         let client = fake.client.clone();
         let read = tokio::spawn(async move {
             client
-                .config_read("/workspace", Duration::from_millis(20))
+                .config_read("/workspace", 512, Duration::from_millis(20))
                 .await
         });
         let request = fake.read_message().await;

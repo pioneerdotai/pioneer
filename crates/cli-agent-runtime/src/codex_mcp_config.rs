@@ -15,6 +15,8 @@ const CODEX_DEFAULT_PERSONALITY: &str = "pragmatic";
 const MAX_CALLABLE_NAME_BYTES: usize = 64;
 const MAX_MANAGED_PATH_BYTES: usize = 4_096;
 const MAX_CONFIG_BYTES: usize = 1024 * 1024;
+const CONFIG_READ_ORIGINS_PER_MANAGED_TOOL: usize = 2;
+const CONFIG_READ_NON_TOOL_ORIGIN_RESERVE: usize = 512;
 
 const ISOLATION_FEATURE_NAMES: &[&str] = &[
     "apps",
@@ -60,6 +62,21 @@ pub struct CodexManagedMcpConfigInput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CodexManagedMcpConfigLimits {
     pub max_tools: usize,
+}
+
+/// Bound the `config/read.origins` evidence returned by Codex for a managed
+/// MCP projection. Codex emits two origin entries for every selected tool:
+/// one for `enabled_tools` and one for the per-tool approval policy. The
+/// non-tool reserve preserves a bounded allowance for Pioneer-owned fixed
+/// fields and any system/session config layers that Codex reports alongside
+/// the managed overlay.
+pub fn codex_config_read_max_origins(max_tools: usize) -> Option<usize> {
+    if max_tools == 0 {
+        return None;
+    }
+    max_tools
+        .checked_mul(CONFIG_READ_ORIGINS_PER_MANAGED_TOOL)?
+        .checked_add(CONFIG_READ_NON_TOOL_ORIGIN_RESERVE)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -720,5 +737,13 @@ mod tests {
             serialize_codex_managed_mcp_config(invalid),
             Err(CodexManagedMcpConfigError::InvalidMaxTools)
         );
+    }
+
+    #[test]
+    fn codex_config_read_origin_budget_scales_with_the_tool_limit() {
+        assert_eq!(codex_config_read_max_origins(512), Some(1_536));
+        assert_eq!(codex_config_read_max_origins(306), Some(1_124));
+        assert_eq!(codex_config_read_max_origins(0), None);
+        assert_eq!(codex_config_read_max_origins(usize::MAX), None);
     }
 }
